@@ -1,0 +1,23 @@
+# FxSound on Hyprland ------------------------------------------------------
+# The window is frameless and has a fixed design size (1040x588 for the Pro
+# view, 550x189 for the Lite view - content plus the 56px title bar, the 1px
+# divider and the 20px bottom pad), so let it float instead of tiling.
+
+windowrulev2 = float,        class:^(com\.fxsound\.FxSound)$
+windowrulev2 = noborder,     class:^(com\.fxsound\.FxSound)$
+windowrulev2 = rounding 8,   class:^(com\.fxsound\.FxSound)$
+# The app paints its own drop shadow; disable the compositor's to match Windows.
+windowrulev2 = noshadow,     class:^(com\.fxsound\.FxSound)$
+
+# Settings, the changelog and the preset dialogs are panes inside the main window, so there
+# are no extra toplevels to rule for. Fullscreen (e.g. `fullscreen` on Super+F) scales the
+# window's fixed design up to fit the monitor.
+
+# Global hotkeys ----------------------------------------------------------
+# A Wayland client cannot grab global shortcuts the way the Windows build does.
+# Bind them in the compositor instead; each one is forwarded over FxSound's
+# control socket to the running instance.
+bind = CTRL SHIFT, F,   exec, fxsound --next-preset
+bind = CTRL SHIFT, D,   exec, fxsound --prev-preset
+bind = CTRL SHIFT, P,   exec, fxsound --toggle-power
+bind = CTRL SHIFT, O,   exec, fxsound --toggle-window

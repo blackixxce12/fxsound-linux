@@ -1,0 +1,29 @@
+language: Japanese
+countries: ja
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s 個のプリセットファイルがエクスポート先に既に存在します。上書きしますか？"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Wayland クライアントはグローバルショートカットを登録できません。それはコンポジタの役割です。これらのコマンドをコンポジタの設定で割り当ててください — それぞれ FxSound の制御ソケットを通じて実行中のインスタンスに届きます。"
+"A preset named %s already exists" = "%s という名前のプリセットは既に存在します"
+"Audio disconnected:" = "オーディオが切断されました:"
+"Choose folder…" = "フォルダーを選択…"
+"Could not change the startup setting" = "自動起動の設定を変更できませんでした"
+"Could not create the export folder" = "エクスポート先フォルダーを作成できませんでした"
+"Could not delete %s" = "%s を削除できませんでした"
+"Could not export %s" = "%s をエクスポートできませんでした"
+"Could not load %s" = "%s を読み込めませんでした"
+"Could not open the link" = "リンクを開けませんでした"
+"Could not rename %s" = "%s の名前を変更できませんでした"
+"Could not save %s" = "%s を保存できませんでした"
+"Factory presets cannot be deleted" = "工場出荷時のプリセットは削除できません"
+"Factory presets cannot be renamed" = "工場出荷時のプリセットは名前を変更できません"
+"Folder: (none chosen)" = "フォルダー: (未選択)"
+"Input" = "入力"
+"Keyboard shortcuts" = "キーボードショートカット"
+"Output" = "出力"
+"Presets exported to %s" = "プリセットを %s にエクスポートしました"
+"Renamed %s to %s" = "%s の名前を %s に変更しました"
+"System language" = "システムの言語"
+"Input: " = "入力: "
+"Could not open the folder picker" = "フォルダー選択を開けませんでした"

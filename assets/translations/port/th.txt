@@ -1,0 +1,29 @@
+language: Thai
+countries: th
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "มีไฟล์พรีเซ็ต %s ไฟล์อยู่ในโฟลเดอร์ส่งออกแล้ว ต้องการเขียนทับหรือไม่?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "ไคลเอนต์ Wayland ไม่สามารถกำหนดปุ่มลัดทั่วทั้งระบบได้: สิทธิ์นั้นเป็นของคอมโพสิเตอร์ โปรดผูกคำสั่งเหล่านี้ในการตั้งค่าคอมโพสิเตอร์ของคุณ — แต่ละคำสั่งจะส่งถึง FxSound ที่กำลังทำงานผ่านซ็อกเก็ตควบคุม"
+"A preset named %s already exists" = "มีพรีเซ็ตชื่อ %s อยู่แล้ว"
+"Audio disconnected:" = "เสียงถูกตัดการเชื่อมต่อ:"
+"Choose folder…" = "เลือกโฟลเดอร์…"
+"Could not change the startup setting" = "ไม่สามารถเปลี่ยนการตั้งค่าเริ่มทำงานพร้อมระบบได้"
+"Could not create the export folder" = "ไม่สามารถสร้างโฟลเดอร์ส่งออกได้"
+"Could not delete %s" = "ไม่สามารถลบ %s ได้"
+"Could not export %s" = "ไม่สามารถส่งออก %s ได้"
+"Could not load %s" = "ไม่สามารถโหลด %s ได้"
+"Could not open the link" = "ไม่สามารถเปิดลิงก์ได้"
+"Could not rename %s" = "ไม่สามารถเปลี่ยนชื่อ %s ได้"
+"Could not save %s" = "ไม่สามารถบันทึก %s ได้"
+"Factory presets cannot be deleted" = "ไม่สามารถลบพรีเซ็ตจากโรงงานได้"
+"Factory presets cannot be renamed" = "ไม่สามารถเปลี่ยนชื่อพรีเซ็ตจากโรงงานได้"
+"Folder: (none chosen)" = "โฟลเดอร์: (ยังไม่ได้เลือก)"
+"Input" = "อินพุต"
+"Keyboard shortcuts" = "ปุ่มลัดแป้นพิมพ์"
+"Output" = "เอาต์พุต"
+"Presets exported to %s" = "ส่งออกพรีเซ็ตไปยัง %s แล้ว"
+"Renamed %s to %s" = "เปลี่ยนชื่อ %s เป็น %s แล้ว"
+"System language" = "ภาษาของระบบ"
+"Input: " = "อินพุต: "
+"Could not open the folder picker" = "ไม่สามารถเปิดตัวเลือกโฟลเดอร์ได้"

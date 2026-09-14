@@ -1,0 +1,29 @@
+language: Italiano
+countries: it
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s file di preset esistono già nella cartella di esportazione, vuoi sovrascriverli?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Un client Wayland non può impostare scorciatoie globali: appartengono al compositor. Associa questi comandi nella configurazione del tuo compositor — ognuno raggiunge l'istanza in esecuzione tramite il socket di controllo di FxSound."
+"A preset named %s already exists" = "Esiste già un preset chiamato %s"
+"Audio disconnected:" = "Audio disconnesso:"
+"Choose folder…" = "Scegli cartella…"
+"Could not change the startup setting" = "Impossibile modificare l'impostazione di avvio automatico"
+"Could not create the export folder" = "Impossibile creare la cartella di esportazione"
+"Could not delete %s" = "Impossibile eliminare %s"
+"Could not export %s" = "Impossibile esportare %s"
+"Could not load %s" = "Impossibile caricare %s"
+"Could not open the link" = "Impossibile aprire il collegamento"
+"Could not rename %s" = "Impossibile rinominare %s"
+"Could not save %s" = "Impossibile salvare %s"
+"Factory presets cannot be deleted" = "I preset di fabbrica non possono essere eliminati"
+"Factory presets cannot be renamed" = "I preset di fabbrica non possono essere rinominati"
+"Folder: (none chosen)" = "Cartella: (nessuna scelta)"
+"Input" = "Ingresso"
+"Keyboard shortcuts" = "Scorciatoie da tastiera"
+"Output" = "Uscita"
+"Presets exported to %s" = "Preset esportati in %s"
+"Renamed %s to %s" = "%s rinominato in %s"
+"System language" = "Lingua di sistema"
+"Input: " = "Ingresso: "
+"Could not open the folder picker" = "Impossibile aprire il selettore di cartelle"

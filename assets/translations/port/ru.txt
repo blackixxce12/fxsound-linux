@@ -1,0 +1,30 @@
+language: Russian
+countries: ru
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s файлов пресетов уже существуют в папке экспорта, перезаписать их?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Клиент Wayland не может назначать глобальные горячие клавиши: ими управляет композитор. Назначьте эти команды в его конфигурации — каждая из них доходит до запущенного FxSound через его управляющий сокет."
+"A preset named %s already exists" = "Пресет с именем %s уже существует"
+"Audio disconnected:" = "Звук отключён:"
+"Choose folder…" = "Выбрать папку…"
+"Could not change the startup setting" = "Не удалось изменить настройку автозапуска"
+"Could not create the export folder" = "Не удалось создать папку экспорта"
+"Could not delete %s" = "Не удалось удалить %s"
+"Could not export %s" = "Не удалось экспортировать %s"
+"Could not load %s" = "Не удалось загрузить %s"
+"Could not open the link" = "Не удалось открыть ссылку"
+"Could not rename %s" = "Не удалось переименовать %s"
+"Could not save %s" = "Не удалось сохранить %s"
+"Factory presets cannot be deleted" = "Заводские пресеты нельзя удалить"
+"Factory presets cannot be renamed" = "Заводские пресеты нельзя переименовать"
+"Folder: (none chosen)" = "Папка: (не выбрана)"
+"Input" = "Ввод"
+"Keyboard shortcuts" = "Горячие клавиши"
+"Output" = "Вывод"
+"Presets exported to %s" = "Пресеты экспортированы в %s"
+"Renamed %s to %s" = "%s переименован в %s"
+"System language" = "Язык системы"
+"Input: " = "Ввод: "
+"Could not open the folder picker" = "Не удалось открыть выбор папки"
+"Launch on system startup" = "Автоматически запускать при входе в систему"

@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+Name=FxSound
+GenericName=Audio Enhancer
+GenericName[ru]=Улучшение звука
+GenericName[de]=Klangverbesserung
+GenericName[fr]=Amélioration audio
+GenericName[es]=Mejora de audio
+GenericName[uk]=Покращення звуку
+Comment=System-wide audio enhancement: EQ, ambience, surround, bass and dynamic boost
+Comment[ru]=Улучшение звука для всей системы: эквалайзер, объём, surround, бас и динамическое усиление
+Comment[de]=Systemweite Klangverbesserung: EQ, Ambience, Surround, Bass und Dynamic Boost
+Comment[fr]=Amélioration audio pour tout le système : égaliseur, ambiance, surround, basses et dynamique
+Comment[es]=Mejora de audio para todo el sistema: ecualizador, ambiente, surround, graves y dinámica
+Comment[uk]=Покращення звуку для всієї системи: еквалайзер, об'єм, surround, бас і динамічне підсилення
+Exec=fxsound
+Icon=fxsound
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=equalizer;audio;dsp;sound;enhancer;pipewire;
+StartupNotify=true
+StartupWMClass=com.fxsound.FxSound
+SingleMainWindow=true

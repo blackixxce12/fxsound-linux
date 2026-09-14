@@ -1,0 +1,29 @@
+language: Arabic
+countries: EG sa
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "يوجد بالفعل %s ملفات إعدادات مسبقة في مجلد التصدير، هل تريد استبدالها؟"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "لا يمكن لعميل Wayland ربط اختصارات عامة: فهي من اختصاص مدير النوافذ (compositor). اربط هذه الأوامر في إعدادات مدير النوافذ لديك — يصل كل منها إلى FxSound قيد التشغيل عبر مقبس التحكم الخاص به."
+"A preset named %s already exists" = "يوجد بالفعل إعداد مسبق باسم %s"
+"Audio disconnected:" = "انقطع الصوت:"
+"Choose folder…" = "اختر مجلدًا…"
+"Could not change the startup setting" = "تعذر تغيير إعداد التشغيل مع بدء النظام"
+"Could not create the export folder" = "تعذر إنشاء مجلد التصدير"
+"Could not delete %s" = "تعذر حذف %s"
+"Could not export %s" = "تعذر تصدير %s"
+"Could not load %s" = "تعذر تحميل %s"
+"Could not open the link" = "تعذر فتح الرابط"
+"Could not rename %s" = "تعذر إعادة تسمية %s"
+"Could not save %s" = "تعذر حفظ %s"
+"Factory presets cannot be deleted" = "لا يمكن حذف الإعدادات المسبقة الافتراضية"
+"Factory presets cannot be renamed" = "لا يمكن إعادة تسمية الإعدادات المسبقة الافتراضية"
+"Folder: (none chosen)" = "المجلد: (لم يُختر)"
+"Input" = "الإدخال"
+"Keyboard shortcuts" = "اختصارات لوحة المفاتيح"
+"Output" = "الإخراج"
+"Presets exported to %s" = "تم تصدير الإعدادات المسبقة إلى %s"
+"Renamed %s to %s" = "تمت إعادة تسمية %s إلى %s"
+"System language" = "لغة النظام"
+"Input: " = "الإدخال: "
+"Could not open the folder picker" = "تعذر فتح منتقي المجلدات"

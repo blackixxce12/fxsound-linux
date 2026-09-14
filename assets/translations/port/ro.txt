@@ -1,0 +1,29 @@
+language: Romanian
+countries: ro
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s fișiere de preseturi există deja în dosarul de export, doriți să le suprascrieți?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Un client Wayland nu poate defini scurtături globale: acestea aparțin compozitorului. Asociați aceste comenzi în configurația compozitorului — fiecare ajunge la instanța pornită prin socketul de control al FxSound."
+"A preset named %s already exists" = "Există deja un preset numit %s"
+"Audio disconnected:" = "Audio deconectat:"
+"Choose folder…" = "Alege dosarul…"
+"Could not change the startup setting" = "Setarea de pornire automată nu a putut fi schimbată"
+"Could not create the export folder" = "Dosarul de export nu a putut fi creat"
+"Could not delete %s" = "%s nu a putut fi șters"
+"Could not export %s" = "%s nu a putut fi exportat"
+"Could not load %s" = "%s nu a putut fi încărcat"
+"Could not open the link" = "Linkul nu a putut fi deschis"
+"Could not rename %s" = "%s nu a putut fi redenumit"
+"Could not save %s" = "%s nu a putut fi salvat"
+"Factory presets cannot be deleted" = "Preseturile din fabrică nu pot fi șterse"
+"Factory presets cannot be renamed" = "Preseturile din fabrică nu pot fi redenumite"
+"Folder: (none chosen)" = "Dosar: (niciunul ales)"
+"Input" = "Intrare"
+"Keyboard shortcuts" = "Scurtături de tastatură"
+"Output" = "Ieșire"
+"Presets exported to %s" = "Preseturi exportate în %s"
+"Renamed %s to %s" = "%s redenumit în %s"
+"System language" = "Limba sistemului"
+"Input: " = "Intrare: "
+"Could not open the folder picker" = "Selectorul de dosare nu a putut fi deschis"

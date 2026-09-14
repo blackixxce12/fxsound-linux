@@ -1,0 +1,21 @@
+[package]
+name = "fxsound-audio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "PipeWire audio backend for the FxSound Linux port: the virtual sink, the DSP process callback and the playback stream"
+
+[dependencies]
+fxsound-core = { workspace = true }
+fxsound-dsp = { workspace = true }
+# `v0_3_65` is the feature level the verified cheatsheet prescribes
+# (`docs/api/pipewire-0.10-rust.md` §1.1): without it `keys::NODE_LINK_GROUP`,
+# `keys::TARGET_OBJECT`, `keys::NODE_WANT_DRIVER` and `Buffer::requested()` do not exist.
+# Features are additive on top of the workspace pin, so the version stays workspace-owned.
+pipewire = { workspace = true, features = ["v0_3_65"] }
+libspa = { workspace = true, features = ["v0_3_65"] }
+crossbeam-channel = { workspace = true }
+triple_buffer = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }

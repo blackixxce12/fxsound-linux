@@ -1,0 +1,29 @@
+language: Finnish
+countries: fi
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s esiasetustiedostoa on jo vientikansiossa, korvataanko ne?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Wayland-asiakas ei voi määrittää yleisiä pikanäppäimiä: ne kuuluvat kompositorille. Sido nämä komennot kompositorisi asetuksissa — jokainen tavoittaa käynnissä olevan FxSoundin sen ohjausvastakkeen kautta."
+"A preset named %s already exists" = "Esiasetus nimeltä %s on jo olemassa"
+"Audio disconnected:" = "Ääni katkaistu:"
+"Choose folder…" = "Valitse kansio…"
+"Could not change the startup setting" = "Automaattisen käynnistyksen asetusta ei voitu muuttaa"
+"Could not create the export folder" = "Vientikansiota ei voitu luoda"
+"Could not delete %s" = "Kohdetta %s ei voitu poistaa"
+"Could not export %s" = "Kohdetta %s ei voitu viedä"
+"Could not load %s" = "Kohdetta %s ei voitu ladata"
+"Could not open the link" = "Linkkiä ei voitu avata"
+"Could not rename %s" = "Kohdetta %s ei voitu nimetä uudelleen"
+"Could not save %s" = "Kohdetta %s ei voitu tallentaa"
+"Factory presets cannot be deleted" = "Tehdasesiasetuksia ei voi poistaa"
+"Factory presets cannot be renamed" = "Tehdasesiasetuksia ei voi nimetä uudelleen"
+"Folder: (none chosen)" = "Kansio: (ei valittu)"
+"Input" = "Tulo"
+"Keyboard shortcuts" = "Pikanäppäimet"
+"Output" = "Lähtö"
+"Presets exported to %s" = "Esiasetukset viety kansioon %s"
+"Renamed %s to %s" = "%s nimettiin uudelleen: %s"
+"System language" = "Järjestelmän kieli"
+"Input: " = "Tulo: "
+"Could not open the folder picker" = "Kansion valintaa ei voitu avata"

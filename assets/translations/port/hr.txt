@@ -1,0 +1,29 @@
+language: Croatian
+countries: HR
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s datoteka presetova već postoji u mapi za izvoz, želite li ih prepisati?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Wayland klijent ne može postavljati globalne prečace: oni pripadaju kompozitoru. Dodijelite ove naredbe u konfiguraciji svog kompozitora — svaka dolazi do pokrenute instance preko upravljačkog socketa FxSounda."
+"A preset named %s already exists" = "Preset naziva %s već postoji"
+"Audio disconnected:" = "Zvuk odspojen:"
+"Choose folder…" = "Odaberi mapu…"
+"Could not change the startup setting" = "Postavku automatskog pokretanja nije moguće promijeniti"
+"Could not create the export folder" = "Mapu za izvoz nije moguće stvoriti"
+"Could not delete %s" = "%s nije moguće izbrisati"
+"Could not export %s" = "%s nije moguće izvesti"
+"Could not load %s" = "%s nije moguće učitati"
+"Could not open the link" = "Poveznicu nije moguće otvoriti"
+"Could not rename %s" = "%s nije moguće preimenovati"
+"Could not save %s" = "%s nije moguće spremiti"
+"Factory presets cannot be deleted" = "Tvorničke presete nije moguće izbrisati"
+"Factory presets cannot be renamed" = "Tvorničke presete nije moguće preimenovati"
+"Folder: (none chosen)" = "Mapa: (nije odabrana)"
+"Input" = "Ulaz"
+"Keyboard shortcuts" = "Tipkovnički prečaci"
+"Output" = "Izlaz"
+"Presets exported to %s" = "Preseti izvezeni u %s"
+"Renamed %s to %s" = "%s preimenovan u %s"
+"System language" = "Jezik sustava"
+"Input: " = "Ulaz: "
+"Could not open the folder picker" = "Odabir mape nije moguće otvoriti"

@@ -1,0 +1,29 @@
+language: Chinese (Simplified)
+countries: cn sg
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "导出文件夹中已存在 %s 个预设文件，是否覆盖？"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Wayland 客户端无法绑定全局快捷键：这由合成器负责。请在合成器的配置中绑定这些命令 — 每条命令都会通过 FxSound 的控制套接字送达正在运行的实例。"
+"A preset named %s already exists" = "名为 %s 的预设已存在"
+"Audio disconnected:" = "音频已断开："
+"Choose folder…" = "选择文件夹…"
+"Could not change the startup setting" = "无法更改开机自启设置"
+"Could not create the export folder" = "无法创建导出文件夹"
+"Could not delete %s" = "无法删除 %s"
+"Could not export %s" = "无法导出 %s"
+"Could not load %s" = "无法加载 %s"
+"Could not open the link" = "无法打开链接"
+"Could not rename %s" = "无法重命名 %s"
+"Could not save %s" = "无法保存 %s"
+"Factory presets cannot be deleted" = "出厂预设无法删除"
+"Factory presets cannot be renamed" = "出厂预设无法重命名"
+"Folder: (none chosen)" = "文件夹：（未选择）"
+"Input" = "输入"
+"Keyboard shortcuts" = "键盘快捷键"
+"Output" = "输出"
+"Presets exported to %s" = "预设已导出到 %s"
+"Renamed %s to %s" = "已将 %s 重命名为 %s"
+"System language" = "系统语言"
+"Input: " = "输入："
+"Could not open the folder picker" = "无法打开文件夹选择器"

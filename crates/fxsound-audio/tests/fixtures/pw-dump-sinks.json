@@ -1,0 +1,482 @@
+[
+  {
+    "id": 31,
+    "type": "PipeWire:Interface:Metadata",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x"
+    ],
+    "props": {
+      "metadata.name": "settings",
+      "object.serial": 31
+    },
+    "metadata": [
+      {
+        "subject": 0,
+        "key": "log.level",
+        "type": "",
+        "value": 2
+      },
+      {
+        "subject": 0,
+        "key": "clock.rate",
+        "type": "",
+        "value": 48000
+      },
+      {
+        "subject": 0,
+        "key": "clock.allowed-rates",
+        "type": "",
+        "value": "[ 48000 ]"
+      },
+      {
+        "subject": 0,
+        "key": "clock.quantum",
+        "type": "",
+        "value": 1024
+      },
+      {
+        "subject": 0,
+        "key": "clock.min-quantum",
+        "type": "",
+        "value": 32
+      },
+      {
+        "subject": 0,
+        "key": "clock.max-quantum",
+        "type": "",
+        "value": 2048
+      },
+      {
+        "subject": 0,
+        "key": "clock.force-quantum",
+        "type": "",
+        "value": 0
+      },
+      {
+        "subject": 0,
+        "key": "clock.force-rate",
+        "type": "",
+        "value": 0
+      }
+    ]
+  },
+  {
+    "id": 39,
+    "type": "PipeWire:Interface:Metadata",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x"
+    ],
+    "props": {
+      "client.id": 33,
+      "factory.id": 7,
+      "metadata.name": "default",
+      "module.id": 6,
+      "object.serial": 39
+    },
+    "metadata": [
+      {
+        "subject": 0,
+        "key": "default.configured.audio.sink",
+        "type": "Spa:String:JSON",
+        "value": {
+          "name": "alsa_output.pci-0000_05_00.6.analog-stereo"
+        }
+      },
+      {
+        "subject": 0,
+        "key": "default.audio.sink",
+        "type": "Spa:String:JSON",
+        "value": {
+          "name": "alsa_output.pci-0000_05_00.6.analog-stereo"
+        }
+      },
+      {
+        "subject": 0,
+        "key": "default.audio.source",
+        "type": "Spa:String:JSON",
+        "value": {
+          "name": "alsa_input.usb-3142_fifine_Microphone-00.analog-stereo"
+        }
+      },
+      {
+        "subject": 75,
+        "key": "target.node",
+        "type": "Spa:Id",
+        "value": -1
+      }
+    ]
+  },
+  {
+    "id": 55,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 129,
+      "max-output-ports": 0,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 2,
+      "n-output-ports": 2,
+      "state": "suspended",
+      "error": null,
+      "props": {
+        "alsa.card": 2,
+        "alsa.card_name": "fifine Microphone",
+        "alsa.class": "generic",
+        "alsa.components": "USB3142:17a8",
+        "alsa.device": 0,
+        "alsa.driver_name": "snd_usb_audio",
+        "alsa.id": "Microphone",
+        "alsa.long_card_name": "fifine Microphone at usb-0000:05:00.4-1.2, full speed",
+        "alsa.mixer_name": "USB Mixer",
+        "alsa.name": "USB Audio",
+        "alsa.resolution_bits": 16,
+        "alsa.subclass": "generic-mix",
+        "alsa.subdevice": 0,
+        "alsa.subdevice_name": "subdevice #0",
+        "alsa.sync.id": "00000000:00000000:00000000:00000000",
+        "api.alsa.card.longname": "fifine Microphone at usb-0000:05:00.4-1.2, full speed",
+        "api.alsa.card.name": "fifine Microphone",
+        "api.alsa.path": "front:2",
+        "api.alsa.pcm.card": 2,
+        "api.alsa.pcm.stream": "playback",
+        "audio.channels": 2,
+        "audio.position": "[ FL, FR ]",
+        "card.profile.device": 4,
+        "client.id": 33,
+        "clock.quantum-limit": 8192,
+        "device.api": "alsa",
+        "device.bus": "usb",
+        "device.class": "sound",
+        "device.form-factor": "microphone",
+        "device.icon-name": "audio-card-analog",
+        "device.id": 47,
+        "device.profile.description": "Аналоговый стерео",
+        "device.profile.name": "analog-stereo",
+        "device.routes": 1,
+        "factory.id": 19,
+        "factory.name": "api.alsa.pcm.sink",
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Audio/Sink",
+        "node.description": "fifine Microphone Аналоговый стерео",
+        "node.driver": true,
+        "node.loop.name": "data-loop.0",
+        "node.name": "alsa_output.usb-3142_fifine_Microphone-00.analog-stereo",
+        "node.nick": "fifine Microphone",
+        "node.pause-on-idle": false,
+        "object.id": 55,
+        "object.path": "alsa:acp:Microphone:4:playback",
+        "object.serial": 55,
+        "port.group": "playback",
+        "priority.driver": 1109,
+        "priority.session": 1109
+      }
+    }
+  },
+  {
+    "id": 56,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 0,
+      "max-output-ports": 129,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 0,
+      "n-output-ports": 2,
+      "state": "suspended",
+      "error": null,
+      "props": {
+        "alsa.card": 2,
+        "alsa.card_name": "fifine Microphone",
+        "alsa.class": "generic",
+        "alsa.components": "USB3142:17a8",
+        "alsa.device": 0,
+        "alsa.driver_name": "snd_usb_audio",
+        "alsa.id": "Microphone",
+        "alsa.long_card_name": "fifine Microphone at usb-0000:05:00.4-1.2, full speed",
+        "alsa.mixer_name": "USB Mixer",
+        "alsa.name": "USB Audio",
+        "alsa.resolution_bits": 16,
+        "alsa.subclass": "generic-mix",
+        "alsa.subdevice": 0,
+        "alsa.subdevice_name": "subdevice #0",
+        "alsa.sync.id": "00000000:00000000:00000000:00000000",
+        "api.alsa.card.longname": "fifine Microphone at usb-0000:05:00.4-1.2, full speed",
+        "api.alsa.card.name": "fifine Microphone",
+        "api.alsa.path": "front:2",
+        "api.alsa.pcm.card": 2,
+        "api.alsa.pcm.stream": "capture",
+        "audio.channels": 2,
+        "audio.position": "[ FL, FR ]",
+        "card.profile.device": 0,
+        "client.id": 33,
+        "clock.quantum-limit": 8192,
+        "device.api": "alsa",
+        "device.bus": "usb",
+        "device.class": "sound",
+        "device.form-factor": "microphone",
+        "device.icon-name": "audio-card-analog",
+        "device.id": 47,
+        "device.profile.description": "Аналоговый стерео",
+        "device.profile.name": "analog-stereo",
+        "device.routes": 1,
+        "factory.id": 19,
+        "factory.name": "api.alsa.pcm.source",
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Audio/Source",
+        "node.description": "fifine Microphone Аналоговый стерео",
+        "node.driver": true,
+        "node.loop.name": "data-loop.0",
+        "node.name": "alsa_input.usb-3142_fifine_Microphone-00.analog-stereo",
+        "node.nick": "fifine Microphone",
+        "node.pause-on-idle": false,
+        "object.id": 56,
+        "object.path": "alsa:acp:Microphone:0:capture",
+        "object.serial": 56,
+        "port.group": "capture",
+        "priority.driver": 2109,
+        "priority.session": 2109
+      }
+    }
+  },
+  {
+    "id": 57,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 129,
+      "max-output-ports": 0,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 2,
+      "n-output-ports": 2,
+      "state": "suspended",
+      "error": null,
+      "props": {
+        "alsa.card": 1,
+        "alsa.card_name": "HD-Audio Generic",
+        "alsa.class": "generic",
+        "alsa.components": "HDA:10ec0294,10431cb2,00100004",
+        "alsa.device": 0,
+        "alsa.driver_name": "snd_hda_intel",
+        "alsa.id": "Generic",
+        "alsa.long_card_name": "HD-Audio Generic at 0xfc5c0000 irq 66",
+        "alsa.mixer_name": "Realtek ALC294",
+        "alsa.name": "ALC294 Analog",
+        "alsa.resolution_bits": 16,
+        "alsa.subclass": "generic-mix",
+        "alsa.subdevice": 0,
+        "alsa.subdevice_name": "subdevice #0",
+        "alsa.sync.id": "00000000:00000000:00000000:00000000",
+        "api.alsa.card.longname": "HD-Audio Generic at 0xfc5c0000 irq 66",
+        "api.alsa.card.name": "HD-Audio Generic",
+        "api.alsa.path": "front:1",
+        "api.alsa.pcm.card": 1,
+        "api.alsa.pcm.stream": "playback",
+        "audio.channels": 2,
+        "audio.position": "[ FL, FR ]",
+        "card.profile.device": 3,
+        "client.id": 33,
+        "clock.quantum-limit": 8192,
+        "device.api": "alsa",
+        "device.bus": "pci",
+        "device.class": "sound",
+        "device.icon-name": "audio-card-analog",
+        "device.id": 48,
+        "device.profile.description": "Аналоговый стерео",
+        "device.profile.name": "analog-stereo",
+        "device.routes": 2,
+        "factory.id": 19,
+        "factory.name": "api.alsa.pcm.sink",
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Audio/Sink",
+        "node.description": "Ryzen HD Audio Controller Аналоговый стерео",
+        "node.driver": true,
+        "node.loop.name": "data-loop.0",
+        "node.name": "alsa_output.pci-0000_05_00.6.analog-stereo",
+        "node.nick": "ALC294 Analog",
+        "node.pause-on-idle": false,
+        "object.id": 57,
+        "object.path": "alsa:acp:Generic:3:playback",
+        "object.serial": 57,
+        "port.group": "playback",
+        "priority.driver": 1009,
+        "priority.session": 1009
+      }
+    }
+  },
+  {
+    "id": 58,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 0,
+      "max-output-ports": 129,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 0,
+      "n-output-ports": 2,
+      "state": "suspended",
+      "error": null,
+      "props": {
+        "alsa.card": 1,
+        "alsa.card_name": "HD-Audio Generic",
+        "alsa.class": "generic",
+        "alsa.components": "HDA:10ec0294,10431cb2,00100004",
+        "alsa.device": 0,
+        "alsa.driver_name": "snd_hda_intel",
+        "alsa.id": "Generic",
+        "alsa.long_card_name": "HD-Audio Generic at 0xfc5c0000 irq 66",
+        "alsa.mixer_name": "Realtek ALC294",
+        "alsa.name": "ALC294 Analog",
+        "alsa.resolution_bits": 16,
+        "alsa.subclass": "generic-mix",
+        "alsa.subdevice": 0,
+        "alsa.subdevice_name": "subdevice #0",
+        "alsa.sync.id": "00000000:00000000:00000000:00000000",
+        "api.alsa.card.longname": "HD-Audio Generic at 0xfc5c0000 irq 66",
+        "api.alsa.card.name": "HD-Audio Generic",
+        "api.alsa.path": "front:1",
+        "api.alsa.pcm.card": 1,
+        "api.alsa.pcm.stream": "capture",
+        "audio.channels": 2,
+        "audio.position": "[ FL, FR ]",
+        "card.profile.device": 0,
+        "client.id": 33,
+        "clock.quantum-limit": 8192,
+        "device.api": "alsa",
+        "device.bus": "pci",
+        "device.class": "sound",
+        "device.icon-name": "audio-card-analog",
+        "device.id": 48,
+        "device.profile.description": "Аналоговый стерео",
+        "device.profile.name": "analog-stereo",
+        "device.routes": 2,
+        "factory.id": 19,
+        "factory.name": "api.alsa.pcm.source",
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Audio/Source",
+        "node.description": "Ryzen HD Audio Controller Аналоговый стерео",
+        "node.driver": true,
+        "node.loop.name": "data-loop.0",
+        "node.name": "alsa_input.pci-0000_05_00.6.analog-stereo",
+        "node.nick": "ALC294 Analog",
+        "node.pause-on-idle": false,
+        "object.id": 58,
+        "object.path": "alsa:acp:Generic:0:capture",
+        "object.serial": 58,
+        "port.group": "capture",
+        "priority.driver": 2009,
+        "priority.session": 2009
+      }
+    }
+  },
+  {
+    "id": 75,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 129,
+      "max-output-ports": 0,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 2,
+      "n-output-ports": 2,
+      "state": "suspended",
+      "error": null,
+      "props": {
+        "adapt.follower.spa-node": "",
+        "application.name": "Noctalia Spectrum",
+        "channelmix.normalize": true,
+        "client.id": 44,
+        "clock.quantum-limit": 8192,
+        "factory.id": 9,
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.category": "Capture",
+        "media.class": "Stream/Input/Audio",
+        "media.name": "Noctalia Spectrum",
+        "media.type": "Audio",
+        "node.async": true,
+        "node.autoconnect": true,
+        "node.driver-id": 57,
+        "node.loop.class": "main",
+        "node.loop.name": "",
+        "node.name": "noctalia",
+        "node.passive": true,
+        "node.want-driver": true,
+        "object.id": 75,
+        "object.register": false,
+        "object.serial": 1949,
+        "port.group": "stream.0",
+        "port.ignore-latency": true,
+        "resample.peaks": true,
+        "stream.capture.sink": true,
+        "stream.is-live": true,
+        "stream.monitor": true,
+        "target.object": "alsa_output.pci-0000_05_00.6.analog-stereo"
+      }
+    }
+  }
+]

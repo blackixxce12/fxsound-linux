@@ -1,0 +1,29 @@
+language: Vietnamese
+countries: vn
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s tệp preset đã tồn tại trong thư mục xuất, bạn có muốn ghi đè không?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Ứng dụng Wayland không thể gán phím tắt toàn cục: chúng thuộc về trình quản lý cửa sổ (compositor). Hãy gán các lệnh này trong cấu hình compositor của bạn — mỗi lệnh sẽ đến phiên bản FxSound đang chạy qua socket điều khiển."
+"A preset named %s already exists" = "Đã có preset tên %s"
+"Audio disconnected:" = "Âm thanh đã ngắt kết nối:"
+"Choose folder…" = "Chọn thư mục…"
+"Could not change the startup setting" = "Không thể thay đổi cài đặt khởi động cùng hệ thống"
+"Could not create the export folder" = "Không thể tạo thư mục xuất"
+"Could not delete %s" = "Không thể xóa %s"
+"Could not export %s" = "Không thể xuất %s"
+"Could not load %s" = "Không thể tải %s"
+"Could not open the link" = "Không thể mở liên kết"
+"Could not rename %s" = "Không thể đổi tên %s"
+"Could not save %s" = "Không thể lưu %s"
+"Factory presets cannot be deleted" = "Không thể xóa preset mặc định"
+"Factory presets cannot be renamed" = "Không thể đổi tên preset mặc định"
+"Folder: (none chosen)" = "Thư mục: (chưa chọn)"
+"Input" = "Đầu vào"
+"Keyboard shortcuts" = "Phím tắt"
+"Output" = "Đầu ra"
+"Presets exported to %s" = "Đã xuất preset vào %s"
+"Renamed %s to %s" = "Đã đổi tên %s thành %s"
+"System language" = "Ngôn ngữ hệ thống"
+"Input: " = "Đầu vào: "
+"Could not open the folder picker" = "Không thể mở hộp chọn thư mục"

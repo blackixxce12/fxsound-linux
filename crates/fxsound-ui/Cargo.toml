@@ -1,0 +1,18 @@
+[package]
+name = "fxsound-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "egui front end for the FxSound Linux port"
+
+[dependencies]
+fxsound-core = { workspace = true }
+egui = { workspace = true }
+resvg = { workspace = true }
+usvg = { workspace = true }
+tiny-skia = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+eframe = { workspace = true }

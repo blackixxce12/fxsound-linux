@@ -1,0 +1,15 @@
+[Unit]
+Description=FxSound audio enhancer
+After=pipewire.service pipewire-pulse.service
+Wants=pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/fxsound --hide
+Restart=on-failure
+RestartSec=3
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target

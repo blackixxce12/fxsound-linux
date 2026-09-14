@@ -1,0 +1,29 @@
+language: French
+countries: fr
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s fichiers de presets existent déjà dans le dossier d'export, voulez-vous les écraser ?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Un client Wayland ne peut pas définir de raccourcis globaux : ils appartiennent au compositeur. Associez ces commandes dans la configuration de votre compositeur — chacune atteint l'instance en cours via le socket de contrôle de FxSound."
+"A preset named %s already exists" = "Un preset nommé %s existe déjà"
+"Audio disconnected:" = "Audio déconnecté :"
+"Choose folder…" = "Choisir un dossier…"
+"Could not change the startup setting" = "Impossible de modifier le réglage de lancement automatique"
+"Could not create the export folder" = "Impossible de créer le dossier d'export"
+"Could not delete %s" = "Impossible de supprimer %s"
+"Could not export %s" = "Impossible d'exporter %s"
+"Could not load %s" = "Impossible de charger %s"
+"Could not open the link" = "Impossible d'ouvrir le lien"
+"Could not rename %s" = "Impossible de renommer %s"
+"Could not save %s" = "Impossible d'enregistrer %s"
+"Factory presets cannot be deleted" = "Les presets d'usine ne peuvent pas être supprimés"
+"Factory presets cannot be renamed" = "Les presets d'usine ne peuvent pas être renommés"
+"Folder: (none chosen)" = "Dossier : (aucun choisi)"
+"Input" = "Entrée"
+"Keyboard shortcuts" = "Raccourcis clavier"
+"Output" = "Sortie"
+"Presets exported to %s" = "Presets exportés vers %s"
+"Renamed %s to %s" = "%s renommé en %s"
+"System language" = "Langue du système"
+"Input: " = "Entrée : "
+"Could not open the folder picker" = "Impossible d'ouvrir le sélecteur de dossier"

@@ -1,0 +1,29 @@
+language: Persian
+countries: ir
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s فایل پیش‌تنظیم از قبل در پوشهٔ صادرات وجود دارد، بازنویسی شوند؟"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "یک کلاینت Wayland نمی‌تواند میانبرهای سراسری تعیین کند: این کار بر عهدهٔ کامپوزیتور است. این فرمان‌ها را در پیکربندی کامپوزیتور خود ببندید — هر کدام از طریق سوکت کنترل FxSound به نمونهٔ در حال اجرا می‌رسد."
+"A preset named %s already exists" = "پیش‌تنظیمی با نام %s از قبل وجود دارد"
+"Audio disconnected:" = "صدا قطع شد:"
+"Choose folder…" = "انتخاب پوشه…"
+"Could not change the startup setting" = "تنظیم اجرای خودکار تغییر نکرد"
+"Could not create the export folder" = "پوشهٔ صادرات ساخته نشد"
+"Could not delete %s" = "%s حذف نشد"
+"Could not export %s" = "%s صادر نشد"
+"Could not load %s" = "%s بارگذاری نشد"
+"Could not open the link" = "پیوند باز نشد"
+"Could not rename %s" = "نام %s تغییر نکرد"
+"Could not save %s" = "%s ذخیره نشد"
+"Factory presets cannot be deleted" = "پیش‌تنظیم‌های کارخانه قابل حذف نیستند"
+"Factory presets cannot be renamed" = "پیش‌تنظیم‌های کارخانه قابل تغییر نام نیستند"
+"Folder: (none chosen)" = "پوشه: (انتخاب نشده)"
+"Input" = "ورودی"
+"Keyboard shortcuts" = "میانبرهای صفحه‌کلید"
+"Output" = "خروجی"
+"Presets exported to %s" = "پیش‌تنظیم‌ها به %s صادر شدند"
+"Renamed %s to %s" = "نام %s به %s تغییر کرد"
+"System language" = "زبان سیستم"
+"Input: " = "ورودی: "
+"Could not open the folder picker" = "انتخابگر پوشه باز نشد"

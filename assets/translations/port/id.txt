@@ -1,0 +1,29 @@
+language: Indonesian
+countries: id
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s berkas preset sudah ada di folder ekspor, timpa?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Klien Wayland tidak dapat mengatur pintasan global: itu milik kompositor. Ikat perintah-perintah ini di konfigurasi kompositor Anda — masing-masing mencapai instans yang berjalan melalui soket kontrol FxSound."
+"A preset named %s already exists" = "Preset bernama %s sudah ada"
+"Audio disconnected:" = "Audio terputus:"
+"Choose folder…" = "Pilih folder…"
+"Could not change the startup setting" = "Pengaturan mulai otomatis tidak dapat diubah"
+"Could not create the export folder" = "Folder ekspor tidak dapat dibuat"
+"Could not delete %s" = "%s tidak dapat dihapus"
+"Could not export %s" = "%s tidak dapat diekspor"
+"Could not load %s" = "%s tidak dapat dimuat"
+"Could not open the link" = "Tautan tidak dapat dibuka"
+"Could not rename %s" = "%s tidak dapat diganti namanya"
+"Could not save %s" = "%s tidak dapat disimpan"
+"Factory presets cannot be deleted" = "Preset bawaan tidak dapat dihapus"
+"Factory presets cannot be renamed" = "Preset bawaan tidak dapat diganti namanya"
+"Folder: (none chosen)" = "Folder: (belum dipilih)"
+"Input" = "Masukan"
+"Keyboard shortcuts" = "Pintasan papan ketik"
+"Output" = "Keluaran"
+"Presets exported to %s" = "Preset diekspor ke %s"
+"Renamed %s to %s" = "%s diganti namanya menjadi %s"
+"System language" = "Bahasa sistem"
+"Input: " = "Masukan: "
+"Could not open the folder picker" = "Pemilih folder tidak dapat dibuka"

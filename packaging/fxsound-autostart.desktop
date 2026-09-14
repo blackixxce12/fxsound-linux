@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FxSound
+Comment=Start FxSound minimised to the system tray on login
+Exec=fxsound --hide
+Icon=fxsound
+Terminal=false
+Categories=AudioVideo;Audio;
+X-GNOME-Autostart-enabled=true

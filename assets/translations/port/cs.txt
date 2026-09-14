@@ -1,0 +1,29 @@
+language: Česky
+countries: cz
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s souborů presetů již v exportní složce existuje, chcete je přepsat?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Klient Waylandu nemůže nastavovat globální klávesové zkratky: patří kompozitoru. Přiřaďte tyto příkazy v konfiguraci svého kompozitoru — každý se dostane k běžící instanci přes řídicí socket FxSound."
+"A preset named %s already exists" = "Preset s názvem %s již existuje"
+"Audio disconnected:" = "Zvuk odpojen:"
+"Choose folder…" = "Vybrat složku…"
+"Could not change the startup setting" = "Nastavení automatického spouštění se nepodařilo změnit"
+"Could not create the export folder" = "Exportní složku se nepodařilo vytvořit"
+"Could not delete %s" = "%s se nepodařilo smazat"
+"Could not export %s" = "%s se nepodařilo exportovat"
+"Could not load %s" = "%s se nepodařilo načíst"
+"Could not open the link" = "Odkaz se nepodařilo otevřít"
+"Could not rename %s" = "%s se nepodařilo přejmenovat"
+"Could not save %s" = "%s se nepodařilo uložit"
+"Factory presets cannot be deleted" = "Tovární presety nelze smazat"
+"Factory presets cannot be renamed" = "Tovární presety nelze přejmenovat"
+"Folder: (none chosen)" = "Složka: (žádná nevybrána)"
+"Input" = "Vstup"
+"Keyboard shortcuts" = "Klávesové zkratky"
+"Output" = "Výstup"
+"Presets exported to %s" = "Presety exportovány do %s"
+"Renamed %s to %s" = "%s přejmenován na %s"
+"System language" = "Jazyk systému"
+"Input: " = "Vstup: "
+"Could not open the folder picker" = "Výběr složky se nepodařilo otevřít"

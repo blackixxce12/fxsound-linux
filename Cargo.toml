@@ -1,0 +1,76 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/fxsound-core",
+    "crates/fxsound-dsp",
+    "crates/fxsound-preset",
+    "crates/fxsound-audio",
+    "crates/fxsound-ui",
+    "crates/fxsound-app",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/fxsound2/fxsound-app"
+authors = ["FxSound Linux port contributors"]
+
+[workspace.dependencies]
+fxsound-core = { path = "crates/fxsound-core" }
+fxsound-dsp = { path = "crates/fxsound-dsp" }
+fxsound-preset = { path = "crates/fxsound-preset" }
+fxsound-audio = { path = "crates/fxsound-audio" }
+fxsound-ui = { path = "crates/fxsound-ui" }
+
+egui = "=0.36.0"
+eframe = { version = "=0.36.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_extras = { version = "=0.36.0", default-features = false }
+
+pipewire = "0.10.1"
+libspa = "0.10.1"
+
+resvg = "0.48.1"
+usvg = "0.48.1"
+tiny-skia = "0.12.0"
+
+ksni = "0.3.6"
+notify-rust = "4.18.0"
+rfd = "0.17.2"
+# `ksni` is not runtime-agnostic: its `default = ["tokio"]` feature is a hard requirement
+# (`ksni-0.3.6/src/compat.rs:1-5` is a `compile_error!` when neither runtime is on), and its
+# `blocking` facade — the one this port uses, so that the tray handle can be driven straight from
+# the egui thread — builds a private current-thread runtime on top of it
+# (`ksni-0.3.6/src/compat.rs:24-35`). Pin the flavour here instead of inheriting whatever ksni's
+# own transitive `features = ["rt", "macros"]` happens to resolve to.
+tokio = { version = "1.53.1", default-features = false, features = ["rt"] }
+
+crossbeam-channel = "0.5.17"
+# A Wayland client gets no close request from `kill`, `systemctl --user stop` or a logout hook;
+# the flag this registers is what turns those into the same clean quit as the tray's Exit.
+signal-hook = "0.3.18"
+triple_buffer = "9.0.0"
+arc-swap = "1.9.2"
+rtrb = "0.3.5"
+realfft = "3.5.0"
+
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.6"
+dirs = "7.0.0"
+anyhow = "1.0.104"
+thiserror = "2.0.20"
+log = "0.4.34"
+env_logger = "0.11.11"
+clap = { version = "4.6.6", features = ["derive"] }
+tempfile = "3.27.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,29 @@
+language: Turkish
+countries: tr
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s ön ayar dosyası dışa aktarma klasöründe zaten var, üzerine yazılsın mı?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Bir Wayland istemcisi genel kısayollar atayamaz: bunlar birleştiriciye (compositor) aittir. Bu komutları birleştiricinizin yapılandırmasında bağlayın — her biri FxSound'un denetim soketi üzerinden çalışan örneğe ulaşır."
+"A preset named %s already exists" = "%s adında bir ön ayar zaten var"
+"Audio disconnected:" = "Ses bağlantısı kesildi:"
+"Choose folder…" = "Klasör seç…"
+"Could not change the startup setting" = "Başlangıçta çalıştırma ayarı değiştirilemedi"
+"Could not create the export folder" = "Dışa aktarma klasörü oluşturulamadı"
+"Could not delete %s" = "%s silinemedi"
+"Could not export %s" = "%s dışa aktarılamadı"
+"Could not load %s" = "%s yüklenemedi"
+"Could not open the link" = "Bağlantı açılamadı"
+"Could not rename %s" = "%s yeniden adlandırılamadı"
+"Could not save %s" = "%s kaydedilemedi"
+"Factory presets cannot be deleted" = "Fabrika ön ayarları silinemez"
+"Factory presets cannot be renamed" = "Fabrika ön ayarları yeniden adlandırılamaz"
+"Folder: (none chosen)" = "Klasör: (seçilmedi)"
+"Input" = "Giriş"
+"Keyboard shortcuts" = "Klavye kısayolları"
+"Output" = "Çıkış"
+"Presets exported to %s" = "Ön ayarlar %s konumuna dışa aktarıldı"
+"Renamed %s to %s" = "%s, %s olarak yeniden adlandırıldı"
+"System language" = "Sistem dili"
+"Input: " = "Giriş: "
+"Could not open the folder picker" = "Klasör seçici açılamadı"

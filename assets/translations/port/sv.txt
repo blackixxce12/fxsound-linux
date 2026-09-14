@@ -1,0 +1,29 @@
+language: Swedish
+countries: se
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s förinställningsfiler finns redan i exportmappen, vill du skriva över dem?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "En Wayland-klient kan inte binda globala kortkommandon: de tillhör kompositorn. Bind dessa kommandon i din kompositors konfiguration — vart och ett når den körande instansen via FxSounds styrsocket."
+"A preset named %s already exists" = "En förinställning med namnet %s finns redan"
+"Audio disconnected:" = "Ljud frånkopplat:"
+"Choose folder…" = "Välj mapp…"
+"Could not change the startup setting" = "Inställningen för automatisk start kunde inte ändras"
+"Could not create the export folder" = "Exportmappen kunde inte skapas"
+"Could not delete %s" = "%s kunde inte tas bort"
+"Could not export %s" = "%s kunde inte exporteras"
+"Could not load %s" = "%s kunde inte läsas in"
+"Could not open the link" = "Länken kunde inte öppnas"
+"Could not rename %s" = "%s kunde inte byta namn"
+"Could not save %s" = "%s kunde inte sparas"
+"Factory presets cannot be deleted" = "Fabriksförinställningar kan inte tas bort"
+"Factory presets cannot be renamed" = "Fabriksförinställningar kan inte byta namn"
+"Folder: (none chosen)" = "Mapp: (ingen vald)"
+"Input" = "Ingång"
+"Keyboard shortcuts" = "Kortkommandon"
+"Output" = "Utgång"
+"Presets exported to %s" = "Förinställningar exporterade till %s"
+"Renamed %s to %s" = "%s bytte namn till %s"
+"System language" = "Systemspråk"
+"Input: " = "Ingång: "
+"Could not open the folder picker" = "Mappväljaren kunde inte öppnas"

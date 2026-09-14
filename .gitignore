@@ -1,0 +1,10 @@
+# Cargo build output
+/target/
+# makepkg working directories and the built package
+/packaging/pkg/
+/packaging/src/
+/packaging/*.pkg.tar.zst
+/packaging/*.log
+# editor / OS noise
+*.swp
+.DS_Store

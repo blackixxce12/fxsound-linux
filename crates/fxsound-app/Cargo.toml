@@ -1,0 +1,45 @@
+[package]
+name = "fxsound-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Desktop integration for the FxSound Linux port: command line, single-instance IPC, StatusNotifierItem tray and desktop notifications"
+
+[lib]
+name = "fxsound_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fxsound"
+path = "src/main.rs"
+
+[dependencies]
+fxsound-core = { workspace = true }
+fxsound-ui = { workspace = true }
+fxsound-dsp = { workspace = true }
+fxsound-preset = { workspace = true }
+fxsound-audio = { workspace = true }
+eframe = { workspace = true }
+rfd = { workspace = true }
+anyhow = { workspace = true }
+env_logger = { workspace = true }
+clap = { workspace = true }
+crossbeam-channel = { workspace = true }
+signal-hook = { workspace = true }
+# `blocking` is additive on top of the workspace's default (`tokio`) feature and gives us
+# `ksni::blocking::Handle::update`, which is synchronous — the egui thread must never await
+# (`docs/api/linux-desktop-crates.md` §2.9).
+ksni = { workspace = true, features = ["blocking"] }
+notify-rust = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }
+log = { workspace = true }
+# Not called from our code: this is the runtime ksni's tray service and its blocking facade run
+# on. Declaring it makes the flavour explicit and greppable instead of inheriting ksni's own
+# `features = ["rt", "macros"]` (`docs/api/linux-desktop-crates.md` §1).
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

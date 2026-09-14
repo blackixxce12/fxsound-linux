@@ -1,0 +1,80 @@
+# Maintainer: FxSound Linux port contributors
+#
+# Builds the port from the working tree next to this file, so it is meant to be run as
+#
+#     cd packaging && makepkg -f
+#
+# rather than fetched from a remote. Install the result with `pacman -U`.
+
+pkgname=fxsound-linux
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="System-wide audio enhancement for Linux: EQ, ambience, surround, bass and dynamic boost (Rust/egui port of FxSound)"
+arch=('x86_64')
+url="https://github.com/fxsound2/fxsound-app"
+license=('AGPL-3.0-or-later')
+# Runtime: PipeWire for audio, the Wayland/GL stack for the window, D-Bus for the tray and
+# notifications, fontconfig because egui asks it for fallback faces.
+depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus')
+makedepends=('rust' 'cargo' 'pkgconf')
+optdepends=(
+  'wireplumber: session management, needed to switch the default sink'
+  'xdg-desktop-portal: native file dialogs for preset import and export'
+  'libnotify: desktop notifications'
+)
+provides=('fxsound')
+conflicts=('fxsound')
+options=('!lto')   # the workspace already sets `lto = "thin"` in its release profile
+source=()
+sha256sums=()
+
+_srcdir="$(cd "${startdir}/.." && pwd)"
+
+build() {
+  cd "${_srcdir}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="${_srcdir}/target"
+  cargo build --release --frozen --bin fxsound
+}
+
+check() {
+  cd "${_srcdir}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR="${_srcdir}/target"
+  # Nothing here touches the live PipeWire graph or the user's settings file.
+  cargo test --release --frozen --workspace
+}
+
+package() {
+  cd "${_srcdir}"
+
+  install -Dm755 "target/release/fxsound" "${pkgdir}/usr/bin/fxsound"
+
+  # Factory and bonus presets. `PresetStore::with_default_dirs` looks here first when the binary
+  # is installed rather than run out of the source tree.
+  # Only the presets themselves: the upstream folder also carries a zip of the same files and a
+  # stray text file, and neither belongs in a package.
+  for _dir in Factsoft BonusPresets; do
+    install -d "${pkgdir}/usr/share/fxsound/presets/${_dir}"
+    install -Dm644 "assets/presets/${_dir}"/*.fac \
+      -t "${pkgdir}/usr/share/fxsound/presets/${_dir}/"
+  done
+
+  install -Dm644 "packaging/fxsound.desktop" \
+    "${pkgdir}/usr/share/applications/com.fxsound.FxSound.desktop"
+  install -Dm644 "assets/images/fxsound_large.png" \
+    "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fxsound.png"
+  install -Dm644 "assets/images/fxsound.png" \
+    "${pkgdir}/usr/share/icons/hicolor/32x32/apps/fxsound.png"
+
+  # The compositor rules and the keybind examples: a Wayland client cannot grab global shortcuts,
+  # so the bindings live in the compositor and call back into the running instance.
+  install -Dm644 "packaging/hyprland.conf.example" \
+    "${pkgdir}/usr/share/doc/${pkgname}/hyprland.conf.example"
+  install -Dm644 "packaging/fxsound-autostart.desktop" \
+    "${pkgdir}/usr/share/doc/${pkgname}/fxsound-autostart.desktop"
+  install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "CHANGELOG.md" "${pkgdir}/usr/share/doc/${pkgname}/CHANGELOG.md"
+
+  install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

@@ -1,0 +1,29 @@
+language: Brazilian Portuguese 
+countries: br
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s arquivos de presets já existem na pasta de exportação, deseja sobrescrevê-los?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "Um cliente Wayland não pode definir atalhos globais: eles pertencem ao compositor. Associe estes comandos na configuração do seu compositor — cada um chega à instância em execução pelo socket de controle do FxSound."
+"A preset named %s already exists" = "Já existe um preset chamado %s"
+"Audio disconnected:" = "Áudio desconectado:"
+"Choose folder…" = "Escolher pasta…"
+"Could not change the startup setting" = "Não foi possível alterar a configuração de inicialização automática"
+"Could not create the export folder" = "Não foi possível criar a pasta de exportação"
+"Could not delete %s" = "Não foi possível excluir %s"
+"Could not export %s" = "Não foi possível exportar %s"
+"Could not load %s" = "Não foi possível carregar %s"
+"Could not open the link" = "Não foi possível abrir o link"
+"Could not rename %s" = "Não foi possível renomear %s"
+"Could not save %s" = "Não foi possível salvar %s"
+"Factory presets cannot be deleted" = "Presets de fábrica não podem ser excluídos"
+"Factory presets cannot be renamed" = "Presets de fábrica não podem ser renomeados"
+"Folder: (none chosen)" = "Pasta: (nenhuma escolhida)"
+"Input" = "Entrada"
+"Keyboard shortcuts" = "Atalhos de teclado"
+"Output" = "Saída"
+"Presets exported to %s" = "Presets exportados para %s"
+"Renamed %s to %s" = "%s renomeado para %s"
+"System language" = "Idioma do sistema"
+"Input: " = "Entrada: "
+"Could not open the folder picker" = "Não foi possível abrir o seletor de pastas"

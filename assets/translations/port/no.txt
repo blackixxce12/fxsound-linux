@@ -1,0 +1,29 @@
+language: Norsk
+countries: no
+
+
+
+"%s preset files already exist in the export path, do you want to overwrite them?" = "%s forhåndsinnstillingsfiler finnes allerede i eksportmappen, vil du overskrive dem?"
+"A Wayland client cannot bind global shortcuts: the compositor owns them. Bind these commands in your compositor's configuration — each one reaches the running instance over FxSound's control socket." = "En Wayland-klient kan ikke binde globale hurtigtaster: de tilhører kompositoren. Bind disse kommandoene i kompositorens konfigurasjon — hver av dem når den kjørende instansen via FxSounds styringssokkel."
+"A preset named %s already exists" = "En forhåndsinnstilling med navnet %s finnes allerede"
+"Audio disconnected:" = "Lyd frakoblet:"
+"Choose folder…" = "Velg mappe…"
+"Could not change the startup setting" = "Innstillingen for automatisk start kunne ikke endres"
+"Could not create the export folder" = "Eksportmappen kunne ikke opprettes"
+"Could not delete %s" = "%s kunne ikke slettes"
+"Could not export %s" = "%s kunne ikke eksporteres"
+"Could not load %s" = "%s kunne ikke lastes"
+"Could not open the link" = "Lenken kunne ikke åpnes"
+"Could not rename %s" = "%s kunne ikke få nytt navn"
+"Could not save %s" = "%s kunne ikke lagres"
+"Factory presets cannot be deleted" = "Fabrikkinnstillinger kan ikke slettes"
+"Factory presets cannot be renamed" = "Fabrikkinnstillinger kan ikke få nytt navn"
+"Folder: (none chosen)" = "Mappe: (ingen valgt)"
+"Input" = "Inngang"
+"Keyboard shortcuts" = "Hurtigtaster"
+"Output" = "Utgang"
+"Presets exported to %s" = "Forhåndsinnstillinger eksportert til %s"
+"Renamed %s to %s" = "%s fikk nytt navn %s"
+"System language" = "Systemspråk"
+"Input: " = "Inngang: "
+"Could not open the folder picker" = "Mappevelgeren kunne ikke åpnes"
