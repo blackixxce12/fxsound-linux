@@ -14,7 +14,7 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.98.1"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/fxsound2/fxsound-app"
+repository = "https://github.com/blackixxce12/fxsound-linux"
 authors = ["FxSound Linux port contributors"]
 
 [workspace.dependencies]

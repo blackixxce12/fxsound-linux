@@ -11,7 +11,7 @@ pkgver=0.2.0
 pkgrel=1
 pkgdesc="System-wide audio enhancement for Linux: EQ, ambience, surround, bass and dynamic boost (Rust/egui port of FxSound)"
 arch=('x86_64')
-url="https://github.com/fxsound2/fxsound-app"
+url="https://github.com/blackixxce12/fxsound-linux"
 license=('AGPL-3.0-or-later')
 # Runtime: PipeWire for audio, the Wayland/GL stack for the window, D-Bus for the tray and
 # notifications, fontconfig because egui asks it for fallback faces.
