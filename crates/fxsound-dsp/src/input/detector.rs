@@ -12,17 +12,11 @@
 use crate::biquad::Real;
 
 /// Which quantity the threshold is compared against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Detection {
-    /// The rectified sample. Catches every transient, so a plosive or a keyboard strike reaches
-    /// the threshold even when the programme is quiet. What a limiter wants.
-    Peak,
-    /// A short running mean of the square. Tracks how loud the voice *sounds* rather than how tall
-    /// its tallest sample is, which is what makes a compressor even out delivery instead of
-    /// chasing consonants.
-    #[default]
-    Rms,
-}
+///
+/// Defined in [`fxsound_core`] rather than here, and re-exported, because it is part of what a
+/// preset *says* and therefore has to be spellable by everything that reads or writes one — the
+/// settings file, the parameter snapshot and the UI — not only by the stage that acts on it.
+pub use fxsound_core::Detection;
 
 /// A one-pole envelope follower with separate attack and release times.
 #[derive(Clone, Copy, Debug)]

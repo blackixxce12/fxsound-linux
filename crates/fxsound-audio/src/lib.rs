@@ -122,7 +122,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use fxsound_core::DeviceDirection;
-use fxsound_core::messages::{AudioToUi, DspEvent, DspParams, Meters, UiToAudio};
+use fxsound_core::messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio};
 use triple_buffer::{Input, Output, TripleBuffer};
 
 pub use devices::{
@@ -340,6 +340,8 @@ impl AudioEngine {
         engine::preflight(std::env::var_os("XDG_RUNTIME_DIR").as_deref())?;
 
         let (params_in, params_out) = TripleBuffer::new(&DspParams::default()).split();
+        let (input_params_in, input_params_out) =
+            TripleBuffer::new(&InputDspParams::default()).split();
         let (meters_in, meters_out) = TripleBuffer::new(&Meters::default()).split();
         let (events_tx, events_rx) = crossbeam_channel::bounded(EVENT_QUEUE_LEN);
         let (ui_tx, ui_rx) = crossbeam_channel::unbounded();
@@ -352,6 +354,7 @@ impl AudioEngine {
             control: control_rx,
             notify: ui_tx,
             params: params_out,
+            input_params: input_params_out,
             meters: meters_in,
             events: events_rx,
             ready: ready_tx,
@@ -368,6 +371,7 @@ impl AudioEngine {
         let handle = EngineHandle {
             engine,
             params: params_in,
+            input_params: input_params_in,
             meters: meters_out,
             events: events_tx,
             notifications: ui_rx,
@@ -426,6 +430,7 @@ impl Drop for AudioEngine {
 pub struct EngineHandle {
     engine: AudioEngine,
     params: Input<DspParams>,
+    input_params: Input<InputDspParams>,
     meters: Output<Meters>,
     events: Sender<DspEvent>,
     notifications: Receiver<AudioToUi>,
@@ -454,6 +459,22 @@ impl EngineHandle {
         // `Copy` struct on the GUI thread, never on the audio thread.
         params.sanitise();
         self.params.write(params);
+    }
+
+    /// Publish a new snapshot for the microphone chain.
+    ///
+    /// The sibling of [`Self::set_params`], with the same wait-free guarantee and the same single
+    /// gate: [`InputDspParams::sanitise`] runs here so that no producer of a voice preset can
+    /// forget it. Separate from the output snapshot because the two chains share nothing but the
+    /// equalizer — publishing both through one struct would mean every music preset carried a gate
+    /// threshold, and the audio thread would have to know which half of its parameters to ignore.
+    ///
+    /// Publishing while the engine is in the other direction is harmless and deliberate: the
+    /// snapshot is state, so whichever one the audio thread is reading is always current, and a
+    /// direction switch needs no handshake.
+    pub fn set_input_params(&mut self, mut params: InputDspParams) {
+        params.sanitise();
+        self.input_params.write(params);
     }
 
     /// Fire a one-shot event: filter reset, spectrum reset, processed-time reset.
@@ -529,14 +550,17 @@ mod tests {
     fn the_parameter_snapshot_path_is_wait_free_and_lock_free_by_construction() {
         fn param_channel_is_a_triple_buffer(handle: &mut EngineHandle) {
             let _: &mut Input<DspParams> = &mut handle.params;
+            let _: &mut Input<InputDspParams> = &mut handle.input_params;
             let _: &mut Output<Meters> = &mut handle.meters;
         }
         let _ = param_channel_is_a_triple_buffer;
 
         // A payload that owns heap memory would make the audio thread's `write`/`read` drop an
-        // allocation. `Copy` rules that out for good.
+        // allocation. `Copy` rules that out for good. The microphone chain's snapshot is held to
+        // the same standard as the music chain's — it reaches the same thread by the same path.
         const fn assert_copy<T: Copy>() {}
         assert_copy::<DspParams>();
+        assert_copy::<InputDspParams>();
         assert_copy::<Meters>();
 
         // And the mechanism itself: the newest snapshot always arrives, and reading never blocks

@@ -293,6 +293,11 @@ impl Engine {
             processed_samples: self.processed_samples,
             sample_rate: self.sample_rate as u32,
             active: self.active,
+            // The output chain has no gate, compressor or de-esser; the fields belong to the
+            // microphone chain and stay at zero here rather than being left undefined.
+            gate_reduction_db: 0.0,
+            compressor_reduction_db: 0.0,
+            deesser_reduction_db: 0.0,
         }
     }
 

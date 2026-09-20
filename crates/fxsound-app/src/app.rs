@@ -16,7 +16,7 @@
 use fxsound_audio::EngineHandle;
 use fxsound_core::{
     AudioDevice, DeviceDirection, Effect, EqBand, Preset, Settings, ThemeMode, ViewMode,
-    messages::{AudioToUi, DspEvent, DspParams, UiToAudio},
+    messages::{AudioToUi, DspEvent, DspParams, InputDspParams, UiToAudio},
     scale,
 };
 use fxsound_preset::PresetStore;
@@ -57,6 +57,7 @@ pub struct App {
     pub state: UiState,
     /// The snapshot published to the audio thread.
     params: DspParams,
+    input_params: InputDspParams,
     /// Persisted settings, saved when they change rather than on a timer.
     settings: Settings,
     /// Factory and user presets.
@@ -112,6 +113,7 @@ impl App {
                 ..UiState::default()
             },
             params: DspParams::default(),
+            input_params: InputDspParams::default(),
             settings,
             presets,
             loaded_preset: None,
@@ -623,9 +625,54 @@ impl App {
         self.params.balance = self.state.balance_db;
         self.params.volume_leveling_db = self.state.volume_leveling;
 
+        self.sync_input_params_from_state();
+
         if let Some(engine) = self.engine.as_mut() {
             engine.set_params(self.params);
+            engine.set_input_params(self.input_params);
         }
+    }
+
+    /// The same controls, mapped onto the microphone chain.
+    ///
+    /// Both snapshots are published every time, whichever direction the engine is in: they are
+    /// state, so the audio thread always reads a current one and a direction switch needs no
+    /// handshake.
+    ///
+    /// **This mapping is interim, and deliberately conservative.** Three of the controls mean the
+    /// same thing on a voice as on music and are carried straight across: the power switch, the
+    /// ten-band equalizer — the one thing the two chains genuinely share — and the output gain,
+    /// which becomes the chain's makeup. The rest of the voice chain is left where a preset will
+    /// put it, because *nobody has voiced it yet*: the gate, the compressor and the de-esser stay
+    /// switched off until an input preset turns them on, so upgrading to 0.3.0 cannot silently
+    /// start gating someone's quiet talker.
+    ///
+    /// The one stage that is on is the 80 Hz high-pass, because it is the only one that is right
+    /// for every microphone regardless of voicing — it removes desk rumble and the bottom of a
+    /// plosive, both of which sit ten to twenty decibels above the voice down there.
+    ///
+    /// What this mapping does *not* carry: the five effect sliders, the balance and the volume
+    /// leveller, none of which has a counterpart in a voice chain. They are inert while a
+    /// microphone is selected, and the interface does not yet say so — that is the next item.
+    fn sync_input_params_from_state(&mut self) {
+        self.input_params.power = self.state.power;
+
+        self.input_params.eq_on = self.state.eq_on;
+        self.input_params.set_bands(&self.state.eq_bands);
+        self.input_params.filter_q = self.state.filter_q;
+        self.input_params.makeup_db = self.state.master_gain_db;
+
+        self.input_params.highpass_hz = 80.0;
+        self.input_params.highpass_order = 2;
+        self.input_params.gate_on = false;
+        self.input_params.compressor_on = false;
+        self.input_params.deesser_on = false;
+    }
+
+    /// The microphone snapshot currently published, for tests and for `--status`.
+    #[must_use]
+    pub const fn input_params(&self) -> &InputDspParams {
+        &self.input_params
     }
 
     /// The snapshot currently published, for tests and for the CLI's `--status`.
@@ -645,6 +692,7 @@ impl App {
         Self {
             state: UiState::default(),
             params: DspParams::default(),
+            input_params: InputDspParams::default(),
             settings: Settings::default(),
             presets: PresetStore::with_dirs(
                 Vec::new(),
@@ -1568,6 +1616,41 @@ mod tests {
         assert_eq!(app.state.theme, ThemeMode::Light);
         assert_eq!(app.settings.theme_mode, ThemeMode::Light);
         assert!(app.palette().mode() == ThemeMode::Light);
+    }
+
+    #[test]
+    fn the_controls_a_voice_shares_with_music_reach_the_microphone_chain() {
+        let mut app = App::headless_for_tests();
+        app.state.power = true;
+        app.state.eq_on = true;
+        app.state.master_gain_db = -4.0;
+        app.state.eq_bands[2].boost_db = 3.5;
+        app.sync_params_from_state();
+
+        let input = app.input_params();
+        assert!(input.power);
+        assert!(input.eq_on);
+        assert_eq!(
+            input.makeup_db, -4.0,
+            "the gain slider is the chain's makeup"
+        );
+        let (_, boosts) = input.bands();
+        assert_eq!(boosts[2], 3.5, "the equalizer is what the two chains share");
+    }
+
+    #[test]
+    fn the_voice_chains_dynamics_stay_off_until_a_preset_turns_them_on() {
+        // Upgrading must not silently start gating someone's quiet talker, or compressing a voice
+        // to numbers nobody has listened to. The high-pass is the exception and the comment on
+        // `sync_input_params_from_state` says why.
+        let mut app = App::headless_for_tests();
+        app.sync_params_from_state();
+        let input = app.input_params();
+        assert!(!input.gate_on);
+        assert!(!input.compressor_on);
+        assert!(!input.deesser_on);
+        assert_eq!(input.highpass_order, 2);
+        assert_eq!(input.highpass_hz, 80.0);
     }
 
     #[test]

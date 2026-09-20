@@ -261,6 +261,44 @@ pub mod limits {
     /// Peak-normalisation target.
     pub const NORMALIZATION_DB: std::ops::RangeInclusive<f32> = -20.0..=0.0;
 
+    // ---- the input chain ----
+    //
+    // Each of these is clamped again inside the stage that uses it, which is not redundancy: a
+    // stage is entitled to refuse a number that would break its own design whoever sent it, and
+    // these ranges exist so that a snapshot on its way to the audio thread is already sane. The
+    // ranges are wider than any shipped preset, because a preset is a starting point and the user
+    // is allowed past it.
+
+    /// The high-pass corner. Below 20 Hz there is nothing to remove; above 300 Hz it is no longer
+    /// a rumble filter but a tone control.
+    pub const HIGHPASS_HZ: std::ops::RangeInclusive<f32> = 20.0..=300.0;
+    /// Gate threshold, in dBFS of whatever [`crate::Detection`] selected.
+    pub const GATE_THRESHOLD_DB: std::ops::RangeInclusive<f32> = -90.0..=0.0;
+    /// Gate ratio. `1.0` is a straight wire; past 20 it is a switch, which this stage is not.
+    pub const GATE_RATIO: std::ops::RangeInclusive<f32> = 1.0..=20.0;
+    /// The cap on the gate's attenuation. Zero switches the stage off without a second flag.
+    pub const GATE_RANGE_DB: std::ops::RangeInclusive<f32> = -90.0..=0.0;
+    /// Compressor threshold, in dBFS.
+    pub const COMPRESSOR_THRESHOLD_DB: std::ops::RangeInclusive<f32> = -60.0..=0.0;
+    /// Compressor ratio. Past 60 the look-ahead limiter is the better tool.
+    pub const COMPRESSOR_RATIO: std::ops::RangeInclusive<f32> = 1.0..=60.0;
+    /// Width of the compressor's knee, centred on the threshold.
+    pub const COMPRESSOR_KNEE_DB: std::ops::RangeInclusive<f32> = 0.0..=24.0;
+    /// Where the de-esser splits the band. Whether it *can* be built there depends on the capture
+    /// rate — see `fxsound_dsp::input::MAX_CORNER_FRACTION`.
+    pub const DEESSER_HZ: std::ops::RangeInclusive<f32> = 1_000.0..=12_000.0;
+    /// De-esser threshold, measured in the split band rather than in the whole signal.
+    pub const DEESSER_THRESHOLD_DB: std::ops::RangeInclusive<f32> = -60.0..=0.0;
+    /// Gain after every stage that measures and before the limiter.
+    pub const MAKEUP_DB: std::ops::RangeInclusive<f32> = -24.0..=24.0;
+    /// The level the chain's output may never exceed. Never above 0: a ceiling that permits full
+    /// scale is not a ceiling.
+    pub const CEILING_DB: std::ops::RangeInclusive<f32> = -24.0..=0.0;
+    /// Any attack time in the chain.
+    pub const ATTACK_MS: std::ops::RangeInclusive<f32> = 0.0..=200.0;
+    /// Any release or hold time in the chain.
+    pub const RELEASE_MS: std::ops::RangeInclusive<f32> = 0.0..=2_000.0;
+
     /// Clamp into `range`, and substitute `fallback` for a value that is not a number at all.
     ///
     /// `f32::clamp` propagates NaN, so it cannot be used on its own here: the point of this
@@ -375,6 +413,29 @@ impl Default for Preset {
             eq_on: true,
         }
     }
+}
+
+/// Which quantity a dynamics stage compares its threshold against.
+///
+/// This lives in the shared vocabulary rather than inside the DSP because it is part of what a
+/// preset *says*, not how a stage is built. **Peak and RMS detection of the same signal against
+/// the same threshold differ by three to seven decibels of gain reduction**, so a voice preset
+/// that records "threshold −18 dB, ratio 3:1" without recording this has recorded two different
+/// sounds. Every threshold in the shipped input set is an RMS threshold; say so wherever they are
+/// written down.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Detection {
+    /// The rectified sample. Catches every transient, so a plosive or a keyboard strike reaches
+    /// the threshold even when the programme is quiet. What a limiter wants.
+    Peak,
+    /// A short running mean of the square. Tracks how loud the voice *sounds* rather than how tall
+    /// its tallest sample is, which is what makes a compressor even out delivery instead of
+    /// chasing consonants.
+    #[default]
+    Rms,
 }
 
 /// Which way audio flows through a device FxSound can attach to.

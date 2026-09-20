@@ -45,9 +45,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
-use fxsound_core::messages::{AudioToUi, DspEvent, DspParams, Meters, UiToAudio};
+use fxsound_core::messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio};
 use fxsound_core::{AudioDevice, AudioStatus, DeviceDirection};
 use fxsound_dsp::Engine as DspEngine;
+use fxsound_dsp::InputEngine;
 use libspa::param::audio::{AudioFormat, AudioInfoRaw};
 use libspa::param::format::{MediaSubtype, MediaType};
 use libspa::param::format_utils;
@@ -347,26 +348,140 @@ pub(crate) struct StreamStatus {
 /// into the next stream's user data. Keeping the [`DspEngine`] with them is a bonus: its filter
 /// state and its 64 KiB of scratch survive a server restart too.
 pub(crate) struct SinkDsp {
+    /// The music chain and the voice chain. Both are kept alive across a direction switch, which
+    /// is what the recycling exists for in the first place: rebuilding either would mean designing
+    /// every filter again on the main loop, and would throw away the state of the chain the user
+    /// is about to switch *back* to.
     engine: DspEngine,
+    input: InputEngine,
     params: Output<DspParams>,
+    input_params: Output<InputDspParams>,
     meters: Input<Meters>,
     events: Receiver<DspEvent>,
     /// Interleaved de-serialisation buffer, sized for the worst case and never resized.
     scratch: Vec<f32>,
+    /// Which of the two engines the callback runs. Set when the nodes are built, never on the
+    /// audio thread.
+    direction: DeviceDirection,
 }
 
 impl SinkDsp {
-    fn new(params: Output<DspParams>, meters: Input<Meters>, events: Receiver<DspEvent>) -> Self {
+    fn new(
+        params: Output<DspParams>,
+        input_params: Output<InputDspParams>,
+        meters: Input<Meters>,
+        events: Receiver<DspEvent>,
+    ) -> Self {
         Self {
             engine: DspEngine::new(
                 DEFAULT_SAMPLE_RATE as f32,
                 MAX_QUANTUM_FRAMES,
                 MIN_CHANNELS as usize,
             ),
+            input: InputEngine::new(
+                DEFAULT_SAMPLE_RATE as f32,
+                MAX_QUANTUM_FRAMES,
+                MIN_CHANNELS as usize,
+            ),
             params,
+            input_params,
             meters,
             events,
             scratch: vec![0.0; MAX_QUANTUM_FRAMES * MAX_CHANNELS as usize],
+            direction: DeviceDirection::Output,
+        }
+    }
+
+    /// Choose the chain. Called on the main loop while the nodes are being built, so the audio
+    /// callback only ever reads it.
+    fn set_direction(&mut self, direction: DeviceDirection) {
+        self.direction = direction;
+    }
+
+    fn set_format(&mut self, sample_rate: f32, channels: usize) {
+        match self.direction {
+            DeviceDirection::Output => self.engine.set_format(sample_rate, channels),
+            DeviceDirection::Input => self.input.set_format(sample_rate, channels),
+        }
+    }
+
+    /// Where the subwoofer and the front pair sit in the negotiated layout.
+    ///
+    /// Output only, and not because the input side was forgotten: the voice chain has no stage
+    /// that mixes one channel into another, so there is no layout for it to get wrong.
+    fn set_layout(&mut self, lfe: Option<usize>, front_pair: Option<(usize, usize)>) {
+        self.engine.set_lfe_channel(lfe);
+        self.engine.set_front_pair(front_pair);
+    }
+
+    fn latency_frames(&self) -> usize {
+        match self.direction {
+            DeviceDirection::Output => self.engine.latency_frames(),
+            DeviceDirection::Input => self.input.latency_frames(),
+        }
+    }
+
+    /// Clear the active chain's history. The other one keeps its own, which is the point of
+    /// holding both.
+    fn reset(&mut self) {
+        match self.direction {
+            DeviceDirection::Output => self.engine.reset(),
+            DeviceDirection::Input => self.input.reset(),
+        }
+    }
+
+    /// Take the newest parameter snapshot and drain the event queue.
+    ///
+    /// Only the active direction's snapshot is read: the other one is state the GUI is still
+    /// publishing, and reading it would be a wasted atomic on the audio thread.
+    #[inline]
+    fn refresh(&mut self) {
+        match self.direction {
+            DeviceDirection::Output => {
+                self.engine.apply(self.params.read());
+                while let Ok(event) = self.events.try_recv() {
+                    self.engine.handle_event(event);
+                }
+            }
+            DeviceDirection::Input => {
+                self.input.apply(self.input_params.read());
+                while let Ok(event) = self.events.try_recv() {
+                    self.input.handle_event(event);
+                }
+            }
+        }
+    }
+
+    /// De-serialise one block of little-endian `f32` into the scratch buffer, run the active
+    /// chain over it and hand it back for the ring. `None` when the block is larger than the
+    /// scratch, which is the caller's signal to stop.
+    ///
+    /// The conversion lives here rather than in the callback because it writes into
+    /// `self.scratch`: with the engines behind a method, a caller holding that slice and calling
+    /// a `&mut self` method would be borrowing the whole struct twice. Inside one method the
+    /// compiler sees the fields for what they are — disjoint.
+    #[inline]
+    fn process_bytes(&mut self, block: &[u8], channels: usize) -> Option<&[f32]> {
+        let samples = block.len() / std::mem::size_of::<f32>() / channels * channels;
+        let scratch = self.scratch.get_mut(..samples)?;
+        // `as_chunks` hands over fixed-size arrays, so the four-byte guarantee is in the type
+        // rather than in a `try_from` the audio path has to check every sample.
+        let (words, _) = block.as_chunks::<{ std::mem::size_of::<f32>() }>();
+        for (slot, raw) in scratch.iter_mut().zip(words) {
+            *slot = f32::from_le_bytes(*raw);
+        }
+        match self.direction {
+            DeviceDirection::Output => self.engine.process(scratch, channels),
+            DeviceDirection::Input => self.input.process(scratch, channels),
+        }
+        Some(scratch)
+    }
+
+    #[inline]
+    fn meters(&self) -> Meters {
+        match self.direction {
+            DeviceDirection::Output => self.engine.meters(),
+            DeviceDirection::Input => self.input.meters(),
         }
     }
 }
@@ -374,6 +489,7 @@ impl SinkDsp {
 impl std::fmt::Debug for SinkDsp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SinkDsp")
+            .field("direction", &self.direction)
             .field("scratch", &self.scratch.len())
             .finish_non_exhaustive()
     }
@@ -423,6 +539,7 @@ pub(crate) struct Config {
     pub(crate) control: pw::channel::Receiver<UiToAudio>,
     pub(crate) notify: Sender<AudioToUi>,
     pub(crate) params: Output<DspParams>,
+    pub(crate) input_params: Output<InputDspParams>,
     pub(crate) meters: Input<Meters>,
     pub(crate) events: Receiver<DspEvent>,
     pub(crate) ready: Sender<Result<(), AudioError>>,
@@ -672,6 +789,7 @@ pub(crate) fn run(config: Config) {
         control,
         notify,
         params,
+        input_params,
         meters,
         events,
         ready,
@@ -702,7 +820,7 @@ pub(crate) fn run(config: Config) {
         notify,
         remote,
         language,
-        Some(SinkDsp::new(params, meters, events)),
+        Some(SinkDsp::new(params, input_params, meters, events)),
     )));
 
     let control_source = control.attach(mainloop.loop_(), {
@@ -1587,17 +1705,18 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
         log::error!("the DSP state has not come back from the previous pair of nodes");
         return Err(AudioError::PipewireDisconnected);
     };
-    dsp.engine.set_format(rate as f32, channels as usize);
-    dsp.engine.set_lfe_channel(positions.lfe_index());
-    dsp.engine.set_front_pair(positions.front_pair());
+    // Before anything else: which chain this pair of nodes runs. Everything below reads it.
+    dsp.set_direction(direction);
+    dsp.set_format(rate as f32, channels as usize);
+    dsp.set_layout(positions.lfe_index(), positions.front_pair());
     // Read before the engine is handed to the node's user data, where it can no longer be reached
     // from the main loop.
-    let dsp_latency_frames = dsp.engine.latency_frames();
+    let dsp_latency_frames = dsp.latency_frames();
     // `set_format` returns early when neither the rate nor the channel count moved, so switching
     // between two devices that are both 48 kHz stereo — the common case — would otherwise carry
     // the previous device's filter history, reverb tail and leveller gain straight into the new
     // one. The engine is recycled deliberately, but its *state* should not be.
-    dsp.engine.reset();
+    dsp.reset();
 
     shared.ring.reconfigure(channels as usize, quantum as usize);
     shared.counters.sample_rate.store(rate, Ordering::Relaxed);
@@ -1899,7 +2018,7 @@ fn on_sink_format(_stream: &pw::stream::Stream, data: &mut SinkData, id: u32, pa
         .store(channels as u32, Ordering::Relaxed);
     data.ring.reconfigure(channels, data.quantum);
     if let Some(dsp) = data.dsp.as_mut() {
-        dsp.engine.set_format(rate as f32, channels);
+        dsp.set_format(rate as f32, channels);
     }
     log::info!("NODE 1 negotiated {channels} ch @ {rate} Hz");
 }
@@ -1979,10 +2098,7 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
 
     // Parameters are state: take the newest snapshot, discard anything in between. Events are
     // not: drain them all.
-    dsp.engine.apply(dsp.params.read());
-    while let Ok(event) = dsp.events.try_recv() {
-        dsp.engine.handle_event(event);
-    }
+    dsp.refresh();
 
     let Some(bytes) = chunk_data.data() else {
         return;
@@ -1994,22 +2110,15 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
     let block_bytes = dsp.scratch.len() * std::mem::size_of::<f32>();
     let mut frames = 0_u64;
     for block in valid.chunks(block_bytes) {
-        let samples = block.len() / std::mem::size_of::<f32>() / channels * channels;
-        let Some(scratch) = dsp.scratch.get_mut(..samples) else {
+        let Some(processed) = dsp.process_bytes(block, channels) else {
             break;
         };
-        // `as_chunks` hands over fixed-size arrays, so the four-byte guarantee is in the type
-        // rather than in a `try_from` the audio path has to check every sample.
-        let (words, _) = block.as_chunks::<{ std::mem::size_of::<f32>() }>();
-        for (slot, raw) in scratch.iter_mut().zip(words) {
-            *slot = f32::from_le_bytes(*raw);
-        }
-        dsp.engine.process(scratch, channels);
-        data.ring.push(scratch);
-        frames += (samples / channels) as u64;
+        frames += (processed.len() / channels) as u64;
+        data.ring.push(processed);
     }
 
-    dsp.meters.write(dsp.engine.meters());
+    let meters = dsp.meters();
+    dsp.meters.write(meters);
     data.counters.sink_cycles.fetch_add(1, Ordering::Relaxed);
     data.counters
         .frames_processed

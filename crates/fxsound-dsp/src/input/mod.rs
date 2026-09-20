@@ -16,6 +16,7 @@ pub mod chain;
 pub mod compressor;
 pub mod deesser;
 pub mod detector;
+pub mod engine;
 pub mod gate;
 pub mod limiter;
 
@@ -68,5 +69,6 @@ pub use chain::InputChain;
 pub use compressor::Compressor;
 pub use deesser::DeEsser;
 pub use detector::{Detection, Follower};
+pub use engine::InputEngine;
 pub use gate::Gate;
 pub use limiter::LookaheadLimiter;

@@ -156,12 +156,20 @@ impl InputChain {
     /// The high-pass corner and its order — `0` for off, `2` or `4`. Anything else rounds down to
     /// one of those, because there are only two sections to build it from.
     pub fn set_highpass(&mut self, hz: Real, order: usize) {
-        self.highpass_hz = if hz.is_finite() && hz > 0.0 { hz } else { 80.0 };
-        self.highpass_order = match order {
+        let hz = if hz.is_finite() && hz > 0.0 { hz } else { 80.0 };
+        let order = match order {
             0 => 0,
             1..=3 => 2,
             _ => 4,
         };
+        // Redesigning clears the filter's history, which is a click. A parameter snapshot arrives
+        // whenever *any* control moves, so a corner that did not change must not be rebuilt
+        // because the gate threshold did.
+        if hz == self.highpass_hz && order == self.highpass_order {
+            return;
+        }
+        self.highpass_hz = hz;
+        self.highpass_order = order;
         self.design_highpass();
         for section in &mut self.highpass {
             section.reset();
