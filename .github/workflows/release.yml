@@ -58,6 +58,11 @@ jobs:
             install -d "$root/share/fxsound/presets/$dir"
             install -Dm644 assets/presets/$dir/*.fac -t "$root/share/fxsound/presets/$dir/"
           done
+          # The voice presets, which are TOML because they describe the microphone chain and a
+          # .fac has nowhere to put a gate threshold. Without these a tarball install has a
+          # microphone chain and no way to voice it.
+          install -d "$root/share/fxsound/presets/Input"
+          install -Dm644 assets/presets/Input/*.toml -t "$root/share/fxsound/presets/Input/"
           install -Dm644 packaging/fxsound.desktop \
             "$root/share/applications/com.fxsound.FxSound.desktop"
           install -Dm644 packaging/fxsound.service \
@@ -83,5 +88,44 @@ jobs:
           files: |
             fxsound-linux-*-x86_64.tar.gz
             fxsound-linux-*-x86_64.tar.gz.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+
+  deb:
+    name: Debian package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libpipewire-0.3-dev libclang-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release --bin fxsound
+
+      # `packaging/build-deb.sh` assembles the archive with `ar` and `tar` rather than `dpkg-deb`,
+      # so it produces the same package here as it does on the maintainer's Arch machine. The
+      # debhelper sources under `packaging/debian/` are for a Debian maintainer building from the
+      # source package; this is the binary anyone can install today.
+      - name: Build the .deb
+        run: |
+          packaging/build-deb.sh
+          ls -la dist/
+          ar t dist/*.deb
+          sha256sum dist/*.deb > "dist/$(basename dist/*.deb).sha256"
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            dist/*.deb
+            dist/*.deb.sha256
           fail_on_unmatched_files: true
           generate_release_notes: false

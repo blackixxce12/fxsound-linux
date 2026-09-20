@@ -14,7 +14,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 version="${1:-$(sed -n 's/^version = "\(.*\)"/\1/p' "${root}/Cargo.toml" | head -1)}"
 arch="$(uname -m)"
 stage="$(mktemp -d)"
-name="fxsound-${version}-${arch}"
+name="fxsound-linux-${version}-${arch}"
 trap 'rm -rf "${stage}"' EXIT
 
 cd "${root}"

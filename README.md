@@ -107,8 +107,8 @@ For anything else, or for anyone who would rather no package manager were involv
 
 ```bash
 packaging/build-tarball.sh
-tar xf dist/fxsound-0.3.0-x86_64.tar.gz
-sudo ./fxsound-0.3.0-x86_64/install.sh        # /usr/local unless you name another prefix
+tar xf dist/fxsound-linux-0.3.0-x86_64.tar.gz
+sudo ./fxsound-linux-0.3.0-x86_64/install.sh        # /usr/local unless you name another prefix
 ```
 
 `/usr/local` is searched for presets alongside `/usr`, so nothing needs configuring afterwards.
