@@ -10,6 +10,8 @@ description = "Reader, writer and store for FxSound .fac preset files"
 fxsound-core = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 # Only the `write_preset` example needs these. The library itself stays free of serde: a crate

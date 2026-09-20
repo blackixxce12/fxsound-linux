@@ -1,0 +1,17 @@
+# The reference slot: protection and nothing else, so a listener can hear what the other presets
+# are actually doing. Not the same as switching the chain off — with the chain off there is no
+# high-pass and no limiter either. docs/input-presets-decision.md, "Flat".
+name = "Flat"
+description = "Nothing above the rumble and nothing below the ceiling. No voicing at all."
+rnnoise = false
+highpass_hz = 75.0
+highpass_order = 2
+makeup_db = 0.0
+ceiling_db = -3.0
+
+# No [gate], no [compressor], no [deesser]: a stage that is off has no table, so there is no way to
+# ship a full set of numbers that nothing reads.
+
+[eq]
+centers_hz = [62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0]
+gains_db = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

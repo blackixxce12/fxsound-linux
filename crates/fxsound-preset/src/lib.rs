@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod input;
 mod store;
 
 pub use store::{PresetEntry, PresetSource, PresetStore};

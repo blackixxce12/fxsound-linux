@@ -1,0 +1,36 @@
+# The reference the rest of the voice set is voiced against. Numbers and reasoning:
+# docs/voice-presets-research.md (the draft table) and docs/input-presets-decision.md.
+name = "Clean Voice"
+description = "A desk microphone, tidied rather than styled. The one to compare the others against."
+rnnoise = false
+highpass_hz = 80.0
+highpass_order = 2
+makeup_db = 6.0
+ceiling_db = -3.0
+
+[gate]
+threshold_db = -45.0
+ratio = 2.0
+range_db = -14.0
+attack_ms = 5.0
+release_ms = 150.0
+hold_ms = 200.0
+detection = "rms"
+
+[compressor]
+threshold_db = -18.0
+ratio = 3.0
+knee_db = 6.0
+attack_ms = 20.0
+release_ms = 150.0
+detection = "rms"
+
+[deesser]
+frequency_hz = 5500.0
+threshold_db = -22.0
+
+# Nothing exceeds ±2 dB: on a fixed ladder at a derived Q of about 1.6, a large single-band move
+# is a narrow artefact, and a voice curve is built from broad gentle ones.
+[eq]
+centers_hz = [62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0]
+gains_db = [0.0, 0.0, -1.0, -1.5, -0.5, 0.0, 1.5, 0.0, 0.0, 0.0]
