@@ -58,6 +58,12 @@ pub struct App {
     /// The snapshot published to the audio thread.
     params: DspParams,
     input_params: InputDspParams,
+    /// The shipped voice presets, read once at start-up.
+    ///
+    /// A separate list from `presets`, not a second source for the same one: a `.fac` and a voice
+    /// preset describe different chains, and the only thing they share is that exactly one of them
+    /// is selected at a time — whichever direction is live.
+    input_presets: Vec<fxsound_preset::input::InputPreset>,
     /// Persisted settings, saved when they change rather than on a timer.
     settings: Settings,
     /// Factory and user presets.
@@ -114,6 +120,7 @@ impl App {
             },
             params: DspParams::default(),
             input_params: InputDspParams::default(),
+            input_presets: Vec::new(),
             settings,
             presets,
             loaded_preset: None,
@@ -128,9 +135,13 @@ impl App {
             tray_tip_shown: false,
         };
 
+        app.input_presets = fxsound_preset::input::InputPreset::load_shipped();
+        // The direction is settled before the list is built: they are two lists, and which one the
+        // picker shows depends on which chain is live.
+        app.state.direction = app.settings.device_direction;
         app.refresh_preset_list();
         let saved = app.settings.selected_preset().to_owned();
-        if let Some(index) = app.presets.index_of(&saved) {
+        if let Some(index) = app.state.presets.iter().position(|e| e.name == saved) {
             app.select_preset(index);
         } else if !app.state.presets.is_empty() {
             app.select_preset(0);
@@ -297,6 +308,12 @@ impl App {
                 // lying.
                 self.state.direction = direction;
                 self.settings.set_selected_device(&name, direction);
+                if crossed {
+                    // Two lists, and the picker shows the one belonging to the live chain. The
+                    // previous selection cannot survive: it is not in the new list.
+                    self.refresh_preset_list();
+                    self.state.selected_preset = None;
+                }
                 self.settings_dirty = true;
                 if let Some(engine) = &self.engine {
                     engine.send(UiToAudio::SelectDevice {
@@ -328,6 +345,14 @@ impl App {
                     && let Some(at) = self.state.presets.iter().position(|e| e.name == preset)
                 {
                     self.select_preset(at);
+                }
+                // A crossing swapped the list, so something in the new one has to be selected: the
+                // picker cannot sit blank in front of a chain that is running. This is not the
+                // guess the code refuses to make above — that one is about choosing *between*
+                // presets on no evidence, and here the alternative is showing none at all.
+                if crossed && self.state.selected_preset.is_none() && !self.state.presets.is_empty()
+                {
+                    self.select_preset(0);
                 }
 
                 // `"Output: "` + name, and the preset in use with it (`FxController.cpp:1150`).
@@ -412,17 +437,65 @@ impl App {
         }
     }
 
+    /// Rebuild the list the picker shows, from whichever chain is live.
+    ///
+    /// The two sets are never merged. A music preset on a microphone is wrong by construction, and
+    /// a list mixing both would make picking the wrong one a normal thing to do.
     fn refresh_preset_list(&mut self) {
-        self.state.presets = self
-            .presets
-            .entries()
+        self.state.presets = match self.state.direction {
+            DeviceDirection::Output => self
+                .presets
+                .entries()
+                .iter()
+                .map(|entry| PresetEntry {
+                    name: entry.name.clone(),
+                    factory: entry.source == fxsound_preset::PresetSource::Factory,
+                    modified: entry.modified,
+                })
+                .collect(),
+            // Voice presets are read-only for now: they ship with the application, nothing writes
+            // one, and `modified` is therefore always false. Saving over one is the next piece of
+            // work, and until it exists the interface should not imply it is possible.
+            DeviceDirection::Input => self
+                .input_presets
+                .iter()
+                .map(|preset| PresetEntry {
+                    name: preset.name.clone(),
+                    factory: true,
+                    modified: false,
+                })
+                .collect(),
+        };
+    }
+
+    /// Put a voice preset's settings into the interface and publish them.
+    ///
+    /// The four stage switches live in [`UiState`] rather than in the mapping precisely so that
+    /// this can move them: without it a preset's gate is a number nothing reads.
+    fn apply_input_preset(&mut self, preset: &fxsound_preset::input::InputPreset) {
+        let params = preset.to_params();
+        self.state.eq_on = params.eq_on;
+        self.state.eq_bands = params
+            .bands()
+            .0
             .iter()
-            .map(|entry| PresetEntry {
-                name: entry.name.clone(),
-                factory: entry.source == fxsound_preset::PresetSource::Factory,
-                modified: entry.modified,
+            .zip(params.bands().1)
+            .map(|(&center_hz, &boost_db)| fxsound_core::EqBand {
+                center_hz,
+                boost_db,
             })
             .collect();
+        self.state.filter_q = params.filter_q;
+        self.state.master_gain_db = params.makeup_db;
+        self.state.denoise_on = params.rnnoise;
+        self.state.gate_on = params.gate_on;
+        self.state.compressor_on = params.compressor_on;
+        self.state.deesser_on = params.deesser_on;
+
+        // The stages the interface has no control for come straight from the preset, which is the
+        // whole reason the voice set is navigated by preset rather than by knobs.
+        self.input_params = params;
+        self.sync_params_from_state();
     }
 
     fn select_preset(&mut self, index: usize) {
@@ -430,6 +503,28 @@ impl App {
             return;
         };
         let name = entry.name.clone();
+
+        // A microphone's presets are a different set in a different format, and they are read-only:
+        // none of the autosave, overwrite or modified-marker machinery below applies to one yet.
+        if self.state.direction == DeviceDirection::Input {
+            let Some(preset) = self
+                .input_presets
+                .iter()
+                .find(|preset| preset.name == name)
+                .cloned()
+            else {
+                return;
+            };
+            self.apply_input_preset(&preset);
+            self.state.selected_preset = Some(index);
+            self.notify(Message::preset_selected(&name));
+            self.settings.set_selected_preset(&name);
+            self.settings_dirty = true;
+            if let Some(engine) = &self.engine {
+                engine.send_event(DspEvent::ResetFilterState);
+            }
+            return;
+        }
 
         // Switching away from unsaved edits stashes them, exactly as the original does
         // (`FxController.cpp:1061-1065`), so nothing the user did is silently lost.
@@ -663,21 +758,25 @@ impl App {
     /// state, so the audio thread always reads a current one and a direction switch needs no
     /// handshake.
     ///
-    /// **This mapping is interim, and deliberately conservative.** Three of the controls mean the
-    /// same thing on a voice as on music and are carried straight across: the power switch, the
-    /// ten-band equalizer — the one thing the two chains genuinely share — and the output gain,
-    /// which becomes the chain's makeup. The rest of the voice chain is left where a preset will
-    /// put it, because *nobody has voiced it yet*: the gate, the compressor and the de-esser stay
-    /// switched off until an input preset turns them on, so upgrading to 0.3.0 cannot silently
-    /// start gating someone's quiet talker.
+    /// **Who owns what.** Three controls mean the same thing on a voice as on music and are
+    /// carried straight across: the power switch, the ten-band equalizer — the one thing the two
+    /// chains genuinely share — and the output gain, which becomes the chain's makeup. The four
+    /// stage switches come from [`UiState`] too, and a voice preset is what moves them.
     ///
-    /// The one stage that is on is the 80 Hz high-pass, because it is the only one that is right
-    /// for every microphone regardless of voicing — it removes desk rumble and the bottom of a
-    /// plosive, both of which sit ten to twenty decibels above the voice down there.
+    /// Everything else — the high-pass corner and order, and the gate, compressor and de-esser
+    /// numbers — belongs to the **preset** and is deliberately not touched here. There is no
+    /// control for any of it, which is the point: the voice set is navigated by preset, so a
+    /// mapping that overwrote a preset's high-pass with a constant would undo the thing the preset
+    /// was for. It did, until a test caught it.
+    ///
+    /// With no preset selected the chain runs on `InputDspParams::default()` — an 80 Hz
+    /// second-order high-pass and every dynamics stage off. The high-pass is the only stage right
+    /// for every microphone regardless of voicing; nothing else should start working on someone's
+    /// voice before they have chosen it.
     ///
     /// What this mapping does *not* carry: the five effect sliders, the balance and the volume
     /// leveller, none of which has a counterpart in a voice chain. They are inert while a
-    /// microphone is selected, and the interface does not yet say so — that is the next item.
+    /// microphone is selected, and the interface says so.
     fn sync_input_params_from_state(&mut self) {
         self.input_params.power = self.state.power;
 
@@ -686,8 +785,6 @@ impl App {
         self.input_params.filter_q = self.state.filter_q;
         self.input_params.makeup_db = self.state.master_gain_db;
 
-        self.input_params.highpass_hz = 80.0;
-        self.input_params.highpass_order = 2;
         self.input_params.rnnoise = self.state.denoise_on;
         self.input_params.gate_on = self.state.gate_on;
         self.input_params.compressor_on = self.state.compressor_on;
@@ -718,6 +815,7 @@ impl App {
             state: UiState::default(),
             params: DspParams::default(),
             input_params: InputDspParams::default(),
+            input_presets: Vec::new(),
             settings: Settings::default(),
             presets: PresetStore::with_dirs(
                 Vec::new(),
@@ -1680,33 +1778,119 @@ mod tests {
         }
     }
 
+    /// Two voice presets, so a crossing has somewhere to land.
+    fn with_voice_presets(app: &mut App) {
+        use fxsound_preset::input::{Equalizer, InputPreset};
+        let voice = |name: &str, hz: f32| InputPreset {
+            name: name.to_owned(),
+            description: String::new(),
+            rnnoise: false,
+            highpass_hz: hz,
+            highpass_order: 2,
+            gate: None,
+            compressor: None,
+            deesser: None,
+            eq: Equalizer {
+                centers_hz: fxsound_core::eq::DEFAULT_CENTERS_HZ.to_vec(),
+                gains_db: vec![0.0; 10],
+            },
+            makeup_db: 0.0,
+            ceiling_db: -3.0,
+        };
+        app.input_presets = vec![voice("Clean Voice", 80.0), voice("Flat", 75.0)];
+    }
+
     #[test]
-    fn crossing_between_a_speaker_and_a_microphone_carries_that_directions_preset() {
-        // A device nobody has used before keeps whatever is selected — guessing on first sight
-        // would change the sound on no evidence. Crossing directions is different, and is not a
-        // guess: the two chains share nothing but the equalizer, so a music preset on a voice is
-        // wrong by construction, and the direction itself remembers what was last used in it.
+    fn crossing_to_a_microphone_swaps_the_whole_preset_list() {
+        // The two sets are never merged: a music preset on a voice is wrong by construction, and a
+        // list holding both would make picking the wrong one a normal thing to do.
         let mut app = app_with_two_presets("directions");
+        with_voice_presets(&mut app);
         app.state.devices = vec![
             device("alsa_output.speakers", DeviceDirection::Output, true),
             device("alsa_input.mic", DeviceDirection::Input, false),
         ];
-        // As if a previous session had left a voice preset selected on the microphone.
-        app.settings.input_preset = "Alpha".to_owned();
+        app.settings.input_preset = "Flat".to_owned();
 
         app.handle(&[UiAction::SelectDevice(0), UiAction::SelectPreset(1)]);
         assert_eq!(app.settings.output_preset, "Beta");
+        let names: Vec<&str> = app.state.presets.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "Beta"], "the speakers show the .fac set");
 
         app.handle(&[UiAction::SelectDevice(1)]);
-        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Alpha"));
+        let names: Vec<&str> = app.state.presets.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Clean Voice", "Flat"],
+            "the microphone shows the voice set"
+        );
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Flat"));
         assert_eq!(
             app.settings.output_preset, "Beta",
             "the other direction is untouched"
         );
 
-        // And back again, to what the speakers had.
+        // And back again, to the music set and what the speakers had.
         app.handle(&[UiAction::SelectDevice(0)]);
+        let names: Vec<&str> = app.state.presets.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "Beta"]);
         assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Beta"));
+    }
+
+    #[test]
+    fn a_voice_preset_moves_the_stages_the_interface_has_no_control_for() {
+        // The whole reason the voice set is navigated by preset: the gate, the compressor and the
+        // de-esser have no knobs anywhere, so if a preset does not move them nothing does.
+        use fxsound_preset::input::{Compressor, Equalizer, Gate, InputPreset};
+        let mut app = App::headless_for_tests();
+        app.state.direction = DeviceDirection::Input;
+        app.input_presets = vec![InputPreset {
+            name: "Voiced".to_owned(),
+            description: String::new(),
+            rnnoise: true,
+            highpass_hz: 90.0,
+            highpass_order: 4,
+            gate: Some(Gate {
+                threshold_db: -40.0,
+                ratio: 2.0,
+                range_db: -12.0,
+                attack_ms: 5.0,
+                release_ms: 150.0,
+                hold_ms: 200.0,
+                detection: fxsound_core::Detection::Rms,
+            }),
+            compressor: Some(Compressor {
+                threshold_db: -20.0,
+                ratio: 4.0,
+                knee_db: 6.0,
+                attack_ms: 20.0,
+                release_ms: 150.0,
+                detection: fxsound_core::Detection::Rms,
+            }),
+            deesser: None,
+            eq: Equalizer {
+                centers_hz: fxsound_core::eq::DEFAULT_CENTERS_HZ.to_vec(),
+                gains_db: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0],
+            },
+            makeup_db: 4.0,
+            ceiling_db: -3.0,
+        }];
+        app.refresh_preset_list();
+        app.handle(&[UiAction::SelectPreset(0)]);
+
+        assert!(app.state.denoise_on);
+        assert!(app.state.gate_on);
+        assert!(app.state.compressor_on);
+        assert!(!app.state.deesser_on, "an absent table is an absent stage");
+
+        let published = app.input_params();
+        assert_eq!(published.highpass_hz, 90.0);
+        assert_eq!(published.highpass_order, 4);
+        assert_eq!(published.gate_threshold_db, -40.0);
+        assert_eq!(published.compressor_ratio, 4.0);
+        assert_eq!(published.makeup_db, 4.0);
+        assert!(published.rnnoise);
+        assert_eq!(published.band_boost_db[6], 1.5);
     }
 
     #[test]
@@ -1731,24 +1915,28 @@ mod tests {
     }
 
     #[test]
-    fn a_direction_whose_preset_no_longer_exists_changes_nothing() {
-        // The preset a direction remembers can be deleted, renamed, or — until the input set
-        // ships — never have existed. Falling back to "the first one in the list" would be the
-        // guess this whole path exists to avoid, so the selection simply stays where it is.
-        let mut app = app_with_two_presets("missing");
+    fn a_microphone_with_no_voice_presets_installed_still_runs() {
+        // A build without `assets/presets/Input` is a build whose microphone chain runs on its
+        // defaults, which is a working chain: an 80 Hz high-pass and every dynamics stage off.
+        // The picker is empty, nothing is selected, and nothing pretends otherwise.
+        let mut app = app_with_two_presets("no-voice");
         app.state.devices = vec![
             device("alsa_output.speakers", DeviceDirection::Output, true),
             device("alsa_input.mic", DeviceDirection::Input, false),
         ];
-        app.settings.input_preset = "Gone".to_owned();
-
         app.handle(&[UiAction::SelectDevice(0), UiAction::SelectPreset(1)]);
         app.handle(&[UiAction::SelectDevice(1)]);
-        assert_eq!(
-            app.state.preset().map(|p| p.name.as_str()),
-            Some("Beta"),
-            "a missing preset must not become a silent jump to some other one"
+
+        assert!(
+            app.state.presets.is_empty(),
+            "there are no voice presets to show"
         );
+        assert_eq!(app.state.preset(), None);
+        let published = app.input_params();
+        assert_eq!(published.highpass_hz, 80.0);
+        assert_eq!(published.highpass_order, 2);
+        assert!(!published.gate_on && !published.compressor_on && !published.deesser_on);
+        assert!(!published.rnnoise);
     }
 
     #[test]

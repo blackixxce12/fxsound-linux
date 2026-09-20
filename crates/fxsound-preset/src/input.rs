@@ -162,6 +162,47 @@ impl InputPreset {
         Ok(presets)
     }
 
+    /// Every directory a shipped voice preset could be in, source tree first.
+    ///
+    /// The same search order `PresetStore::with_default_dirs` uses, and for the same reason: a
+    /// developer running out of `target/release` must get the presets in the working tree, not the
+    /// ones an installed package left behind.
+    #[must_use]
+    pub fn default_dirs() -> Vec<std::path::PathBuf> {
+        let mut dirs = Vec::new();
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(root) = exe
+                .parent()
+                .and_then(std::path::Path::parent)
+                .and_then(std::path::Path::parent)
+        {
+            dirs.push(root.join("assets/presets/Input"));
+        }
+        for prefix in ["/usr/share/fxsound", "/usr/local/share/fxsound"] {
+            dirs.push(Path::new(prefix).join("presets/Input"));
+        }
+        dirs
+    }
+
+    /// Load the shipped voice presets from the first directory that has any.
+    ///
+    /// A missing directory is not an error: a build without them is a build whose microphone chain
+    /// runs on its defaults, which is a working chain. A directory that exists and cannot be read,
+    /// or a preset that will not parse, *is* — a preset silently missing from the list is how
+    /// someone ends up wondering where their voice went.
+    #[must_use]
+    pub fn load_shipped() -> Vec<Self> {
+        for dir in Self::default_dirs() {
+            match Self::load_dir(&dir) {
+                Ok(presets) if !presets.is_empty() => return presets,
+                Ok(_) => {}
+                Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => log::warn!("{}: {err}", dir.display()),
+            }
+        }
+        Vec::new()
+    }
+
     /// The parameter snapshot this preset describes.
     ///
     /// Deliberately *not* sanitised here: a preset that carries a number the engine would clamp is

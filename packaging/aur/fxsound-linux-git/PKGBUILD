@@ -71,6 +71,12 @@ package() {
       -t "${pkgdir}/usr/share/fxsound/presets/${_dir}/"
   done
 
+  # The voice presets, which are TOML rather than .fac because they describe the microphone chain
+  # and a .fac has nowhere to put a gate threshold.
+  install -d "${pkgdir}/usr/share/fxsound/presets/Input"
+  install -Dm644 assets/presets/Input/*.toml \
+    -t "${pkgdir}/usr/share/fxsound/presets/Input/"
+
   install -Dm644 "packaging/fxsound.desktop" \
     "${pkgdir}/usr/share/applications/com.fxsound.FxSound.desktop"
   install -Dm644 "packaging/fxsound.service" \
