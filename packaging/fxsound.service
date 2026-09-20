@@ -1,12 +1,18 @@
 [Unit]
 Description=FxSound audio enhancer
-After=pipewire.service pipewire-pulse.service
+Documentation=man:fxsound(1)
+# Ordering only: FxSound survives PipeWire going away and reconnects on its own, so a hard
+# dependency would take the application down with a daemon restart it is built to ride out.
+After=pipewire.service pipewire-pulse.service wireplumber.service
 Wants=pipewire.service
 PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/fxsound --hide
+ExecStart=/usr/bin/fxsound --hide
+# Hands the session default back before exiting; SIGTERM does the same, so this is belt and
+# braces for a stop that arrives while the window is being recreated.
+ExecStop=-/usr/bin/fxsound --quit
 Restart=on-failure
 RestartSec=3
 Slice=session.slice

@@ -1,0 +1,783 @@
+{
+ "found": [
+  {
+   "area": "Dynamic Boost slider saturation — fxsound-linux (Rust/egui port)",
+   "sources": [
+    {
+     "name": "dfxpComm.cpp — dfxp_CommunicateDynamicBoost",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/dsp/ptutil/dfxp/dfxpComm.cpp:686-779",
+     "what": "The whole chain. Line 703 reads the knob as MIDI 0..127; 709-717 multiplies by DFXP_MUSIC_MODE2_DYNAMIC_BOOST_FACTOR (1.8) or the SPEECH factor (also 1.8); 719-721 clamps to MIDI_MAX_VALUE=127 — the clamp happens BEFORE the 0.7 scale; 742 does pc_gain_boost = (int)(pc_gain_boost * PLY_OPTIMIZER_BOOST_MAX_SCALE); 745 looks the result up in the QNT_RESPONSE_MAXI_BOOST_DSP table."
+    },
+    {
+     "name": "dfxpDefs.h",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/dsp/ptutil/include/dfxpDefs.h:129-130,207",
+     "what": "MUSIC2 factor 1.8, SPEECH factor 1.8, and DFXP_INIT_DYNAMIC_BOOST_MIDI_VAL 51."
+    },
+    {
+     "name": "c_play.h",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/dsp/ptutil/include/c_play.h:90",
+     "what": "PLY_OPTIMIZER_BOOST_MAX_SCALE = 0.7 — the second, independent ceiling."
+    },
+    {
+     "name": "Qntitor.cpp — the MAXI_BOOST table fill",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/dsp/ptutil/Qnt/Qntitor.cpp:458-517",
+     "what": "Three while-loops fill 128 entries: 0.1 dB/step to 6.0, 0.2 dB/step to 12.0, 0.5 dB/step to 30.0; index 126 is overwritten with 127's hard-set 30.0; the _DSP variant then converts dB to linear. The Rust maxi_boost_db reproduces it exactly."
+    },
+    {
+     "name": "dfxpQnt.cpp",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/dsp/ptutil/dfxp/dfxpQnt.cpp:152-160",
+     "what": "The boost quantiser is built over MIDI_MIN_VALUE..MIDI_MAX_VALUE with QNT_RESPONSE_MAXI_BOOST_DSP — full 0..127 input domain."
+    },
+    {
+     "name": "FxAudioControls.cpp — the Windows GUI slider",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/fxsound/Source/GUI/FxAudioControls.cpp:111-114,232-248",
+     "what": "THE DECIDING FACT. setRange(0, 10, 1.0) for all five effect sliders, and valueChanged() calls FxController::setEffectValue(effect, value) with value in 0..10. No sub-range, no per-effect special case."
+    },
+    {
+     "name": "DfxDspPrivate.cpp — setEffectValue",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/dsp/DfxDspPrivate.cpp:254-303",
+     "what": "value/10.0 goes straight into dfxpSetKnobValue as a realtype 0..1."
+    },
+    {
+     "name": "Qntrtoi.cpp — qntRToICalc",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/dsp/ptutil/Qnt/Qntrtoi.cpp:84-101",
+     "what": "Plain linear (int)(x*scale + 0.5). So Windows slider 0..10 -> MIDI 0..127 linearly. Confirms the Windows slider spans the FULL MIDI range."
+    },
+    {
+     "name": "No music-mode setter in the GUI",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/fxsound/Source/GUI/",
+     "what": "grep for MUSIC_MODE across fxsound/Source returns nothing, and dfxpGet.cpp:166-170 defaults DFX_UI_BUTTON_MUSIC_MODE to DFX_UI_MUSIC_MODE_MUSIC2. The 1.8 warp is therefore always in force in the shipping Windows app."
+    },
+    {
+     "name": "Port: gain_boost_for_amount",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-dsp/src/effects/dynamic_boost.rs:324-370",
+     "what": "The port under review, plus maxi_boost_db. Constants at :116 (1.8) and :119 (0.7)."
+    },
+    {
+     "name": "Port: scale module",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-core/src/lib.rs:135-172",
+     "what": "midi_to_value / value_to_midi / value_to_slider / slider_to_value — shared by all five effects, SLIDER_MAX = 10.0."
+    },
+    {
+     "name": "Port: effect slider UI",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-ui/src/views/pro.rs:232-278",
+     "what": "One loop over Effect::ALL building FxSlider::new(&mut value, 0.0, scale::SLIDER_MAX, 1.0) and drawing the readout as format!(\"{value:.0}\"). The only place a per-effect range could be introduced."
+    },
+    {
+     "name": "Port: app state <-> preset <-> DSP",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-app/src/app.rs:457-478,609-620",
+     "what": "apply_preset uses value_to_slider (unrounded, so off-grid presets keep their exact position), current_preset_snapshot and sync_params_from_state use slider_to_value. These three lines are the whole conversion surface in the app."
+    },
+    {
+     "name": "Port: shipped-preset checks",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-dsp/tests/shipped_presets.rs:29-32,287-310",
+     "what": "DYNAMIC_BOOST_SATURATION_MIDI = 70, and every_effect_amount_a_preset_stores_is_one_a_slider_can_reach, which already reports (not asserts) off-detent stored values."
+    },
+    {
+     "name": "Port: the two tests that pin the saturation",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-dsp/src/effects/dynamic_boost.rs:540-573",
+     "what": "the_gain_boost_mapping_matches_the_shipping_slider_table and sliders_six_through_ten_are_identical_because_the_music_warp_saturates. Both are keyed to scale::slider_to_value and both must be re-expressed if the UI mapping changes."
+    },
+    {
+     "name": "Spec, already correct",
+     "url": "/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/docs/spec/10-dsp-effects.md:325-347",
+     "what": "Already states 'Dynamic Boost saturates at UI ~= 5.59 (midi >= 71 -> 71*1.8 = 127.8 -> clamped to 127). The top 44% of the Dynamic Boost slider does nothing.' The 71 should read 70 (f32 rounds 1.8f*70 up to 126.0)."
+    },
+    {
+     "name": "Measured ladders",
+     "url": "/tmp/claude-1000/-home-blackixxce----------fxsound-app-main/f86702d2-2dda-4ae2-8f57-6f93eb145a58/scratchpad/b.py",
+     "what": "f32-faithful replay of the integer chain over all 128 MIDI values. 67 distinct dB values exist; MIDI 70..127 all land on index 88 = +11.60 dB (58 of 128 values, 45.3%)."
+    }
+   ],
+   "options": [
+    {
+     "name": "(a) Affine remap: the Dynamic Boost slider's eleven positions span MIDI 0..70 instead of 0..127",
+     "how": "Add to crates/fxsound-core/src/lib.rs scale: `pub const DYNAMIC_BOOST_MAX_MIDI: u8 = 70;` plus `slider_to_value_for(effect, slider)` and `value_to_slider_for(effect, value)`. For DynamicBoost, slider_to_value_for(p) = p * 70.0 / 10.0 / 127.0 (so value_to_midi gives exactly 7p for integer p) and value_to_slider_for(v) = (v * 127.0 / 7.0).min(10.0); for the other four they delegate to the existing functions unchanged. Route the four conversion sites through them: app.rs:459 (apply_preset), app.rs:474 (current_preset_snapshot), app.rs:615 (sync_params_from_state), and the CLI's --set_effect parse in cli.rs around :816/:1050, plus crates/fxsound-preset/examples/write_preset.rs:168. gain_boost_for_amount and maxi_boost_db in dynamic_boost.rs are NOT touched — the DSP stays bit-faithful. The resulting ladder, verified against the f32 chain: 0.00, 0.80, 1.70, 2.50, 3.50, 4.40, 5.20, 6.20, 8.00, 9.80, 11.60 dB at positions 0..10, every one distinct and monotone.",
+     "breaks": "(1) A position number no longer means the same thing as on Windows: position 5 becomes 4.4 dB where Windows gives 10.0 dB. Community advice and docs that say 'set Dynamic Boost to 4' become approximate. (2) 22 of the 34 shipped presets currently sit exactly on a detent (stored 0, 13, 25, 38, 51, 64, 127); after the remap only the four zeros do. apply_preset does not round, so their sound is untouched on load — but one click on that slider now snaps them, changing the gain by at most 0.4 dB (stored 25 -> 28 is 3.10 -> 3.50 dB; stored 51 -> 49 is 6.60 -> 6.20 dB). Today that same click is near-lossless. (3) A preset saved on Linux at position 10 stores 70; reopened on Windows it shows '6' (70/12.7 = 5.51, JUCE snaps to 6) and, if re-saved there, stores 76. Both produce +11.60 dB, so the file drifts but the sound does not. (4) The two tests at dynamic_boost.rs:540-573 and the round-trip report at shipped_presets.rs:287-305 must be re-expressed against the new per-effect map. (5) The .fac parser and writer are untouched, so the byte-for-byte round-trip contract itself is unaffected — what changes is only which value the app chooses to store when the user moves that one slider.",
+     "effort": "small",
+     "verdict": "recommend",
+     "why": "It is the only option that makes all eleven positions audibly distinct without touching a single number the DSP consumes. Every stored value still maps to exactly the gain the Windows build gives it, so no preset — shipped or imported — changes how it sounds. The mapping is one affine constant, not a magic table, and it lives in the UI layer where the defect actually is."
+    },
+    {
+     "name": "(b) Leave the mapping; mark the ceiling in the interface",
+     "how": "In crates/fxsound-ui/src/views/pro.rs:264-277, draw the Dynamic Boost readout in the muted colour once the stored value is at or past the saturation point, or replace the '{value:.0}' readout with the achieved dB from a new pub fn gain_boost_db_for_amount() exported from dynamic_boost.rs. Optionally stop the slider's track fill at the saturation point. No change to fxsound-core, no change to what is stored.",
+     "breaks": "Nothing. The 34 shipped presets, imported Windows presets, the CLI, the .fac round trip and both existing DSP tests all stay exactly as they are.",
+     "effort": "trivial",
+     "verdict": "viable",
+     "why": "Zero risk and it stops the app lying, but the user is still handed a control whose top five positions do nothing — the complaint is not addressed, only labelled. Worth doing as a companion to (a): showing '+9.8 dB' next to the thumb makes the whole stage legible, and (a) plus the dB readout is the complete fix."
+    },
+    {
+     "name": "(c) Change the warp — drop or reduce the 1.8, or reorder the clamp so it applies after the 0.7 scale",
+     "how": "Edit MUSIC2_BOOST_FACTOR at crates/fxsound-dsp/src/effects/dynamic_boost.rs:116, or move the .min(127) from line 343 to after line 344 so the index can reach 127 and the table's 12..30 dB region opens up.",
+     "breaks": "Every preset ever made, on both platforms. Dropping the warp turns stored 51 from 6.60 dB into 5.00 dB and stored 127 from 11.60 dB into 11.60 dB (the 0.7 scale still caps at index 88) — so it does not even remove the ceiling. Moving the clamp is worse: stored 127 would jump from +11.60 dB to +30.00 dB of auto-gain into a limiter whose ceiling is -0.3 dBFS, which is not a louder preset, it is a pumping one. The four Quizal presets and every Windows preset storing 127 would be unrecognisable. The port's central claim dies.",
+     "effort": "trivial",
+     "verdict": "reject",
+     "why": "This is the one change the port's compatibility contract explicitly forbids, and it does not even buy what it costs: the 0.7 scale, not the 1.8 warp, is what caps the effect at +11.60 dB. Removing the warp only re-spreads the slider downward while still ending at the same ceiling."
+    },
+    {
+     "name": "(d) dB-even detents: an eleven-entry lookup table chosen so each position is ~1.16 dB above the last",
+     "how": "Same plumbing as (a), but instead of an affine map use a const table BOOST_DETENTS: [u8; 11] = [0, 10, 19, 28, 37, 47, 52, 57, 61, 66, 70], found by searching the f32-faithful chain for the MIDI value nearest each k*11.6/10 target. Ladder: 0.0, 1.2, 2.3, 3.5, 4.6, 5.8, 7.0, 8.2, 9.2, 10.4, 11.6 dB — steps of 1.0 to 1.2 dB throughout.",
+     "breaks": "Everything (a) breaks, and more of it. The inverse map is a binary search rather than a division. Position 5 becomes 5.8 dB against Windows' 10.0 dB, the largest divergence of any option. And 30 of the 34 shipped presets land between detents instead of (a)'s 30 — no better — while the table has to be justified entry by entry rather than derived from one constant.",
+     "effort": "small",
+     "verdict": "viable",
+     "why": "Genuinely the most even control, and if the goal were a well-tempered fader this would win. It loses to (a) on explainability and on how far it moves the meaning of a position number, for a gain in evenness that matters mostly at the top where the table's own slope doubles anyway."
+    },
+    {
+     "name": "(e) Conservative piecewise remap: keep positions 0..5 exactly where they are, redistribute only the dead top",
+     "how": "A table again, but [0, 13, 25, 38, 51, 64, 65, 66, 67, 68, 70] — the first six entries are precisely what value_to_midi produces today. Ladder: 0.0, 1.6, 3.1, 4.7, 6.6, 10.0, 10.2, 10.4, 10.8, 11.0, 11.6 dB.",
+     "breaks": "Almost nothing. All 22 shipped presets that sit on a detent today still do. Positions 0..5 are bit-identical to Windows. The only visible change: presets storing 76, 89, 102 or 114 stop displaying as 6, 7, 8, 9 and all display as 10 — which is honest, since they are all the same sound. Saving such a preset rewrites it to 70, again with no change in gain.",
+     "effort": "small",
+     "verdict": "viable",
+     "why": "Maximum compatibility and it does make every position distinct. But positions 6..10 span 1.4 dB in total, in steps of 0.2 to 0.4 dB on a slow auto-gain stage — below what anyone will hear. It converts 'half the slider does nothing' into 'half the slider does almost nothing with a moving number', which is more honest but not much more useful. Take it if position-number compatibility with the Windows build is judged a hard requirement."
+    },
+    {
+     "name": "(f) Raise PLY_OPTIMIZER_BOOST_MAX_SCALE above 0.7 to unlock the table's 12..30 dB region",
+     "how": "Change BOOST_MAX_SCALE at crates/fxsound-dsp/src/effects/dynamic_boost.rs:119.",
+     "breaks": "The gain for every non-zero stored value on every preset, immediately and by a lot.",
+     "effort": "trivial",
+     "verdict": "reject",
+     "why": "The 0.7 is the one part of this chain that reads as deliberate — it is the safety cap that keeps a user from asking a limiter for 30 dB of makeup. Listed only so it is on the record as considered and refused."
+    }
+   ],
+   "recommendation": "Do (a) plus the readout half of (b), and fix one number in the spec.\n\n**First, the finding that decides the whole question: this is an inherited defect, not a port defect.** The Windows GUI's Dynamic Boost slider spans the full MIDI range. `FxAudioControls.cpp:113` is `setRange(0, 10, 1.0)` for all five effect sliders with no per-effect case; `valueChanged` at `:232-248` passes 0..10 to `FxController::setEffectValue`; `DfxDspPrivate.cpp:254-303` divides by 10 and hands a realtype 0..1 to `dfxpSetKnobValue`; `qntRToICalc` (`Qntrtoi.cpp:96-97`) is plain linear `(int)(x*scale + 0.5)` over `MIDI_MIN_VALUE..MIDI_MAX_VALUE`. The shipping Windows app has exactly the same dead top of the slider. The port is correct and `gain_boost_for_amount` should not be touched.\n\n**Why it saturates, precisely.** Two independent ceilings, not one.\n- `PLY_OPTIMIZER_BOOST_MAX_SCALE = 0.7` (`c_play.h:90`) applied at `dfxpComm.cpp:742` caps the table index at `(int)(127 * 0.7) = 88`, which is `+11.60 dB`. The table's 12..30 dB region (indices 90..127) is unreachable by any path, warp or no warp. That cap reads as deliberate — a limiter is not meant to be asked for 30 dB of makeup.\n- `DFXP_MUSIC_MODE2_DYNAMIC_BOOST_FACTOR = 1.8` applied at `dfxpComm.cpp:709-717` with the clamp at `:719-721` landing *before* the 0.7 scale is what kills the top of the control. `f32(1.8) * 70` rounds to exactly `126.0`, so saturation begins at **MIDI 70**, not 71: all 58 values from 70 to 127 (45.3% of the range) collapse onto index 88. The clamp was written to protect a 128-entry array lookup; it ended up being the operating point of half the slider. And because `dfxpGet.cpp:166-170` defaults the mode to `MUSIC2` and nothing in `fxsound/Source/` ever sets it (SPEECH's factor is also 1.8), the warp is always in force — the unwarped `MUSIC1` path is dead code in this product.\n\n**The fix.** The defect is in the UI layer, so fix it there. Add to the `scale` module in `crates/fxsound-core/src/lib.rs`:\n\n```\npub const DYNAMIC_BOOST_MAX_MIDI: u8 = 70;   // the last value that changes anything\npub fn slider_to_value_for(effect: Effect, slider: f32) -> f32\npub fn value_to_slider_for(effect: Effect, value: f32) -> f32\n```\n\nFor `DynamicBoost`, `slider_to_value_for(p) = p * 70.0 / 10.0 / 127.0` — chosen so `value_to_midi` returns exactly `7p` for every integer position — and `value_to_slider_for(v) = (v * 127.0 / 7.0).min(10.0)`. For the other four effects both delegate to the existing `slider_to_value` / `value_to_slider`, unchanged. Then route the five conversion sites through the per-effect pair: `app.rs:459`, `app.rs:474`, `app.rs:615`, the `--set_effect` path in `cli.rs`, and `write_preset.rs:168`. Nothing in `crates/fxsound-dsp` changes except the two tests.\n\nThe slider then reads, at positions 0 through 10: **0.00, 0.80, 1.70, 2.50, 3.50, 4.40, 5.20, 6.20, 8.00, 9.80, 11.60 dB** — every position distinct, monotone, and derived from the unmodified table. Add the dB to the readout at `pro.rs:264-277` (export a `gain_boost_db_for_amount` alongside `gain_boost_for_amount`) so the stage stops being opaque; that is the part of (b) worth keeping.\n\n**Preset compatibility is not broken, and here is the exact accounting.** The `.fac` parser and writer are untouched, so the byte-for-byte round trip stands. `gain_boost_for_amount` is untouched, so **every stored value from 0 to 127 produces exactly the gain it produces today and exactly the gain it produces on Windows.** What changes is only which value the app *writes* when the user moves that one slider.\n- The 34 shipped presets: nothing happens on load. `apply_preset` does not round, so `Competitive FPS` (stored 64) keeps its 10.00 dB and simply displays at 9.1 instead of 5. Ten presets store 70 or more — 85, 85, 95, 103, 115 and the four Quizal files at 127 — and they all display at 10 and sound at +11.60 dB before and after.\n- A preset imported from Windows storing 89 or 127: loads, displays at position 10, sounds at +11.60 dB. Identical to today. If the user then edits and saves it, the file records 70 instead of 89 or 127 — a different byte, the same gain, and a value the app can now actually reproduce from its own slider.\n- Round-tripping back to Windows: a Linux position 10 stores 70, which Windows shows as '6' (70/12.7 = 5.51, snapped by JUCE's interval) and would re-save as 76. The number on the screen disagrees; the sound does not.\n- The real cost, stated plainly: 22 of the 34 shipped presets sit exactly on a detent today and will not after the change, so a single click on that slider will nudge them by up to 0.4 dB (stored 25 -> 28 is 3.10 -> 3.50 dB; stored 51 -> 49 is 6.60 -> 6.20 dB). That is the price. Set against it, today a user who drags a saturated preset from 10 down to 6 hears nothing at all and concludes the application is broken — which is the bug being fixed.\n\n**Tests and docs to update in the same change.** `dynamic_boost.rs:540-563` (`the_gain_boost_mapping_matches_the_shipping_slider_table`) should keep asserting the Windows table but express it in stored MIDI rather than in slider positions, so it still guards the DSP. `dynamic_boost.rs:565-573` (`sliders_six_through_ten_are_identical...`) should be rewritten to assert the property that actually matters now — that `gain_boost_for_amount` still saturates at MIDI 70 and that the UI map never emits a value at or above it — so nobody later \"fixes\" the clamp order. `shipped_presets.rs:287-305` should use the per-effect map. And `docs/spec/10-dsp-effects.md:346-347` says saturation starts at `midi >= 71`; the f32 rounding makes it 70, and \"the top 44%\" is 45.3%.\n\nIf position-number parity with the Windows GUI is judged a hard requirement by someone who owns that call, option (e) is the fallback and costs almost nothing — but be clear that it buys distinctness, not audibility, above position 5.",
+   "notes": "Three things I could not settle from the source and that are worth a second pair of eyes:\n\n1. **The 0.7 is load-bearing and I left it alone deliberately.** It, not the 1.8 warp, is why +11.60 dB is the ceiling. Removing the warp entirely (a \"faithful MUSIC1\" mode) would re-spread the slider downward but end at the same +11.60 dB, so it fixes nothing and changes every preset. Worth recording so the next person does not rediscover it the expensive way.\n\n2. **`gain_boost_db_for_amount` does not exist yet.** The readout half of the recommendation needs it exported from `dynamic_boost.rs`; `maxi_boost_db` is private and takes a table index, not an amount. Small addition, but it is new public API on the DSP crate.\n\n3. **`DFXP_INIT_DYNAMIC_BOOST_MIDI_VAL` is 51** (`dfxpDefs.h:207`), which under the new map displays at position 7.3 rather than 4. If the port has a default-preset or reset-to-default path that assumes position 4, it needs the same treatment. I did not find one, but I also did not audit the settings-restore path.\n\nRelated observations, not part of this task: the same `every_effect_amount_a_preset_stores_is_one_a_slider_can_reach` test already reports eight shipped presets storing values no slider can produce (5, 20, 54, 60, 85, 95, 103, 115) — the remap does not create that problem, it inherits it. And four Quizal presets store Dynamic Boost 127, which is the most saturated value there is; whoever authored them was dragging a slider that had stopped responding six positions earlier."
+  },
+  {
+   "area": "Microphone/input presets for the Rust/egui FxSound Linux port — what comparable products actually ship as named voice profiles, and which recurring cases the seven planned presets (Clean Voice, Streaming, Podcast, Discord, Warm Voice, Studio, Laptop Mic) do not cover.",
+   "sources": [
+    {
+     "name": "Logitech Blue VO!CE — Reviewer's Guide (Yeti Nano / Yeti / Yeti X), build 2021.8.792",
+     "url": "https://files.bbystatic.com/oR3epWyOx8ETxV1%2Bw%2F9agg==/Installation%2Bguide%2BBlue%2BVOICE",
+     "what": "Vendor PDF (extracted with pdftotext). Names the factory presets 'Warm and Vintage', 'Broadcaster 2', 'Bass Boost' in prose, and documents the chain as two tabs: EQUALIZER (Voice EQ, low/mid/high) and SIGNAL CLEANUP (Noise Reduction, Gate, Compressor, De-Esser, De-Popper, Limiter), with a separate EFFECTS tab (pitch/formant PRIMARY+SECONDARY VOICE, flanger/phaser, chorus). Confirms the presets are a starting point plus a community browser, not a closed set."
+    },
+    {
+     "name": "Logitech press release — Advanced Blue VO!CE for all Yeti mics",
+     "url": "https://stocktitan.net/news/LOGI/advanced-blue-vo-ce-software-now-available-to-all-blue-yeti-yeti-xjqh46n69xrc.html",
+     "what": "Names the broadcast filter presets 'Classic Radio Voice' and 'Crisp and Modern', and the voice-modulation effects 'DJ Robot', 'Electrobeast', 'Ethereal'. Confirms the split between broadcast presets and character effects."
+    },
+    {
+     "name": "Logitech G — Blue VO!CE guide",
+     "url": "https://www.logitechg.com/en-us/software/guides/blue-voice",
+     "what": "Vendor page for the signal flow: Input Gain, Mic EQ, Signal Cleanup (Noise Reduction, Gate, Compressor, De-Esser, De-Popper, Limiter), Effects, Sampler. Notably lists no factory preset names at all — the page pushes community presets instead."
+    },
+    {
+     "name": "Tom's Guide — Blue Yeti X review",
+     "url": "https://www.tomsguide.com/reviews/blue-yeti-x-review-the-best-usb-microphone-evolved",
+     "what": "Third-party enumeration of Blue VO!CE presets actually seen in G HUB: 'Broadcaster', 'Classic Radio Voice', 'AM Radio', plus descriptions ('louder and fuller'; AM Radio as an intentionally canned old-car-stereo sound)."
+    },
+    {
+     "name": "Elgato — Wave Link 2 Audio Effect Presets / Wave Link 3 VST Preset Locations",
+     "url": "https://help.elgato.com/hc/en-us/articles/5635851854989-Wave-Link-2-Audio-Effect-Presets",
+     "what": "Wave Link ships no named factory voice presets. A 'preset' is an exported .xml of a channel's whole effect stack; content comes from Elgato Marketplace and makers such as EposVox. (Page 403s to WebFetch; content confirmed via search result text and the sibling Marketplace docs.)"
+    },
+    {
+     "name": "Elgato — Voice Focus",
+     "url": "https://www.elgato.com/us/en/explorer/products/marketplace/voice-focus-make-any-microphone-sound-studio-ready/",
+     "what": "Wave Link 2.0's answer to presets is one AI button (built with ai|coustics), sold as 'make any microphone sound studio-ready' — the whole 'bad mic' case collapsed into a single switch rather than a preset."
+    },
+    {
+     "name": "RØDE — RØDECaster Pro II on-board processing / Sound On Sound RØDECaster Pro v2 review",
+     "url": "https://www.soundonsound.com/reviews/rode-rodecaster-pro-v2",
+     "what": "RØDECaster Pro II ships exactly three processing presets — 'Neutral', 'Podcast Studio', 'Broadcast' — plus three macro controls, 'Depth', 'Sparkle' and 'Punch', each moving several parameters across several processors. The original RØDECaster instead ships mic-model presets (generic Dynamic, generic Condenser, specific RØDE models, Electro-Voice RE-20) plus a 'voice strength' preset, with Tone = Deep/Medium/High and Strength = Soft/Medium/Strong."
+    },
+    {
+     "name": "RØDE — RØDE Connect & NT-USB mini audio processing explained",
+     "url": "https://rode.com/en-us/about/news-info/rode-connect-and-nt-usb-plus-audio-processing-explained",
+     "what": "RØDE Connect / NT-USB+ ship no named voice presets: four always-on processors (Noise Gate, Compressor, APHEX Aural Exciter, APHEX Big Bottom), each individually toggleable, auto-enabled on connect."
+    },
+    {
+     "name": "Shure — MV7+ user guide and MOTIV product line",
+     "url": "https://pubs.shure.com/view/guide/MV7/en-US.pdf",
+     "what": "MOTIV's five DSP preset modes across MV5/MV51/MV88: 'Speech', 'Singing', 'Flat', 'Acoustic Instrument', 'Loud'. MV7/MV7+ replace them with a three-point Tone slider — 'Dark', 'Natural', 'Bright' — plus Auto Level Mode, Real-time Denoiser, Digital Popper Stopper, 75/150 Hz high-pass, compressor, limiter, and three reverbs (Plate, Hall, Studio)."
+    },
+    {
+     "name": "NVIDIA Broadcast app",
+     "url": "https://www.nvidia.com/en-us/geforce/broadcasting/broadcast-app/",
+     "what": "Three named microphone effects, no presets: 'Noise Removal' (fans, room noise), 'Room Echo Removal' (small-room reverb/reflections), 'Studio Voice' (recovers speech degraded by a low-end mic in a bad room)."
+    },
+    {
+     "name": "Krisp — noise cancellation feature set",
+     "url": "https://krisp.ai/noise-cancellation/",
+     "what": "Named capabilities, again toggles not presets: 'Noise Cancellation', 'Background Voice Cancellation' (removes other nearby humans), 'Room Echo Cancellation', 'HD Voice'/voice clarity, plus accent conversion. This is what Discord embeds."
+    },
+    {
+     "name": "Discord voice settings (Krisp-powered)",
+     "url": "https://simpleclean.app/blog/remove-background-noise-in-discord",
+     "what": "Discord's Noise Suppression is a three-way choice — 'None', 'Standard' (light gate, fewer artefacts), 'Krisp' — plus Echo Cancellation, Automatic Gain Control, and Input Sensitivity as its gate. No tonal presets anywhere in Discord."
+    },
+    {
+     "name": "SteelSeries Sonar — mic settings",
+     "url": "https://support.steelseries.com/hc/en-us/articles/22291026664717-Getting-to-know-your-sonar-settings",
+     "what": "Sonar's Mic tab: ClearCast AI Noise Cancellation, a weaker Noise Reduction, a Noise Gate, and a mic EQ whose named curves include 'Deep Voice' and 'Balanced'. (403s to WebFetch; names confirmed via search result text and slurptech/evetech write-ups.)"
+    },
+    {
+     "name": "OBS community filter-chain consensus",
+     "url": "https://obs-versions.com/filters",
+     "what": "The chain every guide converges on, in order: Noise Suppression (RNNoise, no parameters) → Noise Gate (open -26 dB, close -32 dB) → three-band EQ → Compressor (3:1, -18 dB, 6 ms / 60 ms) → Limiter (-3 dB). Sold as one chain for everybody, not as a set of named voices."
+    },
+    {
+     "name": "EasyEffects — Community presets wiki",
+     "url": "https://github.com/wwmm/easyeffects/wiki/Community-presets",
+     "what": "Fifteen output/speaker preset repos are listed against exactly ONE input/microphone entry: jtrv's 'Masc NPR Voice + Noise Reduction'. The other widely-passed-around input preset is MateusRodCosta's 'Improved Microphone (Male voices, with Noise Reduction)'. Both are named for a voice type, and no download counts are published."
+    },
+    {
+     "name": "dbx 286s / Aphex 230 — hardware voice channels",
+     "url": "https://www.barryrudolph.com/recall/manuals/aphex230manual.pdf",
+     "what": "Checked for factory presets and found none. Both are all-knob chains (286s: preamp, de-esser, expander/gate, compressor, enhancer; Aphex 230: tube pre, Logic Assisted Gate, EasyRider compressor, de-esser, parametric mid, Aural Exciter, Big Bottom). Named starting points exist only in third-party guides, always split by male vs female voice."
+    },
+    {
+     "name": "Streamlabs Desktop — mic filters",
+     "url": "https://support.streamlabs.com/hc/en-us/articles/4413174996379-How-to-Improve-Mic-Quality-in-Streamlabs-Desktop",
+     "what": "Seven filter types, no voice presets. The only named presets in the whole product are the Expander filter's two modes, 'Expander' and 'Gate'."
+    },
+    {
+     "name": "Voicemod Voicelab / Adobe Enhanced Speech",
+     "url": "https://www.voicemod.net/en/voicelab/",
+     "what": "Voicemod's taxonomy is 'Characters', 'Devices' (megaphone, vintage radio) and 'Surroundings' — character effects, not voice correction. Adobe Podcast Enhance ships no profiles at all: one 'Enhance' action with a strength slider."
+    }
+   ],
+   "options": [
+    {
+     "name": "Broadcaster (the deliberately large radio voice)",
+     "how": "A ninth preset in the input set, written as a new file beside the six drafted in docs/voice-presets-research.md (and its per-value record in docs/voice-presets-research.json). Distinguish it from Podcast by processing depth, not by tone alone: HPF ~70 Hz (keep the chest), compressor 4.5:1 at -22 dB with a slow 30 ms attack and 250 ms release, makeup +10 dB, band 1 (115.7 Hz) +2.0 dB and band 6 (1360.8 Hz) -1.5 dB for the scooped broadcast midrange, band 7 (2519.8 Hz) +2.0 dB, de-esser tight at 6000 Hz / -26 dB because the presence lift exposes sibilance. It is the only preset in the set allowed to sound processed.",
+     "breaks": "Nothing in the .fac contract — mic presets are a new path and must not be pushed through crates/fxsound-preset/src/lib.rs, whose whole job is byte-exact round-tripping of the Windows format. It does break the drafted premise that 'the moves are small, nothing exceeds ±2 dB': Broadcaster is the one preset where a user who picks it wants to hear the difference, and holding it to the same restraint as Clean Voice makes it a duplicate of Podcast. It also needs the compressor detector question settled first (research doc objection 1), because a 4.5:1 ratio means two different things under peak vs RMS.",
+     "effort": "small",
+     "verdict": "recommend",
+     "why": "The single most-shipped named voice profile in the market. Blue VO!CE ships 'Broadcaster 1', 'Broadcaster 2' AND 'Classic Radio Voice'; RØDECaster Pro II ships 'Broadcast' as one of only three presets; GoXLR profiles are sold as broadcast profiles; and the entire hardware lineage (dbx 286s, Aphex 230, Symetrix) is marketed as broadcast voice processing. Four independent products, and the one name that appears three times inside a single vendor's set."
+    },
+    {
+     "name": "Bright Voice — the missing half of the tone pair",
+     "how": "An input preset that mirrors Warm Voice about zero rather than inventing a new shape: band 1 (115.7 Hz) -1.5 dB, band 2 (214.3 Hz) -1.0 dB, band 7 (2519.8 Hz) +1.5 dB, band 8 (4666.1 Hz) +1.5 dB, band 9 (8640.5 Hz) +1.0 dB, HPF 90 Hz, and a de-esser that must be stronger than Warm Voice's, not equal to it (5500 Hz, around -26 dB). Ship it as a declared pair with Warm Voice in the UI list so the two read as one axis.",
+     "breaks": "The de-esser interaction is the real cost: lifting bands 8 and 9 puts energy straight into the de-esser's detection band, so the shipped de-esser threshold and the EQ gains stop being independently tunable for this one preset. It also breaks the idea that the ten EQ gains can be validated band-by-band — Bright is the preset where the summing behaviour that crates/fxsound-dsp/tests/shipped_presets.rs already measures for output presets (adjacent bands at derived Q ≈ 1.6 adding past what any band asks) matters most, so the mic analogue of that test has to exist before this ships.",
+     "effort": "small",
+     "verdict": "recommend",
+     "why": "Warm and bright ship as a PAIR in every product that ships either. Blue VO!CE: 'Warm and Vintage' + 'Crisp and Modern'. Shure MV7/MV7+: 'Dark' / 'Natural' / 'Bright'. RØDECaster: Tone 'Deep' / 'Medium' / 'High', and on the Pro II a 'Sparkle' macro. SteelSeries Sonar: 'Deep Voice' vs 'Balanced'. Elgato's EQ presets include a 'High Clarity' that brings a voice forward. Five products, and shipping only the warm end is the clearest asymmetry in the planned seven."
+    },
+    {
+     "name": "Flat / Safety Only — protection with no voicing",
+     "how": "HPF at 75 Hz, gate off, all ten EQ bands 0.0 dB, de-esser off, compressor off (not merely gentle), makeup 0.0 dB, limiter at -3.0 dBFS. It is the only preset where the answer to 'what does this change' is 'nothing above the rumble and nothing below the ceiling'. Distinct from the drafted Studio, which still runs a 2.0:1 compressor at -18 dB with +1.5 dB makeup.",
+     "breaks": "It makes Studio hard to justify as a separate entry — Studio and Flat differ only by one gentle compressor, which is exactly the 'two presets that are the same voicing under different names' defect the existing shipped_presets.rs test was written to catch in the output set. Pick one: either Flat replaces Studio, or Studio gains a real identity (more makeup, a real de-esser) to earn its slot. Shipping both as drafted is the duplicate case.",
+     "effort": "trivial",
+     "verdict": "recommend",
+     "why": "Recurs as a named entry in three products plus the community consensus: Shure MOTIV 'Flat', RØDECaster Pro II 'Neutral', Discord noise suppression 'None', and every OBS guide's advice to hear the raw mic before adding filters. It also matters here specifically because the input chain, unlike the output chain, has no bypass problem to work around — nothing in it is un-bypassable the way Dynamic Boost is, so a genuinely flat input preset is honest in a way a flat output preset cannot be."
+    },
+    {
+     "name": "Noisy Room — the suppression case, as a preset rather than only a toggle",
+     "how": "A preset that turns RNNoise on and tightens everything around it: gate threshold raised to about -38 dB with range_db capped near -18 dB (the field the research doc already flags as missing), HPF 100 Hz, compressor ratio held low at 2.5:1 so the gain reduction does not pump the residual floor up between phrases. Requires RNNoise to become a per-preset field on InputDspParams in crates/fxsound-dsp/src/input/mod.rs, not only a global switch in the UI.",
+     "breaks": "Two things. It breaks the one-way relationship between the UI's RNNoise toggle and the preset — once a preset can turn RNNoise on, selecting a preset changes a control the user may have set deliberately, and the UI has to show that. And it breaks preset portability across machines that lack the RNNoise model, so the loader needs a defined behaviour when the preset asks for a denoiser that is not available (degrade to the gate, and say so) rather than failing to load.",
+     "effort": "medium",
+     "verdict": "recommend",
+     "why": "Every product ships this case, and it is the flagship feature in most of them: NVIDIA Broadcast 'Noise Removal', Krisp 'Noise Cancellation', Discord's Krisp mode, SteelSeries 'ClearCast AI Noise Cancellation', Elgato 'Voice Focus', RNNoise first in every OBS chain. The sceptical caveat is real and worth stating: every one of them ships it as a SWITCH, never as a named voice preset. So the finding is not 'add a Noisy Room voice' but 'the suppression strength has to be part of the preset, because a preset that ignores it is describing half the sound'."
+    },
+    {
+     "name": "Rename Discord → Voice Chat, and Laptop Mic → Small Mic",
+     "how": "Naming only, in the preset files and in the UI list. 'Voice Chat' for the drafted Discord numbers (90 Hz, 3.0:1 at -18 dB, +4 dB makeup); 'Small Mic' for the laptop preset, whose numbers serve a headset boom and a webcam mic identically.",
+     "breaks": "Nothing technical. It does break the discoverability argument for app names — a user looking for a Discord preset will not find one, so the description line has to carry the app names ('Discord, Teams, Zoom, in-game voice').",
+     "effort": "trivial",
+     "verdict": "recommend",
+     "why": "No comparable product names a voice profile after a destination app. They name by role ('Podcast Studio', 'Broadcast'), by tone ('Crisp and Modern', 'Bright'), or by source ('Speech', 'Acoustic Instrument'). Krisp integrates with Discord and Zoom and still ships no Discord profile. An app name also dates badly and implies a codec-specific tuning the preset does not actually have — the -3 dBFS ceiling in the draft is already the Opus/AAC headroom argument, and it applies to all of them equally."
+    },
+    {
+     "name": "A three-point tone family instead of scattered tonal presets",
+     "how": "Rather than Warm Voice and Bright Voice as two of nine loose entries, express tone as an explicit ladder — Dark / Neutral / Bright — applied over whichever destination preset is loaded, i.e. a small signed EQ offset vector added to the preset's ten gains. Implemented as a second, much smaller struct alongside InputDspParams and summed at install time in crates/fxsound-dsp/src/input/mod.rs.",
+     "breaks": "It breaks the 'a preset is a complete stored state' model that the whole project rests on for the output side, and with it any chance of a mic preset file being a single flat list of values. It also breaks the shipped-preset tests as currently conceived: you can no longer assert that a preset's audible curve equals its stored curve, because the effective curve is a sum of two stored things. And two summed EQ curves on a fixed ladder at derived Q ≈ 1.6 is exactly how you get bands that add past what either asks for.",
+     "effort": "medium",
+     "verdict": "viable",
+     "why": "Three vendors converged on exactly this shape — Shure Dark/Natural/Bright, RØDE Deep/Medium/High, RØDECaster Pro II's Depth/Sparkle/Punch macros over three base presets — which is strong evidence that tone-over-destination is how people actually want to navigate. But it is a UI-contract change, not a preset addition, and the port's claim is fidelity to a stored-values model. Worth doing later, not as part of shipping the input set."
+    },
+    {
+     "name": "Room echo / de-reverb preset",
+     "how": "Cannot be done in the current chain. Would need a de-reverberation stage (spectral or ML) added before the EQ, which is a new effect, not a preset.",
+     "breaks": "The chain's shape and its real-time-safety story. Any spectral de-reverb needs an FFT with a frame buffer, and the input chain's stated contract is allocation-free after construction, sized for the worst case.",
+     "effort": "large",
+     "verdict": "reject",
+     "why": "The case genuinely recurs — NVIDIA 'Room Echo Removal', Krisp 'Room Echo Cancellation', Adobe Enhance, and it is the second thing every one of them advertises after noise. But it is not a preset in any of them either, and no combination of HPF, gate, EQ, de-esser and compressor removes reverb. Naming a preset 'Room Echo' when the chain cannot do it would be the same defect the output-side tests were written to catch: a preset claiming an effect it does not get."
+    },
+    {
+     "name": "Singing / Acoustic Instrument / Loud (the MOTIV source-type modes)",
+     "how": "Three presets keyed to what is in front of the mic rather than to where the audio is going: Singing (no gate, gentle 2:1, no de-esser), Acoustic Instrument (flat EQ, HPF 60 Hz, no de-esser), Loud (HPF 80 Hz, hard limiter, no makeup).",
+     "breaks": "The framing of the whole input set. Every other preset assumes speech, and a singing preset that keeps the de-esser off and the gate open is really 'Flat with a different name' — see the Flat/Studio duplicate problem.",
+     "effort": "small",
+     "verdict": "reject",
+     "why": "Fails the scepticism test: 'Speech', 'Singing', 'Flat', 'Acoustic Instrument', 'Loud' appear in exactly one vendor's lineup (Shure MOTIV, across MV5/MV51/MV88), and Shure itself dropped them for the MV7/MV7+ in favour of the Dark/Natural/Bright tone slider. One vendor, and that vendor abandoned the taxonomy."
+    },
+    {
+     "name": "Character presets — AM Radio, Megaphone, Telephone",
+     "how": "EQ-only novelties: brutal HPF around 300 Hz plus a low-pass the chain does not currently have, band 6/7 lifted hard, everything else flat.",
+     "breaks": "The chain has no low-pass stage, so a convincing telephone/AM sound is not reachable — you would get a thin voice, not a canned one. Adding a low-pass to the input chain to serve a novelty is the wrong trade.",
+     "effort": "medium",
+     "verdict": "reject",
+     "why": "Blue VO!CE ships 'AM Radio' and Voicemod's whole 'Devices' category is megaphones and vintage radios, so the case exists in two products — but in both it lives in a separate EFFECTS section next to pitch and formant shifting, explicitly not among the broadcast presets. Blue's own guide says the two sets 'don't always match up'. It is a different product category, not a missing voice preset."
+    },
+    {
+     "name": "Mic-type presets — Dynamic / Condenser / Headset",
+     "how": "Presets differing mainly in makeup_db and HPF corner: Dynamic (low output, makeup +14 dB, HPF 70 Hz), Condenser (makeup +4 dB, HPF 90 Hz), Headset (makeup +8 dB, HPF 110 Hz).",
+     "breaks": "It conflates gain staging with voicing. Three presets whose ten EQ gains are identical and whose only real difference is one number is the duplicate-voicing defect by construction, and it multiplies the set by three for a value the user can set with one control.",
+     "effort": "small",
+     "verdict": "reject",
+     "why": "The case recurs in hardware-adjacent software — RØDECaster's generic Dynamic / Condenser / RE-20 presets, GoXLR's Dynamic/Condenser/Jack selection, Wave XLR's gain and Clipguard — but in every one of those it is a HARDWARE input selection (phantom power, preamp gain, impedance), not a voice profile. On a Linux port with no control over the interface, the honest equivalent is an input-gain control plus a level meter, not three presets."
+    }
+   ],
+   "recommendation": "Ship ten input presets, not seven, organised on the two axes the market actually uses — destination and tone — with one repair preset and one true bypass.\n\nDestination: **Streaming**, **Podcast**, **Voice Chat** (the drafted Discord numbers, renamed), **Broadcaster** (new).\nTone: **Warm Voice**, **Bright Voice** (new), **Clean Voice** as the neutral centre.\nRepair: **Small Mic** (Laptop Mic, renamed), **Noisy Room** (new, and the reason RNNoise has to become a per-preset field).\nReference: **Flat** (new) — HPF and limiter only. Drop **Studio** or give it an identity that is not 'Flat with a compressor'; as drafted the two are the same voicing under different names, which is precisely the defect `crates/fxsound-dsp/tests/shipped_presets.rs` was written to catch on the output side.\n\nThree of the four additions each have four or more independent vendors behind them, and all four are reachable with the chain exactly as specified — no new stages. End to end that means: write the four new presets into the same format as the six drafted in `docs/voice-presets-research.md`, with their per-value rationale and citations in `docs/voice-presets-research.json`; add `range_db` to the gate and a detector type to the compressor on `InputDspParams` in `crates/fxsound-dsp/src/input/mod.rs` first, since Noisy Room and Broadcaster are both unspecified without them; add an RNNoise field to the same struct with a defined fallback when the model is absent; and write the mic-side analogue of `shipped_presets.rs` before any of them ship, because Bright Voice is the preset where adjacent bands at the derived Q of about 1.6 will sum past what either band asks for. Keep all of this out of `crates/fxsound-preset/src/lib.rs` — the `.fac` format is the byte-exact compatibility contract with the Windows build and has no place to put a de-esser.",
+   "notes": "THE ACTUAL LISTS, as shipped.\n\nLogitech Blue VO!CE (G HUB). Factory presets confirmed by name across vendor and review sources: Broadcaster 1, Broadcaster 2 ('noticeably louder and fuller'), Crisp and Modern, Warm and Vintage ('rich undertones and smooth output'), Classic Radio Voice ('crisp, higher-pitched immediacy'), AM Radio ('intentionally canned', old car stereo), Bass Boost, plus high-voice and low-voice variants. Separately, an EFFECTS tab of character voices (DJ Robot, Electrobeast, Ethereal) built from pitch/formant PRIMARY and SECONDARY VOICE, flanger/phaser, chorus. Vendor's own guide deliberately does not publish the preset list — the pitch is 'pick one and edit it, or browse the community'. Caveat: Logitech has never published a canonical list, and G HUB's set has changed across builds; the names above are each attested at least twice but the set may not be complete.\n\nElgato Wave Link / Wave XLR. Ships NO named voice presets. A preset is an exported .xml of a channel's whole effect stack; the content model is Elgato Marketplace plus makers (EposVox). Wave Link 2.0's answer to the preset question is one AI button, Voice Focus (with ai|coustics), sold as making any mic studio-ready. Their published EQ presets are tonal, not role-based ('High Clarity' brings a voice forward).\n\nRØDE. RØDECaster Pro II: three presets — Neutral, Podcast Studio, Broadcast — plus three macros, Depth, Sparkle, Punch, each moving several parameters across several processors. Original RØDECaster Pro: mic-model presets (generic Dynamic, generic Condenser, specific RØDE models, Electro-Voice RE-20), then a voice-strength preset, with Tone = Deep/Medium/High and Strength = Soft/Medium/Strong. RØDE Connect and NT-USB+: no presets at all, four always-on toggles (Noise Gate, Compressor, APHEX Aural Exciter, APHEX Big Bottom).\n\nShure MOTIV. MV5 / MV51 / MV88: five DSP modes — Speech, Singing, Flat, Acoustic Instrument, Loud. MV7 / MV7+ dropped those for a three-point Tone slider — Dark, Natural, Bright — alongside Auto Level Mode, Real-time Denoiser, Digital Popper Stopper, 75/150 Hz high-pass, compressor, limiter, and three reverbs (Plate, Hall, Studio). The abandonment matters: the vendor with the most source-type presets moved to a tone axis.\n\nNVIDIA Broadcast: Noise Removal, Room Echo Removal, Studio Voice. Three effects, no presets. Krisp: Noise Cancellation, Background Voice Cancellation, Room Echo Cancellation, HD Voice, accent conversion. Toggles, no presets. Discord: Noise Suppression None / Standard / Krisp, plus Echo Cancellation, Automatic Gain Control, Input Sensitivity. No tonal anything.\n\nSteelSeries Sonar (Mic tab): ClearCast AI Noise Cancellation, a weaker Noise Reduction, Noise Gate, and a mic EQ with named curves including Deep Voice and Balanced. GoXLR: Dynamic / Condenser / Jack input selection plus user mic profiles; 'Broadcast' is a community profile name, not a factory one. Streamlabs Desktop: seven filter types and exactly two named presets in the whole product, the Expander filter's Expander and Gate modes. Voicemod Voicelab: Characters, Devices, Surroundings — a character-effects taxonomy. Adobe Podcast Enhance: no profiles, one Enhance action with a strength slider. OBS: no presets, a consensus chain (RNNoise → gate at -26/-32 dB → three-band EQ → compressor 3:1 / -18 dB / 6 ms / 60 ms → limiter at -3 dB). Hardware (dbx 286s, Aphex 230, Symetrix): no factory presets exist; named starting points live only in third-party guides, and those always split by male vs female voice.\n\nEasyEffects, by visibility rather than download count: the community wiki lists fifteen output/speaker preset repositories against ONE input entry, jtrv's 'Masc NPR Voice + Noise Reduction'; the other commonly passed-around input preset is MateusRodCosta's 'Improved Microphone (Male voices, with Noise Reduction)'. Neither GitHub gists nor the wiki publish download counts, so no ranking is possible — the honest signal is the 15:1 output-to-input ratio, which says the Linux input-preset space is close to empty and this port has room to define it.\n\nTHREE FINDINGS THAT SURVIVE SCEPTICISM.\n\n1. Warm and bright always ship as a pair (five products). Shipping Warm Voice alone is the clearest gap in the seven.\n2. 'Broadcast' is the most-repeated single name in the market (four products, three times inside Blue VO!CE alone), and it is a processing-depth case, not a tone case — which is why Podcast does not cover it.\n3. Nobody names a voice profile after a destination app. Every vendor names by role, tone, or source. 'Discord' is ours alone.\n\nAND THREE NON-FINDINGS, stated so they do not get re-proposed. Singing / Acoustic Instrument / Loud: one vendor, who dropped them. AM Radio / Megaphone: real, but it lives in a separate character-effects section in both products that have it, and the chain has no low-pass. Mic-type presets: real, but everywhere it appears it is a hardware input selection, not a voice profile.\n\nFinally, a cross-check against the port's own constraint set. The input chain is still almost unbuilt — `crates/fxsound-dsp/src/input/` contains only `mod.rs` and `limiter.rs`, and `InputDspParams` does not exist yet in the tree, so the two gaps the existing research already flags (missing gate `range_db`, unspecified compressor detector) are cheap to close now and expensive after presets are written against them. Nothing recommended here touches `assets/presets/` or the `.fac` path; the shipped 34 and their six checks are unaffected."
+  },
+  {
+   "area": "Microphone-situation coverage of the seven planned input presets (Clean Voice, Streaming, Podcast, Discord, Warm Voice, Studio, Laptop Mic) for the FxSound Linux input chain — HPF → gate → 10-band EQ → de-esser → compressor → makeup → limiter → optional RNNoise",
+   "sources": [
+    {
+     "name": "Jongman, A. — Phonetics of Fricatives (Oxford Research Encyclopedia of Linguistics, in press)",
+     "url": "https://kuppl.ku.edu/sites/kuppl/files/documents/publications/Jongman%20OREL%202024%20Phonetics%20of%20Fricatives.pdf",
+     "what": "The load-bearing phonetic source for the language question. States directly: 'In Polish, the CoG and spectral peak values of the frication noise are very similar for the retroflex and alveopalatal fricatives and distinctly lower than those of the dental fricatives' (citing Nowak 2006; Bukmaier & Harrington 2016). Also establishes that Polish and Mandarin both have a three-way dental/alveopalatal/retroflex sibilant contrast, versus the two-way /s/~/ʃ/ of English, and that Mandarin and Polish /ʂ/ differ substantially in CoG despite looking alike. Extracted locally with pdftotext; WebFetch could not read the PDF."
+    },
+    {
+     "name": "Bukmaier, Harrington, Reubold, Kleber — Synchronic variation in the articulation and acoustics of the Polish three-way place distinction in sibilants (Interspeech 2014)",
+     "url": "https://www.phonetik.uni-muenchen.de/~jmh/papers/Bukmaieretal_IS2014.pdf",
+     "what": "Primary study behind the Jongman statement. Confirms /ʂ/ and /ɕ/ have overlapping centres of gravity distinct from /s/, and that the alveolopalatal CoG sits between /s/ and /ʂ/. Its own analysis band is 500–3500 Hz for the DCT work, i.e. well below where an English-tuned de-esser looks."
+    },
+    {
+     "name": "Spinu, Kochetov et al. — Acoustic classification of Russian plain and palatalized sibilant fricatives (Speech Communication)",
+     "url": "https://academicworks.cuny.edu/kb_pubs/164/",
+     "what": "Establishes Russian's FOUR-way voiceless sibilant contrast (/s/, /sʲ/, /ʂ/, /ɕː/), 1,431 tokens from 10 speakers, with CoG measured over a 500–10000 Hz band at fricative onset/mid/offset. Confirms the anterior-vs-posterior contrast is carried by CoG throughout frication. I could NOT retrieve the per-phoneme Hz table — the one free full-text mirror was unreachable (DNS failure)."
+    },
+    {
+     "name": "Do children better understand adults or themselves? An acoustic and perceptual study of the complex sibilant system of Polish (Journal of Phonetics)",
+     "url": "https://www.sciencedirect.com/science/article/pii/S0095447023000165",
+     "what": "Source of the figure that Polish adult dental /s/ has a first spectral peak and CoG 'around 8000 Hz and higher', clearly separated from /ʂ/ and /ɕ/. This is the number that puts a 5500 Hz de-esser detector below, not on, the Slavic /s/."
+    },
+    {
+     "name": "NHSS: A Speech and Singing Parallel Database",
+     "url": "https://arxiv.org/pdf/2012.00337",
+     "what": "Parallel corpus of the same speakers singing and speaking. Mean dynamic range 33.60 dB for singing versus 30.95 dB for speech, and greater across-utterance variation for singing. The only apples-to-apples singing/speech dynamics number I found."
+    },
+    {
+     "name": "ProSoundWeb — An Examination of Bandwidth, Dynamic Range and Normal Operating Levels",
+     "url": "https://www.prosoundweb.com/an-examination-of-bandwidth-dynamic-range-and-normal-operating-levels/",
+     "what": "Crest factor: normal speech ~12 dB peak factor, musical material 16–20 dB. Supports the claim that a compressor threshold voiced for speech sits wrong for singing."
+    },
+    {
+     "name": "PipeWire — libpipewire-module-echo-cancel",
+     "url": "https://docs.pipewire.org/page_module_echo_cancel.html",
+     "what": "Acoustic echo cancellation on Linux is a separate PipeWire module using the WebRTC AEC, creating its own virtual capture/playback nodes and needing the playback signal as reference. Confirms the game-voice-chat case is an integration, not a preset."
+    },
+    {
+     "name": "WirePlumber — Bluetooth configuration / LC3 codec",
+     "url": "https://pipewire.pages.freedesktop.org/wireplumber/daemon/configuration/bluetooth.html",
+     "what": "HFP capture codecs and rates: CVSD 8 kHz, mSBC 16 kHz, and mono LC3-SWB (HFP 1.9) succeeding mSBC. Basis for the Nyquist arithmetic that kills EQ bands and the de-esser on Bluetooth headsets."
+    },
+    {
+     "name": "In-repo: /home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/docs/voice-presets-research.json",
+     "url": "file:///home/blackixxce/%D0%97%D0%B0%D0%B3%D1%80%D1%83%D0%B7%D0%BA%D0%B8/fxsound-app-main/fxsound-linux/docs/voice-presets-research.json",
+     "what": "116 sources already gathered. Reused rather than re-derived: proximity effect worth up to +16 dB and untrackable by a fixed preset; HFP/mSBC 16 kHz capture already noted as killing bands 8–9; WebRTC 2nd-order HPF measured -3.54 dB @100 Hz, -6.21 @80 Hz, -1.01 @150 Hz; the Discord cascade giving -7.1 dB @100 Hz; band spans at Q=1.5976 (band 1 = 85–157 Hz, band 2 = 157–292 Hz); 5 of 9 community presets put RNNoise FIRST and none put it after the limiter; the missing gate range_db and unspecified compressor detector."
+    }
+   ],
+   "options": [
+    {
+     "name": "Conference / several people at one microphone",
+     "how": "New preset. The seven all assume one talker at a roughly known distance; this is the only case where the chain must level BETWEEN talkers rather than within a phrase. Inverse-square alone gives 6 dB per doubling of distance, so a near talker at 30 cm and a far one at 120 cm differ by 12 dB, and cardioid off-axis rolloff pushes the realistic spread to 15–20 dB. Concretely versus Clean Voice: HPF up to 110 Hz (no proximity effect to preserve, and the reverberant field brings more HVAC and room rumble relative to voice); gate OFF, not merely raised — a gate thresholded for the near talker removes the far talker's speech entirely, which is the classic conference failure; compressor -30 dB / 4:1 with attack 20 ms and release 600 ms so it behaves as an auto-leveller across turns instead of pumping within a sentence; makeup +10 dB to recover the lower average; EQ leaning harder on the reverberant mud and buying back lost intelligibility — 214.311 Hz -2.0, 396.85 Hz -2.5, 2519.84 Hz +2.5. The 2519.84 band matters more here than anywhere else because distance is what costs consonant intelligibility.",
+     "breaks": "Nothing in the format. It does break the implicit assumption behind the shared gate settings (-42 to -48 dB, 2.0:1 in six of seven presets) that a gate is always appropriate, and it is the second preset after Studio to ship with the gate off — which makes the missing range_db field more visible, not less.",
+     "effort": "small",
+     "verdict": "recommend",
+     "why": "Genuinely distinct and completely uncovered. Every one of the seven is a single-talker preset; none of them levels across talkers, and the one stage that would try (the gate) actively destroys the case. The research JSON has exactly one hit for 'conference' across 116 sources, so this was never considered."
+    },
+    {
+     "name": "Headset boom mic at 2–5 cm (close-mic) as distinct from the desk case",
+     "how": "New preset. The existing research already concedes the decisive number: proximity effect is worth up to +16 dB and 'no fixed preset can track it' — which is an argument for splitting the distance case, not for ignoring it, because +16 dB is roughly eight times the ±2 dB the seven presets actually move. Versus the desk-voiced defaults: HPF to 110–120 Hz and 4th order rather than 2nd (the general case chose 2nd order to protect the male fundamental at 80 Hz; at a 120 Hz corner on a mouth-adjacent capsule that concern inverts, and plosive energy at 2–5 cm without a pop filter runs 10–20 dB above speech and lands below 150 Hz); band 1 (115.734 Hz, span 85–157 Hz — the research calls it 'the only genuinely effective LF control in the chain') at -2.5 dB; band 2 (214.311 Hz) at -1.5; de-esser threshold ~4 dB lower than Clean Voice because a capsule at 2–5 cm captures far more sibilant and breath energy; gate threshold can safely go UP to -38 dB since the wanted signal is much hotter relative to the room.",
+     "breaks": "Makes the desk assumption explicit, which means Clean Voice, Podcast and Warm Voice should be documented as desk-distance presets rather than universal. Nothing in the file format or the UI contract changes.",
+     "effort": "small",
+     "verdict": "recommend",
+     "why": "The largest single acoustic variable in the whole input problem, and the seven were, as the brief says, all voiced around the desk case. A 16 dB LF swing dwarfs every EQ move in the draft table, so no amount of re-tuning within one preset can straddle both distances."
+    },
+    {
+     "name": "Narrowband / Bluetooth-headset capture (the gap that was not on the list)",
+     "how": "New preset plus a runtime guard. HFP capture is 8 kHz with CVSD and 16 kHz with mSBC; even LC3-SWB on HFP 1.9 is 32 kHz mono. Computed against the fixed ladder: at 16 kHz capture, bands 8 (8640.48) and 9 (16000) are at or above Nyquist and do nothing; at 8 kHz capture, bands 7 (4666.12), 8 and 9 are dead AND the de-esser detector at 5500–6000 Hz is above Nyquist, so the de-esser is inert in five of the seven presets; even at 32 kHz band 9 sits exactly at Nyquist. The preset: put the presence lift on 1360.79 (+1.5) and 2519.84 (+2.0) where there is still signal, leave 4666.12 and up at 0.0, move the de-esser detector down to 3800 Hz or disable it, compensate the codec's own AGC by dropping makeup to +3 dB, and raise the HPF to 120 Hz since HFP links are noisy below that anyway. The guard: read the capture node's rate and, when Nyquist falls below a band centre, grey that band out in the UI rather than letting the user spend a move on a phantom control.",
+     "breaks": "The guard is the only real break — it makes the EQ UI rate-dependent, so the ten-band widget can no longer assume all ten are always live. The preset itself breaks nothing.",
+     "effort": "medium",
+     "verdict": "recommend",
+     "why": "This was not in the brief's list and is the most concretely broken case I found: on a Bluetooth headset, between two and four of ten EQ bands and possibly the entire de-esser do literally nothing, and these are exactly the users with the worst microphones and the least ability to diagnose it. The research JSON already noticed the 16 kHz fact twice but only as a warning against boosting band 9 — nobody carried it through to the de-esser or to the UI."
+    },
+    {
+     "name": "Noisy room (fan, keyboard, traffic, family)",
+     "how": "Would be a preset raising the gate threshold to track a floor ~20 dB higher. Do not do this. A gate is a time-domain switch: it does nothing about noise DURING speech, which is the actual complaint, and it degrades sharply as the floor rises. With the floor at -50 dB a -45 dB threshold works; move the floor to -30 dB and the threshold must climb to about -25 dB, which is roughly 10 dB below conversational peaks — close enough that it chatters on every word onset and clips the tails of quiet sentence-final syllables. The correct response is the RNNoise switch plus two parameter-set fixes the existing reviewers already raised: move RNNoise from after the limiter to FIRST, before the gate (5 of 9 surveyed community presets put denoise first, none put it after the limiter, and putting it first is what makes a fixed gate threshold meaningful because the gate then sees a cleaned floor), and add the missing range_db so the gate attenuates by a bounded -12 to -16 dB instead of to silence.",
+     "breaks": "Moving RNNoise ahead of the limiter changes the stage order that the draft presets were all voiced against, and re-voicing is needed because every gate threshold in the table was chosen against an un-denoised floor. Adding range_db grows InputDspParams.",
+     "effort": "medium",
+     "verdict": "reject",
+     "why": "Rejected as a preset, kept as a real defect. It is the brief's own question answered against the preset: a 'Noisy Room' preset would ship the exact failure mode — a high gate threshold — as if it were the fix. The gain lives in stage order and a missing field, not in a row of numbers."
+    },
+    {
+     "name": "Language-specific sibilance (Russian, Polish) as a named preset",
+     "how": "Would be a preset with a shifted de-esser. The phonetic evidence is real and it does not point at a preset. English has a two-way /s/~/ʃ/ contrast; Polish has three (dental /s/, retroflex /ʂ/, alveolo-palatal /ɕ/) and Russian four (/s/, /sʲ/, /ʂ/, /ɕː/). Jongman states that in Polish the retroflex and alveopalatal sit together with CoG and spectral peak distinctly LOWER than the dental, and Polish adult /s/ is reported with a first peak and CoG around 8000 Hz and above. So Slavic sibilant energy is bimodal, and a single-band detector at 5500–6000 Hz sits in the valley between the two modes: too low to sit on the Slavic /s/ it is supposed to tame, too high to touch /ʂ/ (ш, sz) — and chasing /ʂ/ downward would duck 2.5–4 kHz, the consonant intelligibility core, which is the one region every preset in the draft table BOOSTS. The right change is one number, not a preset: treat the de-esser detector frequency as a first-class per-preset parameter (it already varies 5500/6000 in the draft) and raise the default toward 7000–7500 Hz, which serves a high English /s/ and a Slavic /s/ both, while leaving the retroflex alone deliberately rather than by accident.",
+     "breaks": "Raising the detector makes the existing de-esser thresholds slightly conservative — less energy reaches the detector, so the -22 to -25 dB thresholds will produce less reduction and want revisiting. Nothing in the format breaks.",
+     "effort": "trivial",
+     "verdict": "reject",
+     "why": "Reject the preset, accept the finding. Users do not self-identify by sibilant inventory and will never pick a 'Russian' preset, but the underlying observation is sound and cheap to act on. Honest limit: I confirmed the Polish claim from an authoritative source and confirmed Russian's four-way contrast and CoG methodology, but I could NOT retrieve per-phoneme Hz values for Russian — the one free full-text mirror was unreachable. Treat the 7000–7500 Hz figure as inferred from the Polish numbers, not measured for Russian."
+    },
+    {
+     "name": "Game voice chat with the game loud in the room",
+     "how": "Would be a preset. It cannot work. The dominant problem is acoustic echo — game audio leaving the speakers and re-entering the microphone — and removing it requires an adaptive filter fed with the playback signal as a reference. No combination of HPF, gate, EQ, de-esser and compressor has access to that reference, so no preset can address it. On Linux the answer is libpipewire-module-echo-cancel with the WebRTC AEC. Worth naming as an architectural opportunity rather than a preset: FxSound Linux already owns both the playback and the capture path, so it is unusually well placed to wire the reference up. Secondary point: most gamers wear headphones, in which case there is no echo at all and the case collapses into Discord plus keyboard clatter — which is the RNNoise row above, not a new preset.",
+     "breaks": "An AEC integration would break the current assumption that the input path is independent of the output path, and it adds a hard dependency on the playback stream being routed through the app.",
+     "effort": "large",
+     "verdict": "reject",
+     "why": "Rejected as a preset because it is categorically not a preset-shaped problem. Kept visible because it is the one case where the port has a structural advantage over a standalone plugin chain and could eventually do something no EasyEffects preset can."
+    },
+    {
+     "name": "Singing rather than speaking",
+     "how": "Mostly already shipped as Studio. Studio is HPF 75 Hz, gate off, -18 dB 2.0:1 with 25/200 ms, makeup +1.5, de-esser off — which is very nearly what singing wants, and the gate being off is the single most important thing (a gate is actively harmful on sustained notes and decays, which is why the brief was right to ask). Singing's measured dynamic range is 33.60 dB against 30.95 dB for speech, and crest factor runs 16–20 dB against ~12 dB for speech, so the remaining honest deltas are a slower release (400 ms rather than 200) and ratio staying at 2.0:1. The ONE thing no speech preset can give: the HPF. Speech fundamentals floor at about 85 Hz, which is why 75–80 Hz is safe everywhere in the draft — but sung fundamentals go lower, to E2 at 82.4 Hz for a bass and C2 at 65.4 Hz for a basso profondo. Studio's 75 Hz corner therefore cuts a bass singer's fundamental, and Studio is precisely the preset a singer will reach for. Fix is a 40 Hz corner (or off) on a Studio variant, not a new preset family.",
+     "breaks": "Dropping the corner to 40 Hz lets desk rumble and HVAC back into the compressor detector and eats limiter headroom — acceptable in a preset that already has the gate and de-esser off and is explicitly the least-processing option, unacceptable as a general default.",
+     "effort": "trivial",
+     "verdict": "viable",
+     "why": "Genuinely distinct in exactly one parameter and identical to Studio in the rest, so it fails the brief's own test for a separate preset — but the bass-fundamental finding is real and currently mis-served, and it is a one-number fix to an existing preset."
+    },
+    {
+     "name": "Recording for later editing versus live",
+     "how": "Already shipped as Studio in its EQ and dynamics — gate off, de-esser off, 2:1, flat EQ, +1.5 makeup is exactly 'the least processing that still captures cleanly'. But two numbers are wrong for the recording case and right for every other preset, which is worth correcting rather than duplicating. First, the -3.0 dBFS ceiling: the draft justifies it because the output is re-encoded by a lossy codec (Opus for Discord, AAC for streaming) that overshoots the sample peak it was given. A recording path is not lossy-encoded — it lands in WAV or FLAC in Ardour, Reaper or Audacity — so the justification does not apply and the limiter should be a safety catch at -1.0 dBFS rather than a working ceiling at -3.0. Second, makeup +1.5 dB: an editor doing their own gain staging wants the capture untouched, so 0.0 dB is the honest value.",
+     "breaks": "Breaks the current clean claim that all presets share a -3.0 dBFS ceiling — the doc's third headline finding would need a stated exception. That is a documentation cost, not a compatibility one.",
+     "effort": "trivial",
+     "verdict": "viable",
+     "why": "Distinct in intent and already served in substance; the delta is two numbers on an existing preset, not a new one. Rejecting it as a preset while fixing the two numbers is the correct trade."
+    },
+    {
+     "name": "Voice pitch: deep male ~85–100 Hz against high ~200–250 Hz",
+     "how": "No preset. The existing research already settled this with measured numbers rather than assumption, and I found nothing to contradict it. Male F0 runs 85–180 Hz and female 165–255 Hz; the 80 Hz corner in Clean Voice and Podcast sits deliberately below the male floor, and the band spans at Q=1.5976 put band 1 (85–157 Hz) on the male fundamental and band 2 (157–292 Hz) on the female, which is why the draft sets band 0 to exactly 0.0 dB everywhere. The one genuine pitch failure is already logged as an objection: Streaming at 100 Hz and Discord at 90 Hz cascade with the VoIP stack's own 2nd-order 100 Hz Butterworth (WebRTC's measured -3.54 dB @100 Hz), giving about -7.1 dB at 100 Hz on a deep male voice.",
+     "breaks": "Nothing — this is a no-op recommendation.",
+     "effort": "trivial",
+     "verdict": "reject",
+     "why": "Rejected because a fixed 80 Hz high-pass demonstrably serves both pitch classes, and because users cannot self-identify by fundamental frequency anyway. The residual problem is a per-preset corner already on the objection list, not a missing situation."
+    }
+   ],
+   "recommendation": "Add three presets, fix four numbers, and add one runtime guard — do not add a preset for the other five cases.\n\nShip three genuinely new presets. **Conference** is the only one that levels between talkers rather than within a phrase: gate off, compressor -30 dB / 4:1 with a 600 ms release, HPF 110 Hz, makeup +10 dB, and a harder mud cut with 2519.84 Hz at +2.5 to buy back the intelligibility that distance costs. **Headset** splits the close-mic case off from the desk case that all seven were voiced around, because proximity effect is worth up to +16 dB and no single preset can straddle a swing eight times larger than any EQ move in the draft table: HPF 120 Hz at 4th order, band 1 at -2.5 dB, de-esser threshold 4 dB lower, gate threshold raised to -38 dB. **Narrowband** covers Bluetooth headsets, and is the case nobody had on the list: keep the presence lift on 1360.79 and 2519.84, leave everything from 4666.12 up at 0.0, drop the de-esser detector to 3800 Hz, makeup +3 dB.\n\nPair Narrowband with the one guard worth building: read the capture node's rate and grey out any EQ band whose centre is at or above Nyquist. The arithmetic is not marginal — at 16 kHz capture, bands 8 and 9 are dead; at 8 kHz, bands 7, 8 and 9 are dead and the de-esser detector at 5500–6000 Hz is above Nyquist, so the de-esser is silently inert in five of the seven presets. Users on the worst microphones currently get phantom controls.\n\nThen four number changes on presets that already exist, instead of four presets that would duplicate them. Raise the de-esser detector default toward 7000–7500 Hz: Jongman's Polish data puts dental /s/ around 8000 Hz and the retroflex and alveolo-palatal distinctly lower, so a 5500 Hz detector sits in the valley between the two Slavic modes and chasing the retroflex downward would duck the 2.5–4 kHz region every preset deliberately boosts. Give Studio a variant with the HPF at 40 Hz, because sung fundamentals reach E2 at 82.4 Hz and a bass reaches C2 at 65.4 Hz, while Studio's 75 Hz corner is the preset a singer will actually reach for. Set Studio's ceiling to -1.0 dBFS and its makeup to 0.0 dB, since the -3.0 dBFS rationale is lossy-codec overshoot and a recording path is not lossy-encoded.\n\nFinally, act on the noisy-room case as stage order rather than as a preset: move RNNoise from after the limiter to first, ahead of the gate, and add the missing gate `range_db`. This was already raised by the existing reviewers and the noisy-room analysis independently lands on it — a preset that merely raises the gate threshold would ship the failure mode as the fix. Note this forces re-voicing of every gate threshold in the draft table, since all of them were chosen against an un-denoised floor.",
+   "notes": "Where the evidence is thinner than it looks. The Russian sibilance conclusion is INFERRED, not measured: I confirmed Russian's four-way contrast and the CoG methodology from Spinu & Kochetov, and confirmed the Polish claim from an authoritative encyclopedia chapter, but the one free full-text mirror carrying per-phoneme Hz values for Russian was unreachable (DNS failure). The 7000–7500 Hz detector figure is extrapolated from Polish. If that number is going to be defended in a shipped preset, someone should retrieve the Kochetov table properly or measure a few Russian speakers directly. Everything else here is either from a retrieved source or arithmetic I ran.\n\nTwo source-quality notes. Both phonetics PDFs defeated WebFetch (it reported them as corrupted binary); `pdftotext` read them fine from the locally saved copies, so that is the route for any follow-up. And the singing crest-factor comparison leans on a general speech-versus-music figure (~12 dB against 16–20 dB) rather than a singing-specific one; only the 33.60 vs 30.95 dB dynamic-range pair is a true parallel measurement of the same speakers.\n\nRelevant files. The prior research is at /home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/docs/voice-presets-research.md and its machine-readable record at /home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/docs/voice-presets-research.json — I reused its proximity, WebRTC high-pass, band-span and RNNoise-ordering findings rather than re-deriving them, as instructed. Note the draft table there lists SIX presets, not the seven in the brief: Laptop Mic has no row and no reviewed numbers, and Warm Voice is flagged as never reviewed at all. So of the seven named, two are less settled than the framing suggests.\n\nImplementation reality check: the input chain does not exist in code yet. /home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-dsp/src/effects/ contains only the output effects (ambience, bass, dynamic_boost, fidelity, surround), and /home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-preset/src/lib.rs is the .fac output-preset parser only. `InputDspParams` is not written yet. That is good news for the two parameter-set gaps — the compressor's unspecified detector and the gate's missing `range_db` — since both can be designed in rather than retrofitted, and my Narrowband and Conference recommendations both assume the gate can be genuinely disabled per preset rather than merely thresholded away. The .fac byte-for-byte round-trip contract is not at risk from any of this: input presets are a new format and touch none of it.\n\nOne thing I deliberately did not do: the brief asked which situations the seven serve badly, and five of my nine answers are \"not a preset\". That is the finding, not an evasion — three of those five (RNNoise ordering, the de-esser detector, the AEC reference) are places where the preset layer is the wrong layer, and shipping presets for them would encode the bug as a product feature."
+  },
+  {
+   "area": "Objective measurement of genre-preset voicing: what can actually be measured through the real engine, what reference data exists as numbers, which corpora are licence-clean for this AGPL repo, and where the measurable ends",
+   "sources": [
+    {
+     "name": "Pestana, Ma, Reiss, Barbosa, Black — \"Spectral Characteristics of Popular Commercial Recordings 1950–2010\" (AES 135, paper 8960)",
+     "url": "https://aes.org/publications/elibrary-page/?id=17010",
+     "what": "The canonical genre/era spectral corpus work (~800 number-one singles). Headline result is published as text and figures — 'a consistent linear decay of about 5 dB per octave from 100 to 4000 Hz'. The per-genre curves exist only as plots behind the AES paywall. NOT available as numbers."
+    },
+    {
+     "name": "Ma, Reiss, Black — \"Implementation of an intelligent equalization tool using Yule-Walker for music mixing and mastering\" (AES 134)",
+     "url": "https://aes.org/publications/elibrary-page/?id=16792",
+     "what": "Derives a mastering target curve from the same corpus. Same access problem; a third-party MATLAB reimplementation exists (github.com/bombsandbottles/Intelligent-Equalization) but carries the author's own curve, not the published one."
+    },
+    {
+     "name": "Elowsson & Friberg — \"Long-term Average Spectrum in Popular Music and its Relation to the Level of the Percussion\" (AES 142, 2017)",
+     "url": "https://www.aes.org/e-lib/browse.cfm?elib=18638",
+     "what": "The single most important source for the ceiling argument: LTAS variation between genres is mainly a side-effect of percussive prominence, not of genre-specific tonal intent. Constrains how much a per-genre reference curve can ever prove."
+    },
+    {
+     "name": "AcousticBrainz data dumps (2022-06-23, final)",
+     "url": "https://acousticbrainz.org/download",
+     "what": "29,460,584 submissions, still downloadable. Low-level CSV feature dumps are 1 GB (lowlevel), 1 GB (rhythm), 843 MB (tonal) zstd; full JSON dumps in 30 archives. Data is CC0. Contains per-track barkbands (27), melbands (40), erbbands (40) energies with mean/var statistics — the only per-track spectral summary of *commercial* masters that is downloadable as numbers under a licence this repo can vendor."
+    },
+    {
+     "name": "Essentia MusicExtractor descriptor reference",
+     "url": "https://essentia.upf.edu/streaming_extractor_music.html",
+     "what": "Defines what is in an AcousticBrainz lowlevel record: barkbands = spectral energy in 27 Bark bands, plus crest/flatness/skewness/spread. Confirms barkbands.mean is usable as a coarse per-track LTAS."
+    },
+    {
+     "name": "FMA: A Dataset For Music Analysis (Defferrard et al., ISMIR 2017) + repository",
+     "url": "https://github.com/mdeff/fma",
+     "what": "106,574 CC-licensed tracks, 16,341 artists, 161-genre hierarchy. Subsets: small 8k/7.2 GiB (8 balanced genres), medium 25k/22 GiB (16 genres), large 106k/93 GiB (30 s clips), full 879 GiB. MP3, mostly 44.1 kHz stereo, 320 kbit/s nominal (263 average). Metadata is CC BY 4.0; audio is per-artist CC, and tracks.csv carries a per-track `license` column."
+    },
+    {
+     "name": "MTG-Jamendo dataset",
+     "url": "https://mtg.github.io/mtg-jamendo-dataset/",
+     "what": "55k full tracks, 3,777 hours, 320 kbit/s, 87 genre tags. Audio is CC; code Apache-2.0; but METADATA IS CC BY-NC-SA 4.0 — cannot be vendored into an AGPL-3.0 repo."
+    },
+    {
+     "name": "AcousticBrainz Genre Dataset (MediaEval)",
+     "url": "https://mtg.github.io/acousticbrainz-genre-dataset/",
+     "what": "Genre ground truth from AllMusic, Discogs, Last.fm and Tagtraum joined to AcousticBrainz features. Discogs/Lastfm/Tagtraum are open; AllMusic needs a signed agreement. Licensed CC BY-NC-SA 4.0 — usable locally, not vendorable here."
+    },
+    {
+     "name": "MUSDB18 / MedleyDB",
+     "url": "https://sigsep.github.io/datasets/musdb.html",
+     "what": "150 and 122 tracks, stems corpora, academic use only, mostly CC BY-NC-SA. Too small, wrong shape (stems not masters), and licence-incompatible for vendoring. Reject for this purpose."
+    },
+    {
+     "name": "iZotope Tonal Balance Control target curves",
+     "url": "https://www.izotope.com/products/tonal-balance-control",
+     "what": "30+ genre/subgenre curves in v3 (12 in v2), built in-house from 'thousands of masters'. No numbers published anywhere; the curves live inside a proprietary plugin. Same for Har-Bal. Unusable as a reference source."
+    },
+    {
+     "name": "MoSQITo (Eomys)",
+     "url": "https://github.com/Eomys/MoSQITo",
+     "what": "Apache-2.0 (verified via the GitHub API), Python. Implements ISO 532-1 loudness and DIN 45692 sharpness with validation procedures. The nearest thing to a standardised proxy for 'bright/harsh', and licence-compatible with AGPL-3.0."
+    },
+    {
+     "name": "ccMixter",
+     "url": "https://ccmixter.org/about",
+     "what": "~10k CC BY / CC BY-NC samples and tracks, free-form genre tags, no curated taxonomy. Fallback only."
+    }
+   ],
+   "options": [
+    {
+     "name": "Analytic EQ response only (what ships today)",
+     "how": "crates/fxsound-dsp/tests/shipped_presets.rs already does this: impulse through GraphicEq, realfft, 29 third-octave points, pairwise worst-case dB difference. It proves distinctness and catches band summing.",
+     "breaks": "Nothing — it is the current baseline. But it measures the EQ block alone. It never sees Dynamic Boost's auto-gain and −0.3 dBFS ceiling, the leveller, Bass, Ambience or Surround, all of which are program-dependent and none of which are bypassable. So what it measures is not what a listener gets.",
+     "effort": "trivial",
+     "verdict": "viable",
+     "why": "Keep it. It answers 'are these twelve different from each other' and it answers it well. It cannot answer 'is Jazz jazz', and no extension of an impulse test can, because the stages that colour the result are nonlinear."
+    },
+    {
+     "name": "Genre-shaped synthetic program material through the FULL engine, scored as a 12×12 confusion matrix",
+     "how": "New analysis module (reuse realfft 3.5.0, already a dep; no new runtime deps). Generate deterministic seeded material per genre: pink noise filtered to that genre's reference shape, plus a noise-burst train at a genre-typical crest factor to wake the dynamics stages. Render each of the 12 presets over each of the 12 materials through Engine::process at 48 kHz/1024-frame blocks. Measure: LTAS on the 29-point third-octave grid already in shipped_presets.rs, level-normalised to a shape (subtract the band mean); BS.1770-4 integrated LUFS (K-weighting is two biquads — biquad.rs exists); 4× oversampled true peak. Statistic: ΔD(P,g) = D(out,R_g) − D(in,R_g) after loudness-matching out to in, where D is weighted RMS dB error to the reference shape. The test asserts that for each genre column, the minimum of ΔD is the preset of that name, and reports the margin over the runner-up.",
+     "breaks": "Nothing in the compatibility contract — no .fac file changes, no engine changes. It adds one data asset (12 × 29 floats) that must be regenerated if the reference method changes, and a test whose failure means 'this preset is not the best fit for its own genre', which will be uncomfortable the first time it runs.",
+     "effort": "medium",
+     "verdict": "recommend",
+     "why": "This is the one that can be built and run today, entirely offline, in CI, in seconds, with no download and no licence question. And it is a genuinely stronger claim than the current tests: it exercises the whole nonlinear chain, and it is *relative*, so it survives the reference curve being only approximately right. Stationary noise under-exercises the transient behaviour — that is what the burst train is for, and it is still weaker than real music."
+    },
+    {
+     "name": "Render a real genre-labelled corpus (FMA) and measure the same ΔD over thousands of tracks",
+     "how": "Filter fma_medium's tracks.csv (metadata CC BY 4.0) by `genre_top` and by the `license` column down to CC-BY / CC-BY-SA / CC0 tracks only. Decode outside the build with `ffmpeg -i x.mp3 -ac 2 -ar 48000 -f s16le -` piped to a new workspace member `crates/fxsound-voicing` (publish = false), so fxsound-dsp keeps its single dependency. Per track: render bypass and preset, loudness-match, compute ΔD, ΔLUFS, ΔPLR, clipped-sample count. Aggregate as median plus a bootstrap CI over tracks, and produce the 12×12 matrix plus docs/genre-voicing-measurement.{md,json} in the same style as the existing voice-presets research pair.",
+     "breaks": "Nothing in the repo. Costs 22–93 GiB of download and hours of render. Never redistribute audio or renders — only derived numbers, with FMA's CC BY 4.0 attribution recorded. Coverage is the real break: FMA is indie/amateur CC material, not commercial masters, so it was mastered by different conventions than the Windows presets were voiced against.",
+     "effort": "large",
+     "verdict": "viable",
+     "why": "The honest version of the test, and the only one where the material is real music. Run it once offline, check in the numbers, do not put it in CI. Note the coverage gaps up front: Metal and Trap are thin subgenres under Rock and Hip-Hop in FMA's 161-genre tree, and 70's / 80's are not genres at all — FMA has no era coverage, so those two presets are simply not testable by rendering."
+    },
+    {
+     "name": "Build the per-genre reference curves from AcousticBrainz barkbands (CC0, commercial masters)",
+     "how": "Pull acousticbrainz-lowlevel-features-20220623-lowlevel.tar.zst (1 GB), take lowlevel.barkbands.mean (27 linear energies per track), convert to dB, normalise each track to a shape, join to genre by MBID using MusicBrainz's own CC0 genre/tag data (NOT the AcousticBrainz Genre Dataset, which is CC BY-NC-SA), and take per-genre medians plus percentile bands. Resample the 27 Bark centres onto the 29-point third-octave grid. Same join by release year gives era curves for the 70's / 80's presets.",
+     "breaks": "Nothing. Two accuracy caveats that must be written down beside the numbers: the analyses were run by users on their own files of unknown encoding quality, and MusicExtractor applies replay gain, so absolute level is not comparable across tracks — which is exactly why every comparison in this proposal is shape-only and loudness-matched.",
+     "effort": "medium",
+     "verdict": "recommend",
+     "why": "This is the answer to 'which genre reference spectra exist as numbers': none do, so make one. This is the only route to a reference built from *commercial* masters — the material the presets were actually voiced against — under a licence (CC0) that an AGPL repo can vendor without conditions. 27 Bark bands is coarser than 29 third-octaves and the resample is an approximation; say so in the asset header."
+    },
+    {
+     "name": "Vendor a published or commercial reference curve (Pestana/Reiss, Ozone Tonal Balance, Har-Bal)",
+     "how": "Would mean lifting the AES paper's per-genre curves from figures, or extracting iZotope's or Har-Bal's targets from their binaries.",
+     "breaks": "Licence, and accuracy. The AES per-genre curves exist only as plots behind a paywall; digitising a plot into a repo asset is both a rights problem and a precision problem. iZotope's 30+ curves and Har-Bal's are in-house, undocumented and embedded in proprietary plugins — extracting them into an AGPL-3.0 repo is not defensible.",
+     "effort": "small",
+     "verdict": "reject",
+     "why": "There is exactly one usable number in this whole literature that is public: the ≈ −5 dB/octave decay from 100 Hz to 4 kHz, and it is a global curve across all popular music, not a per-genre one. Use it as a sanity check on a self-derived reference (does the derived curve slope roughly −5 dB/oct through the midband?) and nothing more."
+    },
+    {
+     "name": "Psychoacoustic proxies for the words that have no spectrum (sharpness, roughness, pumping, image width)",
+     "how": "DIN 45692 sharpness in acum and ISO 532-1 loudness via MoSQITo (Apache-2.0, licence-compatible) as an offline Python check on rendered pairs; EBU R128 LRA and PLR from the LUFS code for leveller pumping; inter-channel correlation and a Gerzon energy-vector estimate for what Surround does to the image.",
+     "breaks": "Nothing in the repo — these run on rendered output, offline. Implementing ISO 532-1 natively in Rust would be a large lift for little gain; call MoSQITo from a script instead.",
+     "effort": "medium",
+     "verdict": "viable",
+     "why": "Worth doing for the ceiling cases, and worth being blunt about what it buys. Sharpness in acum is a standardised measure of a signal property that correlates with the word 'bright' on stationary content. It is not a measure of whether a cymbal sounds harsh in a mix. Report the number, never let it decide."
+    },
+    {
+     "name": "Blind A/B harness — I cannot hear, but I can make the user's listening cheap and unbiased",
+     "how": "A `--ab` mode on the measurement tool: take N tracks, render preset vs bypass (or preset vs preset), loudness-match to identical integrated LUFS, write them as randomly-ordered pairs into a folder with a hidden key file. The user listens, writes a choices file, the tool scores it against the key with a binomial p-value.",
+     "breaks": "Nothing.",
+     "effort": "small",
+     "verdict": "recommend",
+     "why": "This is the direct answer to 'is there a way for you to listen': no, there is not, and there is no proxy that closes the gap. But loudness-matching and order-randomisation are exactly where informal listening goes wrong — a preset that is 2 dB louder wins every sighted comparison — and those are mechanical, so I can do them. Highest value per hour of anything in this list."
+    }
+   ],
+   "recommendation": "Build it in three layers, cheapest first.\n\n**Layer 1 — an analysis module in the workspace, no new runtime deps, no downloads.** Add `ltas_thirds()` (Welch, Hann, 50% overlap, 8192-point realfft, power summed into the 29 third-octave centres already tabulated in `crates/fxsound-dsp/tests/shipped_presets.rs:167`), `lufs_integrated()` (BS.1770-4: K-weighting as two biquads on top of the existing `crates/fxsound-dsp/src/biquad.rs`, 400 ms blocks at 75% overlap, −70 LUFS absolute gate, −10 LU relative gate), `true_peak_dbtp()` (4× oversample), and PLR = true peak − integrated LUFS. Everything else in this proposal is built out of those four.\n\n**Layer 2 — the falsifiable test, offline and in CI.** Check in `assets/reference/ltas-<genre>.csv`: 12 genres × 29 third-octave values, level-normalised to shapes, derived in Layer 3 and carrying a provenance header. Generate deterministic seeded program material per genre (pink noise shaped to that genre's reference, plus a noise-burst train at a genre-typical crest factor so the dynamics stages actually engage), render all 12 presets across all 12 materials through the real `Engine`, loudness-match output to input, and compute ΔD(P,g) = D(out,R_g) − D(in,R_g) where D is the weighted RMS dB error between level-normalised shapes over 40 Hz–16 kHz.\n\nThe test asserts one thing: **for each genre column, the preset whose ΔD is lowest is the preset of that name**, and it reports the margin over the runner-up. That claim is relative, so it holds up even when the reference curve is only approximately right — which it will be. Report, don't assert: ΔLUFS, ΔPLR, spectral centroid shift, clipped-sample count, and the spread of ΔD across materials. The whole matrix runs in seconds.\n\nThis is strictly stronger than what `shipped_presets.rs` can do today, because it sees Dynamic Boost's auto-gain and its −0.3 dBFS ceiling, the leveller, Bass, Ambience and Surround — none of which an impulse through `GraphicEq` ever touches, and none of which are bypassable.\n\n**Layer 3 — the reference curves, derived once, offline.** There is no per-genre reference spectrum available as numbers anywhere: Pestana/Reiss is figures behind the AES paywall, iZotope's and Har-Bal's are proprietary and embedded, and the Million Song Dataset's 12 Echo Nest timbre coefficients are not invertible to a dB spectrum. So derive one. Primary: AcousticBrainz's `lowlevel.barkbands.mean` (27 Bark-band energies per track), CC0, ~29.5M tracks, 1 GB zstd, joined to genre and release year by MBID through MusicBrainz's own CC0 genre data — commercial masters, the material the presets were actually voiced against, under a licence this AGPL repo can vendor outright. Cross-check against a second reference derived by rendering licence-filtered FMA audio (metadata CC BY 4.0, per-track `license` column, decode via an external ffmpeg pipe so `fxsound-dsp` keeps its single dependency). Sanity-check both against the one public number in the literature: roughly −5 dB/octave from 100 Hz to 4 kHz.\n\n**And Layer 0, which is the smallest and probably the most useful: the blind A/B harness.** I cannot hear the presets, and nothing above changes that. What I can do is remove the two things that make informal listening lie — render loudness-matched pairs at identical integrated LUFS, in randomised order, with a hidden key — and score the user's answers with a binomial test. Twelve presets, ten trials each, is an evening's work for a person who can hear, and it is the only step in this entire proposal that measures sound rather than a proxy for sound.\n\nBuild order: Layer 0 and Layer 1 first (both small, both immediately useful), then Layer 3's AcousticBrainz extraction, then Layer 2's test once there are curves to test against.",
+   "notes": "**What `process_wav.rs` can do today, and what it is missing.** It reads 16-bit PCM WAV only (it walks the chunk list properly, so real files with LIST/fact chunks work), applies a `.fac` preset or individual effect flags on the GUI's 0..10 scale, runs the real `Engine` in 1024-frame blocks exactly as an audio callback would, prints peak L/R from `engine.meters()` and a count of samples that exceeded full scale, and writes the result back. To render a corpus it needs: MP3/24-bit/float input (or an external ffmpeg pipe — cleaner, keeps `fxsound-dsp`'s single dependency intact), a bypass A/B render in one pass, LUFS and true-peak measurement, third-octave LTAS output, loudness-matching, and batch mode over a file list. None of that requires touching the engine.\n\n**Three honest limits, stated plainly.**\n\n*First, matching a genre reference proves 'not wrong', never 'right'.* A preset that lands exactly on the genre mean is average, and average is not what a preset is for — a preset is a deliberate colour. The strongest true statement this method can ever produce is: \"the Jazz preset moves jazz-labelled material toward the jazz reference more than the other eleven presets do, by a margin of X dB with a CI of Y.\" That is a real claim and it is worth having. It is not \"Jazz sounds like jazz\".\n\n*Second, the between-genre signal may be small and partly the wrong signal.* Elowsson & Friberg (AES 142, 2017) found that LTAS variation between genres is mainly a side-effect of percussive prominence. So a per-genre LTAS reference partly encodes \"how much drums this genre has\", not \"how this genre should be EQ'd\", and the between-genre spread is likely small against the within-genre spread. If the confusion matrix's diagonal margin falls inside its bootstrap CI, the correct conclusion is \"these presets are provably distinct but not demonstrably genre-targeted\" — and reporting that is a better outcome than a green test.\n\n*Third, some judgements have no proxy at all.* \"Does it sound harsh\", \"does the vocal sit right\", \"is that boost musical or resonant\", \"does the leveller pump\", \"does Surround widen or hollow it\" — none of these are reachable. DIN 45692 sharpness, ECMA-418-2 roughness, EBU R128 LRA and inter-channel correlation each measure a signal property that correlates with one of those words on constrained material. They are worth computing and worth never letting decide anything.\n\n**Repo-specific licence findings** (this repo is AGPL-3.0-or-later, `Cargo.toml:16`): AcousticBrainz data is CC0 — vendor freely. FMA metadata is CC BY 4.0 — vendorable with attribution; FMA audio is per-artist CC with a `license` column to filter on, and must never be redistributed, nor must renders of it. MTG-Jamendo metadata and the AcousticBrainz Genre Dataset are both CC BY-NC-SA 4.0 — usable as local scratch, **not** vendorable into this repo. MUSDB18 and MedleyDB are academic-use-only stems corpora — reject on all three of size, shape and licence. MoSQITo is Apache-2.0 (verified via the GitHub API) and compatible.\n\n**Two presets this cannot reach at all.** \"70's\" and \"80's\" are eras, not genres. No open corpus carries era-labelled renderable audio — FMA's release dates are upload dates for contemporary CC material. AcousticBrainz joined to MusicBrainz release years can give era *reference curves* (and era trend is precisely what the Pestana corpus was about), so those two presets can be checked against a curve but never by rendering era-appropriate material. Say so in the report rather than quietly testing them against something else.\n\n**Structural suggestion:** follow the pattern already set by `docs/voice-presets-research.{md,json}` — a machine-readable JSON carrying every source, every derived number and every caveat, with a short human-readable MD beside it. The reference curves themselves belong in `assets/reference/` as CSV with a provenance header naming the dump date, the join, the track count per genre and the licence.\n\n**Relevant files:** `/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-dsp/examples/process_wav.rs`, `/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-dsp/tests/shipped_presets.rs` (the `THIRD_OCTAVES` table and `response_db()` are directly reusable), `/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-dsp/src/biquad.rs`, `/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-dsp/src/spectrum.rs` (its realfft windowing is a working model to copy, though the analyser itself is a display meter and the wrong tool for measurement), `/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/docs/voice-presets-research.md`.\n\nThe twelve genre presets are: 70's, 80's, Alternative Rock, Classical, Classic Rock, Jazz, Metal, Modern Country, Modern Rock, Pop, R&B, Trap — all in `/home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/assets/presets/BonusPresets/`."
+  },
+  {
+   "area": "Listening harness for judging the twelve revoiced genre presets (fxsound-linux)",
+   "sources": [
+    {
+     "name": "process_wav example (in-repo)",
+     "url": "file:///home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-dsp/examples/process_wav.rs",
+     "what": "Already does everything the offline path needs: --preset FILE, block-by-block Engine::process with BLOCK = 1024, 16-bit PCM in/out, peak + clip report. Measured: 0.097 s to render 30 s of 48 kHz stereo in release (~300x realtime). It needs no new code for this harness."
+    },
+    {
+     "name": "shipped_presets.rs (in-repo)",
+     "url": "file:///home/blackixxce/Загрузки/fxsound-app-main/fxsound-linux/crates/fxsound-dsp/tests/shipped_presets.rs",
+     "what": "The six existing checks and the constants they encode (AMBIENCE_MIN_AUDIBLE_MIDI = 39, DYNAMIC_BOOST_SATURATION_MIDI = 70). These are the objective half; the listening harness is the subjective half and should not duplicate them."
+    },
+    {
+     "name": "mpv manual",
+     "url": "https://mpv.io/manual/master/",
+     "what": "The `run` command (spawns a process from a keybinding), `cycle aid` / `set aid N` for instant position-preserving audio-track switching, --input-conf, --loop-file. Verified live over --input-ipc-server: `run` wrote the vote file, `cycle aid` moved to track 2 while time-pos kept running at 5.79 s."
+    },
+    {
+     "name": "ffmpeg filter documentation",
+     "url": "https://ffmpeg.org/ffmpeg-filters.html",
+     "what": "ebur128 (integrated LUFS measurement), volume=NdB (the matching gain), and Matroska muxing of several audio streams with per-stream title metadata. ffmpeg n9.0.1 is installed; loudnorm, ebur128, replaygain and volumedetect are all present."
+    },
+    {
+     "name": "ABX test (method reference)",
+     "url": "https://en.wikipedia.org/wiki/ABX_test",
+     "what": "What ABX actually establishes — discriminability, not preference. Relevant because it is the wrong question for eleven of the twelve presets and the right one for the narrow duplicate-voicing case."
+    },
+    {
+     "name": "Lacinato ABX/Shootout-er",
+     "url": "https://lacinato.com/cm/software/othersoft/abx",
+     "what": "Free cross-platform (Linux) blind tester with a 'shootout' mode: shuffled anonymised list, fine-grained scoring, keeps play position when jumping between files. The ready-made fallback if the mpv script is not wanted."
+    },
+    {
+     "name": "Open Goldberg Variations, Kimiko Ishizaka",
+     "url": "https://archive.org/details/OpenGoldbergVariations",
+     "what": "Verified via the archive.org metadata API: licence CC0 1.0, 31 tracks in 24-bit FLAC, VBR MP3 and Ogg. The Classical material, with no licence question at all."
+    },
+    {
+     "name": "blocsonic netlabel collection",
+     "url": "https://archive.org/details/blocsonic",
+     "what": "Verified via the search API: 425 items, CC-licensed, modern production, hip-hop / funk / soul / rock. The realistic free source for R&B, Trap, Pop and Modern Rock material."
+    },
+    {
+     "name": "archive.org advancedsearch API",
+     "url": "https://archive.org/advancedsearch.php",
+     "what": "Scriptable JSON search used to pin material identifiers. Caveat I measured rather than assumed: subject tagging is unreliable — `collection:netlabels AND subject:\"country\"` returned field recordings from Crete as the top hit. Pin identifiers once into a lockfile; do not search per run."
+    }
+   ],
+   "options": [
+    {
+     "name": "Offline render + loudness match + blind three-way preference in one mpv window (dry / shipped / revoiced)",
+     "how": "No Rust changes. Three files under scripts/voicing/. (1) render.sh: for each of the twelve genres take material/<genre>.wav (48 kHz, 16-bit, stereo, a 45 s excerpt from a busy passage), render it twice with target/release/examples/process_wav --preset <old.fac> and --preset <new.fac>, measure all three with `ffmpeg -filter:a ebur128`, attenuate the two processed renders to the dry file's integrated LUFS with volume=NdB, then `ffmpeg -map 0:a -map 1:a -map 2:a -c:a flac -metadata:s:a:N title=\"1|2|3\"` into one <genre>.mkv with the three tracks in a per-genre shuffled order, writing the shuffle into key.tsv. (2) session.conf, an mpv --input-conf: a/s/d → `set aid 1|2|3`; 1/2/3 → `run /bin/sh -c 'echo ... >> votes.tsv'` then playlist-next; b/h/t/p append a flag (boomy / harsh / thin / pumping) to the current line; --loop-file=inf so the excerpt repeats while they switch. (3) unblind.sh joins votes.tsv with key.tsv into docs/voicing-verdicts.tsv. Every piece is verified working on this machine: the render, the LUFS match (three files landed on -26.3 LUFS exactly, one pass, no iteration), the three-track mkv (mpv lists aid 1/2/3), and mpv's `run` writing a vote file while playback continues.",
+     "breaks": "Nothing in the shipped code — it adds scripts and one committed verdicts file. The only contract it touches is that render.sh must read the .fac files through fxsound_preset::parse, so it inherits the byte-for-byte round-trip requirement rather than threatening it. It does not exercise the PipeWire path, the output device selection, or preset switching in the running app.",
+     "effort": "small",
+     "verdict": "recommend",
+     "why": "It is the only option that removes the two biases that would otherwise make the whole exercise worthless. Measured on one identical input: dry -26.3 LUFS, Metal -23.0, Pop -20.3, Jazz -18.9 — a 7.4 LU spread between presets and 1.9 to 7.4 LU above dry, because Dynamic Boost is never bypassed. Unmatched, the listener is grading loudness and the loudest preset wins every time. And because they authored the new voicings, sighted comparison grades their own intent. Both fixes cost a few lines. The render itself is free (0.097 s per 30 s per preset), so the expensive resource — their attention — is spent only on listening."
+    },
+    {
+     "name": "Live A/B through the running app on a keybind",
+     "how": "A Hyprland bind cycling `fxsound --preset <name>` over the control socket at $XDG_RUNTIME_DIR/fxsound while music plays, using the already-shipped --preset / --next-preset options. Roughly ten lines in packaging/hyprland.conf.example.",
+     "breaks": "Nothing. But it cannot level-match (the gain difference is the thing being switched), cannot blind (the GUI and the notification name the preset), and the comparison is sequential with a preset-change gap rather than instantaneous at the same bar of music.",
+     "effort": "trivial",
+     "verdict": "viable",
+     "why": "Keep it as the second, unblinded pass — not the instrument of judgement. It catches what offline rendering structurally cannot: the real output chain (HECATE G2000 PRO vs Ryzen analog), clicks or dropouts on preset change, and how a voicing wears over an hour of varied material rather than 45 seconds. Offline catches what live cannot: level matching, blinding, position-preserving switching, repeatability, and renders that can be measured afterwards and correlated with the verdict. Note that offline is not an approximation of live here — PipeWire runs 48 kHz with clock.quantum 1024 and process_wav uses BLOCK = 1024 at the file's rate, so with 48 kHz material the offline path runs the same rate and the same block size, including Dynamic Boost's time-varying auto-gain."
+    },
+    {
+     "name": "Blind ABX with an existing tool (Lacinato ABX, foobar2000's comparator, LinABX)",
+     "how": "Install Lacinato ABX, load pairs, run trials to a confidence threshold.",
+     "breaks": "Nothing, but it answers a question that is already answered.",
+     "effort": "small",
+     "verdict": "reject",
+     "why": "ABX establishes discriminability. These presets differ by several dB across whole bands and by up to 7.4 LU — of course they are distinguishable, and proving it costs sixteen trials per pair. The maintainer's question is preference plus a floor check ('is this worse than doing nothing'), which is a shootout protocol, not ABX. Narrow exception worth keeping in the back pocket: when the shipped-preset test flags two presets as the same voicing under different names, ABX on that one pair is exactly the right tool and Lacinato's shootout mode would serve as a drop-in replacement for the mpv script."
+    },
+    {
+     "name": "Pre-filled Markdown/TSV scorecard they edit by hand after listening",
+     "how": "render.sh also emits docs/voicing-verdicts.tsv pre-filled with the twelve preset names and blank columns; they open it in an editor after each item.",
+     "breaks": "Nothing.",
+     "effort": "trivial",
+     "verdict": "viable",
+     "why": "Correct output format, wrong input method. Alt-tabbing to an editor twelve times breaks the listening loop and invites batching all twelve judgements at the end from memory, which is where preference data goes to die. Voting from inside the player with one keystroke produces the same file. Keep the hand-edited file only as the fallback if mpv's `run` binding is unavailable — and keep the column layout either way, since that is what an assistant reads back."
+    },
+    {
+     "name": "Formal multi-listener panel, randomised, repeated trials, statistics",
+     "how": "Recruit listeners, controlled room, MUSHRA or BS.1116 protocol.",
+     "breaks": "Nothing technically; it breaks the budget.",
+     "effort": "large",
+     "verdict": "reject",
+     "why": "One person, one machine, two output devices, and time as the scarce resource. A twelve-item single-listener blind preference test is not statistically strong, and it should not pretend to be — its job is to catch presets that are obviously wrong or obviously worse than no processing, which one attentive listener does reliably. State the weakness in the verdicts file rather than engineering around it."
+    }
+   ],
+   "recommendation": "Build the offline blind shootout; keep the live keybind as an unblinded second pass. Nothing in Rust changes — process_wav already does the whole job, which I confirmed by rendering through it.\n\nWHAT GETS BUILT (three shell files under scripts/voicing/, roughly 120 lines total):\n\n1. render.sh. For each genre: dry = the source excerpt untouched (not an engine render with power=0, and not a flat preset — Dynamic Boost is never bypassed and still imposes its -0.3 dBFS ceiling and at least +0.5 dB once auto-gain engages, so only the untouched file is a true anchor); old = `target/release/examples/process_wav in.wav old.wav --preset <shipped .fac>`; new = the same with the revoiced .fac. Then measure all three with `ffmpeg -i X -filter:a ebur128 -f null -`, take the minimum integrated LUFS (always the dry file), attenuate the other two by the difference with `volume=NdB` — attenuate only, never boost, so nothing clips. Then mux: `ffmpeg -i dry -i a -i b -map 0:a -map 1:a -map 2:a -c:a flac -metadata:s:a:0 title=1 ... <genre>.mkv`, with the three inputs in an order shuffled per genre, and append \"genre<TAB>track1=dry<TAB>track2=new<TAB>track3=old\" to key.tsv. Verified: render 0.097 s per 30 s per preset, the matched files land on identical LUFS in a single pass (-26.3, -26.3, -26.3), and mpv sees three switchable tracks.\n\n2. session.conf, an mpv --input-conf. a / s / d → `set aid 1` / `2` / `3` (direct, instant, keeps position — verified over IPC: the track changed while time-pos ran on). 1 / 2 / 3 → `run /bin/sh -c 'echo \"$genre\\t$track\" >> votes.tsv'` followed by `playlist-next` (verified: the run binding wrote its file). b / h / t / p append a one-letter flag — boomy, harsh, thin, pumping — to the current line. `--loop-file=inf` so a 45-second excerpt repeats indefinitely while they switch. One mpv invocation with all twelve .mkv files as the playlist; they never touch a terminal during the session.\n\n3. unblind.sh. Joins votes.tsv with key.tsv and writes docs/voicing-verdicts.tsv, one line per preset:\n   preset<TAB>winner(new|old|dry)<TAB>flags<TAB>confidence(sure|unsure)\nThat file is the deliverable an assistant reads and turns into a revision: \"winner=dry\" means the voicing is a net loss and should be pulled back toward flat; \"winner=old\" means the revoicing regressed; \"flags=p\" points straight at Dynamic Boost, which is the one control where the port has a known cliff (positions 6 through 10 are all +11.60 dB, so if pumping is flagged the fix is to move the stored value down into the 0..70 range where it still does something, not to nudge it).\n\nWHAT THE PERSON DOES, AND FOR HOW LONG:\n- 10 min, once: drop one track per genre into material/. Their own files first — familiarity beats licensing for a private judgement, and these renders never leave the machine. Their ~/Музыка is empty, so for genres they have nothing for, fetch.sh pulls the pinned free material below. Pick the excerpt from a busy passage, not an intro: `ffmpeg -ss 60 -t 45 -ar 48000 -ac 2 -c:a pcm_s16le`. 48 kHz and 16-bit are required — process_wav reads 16-bit PCM only, and 48 kHz is the only rate PipeWire allows here, so the offline render matches the live path exactly.\n- 1 min: `./render.sh` (the DSP part is about 4 seconds for all twelve; the ffmpeg loudness passes dominate).\n- 25 to 35 min: `mpv --input-conf=session.conf --playlist=session.m3u`. Per item, the OSD shows one instruction: \"Same 45 seconds, three versions, level-matched. a/s/d to switch instantly. Which one do you want to keep listening to — 1, 2 or 3? If the one that sounds untouched is the best of the three, say so. Optional: b boomy, h harsh, t thin, p pumping.\" About 2.5 minutes each, two keystrokes.\n- 0 min: the verdicts file writes itself; `./unblind.sh` prints it.\nTotal: under an hour, most of it actual listening.\n\nWHY THE QUESTION IS PHRASED THAT WAY: \"does Jazz sound like jazz\" has no answer. \"Of three level-matched renders of the same track, which do you want to keep listening to, and is the untouched one the best of them\" has an answer in thirty seconds, and it yields the two facts that can be acted on — a direction of preference, and a floor check that catches a preset which is actively harmful. Blind, because they authored the new voicings; level-matched, because otherwise the answer is just \"the loudest one\".\n\nMATERIAL, per genre: Classical → Open Goldberg Variations, Kimiko Ishizaka, CC0, 24-bit FLAC (verified via the archive.org metadata API). R&B, Trap, Pop, Modern Rock, Alternative Rock → the blocsonic collection, 425 CC-licensed items of modern-production hip-hop, funk, soul and rock (verified, 425 items). Jazz → Podington Bear (Chad Crouch), CC-BY, on archive.org and FMA. Metal → the archive.org netlabels collection has ~2500 metal-tagged CC items; pin one CC-BY or BY-SA release by identifier. 70's, 80's, Classic Rock, Modern Country → there is essentially no good free material; be honest about it. Those four should be judged on their own records, or accepted as judged against a modern proxy with the caveat written into the verdicts file. Pin every identifier into a material.lock the first time rather than searching per run: I measured that archive.org's subject tags are unreliable — a `subject:\"country\"` query in the netlabels collection returned field recordings from Crete as its top hit. Prefer CC0 / CC-BY / CC-BY-SA items over the many NC-ND ones, so a render can be attached to a GitHub issue later without a licence problem.",
+   "notes": "Four things worth carrying forward.\n\nFirst, the dry anchor has to be the untouched file. Rendering \"FxSound off\" through the engine is not the same thing: DspParams has a `power` flag that bypasses, but process_wav does not expose it, and at power=true with a zero knob Dynamic Boost still ceilings at -0.3 dBFS. If a true engine-bypass render is ever wanted, adding `--power 0` to process_wav is a two-line change — but for this harness copying the source is simpler and byte-exact.\n\nSecond, the loudness spread is the headline number and it is measured, not estimated: on one identical input, dry -26.3 LUFS, Classical -24.4, Metal -23.0, Pop -20.3, Jazz -18.9. Every preset is louder than dry, and they differ from each other by up to 7.4 LU. Any comparison that skips level matching — including every live A/B — measures Dynamic Boost's gain and nothing else. This is also the single strongest argument that the Dynamic Boost cliff (five of eleven slider positions at +11.60 dB) is audible as more than a number: presets sitting above stored 70 are all shouting at the same volume regardless of what their slider says.\n\nThird, the harness and the existing test suite divide cleanly. shipped_presets.rs answers \"is this preset internally coherent\" — no inaudible Ambience below 39, no saturated Dynamic Boost, no duplicate voicings, no bands summing past what any of them claims. The listening harness answers \"is it any good\". Neither substitutes for the other, and the verdicts file should say which presets the test already flags so a subjective \"this sounds wrong\" can be checked against an objective cause before anything is revoiced by ear.\n\nFourth, one cheap addition for the second round if the first verdicts are ambiguous: since the renders already exist as files, a preset whose verdict is \"unsure\" between new and old can go straight into Lacinato's shootout mode, or into an ABX of exactly that pair, without rebuilding anything. The pipeline produces the material both protocols need.\n\nNot built, deliberately: any attempt to score the presets automatically against a spectral target. The port's claim is that presets voiced on Windows sound the same here, and a spectral target would be inventing a reference the original never had."
+  }
+ ],
+ "shortlist": {
+  "ship": [
+   {
+    "name": "Bright Voice",
+    "why": "The clearest asymmetry in the planned seven. Warm/bright ship as a PAIR in every product that ships either: Blue VO!CE 'Warm and Vintage' + 'Crisp and Modern'; Shure MV7+ Dark/Natural/Bright; RØDE Tone Deep/Medium/High plus the Pro II 'Sparkle' macro; SteelSeries 'Deep Voice' vs 'Balanced'; Elgato 'High Clarity'. Five independent vendors, and the set currently ships only the warm end, so a user whose voice is already chesty (or whose mic is dull) has nowhere to go but Clean Voice. It is also the cheapest addition in the set: it is Warm Voice mirrored about zero, no new stage, no new field.",
+    "settings": "HPF 90 Hz, 2nd order. Gate -45 dB, 2.0:1, range -14 dB. Compressor -18 dB, 3.0:1, 15/150 ms, RMS. Makeup +5.0 dB. De-esser 5500 Hz, -26 dB. Ceiling -3.0 dBFS. RNNoise off. EQ (62.5 / 115.734 / 214.311 / 396.85 / 734.867 / 1360.79 / 2519.84 / 4666.12 / 8640.48 / 16000): 0, -1.5, -1.0, -0.5, 0, 0, +1.5, +1.5, +1.0, 0. Two deliberate asymmetries against a literal mirror of Warm Voice: band 1 is -1.5 not -2.0 (cutting a male fundamental thins more than boosting one fattens), and band 9 (16 kHz) stays at 0.0 rather than mirroring Warm's -2.0, because on a microphone 16 kHz is hiss and on most capture rates that band is at or above Nyquist. The de-esser threshold MUST be 4 dB hotter than Clean Voice's -22 dB: bands 7 and 8 feed energy straight into the detection band, so for this one preset the EQ gains and the de-esser threshold are not independently tunable.",
+    "confidence": "high"
+   },
+   {
+    "name": "Headset (close boom mic, 2-5 cm)",
+    "why": "Not a market finding — forced by acoustics, which is the other bar the brief sets. The existing research already concedes the number that decides it: proximity effect is worth up to +16 dB, and every one of the seven was voiced around desk distance. A 16 dB low-frequency swing is eight times larger than the ±2 dB any EQ move in the draft table makes, so no re-tuning inside one preset can straddle both distances, and the user population (gamers, callers, anyone on a headset) is the largest single group the input feature will have. Laptop Mic does not cover it: that is the far-field, thin, noisy case; this is the near-field, boomy, plosive case. They are opposite ends of the same axis.",
+    "settings": "HPF 120 Hz, 4th ORDER (the general case chose 2nd order to protect an 80 Hz male fundamental; at a mouth-adjacent capsule that concern inverts and plosive energy 10-20 dB above speech sits below 150 Hz). Gate -38 dB, 2.0:1, range -12 dB (the wanted signal is far hotter relative to the room, so the threshold can safely rise). Compressor -18 dB, 3.0:1, 10 ms attack / 150 ms release, RMS — the fast attack is for close-in transients, not for level. Makeup +3.0 dB (hot source; +6 would be wrong here). De-esser 5500 Hz, -26 dB, i.e. 4 dB hotter than Clean Voice. Ceiling -3.0 dBFS. RNNoise off by default (close-mic SNR is already good). EQ: 0, -2.5, -1.5, -0.5, 0, 0, +1.5, 0, 0, 0. Band 1 (115.734 Hz, span 85-157 Hz) is the only genuinely effective LF control in the chain and carries the proximity cut. Document Clean Voice, Podcast, Warm Voice and Bright Voice as desk-distance presets once this ships.",
+    "confidence": "high"
+   },
+   {
+    "name": "Flat",
+    "why": "The reference slot: protection with no voicing, so the user can hear what the other ten are actually doing. Recurs as a named entry in three products plus the community consensus — Shure MOTIV 'Flat', RØDECaster Pro II 'Neutral', Discord's 'None', and every OBS guide's advice to hear the raw mic first. Distinct from the app's own input on/off toggle, which is the obvious objection: with the chain disabled the app is out of the path entirely, so there is no high-pass and no limiter. Flat is 'nothing above the rumble and nothing below the ceiling', which is a real and common want for someone with a good microphone. It is one row and ten zeros.",
+    "settings": "HPF 75 Hz, 2nd order. Gate OFF. All ten EQ bands 0.0 dB. De-esser OFF. Compressor OFF (not 'gentle' — off). Makeup 0.0 dB. Limiter -3.0 dBFS. RNNoise off. Ships only if Studio is revoiced as below; as currently drafted Flat and Studio differ by one gentle compressor, which is exactly the duplicate-voicing defect the output-side shipped_presets.rs was written to catch.",
+    "confidence": "medium"
+   },
+   {
+    "name": "Broadcaster",
+    "why": "The most-repeated single name in the market: Blue VO!CE ships 'Broadcaster 1', 'Broadcaster 2' AND 'Classic Radio Voice'; RØDECaster Pro II ships 'Broadcast' as one of only three presets; GoXLR profiles are sold as broadcast profiles; the whole hardware lineage (dbx 286s, Aphex 230, Symetrix) is marketed as broadcast voice processing. Four independent vendors, three occurrences inside one vendor's set. It is a processing-DEPTH case, which is why Podcast does not cover it, and its EQ shape — chest lift plus scooped low-mid plus presence — is unoccupied by anything else in the set (Warm lifts the chest but cuts presence; Streaming lifts presence but with a bright tilt and no chest). Lowest-confidence addition, and it carries an explicit kill condition: its dynamics sit within half a ratio point and 2 dB of Streaming's, so if the mic-side distinctness test collapses the two, drop Broadcaster, not Streaming.",
+    "settings": "HPF 70 Hz, 2nd order (keep the chest). Gate -42 dB, 2.0:1, range -16 dB. Compressor -22 dB, 4.5:1, 30 ms attack / 250 ms release, RMS — the slow attack is what makes it read as 'radio' rather than 'squashed'. Makeup +10.0 dB. De-esser 6000 Hz, -26 dB (tight, because the presence lift exposes sibilance). Ceiling -3.0 dBFS. RNNoise off. EQ: 0, +2.0, 0, -1.0, -0.5, -1.5, +2.0, 0, 0, 0. This is the one preset allowed past the set's ±2 dB restraint and the only one where the user picking it wants to hear the difference; holding it to Clean Voice's restraint makes it a Podcast duplicate. Note the 396.85/734.867 cuts are softened against the researcher's proposal: +2.0 at 115 Hz plus deep cuts at 396 Hz hollows the voice, so the scoop lives at 1360.79 alone.",
+    "confidence": "medium"
+   },
+   {
+    "name": "Studio, revoiced as the capture preset",
+    "why": "Not an addition — a repair, and the precondition for Flat. As drafted, Studio is Flat with a 2:1 compressor, which is two presets for one voicing. Two independent findings give it a real identity instead. First, it is the preset a singer or anyone recording into Ardour/Reaper/Audacity will reach for, and its 75 Hz corner cuts a bass singer's fundamental: sung fundamentals reach E2 at 82.4 Hz and C2 at 65.4 Hz, well below the ~85 Hz speech floor that justifies 75-80 Hz everywhere else. Second, the -3.0 dBFS ceiling is justified by lossy-codec overshoot (Opus, AAC), and a recording path is not lossy-encoded, so there the limiter should be a safety catch, not a working ceiling — and an editor doing their own gain staging wants unity makeup.",
+    "settings": "HPF 40 Hz, 2nd order (or off). Gate OFF. Compressor -18 dB, 2.0:1, 25 ms / 400 ms (release lengthened from 200 ms: singing's measured dynamic range is 33.60 dB against 30.95 dB for speech and crest factor runs 16-20 dB against ~12 dB), RMS. Makeup 0.0 dB (was +1.5). De-esser OFF. Ceiling -1.0 dBFS sample-peak (was -3.0). All ten EQ bands 0.0 dB. RNNoise off. This costs the documentation's third headline finding a stated exception: 'every preset ships a -3.0 dBFS ceiling' becomes 'every preset except Studio, and here is why'. Dropping the corner to 40 Hz also lets desk rumble into the compressor detector — acceptable in the preset that already has gate and de-esser off and is explicitly the least-processing option, unacceptable as a general default.",
+    "confidence": "high"
+   },
+   {
+    "name": "Rename Discord -> Voice Chat, and fix its high-pass corner",
+    "why": "No comparable product names a voice profile after a destination app — they name by role ('Podcast Studio', 'Broadcast'), by tone ('Crisp and Modern', 'Bright') or by source ('Speech', 'Acoustic Instrument'). Krisp integrates with Discord and Zoom and still ships no Discord profile. The name dates badly and implies a codec-specific tuning the preset does not have: the -3 dBFS ceiling is the Opus/AAC headroom argument and it applies to Teams, Zoom and in-game voice identically. Carry the app names in the description line, not the preset name, so discoverability does not suffer. Explicitly NOT extending this to Laptop Mic: 'Laptop Mic' names a source, which is the vendor-sanctioned axis, and it is more informative than 'Small Mic' now that the headset case has its own preset.",
+    "settings": "Keep the drafted Discord numbers, with one correction: HPF 80 Hz, not 90. At 90 Hz the preset cascades with the VoIP stack's own 2nd-order 100 Hz Butterworth (WebRTC measured -3.54 dB @100 Hz) for about -7.1 dB at 100 Hz on a deep male voice — already on the objection list and cheapest to fix now. Otherwise: gate -45 dB / 2.0:1 / range -14 dB; compressor -18 dB, 3.0:1, 20/150 ms, RMS; makeup +4.0 dB; de-esser 6000 Hz, -20 dB; ceiling -3.0 dBFS; EQ 0, -2.0, -1.0, -2.0, -1.0, 0, +2.0, 0, 0, 0.",
+    "confidence": "medium"
+   },
+   {
+    "name": "Close the parameter set before any preset is written down",
+    "why": "Both new presets above are literally unspecified without this, and the input chain does not exist in code yet (crates/fxsound-dsp/src/input/ holds only mod.rs and limiter.rs; InputDspParams is not written), so these are design-in costs now and retrofit costs later. Three items, all already raised by the existing reviewers. The gate has no range cap, so it pumps the floor in and out; every reference implementation surveyed (LSP, Calf, OBS) caps it. The compressor's detector is unspecified, and peak vs RMS against the same threshold differ by 3-7 dB of gain reduction, which means Broadcaster's 4.5:1 at -22 dB means two different things. And RNNoise must be a per-preset field, not only a global switch, because a preset that ignores the denoiser is describing half its own sound.",
+    "settings": "On InputDspParams: gate `range_db: f32`, default -14.0, per preset (-12 Headset, -16 Broadcaster, gate off entirely on Flat and Studio). Compressor `detector: Detector` with variants Peak and Rms { window_ms }, default Rms { window_ms: 10.0 } — every threshold in the draft table and above is an RMS threshold, say so in the asset header. `rnnoise: bool` per preset, with a defined fallback when the model is absent: degrade to the gate and log once, never fail the preset load; and because a preset can now move a control the user set deliberately, the UI must show that the selection changed it. Move RNNoise FIRST in the chain, ahead of the gate (5 of 9 surveyed community presets put denoise first, none put it after the limiter) — this forces re-voicing every gate threshold in the draft table, since all of them were chosen against an un-denoised floor. Do all of it in crates/fxsound-dsp/src/input/mod.rs; none of it goes near crates/fxsound-preset/src/lib.rs, whose only job is byte-exact .fac round-tripping.",
+    "confidence": "high"
+   },
+   {
+    "name": "Nyquist guard on the EQ bands and the de-esser detector",
+    "why": "This is what replaces a Narrowband preset, and it is the most concretely broken thing either researcher found. HFP capture is 8 kHz with CVSD and 16 kHz with mSBC; even LC3-SWB is 32 kHz mono. At 16 kHz capture, bands 8 (8640.48) and 9 (16000) are at or above Nyquist and do nothing. At 8 kHz, bands 7, 8 and 9 are dead AND the de-esser detector at 5500-6000 Hz is above Nyquist, so the de-esser is silently inert in five of the seven planned presets. The users hitting this are the ones with the worst microphones and the least ability to diagnose it, and they are currently handed phantom controls. Once the guard exists, every preset degrades honestly on a narrowband link and a dedicated Narrowband preset earns almost nothing.",
+    "settings": "Read the capture node's rate at stream setup and on format change. Grey out (and neutralise) any EQ band whose centre is >= Nyquist, with a tooltip naming the capture rate. When the de-esser detector frequency is >= Nyquist, disable the de-esser rather than letting it run inert, and say so in the UI. Note for the record that band 9 at 16000 Hz sits exactly at Nyquist even on a 32 kHz link, which is a second reason Bright Voice leaves it at 0.0 dB.",
+    "confidence": "high"
+   },
+   {
+    "name": "Mic-side analogue of shipped_presets.rs, before any of the above ships",
+    "why": "The gate on Bright Voice and Broadcaster specifically. At the derived Q of about 1.6 (ten bands), adjacent bands sum past what either band asks for — that is the exact defect the output-side test already measures. Bright Voice lifts bands 7, 8 and 9 together and Broadcaster lifts band 1 while cutting band 5, so both are the case where summing matters most. The test is also what enforces the Flat/Studio and Broadcaster/Streaming separations rather than leaving them to assertion: it is the mechanism that would have caught 'two presets that are the same voicing under different names' on the output side, and the input set is now eleven presets deep.",
+    "settings": "Impulse through the input GraphicEq, realfft, the 29 third-octave points already tabulated at crates/fxsound-dsp/tests/shipped_presets.rs:167, pairwise worst-case dB difference across all eleven presets with a stated minimum margin. Add two checks the output set does not need: effective per-band gain versus stored per-band gain (catches the Q-summing overshoot), and a full-chain distinctness pass that includes HPF corner/order, compressor ratio+threshold+detector and de-esser frequency+threshold, so Broadcaster vs Streaming and Flat vs Studio are measured, not assumed. Keep it entirely out of the .fac path.",
+    "confidence": "high"
+   }
+  ],
+  "reject": [
+   {
+    "name": "Conference / several talkers at one microphone",
+    "why_not": "Real case, but it fails two of the three bars. No vendor ships a conference voice preset — conference systems solve it with auto-mixing and AGC, not with a named profile — and the chain can express only the leveling third of the problem. The dominant complaints in a meeting room are reverberation and HVAC, and one broadband compressor with a 600 ms release does nothing about either; it would ship as a preset that claims to fix the conference case and fixes the least important part of it. The finding worth keeping is the negative one: a gate thresholded for the near talker deletes the far talker entirely, which is why Flat and Studio being gate-off matters, and why range_db exists."
+   },
+   {
+    "name": "Narrowband / Bluetooth-headset preset",
+    "why_not": "The arithmetic behind it is correct and important, but it argues for the runtime guard, not for a preset. Once bands above Nyquist are neutralised and the de-esser auto-disables, every preset behaves honestly on an HFP link and the remaining Narrowband-specific deltas are two numbers (makeup +3, HPF 120). Two numbers is not a voicing. Shipping both the guard and the preset would also mean the preset's own presence lift duplicates what Clean Voice already does in the surviving bands."
+   },
+   {
+    "name": "Noisy Room",
+    "why_not": "It would ship the failure mode as the fix. A gate is a time-domain switch: it does nothing about noise DURING speech, which is the actual complaint. With the floor at -30 dB the threshold must climb to about -25 dB, roughly 10 dB below conversational peaks, so it chatters on every word onset and clips quiet sentence-final syllables. Every product that serves this case ships it as a SWITCH and never as a named voice — NVIDIA 'Noise Removal', Krisp, Discord's Krisp mode, SteelSeries ClearCast, Elgato Voice Focus, RNNoise first in every OBS chain. The gain lives in stage order and a missing field, both of which are in the ship list."
+   },
+   {
+    "name": "Room echo / de-reverb preset",
+    "why_not": "The chain cannot do it. No combination of one high-pass, one gate, ten EQ bands, one de-esser and one compressor removes reverberation, and a spectral or ML de-reverb stage needs an FFT with a frame buffer, which breaks the input chain's allocation-free-after-construction contract. Naming a preset 'Room Echo' when nothing in the path can touch reverb is a preset claiming an effect it does not get — the exact defect the output-side tests exist to catch. The case is real (NVIDIA, Krisp, Adobe all advertise it second after noise) and it is not a preset in any of them either."
+   },
+   {
+    "name": "Game voice chat with the game loud in the room",
+    "why_not": "Categorically not preset-shaped. The dominant problem is acoustic echo, and cancelling it requires an adaptive filter fed with the PLAYBACK signal as a reference, which no stage in this chain has access to. On Linux the answer is libpipewire-module-echo-cancel with the WebRTC AEC. Worth logging separately as an architectural opportunity — FxSound Linux owns both the playback and the capture path and is unusually well placed to wire that reference up — but not as a row in the combo box. For the majority case (headphones) there is no echo at all and it collapses into Voice Chat plus keyboard clatter, i.e. the RNNoise switch."
+   },
+   {
+    "name": "Singing / Acoustic Instrument / Loud (the MOTIV source-type modes)",
+    "why_not": "Fails the scepticism test outright: these appear in exactly one vendor's lineup (Shure MOTIV, MV5/MV51/MV88) and that vendor dropped them for the MV7/MV7+ in favour of the Dark/Natural/Bright tone axis. One vendor, who abandoned the taxonomy. A Singing preset with gate and de-esser off is also Flat under a different name — and the one genuinely distinct parameter, a low high-pass corner for sung fundamentals down to C2 at 65.4 Hz, is already absorbed by the Studio revoicing above."
+   },
+   {
+    "name": "Character presets — AM Radio, Megaphone, Telephone",
+    "why_not": "Different product category, and unreachable anyway. The chain has no low-pass stage, so the result would be a thin voice rather than a canned one, and adding a low-pass to serve a novelty is the wrong trade. Blue VO!CE does ship 'AM Radio' and Voicemod's whole 'Devices' category is megaphones and vintage radios, but in both products these live in a separate EFFECTS section next to pitch and formant shifting, explicitly not among the broadcast presets — Blue's own guide says the two sets do not always match up."
+   },
+   {
+    "name": "Mic-type presets — Dynamic / Condenser / Headset-by-gain",
+    "why_not": "Conflates gain staging with voicing. Three presets whose ten EQ gains are identical and whose only real difference is makeup_db is the duplicate-voicing defect by construction, and it multiplies the set by three for a value one control sets. Everywhere the case appears — RØDECaster's Dynamic/Condenser/RE-20, GoXLR's Dynamic/Condenser/Jack, Wave XLR — it is a HARDWARE input selection (phantom power, preamp gain, impedance), not a voice profile. On a Linux port with no control over the interface, the honest equivalent is an input-gain control and a level meter. Note this is distinct from the Headset preset shipped above, which is justified by capsule DISTANCE (a +16 dB proximity swing and a plosive problem), not by transducer type."
+   },
+   {
+    "name": "Language-specific sibilance (Russian, Polish) as a preset — and the 7000-7500 Hz default shift",
+    "why_not": "The preset is rejected because users do not self-identify by sibilant inventory and will never pick a 'Russian' preset. The underlying phonetics is sound — Polish has a three-way and Russian a four-way sibilant contrast against English's two, Polish adult dental /s/ is reported with CoG around 8000 Hz and above while the retroflex and alveolo-palatal sit distinctly lower, so a 5500 Hz detector sits in the valley between the two modes. But the proposed remedy, raising the detector default toward 7000-7500 Hz across the set, is also rejected FOR NOW: that figure is extrapolated from Polish, per-phoneme Hz values for Russian were never retrieved, and moving it would invalidate every de-esser threshold in the draft table (less energy reaches the detector, so -22 to -25 dB stops meaning what it meant). Keep the detector frequency as the per-preset field it already is, keep 5500/6000, and log the measurement as a task: retrieve the Kochetov table or measure a handful of Russian speakers, then decide. Do not defend an inferred number in a shipped preset."
+   },
+   {
+    "name": "A Dark / Neutral / Bright tone ladder applied over the loaded preset",
+    "why_not": "Right observation, wrong project phase. Three vendors converged on tone-over-destination (Shure, RØDE, RØDECaster's Depth/Sparkle/Punch macros), which is real evidence about how people navigate — but it breaks the 'a preset is a complete stored state' model the whole port rests on, makes the effective EQ curve a sum of two stored things (so no test can assert that a preset's audible curve equals its stored curve), and two summed curves on a fixed ladder at derived Q ~1.6 is precisely how bands add past what either asks for. It is a UI-contract change, not a preset addition. Revisit after the input set has shipped and been listened to."
+   },
+   {
+    "name": "A separate Recording preset",
+    "why_not": "Distinct in intent, already served in substance. The delta against Studio was two numbers — the ceiling and the makeup — and both are folded into the Studio revoicing above. A twelfth row that differs from the eleventh by 2 dB of makeup and 2 dB of ceiling is the duplicate case."
+   },
+   {
+    "name": "Voice-pitch presets (deep male ~85-100 Hz vs high ~200-250 Hz)",
+    "why_not": "A no-op. The measured numbers already settle it: male F0 runs 85-180 Hz and female 165-255 Hz, the 80 Hz corner sits deliberately below the male floor, and at Q=1.5976 band 1 spans 85-157 Hz (male fundamental) while band 2 spans 157-292 Hz (female), which is why band 0 is 0.0 dB everywhere. A fixed 80 Hz high-pass demonstrably serves both, and users cannot self-identify by fundamental frequency anyway. The one genuine pitch failure — the Discord/WebRTC high-pass cascade — is a per-preset corner and is fixed in the Voice Chat entry above."
+   },
+   {
+    "name": "Rename Laptop Mic -> Small Mic",
+    "why_not": "Half of the rename proposal, and the half that is wrong. The vendor argument is against DESTINATION names (Discord), not against source names — 'Speech' and 'Acoustic Instrument' are source names and they are exactly what vendors do ship. 'Laptop Mic' tells a user instantly whether it is for them; 'Small Mic' does not, and its stated coverage of headset booms is now served by a preset voiced for that distance rather than by a vaguer name. Keep Laptop Mic, and write its numbers down — it is currently the only one of the seven with no row in the draft table and no reviewed values at all."
+   }
+  ],
+  "verdict": "Eleven, and the four additions are two tone-pair repairs, one acoustically forced case and one reference — not four new ideas.\n\nThe set, on the five axes it actually navigates: **Reference** — Flat, Clean Voice. **Destination** — Streaming, Podcast, Voice Chat, Broadcaster. **Tone** — Warm Voice, Bright Voice. **Source/repair** — Laptop Mic, Headset. **Capture** — Studio.\n\nWhy not seven. Two of the seven are not really settled: Laptop Mic has no row in the draft table and no reviewed numbers, and Warm Voice was never reviewed at all — so the claim that the seven cover the common cases rests partly on presets nobody has written down. Beyond that, exactly two gaps survive scepticism. Shipping Warm without Bright is an asymmetry five independent vendors contradict, and it is the cheapest possible fix. And the entire set is voiced for a microphone at desk distance while the largest acoustic variable in the input problem — proximity effect, up to +16 dB — is eight times bigger than any EQ move in the table; a headset user gets a preset built for a condition they are nowhere near. Broadcaster is the one market-driven addition (four vendors, three occurrences inside Blue VO!CE alone) and it is the weakest of the four, shipped with a kill condition: if the mic-side distinctness test collapses it into Streaming, drop Broadcaster.\n\nWhy not fourteen or more. Five of the nine cases the researchers surfaced are not preset-shaped at all, and shipping presets for them would encode a bug as a product feature: Noisy Room would ship a high gate threshold as the fix for noise during speech; Narrowband would ship two numbers where the honest fix is a Nyquist guard that makes all eleven presets degrade honestly; Room Echo and Game Voice Chat name effects this chain structurally cannot produce; Conference addresses the leveling third of a problem that is mostly reverberation. Conference was the closest reject — real, uncovered, expressible — and it loses because no vendor ships it, the chain fixes the least important part of it, and the near/far talker problem is one of the cases the brief correctly guessed may be outside what one gate and one compressor can do.\n\nEleven is defensible against the market: Blue VO!CE ships about eight named presets plus a community browser, Shure MOTIV shipped five, RØDECaster Pro II ships three. Eleven is at the top of that range, which is why Flat and Broadcaster both carry explicit conditions and why nothing ships before the mic-side analogue of shipped_presets.rs exists.\n\nThree things must land before any preset numbers are frozen, and all three are cheap now and expensive later, because the input chain is still almost unbuilt (only mod.rs and limiter.rs exist; InputDspParams is not written): gate range_db, a named compressor detector with its window, and RNNoise as a per-preset field moved to the FRONT of the chain — which forces re-voicing every gate threshold in the draft table, since all of them were chosen against an un-denoised floor. None of this goes near crates/fxsound-preset/src/lib.rs; the .fac byte-exact contract and the shipped 34 output presets are untouched."
+ }
+}

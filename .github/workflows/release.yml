@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build, e.g. v0.3.0'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tarball:
+    name: Binary tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libpipewire-0.3-dev libclang-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The tag and the version in Cargo.toml disagreeing is the classic release mistake, and it
+      # is silent: the archive is named after one and reports the other when asked.
+      - name: Check the tag against the manifest
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          manifest=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "$tag" != "v$manifest" ]; then
+            echo "tag $tag does not match Cargo.toml version $manifest" >&2
+            exit 1
+          fi
+
+      - run: cargo build --release --bin fxsound
+
+      # The same layout the Arch package installs, so the tarball is extractable over a prefix and
+      # a user who is not on Arch gets the presets, the desktop entry and the icons rather than a
+      # bare binary that then cannot find anything.
+      - name: Assemble
+        run: |
+          ver="${{ github.event.inputs.tag || github.ref_name }}"
+          ver="${ver#v}"
+          root="fxsound-linux-${ver}-x86_64"
+          install -Dm755 target/release/fxsound "$root/bin/fxsound"
+          for dir in Factsoft BonusPresets; do
+            install -d "$root/share/fxsound/presets/$dir"
+            install -Dm644 assets/presets/$dir/*.fac -t "$root/share/fxsound/presets/$dir/"
+          done
+          install -Dm644 packaging/fxsound.desktop \
+            "$root/share/applications/com.fxsound.FxSound.desktop"
+          install -Dm644 packaging/fxsound.service \
+            "$root/lib/systemd/user/fxsound.service"
+          install -Dm644 assets/images/fxsound_large.png \
+            "$root/share/icons/hicolor/256x256/apps/fxsound.png"
+          install -Dm644 assets/images/fxsound.png \
+            "$root/share/icons/hicolor/32x32/apps/fxsound.png"
+          install -Dm644 README.md CHANGELOG.md LICENSE -t "$root/share/doc/fxsound-linux/"
+          install -Dm644 packaging/hyprland.conf.example \
+            -t "$root/share/doc/fxsound-linux/"
+          tar czf "$root.tar.gz" "$root"
+          sha256sum "$root.tar.gz" > "$root.tar.gz.sha256"
+          ls -la "$root.tar.gz"*
+
+      # The one thing this archive does not promise: it is linked against the runner's glibc, so
+      # it runs on that release and newer, not on an older one. Anyone on an older distribution
+      # builds from source, which is what the source tarball GitHub attaches is for.
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            fxsound-linux-*-x86_64.tar.gz
+            fxsound-linux-*-x86_64.tar.gz.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: false

@@ -1,0 +1,91 @@
+# Maintainer: FxSound Linux port contributors
+#
+# Builds the current `main` from the repository. Unlike `packaging/PKGBUILD`, which is a
+# convenience for building the working tree you already have, this one is self-contained: it
+# fetches its own source, so it works from an empty directory, which is what AUR requires.
+
+pkgname=fxsound-linux-git
+_pkgname=fxsound-linux
+pkgver=0.2.0.r0.g0000000
+pkgrel=1
+pkgdesc="System-wide audio enhancement for Linux: EQ, ambience, surround, bass and dynamic boost (Rust/egui port of FxSound) — development version"
+arch=('x86_64')
+url="https://github.com/blackixxce12/fxsound-linux"
+license=('AGPL-3.0-or-later')
+depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus')
+# `clang` is not optional: pipewire-sys runs bindgen in its build script and fails with
+# "Unable to find libclang" without it.
+makedepends=('git' 'rust' 'cargo' 'pkgconf' 'clang')
+optdepends=(
+  'wireplumber: session management, needed to switch the default sink'
+  'xdg-desktop-portal: native file dialogs for preset import and export'
+  'libnotify: desktop notifications'
+)
+provides=("${_pkgname}" 'fxsound')
+conflicts=("${_pkgname}" 'fxsound')
+options=('!lto')   # the workspace already sets `lto = "thin"` in its release profile
+source=("${_pkgname}::git+${url}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "${srcdir}/${_pkgname}"
+  # `<manifest version>.r<commits since the last tag>.g<short hash>`, so an untagged build still
+  # sorts after the release it descends from.
+  local ver
+  ver=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+  printf '%s.r%s.g%s' "$ver" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "${srcdir}/${_pkgname}"
+  # Vendor up front so `build()` and `check()` can run with the network off, which is what a
+  # clean chroot does.
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "${srcdir}/${_pkgname}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --release --frozen --bin fxsound
+}
+
+check() {
+  cd "${srcdir}/${_pkgname}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Nothing here touches the live PipeWire graph, the session bus or the user's settings file.
+  cargo test --release --frozen --workspace
+}
+
+package() {
+  cd "${srcdir}/${_pkgname}"
+
+  install -Dm755 "target/release/fxsound" "${pkgdir}/usr/bin/fxsound"
+
+  # Only the presets themselves: the upstream folder also carries a zip of the same files and a
+  # stray text file, and neither belongs in a package.
+  for _dir in Factsoft BonusPresets; do
+    install -d "${pkgdir}/usr/share/fxsound/presets/${_dir}"
+    install -Dm644 "assets/presets/${_dir}"/*.fac \
+      -t "${pkgdir}/usr/share/fxsound/presets/${_dir}/"
+  done
+
+  install -Dm644 "packaging/fxsound.desktop" \
+    "${pkgdir}/usr/share/applications/com.fxsound.FxSound.desktop"
+  install -Dm644 "packaging/fxsound.service" \
+    "${pkgdir}/usr/lib/systemd/user/fxsound.service"
+  install -Dm644 "assets/images/fxsound_large.png" \
+    "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fxsound.png"
+  install -Dm644 "assets/images/fxsound.png" \
+    "${pkgdir}/usr/share/icons/hicolor/32x32/apps/fxsound.png"
+
+  install -Dm644 "packaging/hyprland.conf.example" \
+    "${pkgdir}/usr/share/doc/${_pkgname}/hyprland.conf.example"
+  install -Dm644 "packaging/fxsound-autostart.desktop" \
+    "${pkgdir}/usr/share/doc/${_pkgname}/fxsound-autostart.desktop"
+  install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${_pkgname}/README.md"
+  install -Dm644 "CHANGELOG.md" "${pkgdir}/usr/share/doc/${_pkgname}/CHANGELOG.md"
+
+  install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE"
+}

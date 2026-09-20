@@ -1,0 +1,55 @@
+# Maintainer: FxSound Linux port contributors
+#
+# Installs the prebuilt tarball from a GitHub release. For anyone who does not want a Rust
+# toolchain and a ten-minute build to get an audio equalizer.
+#
+# The binary in that tarball is linked against the glibc of the runner that built it, so this
+# package declares that dependency honestly rather than pretending to be portable: on a
+# distribution older than the one in `.github/workflows/release.yml`, build `fxsound-linux-git`
+# from source instead.
+
+pkgname=fxsound-linux-bin
+_pkgname=fxsound-linux
+pkgver=0.3.0
+pkgrel=1
+pkgdesc="System-wide audio enhancement for Linux: EQ, ambience, surround, bass and dynamic boost (Rust/egui port of FxSound) — prebuilt binary"
+arch=('x86_64')
+url="https://github.com/blackixxce12/fxsound-linux"
+license=('AGPL-3.0-or-later')
+depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus' 'glibc')
+optdepends=(
+  'wireplumber: session management, needed to switch the default sink'
+  'xdg-desktop-portal: native file dialogs for preset import and export'
+  'libnotify: desktop notifications'
+)
+provides=("${_pkgname}" 'fxsound')
+conflicts=("${_pkgname}" 'fxsound' 'fxsound-linux-git')
+options=('!strip')   # the release build is already stripped of what it can spare
+source=("${url}/releases/download/v${pkgver}/${_pkgname}-${pkgver}-x86_64.tar.gz")
+# Replace on every version bump with the value from the release's .sha256 file; `makepkg -g`
+# regenerates it. Never SKIP here — a checksum is the only thing standing between a user and a
+# tampered release asset.
+sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+
+package() {
+  cd "${srcdir}/${_pkgname}-${pkgver}-x86_64"
+
+  install -Dm755 "bin/fxsound" "${pkgdir}/usr/bin/fxsound"
+
+  find share/fxsound/presets -name '*.fac' -print0 | while IFS= read -r -d '' _preset; do
+    install -Dm644 "${_preset}" "${pkgdir}/usr/${_preset}"
+  done
+
+  install -Dm644 "share/applications/com.fxsound.FxSound.desktop" \
+    "${pkgdir}/usr/share/applications/com.fxsound.FxSound.desktop"
+  install -Dm644 "lib/systemd/user/fxsound.service" \
+    "${pkgdir}/usr/lib/systemd/user/fxsound.service"
+  install -Dm644 "share/icons/hicolor/256x256/apps/fxsound.png" \
+    "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fxsound.png"
+  install -Dm644 "share/icons/hicolor/32x32/apps/fxsound.png" \
+    "${pkgdir}/usr/share/icons/hicolor/32x32/apps/fxsound.png"
+
+  install -Dm644 share/doc/fxsound-linux/* -t "${pkgdir}/usr/share/doc/${_pkgname}/"
+  install -Dm644 "share/doc/fxsound-linux/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE"
+}

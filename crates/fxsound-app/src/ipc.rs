@@ -464,8 +464,17 @@ pub fn socket_path() -> PathBuf {
 /// (`docs/spec/07-startup-tray.md` §4.7).
 #[must_use]
 pub fn runtime_dir() -> PathBuf {
-    dirs::runtime_dir().map_or_else(
-        || PathBuf::from(format!("/tmp/fxsound-{}", current_uid())),
+    runtime_dir_from(dirs::runtime_dir(), current_uid())
+}
+
+/// The decision itself, with the session's answer passed in.
+///
+/// Split out so both branches can be tested on any machine. Reading `dirs::runtime_dir()` inside
+/// the test instead means the fallback branch is exercised only where `XDG_RUNTIME_DIR` happens to
+/// be unset — which on a developer's desktop is never, and on a CI runner is always.
+fn runtime_dir_from(session: Option<PathBuf>, uid: u32) -> PathBuf {
+    session.map_or_else(
+        || PathBuf::from(format!("/tmp/fxsound-{uid}")),
         |dir| dir.join("fxsound"),
     )
 }
@@ -500,7 +509,10 @@ fn prepare_dir(dir: &Path) -> io::Result<()> {
 fn record_pid(lock: &File) {
     let pid = std::process::id();
     let mut handle: &File = lock;
-    if let Err(e) = lock.set_len(0).and_then(|()| handle.write_all(format!("{pid}\n").as_bytes())) {
+    if let Err(e) = lock
+        .set_len(0)
+        .and_then(|()| handle.write_all(format!("{pid}\n").as_bytes()))
+    {
         log::debug!("could not record the pid in the lock file: {e}");
     }
 }
@@ -751,10 +763,7 @@ mod tests {
             .expect("the replacement primary should answer")
         });
         let forwarded = wait_for(&server);
-        assert_eq!(
-            forwarded.commands(),
-            [Command::Preset(PresetCommand::Next)]
-        );
+        assert_eq!(forwarded.commands(), [Command::Preset(PresetCommand::Next)]);
         drop(forwarded);
         assert!(sender.join().expect("client thread").ok);
     }
@@ -781,7 +790,10 @@ mod tests {
         assert!(path.exists());
 
         drop(server);
-        assert!(!path.exists(), "the socket file must not outlive the server");
+        assert!(
+            !path.exists(),
+            "the socket file must not outlive the server"
+        );
 
         // With the lock released, the next process is the primary again.
         assert!(matches!(
@@ -795,17 +807,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let nested = dir.path().join("fxsound");
         prepare_dir(&nested).expect("prepare");
-        let mode = fs::metadata(&nested).expect("metadata").permissions().mode();
+        let mode = fs::metadata(&nested)
+            .expect("metadata")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o700, "got {:o}", mode & 0o777);
     }
 
     #[test]
     fn the_runtime_directory_falls_back_to_tmp_when_the_session_has_none() {
-        let dir = runtime_dir();
-        assert!(
-            dir.ends_with("fxsound") || dir.starts_with("/tmp/fxsound-"),
-            "unexpected runtime directory {}",
-            dir.display()
+        assert_eq!(
+            runtime_dir_from(Some(PathBuf::from("/run/user/1000")), 1000),
+            PathBuf::from("/run/user/1000/fxsound")
+        );
+        // `Path::starts_with` compares whole components, so an assertion spelled
+        // `starts_with("/tmp/fxsound-")` is false for `/tmp/fxsound-1000` and this test passed
+        // only through its other branch — on a machine that has a session runtime directory.
+        assert_eq!(
+            runtime_dir_from(None, 1000),
+            PathBuf::from("/tmp/fxsound-1000")
         );
     }
 
@@ -819,7 +839,9 @@ mod tests {
         let server = listener.serve().expect("serve");
 
         let stream = UnixStream::connect(&path).expect("connect");
-        stream.set_read_timeout(Some(REPLY_TIMEOUT)).expect("timeout");
+        stream
+            .set_read_timeout(Some(REPLY_TIMEOUT))
+            .expect("timeout");
         write_frame(
             &stream,
             &Request {

@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A build failure should not be buried under a thousand lines of dependency output.
+  CARGO_NET_RETRY: 3
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    name: Format, lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The build needs far less than the runtime does. `libpipewire-0.3-dev` is for the headers
+      # pipewire-sys binds, and `libclang-dev` because it runs bindgen to do it — without it the
+      # build fails with "Unable to find libclang", which is the same hole the PKGBUILD had.
+      # Deliberately NOT installed: libwayland-dev, libxkbcommon-dev, libgl-dev. None is needed to
+      # compile, and adding them would hide the fact that the binary loads them at run time.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libpipewire-0.3-dev libclang-dev
+
+      # rust-toolchain.toml pins 1.98.1 and asks for rustfmt and clippy, so rustup installs
+      # exactly what the developers use rather than whatever the runner image happens to ship.
+      - name: Show the toolchain
+        run: |
+          rustc --version
+          cargo --version
+          cargo fmt --version
+          cargo clippy --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # The runner sets no XDG_RUNTIME_DIR, no session bus and no PipeWire daemon. Nothing in the
+      # suite needs any of them — every test is a unit test that stops at the crate boundary — and
+      # the one that used to depend on the session's runtime directory now takes it as an argument
+      # rather than reading it. If this step ever fails for want of a daemon, the fix is to make
+      # that test take its dependency as a parameter too, not to start a daemon here.
+      - name: Tests
+        run: cargo test --workspace
+
+      # Release as well: the DSP is full of arithmetic whose rounding differs between opt-levels,
+      # and `panic = "abort"` only applies to the release profile.
+      - name: Tests, release profile
+        run: cargo test --release --workspace
+
+      - name: Build
+        run: cargo build --release --bin fxsound
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    # Advisories appear without anything in this repository changing, so a red run here means
+    # "look at this", not "your commit is broken".
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

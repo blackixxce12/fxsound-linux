@@ -16,7 +16,10 @@ license=('AGPL-3.0-or-later')
 # Runtime: PipeWire for audio, the Wayland/GL stack for the window, D-Bus for the tray and
 # notifications, fontconfig because egui asks it for fallback faces.
 depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus')
-makedepends=('rust' 'cargo' 'pkgconf')
+# `clang` is not optional: pipewire-sys runs bindgen in its build script and fails with
+# "Unable to find libclang" without it. The build only appears to work without it on a machine
+# that happens to have clang installed for something else — a clean chroot does not.
+makedepends=('rust' 'cargo' 'pkgconf' 'clang')
 optdepends=(
   'wireplumber: session management, needed to switch the default sink'
   'xdg-desktop-portal: native file dialogs for preset import and export'
@@ -62,6 +65,11 @@ package() {
 
   install -Dm644 "packaging/fxsound.desktop" \
     "${pkgdir}/usr/share/applications/com.fxsound.FxSound.desktop"
+
+  # The systemd user unit, so `systemctl --user enable --now fxsound` works on an installed
+  # package rather than failing with "Unit not found".
+  install -Dm644 "packaging/fxsound.service" \
+    "${pkgdir}/usr/lib/systemd/user/fxsound.service"
   install -Dm644 "assets/images/fxsound_large.png" \
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fxsound.png"
   install -Dm644 "assets/images/fxsound.png" \
