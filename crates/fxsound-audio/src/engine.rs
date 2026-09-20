@@ -67,6 +67,13 @@ use crate::{
     SINK_NODE_NAME, SOURCE_NODE_NAME, locale, our_node_name,
 };
 
+/// The rate the capture stream asks for, whatever the microphone runs at.
+///
+/// RNNoise exists at 48 kHz and nowhere else, and it sits in front of every stage that measures a
+/// level — so a preset voiced with it on means something different at any other rate. Asking for
+/// one rate and letting PipeWire resample is what makes a voice preset mean one thing everywhere.
+const CAPTURE_RATE: u32 = DEFAULT_SAMPLE_RATE;
+
 /// How often the supervisor runs. Also the shortest possible reconnect interval, which is the
 /// "never retry faster than 200 ms" floor of `docs/spec/12-audio-io.md` §22.
 const SUPERVISOR_PERIOD: Duration = Duration::from_millis(200);
@@ -325,6 +332,14 @@ pub(crate) struct Counters {
     format_mismatches: AtomicU64,
     sample_rate: AtomicU32,
     channels: AtomicU32,
+    /// Frames of delay the DSP is adding right now.
+    ///
+    /// Written by the audio thread every cycle and read by the supervisor, because it *changes*:
+    /// switching the denoiser on adds ten milliseconds. The figure published to PipeWire when the
+    /// nodes were built would otherwise stay put, and a recording application would be told the
+    /// stream is ten milliseconds tighter than it is — which shows up as lip-sync drift nobody can
+    /// diagnose.
+    dsp_latency_frames: AtomicU32,
 }
 
 /// Stream state, published by `state_changed` (main loop) for the supervisor to act on.
@@ -552,8 +567,12 @@ pub(crate) struct Config {
 struct Nodes {
     _first_listener: pw::stream::StreamListener<SinkData>,
     _second_listener: pw::stream::StreamListener<OutData>,
-    _first: pw::stream::StreamRc,
+    /// Kept reachable rather than merely alive: the supervisor republishes this node's
+    /// `ProcessLatency` when the DSP's delay changes under it.
+    first: pw::stream::StreamRc,
     _second: pw::stream::StreamRc,
+    /// The last delay published on NODE 1, in frames.
+    published_latency: u32,
     /// Which pair this is: sink + playback stream, or capture stream + source.
     direction: DeviceDirection,
     /// `node.name` of the real device NODE 2 renders to, or NODE 1 captures from.
@@ -746,6 +765,45 @@ impl Shared {
     fn has_nodes(&self) -> bool {
         self.session.as_ref().is_some_and(|s| s.nodes.is_some())
     }
+}
+
+/// Republish NODE 1's `ProcessLatency` when the DSP's delay has moved under it.
+///
+/// The figure is fixed at build time for the output chain — the limiter's look-ahead does not
+/// change — but the microphone chain's denoiser is a per-preset switch worth ten milliseconds, and
+/// a preset can be chosen at any moment. Without this, a recording application keeps the number it
+/// was told when the nodes were built, and a ten-millisecond error in a voice stream is exactly
+/// the kind of lip-sync drift nobody can diagnose from the outside.
+///
+/// Once per supervisor tick, so the correction is at most 200 ms late, and only when the number
+/// actually changed: `update_params` on an unchanged pod would be churn in the graph.
+fn republish_latency(shared: &mut Shared) {
+    let current = shared.counters.dsp_latency_frames.load(Ordering::Relaxed);
+    let Some(nodes) = shared
+        .session
+        .as_mut()
+        .and_then(|session| session.nodes.as_mut())
+    else {
+        return;
+    };
+    if current == nodes.published_latency || current == 0 {
+        return;
+    }
+
+    let values = process_latency_pod(current as usize);
+    let Some(pod) = libspa::pod::Pod::from_bytes(&values) else {
+        log::warn!("could not build a ProcessLatency pod for {current} frames");
+        return;
+    };
+    if let Err(error) = nodes.first.update_params(&mut [pod]) {
+        log::warn!("could not republish the DSP latency: {error}");
+        return;
+    }
+    log::info!(
+        "DSP latency is now {current} frames (was {})",
+        nodes.published_latency
+    );
+    nodes.published_latency = current;
 }
 
 /// The word for a direction in log lines.
@@ -1158,7 +1216,11 @@ fn supervise(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) {
             apply_rules(&mut guard);
         }
 
-        // 5. Tell the GUI what changed.
+        // 5. Keep the published delay honest. Switching the denoiser on adds ten milliseconds,
+        //    and only the audio thread knows it happened.
+        republish_latency(&mut guard);
+
+        // 6. Tell the GUI what changed.
         publish(&mut guard);
 
         guard.session.is_none() && Instant::now() >= guard.next_attempt
@@ -1664,7 +1726,16 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
     }
     let direction = target.direction;
     let channels = target.clamped_channels();
-    let rate = target.rate.unwrap_or(shared.graph_rate);
+    // The capture stream asks for 48 kHz whatever the microphone runs at, and lets PipeWire
+    // resample. RNNoise exists at 48 kHz and nowhere else, and a voice preset has to mean one
+    // thing on every device — a preset whose denoiser silently drops out on a 44.1 kHz microphone
+    // is a preset describing half its own sound. The cost is a resampler in the graph on devices
+    // that are not already at 48 kHz, which is a little latency and a little CPU on a path that
+    // carries one or two channels.
+    let rate = match direction {
+        DeviceDirection::Input => CAPTURE_RATE,
+        DeviceDirection::Output => target.rate.unwrap_or(shared.graph_rate),
+    };
     let positions = target.positions.resized(channels);
     let quantum = DEFAULT_QUANTUM_FRAMES.min(MAX_QUANTUM_FRAMES as u32);
     let latency = format!("{quantum}/{rate}");
@@ -1844,8 +1915,9 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
     Ok(Nodes {
         _first_listener: first_listener,
         _second_listener: second_listener,
-        _first: first,
+        first,
         _second: second,
+        published_latency: u32::try_from(dsp_latency_frames).unwrap_or(u32::MAX),
         direction,
         target: target.name.clone(),
         channels,
@@ -2119,6 +2191,12 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
 
     let meters = dsp.meters();
     dsp.meters.write(meters);
+    // Cheap, and it has to be here: the latency changes when a preset switches the denoiser on,
+    // and the supervisor is the only thing that can tell PipeWire about it.
+    data.counters.dsp_latency_frames.store(
+        u32::try_from(dsp.latency_frames()).unwrap_or(u32::MAX),
+        Ordering::Relaxed,
+    );
     data.counters.sink_cycles.fetch_add(1, Ordering::Relaxed);
     data.counters
         .frames_processed

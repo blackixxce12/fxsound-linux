@@ -166,6 +166,9 @@ impl App {
         // so. A 16 kHz Bluetooth capture takes the top two bands of the standard ladder with it.
         self.state.sample_rate = meters.sample_rate;
         self.state.gate_reduction_db = meters.gate_reduction_db;
+        self.state.deesser_running = meters.deesser_running;
+        self.state.denoise_running = meters.denoiser_running;
+        self.state.voice_probability = meters.voice_probability;
         self.state.compressor_reduction_db = meters.compressor_reduction_db;
         self.state.deesser_reduction_db = meters.deesser_reduction_db;
 
@@ -685,6 +688,7 @@ impl App {
 
         self.input_params.highpass_hz = 80.0;
         self.input_params.highpass_order = 2;
+        self.input_params.rnnoise = self.state.denoise_on;
         self.input_params.gate_on = self.state.gate_on;
         self.input_params.compressor_on = self.state.compressor_on;
         self.input_params.deesser_on = self.state.deesser_on;

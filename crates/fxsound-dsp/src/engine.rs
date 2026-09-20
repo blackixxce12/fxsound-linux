@@ -298,6 +298,9 @@ impl Engine {
             gate_reduction_db: 0.0,
             compressor_reduction_db: 0.0,
             deesser_reduction_db: 0.0,
+            deesser_running: false,
+            denoiser_running: false,
+            voice_probability: 0.0,
         }
     }
 

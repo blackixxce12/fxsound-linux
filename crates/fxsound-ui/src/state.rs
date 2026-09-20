@@ -88,6 +88,15 @@ pub struct UiState {
     pub gate_on: bool,
     pub compressor_on: bool,
     pub deesser_on: bool,
+    /// Whether the preset asks for RNNoise in front of everything else.
+    pub denoise_on: bool,
+    /// Whether the two stages that can be asked for and still not run are running: the de-esser
+    /// needs a rate that can carry its crossover, and RNNoise exists at 48 kHz and nowhere else.
+    /// Asked-for-but-not-running is a third state, and the interface has to be able to say it.
+    pub deesser_running: bool,
+    pub denoise_running: bool,
+    /// The denoiser's voice probability for the last frame, `0.0..=1.0`.
+    pub voice_probability: f32,
 
     // ---- chrome ----------------------------------------------------------------------------
     /// Transient message shown in the notification strip, with the frame count left to live.
@@ -123,6 +132,10 @@ impl Default for UiState {
             gate_on: false,
             compressor_on: false,
             deesser_on: false,
+            denoise_on: false,
+            deesser_running: false,
+            denoise_running: false,
+            voice_probability: 0.0,
             notification: None,
             hide_tooltips: false,
         }

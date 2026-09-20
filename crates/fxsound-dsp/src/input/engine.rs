@@ -87,6 +87,7 @@ impl InputEngine {
         self.chain
             .set_highpass(params.highpass_hz, usize::from(params.highpass_order));
 
+        self.chain.set_denoise_enabled(params.rnnoise);
         self.chain.set_gate_enabled(params.gate_on);
         let gate = self.chain.gate_mut();
         gate.set_threshold_db(params.gate_threshold_db);
@@ -143,7 +144,7 @@ impl InputEngine {
 
     /// Latency the chain adds, in frames. Only the limiter's look-ahead contributes.
     #[must_use]
-    pub const fn latency_frames(&self) -> usize {
+    pub fn latency_frames(&self) -> usize {
         self.chain.latency_frames()
     }
 
@@ -155,6 +156,23 @@ impl InputEngine {
     #[must_use]
     pub const fn deesser_running(&self) -> bool {
         self.chain.deesser().is_active()
+    }
+
+    /// Whether the denoiser is actually processing.
+    ///
+    /// `false` while it is switched off, and `false` at any capture rate other than 48 kHz —
+    /// RNNoise exists at that rate and nowhere else. Worth surfacing for the same reason as the
+    /// de-esser: a preset that asks for a stage the device cannot run should say so rather than
+    /// sound different without explanation.
+    #[must_use]
+    pub fn denoiser_running(&self) -> bool {
+        self.chain.denoiser().is_active()
+    }
+
+    /// The denoiser's opinion of whether the last frame was voice, `0.0..=1.0`.
+    #[must_use]
+    pub fn voice_probability(&self) -> f32 {
+        self.chain.denoiser().voice_probability()
     }
 
     /// Process one interleaved block in place.
@@ -228,6 +246,9 @@ impl InputEngine {
             gate_reduction_db: self.chain.gate().reduction_db(0),
             compressor_reduction_db: self.chain.compressor().reduction_db(0),
             deesser_reduction_db: self.chain.deesser().reduction_db(0),
+            deesser_running: self.chain.deesser().is_active(),
+            denoiser_running: self.chain.denoiser().is_active(),
+            voice_probability: self.chain.denoiser().voice_probability(),
         }
     }
 
@@ -444,6 +465,85 @@ mod tests {
         }
         let gap = reductions[0] - reductions[1];
         assert!(gap.abs() > 3.0, "the mode did not reach the stage: {gap}");
+    }
+
+    #[test]
+    fn switching_the_denoiser_on_changes_the_latency_and_says_so() {
+        // Ten milliseconds is far too much to add silently: a recording application told the old
+        // figure drifts out of lip sync by exactly that much, and nobody can diagnose it from the
+        // outside. The engine's number has to move, which is what lets the supervisor republish.
+        let mut engine = InputEngine::new(FS, 1_024, 1);
+        let quiet = engine.latency_frames();
+        assert_eq!(quiet, 48, "the limiter's millisecond, and nothing else");
+
+        let mut params = InputDspParams {
+            rnnoise: true,
+            ..InputDspParams::default()
+        };
+        params.sanitise();
+        engine.apply(&params);
+        assert!(engine.denoiser_running());
+        assert_eq!(
+            engine.latency_frames(),
+            quiet + 480,
+            "RNNoise's whole frame, on top of the limiter's look-ahead"
+        );
+
+        // And at a rate RNNoise cannot work at, the stage stands aside and takes its latency with
+        // it — the chain is still correct, it is just not denoised.
+        engine.set_format(44_100.0, 1);
+        assert!(!engine.denoiser_running());
+        assert_eq!(engine.latency_frames(), 44, "1 ms at 44.1 kHz, no denoiser");
+    }
+
+    #[test]
+    fn the_denoiser_runs_before_everything_that_measures_a_level() {
+        // Position is the whole argument for putting it first: the gate, the compressor and the
+        // de-esser all measure a level, and a denoised level is a different number. With a room
+        // floor on the input, the gate sees less of it — which is why every gate threshold in the
+        // preset draft has to be re-voiced now that this stage exists.
+        let floor: Vec<f32> = {
+            let mut state = 0x2545_f491_4f6c_dd1d_u64;
+            (0..48_000)
+                .map(|n| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let hiss = ((state >> 40) as f32 / 8_388_608.0 - 1.0) * 0.02;
+                    hiss + (n as f32 * std::f32::consts::TAU * 50.0 / FS).sin() * 0.05
+                })
+                .collect()
+        };
+
+        let reduction = |rnnoise: bool| {
+            let mut engine = InputEngine::new(FS, 1_024, 1);
+            let mut params = InputDspParams {
+                rnnoise,
+                gate_on: true,
+                gate_threshold_db: -30.0,
+                gate_ratio: 2.0,
+                gate_range_db: -20.0,
+                gate_hold_ms: 0.0,
+                compressor_on: false,
+                deesser_on: false,
+                eq_on: false,
+                highpass_order: 0,
+                makeup_db: 0.0,
+                ..InputDspParams::default()
+            };
+            params.sanitise();
+            engine.apply(&params);
+            let mut block = floor.clone();
+            engine.process(&mut block, 1);
+            engine.meters().gate_reduction_db
+        };
+
+        let plain = reduction(false);
+        let denoised = reduction(true);
+        assert!(
+            denoised > plain + 3.0,
+            "the gate saw the same floor either way: {plain} against {denoised}"
+        );
     }
 
     #[test]

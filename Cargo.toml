@@ -64,6 +64,10 @@ thiserror = "2.0.20"
 log = "0.4.34"
 env_logger = "0.11.11"
 clap = { version = "4.6.6", features = ["derive"] }
+# RNNoise, as a pure-Rust port. `default-features = false` is not optional: the default features
+# pull in clap 3 alongside this workspace's clap 4. BSD-3-Clause, which an AGPL-3.0 work may
+# incorporate, and the model weights are embedded in the crate rather than loaded from a file.
+nnnoiseless = { version = "0.5.2", default-features = false }
 tempfile = "3.27.0"
 
 [profile.release]

@@ -1,12 +1,16 @@
 //! The microphone chain, in order.
 //!
 //! ```text
-//! mic ─► high-pass ─► gate ─► 10-band EQ ─► de-esser ─► compressor ─► makeup ─► limiter ─► out
+//! mic ─► denoise ─► high-pass ─► gate ─► EQ ─► de-esser ─► compressor ─► makeup ─► limiter ─► out
 //! ```
 //!
 //! The order is not a preference. Each position earns itself:
 //!
-//! - **High-pass first**, because desk rumble and a plosive are ten to twenty decibels above the
+//! - **Denoising first of all.** Five of the nine community chains surveyed put it first and none
+//!   put it after the limiter, and the reason is downstream: everything below measures a level,
+//!   and a denoised level is a different number. Every gate threshold in the preset draft was
+//!   chosen against an un-denoised floor and has to be re-voiced now that this stage exists.
+//! - **High-pass next**, because desk rumble and a plosive are ten to twenty decibels above the
 //!   voice below 150 Hz. Leave them in and they hold the gate open through every pause and drive
 //!   the compressor on sounds nobody can hear.
 //! - **Gate before the EQ**, so that what the gate measures is the microphone rather than the
@@ -20,14 +24,11 @@
 //!   gain is the one control here that can produce a sample above full scale, and something has to
 //!   be standing behind it.
 //!
-//! Denoising, when it arrives, goes in *front* of the high-pass — five of the nine community
-//! chains surveyed put it first and none put it after the limiter — which is why the gate
-//! thresholds in the preset table will have to be re-voiced when it does.
-//!
 //! Real-time safe: every stage is fixed-size, and the chain itself only sequences them.
 
 use crate::biquad::{MAX_CHANNELS, Real, Section, calc_butterworth_highpass};
 use crate::eq::GraphicEq;
+use crate::input::denoise::Denoiser;
 use crate::input::limiter::LookaheadLimiter;
 use crate::input::{Compressor, DeEsser, Gate, prewarped, sane_rate};
 
@@ -45,6 +46,7 @@ const LIMITER_RELEASE_MS: Real = 80.0;
 const MAX_SECTIONS: usize = 2;
 
 pub struct InputChain {
+    denoiser: Denoiser,
     highpass: [Section; MAX_SECTIONS],
     highpass_hz: Real,
     /// `0`, `2` or `4`. Zero is off; the preset set uses both of the others.
@@ -78,6 +80,7 @@ impl std::fmt::Debug for InputChain {
             .field("highpass_hz", &self.highpass_hz)
             .field("highpass_order", &self.highpass_order)
             .field("highpass_sections", &self.highpass_sections)
+            .field("denoiser", &self.denoiser)
             .field("gate_on", &self.gate_on)
             .field("deesser_on", &self.deesser_on)
             .field("compressor_on", &self.compressor_on)
@@ -96,6 +99,7 @@ impl InputChain {
         limiter.set_ceiling_db(DEFAULT_CEILING_DB);
 
         let mut chain = Self {
+            denoiser: Denoiser::new(sample_rate),
             highpass: [Section::new(); MAX_SECTIONS],
             highpass_hz: 80.0,
             highpass_order: 2,
@@ -144,6 +148,7 @@ impl InputChain {
             return;
         }
         self.sample_rate = sample_rate;
+        self.denoiser.set_sample_rate(sample_rate);
         self.gate.set_sample_rate(sample_rate);
         self.eq.set_sample_rate(sample_rate);
         self.deesser.set_sample_rate(sample_rate);
@@ -202,6 +207,17 @@ impl InputChain {
     /// The level the chain's output may never exceed, in dBFS.
     pub fn set_ceiling_db(&mut self, db: Real) {
         self.limiter.set_ceiling_db(db);
+    }
+
+    /// Switch the denoiser on. Whether it then runs also depends on the capture rate: RNNoise
+    /// exists at 48 kHz and nowhere else. [`InputChain::denoiser`] reports which.
+    pub fn set_denoise_enabled(&mut self, on: bool) {
+        self.denoiser.set_enabled(on);
+    }
+
+    #[must_use]
+    pub const fn denoiser(&self) -> &Denoiser {
+        &self.denoiser
     }
 
     pub fn set_gate_enabled(&mut self, on: bool) {
@@ -283,6 +299,7 @@ impl InputChain {
     }
 
     pub fn reset(&mut self) {
+        self.denoiser.reset();
         for section in &mut self.highpass {
             section.reset();
         }
@@ -293,15 +310,16 @@ impl InputChain {
         self.limiter.reset();
     }
 
-    /// Frames of delay the chain adds. Only the limiter's look-ahead contributes; everything else
-    /// here is a filter or a gain.
+    /// Frames of delay the chain adds: the limiter's look-ahead, plus RNNoise's whole frame when
+    /// the denoiser is running. Everything else here is a filter or a gain.
     ///
     /// Reported whether or not the chain is powered, as the output chain does: a latency that
     /// changed when someone pressed a button would mean renegotiating the stream to save a
-    /// millisecond.
+    /// millisecond. **Switching the denoiser on does change it** — by ten milliseconds, which is
+    /// too much to leave unsaid — so a caller that publishes this figure has to notice.
     #[must_use]
-    pub const fn latency_frames(&self) -> usize {
-        self.limiter.latency_frames()
+    pub fn latency_frames(&self) -> usize {
+        self.limiter.latency_frames() + self.denoiser.latency_frames()
     }
 
     /// Run the chain over one interleaved block, in place.
@@ -309,6 +327,10 @@ impl InputChain {
         if !self.power || channels == 0 || buffer.is_empty() {
             return;
         }
+
+        // Before everything, including the filter: what follows measures levels, and the level
+        // of a denoised signal is a different number.
+        self.denoiser.process(buffer, channels);
 
         if self.highpass_sections != 0 {
             for frame in buffer.chunks_exact_mut(channels) {

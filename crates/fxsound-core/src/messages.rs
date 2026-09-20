@@ -186,6 +186,15 @@ pub struct InputDspParams {
     pub highpass_hz: f32,
     pub highpass_order: u8,
 
+    /// Run RNNoise in front of everything else.
+    ///
+    /// A per-preset field rather than a global switch, because a preset that ignores the denoiser
+    /// is describing half its own sound: every threshold below it is a threshold on a *denoised*
+    /// level. Whether it then runs also depends on the capture rate — RNNoise exists at 48 kHz
+    /// and nowhere else — so a preset asking for it on a device that cannot have it gets a
+    /// working chain and an interface that says which stages are running.
+    pub rnnoise: bool,
+
     pub gate_on: bool,
     pub gate_threshold_db: f32,
     pub gate_ratio: f32,
@@ -363,6 +372,7 @@ impl Default for InputDspParams {
             power: true,
             highpass_hz: 80.0,
             highpass_order: 2,
+            rnnoise: false,
             gate_on: true,
             gate_threshold_db: -45.0,
             gate_ratio: 2.0,
@@ -429,6 +439,17 @@ pub struct Meters {
     pub gate_reduction_db: f32,
     pub compressor_reduction_db: f32,
     pub deesser_reduction_db: f32,
+    /// Whether the two stages that can be *asked for* and still not run are running.
+    ///
+    /// The de-esser needs a rate that can carry its crossover, and RNNoise exists at 48 kHz and
+    /// nowhere else. A preset that asks for either on a device that cannot have it gets a working
+    /// chain, and this is how the interface knows to say so rather than leaving the user to
+    /// wonder why the sound did not change.
+    pub deesser_running: bool,
+    pub denoiser_running: bool,
+    /// The denoiser's opinion of whether the last frame was voice, `0.0..=1.0`. Zero when it is
+    /// not running.
+    pub voice_probability: f32,
 }
 
 impl Default for Meters {
@@ -443,6 +464,9 @@ impl Default for Meters {
             gate_reduction_db: 0.0,
             compressor_reduction_db: 0.0,
             deesser_reduction_db: 0.0,
+            deesser_running: false,
+            denoiser_running: false,
+            voice_probability: 0.0,
         }
     }
 }

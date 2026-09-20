@@ -229,7 +229,80 @@ pub fn show(
     response
 }
 
-/// The microphone chain's three gain-reduction readouts.
+/// One entry in the microphone chain's readout strip.
+///
+/// A gain-reduction meter and the denoiser are different animals — one measures decibels taken
+/// away, the other reports how sure the network is that it is hearing a voice — so the strip holds
+/// a small sum type rather than pretending they are the same number.
+#[derive(Clone, Copy)]
+enum Stage {
+    /// Asked for and running: a name, how far to fill the bar, and what the number means.
+    Running(&'static str, f32, Readout),
+    /// Asked for, and the device cannot carry it.
+    Unavailable(&'static str),
+    /// Not asked for.
+    Off(&'static str),
+}
+
+/// What the number beside a running stage means.
+#[derive(Clone, Copy)]
+enum Readout {
+    /// Decibels of gain reduction, as a positive number.
+    Reduction(f32),
+    /// A probability, `0.0..=1.0`.
+    Probability(f32),
+}
+
+impl Stage {
+    fn meter(name: &'static str, on: bool, running: bool, reduction_db: f32) -> Self {
+        match (on, running) {
+            (false, _) => Self::Off(name),
+            (true, false) => Self::Unavailable(name),
+            (true, true) => Self::Running(
+                name,
+                (reduction_db.max(0.0) / METER_FULL_SCALE_DB).clamp(0.0, 1.0),
+                Readout::Reduction(reduction_db.max(0.0)),
+            ),
+        }
+    }
+
+    fn denoiser(state: &UiState) -> Self {
+        let voice = state.voice_probability.clamp(0.0, 1.0);
+        match (state.denoise_on, state.denoise_running) {
+            (false, _) => Self::Off("Denoise"),
+            (true, false) => Self::Unavailable("Denoise"),
+            (true, true) => Self::Running("Denoise", voice, Readout::Probability(voice)),
+        }
+    }
+
+    /// The text, and whether there is a bar to draw beside it.
+    fn readout(self) -> (String, bool) {
+        match self {
+            Self::Off(name) => (format!("{}  {}", tr(name), tr("off")), false),
+            // Not "off": the user asked for this and it is not happening, which is a different
+            // thing and the only state here they might want to act on.
+            Self::Unavailable(name) => (
+                format!("{}  {}", tr(name), tr("unavailable at this rate")),
+                false,
+            ),
+            Self::Running(name, _, Readout::Reduction(db)) => {
+                (format!("{}  −{db:.1} dB", tr(name)), true)
+            }
+            Self::Running(name, _, Readout::Probability(p)) => {
+                (format!("{}  {}  {p:.2}", tr(name), tr("voice")), true)
+            }
+        }
+    }
+
+    const fn fill(self) -> f32 {
+        match self {
+            Self::Running(_, fill, _) => fill,
+            _ => 0.0,
+        }
+    }
+}
+
+/// The microphone chain's four readouts.
 ///
 /// A voice chain that is working is a chain that is *changing* something, and none of its stages
 /// has a control the user can watch: the gate opens and closes on its own, the compressor rides
@@ -238,14 +311,26 @@ pub fn show(
 ///
 /// Drawn only in the input direction, in space the original leaves as padding.
 fn input_meters(ui: &Ui, state: &UiState, palette: Palette, strip: Rect) {
+    // Three states, not two. A stage can be off; it can be on and working; and it can be asked
+    // for by a preset and still not running, because the device cannot carry it — a de-esser needs
+    // a rate that can hold its crossover, and RNNoise exists at 48 kHz and nowhere else. Leaving
+    // that third state looking like the second is how someone ends up wondering why the sound did
+    // not change.
     let stages = [
-        ("Gate", state.gate_on, state.gate_reduction_db),
-        (
+        Stage::denoiser(state),
+        Stage::meter("Gate", state.gate_on, true, state.gate_reduction_db),
+        Stage::meter(
             "Compressor",
             state.compressor_on,
+            true,
             state.compressor_reduction_db,
         ),
-        ("De-esser", state.deesser_on, state.deesser_reduction_db),
+        Stage::meter(
+            "De-esser",
+            state.deesser_on,
+            state.deesser_running,
+            state.deesser_reduction_db,
+        ),
     ];
 
     let label_colour = palette.color(FxColor::DefaultText);
@@ -253,16 +338,12 @@ fn input_meters(ui: &Ui, state: &UiState, palette: Palette, strip: Rect) {
     let font = caption_font(METER_FONT_PX);
     let slot = strip.width() / stages.len() as f32;
 
-    for (index, (name, on, reduction)) in stages.into_iter().enumerate() {
+    for (index, stage) in stages.into_iter().enumerate() {
         let left = strip.left() + slot * index as f32;
         // A stage nobody has switched on can only ever read zero, and a meter pinned at zero is
-        // noise. Say which it is instead: the chain has these three, and none of them is engaged
-        // until a preset engages it.
-        let text = if on {
-            format!("{}  −{:.1} dB", tr(name), reduction.max(0.0))
-        } else {
-            format!("{}  {}", tr(name), tr("off"))
-        };
+        // noise. Say which it is instead: the chain has these four, and none is engaged until a
+        // preset engages it.
+        let (text, metered) = stage.readout();
         let galley = ui
             .painter()
             .layout_no_wrap(text, font.clone(), label_colour);
@@ -273,8 +354,14 @@ fn input_meters(ui: &Ui, state: &UiState, palette: Palette, strip: Rect) {
             label_colour,
         );
 
+        if !metered {
+            continue;
+        }
         // A bar as well as a number: a number that changes twenty times a second is not something
-        // anyone reads. Full scale is 24 dB, past anything a voice preset asks for.
+        // anyone reads. The unlit track needs a colour of its own — the panel's background is what
+        // it is drawn on top of, so painting it there makes an empty meter invisible, which is
+        // exactly what the first build did and what a screenshot showed before anyone had to
+        // listen for it.
         let bar = Rect::from_min_size(
             pos2(
                 left + text_width + METER_BAR_GAP,
@@ -285,15 +372,9 @@ fn input_meters(ui: &Ui, state: &UiState, palette: Palette, strip: Rect) {
                 METER_BAR_HEIGHT,
             ),
         );
-        if !on {
-            continue;
-        }
-        // The unlit track needs a colour of its own: the panel's background is what it is drawn on
-        // top of, so painting it there makes an empty meter invisible — which is exactly what the
-        // first build did, and what a screenshot showed before anyone had to listen for it.
         ui.painter()
             .rect_filled(bar, 1.0, palette.color_alpha(FxColor::DefaultText, 0.15));
-        let filled = (reduction.max(0.0) / METER_FULL_SCALE_DB).clamp(0.0, 1.0);
+        let filled = stage.fill();
         if filled > 0.0 {
             let mut lit = bar;
             lit.set_width(bar.width() * filled);

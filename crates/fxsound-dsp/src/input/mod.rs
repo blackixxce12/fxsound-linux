@@ -15,6 +15,7 @@
 pub mod chain;
 pub mod compressor;
 pub mod deesser;
+pub mod denoise;
 pub mod detector;
 pub mod engine;
 pub mod gate;
@@ -68,6 +69,7 @@ pub const MAX_CORNER_FRACTION: Real = 0.3;
 pub use chain::InputChain;
 pub use compressor::Compressor;
 pub use deesser::DeEsser;
+pub use denoise::Denoiser;
 pub use detector::{Detection, Follower};
 pub use engine::InputEngine;
 pub use gate::Gate;
