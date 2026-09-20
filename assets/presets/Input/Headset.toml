@@ -1,0 +1,36 @@
+# Order 4 here is a Linkwitz-Riley, which is 6 dB down at the corner and not 3: measured,
+# -6.0 at 120 Hz, -6.7 at 115.7, -9.8 at 100, -13.9 at 85. Against a proximity shelf worth
+# +10 to +16 dB at this distance that is defensible; against the textbook Butterworth figures
+# the preset was first written to, it is 3 dB more than intended.
+name = "Headset"
+description = "A boom microphone two to five centimetres from the mouth: proximity and plosives held down."
+rnnoise = false
+highpass_hz = 120.0
+highpass_order = 4
+makeup_db = 3.0
+ceiling_db = -3.0
+
+[gate]
+threshold_db = -38.0
+ratio = 2.0
+range_db = -12.0
+attack_ms = 5.0
+release_ms = 150.0
+hold_ms = 200.0
+detection = "rms"
+
+[compressor]
+threshold_db = -18.0
+ratio = 3.0
+knee_db = 6.0
+attack_ms = 10.0
+release_ms = 150.0
+detection = "rms"
+
+[deesser]
+frequency_hz = 5500.0
+threshold_db = -26.0
+
+[eq]
+centers_hz = [62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0]
+gains_db = [0, -2, -1, 0, 0, 0, 1.5, 0, 0, 0]

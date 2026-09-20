@@ -170,80 +170,249 @@ fn each_band_does_what_it_says_it_does() {
     );
 }
 
-/// Everything a listener can hear about a preset, as one vector of comparable numbers.
+/// Everything a listener can hear about a preset, measured by running signal through it.
 ///
-/// Each entry is scaled so that "one unit" means about the same amount of audible difference
-/// wherever it comes from: a decibel of equalizer, a decibel of threshold, a ratio step. That is a
-/// judgement, and it is written down here rather than buried in a comparison.
+/// **The first version of this compared parameter vectors, and it was wrong.** Three of its terms
+/// could not be heard: a preset scored 6.0 for switching the denoiser on, 20.0 for having a gate
+/// where its neighbour had none, and something for a `range_db` that measurement shows is inert
+/// above a −58 dBFS floor. Because the distance is a maximum over terms, those constants *were*
+/// the distance for most pairs, and the bar of 1.0 became unreachable. It reported 26.0 for Flat
+/// against Studio — two presets whose audible difference is a high-pass corner — and it could not
+/// have flagged that pair at any threshold. A guard that cannot fire is not a guard.
+///
+/// So nothing here is a parameter. Every term is decibels of something that happens to a signal,
+/// measured through the real [`fxsound_dsp::InputChain`], and two presets that score alike score
+/// alike because they *do* alike.
+///
+/// Tone and level are measured apart on purpose. Makeup gain is a constant offset, and folded into
+/// the tone curve it would swamp a set whose tonal moves are all under two decibels — which is
+/// itself worth knowing, because the loudest thing about changing preset should not be loudness.
 fn fingerprint(preset: &InputPreset) -> Vec<f32> {
-    let params = preset.to_params();
-    let eq = equalizer(&params);
-    let mut out: Vec<f32> = THIRD_OCTAVES
-        .iter()
-        .map(|&hz| {
-            if hz * 2.0 >= CAPTURE_RATE {
-                0.0
-            } else {
-                eq.response_db(hz)
-            }
-        })
-        .collect();
-
-    // The high-pass: its corner in octaves from 80 Hz, and its order. A 4th-order 120 Hz filter
-    // and a 2nd-order 75 Hz one are not the same preset.
-    out.push((preset.highpass_hz / 80.0).log2() * 3.0);
-    out.push(f32::from(preset.highpass_order));
-    out.push(if preset.rnnoise { 6.0 } else { 0.0 });
-
-    // A stage that is off is not a stage at its defaults, so absence has to read as distance.
-    match &preset.gate {
-        Some(gate) => out.extend([
-            gate.threshold_db + 45.0,
-            gate.ratio * 3.0,
-            gate.range_db + 14.0,
-        ]),
-        None => out.extend([-20.0, -20.0, -20.0]),
-    }
-    match &preset.compressor {
-        Some(compressor) => out.extend([
-            compressor.threshold_db + 18.0,
-            compressor.ratio * 3.0,
-            (compressor.attack_ms / 20.0).log2() * 3.0,
-            (compressor.release_ms / 150.0).log2() * 3.0,
-        ]),
-        None => out.extend([-20.0, -20.0, -20.0, -20.0]),
-    }
-    match &preset.deesser {
-        Some(deesser) => out.extend([
-            (deesser.frequency_hz / 5_500.0).log2() * 6.0,
-            deesser.threshold_db + 22.0,
-        ]),
-        None => out.extend([-20.0, -20.0]),
-    }
-
-    out.push(preset.makeup_db);
-    out.push(preset.ceiling_db);
+    let mut out = tone_curve(preset);
+    out.extend(dynamics(preset));
     out
 }
 
-/// How far apart two presets are: the largest single difference anywhere in the chain.
+/// The chain a preset describes, with every stage it asks for.
+fn chain_for(preset: &InputPreset) -> fxsound_dsp::InputChain {
+    let params = preset.to_params();
+    let mut chain = fxsound_dsp::InputChain::new(CAPTURE_RATE);
+    chain.set_highpass(params.highpass_hz, usize::from(params.highpass_order));
+    chain.set_denoise_enabled(params.rnnoise);
+
+    chain.set_gate_enabled(params.gate_on);
+    let gate = chain.gate_mut();
+    gate.set_threshold_db(params.gate_threshold_db);
+    gate.set_ratio(params.gate_ratio);
+    gate.set_range_db(params.gate_range_db);
+    gate.set_times(params.gate_attack_ms, params.gate_release_ms);
+    gate.set_hold_ms(params.gate_hold_ms);
+    gate.set_detection(params.gate_detection);
+
+    let eq = chain.eq_mut();
+    eq.set_enabled(params.eq_on);
+    eq.set_q_multiplier(params.filter_q);
+    let (centers, gains) = params.bands();
+    eq.set_bands(centers, gains);
+
+    chain.set_deesser_enabled(params.deesser_on);
+    let deesser = chain.deesser_mut();
+    deesser.set_frequency(params.deesser_hz);
+    deesser.set_threshold_db(params.deesser_threshold_db);
+
+    chain.set_compressor_enabled(params.compressor_on);
+    let compressor = chain.compressor_mut();
+    compressor.set_threshold_db(params.compressor_threshold_db);
+    compressor.set_ratio(params.compressor_ratio);
+    compressor.set_knee_db(params.compressor_knee_db);
+    compressor.set_times(params.compressor_attack_ms, params.compressor_release_ms);
+    compressor.set_detection(params.compressor_detection);
+
+    chain.set_makeup_db(params.makeup_db);
+    chain.set_ceiling_db(params.ceiling_db);
+    chain
+}
+
+/// Run a block through a chain and report the settled level, in dB against the input.
+///
+/// RMS, not peak. The peak of a loud probe is whatever the limiter's ceiling is — every preset
+/// reads −3 dBFS and the measurement says nothing — which is how a preset differing only in its
+/// compressor's detector looked identical to its neighbour here. RMS is what survives the ceiling,
+/// and is the better question anyway: a listener judges loudness, not the tallest sample.
+fn through(chain: &mut fxsound_dsp::InputChain, block: &mut [f32], reference: f32) -> f32 {
+    chain.reset();
+    chain.process(block, 1);
+    let settled = &block[block.len() / 2..];
+    let mean_square = settled.iter().map(|x| x * x).sum::<f32>() / settled.len().max(1) as f32;
+    20.0 * (mean_square.sqrt().max(1.0e-9) / reference).log10()
+}
+
+/// What the preset does to *tone*: the high-pass and the equalizer, with the dynamics out of the
+/// way and the makeup zeroed, so the curve is a shape rather than a shape plus a level.
+fn tone_curve(preset: &InputPreset) -> Vec<f32> {
+    let mut chain = chain_for(preset);
+    chain.set_gate_enabled(false);
+    chain.set_compressor_enabled(false);
+    chain.set_deesser_enabled(false);
+    chain.set_denoise_enabled(false);
+    chain.set_makeup_db(0.0);
+
+    THIRD_OCTAVES
+        .iter()
+        .map(|&hz| {
+            if hz * 2.0 >= CAPTURE_RATE {
+                return 0.0;
+            }
+            let amplitude = 0.05;
+            let mut block = probe_tone(hz, amplitude, 9_600);
+            through(&mut chain, &mut block, amplitude)
+        })
+        .collect()
+}
+
+/// What the preset does to *level*: four probes, each a decibel figure a listener would notice.
+///
+/// **One thing this cannot see, stated rather than left to be discovered.** Two presets differing
+/// *only* in their compressor's `detection` measure within a decibel of each other here, even
+/// with a syllabic envelope on the probe — the peak-to-RMS gap the research measures at three to
+/// seven decibels needs real speech, not a harmonic sum. Such a pair would be refused as a
+/// duplicate. That is the safe direction (this errs toward refusing, never toward shipping two
+/// presets that sound alike), no preset in the set is in that position, and if one ever is, the
+/// fix is a probe with a real talker's crest factor rather than a looser bar.
+///
+/// A loud passage and a quiet one together say how much the preset compresses and how much it
+/// makes up; the floor says how much the gate and the denoiser take away; the sibilant says how
+/// much the de-esser does. All through the whole chain, so a stage that is absent shows up only as
+/// the number it fails to change — which is the honest weight for it.
+fn dynamics(preset: &InputPreset) -> Vec<f32> {
+    let mut chain = chain_for(preset);
+    let mut out = Vec::with_capacity(4);
+
+    for level_db in [-6.0_f32, -26.0] {
+        let amplitude = 10.0_f32.powf(level_db / 20.0);
+        let mut block = speech_like(amplitude, 48_000);
+        out.push(through(&mut chain, &mut block, amplitude));
+    }
+
+    // A *room* floor, not white noise. The difference matters: RNNoise separates speech from
+    // noise, so on undifferentiated hiss it removes about a decibel and on hum-under-hiss about
+    // forty-four. Probing with white noise would have made the denoiser almost invisible here —
+    // it did, until a preset that differed from its neighbour only by switching the denoiser on
+    // slipped past this check.
+    let floor = 10.0_f32.powf(-55.0 / 20.0);
+    let mut block = room_floor(floor, 48_000);
+    out.push(through(&mut chain, &mut block, floor));
+
+    let sibilant = 10.0_f32.powf(-12.0 / 20.0);
+    let mut block = sibilance(sibilant, 24_000);
+    out.push(through(&mut chain, &mut block, sibilant));
+
+    out
+}
+
+fn probe_tone(hz: f32, amplitude: f32, frames: usize) -> Vec<f32> {
+    (0..frames)
+        .map(|n| (n as f32 * std::f32::consts::TAU * hz / CAPTURE_RATE).sin() * amplitude)
+        .collect()
+}
+
+/// Deterministic noise, so every run measures the same signal.
+fn noise(frames: usize, amplitude: f32) -> Vec<f32> {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    (0..frames)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 40) as f32 / 8_388_608.0 - 1.0) * amplitude
+        })
+        .collect()
+}
+
+/// A stand-in for a voice: a fundamental with harmonics, under a syllabic envelope.
+///
+/// The envelope is not decoration. Without it the probe is a steady tone whose peak and RMS are a
+/// few decibels apart, and a compressor detecting peak looks exactly like one detecting RMS —
+/// which made this test refuse two presets that differ only in their detector, the one field the
+/// research insisted on because peak and RMS against the same threshold differ by three to seven
+/// decibels *on speech*. Speech has a crest factor near twelve decibels because it starts and
+/// stops; a probe for a voice chain has to as well.
+fn speech_like(amplitude: f32, frames: usize) -> Vec<f32> {
+    (0..frames)
+        .map(|n| {
+            let t = n as f32 / CAPTURE_RATE;
+            let f = 130.0;
+            let body = (t * std::f32::consts::TAU * f).sin() * 0.6
+                + (t * std::f32::consts::TAU * f * 2.0).sin() * 0.3
+                + (t * std::f32::consts::TAU * f * 5.0).sin() * 0.2
+                + (t * std::f32::consts::TAU * f * 11.0).sin() * 0.1;
+            // Four syllables a second, each with a quiet tail — roughly a talker's rhythm.
+            let syllable = (t * 4.0).fract();
+            let envelope = if syllable < 0.55 {
+                (syllable / 0.55 * std::f32::consts::PI).sin().powf(0.6)
+            } else {
+                0.02
+            };
+            body * envelope * amplitude / 1.2
+        })
+        .collect()
+}
+
+/// What a desk microphone in a room with a computer in it actually picks up: mains hum with
+/// broadband hiss over it.
+fn room_floor(amplitude: f32, frames: usize) -> Vec<f32> {
+    noise(frames, amplitude * 0.4)
+        .iter()
+        .enumerate()
+        .map(|(n, hiss)| {
+            let t = n as f32 / CAPTURE_RATE;
+            hiss + (t * std::f32::consts::TAU * 50.0).sin() * amplitude
+        })
+        .collect()
+}
+
+/// Energy where sibilance lives, so the de-esser has something to act on.
+fn sibilance(amplitude: f32, frames: usize) -> Vec<f32> {
+    (0..frames)
+        .map(|n| {
+            let t = n as f32 / CAPTURE_RATE;
+            ((t * std::f32::consts::TAU * 6_500.0).sin()
+                + (t * std::f32::consts::TAU * 7_900.0).sin()
+                + (t * std::f32::consts::TAU * 9_100.0).sin())
+                * amplitude
+                / 3.0
+        })
+        .collect()
+}
+
+/// How far apart two presets are, in decibels: the largest single difference anywhere.
 ///
 /// A maximum rather than a mean, because a listener notices the one thing that changed, not the
-/// average of everything that did not.
-fn distance(left: &InputPreset, right: &InputPreset) -> f32 {
-    fingerprint(left)
-        .iter()
-        .zip(fingerprint(right))
+/// average of everything that did not. Now that every term is a decibel of something audible, the
+/// number this returns is decibels too, and the bar can be argued about in those terms.
+fn distance(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
         .fold(0.0_f32, |worst, (a, b)| worst.max((a - b).abs()))
+}
+
+/// Measure every preset once.
+///
+/// Measuring is real work — thirty-three probes through a whole chain each — and there are
+/// n(n−1)/2 pairs, so measuring inside the comparison did it ten times per preset and made the
+/// suite take half a minute.
+fn fingerprints(presets: &[InputPreset]) -> Vec<Vec<f32>> {
+    presets.iter().map(fingerprint).collect()
 }
 
 #[test]
 fn no_two_presets_are_the_same_chain_under_two_names() {
     let presets = shipped();
+    let measured = fingerprints(&presets);
     let mut pairs = Vec::new();
     for (index, left) in presets.iter().enumerate() {
-        for right in &presets[index + 1..] {
-            let apart = distance(left, right);
+        for (offset, right) in presets[index + 1..].iter().enumerate() {
+            let apart = distance(&measured[index], &measured[index + 1 + offset]);
             if apart < INDISTINGUISHABLE {
                 pairs.push(format!(
                     "{} and {} differ by at most {apart:.2} anywhere in the chain",
@@ -274,10 +443,15 @@ fn how_close_the_closest_voice_presets_are_is_reported() {
     // above says when two presets are indefensibly alike; this says which pair is nearest, which
     // is the question worth asking while a set is being voiced. Run with `-- --nocapture`.
     let presets = shipped();
+    let measured = fingerprints(&presets);
     let mut pairs = Vec::new();
     for (index, left) in presets.iter().enumerate() {
-        for right in &presets[index + 1..] {
-            pairs.push((distance(left, right), left.name.clone(), right.name.clone()));
+        for (offset, right) in presets[index + 1..].iter().enumerate() {
+            pairs.push((
+                distance(&measured[index], &measured[index + 1 + offset]),
+                left.name.clone(),
+                right.name.clone(),
+            ));
         }
     }
     pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("finite"));

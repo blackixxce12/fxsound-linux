@@ -98,8 +98,8 @@ pub struct Settings {
     /// Separate because the two chains are separate. A music preset on a voice is wrong by
     /// construction — reverberation, stereo widening and a bass lift are the opposite of what a
     /// voice wants — so carrying one across a direction switch would hand the user a sound nobody
-    /// chose. Until the input preset set ships this defaults to the same name as the output one,
-    /// because there is only one pool of presets to name.
+    /// chose. The default is the voice set's own reference preset, not the output set's: a name
+    /// that is in neither list means the picker lands on whatever happens to sort first.
     pub input_preset: String,
     /// The 0.2.0 spelling of [`Settings::output_preset`], folded in by [`Settings::sanitise`].
     ///
@@ -171,7 +171,7 @@ impl Default for Settings {
         Self {
             power: true,
             output_preset: "General".into(),
-            input_preset: "General".into(),
+            input_preset: "Clean Voice".into(),
             legacy_preset: None,
             output_device_name: String::new(),
             input_device_name: String::new(),
@@ -475,7 +475,7 @@ mod tests {
         s.set_selected_device("alsa_input.usb-fifine", crate::DeviceDirection::Input);
         assert_eq!(
             s.selected_preset(),
-            "General",
+            "Clean Voice",
             "a microphone must not inherit the music preset"
         );
         s.set_selected_preset("Clean Voice");

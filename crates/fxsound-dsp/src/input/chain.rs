@@ -160,6 +160,15 @@ impl InputChain {
 
     /// The high-pass corner and its order — `0` for off, `2` or `4`. Anything else rounds down to
     /// one of those, because there are only two sections to build it from.
+    ///
+    /// **Order 4 is Linkwitz–Riley, not Butterworth, and it is 6 dB down at the corner rather than
+    /// 3.** It is two *identical* second-order Butterworth sections in series; a true fourth-order
+    /// Butterworth would need two sections at different Qs, and this crate's design function only
+    /// makes the one Q. That is a fine filter — the steeper approach is what a rumble filter wants
+    /// — but the number matters to whoever writes a preset: measured at 48 kHz, a 120 Hz
+    /// fourth-order corner is −6.0 dB at 120 Hz, −6.7 at 115.7, −9.8 at 100 and −13.9 at 85, where
+    /// the second-order one is −3.0, −3.3, −4.9 and −7.0. A preset voiced against the textbook
+    /// Butterworth figures is voiced against a filter this chain does not build.
     pub fn set_highpass(&mut self, hz: Real, order: usize) {
         let hz = if hz.is_finite() && hz > 0.0 { hz } else { 80.0 };
         let order = match order {
@@ -547,6 +556,45 @@ mod tests {
             (lift - 12.0).abs() < 0.1,
             "twelve decibels of makeup produced {lift} dB"
         );
+    }
+
+    #[test]
+    fn the_fourth_order_high_pass_is_six_decibels_down_at_its_corner() {
+        // Pinned because it is a trap for whoever writes a preset. "Order 4" reads as a
+        // fourth-order Butterworth, which is 3 dB down at the corner; this is two identical
+        // second-order sections, which is a Linkwitz-Riley and is 6 dB down. Two voice presets
+        // were drafted against the textbook figures before anyone measured the real ones.
+        let measure = |hz: Real, order: usize, at: Real| {
+            let mut chain = InputChain::new(FS);
+            chain.set_highpass(hz, order);
+            chain.set_gate_enabled(false);
+            chain.set_deesser_enabled(false);
+            chain.set_compressor_enabled(false);
+            chain.eq_mut().set_enabled(false);
+            chain.set_makeup_db(0.0);
+            let mut block = tone(at, 0.1, 48_000);
+            chain.process(&mut block, 1);
+            let peak = block[24_000..].iter().fold(0.0_f32, |a, b| a.max(b.abs()));
+            20.0 * (peak / 0.1).log10()
+        };
+
+        for (at, fourth, second) in [
+            (120.0, -6.0, -3.0),
+            (115.7, -6.7, -3.3),
+            (100.0, -9.8, -4.9),
+            (85.0, -13.9, -7.0),
+        ] {
+            let got = measure(120.0, 4, at);
+            assert!(
+                (got - fourth).abs() < 0.2,
+                "120 Hz order 4 at {at} Hz: {got:.2} dB, expected {fourth}"
+            );
+            let got = measure(120.0, 2, at);
+            assert!(
+                (got - second).abs() < 0.2,
+                "120 Hz order 2 at {at} Hz: {got:.2} dB, expected {second}"
+            );
+        }
     }
 
     #[test]

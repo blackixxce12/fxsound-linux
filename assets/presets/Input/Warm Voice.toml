@@ -1,0 +1,34 @@
+# De-esser -22 dB, not -20: measured through the real stage with this EQ in front, -20 dB
+# delivers 0.75 dB on a -16 dBFS sibilant, which is not gentler than the reference, it is absent.
+name = "Warm Voice"
+description = "For a thin or distant-sounding microphone: chest added, presence eased back."
+rnnoise = false
+highpass_hz = 75.0
+highpass_order = 2
+makeup_db = 6.0
+ceiling_db = -3.0
+
+[gate]
+threshold_db = -48.0
+ratio = 2.0
+range_db = -14.0
+attack_ms = 5.0
+release_ms = 150.0
+hold_ms = 200.0
+detection = "rms"
+
+[compressor]
+threshold_db = -18.0
+ratio = 2.5
+knee_db = 6.0
+attack_ms = 25.0
+release_ms = 200.0
+detection = "rms"
+
+[deesser]
+frequency_hz = 6000.0
+threshold_db = -22.0
+
+[eq]
+centers_hz = [62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0]
+gains_db = [0, 1.5, 1.5, 0, 0, 0, -1.5, -1.5, 0, 0]

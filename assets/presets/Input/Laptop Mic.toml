@@ -1,0 +1,37 @@
+# The only preset that turns RNNoise on, and the rule is the decision doc's own: a denoiser
+# is a switch, never a voicing, and a preset sets it only where the named source's acoustics
+# force it. A laptop with a fan is that source. The 85 Hz corner is where the 4th-order
+# Linkwitz-Riley costs -6.0 dB rather than the -9.3 a 100 Hz corner would, and at far field
+# there is no proximity lift underneath to spare.
+name = "Laptop Mic"
+description = "A built-in microphone half a metre away, with a fan running: the repair preset."
+rnnoise = true
+highpass_hz = 85.0
+highpass_order = 4
+makeup_db = 8.0
+ceiling_db = -3.0
+
+[gate]
+threshold_db = -42.0
+ratio = 3.0
+range_db = -10.0
+attack_ms = 5.0
+release_ms = 200.0
+hold_ms = 250.0
+detection = "rms"
+
+[compressor]
+threshold_db = -24.0
+ratio = 2.5
+knee_db = 6.0
+attack_ms = 20.0
+release_ms = 250.0
+detection = "rms"
+
+[deesser]
+frequency_hz = 6000.0
+threshold_db = -18.0
+
+[eq]
+centers_hz = [62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0]
+gains_db = [0, 0, 1.5, -1.5, -0.5, 0, 2, 0, -1, 0]

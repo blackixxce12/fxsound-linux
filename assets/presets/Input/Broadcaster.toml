@@ -1,0 +1,35 @@
+# The one preset allowed past the set's +-2 dB restraint: it is the only one where the user
+# picking it wants to hear the difference. Its separation from Streaming is its equalizer and
+# its time constants, not its processing depth.
+name = "Broadcaster"
+description = "The radio voice: chest, presence, and a compressor that rides phrases rather than syllables."
+rnnoise = false
+highpass_hz = 70.0
+highpass_order = 2
+makeup_db = 10.0
+ceiling_db = -3.0
+
+[gate]
+threshold_db = -42.0
+ratio = 2.0
+range_db = -16.0
+attack_ms = 5.0
+release_ms = 200.0
+hold_ms = 250.0
+detection = "rms"
+
+[compressor]
+threshold_db = -22.0
+ratio = 4.5
+knee_db = 6.0
+attack_ms = 30.0
+release_ms = 250.0
+detection = "rms"
+
+[deesser]
+frequency_hz = 6000.0
+threshold_db = -26.0
+
+[eq]
+centers_hz = [62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0]
+gains_db = [0, 2, 0, -0.5, -0.5, -1.5, 2, 0, 0, 0]

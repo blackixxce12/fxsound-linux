@@ -1,0 +1,23 @@
+# The set's one exception to -3.0 dBFS, and it is stated as one: the -3.0 default buys
+# headroom for lossy-codec overshoot, and a capture path writes a file that is not re-encoded.
+# The 40 Hz corner keeps a bass singer's fundamental and, said plainly, lets desk rumble into
+# the compressor's detector -- with no gate here that is the editor's to cut.
+name = "Studio"
+description = "Recording into a DAW. One gentle compressor, nothing else, and the headroom left for you."
+rnnoise = false
+highpass_hz = 40.0
+highpass_order = 2
+makeup_db = 0.0
+ceiling_db = -1.0
+
+[compressor]
+threshold_db = -18.0
+ratio = 2.0
+knee_db = 6.0
+attack_ms = 25.0
+release_ms = 400.0
+detection = "rms"
+
+[eq]
+centers_hz = [62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0]
+gains_db = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]

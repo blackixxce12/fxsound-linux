@@ -1,0 +1,35 @@
+# The gentlest gate in the set, and deliberately: against a -52 dBFS room a -48 dB threshold
+# at 2:1 lowers the room tone rather than switching it. For material going to an editor the
+# second is a defect -- a floor that comes and goes defeats a crossfade over a splice.
+name = "Podcast"
+description = "Recorded speech on its way to an editor: gentle, warm, and left with headroom on purpose."
+rnnoise = false
+highpass_hz = 80.0
+highpass_order = 2
+makeup_db = 5.0
+ceiling_db = -3.0
+
+[gate]
+threshold_db = -48.0
+ratio = 2.0
+range_db = -14.0
+attack_ms = 5.0
+release_ms = 250.0
+hold_ms = 300.0
+detection = "rms"
+
+[compressor]
+threshold_db = -20.0
+ratio = 3.0
+knee_db = 6.0
+attack_ms = 20.0
+release_ms = 200.0
+detection = "rms"
+
+[deesser]
+frequency_hz = 5500.0
+threshold_db = -24.0
+
+[eq]
+centers_hz = [62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0]
+gains_db = [0, 1.5, -1, -2, -1, 0, 2, 0, 0, 0]

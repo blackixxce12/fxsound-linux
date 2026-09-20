@@ -1,0 +1,34 @@
+# The 80 Hz corner is the decision doc's own correction from 90: at 90 it cascades with the
+# VoIP stack's 2nd-order 100 Hz filter for about -7.1 dB at 100 Hz on a deep male voice.
+name = "Voice Chat"
+description = "Discord, Teams, Zoom or in-game: lean, intelligible and quiet between words."
+rnnoise = false
+highpass_hz = 80.0
+highpass_order = 2
+makeup_db = 4.0
+ceiling_db = -3.0
+
+[gate]
+threshold_db = -45.0
+ratio = 2.0
+range_db = -14.0
+attack_ms = 5.0
+release_ms = 150.0
+hold_ms = 200.0
+detection = "rms"
+
+[compressor]
+threshold_db = -18.0
+ratio = 3.0
+knee_db = 6.0
+attack_ms = 20.0
+release_ms = 150.0
+detection = "rms"
+
+[deesser]
+frequency_hz = 6000.0
+threshold_db = -24.0
+
+[eq]
+centers_hz = [62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0]
+gains_db = [0, -1.25, -1.75, -1.0, -0.5, 0, 2, 0, 0, 0]
