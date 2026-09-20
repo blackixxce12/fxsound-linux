@@ -531,6 +531,9 @@ impl EngineHandle {
 }
 
 #[cfg(test)]
+mod graph_churn;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

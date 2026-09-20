@@ -28,7 +28,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev libclang-dev
+            pkg-config libpipewire-0.3-dev libclang-dev pipewire
+          # `pipewire` itself is the daemon, and it is here for the graph-churn tests: each one
+          # starts a private server with its own socket and synthetic devices. Without the binary
+          # those tests print that they are skipping and pass, which is the right behaviour for a
+          # contributor's laptop and the wrong one for CI.
 
       # rust-toolchain.toml pins 1.98.1 and asks for rustfmt and clippy, so rustup installs
       # exactly what the developers use rather than whatever the runner image happens to ship.
