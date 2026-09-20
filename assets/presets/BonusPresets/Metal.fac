@@ -4,11 +4,11 @@ Metal
 0: Double Params Flag
 1: Total number of elements
 25: Main 0
-20: Main 1
+0: Main 1
 0: Main 2
-38: Main 3
-38: Main 4
-25: Main 5
+0: Main 3
+13: Main 4
+38: Main 5
 0: Element Number
    0: Param 0
    0: Param 1
@@ -21,7 +21,7 @@ Metal
 0: Number of Application Dependent Reals
 0: Number of Application Dependent Strings
 1: Integer[0]
-1: Integer[1]
+0: Integer[1]
 0: Integer[2]
 1: Integer[3]
 1: Integer[4]
@@ -31,31 +31,31 @@ Metal
 1: On/Off Flag
 Band 1
    62.5: CF
-   1.9685: Boost/Cut
+   0: Boost/Cut
 Band 2
-   109.43: CF
+   110: CF
    1: Boost/Cut
 Band 3
-   266.54: CF
-   1: Boost/Cut
+   200: CF
+   -2: Boost/Cut
 Band 4
-   293: CF
-   0: Boost/Cut
+   360: CF
+   -1: Boost/Cut
 Band 5
-   738.37: CF
-   0: Boost/Cut
-Band 6
-   1355.22: CF
-   0: Boost/Cut
-Band 7
-   2567.15: CF
-   0: Boost/Cut
-Band 8
-   4719.84: CF
-   0: Boost/Cut
-Band 9
-   8573.18: CF
-   0: Boost/Cut
-Band 10
-   16000: CF
+   650: CF
    1: Boost/Cut
+Band 6
+   1000: CF
+   1: Boost/Cut
+Band 7
+   1800: CF
+   2: Boost/Cut
+Band 8
+   3200: CF
+   3: Boost/Cut
+Band 9
+   6000: CF
+   1: Boost/Cut
+Band 10
+   11000: CF
+   -2: Boost/Cut

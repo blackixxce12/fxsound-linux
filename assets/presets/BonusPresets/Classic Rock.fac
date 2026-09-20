@@ -3,12 +3,12 @@ CLASS1 : Effect Type
 Classic Rock
 0: Double Params Flag
 1: Total number of elements
-76: Main 0
-0: Main 1
+51: Main 0
+38: Main 1
 0: Main 2
-89: Main 3
+51: Main 3
 38: Main 4
-76: Main 5
+25: Main 5
 0: Element Number
    0: Param 0
    0: Param 1
@@ -33,29 +33,29 @@ Band 1
    62.5: CF
    0: Boost/Cut
 Band 2
-   110: CF
+   105: CF
    2: Boost/Cut
 Band 3
-   200: CF
-   1: Boost/Cut
+   215: CF
+   -1: Boost/Cut
 Band 4
-   295: CF
-   3: Boost/Cut
+   440: CF
+   -1: Boost/Cut
 Band 5
-   650: CF
-   1: Boost/Cut
-Band 6
-   1200: CF
-   1: Boost/Cut
-Band 7
-   2130: CF
-   0: Boost/Cut
-Band 8
-   4550: CF
+   850: CF
    2: Boost/Cut
+Band 6
+   1600: CF
+   2: Boost/Cut
+Band 7
+   2900: CF
+   2: Boost/Cut
+Band 8
+   5200: CF
+   1: Boost/Cut
 Band 9
-   6360: CF
-   -1: Boost/Cut
+   8600: CF
+   0: Boost/Cut
 Band 10
-   16000: CF
-   -1: Boost/Cut
+   14000: CF
+   1: Boost/Cut
