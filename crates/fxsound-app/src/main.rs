@@ -561,7 +561,12 @@ impl<'a> Shell<'a> {
     /// Hide to the tray: destroy the window and let `run_native` return with
     /// [`WindowExit::Hidden`], which is what [`Runtime::exit`] already says.
     fn hide(&mut self, ctx: &egui::Context) {
-        self.rt.app.notify_hidden_to_tray();
+        let tray_visible = self
+            .rt
+            .tray
+            .as_ref()
+            .is_some_and(crate::tray::TrayHandle::is_visible);
+        self.rt.app.notify_hidden_to_tray(tray_visible);
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 

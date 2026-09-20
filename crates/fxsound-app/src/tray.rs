@@ -48,6 +48,8 @@ use fxsound_core::i18n::{tr, tr_args};
 use ksni::blocking::{Handle, TrayMethods as _};
 use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Category, Icon, MenuItem, Status, ToolTip, Tray};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The D-Bus / desktop identity of the application (`docs/spec/07-startup-tray.md` §1.5). It has
 /// to match the `.desktop` file's basename and the Wayland `app_id` for shells to associate the
@@ -287,12 +289,29 @@ pub enum TrayCommand {
 pub struct FxTray {
     state: TrayState,
     tx: Sender<TrayCommand>,
+    /// Whether a `StatusNotifierWatcher` is actually there to draw the icon.
+    ///
+    /// Shared with the GUI thread, which needs it to answer one question honestly: when the
+    /// window hides, is there anything left on screen? On a GNOME session without the
+    /// AppIndicator extension there is not — no window, no icon, and until now no message saying
+    /// so, which leaves a running process the user cannot see or reach.
+    watcher: Arc<AtomicBool>,
 }
 
 impl FxTray {
     #[must_use]
     pub fn new(state: TrayState, tx: Sender<TrayCommand>) -> Self {
-        Self { state, tx }
+        Self {
+            state,
+            tx,
+            watcher: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The flag the GUI thread reads to find out whether the icon is really there.
+    #[must_use]
+    pub fn watcher_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.watcher)
     }
 
     /// The mirror the menu is built from.
@@ -641,7 +660,14 @@ impl Tray for FxTray {
     /// (`FxSystemTrayView.cpp:42`, `:438-441`). Returning `false` would shut it down for good.
     fn watcher_offline(&self, reason: ksni::OfflineReason) -> bool {
         log::warn!("no StatusNotifierWatcher: {reason:?}; waiting for one to appear");
+        self.watcher.store(false, Ordering::Relaxed);
         true
+    }
+
+    /// A watcher appeared — a panel starting, or the session finally providing one.
+    fn watcher_online(&self) {
+        log::info!("a StatusNotifierWatcher is present; the tray icon is visible");
+        self.watcher.store(true, Ordering::Relaxed);
     }
 }
 
@@ -651,6 +677,19 @@ impl Tray for FxTray {
 /// thread can call it directly without an async runtime of its own.
 pub struct TrayHandle {
     handle: Handle<FxTray>,
+    watcher: Arc<AtomicBool>,
+}
+
+impl TrayHandle {
+    /// Whether the icon is actually on screen.
+    ///
+    /// `spawn` succeeds on a session with no `StatusNotifierWatcher` — deliberately, so the icon
+    /// appears the moment a panel starts — which means "the tray is running" and "the tray is
+    /// visible" are two different questions. This answers the second.
+    #[must_use]
+    pub fn is_visible(&self) -> bool {
+        self.watcher.load(Ordering::Relaxed)
+    }
 }
 
 impl TrayHandle {
@@ -699,8 +738,10 @@ impl TrayHandle {
 ///
 /// If the session bus is unreachable or the item cannot be registered.
 pub fn spawn(state: TrayState, tx: Sender<TrayCommand>) -> Result<TrayHandle, ksni::Error> {
-    let handle = FxTray::new(state, tx).assume_sni_available(true).spawn()?;
-    Ok(TrayHandle { handle })
+    let tray = FxTray::new(state, tx);
+    let watcher = tray.watcher_flag();
+    let handle = tray.assume_sni_available(true).spawn()?;
+    Ok(TrayHandle { handle, watcher })
 }
 
 /// `"<name> *"` for a preset with unsaved changes (`FxSystemTrayView.cpp:231`).

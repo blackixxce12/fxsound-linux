@@ -1501,10 +1501,21 @@ impl App {
 
     /// The "FxSound in system tray" tip, once per process, the first time the window hides
     /// (`FxController.cpp:920-926`).
-    pub fn notify_hidden_to_tray(&mut self) {
-        if !self.tray_tip_shown {
-            self.tray_tip_shown = true;
+    pub fn notify_hidden_to_tray(&mut self, tray_visible: bool) {
+        if self.tray_tip_shown {
+            return;
+        }
+        self.tray_tip_shown = true;
+        if tray_visible {
             self.notify(Message::minimised_to_tray());
+        } else {
+            // "Click FxSound icon to reopen" is not advice on a session with no icon. This is the
+            // GNOME-without-AppIndicator case, and the honest version names the way back.
+            log::warn!(
+                "hiding with no tray icon in this session; the window can be brought back with \
+                 `fxsound --show`"
+            );
+            self.notify(Message::hidden_with_no_tray());
         }
     }
 
@@ -2008,6 +2019,26 @@ mod tests {
             Some("Beta"),
             "picking another speaker changed the preset"
         );
+    }
+
+    #[test]
+    fn hiding_with_no_tray_says_so_instead_of_pointing_at_an_icon() {
+        // The GNOME-without-AppIndicator case: no window, no icon, and until this existed nothing
+        // said about either — a running process the user can neither see nor reach. "Click
+        // FxSound icon to reopen" is not advice on a session with no icon.
+        let with_tray = Message::minimised_to_tray().body;
+        let without = Message::hidden_with_no_tray().body;
+        assert!(with_tray.contains("Click FxSound icon"), "{with_tray}");
+        assert!(without.contains("--show"), "{without}");
+        assert!(!without.contains("Click FxSound icon"), "{without}");
+
+        // And the tip is shown once per process either way, as the original does.
+        let mut app = App::headless_for_tests();
+        assert!(!app.tray_tip_shown);
+        app.notify_hidden_to_tray(false);
+        assert!(app.tray_tip_shown);
+        app.notify_hidden_to_tray(true);
+        assert!(app.tray_tip_shown, "the second call must be a no-op");
     }
 
     #[test]

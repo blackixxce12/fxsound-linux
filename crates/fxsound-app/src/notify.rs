@@ -143,6 +143,23 @@ impl Message {
         Self::new(tr("FxSound in system tray\nClick FxSound icon to reopen"))
     }
 
+    /// The same moment, on a session that has no tray to hide into.
+    ///
+    /// A GNOME session without the AppIndicator extension registers no `StatusNotifierWatcher`,
+    /// so hiding the window leaves a process with no window, no icon and — until this existed —
+    /// nothing said about either. The user's audio keeps being processed by something they can
+    /// neither see nor reach.
+    ///
+    /// English key, like every other string this port added: `tr` falls back to the key, so an
+    /// untranslated build reads correctly.
+    #[must_use]
+    pub fn hidden_with_no_tray() -> Self {
+        Self::new(tr(
+            "FxSound is still running, but this session has no tray icon.\nRun 'fxsound --show' \
+             to bring the window back.",
+        ))
+    }
+
     /// Shown from `showMainWindow` once the 7-day `survey_timer` has elapsed
     /// (`FxController.cpp:938-960`).
     #[must_use]
