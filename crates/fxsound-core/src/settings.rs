@@ -85,8 +85,31 @@ pub struct Settings {
     // ---- audio -----------------------------------------------------------------------------
     /// Master power state, restored on launch.
     pub power: bool,
-    /// Name of the preset to select on launch.
-    pub preset: String,
+    /// Name of the preset to select on launch while FxSound sits in front of a playback device.
+    ///
+    /// A `settings.toml` written by 0.2.0 — which had one preset key because it had one chain —
+    /// is read through the private `legacy_preset` below. On the next save the file is written
+    /// under the new name only, so a 0.2.0 binary reading a 0.3.0 file falls back to its default
+    /// preset: a cosmetic loss on a downgrade, not a data one, since the presets themselves are
+    /// files of their own and are untouched.
+    pub output_preset: String,
+    /// Name of the preset to select while FxSound sits behind a microphone.
+    ///
+    /// Separate because the two chains are separate. A music preset on a voice is wrong by
+    /// construction — reverberation, stereo widening and a bass lift are the opposite of what a
+    /// voice wants — so carrying one across a direction switch would hand the user a sound nobody
+    /// chose. Until the input preset set ships this defaults to the same name as the output one,
+    /// because there is only one pool of presets to name.
+    pub input_preset: String,
+    /// The 0.2.0 spelling of [`Settings::output_preset`], folded in by [`Settings::sanitise`].
+    ///
+    /// `#[serde(alias)]` would have been one line, and was the first attempt. It is wrong here:
+    /// serde rejects a document carrying both the alias and the real name as a **duplicate
+    /// field**, and [`Settings::load`] turns any parse error into a full reset — so one stale
+    /// `preset =` line left in a hand-edited file would have cost the user every setting they
+    /// had. A field of its own cannot collide with anything, and is never written back.
+    #[serde(rename = "preset", skip_serializing)]
+    legacy_preset: Option<String>,
     /// `node.name` of the real output device FxSound renders to.
     pub output_device_name: String,
     /// `node.name` of the real capture device FxSound listens to, when it runs as an input.
@@ -147,7 +170,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             power: true,
-            preset: "General".into(),
+            output_preset: "General".into(),
+            input_preset: "General".into(),
+            legacy_preset: None,
             output_device_name: String::new(),
             input_device_name: String::new(),
             device_direction: crate::DeviceDirection::Output,
@@ -257,6 +282,18 @@ impl Settings {
         use crate::limits::{self, finite};
 
         let default = Self::default();
+
+        // A 0.2.0 file's single preset is this version's *output* preset. It is taken only when
+        // the new key is absent — which, with `#[serde(default)]` filling it in, reads as "still
+        // the default". A file carrying both a stale `preset` line and a real `output_preset` is
+        // already strange; the worst this rule can do there is prefer the older of the two names,
+        // which beats the alternative of refusing to load the file at all.
+        if let Some(legacy) = self.legacy_preset.take()
+            && self.output_preset == default.output_preset
+        {
+            self.output_preset = legacy;
+        }
+
         self.master_gain = finite(
             self.master_gain,
             limits::MASTER_GAIN_DB,
@@ -278,6 +315,29 @@ impl Settings {
         match self.device_direction {
             crate::DeviceDirection::Output => &self.output_device_name,
             crate::DeviceDirection::Input => &self.input_device_name,
+        }
+    }
+
+    /// The preset belonging to one direction.
+    #[must_use]
+    pub fn preset_for_direction(&self, direction: crate::DeviceDirection) -> &str {
+        match direction {
+            crate::DeviceDirection::Output => &self.output_preset,
+            crate::DeviceDirection::Input => &self.input_preset,
+        }
+    }
+
+    /// The preset of the direction FxSound is in right now — what to select on launch.
+    #[must_use]
+    pub fn selected_preset(&self) -> &str {
+        self.preset_for_direction(self.device_direction)
+    }
+
+    /// Record the preset for the live direction, leaving the other direction's alone.
+    pub fn set_selected_preset(&mut self, name: &str) {
+        match self.device_direction {
+            crate::DeviceDirection::Output => name.clone_into(&mut self.output_preset),
+            crate::DeviceDirection::Input => name.clone_into(&mut self.input_preset),
         }
     }
 
@@ -370,10 +430,63 @@ mod tests {
 
     #[test]
     fn unknown_keys_do_not_break_loading() {
-        let parsed: Settings =
+        let mut parsed: Settings =
             toml::from_str("preset = \"Jazz\"\nsome_future_key = 3\n").expect("parse");
-        assert_eq!(parsed.preset, "Jazz");
+        parsed.sanitise();
+        assert_eq!(parsed.output_preset, "Jazz");
         assert_eq!(parsed.max_user_presets, 120);
+    }
+
+    #[test]
+    fn a_settings_file_written_by_0_2_0_still_finds_its_preset() {
+        // 0.2.0 had one preset key because it had one chain. The alias puts it where the playback
+        // direction now looks, and the microphone starts from the default rather than inheriting
+        // a music preset it was never meant to have.
+        let parsed: Settings = toml::from_str(
+            "preset = \"Rock\"\noutput_device_name = \"alsa_output.pci-0000_00_1f.3\"\n",
+        )
+        .expect("parse");
+        let mut parsed = parsed;
+        parsed.sanitise();
+        assert_eq!(parsed.output_preset, "Rock");
+        assert_eq!(
+            parsed.selected_preset(),
+            "Rock",
+            "0.2.0 files are output files"
+        );
+        assert_eq!(parsed.input_preset, Settings::default().input_preset);
+
+        // And a file carrying both keys still loads — which is the whole reason this is a field
+        // rather than a `#[serde(alias)]`. With an alias serde called it a duplicate field,
+        // `load` turned that into a full reset, and one stale line cost the user everything.
+        let mut both: Settings =
+            toml::from_str("preset = \"Rock\"\noutput_preset = \"Jazz\"\n").expect("parse");
+        both.sanitise();
+        assert_eq!(both.output_preset, "Jazz");
+    }
+
+    #[test]
+    fn the_two_directions_remember_their_own_presets() {
+        let mut s = Settings::default();
+        s.set_selected_device("alsa_output.pci", crate::DeviceDirection::Output);
+        s.set_selected_preset("Rock");
+        assert_eq!(s.selected_preset(), "Rock");
+
+        s.set_selected_device("alsa_input.usb-fifine", crate::DeviceDirection::Input);
+        assert_eq!(
+            s.selected_preset(),
+            "General",
+            "a microphone must not inherit the music preset"
+        );
+        s.set_selected_preset("Clean Voice");
+
+        // And switching back returns what was there, in both senses.
+        s.set_selected_device("alsa_output.pci", crate::DeviceDirection::Output);
+        assert_eq!(s.selected_preset(), "Rock");
+        assert_eq!(
+            s.preset_for_direction(crate::DeviceDirection::Input),
+            "Clean Voice"
+        );
     }
 
     #[test]

@@ -129,7 +129,7 @@ impl App {
         };
 
         app.refresh_preset_list();
-        let saved = app.settings.preset.clone();
+        let saved = app.settings.selected_preset().to_owned();
         if let Some(index) = app.presets.index_of(&saved) {
             app.select_preset(index);
         } else if !app.state.presets.is_empty() {
@@ -285,6 +285,8 @@ impl App {
                     return;
                 };
 
+                let crossed = direction != self.settings.device_direction;
+
                 self.state.selected_device = Some(index);
                 // The interface follows the device immediately rather than waiting for the next
                 // device list: picking a microphone is exactly the moment the five effect sliders
@@ -305,10 +307,16 @@ impl App {
                 // *remembered* one does: the first time something is plugged in, whatever is
                 // selected stays selected, because guessing then would be changing the sound on
                 // no evidence at all.
+                //
+                // Crossing between a speaker and a microphone is the exception, and it is not a
+                // guess: the two chains share nothing but the equalizer, so a music preset on a
+                // voice is wrong by construction. When the device itself is new, the direction
+                // still remembers what the user last had in it.
                 let remembered = self
                     .settings
                     .preset_for_device(&name)
-                    .map(ToOwned::to_owned);
+                    .map(ToOwned::to_owned)
+                    .or_else(|| crossed.then(|| self.settings.selected_preset().to_owned()));
                 if let Some(preset) = remembered
                     && self
                         .state
@@ -455,7 +463,7 @@ impl App {
                     self.settings
                         .remember_device_preset(&node, &description, &name, &form_factor);
                 }
-                self.settings.preset = name;
+                self.settings.set_selected_preset(&name);
                 self.settings_dirty = true;
                 // A new band layout means the old filter history is meaningless.
                 if let Some(engine) = &self.engine {
@@ -516,7 +524,7 @@ impl App {
                 self.loaded_preset = Some(preset);
                 self.refresh_preset_list();
                 self.state.selected_preset = self.presets.index_of(&name);
-                self.settings.preset = name.clone();
+                self.settings.set_selected_preset(&name);
                 self.settings_dirty = true;
                 // `FxController.cpp:1221` / `:1234`, the same text on the desktop and in the strip.
                 let message = if is_new {
@@ -907,7 +915,7 @@ impl App {
         self.loaded_preset = Some(preset);
         self.refresh_preset_list();
         self.state.selected_preset = self.presets.index_of(new_name);
-        self.settings.preset = new_name.to_owned();
+        self.settings.set_selected_preset(new_name);
         self.settings_dirty = true;
         self.state.notification = Some(tr_args("Renamed %s to %s", &[old.as_str(), new_name]));
         // Direct callers (the menu) do not go through `handle`, so flush here.
@@ -1669,6 +1677,77 @@ mod tests {
     }
 
     #[test]
+    fn crossing_between_a_speaker_and_a_microphone_carries_that_directions_preset() {
+        // A device nobody has used before keeps whatever is selected — guessing on first sight
+        // would change the sound on no evidence. Crossing directions is different, and is not a
+        // guess: the two chains share nothing but the equalizer, so a music preset on a voice is
+        // wrong by construction, and the direction itself remembers what was last used in it.
+        let mut app = app_with_two_presets("directions");
+        app.state.devices = vec![
+            device("alsa_output.speakers", DeviceDirection::Output, true),
+            device("alsa_input.mic", DeviceDirection::Input, false),
+        ];
+        // As if a previous session had left a voice preset selected on the microphone.
+        app.settings.input_preset = "Alpha".to_owned();
+
+        app.handle(&[UiAction::SelectDevice(0), UiAction::SelectPreset(1)]);
+        assert_eq!(app.settings.output_preset, "Beta");
+
+        app.handle(&[UiAction::SelectDevice(1)]);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Alpha"));
+        assert_eq!(
+            app.settings.output_preset, "Beta",
+            "the other direction is untouched"
+        );
+
+        // And back again, to what the speakers had.
+        app.handle(&[UiAction::SelectDevice(0)]);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Beta"));
+    }
+
+    #[test]
+    fn switching_between_two_speakers_never_moves_the_preset() {
+        // The `crossed` guard exists for this, and the mutation run showed why it needs a test of
+        // its own: without the guard, every device switch would reapply whatever the settings file
+        // records for the direction. That is a no-op only for as long as the file and the
+        // selection agree, and they are two pieces of state kept in step by hand. Here they are
+        // deliberately out of step — which is the shape of any future bug that separates them —
+        // and a same-direction switch must still leave the user's preset alone.
+        let mut app = app_with_two_presets("same-direction");
+        app.handle(&[UiAction::SelectDevice(0), UiAction::SelectPreset(1)]);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Beta"));
+
+        app.settings.output_preset = "Alpha".to_owned();
+        app.handle(&[UiAction::SelectDevice(1)]);
+        assert_eq!(
+            app.state.preset().map(|p| p.name.as_str()),
+            Some("Beta"),
+            "picking another speaker changed the preset"
+        );
+    }
+
+    #[test]
+    fn a_direction_whose_preset_no_longer_exists_changes_nothing() {
+        // The preset a direction remembers can be deleted, renamed, or — until the input set
+        // ships — never have existed. Falling back to "the first one in the list" would be the
+        // guess this whole path exists to avoid, so the selection simply stays where it is.
+        let mut app = app_with_two_presets("missing");
+        app.state.devices = vec![
+            device("alsa_output.speakers", DeviceDirection::Output, true),
+            device("alsa_input.mic", DeviceDirection::Input, false),
+        ];
+        app.settings.input_preset = "Gone".to_owned();
+
+        app.handle(&[UiAction::SelectDevice(0), UiAction::SelectPreset(1)]);
+        app.handle(&[UiAction::SelectDevice(1)]);
+        assert_eq!(
+            app.state.preset().map(|p| p.name.as_str()),
+            Some("Beta"),
+            "a missing preset must not become a silent jump to some other one"
+        );
+    }
+
+    #[test]
     fn picking_a_microphone_switches_the_interface_in_the_same_frame() {
         // Not on the next device list: picking a microphone is the moment the five effect sliders
         // stop meaning anything, and a frame of them still looking live is a frame of lying.
@@ -2013,7 +2092,7 @@ mod tests {
         assert_eq!(names(&app), ["Yours"]);
         assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Yours"));
         assert!(!app.state.preset().is_some_and(|p| p.modified));
-        assert_eq!(app.settings.preset, "Yours");
+        assert_eq!(app.settings.selected_preset(), "Yours");
         assert_eq!(
             app.loaded_preset.as_ref().map(|p| p.name.as_str()),
             Some("Yours")
