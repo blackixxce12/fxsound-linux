@@ -43,8 +43,8 @@ pub use presets::{
     PresetsAction,
 };
 pub use settings::{
-    DevicePriority, HotkeyCommand, NavIcon, NavIcons, SettingsAction, SettingsDialog, SettingsState,
-    SettingsTab,
+    DevicePriority, HotkeyCommand, NavIcon, NavIcons, SettingsAction, SettingsDialog,
+    SettingsState, SettingsTab,
 };
 
 use crate::assets::{AssetCache, FxImage};
@@ -432,7 +432,8 @@ impl<'a> DialogChrome<'a> {
             // Everything but the close button drags the window (`FxWindow.cpp:339-358`).
             let mut bar = title_bar;
             bar.set_right(close.left());
-            ui.interact(bar, id.with("drag"), Sense::drag()).drag_started()
+            ui.interact(bar, id.with("drag"), Sense::drag())
+                .drag_started()
         } else {
             false
         };
@@ -586,9 +587,12 @@ impl<'a> TextButton<'a> {
         // one at the top **[JUCE semantics]**; wrapping matters because the reset-presets button is
         // allowed up to three lines (`FxSettingsDialog.cpp:289-315`).
         let inner = rect.shrink2(vec2(2.0, 1.0));
-        let galley = ui
-            .painter()
-            .layout(label.to_owned(), text_button_font(rect.height()), colour, inner.width());
+        let galley = ui.painter().layout(
+            label.to_owned(),
+            text_button_font(rect.height()),
+            colour,
+            inner.width(),
+        );
         let placed = Align2::CENTER_CENTER.align_size_within_rect(galley.size(), inner);
         ui.painter().galley(placed.min, galley, colour);
 
@@ -648,7 +652,8 @@ pub(crate) fn draw_truncated(
     rect: Rect,
     align: Align2,
 ) -> Rect {
-    let mut job = LayoutJob::single_section(text.to_owned(), egui::TextFormat::simple(font, colour));
+    let mut job =
+        LayoutJob::single_section(text.to_owned(), egui::TextFormat::simple(font, colour));
     job.wrap = TextWrapping::truncate_at_width(rect.width().max(0.0));
     let galley = painter.layout_job(job);
     let placed = align.align_size_within_rect(galley.size(), rect);
@@ -721,7 +726,10 @@ mod tests {
         assert!((content.top() - 62.0).abs() < 1e-4, "{content:?}");
         assert!((content.size() - vec2(600.0, 510.0)).length() < 1e-4);
         // The 21 points of corner allowance, less the point the title-bar rule took.
-        assert!((outer.bottom() - content.bottom() - 25.0).abs() < 1e-4, "{content:?}");
+        assert!(
+            (outer.bottom() - content.bottom() - 25.0).abs() < 1e-4,
+            "{content:?}"
+        );
         // …and the round trip is exact for every dialog in the table.
         for size in [vec2(600.0, 510.0), vec2(450.0, 142.0), vec2(350.0, 340.0)] {
             assert!((content_size(outer_size(size)) - size).length() < 1e-4);
@@ -825,7 +833,10 @@ mod tests {
                     &mut assets,
                     ("confirm", mode as u8),
                 );
-                assert!(!response.drag_started, "a non-draggable bar reported a drag");
+                assert!(
+                    !response.drag_started,
+                    "a non-draggable bar reported a drag"
+                );
             });
         }
     }

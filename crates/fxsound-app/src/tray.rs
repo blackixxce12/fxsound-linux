@@ -209,7 +209,8 @@ impl TrayState {
     /// with. With nothing selected it is `Output`, the only direction the Windows build had.
     #[must_use]
     pub fn selected_direction(&self) -> fxsound_core::DeviceDirection {
-        self.selected().map_or_else(Default::default, |device| device.direction)
+        self.selected()
+            .map_or_else(Default::default, |device| device.direction)
     }
 
     /// Which icon the item should be showing.
@@ -244,7 +245,10 @@ impl TrayState {
     /// `TRANS("FxSound is %s.")` with `on`/`off` (`FxSystemTrayView.cpp:76-79`).
     #[must_use]
     pub fn status_line(&self) -> String {
-        tr_args("FxSound is %s.", &[&tr(if self.power { "on" } else { "off" })])
+        tr_args(
+            "FxSound is %s.",
+            &[&tr(if self.power { "on" } else { "off" })],
+        )
     }
 }
 
@@ -695,9 +699,7 @@ impl TrayHandle {
 ///
 /// If the session bus is unreachable or the item cannot be registered.
 pub fn spawn(state: TrayState, tx: Sender<TrayCommand>) -> Result<TrayHandle, ksni::Error> {
-    let handle = FxTray::new(state, tx)
-        .assume_sni_available(true)
-        .spawn()?;
+    let handle = FxTray::new(state, tx).assume_sni_available(true).spawn()?;
     Ok(TrayHandle { handle })
 }
 
@@ -754,8 +756,12 @@ mod tests {
     /// microphone exposes a sink *and* a source under the same description.
     fn with_inputs() -> TrayState {
         let mut state = populated();
-        state.devices.push(input("fifine Microphone Analogue Stereo", 2));
-        state.devices.push(input("Ryzen HD Audio Controller Analogue Stereo", 1));
+        state
+            .devices
+            .push(input("fifine Microphone Analogue Stereo", 2));
+        state
+            .devices
+            .push(input("Ryzen HD Audio Controller Analogue Stereo", 1));
         state
     }
 
@@ -890,11 +896,18 @@ mod tests {
         let built_in = &groups[0];
         let user = &groups[1];
         assert_eq!(
-            built_in.options.iter().map(|o| o.label.clone()).collect::<Vec<_>>(),
+            built_in
+                .options
+                .iter()
+                .map(|o| o.label.clone())
+                .collect::<Vec<_>>(),
             vec!["General", "Bass Booster"]
         );
         assert_eq!(
-            user.options.iter().map(|o| o.label.clone()).collect::<Vec<_>>(),
+            user.options
+                .iter()
+                .map(|o| o.label.clone())
+                .collect::<Vec<_>>(),
             vec!["My Mix *"],
             "an unsaved preset gets a trailing star"
         );
@@ -935,8 +948,7 @@ mod tests {
 
         assert_eq!(group.options[0].label, "Built-in Audio Analogue Stereo");
         assert_eq!(
-            group.options[1].label,
-            "HDMI / DisplayPort 3 Output...",
+            group.options[1].label, "HDMI / DisplayPort 3 Output...",
             "exactly 30 characters, per getTruncatedText"
         );
         assert_eq!(group.options[1].label.chars().count(), MENU_LABEL_MAX);
@@ -966,7 +978,11 @@ mod tests {
         let outputs = groups[0];
         let inputs = groups[1];
         assert_eq!(
-            outputs.options.iter().map(|o| o.label.clone()).collect::<Vec<_>>(),
+            outputs
+                .options
+                .iter()
+                .map(|o| o.label.clone())
+                .collect::<Vec<_>>(),
             vec![
                 "Built-in Audio Analogue Stereo",
                 "HDMI / DisplayPort 3 Output...",
@@ -974,7 +990,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            inputs.options.iter().map(|o| o.label.clone()).collect::<Vec<_>>(),
+            inputs
+                .options
+                .iter()
+                .map(|o| o.label.clone())
+                .collect::<Vec<_>>(),
             vec![
                 "fifine Microphone Analogue ...",
                 "Ryzen HD Audio Controller A...",
@@ -1029,7 +1049,10 @@ mod tests {
         (groups[0].select)(&mut tray, 2);
         assert_eq!(rx.try_recv(), Ok(TrayCommand::SelectDevice(2)));
         (groups[1].select)(&mut tray, 7);
-        assert!(rx.try_recv().is_err(), "an index past the group sends nothing");
+        assert!(
+            rx.try_recv().is_err(),
+            "an index past the group sends nothing"
+        );
     }
 
     #[test]
@@ -1041,7 +1064,10 @@ mod tests {
         });
         let labels = labels(&tray.menu());
         assert!(!labels.contains(&tr("Playback Device Select")));
-        assert!(!labels.contains(&"---".to_owned()), "and so do its separators");
+        assert!(
+            !labels.contains(&"---".to_owned()),
+            "and so do its separators"
+        );
     }
 
     #[test]
@@ -1051,7 +1077,11 @@ mod tests {
         let menu = tray.menu();
         let group = radio_groups(submenu_of(&menu, "Theme"))[0];
         assert_eq!(
-            group.options.iter().map(|o| o.label.clone()).collect::<Vec<_>>(),
+            group
+                .options
+                .iter()
+                .map(|o| o.label.clone())
+                .collect::<Vec<_>>(),
             vec!["Dark", "Light"]
         );
         assert_eq!(group.selected, 0);
@@ -1120,7 +1150,10 @@ mod tests {
         assert_eq!(TrayIcon::of(true, true), TrayIcon::Processing);
         assert_eq!(TrayIcon::Off.name(), "com.fxsound.FxSound-off");
         assert_eq!(TrayIcon::On.name(), "com.fxsound.FxSound-on");
-        assert_eq!(TrayIcon::Processing.name(), "com.fxsound.FxSound-processing");
+        assert_eq!(
+            TrayIcon::Processing.name(),
+            "com.fxsound.FxSound-processing"
+        );
 
         let (tray, _rx) = with_state(TrayState {
             processing: true,
@@ -1175,7 +1208,10 @@ mod tests {
             selected_device: Some(3),
             ..with_inputs()
         };
-        assert_eq!(state.selected_direction(), fxsound_core::DeviceDirection::Input);
+        assert_eq!(
+            state.selected_direction(),
+            fxsound_core::DeviceDirection::Input
+        );
         assert_eq!(
             state.tooltip(),
             "FxSound is on.\n\nInput: fifine Microphone Analogue Stereo"

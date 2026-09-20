@@ -130,7 +130,13 @@ impl<'a> ChangelogPane<'a> {
             content,
             close_clicked,
             ..
-        } = DialogChrome::titled(&tr("Changelog")).show(ui, outer, palette, assets, id.with("chrome"));
+        } = DialogChrome::titled(&tr("Changelog")).show(
+            ui,
+            outer,
+            palette,
+            assets,
+            id.with("chrome"),
+        );
         response.push_if(close_clicked, ChangelogAction::Close);
         response.push_if(
             ui.input(|i| i.key_pressed(Key::Escape)),
@@ -195,7 +201,10 @@ mod tests {
 
     #[test]
     fn markdown_lines_are_classified_and_stripped() {
-        assert_eq!(classify("# Changelog"), Line::Heading(1, "Changelog".into()));
+        assert_eq!(
+            classify("# Changelog"),
+            Line::Heading(1, "Changelog".into())
+        );
         assert_eq!(
             classify("## [0.2.0] — 2026-09-14"),
             Line::Heading(2, "[0.2.0] — 2026-09-14".into())
@@ -236,7 +245,10 @@ mod tests {
             "follows Keep a Changelog; done"
         );
         assert_eq!(plain("a [broken link"), "a [broken link");
-        assert_eq!(plain("`code` and **bold** and *italic*"), "code and bold and italic");
+        assert_eq!(
+            plain("`code` and **bold** and *italic*"),
+            "code and bold and italic"
+        );
     }
 
     #[test]

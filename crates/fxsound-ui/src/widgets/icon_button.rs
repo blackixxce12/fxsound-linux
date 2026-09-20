@@ -57,38 +57,38 @@ const UV_FULL: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 /// how big the artwork really is. Both theme variants of a given `FxImage` share a size — the test
 /// below proves it against the embedded bytes — so this table is indexed by the image alone.
 pub const ART_SIZES: [Vec2; NUM_IMAGES] = [
-    vec2(526.19, 75.15),   // DefaultLogo — logo-white.svg / logo-black.svg
-    vec2(526.19, 75.15),   // HighlightedLogo — logo-red.svg / logo-blue.svg
-    vec2(299.83, 219.26),  // IconLogo — FxSound {White,Black} Bars.svg
-    vec2(30.0, 31.0),      // PowerOnButton — power_on.svg / power_on_blue.svg
-    vec2(30.0, 31.0),      // PowerOffButton — power_off.svg / power_off_black.svg
-    vec2(30.0, 31.0),      // DonateButton
-    vec2(30.0, 31.0),      // DonateButtonHover
-    vec2(14.0, 10.0),      // MenuButton
-    vec2(14.0, 10.0),      // MenuButtonHover
-    vec2(18.0, 18.0),      // MinimizeButton — minimize.svg (the Pro-view flip glyph)
-    vec2(18.0, 18.0),      // MinimizeButtonHover
-    vec2(16.0, 16.0),      // MaximizeButton — maximize.svg (the Lite-view flip glyph)
-    vec2(16.0, 16.0),      // MaximizeButtonHover
-    vec2(14.0, 10.0),      // MinimizeWindowButton — min_window.svg
-    vec2(14.0, 10.0),      // MinimizeWindowButtonHover
-    vec2(16.0, 16.0),      // FlipButton
-    vec2(16.0, 16.0),      // FlipButtonHover
-    vec2(16.0, 16.0),      // RestoreDefaultsButton
-    vec2(16.0, 16.0),      // RestoreDefaultsButtonHover
-    vec2(16.0, 16.0),      // RemoveButton
-    vec2(7.0, 11.0),       // ArrowNext
-    vec2(7.0, 11.0),       // ArrowNextBW
-    vec2(7.0, 11.0),       // ArrowPrev
-    vec2(7.0, 11.0),       // ArrowPrevBW
-    vec2(6.0, 5.0),        // ArrowUpSelected
-    vec2(6.0, 5.0),        // ArrowUp
-    vec2(6.0, 5.0),        // ArrowDownSelected
-    vec2(6.0, 5.0),        // ArrowDown
-    vec2(11.0, 7.0),       // DropDownArrow — dropdown_arrow_bw.svg
-    vec2(11.0, 7.0),       // DropDownArrowHover
-    vec2(64.0, 64.0),      // SliderThumb — a 16 × 16 glyph in a 64 × 64 viewBox
-    vec2(16.0, 16.0),      // SliderThumbBW
+    vec2(526.19, 75.15),  // DefaultLogo — logo-white.svg / logo-black.svg
+    vec2(526.19, 75.15),  // HighlightedLogo — logo-red.svg / logo-blue.svg
+    vec2(299.83, 219.26), // IconLogo — FxSound {White,Black} Bars.svg
+    vec2(30.0, 31.0),     // PowerOnButton — power_on.svg / power_on_blue.svg
+    vec2(30.0, 31.0),     // PowerOffButton — power_off.svg / power_off_black.svg
+    vec2(30.0, 31.0),     // DonateButton
+    vec2(30.0, 31.0),     // DonateButtonHover
+    vec2(14.0, 10.0),     // MenuButton
+    vec2(14.0, 10.0),     // MenuButtonHover
+    vec2(18.0, 18.0),     // MinimizeButton — minimize.svg (the Pro-view flip glyph)
+    vec2(18.0, 18.0),     // MinimizeButtonHover
+    vec2(16.0, 16.0),     // MaximizeButton — maximize.svg (the Lite-view flip glyph)
+    vec2(16.0, 16.0),     // MaximizeButtonHover
+    vec2(14.0, 10.0),     // MinimizeWindowButton — min_window.svg
+    vec2(14.0, 10.0),     // MinimizeWindowButtonHover
+    vec2(16.0, 16.0),     // FlipButton
+    vec2(16.0, 16.0),     // FlipButtonHover
+    vec2(16.0, 16.0),     // RestoreDefaultsButton
+    vec2(16.0, 16.0),     // RestoreDefaultsButtonHover
+    vec2(16.0, 16.0),     // RemoveButton
+    vec2(7.0, 11.0),      // ArrowNext
+    vec2(7.0, 11.0),      // ArrowNextBW
+    vec2(7.0, 11.0),      // ArrowPrev
+    vec2(7.0, 11.0),      // ArrowPrevBW
+    vec2(6.0, 5.0),       // ArrowUpSelected
+    vec2(6.0, 5.0),       // ArrowUp
+    vec2(6.0, 5.0),       // ArrowDownSelected
+    vec2(6.0, 5.0),       // ArrowDown
+    vec2(11.0, 7.0),      // DropDownArrow — dropdown_arrow_bw.svg
+    vec2(11.0, 7.0),      // DropDownArrowHover
+    vec2(64.0, 64.0),     // SliderThumb — a 16 × 16 glyph in a 64 × 64 viewBox
+    vec2(16.0, 16.0),     // SliderThumbBW
 ];
 
 /// The natural size of one image's artwork.

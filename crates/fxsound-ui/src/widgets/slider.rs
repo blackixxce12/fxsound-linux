@@ -198,7 +198,9 @@ impl<'a> FxSlider<'a> {
             }
         }
 
-        paint(ui, rect, track, *value, min, max, palette, assets, enabled, fidelity, &response);
+        paint(
+            ui, rect, track, *value, min, max, palette, assets, enabled, fidelity, &response,
+        );
         response
     }
 }
@@ -352,8 +354,15 @@ mod tests {
             changed = Some(response.changed());
         });
 
-        assert_eq!(changed, Some(false), "an untouched slider must not report a change");
-        assert_eq!(value, before, "an untouched slider must not rewrite its value");
+        assert_eq!(
+            changed,
+            Some(false),
+            "an untouched slider must not report a change"
+        );
+        assert_eq!(
+            value, before,
+            "an untouched slider must not rewrite its value"
+        );
     }
 
     #[test]
@@ -363,13 +372,15 @@ mod tests {
         let mut changed = None;
 
         egui::__run_test_ui(|ui| {
-            let response = FxSlider::new(&mut value, 0.0, 10.0, 1.0).enabled(false).show(
-                ui,
-                Rect::from_min_size(pos2(0.0, 0.0), vec2(160.0, 18.0)),
-                Palette::default(),
-                &mut assets,
-                "disabled",
-            );
+            let response = FxSlider::new(&mut value, 0.0, 10.0, 1.0)
+                .enabled(false)
+                .show(
+                    ui,
+                    Rect::from_min_size(pos2(0.0, 0.0), vec2(160.0, 18.0)),
+                    Palette::default(),
+                    &mut assets,
+                    "disabled",
+                );
             changed = Some(response.changed());
         });
 
@@ -444,7 +455,10 @@ mod tests {
         let red = egui::Color32::from_rgb(0xd5, 0x15, 0x35);
         let grey = desaturate(red);
         let expected = ((0xd5 as f32 + 0x15 as f32) / 2.0).round() as u8;
-        assert_eq!((grey.r(), grey.g(), grey.b()), (expected, expected, expected));
+        assert_eq!(
+            (grey.r(), grey.g(), grey.b()),
+            (expected, expected, expected)
+        );
     }
 
     #[test]

@@ -110,20 +110,23 @@ pub fn direction_word(direction: DeviceDirection, language: Option<&str>) -> &'s
     let language = language.to_ascii_lowercase();
     let language = language.split(['-', '_']).next().unwrap_or_default();
     let language = if language == "ua" { "uk" } else { language };
-    WORDS
-        .iter()
-        .find(|(code, _, _)| *code == language)
-        .map_or(direction.label(), |&(_, output, input)| match direction {
+    WORDS.iter().find(|(code, _, _)| *code == language).map_or(
+        direction.label(),
+        |&(_, output, input)| match direction {
             DeviceDirection::Output => output,
             DeviceDirection::Input => input,
-        })
+        },
+    )
 }
 
 /// The `node.description` (and `node.nick`) of FxSound's virtual node for a direction:
 /// `"FxSound (Вывод)"`, `"FxSound (Input)"`, …
 #[must_use]
 pub fn node_description(direction: DeviceDirection, language: Option<&str>) -> String {
-    format!("{SINK_DESCRIPTION} ({})", direction_word(direction, language))
+    format!(
+        "{SINK_DESCRIPTION} ({})",
+        direction_word(direction, language)
+    )
 }
 
 /// [`node_description`] for the virtual sink, in the system language.
@@ -162,7 +165,11 @@ mod tests {
         assert_eq!(language_of("zh_CN.UTF-8").as_deref(), Some("zh"));
         assert_eq!(language_of("ja_JP.eucJP").as_deref(), Some("ja"));
         assert_eq!(language_of("en").as_deref(), Some("en"));
-        assert_eq!(language_of("PT_BR").as_deref(), Some("pt"), "case-insensitive");
+        assert_eq!(
+            language_of("PT_BR").as_deref(),
+            Some("pt"),
+            "case-insensitive"
+        );
         assert_eq!(language_of(""), None);
         assert_eq!(language_of("   "), None);
         assert_eq!(language_of("C"), None, "the C locale has no language");
@@ -191,8 +198,11 @@ mod tests {
         );
         // `LC_MESSAGES` overrides `LANG`.
         assert_eq!(
-            language_from_env(&env(&[("LC_MESSAGES", "fr_FR.UTF-8"), ("LANG", "ru_RU.UTF-8")]))
-                .as_deref(),
+            language_from_env(&env(&[
+                ("LC_MESSAGES", "fr_FR.UTF-8"),
+                ("LANG", "ru_RU.UTF-8")
+            ]))
+            .as_deref(),
             Some("fr")
         );
         // `LANG` alone.
@@ -238,7 +248,11 @@ mod tests {
             "FxSound (Output)",
             "an unknown language falls back to English rather than to nothing"
         );
-        assert_eq!(direction_word(DeviceDirection::Output, Some("RU")), "Вывод", "case-insensitive");
+        assert_eq!(
+            direction_word(DeviceDirection::Output, Some("RU")),
+            "Вывод",
+            "case-insensitive"
+        );
     }
 
     #[test]
@@ -247,21 +261,45 @@ mod tests {
             let output = direction_word(DeviceDirection::Output, Some(code));
             let input = direction_word(DeviceDirection::Input, Some(code));
             assert!(!output.is_empty() && !input.is_empty(), "{code}");
-            assert_ne!(output, input, "{code}: the two nodes must be distinguishable");
+            assert_ne!(
+                output, input,
+                "{code}: the two nodes must be distinguishable"
+            );
             assert_ne!(output, "Output", "{code} must actually be translated");
         }
         // The table the task prescribes, spot-checked.
         assert_eq!(direction_word(DeviceDirection::Output, Some("uk")), "Вивід");
         assert_eq!(direction_word(DeviceDirection::Input, Some("uk")), "Ввід");
-        assert_eq!(direction_word(DeviceDirection::Output, Some("de")), "Ausgabe");
-        assert_eq!(direction_word(DeviceDirection::Input, Some("de")), "Eingabe");
-        assert_eq!(direction_word(DeviceDirection::Output, Some("fr")), "Sortie");
+        assert_eq!(
+            direction_word(DeviceDirection::Output, Some("de")),
+            "Ausgabe"
+        );
+        assert_eq!(
+            direction_word(DeviceDirection::Input, Some("de")),
+            "Eingabe"
+        );
+        assert_eq!(
+            direction_word(DeviceDirection::Output, Some("fr")),
+            "Sortie"
+        );
         assert_eq!(direction_word(DeviceDirection::Input, Some("fr")), "Entrée");
-        assert_eq!(direction_word(DeviceDirection::Output, Some("es")), "Salida");
-        assert_eq!(direction_word(DeviceDirection::Input, Some("pt")), "Entrada");
-        assert_eq!(direction_word(DeviceDirection::Output, Some("it")), "Uscita");
+        assert_eq!(
+            direction_word(DeviceDirection::Output, Some("es")),
+            "Salida"
+        );
+        assert_eq!(
+            direction_word(DeviceDirection::Input, Some("pt")),
+            "Entrada"
+        );
+        assert_eq!(
+            direction_word(DeviceDirection::Output, Some("it")),
+            "Uscita"
+        );
         assert_eq!(direction_word(DeviceDirection::Input, Some("nl")), "Invoer");
-        assert_eq!(direction_word(DeviceDirection::Output, Some("pl")), "Wyjście");
+        assert_eq!(
+            direction_word(DeviceDirection::Output, Some("pl")),
+            "Wyjście"
+        );
         assert_eq!(direction_word(DeviceDirection::Input, Some("tr")), "Giriş");
         assert_eq!(direction_word(DeviceDirection::Output, Some("ja")), "出力");
         assert_eq!(direction_word(DeviceDirection::Input, Some("ko")), "입력");
@@ -273,8 +311,14 @@ mod tests {
         // The value depends on the machine's locale; the shape does not.
         let sink = sink_description();
         let source = source_description();
-        assert!(sink.starts_with("FxSound (") && sink.ends_with(')'), "{sink}");
-        assert!(source.starts_with("FxSound (") && source.ends_with(')'), "{source}");
+        assert!(
+            sink.starts_with("FxSound (") && sink.ends_with(')'),
+            "{sink}"
+        );
+        assert!(
+            source.starts_with("FxSound (") && source.ends_with(')'),
+            "{source}"
+        );
         assert_ne!(sink, source);
     }
 }
@@ -295,8 +339,14 @@ mod language_coverage {
             assert_ne!(output, input, "{}", language.code);
         }
         // Region-qualified and Windows-specific codes resolve too.
-        assert_eq!(direction_word(DeviceDirection::Output, Some("zh-TW")), "输出");
-        assert_eq!(direction_word(DeviceDirection::Input, Some("pt-br")), "Entrada");
+        assert_eq!(
+            direction_word(DeviceDirection::Output, Some("zh-TW")),
+            "输出"
+        );
+        assert_eq!(
+            direction_word(DeviceDirection::Input, Some("pt-br")),
+            "Entrada"
+        );
         assert_eq!(direction_word(DeviceDirection::Output, Some("ua")), "Вивід");
     }
 }

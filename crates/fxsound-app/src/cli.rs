@@ -243,7 +243,11 @@ pub struct Cli {
     /// `--run_minimized` — `docs/COMMAND_LINE_OPTIONS.md:36`, `FxController.cpp:236-239`,
     /// `:523-531`. `--hide` is the Linux spelling and is what `packaging/fxsound-autostart.desktop`
     /// and `packaging/fxsound.service` invoke.
-    #[arg(long = "run_minimized", alias = "run-minimized", visible_alias = "hide")]
+    #[arg(
+        long = "run_minimized",
+        alias = "run-minimized",
+        visible_alias = "hide"
+    )]
     pub run_minimized: bool,
 
     /// Show and raise the window of the running instance.
@@ -790,7 +794,12 @@ fn parse_effects(list: &str) -> Result<EffectPairs, String> {
     }
     pairs
         .into_iter()
-        .map(|(name, value)| Ok((parse_effect_name(name)?, parse_ranged(value, EFFECT_RANGE, "")?)))
+        .map(|(name, value)| {
+            Ok((
+                parse_effect_name(name)?,
+                parse_ranged(value, EFFECT_RANGE, "")?,
+            ))
+        })
         .collect::<Result<Vec<_>, String>>()
         .map(EffectPairs)
 }
@@ -878,8 +887,14 @@ mod tests {
         // Device descriptions come from ALSA/UCM in the system language; on the development
         // machine that is Cyrillic, and the same string names a sink and a source.
         let cyrillic = "fifine Microphone Аналоговый стерео";
-        assert_eq!(parse(&[&format!("--output={cyrillic}")]).output.as_deref(), Some(cyrillic));
-        assert_eq!(parse(&["--output", cyrillic]).output.as_deref(), Some(cyrillic));
+        assert_eq!(
+            parse(&[&format!("--output={cyrillic}")]).output.as_deref(),
+            Some(cyrillic)
+        );
+        assert_eq!(
+            parse(&["--output", cyrillic]).output.as_deref(),
+            Some(cyrillic)
+        );
         assert_eq!(
             parse(&["--output=alsa_input.usb-3142_fifine_Microphone-00.analog-stereo"]).commands(),
             vec![
@@ -891,7 +906,12 @@ mod tests {
             "a node.name of either direction is just a name here; the controller resolves it"
         );
         // An empty name is no command at all, as `applyConfig` treats an empty --output.
-        assert!(parse(&["--output="]).commands().iter().all(|c| !matches!(c, Command::Output(_))));
+        assert!(
+            parse(&["--output="])
+                .commands()
+                .iter()
+                .all(|c| !matches!(c, Command::Output(_)))
+        );
     }
 
     #[test]
@@ -905,7 +925,9 @@ mod tests {
             Some("My Preset")
         );
         assert_eq!(
-            parse(&["--rename_preset=New Name"]).rename_preset.as_deref(),
+            parse(&["--rename_preset=New Name"])
+                .rename_preset
+                .as_deref(),
             Some("New Name")
         );
     }
@@ -973,7 +995,10 @@ mod tests {
     #[test]
     fn the_band_count_must_be_one_of_the_five_the_equalizer_supports() {
         for bands in VALID_BAND_COUNTS {
-            assert_eq!(parse(&[&format!("--num_bands={bands}")]).num_bands, Some(bands));
+            assert_eq!(
+                parse(&[&format!("--num_bands={bands}")]).num_bands,
+                Some(bands)
+            );
         }
         assert!(error(&["--num_bands=7"]).contains("5, 10, 15, 20 or 31"));
         assert!(error(&["--num_bands=0"]).contains("5, 10, 15, 20 or 31"));
@@ -989,13 +1014,17 @@ mod tests {
 
     #[test]
     fn band_lists_parse_into_index_and_value_pairs() {
-        let freq = parse(&["--set_band_freq=0:60,1:150.5"]).set_band_freq.unwrap();
+        let freq = parse(&["--set_band_freq=0:60,1:150.5"])
+            .set_band_freq
+            .unwrap();
         assert_eq!(freq.0[0].0, 0);
         assert!((freq.0[0].1 - 60.0).abs() < EPS);
         assert_eq!(freq.0[1].0, 1);
         assert!((freq.0[1].1 - 150.5).abs() < EPS);
 
-        let gain = parse(&["--set_band_gain=0:3.0,9:-2.5"]).set_band_gain.unwrap();
+        let gain = parse(&["--set_band_gain=0:3.0,9:-2.5"])
+            .set_band_gain
+            .unwrap();
         assert_eq!(gain.0[1].0, 9);
         assert!((gain.0[1].1 - -2.5).abs() < EPS);
     }
@@ -1024,8 +1053,13 @@ mod tests {
             ("bass_boost", Effect::Bass),
         ];
         for (name, expected) in cases {
-            let parsed = parse(&[&format!("--set_effect={name}:5")]).set_effect.unwrap();
-            assert_eq!(parsed.0[0].0, expected, "`{name}` should map to {expected:?}");
+            let parsed = parse(&[&format!("--set_effect={name}:5")])
+                .set_effect
+                .unwrap();
+            assert_eq!(
+                parsed.0[0].0, expected,
+                "`{name}` should map to {expected:?}"
+            );
             assert!((parsed.0[0].1 - 5.0).abs() < EPS);
         }
     }

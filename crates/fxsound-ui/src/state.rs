@@ -143,7 +143,10 @@ impl UiState {
         if count < 2 {
             return None;
         }
-        Some(self.selected_preset.map_or(count - 1, |i| (i + count - 1) % count))
+        Some(
+            self.selected_preset
+                .map_or(count - 1, |i| (i + count - 1) % count),
+        )
     }
 }
 
@@ -301,6 +304,9 @@ mod tests {
         response.push(UiAction::SetEffect(Effect::Ambience, 5.0));
         assert!(response.contains(&UiAction::TogglePower));
         assert_eq!(response.actions.len(), 2);
-        assert_eq!(response.actions[1], UiAction::SetEffect(Effect::Ambience, 5.0));
+        assert_eq!(
+            response.actions[1],
+            UiAction::SetEffect(Effect::Ambience, 5.0)
+        );
     }
 }

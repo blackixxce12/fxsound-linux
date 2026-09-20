@@ -98,13 +98,7 @@ impl Chrome {
     /// Every button in paint order, so a hit test can walk them.
     #[must_use]
     pub fn buttons(&self) -> [ChromeButton; 5] {
-        [
-            self.menu,
-            self.power,
-            self.flip,
-            self.minimize,
-            self.close,
-        ]
+        [self.menu, self.power, self.flip, self.minimize, self.close]
     }
 }
 
@@ -291,15 +285,16 @@ mod tests {
             pro::equalizer().left() - pro::audio_controls().right(),
             16.0
         );
-        assert_eq!(pro::equalizer().size(), vec2(equalizer::WIDTH, equalizer::HEIGHT));
+        assert_eq!(
+            pro::equalizer().size(),
+            vec2(equalizer::WIDTH, equalizer::HEIGHT)
+        );
     }
 
     #[test]
     fn every_pro_child_fits_inside_the_window() {
-        let window = Rect::from_min_size(
-            pos2(0.0, 0.0),
-            vec2(pro::WINDOW_SIZE.x, pro::WINDOW_SIZE.y),
-        );
+        let window =
+            Rect::from_min_size(pos2(0.0, 0.0), vec2(pro::WINDOW_SIZE.x, pro::WINDOW_SIZE.y));
         for r in [
             pro::panel(),
             pro::preset_combo(),
@@ -320,7 +315,10 @@ mod tests {
         ] {
             for b in chrome.buttons() {
                 assert!(b.rect().right() <= width, "{b:?} overflows width {width}");
-                assert!(b.rect().bottom() <= TITLE_BAR_HEIGHT, "{b:?} overflows the bar");
+                assert!(
+                    b.rect().bottom() <= TITLE_BAR_HEIGHT,
+                    "{b:?} overflows the bar"
+                );
             }
         }
     }

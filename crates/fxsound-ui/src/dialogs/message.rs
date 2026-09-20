@@ -30,7 +30,6 @@
 //! *geometry*, kept because [`layout`] is the only place the original's sizing rules are written
 //! down and a screenshot test of either mode has to agree with it.
 
-use fxsound_core::i18n::tr;
 use super::{ChromeResponse, DialogChrome, TextButton, draw_truncated, link, normal_font};
 use crate::assets::{AssetCache, FxImage};
 use crate::theme::{self, FxColor, Palette};
@@ -38,6 +37,7 @@ use crate::widgets::icon_button::{art_size, fitted_rect, paint_image};
 use egui::{
     Align2, Color32, Context, CornerRadius, Id, Rect, Response, Sense, Shadow, Ui, Vec2, pos2, vec2,
 };
+use fxsound_core::i18n::tr;
 
 // =============================================================================================
 // FxConfirmationMessage
@@ -126,7 +126,10 @@ pub fn no_rect(content: Rect) -> Rect {
 pub fn ok_rect(content: Rect) -> Rect {
     let working = Rect::from_min_max(
         pos2(content.left() + MARGIN, button_top(content)),
-        pos2(content.right() - MARGIN, button_top(content) + BUTTON_SIZE.y),
+        pos2(
+            content.right() - MARGIN,
+            button_top(content) + BUTTON_SIZE.y,
+        ),
     );
     Align2::CENTER_TOP.align_size_within_rect(BUTTON_SIZE, working)
 }
@@ -182,9 +185,13 @@ impl<'a> MessageBox<'a> {
             content,
             close_clicked,
             ..
-        } = DialogChrome::new()
-            .draggable(false)
-            .show(ui, outer, palette, assets, id.with("chrome"));
+        } = DialogChrome::new().draggable(false).show(
+            ui,
+            outer,
+            palette,
+            assets,
+            id.with("chrome"),
+        );
 
         draw_truncated(
             ui.painter(),
@@ -356,7 +363,10 @@ pub fn layout(line_widths: &[f32], link_width: f32, autohide: bool) -> ToastLayo
     }
 
     ToastLayout {
-        size: vec2(width, drawn as f32 * toast::LINE_HEIGHT + toast::HEIGHT_PADDING),
+        size: vec2(
+            width,
+            drawn as f32 * toast::LINE_HEIGHT + toast::HEIGHT_PADDING,
+        ),
         lines: drawn,
         link_line,
     }
@@ -523,10 +533,7 @@ impl<'a> Toast<'a> {
             .rect_filled(rect, corner, palette.color(FxColor::DefaultFill));
 
         if self.autohide {
-            let box_ = Rect::from_min_size(
-                rect.min + toast::ICON_POS.to_vec2(),
-                toast::ICON_SIZE,
-            );
+            let box_ = Rect::from_min_size(rect.min + toast::ICON_POS.to_vec2(), toast::ICON_SIZE);
             paint_image(
                 ui,
                 fitted_rect(box_, art_size(FxImage::DefaultLogo)),
@@ -557,8 +564,15 @@ impl<'a> Toast<'a> {
         if let Some((text, _)) = self.link {
             let width = self.link_width(ui);
             let area = link_rect(rect, &resolved, last_line_width, width, self.autohide);
-            link_clicked =
-                link(ui, area, text, palette, Align2::LEFT_CENTER, id.with("link")).clicked();
+            link_clicked = link(
+                ui,
+                area,
+                text,
+                palette,
+                Align2::LEFT_CENTER,
+                id.with("link"),
+            )
+            .clicked();
         }
 
         // `Sense::hover()` because the in-window banner stays up while the pointer is over it
@@ -594,7 +608,10 @@ mod tests {
         let local = |r: Rect| r.translate(-content.min.to_vec2());
 
         let message = local(message_rect(content));
-        assert!((message.min - pos2(20.0, 20.0)).length() < 1e-4, "{message:?}");
+        assert!(
+            (message.min - pos2(20.0, 20.0)).length() < 1e-4,
+            "{message:?}"
+        );
         assert!((message.size() - vec2(410.0, 52.0)).length() < 1e-4);
 
         let yes = local(yes_rect(content));
@@ -706,7 +723,10 @@ mod tests {
         // 500 > 560 - 80, so the toast takes MAX_WIDTH and the link cannot share the line.
         let resolved = layout(&[480.0], 30.0, true);
         assert!((resolved.size.x - toast::MAX_WIDTH).abs() < 1e-4);
-        assert_eq!(resolved.link_line, 1, "the link should drop to the next row");
+        assert_eq!(
+            resolved.link_line, 1,
+            "the link should drop to the next row"
+        );
         // Narrow enough and the link stays inline on the last line.
         let resolved = layout(&[100.0, 120.0], 30.0, true);
         assert_eq!(resolved.link_line, 1);
@@ -759,7 +779,10 @@ mod tests {
             link_line: 1,
         };
         let rect = link_rect(bounds, &inline, 150.0, 40.0, true);
-        assert!((rect.left() - (toast::AUTOHIDE_X + 150.0)).abs() < 1e-4, "{rect:?}");
+        assert!(
+            (rect.left() - (toast::AUTOHIDE_X + 150.0)).abs() < 1e-4,
+            "{rect:?}"
+        );
         assert!((rect.top() - (20.0 + 30.0)).abs() < 1e-4);
 
         let dropped = ToastLayout {

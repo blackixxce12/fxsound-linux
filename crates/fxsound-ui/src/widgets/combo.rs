@@ -424,7 +424,16 @@ impl<'a> FxComboBox<'a> {
         }
 
         paint_box(
-            ui, rect, palette, assets, items, selected, enabled, placeholder, error, &response,
+            ui,
+            rect,
+            palette,
+            assets,
+            items,
+            selected,
+            enabled,
+            placeholder,
+            error,
+            &response,
         );
 
         if !enabled {
@@ -491,7 +500,15 @@ fn paint_box(
     };
     if !label.is_empty() {
         let box_ = text_box(rect);
-        draw_truncated(&painter, label, font, colour, left, box_.right(), box_.center().y);
+        draw_truncated(
+            &painter,
+            label,
+            font,
+            colour,
+            left,
+            box_.right(),
+            box_.center().y,
+        );
     }
 
     // The arrow is a `Drawable`, and `drawWithin` ignores the colour set on the graphics context,
@@ -619,7 +636,11 @@ fn row(
     let painter = ui.painter();
 
     if highlighted {
-        painter.rect_filled(rect, CornerRadius::ZERO, palette.color(FxColor::ImageButton));
+        painter.rect_filled(
+            rect,
+            CornerRadius::ZERO,
+            palette.color(FxColor::ImageButton),
+        );
     }
     if ticked {
         // FxTheme's one addition to the stock item: a rectangle around the ticked row.

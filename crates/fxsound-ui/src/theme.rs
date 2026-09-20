@@ -258,10 +258,7 @@ pub fn font_definitions() -> FontDefinitions {
 
     // Proportional: Gilroy first, then the scripts Gilroy has no glyphs for, then egui's own
     // default face so symbols and emoji still resolve.
-    let proportional = defs
-        .families
-        .entry(FontFamily::Proportional)
-        .or_default();
+    let proportional = defs.families.entry(FontFamily::Proportional).or_default();
     let stock = std::mem::take(proportional);
     proportional.push(fonts::REGULAR.to_owned());
     proportional.extend(fallbacks.iter().cloned());
@@ -274,8 +271,7 @@ pub fn font_definitions() -> FontDefinitions {
         let chain = std::iter::once(primary.to_owned())
             .chain(fallbacks.iter().cloned())
             .collect();
-        defs.families
-            .insert(FontFamily::Name(family.into()), chain);
+        defs.families.insert(FontFamily::Name(family.into()), chain);
     }
 
     defs
@@ -364,7 +360,10 @@ mod tests {
         let p = Palette::default();
         let base = p.color(FxColor::PanelBackground);
         let faded = p.color_alpha(FxColor::PanelBackground, 0.2);
-        assert_eq!((faded.r(), faded.g(), faded.b()), (base.r(), base.g(), base.b()));
+        assert_eq!(
+            (faded.r(), faded.g(), faded.b()),
+            (base.r(), base.g(), base.b())
+        );
         assert_eq!(faded.a(), 51);
     }
 }

@@ -311,7 +311,11 @@ impl EqLayout {
     /// (`FxEqualizer.cpp:267`, `:274`).
     #[must_use]
     pub fn freq_label_size(&self) -> f32 {
-        if self.wheels { LABEL_HEIGHT } else { SMALL_FONT }
+        if self.wheels {
+            LABEL_HEIGHT
+        } else {
+            SMALL_FONT
+        }
     }
 }
 
@@ -367,7 +371,11 @@ pub fn band_frequency_range(band: usize, num_bands: usize) -> (f32, f32) {
     } else {
         let power = ((one_based as f64 - 1.0) * 2.0 - 1.0) / denominator;
         let edge = (f64::from(min_hz) * ratio.powf(power)).round() as f32;
-        if edge < 1000.0 { edge + 1.0 } else { edge + 10.0 }
+        if edge < 1000.0 {
+            edge + 1.0
+        } else {
+            edge + 10.0
+        }
     };
     let high = if one_based >= num_bands {
         max_hz
@@ -808,7 +816,17 @@ impl<'a> EqualizerWidget<'a> {
         }
 
         for band in 0..layout.num_bands {
-            wheel(ui, assets, &painter, &ctx, &layout, band, state, interaction, response);
+            wheel(
+                ui,
+                assets,
+                &painter,
+                &ctx,
+                &layout,
+                band,
+                state,
+                interaction,
+                response,
+            );
         }
 
         if let Some(controls_rect) = controls {
@@ -1144,8 +1162,7 @@ fn wheel(
     ));
 
     let thumb_center = rotary_point(center, arc_radius, value_angle);
-    let thumb_rect =
-        Rect::from_center_size(thumb_center, Vec2::splat(ROTARY_THUMB_RADIUS * 2.0));
+    let thumb_rect = Rect::from_center_size(thumb_center, Vec2::splat(ROTARY_THUMB_RADIUS * 2.0));
     let image = if ctx.lit {
         FxImage::SliderThumb
     } else {
@@ -1404,7 +1421,14 @@ fn side_controls(
     };
     {
         let painter = ui.painter().clone();
-        draw_image(&painter, ui, assets, reset_image, palette.mode(), reset_rect);
+        draw_image(
+            &painter,
+            ui,
+            assets,
+            reset_image,
+            palette.mode(),
+            reset_rect,
+        );
     }
     if reset_response.hovered() && enabled {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1600,7 +1624,10 @@ mod tests {
     fn the_gain_label_sits_twelve_points_above_the_thumb() {
         let layout = EqLayout::new(10);
         let label = layout.gain_label_rect(0, 0.0);
-        assert_eq!(label.bottom(), layout.gain_to_y(0.0) - THUMB_RADIUS * 3.0 + LABEL_HEIGHT);
+        assert_eq!(
+            label.bottom(),
+            layout.gain_to_y(0.0) - THUMB_RADIUS * 3.0 + LABEL_HEIGHT
+        );
         // Its bottom edge is 12 points above the thumb centre.
         assert_eq!(layout.gain_to_y(0.0) - label.bottom(), 12.0);
         assert_eq!(label.width(), FADER_WIDTH);
@@ -1617,7 +1644,11 @@ mod tests {
             (8010.0, 16000.0),
         ];
         for (band, expected) in five.into_iter().enumerate() {
-            assert_eq!(band_frequency_range(band, 5), expected, "5 bands, band {band}");
+            assert_eq!(
+                band_frequency_range(band, 5),
+                expected,
+                "5 bands, band {band}"
+            );
         }
 
         let ten = [
@@ -1672,9 +1703,15 @@ mod tests {
     #[test]
     fn the_wheel_steps_a_hundredth_of_the_band_range() {
         let step = frequency_step(0, 10);
-        assert!((step - 0.225).abs() < 1e-4, "band 1 of ten stepped by {step}");
+        assert!(
+            (step - 0.225).abs() < 1e-4,
+            "band 1 of ten stepped by {step}"
+        );
         let step = frequency_step(4, 5);
-        assert!((step - 79.9).abs() < 1e-3, "band 5 of five stepped by {step}");
+        assert!(
+            (step - 79.9).abs() < 1e-3,
+            "band 5 of five stepped by {step}"
+        );
     }
 
     #[test]
@@ -1837,7 +1874,10 @@ mod tests {
         assert!(high.x > 0.0 && high.y > 0.0, "end thumb at {high:?}");
         // Half way round is straight up.
         let middle = rotary_point(centre, 10.0, rotary_angle(0.5));
-        assert!(middle.x.abs() < 1e-5 && middle.y < 0.0, "mid thumb at {middle:?}");
+        assert!(
+            middle.x.abs() < 1e-5 && middle.y < 0.0,
+            "mid thumb at {middle:?}"
+        );
     }
 
     /// JUCE covers the whole range in 250 pixels of drag, counting right and up as increases.
@@ -1942,7 +1982,10 @@ mod tests {
                 }
                 // Only the 31-band faders are allowed to spill past the margin.
                 if bands < 31 {
-                    assert!(fader.left() >= X_MARGIN, "{bands} bands: fader before margin");
+                    assert!(
+                        fader.left() >= X_MARGIN,
+                        "{bands} bands: fader before margin"
+                    );
                 }
             }
         }

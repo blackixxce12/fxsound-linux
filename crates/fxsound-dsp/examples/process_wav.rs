@@ -14,8 +14,8 @@
 //! Only 16-bit PCM WAV is handled, which is what `.wav` almost always means and what the original
 //! engine's `processAudio` took.
 
-use fxsound_dsp::Engine;
 use fxsound_core::{Effect, messages::DspParams};
+use fxsound_dsp::Engine;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -77,7 +77,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Convert to f32 in the ±1.0 range the engine works in, process block by block the way a real
     // audio callback would, then convert back.
-    let mut floats: Vec<f32> = wav.samples.iter().map(|s| f32::from(*s) / 32768.0).collect();
+    let mut floats: Vec<f32> = wav
+        .samples
+        .iter()
+        .map(|s| f32::from(*s) / 32768.0)
+        .collect();
     let block_samples = BLOCK * wav.channels as usize;
     for block in floats.chunks_mut(block_samples) {
         engine.process(block, wav.channels as usize);

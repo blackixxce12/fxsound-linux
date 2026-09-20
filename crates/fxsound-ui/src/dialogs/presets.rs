@@ -31,17 +31,15 @@
 //! original's two buttons onto [`OverwriteChoice::OverwriteAll`] and [`OverwriteChoice::SkipAll`],
 //! with dismissal cancelling the export outright.
 
-use fxsound_core::i18n::tr;
 use super::message::{ConfirmChoice, MessageBox};
-use super::{
-    DialogChrome, DialogResponse, TextButton, draw_truncated, normal_font, small_font,
-};
+use super::{DialogChrome, DialogResponse, TextButton, draw_truncated, normal_font, small_font};
 use crate::assets::AssetCache;
 use crate::theme::{FxColor, Palette};
 use egui::{
     Align2, CornerRadius, Id, Key, Mesh, Rect, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder,
     Vec2, pos2, vec2,
 };
+use fxsound_core::i18n::tr;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -310,7 +308,13 @@ impl<'a> ImportDialog<'a> {
                 palette.color(FxColor::HintText),
             ),
         };
-        super::draw_wrapped(ui.painter(), &text, small_font(), colour, path_rect(content));
+        super::draw_wrapped(
+            ui.painter(),
+            &text,
+            small_font(),
+            colour,
+            path_rect(content),
+        );
 
         if TextButton::new(&tr("Import"))
             .enabled(self.state.can_import())
@@ -371,10 +375,7 @@ pub fn label_rect(content: Rect) -> Rect {
             content.left() + import::MARGIN,
             content.top() + import::MARGIN / 2.0,
         ),
-        vec2(
-            content.width() - import::MARGIN * 2.0,
-            import::TEXT_HEIGHT,
-        ),
+        vec2(content.width() - import::MARGIN * 2.0, import::TEXT_HEIGHT),
     )
 }
 
@@ -382,7 +383,10 @@ pub fn label_rect(content: Rect) -> Rect {
 #[must_use]
 pub fn choose_rect(content: Rect) -> Rect {
     Rect::from_min_size(
-        pos2(content.left() + import::MARGIN, label_rect(content).bottom() + 10.0),
+        pos2(
+            content.left() + import::MARGIN,
+            label_rect(content).bottom() + 10.0,
+        ),
         import::CHOOSE_BUTTON_SIZE,
     )
 }
@@ -391,7 +395,10 @@ pub fn choose_rect(content: Rect) -> Rect {
 #[must_use]
 pub fn path_rect(content: Rect) -> Rect {
     Rect::from_min_size(
-        pos2(content.left() + import::MARGIN, choose_rect(content).bottom() + 10.0),
+        pos2(
+            content.left() + import::MARGIN,
+            choose_rect(content).bottom() + 10.0,
+        ),
         vec2(content.width() - import::MARGIN * 2.0, import::PATH_HEIGHT),
     )
 }
@@ -656,9 +663,12 @@ impl<'a> ExportDialog<'a> {
 
         if !self.state.collisions.is_empty() {
             let message = overwrite_message(&self.state.collisions);
-            if let Some(choice) =
-                MessageBox::new(&message).show_modal(ui.ctx(), palette, assets, id.with("overwrite"))
-            {
+            if let Some(choice) = MessageBox::new(&message).show_modal(
+                ui.ctx(),
+                palette,
+                assets,
+                id.with("overwrite"),
+            ) {
                 response.push(PresetsAction::Overwrite(match choice {
                     ConfirmChoice::Yes => OverwriteChoice::OverwriteAll,
                     ConfirmChoice::No | ConfirmChoice::Ok => OverwriteChoice::SkipAll,
@@ -699,10 +709,7 @@ impl<'a> ExportDialog<'a> {
 pub fn export_label_rect(content: Rect) -> Rect {
     Rect::from_min_size(
         pos2(content.left() + export::MARGIN, content.top() + 10.0),
-        vec2(
-            content.width() - export::MARGIN * 2.0,
-            export::TEXT_HEIGHT,
-        ),
+        vec2(content.width() - export::MARGIN * 2.0, export::TEXT_HEIGHT),
     )
 }
 
@@ -870,7 +877,10 @@ mod tests {
         // much shorter, because the 310 point file browser is gone.
         let (shrunk, original) = (import::CONTENT_SIZE, import::ORIGINAL_CONTENT_SIZE);
         assert!((outer_size(original) - vec2(410.0, 487.0)).length() < 1e-4);
-        assert!(shrunk.y < original.y, "{shrunk:?} should be shorter than {original:?}");
+        assert!(
+            shrunk.y < original.y,
+            "{shrunk:?} should be shorter than {original:?}"
+        );
         assert!((shrunk.x - original.x).abs() < 1e-6);
     }
 
@@ -897,14 +907,40 @@ mod tests {
         let content = summary_content();
         let expect = |r: Rect, min: egui::Pos2, size: Vec2| {
             let r = local(content, r);
-            assert!((r.min - min).length() < 1e-4, "{r:?} should start at {min:?}");
-            assert!((r.size() - size).length() < 1e-4, "{r:?} should be {size:?}");
+            assert!(
+                (r.min - min).length() < 1e-4,
+                "{r:?} should start at {min:?}"
+            );
+            assert!(
+                (r.size() - size).length() < 1e-4,
+                "{r:?} should be {size:?}"
+            );
         };
-        expect(summary_label_rect(content, 0), pos2(20.0, 10.0), vec2(310.0, 20.0));
-        expect(summary_list_rect(content, 0), pos2(20.0, 40.0), vec2(310.0, 100.0));
-        expect(summary_label_rect(content, 1), pos2(20.0, 150.0), vec2(310.0, 20.0));
-        expect(summary_list_rect(content, 1), pos2(20.0, 180.0), vec2(310.0, 100.0));
-        expect(summary_ok_rect(content), pos2(150.0, 300.0), vec2(50.0, 30.0));
+        expect(
+            summary_label_rect(content, 0),
+            pos2(20.0, 10.0),
+            vec2(310.0, 20.0),
+        );
+        expect(
+            summary_list_rect(content, 0),
+            pos2(20.0, 40.0),
+            vec2(310.0, 100.0),
+        );
+        expect(
+            summary_label_rect(content, 1),
+            pos2(20.0, 150.0),
+            vec2(310.0, 20.0),
+        );
+        expect(
+            summary_list_rect(content, 1),
+            pos2(20.0, 180.0),
+            vec2(310.0, 100.0),
+        );
+        expect(
+            summary_ok_rect(content),
+            pos2(150.0, 300.0),
+            vec2(50.0, 30.0),
+        );
     }
 
     #[test]
@@ -913,13 +949,31 @@ mod tests {
         let content = export_content();
         let expect = |r: Rect, min: egui::Pos2, size: Vec2| {
             let r = local(content, r);
-            assert!((r.min - min).length() < 1e-4, "{r:?} should start at {min:?}");
-            assert!((r.size() - size).length() < 1e-4, "{r:?} should be {size:?}");
+            assert!(
+                (r.min - min).length() < 1e-4,
+                "{r:?} should start at {min:?}"
+            );
+            assert!(
+                (r.size() - size).length() < 1e-4,
+                "{r:?} should be {size:?}"
+            );
         };
-        expect(export_label_rect(content), pos2(20.0, 10.0), vec2(360.0, 20.0));
-        expect(export_list_rect(content), pos2(20.0, 40.0), vec2(360.0, 310.0));
+        expect(
+            export_label_rect(content),
+            pos2(20.0, 10.0),
+            vec2(360.0, 20.0),
+        );
+        expect(
+            export_list_rect(content),
+            pos2(20.0, 40.0),
+            vec2(360.0, 310.0),
+        );
         expect(progress_rect(content), pos2(0.0, 360.0), vec2(400.0, 2.0));
-        expect(export_button_rect(content), pos2(300.0, 372.0), vec2(80.0, 30.0));
+        expect(
+            export_button_rect(content),
+            pos2(300.0, 372.0),
+            vec2(80.0, 30.0),
+        );
         // The bar really does ignore the margins the rest of the window respects.
         assert!(progress_rect(content).left() < export_list_rect(content).left());
     }
@@ -971,7 +1025,10 @@ mod tests {
 
     #[test]
     fn format_string_substitutes_once_and_tolerates_a_missing_placeholder() {
-        assert_eq!(format_string("Preset %s is deleted.", "Rock"), "Preset Rock is deleted.");
+        assert_eq!(
+            format_string("Preset %s is deleted.", "Rock"),
+            "Preset Rock is deleted."
+        );
         // Only the first placeholder, as `swprintf_s` with one argument would.
         assert_eq!(format_string("%s and %s", "a"), "a and %s");
         // A translator who dropped the placeholder gets their string back unharmed.

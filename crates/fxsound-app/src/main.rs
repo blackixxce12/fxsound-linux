@@ -341,7 +341,8 @@ impl Runtime {
                 let palette = runtime.app.palette();
                 theme::apply(&cc.egui_ctx, palette);
                 // The zoom factor is ours (see `fit_zoom`); Ctrl+/- must not fight it.
-                cc.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
+                cc.egui_ctx
+                    .options_mut(|options| options.zoom_with_keyboard = false);
                 Ok(Box::new(Shell::new(runtime, palette.mode())))
             }),
         )?;
@@ -517,8 +518,7 @@ struct Shell<'a> {
 impl<'a> Shell<'a> {
     fn new(rt: &'a mut Runtime, applied_theme: ThemeMode) -> Self {
         // The tray's Settings item may have been chosen while there was no window.
-        let settings = std::mem::take(&mut rt.settings_requested)
-            .then(|| rt.app.settings_state());
+        let settings = std::mem::take(&mut rt.settings_requested).then(|| rt.app.settings_state());
         Self {
             rt,
             scratch: ViewScratch::default(),
@@ -625,7 +625,14 @@ impl<'a> Shell<'a> {
         self.menu.close();
         if self.export.is_none() {
             // Every preset, factory and user alike (`FxPresetExportDialog.cpp:138-141`).
-            let presets = self.rt.app.state.presets.iter().map(|p| p.name.clone()).collect();
+            let presets = self
+                .rt
+                .app
+                .state
+                .presets
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
             self.export = Some(ExportState {
                 presets,
                 ..ExportState::default()
@@ -726,7 +733,13 @@ impl<'a> Shell<'a> {
                         if menu_row(ui, &overwrite_label, can_overwrite, Mark::None, palette) {
                             chosen = Some(MenuChoice::Overwrite);
                         }
-                        if menu_row(ui, &tr("Undo Preset Changes"), can_undo, Mark::None, palette) {
+                        if menu_row(
+                            ui,
+                            &tr("Undo Preset Changes"),
+                            can_undo,
+                            Mark::None,
+                            palette,
+                        ) {
                             chosen = Some(MenuChoice::Undo);
                         }
 
@@ -882,7 +895,8 @@ impl<'a> Shell<'a> {
         let window = self.window_rect();
         dim_backdrop(ui, window);
         let outer = egui::Rect::from_center_size(window.center(), dialogs::changelog::WINDOW_SIZE);
-        let response = ChangelogPane::new(CHANGELOG).show(ui, outer, palette, &mut self.rt.app.assets);
+        let response =
+            ChangelogPane::new(CHANGELOG).show(ui, outer, palette, &mut self.rt.app.assets);
         if response.contains(&ChangelogAction::Close) {
             self.changelog = false;
         }
@@ -1205,7 +1219,9 @@ enum Mark {
     /// A tick in the left gutter: the current theme.
     Tick,
     /// A triangle at the right edge, pointing down while the editor under the row is unfolded.
-    Submenu { expanded: bool },
+    Submenu {
+        expanded: bool,
+    },
 }
 
 /// One menu row. Returns `true` when it was clicked; a disabled row is drawn grey and inert.
@@ -1215,8 +1231,7 @@ fn menu_row(ui: &mut egui::Ui, label: &str, enabled: bool, mark: Mark, palette: 
     } else {
         egui::Sense::hover()
     };
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(MENU_WIDTH, MENU_ROW_HEIGHT), sense);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(MENU_WIDTH, MENU_ROW_HEIGHT), sense);
     if !ui.is_rect_visible(rect) {
         return false;
     }
@@ -1249,8 +1264,14 @@ fn menu_row(ui: &mut egui::Ui, label: &str, enabled: bool, mark: Mark, palette: 
         Mark::None => {}
         Mark::Tick => {
             let c = egui::pos2(rect.left() + MENU_TEXT_INSET / 2.0, rect.center().y);
-            painter.line_segment([c + egui::vec2(-4.0, 0.0), c + egui::vec2(-1.0, 3.0)], stroke);
-            painter.line_segment([c + egui::vec2(-1.0, 3.0), c + egui::vec2(5.0, -4.0)], stroke);
+            painter.line_segment(
+                [c + egui::vec2(-4.0, 0.0), c + egui::vec2(-1.0, 3.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [c + egui::vec2(-1.0, 3.0), c + egui::vec2(5.0, -4.0)],
+                stroke,
+            );
         }
         Mark::Submenu { expanded } => {
             let c = egui::pos2(rect.right() - 12.0, rect.center().y);
@@ -1267,7 +1288,11 @@ fn menu_row(ui: &mut egui::Ui, label: &str, enabled: bool, mark: Mark, palette: 
                     c + egui::vec2(-2.0, 4.0),
                 ]
             };
-            painter.add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+            painter.add(egui::Shape::convex_polygon(
+                points,
+                color,
+                egui::Stroke::NONE,
+            ));
         }
     }
 
@@ -1303,18 +1328,19 @@ fn name_editor(
         egui::vec2(MENU_WIDTH, NAME_EDITOR_SIZE.y + 4.0),
         egui::Sense::hover(),
     );
-    let field = egui::Rect::from_min_size(
-        row.min + egui::vec2(MENU_TEXT_INSET, 2.0),
-        NAME_EDITOR_SIZE,
-    );
+    let field =
+        egui::Rect::from_min_size(row.min + egui::vec2(MENU_TEXT_INSET, 2.0), NAME_EDITOR_SIZE);
     let hint = tr(match editor.purpose {
         EditorPurpose::SaveNew => "Enter your preset name",
         EditorPurpose::Rename => "Enter new preset name",
     });
 
     // Square corners, `DefaultFill` (§11.4). Painted first so the text lands on top of it.
-    ui.painter()
-        .rect_filled(field, egui::CornerRadius::ZERO, palette.color(FxColor::DefaultFill));
+    ui.painter().rect_filled(
+        field,
+        egui::CornerRadius::ZERO,
+        palette.color(FxColor::DefaultFill),
+    );
 
     let inner = field.shrink(2.0);
     let response = ui.place(
@@ -1341,8 +1367,13 @@ fn name_editor(
     }
 
     // `PresetNameInputFilter` (`FxPresetNameEditor.cpp:20-33`).
-    if editor.text.contains(|c| FORBIDDEN_PRESET_NAME_CHARS.contains(c)) {
-        editor.text.retain(|c| !FORBIDDEN_PRESET_NAME_CHARS.contains(c));
+    if editor
+        .text
+        .contains(|c| FORBIDDEN_PRESET_NAME_CHARS.contains(c))
+    {
+        editor
+            .text
+            .retain(|c| !FORBIDDEN_PRESET_NAME_CHARS.contains(c));
     }
     let valid = preset_name_available(presets, &editor.text);
 
@@ -1411,7 +1442,11 @@ mod tests {
 
         let mut edited = state();
         edited.presets[1].modified = true;
-        assert_ne!(TrayFingerprint::of(&edited), base, "a preset's trailing ` *`");
+        assert_ne!(
+            TrayFingerprint::of(&edited),
+            base,
+            "a preset's trailing ` *`"
+        );
 
         let mut renamed = state();
         renamed.presets[1].name = "Renamed".to_owned();
@@ -1419,7 +1454,11 @@ mod tests {
 
         let mut relabelled = state();
         relabelled.devices[0].name = "fifine Microphone Analogue Stereo".to_owned();
-        assert_ne!(TrayFingerprint::of(&relabelled), base, "a device's description");
+        assert_ne!(
+            TrayFingerprint::of(&relabelled),
+            base,
+            "a device's description"
+        );
 
         let mut turned = state();
         turned.devices[0].direction = DeviceDirection::Input;
@@ -1427,7 +1466,11 @@ mod tests {
 
         let mut off = state();
         off.power = false;
-        assert_ne!(TrayFingerprint::of(&off), base, "the Turn On/Turn Off label");
+        assert_ne!(
+            TrayFingerprint::of(&off),
+            base,
+            "the Turn On/Turn Off label"
+        );
     }
 
     /// The pixmaps are the one thing left out: `App::tray_state` never fills them, and they must
@@ -1442,7 +1485,10 @@ mod tests {
             height: 1,
             data: vec![0; 4],
         });
-        assert_eq!(TrayFingerprint::of(&with_pixmaps), TrayFingerprint::of(&state()));
+        assert_eq!(
+            TrayFingerprint::of(&with_pixmaps),
+            TrayFingerprint::of(&state())
+        );
     }
 }
 
@@ -1481,12 +1527,19 @@ mod zoom_tests {
         let lite = fit_zoom(egui::vec2(2560.0, 1440.0), egui::vec2(550.0, 189.0), 1.6);
         assert!(lite > 2.9 && lite < 2.91, "{lite}");
         // The window at its own design size, in physical pixels.
-        let exact = fit_zoom(egui::vec2(1040.0 * 1.6, 588.0 * 1.6), egui::vec2(1040.0, 588.0), 1.6);
+        let exact = fit_zoom(
+            egui::vec2(1040.0 * 1.6, 588.0 * 1.6),
+            egui::vec2(1040.0, 588.0),
+            1.6,
+        );
         assert_eq!(exact, 1.0);
         // A surface smaller than the design is never shrunk.
         let small = fit_zoom(egui::vec2(800.0, 400.0), egui::vec2(1040.0, 588.0), 1.6);
         assert_eq!(small, 1.0);
         // Garbage in, native scale out.
-        assert_eq!(fit_zoom(egui::vec2(0.0, 0.0), egui::vec2(1040.0, 588.0), 0.0), 1.0);
+        assert_eq!(
+            fit_zoom(egui::vec2(0.0, 0.0), egui::vec2(1040.0, 588.0), 0.0),
+            1.0
+        );
     }
 }

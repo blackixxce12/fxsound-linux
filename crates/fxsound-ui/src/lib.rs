@@ -18,4 +18,3 @@ pub use state::{UiAction, UiResponse, UiState};
 pub use theme::{FxColor, Palette};
 pub use views::{ViewScratch, window_size};
 pub use widgets::{FxSlider, VisualizerAnimation, VisualizerWidget};
-

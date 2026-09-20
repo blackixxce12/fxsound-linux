@@ -93,7 +93,11 @@ impl Message {
     }
 
     #[must_use]
-    pub fn with_link(body: impl Into<String>, label: impl Into<String>, url: impl Into<String>) -> Self {
+    pub fn with_link(
+        body: impl Into<String>,
+        label: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Self {
         Self {
             body: body.into(),
             link: Some(Link {
@@ -213,7 +217,10 @@ impl Message {
     /// `fxsound --toggle-power`.
     #[must_use]
     pub fn power_toggled(on: bool) -> Self {
-        Self::new(tr_args("FxSound is %s.", &[&tr(if on { "on" } else { "off" })]))
+        Self::new(tr_args(
+            "FxSound is %s.",
+            &[&tr(if on { "on" } else { "off" })],
+        ))
     }
 }
 
@@ -272,16 +279,17 @@ impl Sink for DesktopSink {
                     // moves to a thread of its own that outlives this call.
                     Some(link) => {
                         thread::spawn(move || {
-                            let _ = handle.wait_for_response(
-                                move |response: &NotificationResponse| match response {
-                                    NotificationResponse::Default
-                                    | NotificationResponse::Action(_) => open_url(&link.url),
-                                    // `Reply` is macOS-only and never arrives here
-                                    // (`notify-rust-4.18.0/src/response.rs:75-78`).
-                                    NotificationResponse::Reply(_)
-                                    | NotificationResponse::Closed(_) => {}
-                                },
-                            );
+                            let _ =
+                                handle.wait_for_response(move |response: &NotificationResponse| {
+                                    match response {
+                                        NotificationResponse::Default
+                                        | NotificationResponse::Action(_) => open_url(&link.url),
+                                        // `Reply` is macOS-only and never arrives here
+                                        // (`notify-rust-4.18.0/src/response.rs:75-78`).
+                                        NotificationResponse::Reply(_)
+                                        | NotificationResponse::Closed(_) => {}
+                                    }
+                                });
                         });
                     }
                     None => drop(handle),
@@ -425,10 +433,7 @@ mod tests {
 
     fn recording(hidden: bool) -> (Notifier, Receiver<(Message, Option<u32>)>) {
         let (tx, rx) = unbounded();
-        (
-            Notifier::with_sink(hidden, Recorder { tx, next_id: 0 }),
-            rx,
-        )
+        (Notifier::with_sink(hidden, Recorder { tx, next_id: 0 }), rx)
     }
 
     fn next(rx: &Receiver<(Message, Option<u32>)>) -> (Message, Option<u32>) {
@@ -445,7 +450,10 @@ mod tests {
         let notification = build(&Message::preset_selected("Bass Booster"), None);
 
         assert_eq!(notification.appname, APP_NAME);
-        assert_eq!(notification.summary, APP_NAME, "matches szInfoTitle at :413");
+        assert_eq!(
+            notification.summary, APP_NAME,
+            "matches szInfoTitle at :413"
+        );
         assert_eq!(notification.body, "Preset: Bass Booster");
         assert_eq!(notification.icon, APP_ID);
         assert_eq!(notification.timeout, Timeout::Milliseconds(TIMEOUT_MS));
@@ -513,12 +521,18 @@ mod tests {
             Message::preset_overwritten("Rock").body,
             "Changes to preset Rock are saved."
         );
-        assert_eq!(Message::preset_saved("Rock").body, "New preset Rock is saved.");
+        assert_eq!(
+            Message::preset_saved("Rock").body,
+            "New preset Rock is saved."
+        );
         assert_eq!(
             Message::preset_limit_reached().body,
             "Reached the limit on new presets."
         );
-        assert_eq!(Message::preset_deleted("Rock").body, "Preset Rock is deleted.");
+        assert_eq!(
+            Message::preset_deleted("Rock").body,
+            "Preset Rock is deleted."
+        );
         assert_eq!(
             Message::presets_restored().body,
             "Presets are restored to factory defaults"

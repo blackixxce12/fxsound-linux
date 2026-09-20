@@ -430,10 +430,7 @@ impl SpectrumAnalyser {
                 ..
             } = self;
             // Lengths come from `make_*_vec`, so this cannot fail; bail rather than unwrap anyway.
-            if fft
-                .process_with_scratch(indata, spectrum, scratch)
-                .is_err()
-            {
+            if fft.process_with_scratch(indata, spectrum, scratch).is_err() {
                 return;
             }
         }
@@ -516,7 +513,12 @@ mod tests {
     const FS: Real = 48_000.0;
 
     /// Feeds `frames` frames of stereo `source(n)` in `block` sized pushes.
-    fn feed(an: &mut SpectrumAnalyser, frames: usize, block: usize, mut source: impl FnMut(usize) -> Real) {
+    fn feed(
+        an: &mut SpectrumAnalyser,
+        frames: usize,
+        block: usize,
+        mut source: impl FnMut(usize) -> Real,
+    ) {
         let mut buf = vec![0.0 as Real; block * 2];
         let mut n = 0;
         let mut left = frames;
@@ -535,7 +537,10 @@ mod tests {
     }
 
     fn sine(freq: Real, amp: Real) -> impl FnMut(usize) -> Real {
-        move |n| amp * (core::f64::consts::TAU * f64::from(freq) * n as f64 / f64::from(FS)).sin() as Real
+        move |n| {
+            amp * (core::f64::consts::TAU * f64::from(freq) * n as f64 / f64::from(FS)).sin()
+                as Real
+        }
     }
 
     /// A deterministic, spectrally flat-ish source; a real RNG would be a dependency for nothing.
@@ -573,18 +578,27 @@ mod tests {
         let quarter_decade = 10.0f32.powf(0.25);
         for k in 0..NUM_BANDS {
             let ratio = BAND_EDGES_HZ[k + 1] / BAND_EDGES_HZ[k];
-            assert!((ratio - quarter_decade).abs() < 0.01, "band {k} edge ratio {ratio}");
+            assert!(
+                (ratio - quarter_decade).abs() < 0.01,
+                "band {k} edge ratio {ratio}"
+            );
         }
         for k in 1..NUM_BANDS {
             let ratio = BAND_CENTRES_HZ[k] / BAND_CENTRES_HZ[k - 1];
-            assert!((ratio - quarter_decade).abs() < 0.01, "band {k} centre ratio {ratio}");
+            assert!(
+                (ratio - quarter_decade).abs() < 0.01,
+                "band {k} centre ratio {ratio}"
+            );
         }
     }
 
     #[test]
     fn the_bin_ranges_tile_the_spectrum_without_gaps_or_overlap() {
         let an = SpectrumAnalyser::new(FS, 1024);
-        assert_eq!(an.bands[0].lo_bin, 1, "bin 0 is DC and must never be counted");
+        assert_eq!(
+            an.bands[0].lo_bin, 1,
+            "bin 0 is DC and must never be counted"
+        );
         assert_eq!(
             an.bands[NUM_BANDS - 1].hi_bin,
             FFT_SIZE / 2,
@@ -614,7 +628,11 @@ mod tests {
             feed(&mut an, 96_000, 512, sine(freq, 0.9));
             let b = an.bands();
 
-            assert!(b[want] > 0.9, "{freq} Hz only reached {:.4} in band {want}", b[want]);
+            assert!(
+                b[want] > 0.9,
+                "{freq} Hz only reached {:.4} in band {want}",
+                b[want]
+            );
             for (k, v) in b.iter().enumerate() {
                 if k != want {
                     assert!(*v < 0.05, "{freq} Hz leaked {v:.4} into band {k}");
@@ -686,7 +704,11 @@ mod tests {
                 b[k]
             );
         }
-        assert!(a[band_of(1000.0)] > 0.2, "the 1 kHz band never lit: {:?}", a);
+        assert!(
+            a[band_of(1000.0)] > 0.2,
+            "the 1 kHz band never lit: {:?}",
+            a
+        );
     }
 
     #[test]
@@ -702,7 +724,11 @@ mod tests {
         an.push(&buf, 2);
 
         let b = an.bands();
-        assert!(b[band_of(3162.28)] > 0.5, "band 8 = {:.4}", b[band_of(3162.28)]);
+        assert!(
+            b[band_of(3162.28)] > 0.5,
+            "band 8 = {:.4}",
+            b[band_of(3162.28)]
+        );
         assert!(b.iter().all(|v| v.is_finite()));
     }
 
@@ -731,11 +757,16 @@ mod tests {
     #[test]
     fn a_non_finite_sample_cannot_poison_the_analyser() {
         let mut an = SpectrumAnalyser::new(FS, 1024);
-        feed(&mut an, 4096, 1024, |n| if n % 997 == 0 { Real::NAN } else { 0.5 });
+        feed(&mut an, 4096, 1024, |n| {
+            if n % 997 == 0 { Real::NAN } else { 0.5 }
+        });
         feed(&mut an, 96_000, 1024, sine(1000.0, 0.3));
         let b = an.bands();
         assert!(b.iter().all(|v| v.is_finite()), "{b:?}");
-        assert!(b[band_of(1000.0)] > 0.2, "the analyser never recovered: {b:?}");
+        assert!(
+            b[band_of(1000.0)] > 0.2,
+            "the analyser never recovered: {b:?}"
+        );
     }
 
     #[test]
@@ -758,7 +789,8 @@ mod tests {
                 let mut n = 0usize;
                 move |_| {
                     let v = 0.9
-                        * (core::f64::consts::TAU * 1000.0 * n as f64 / f64::from(fs)).sin() as Real;
+                        * (core::f64::consts::TAU * 1000.0 * n as f64 / f64::from(fs)).sin()
+                            as Real;
                     n += 1;
                     v
                 }
@@ -783,7 +815,12 @@ mod tests {
 
         let (a, b) = (mono.bands(), stereo.bands());
         for k in 0..NUM_BANDS {
-            assert!((a[k] - b[k]).abs() < 1e-5, "band {k}: mono {} vs stereo {}", a[k], b[k]);
+            assert!(
+                (a[k] - b[k]).abs() < 1e-5,
+                "band {k}: mono {} vs stereo {}",
+                a[k],
+                b[k]
+            );
         }
     }
 

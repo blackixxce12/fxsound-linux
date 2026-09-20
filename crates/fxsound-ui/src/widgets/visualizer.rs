@@ -287,7 +287,11 @@ impl<'a> VisualizerWidget<'a> {
 /// do — there it would poison the history for five frames.
 #[must_use]
 pub fn sanitise(value: f32) -> f32 {
-    if (0.0..=1.0).contains(&value) { value } else { 0.0 }
+    if (0.0..=1.0).contains(&value) {
+        value
+    } else {
+        0.0
+    }
 }
 
 /// One frame's worth of exponential decay: `exp(-dt / tau)`.
@@ -456,14 +460,7 @@ pub fn graph_colours(palette: Palette, enabled: bool, audio_active: bool) -> (Co
     }
 }
 
-fn paint(
-    ui: &Ui,
-    rect: Rect,
-    palette: Palette,
-    enabled: bool,
-    audio_active: bool,
-    bars: &[f32],
-) {
+fn paint(ui: &Ui, rect: Rect, palette: Palette, enabled: bool, audio_active: bool, bars: &[f32]) {
     if !rect.is_positive() {
         return;
     }
@@ -561,10 +558,7 @@ mod tests {
     use fxsound_core::ThemeMode;
 
     fn strip() -> Rect {
-        Rect::from_min_size(
-            pos2(40.0, 149.0),
-            vec2(geometry::WIDTH, geometry::HEIGHT),
-        )
+        Rect::from_min_size(pos2(40.0, 149.0), vec2(geometry::WIDTH, geometry::HEIGHT))
     }
 
     fn frame(value: f32) -> SpectrumFrame {
@@ -682,7 +676,10 @@ mod tests {
     fn the_decay_factor_is_multiplicative_so_the_rate_does_not_follow_the_frame_rate() {
         let one_long = decay_factor(0.1, RELEASE_TAU_SECS);
         let three_short = decay_factor(0.1 / 3.0, RELEASE_TAU_SECS).powi(3);
-        assert!((one_long - three_short).abs() < 1e-6, "{one_long} {three_short}");
+        assert!(
+            (one_long - three_short).abs() < 1e-6,
+            "{one_long} {three_short}"
+        );
         // exp(-0.1 / 0.2) = exp(-0.5).
         assert!((one_long - (-0.5_f32).exp()).abs() < 1e-6);
         // Degenerate arguments hold the value rather than destroying it.
@@ -721,7 +718,10 @@ mod tests {
             previous = held;
             steps += 1;
         }
-        assert!(steps > 20, "the no-op stretch was too short to mean anything");
+        assert!(
+            steps > 20,
+            "the no-op stretch was too short to mean anything"
+        );
     }
 
     #[test]
@@ -799,7 +799,10 @@ mod tests {
     fn the_animation_only_steps_once_a_full_thirtieth_of_a_second_has_passed() {
         let mut animation = VisualizerAnimation::new();
         animation.advance(&frame(1.0), true, 0.008);
-        assert!(animation.bars().iter().all(|&b| b == 0.0), "too early to step");
+        assert!(
+            animation.bars().iter().all(|&b| b == 0.0),
+            "too early to step"
+        );
         // Four 8 ms frames are 32 ms; the fifth crosses 33.3 ms.
         for _ in 0..4 {
             animation.advance(&frame(1.0), true, 0.008);
@@ -858,7 +861,11 @@ mod tests {
             for _ in 0..(rate as usize / 2) {
                 animation.advance(&frame(1.0), true, dt);
             }
-            assert_eq!(animation.bars()[5], 1.0, "{rate} Hz never reached full scale");
+            assert_eq!(
+                animation.bars()[5],
+                1.0,
+                "{rate} Hz never reached full scale"
+            );
 
             let frames = (release_secs / dt).round() as usize;
             for _ in 0..frames {
@@ -884,8 +891,14 @@ mod tests {
         assert_eq!(gradient_colour(high, low, 50.0), low);
         assert_eq!(gradient_colour(high, low, 100.0), high);
         // Quarter way down is halfway between the two stops.
-        assert_eq!(gradient_colour(high, low, 25.0), high.lerp_to_gamma(low, 0.5));
-        assert_eq!(gradient_colour(high, low, 75.0), low.lerp_to_gamma(high, 0.5));
+        assert_eq!(
+            gradient_colour(high, low, 25.0),
+            high.lerp_to_gamma(low, 0.5)
+        );
+        assert_eq!(
+            gradient_colour(high, low, 75.0),
+            low.lerp_to_gamma(high, 0.5)
+        );
     }
 
     #[test]
@@ -991,7 +1004,11 @@ mod tests {
         assert_eq!(mesh.vertices.len(), 4);
         assert_eq!(mesh.indices.len(), 6);
         for vertex in &mesh.vertices {
-            assert_ne!(vertex.color, Color32::RED, "a short bar never reaches a tip");
+            assert_ne!(
+                vertex.color,
+                Color32::RED,
+                "a short bar never reaches a tip"
+            );
         }
     }
 

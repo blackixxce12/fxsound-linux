@@ -409,7 +409,11 @@ impl LanguageChoice {
     #[must_use]
     pub fn all() -> Vec<Self> {
         std::iter::once(Self::System)
-            .chain(i18n::LANGUAGES.iter().map(|language| Self::Code(language.code)))
+            .chain(
+                i18n::LANGUAGES
+                    .iter()
+                    .map(|language| Self::Code(language.code)),
+            )
             .collect()
     }
 
@@ -420,7 +424,8 @@ impl LanguageChoice {
         if settings.language_follows_system {
             return Self::System;
         }
-        i18n::language(&settings.language).map_or(Self::System, |language| Self::Code(language.code))
+        i18n::language(&settings.language)
+            .map_or(Self::System, |language| Self::Code(language.code))
     }
 
     /// What the switch shows: the native name, untranslated, as `getLanguageName` returns it
@@ -638,7 +643,13 @@ impl<'a> SettingsDialog<'a> {
             content,
             close_clicked,
             ..
-        } = DialogChrome::titled(&tr("Settings")).show(ui, outer, palette, assets, id.with("chrome"));
+        } = DialogChrome::titled(&tr("Settings")).show(
+            ui,
+            outer,
+            palette,
+            assets,
+            id.with("chrome"),
+        );
         response.push_if(close_clicked, SettingsAction::Close);
         response.push_if(
             ui.input(|i| i.key_pressed(Key::Escape)),
@@ -798,7 +809,10 @@ pub fn output_title_rect(pane: Rect) -> Rect {
 #[must_use]
 pub fn output_list_rect(pane: Rect) -> Rect {
     Rect::from_min_size(
-        pos2(pane.left() + X_MARGIN, output_title_rect(pane).bottom() + 10.0),
+        pos2(
+            pane.left() + X_MARGIN,
+            output_title_rect(pane).bottom() + 10.0,
+        ),
         vec2(pane.width() - (X_MARGIN + 5.0) * 2.0, audio::LIST_HEIGHT),
     )
 }
@@ -1169,7 +1183,13 @@ fn device_row(
     if !device.present
         && IconButton::new(FxImage::RemoveButton)
             .min_hit_size(device_row::BUTTON_WIDTH)
-            .show(ui, remove_button_rect(row), palette, assets, id.with("remove"))
+            .show(
+                ui,
+                remove_button_rect(row),
+                palette,
+                assets,
+                id.with("remove"),
+            )
             .clicked()
     {
         response.push(SettingsAction::RemoveDevice(index));
@@ -1234,8 +1254,9 @@ fn device_row(
     };
     ui.painter().rect_stroke(
         preset_combo_rect(row),
-        CornerRadius::same(crate::widgets::combo::corner_radius(preset_combo_rect(row).height())
-            as u8),
+        CornerRadius::same(
+            crate::widgets::combo::corner_radius(preset_combo_rect(row).height()) as u8,
+        ),
         Stroke::new(1.0, outline),
         StrokeKind::Inside,
     );
@@ -1362,10 +1383,7 @@ pub fn hotkey_row_rect(pane: Rect, index: usize) -> Rect {
             pane.left() + general::HOTKEY_X,
             hotkey_note_rect(pane).bottom() + 5.0 + index as f32 * general::HOTKEY_PITCH,
         ),
-        vec2(
-            pane.width() - general::HOTKEY_X,
-            general::HOTKEY_ROW_HEIGHT,
-        ),
+        vec2(pane.width() - general::HOTKEY_X, general::HOTKEY_ROW_HEIGHT),
     )
 }
 
@@ -1480,11 +1498,14 @@ fn general_pane(
 /// Wayland, and a bordered box that takes focus and then refuses to do anything is worse than no
 /// box at all. What is left is three columns of text — the command, the chord the Windows build
 /// ships, and the command line to bind.
-fn hotkey_row(ui: &mut Ui, rect: Rect, command: HotkeyCommand, settings: &Settings, palette: Palette) {
-    let name = Rect::from_min_size(
-        rect.min,
-        vec2(general::HOTKEY_NAME_WIDTH, rect.height()),
-    );
+fn hotkey_row(
+    ui: &mut Ui,
+    rect: Rect,
+    command: HotkeyCommand,
+    settings: &Settings,
+    palette: Palette,
+) {
+    let name = Rect::from_min_size(rect.min, vec2(general::HOTKEY_NAME_WIDTH, rect.height()));
     draw_truncated(
         ui.painter(),
         &tr(command.label()),
@@ -1530,7 +1551,12 @@ fn language_switch(
     let arrow = |index: f32| {
         Rect::from_min_size(
             pos2(
-                rect.left() + if index < 0.0 { 10.0 } else { rect.width() - 14.0 - 10.0 },
+                rect.left()
+                    + if index < 0.0 {
+                        10.0
+                    } else {
+                        rect.width() - 14.0 - 10.0
+                    },
                 rect.top() + 4.0,
             ),
             vec2(14.0, 22.0),
@@ -1820,13 +1846,23 @@ mod tests {
         let pane = original_pane();
         let expect = |r: Rect, min: egui::Pos2, size: Vec2| {
             let r = local(pane, r);
-            assert!((r.min - min).length() < 1e-4, "{r:?} should start at {min:?}");
-            assert!((r.size() - size).length() < 1e-4, "{r:?} should be {size:?}");
+            assert!(
+                (r.min - min).length() < 1e-4,
+                "{r:?} should start at {min:?}"
+            );
+            assert!(
+                (r.size() - size).length() < 1e-4,
+                "{r:?} should be {size:?}"
+            );
         };
         expect(pane_title_rect(pane), pos2(20.0, 5.0), vec2(429.0, 24.0));
         expect(output_title_rect(pane), pos2(20.0, 50.0), vec2(400.0, 14.0));
         expect(output_list_rect(pane), pos2(20.0, 74.0), vec2(399.0, 260.0));
-        expect(prioritize_toggle_rect(pane), pos2(20.0, 344.0), vec2(399.0, 30.0));
+        expect(
+            prioritize_toggle_rect(pane),
+            pos2(20.0, 344.0),
+            vec2(399.0, 30.0),
+        );
         expect(group_rect(pane), pos2(10.0, 40.0), vec2(419.0, 344.0));
         // The reset button's row, whatever its measured width comes out as.
         let row = local(pane, reset_button_rect(pane, vec2(220.0, 24.0)));
@@ -1838,7 +1874,10 @@ mod tests {
         // FxSettingsDialog.cpp:308-313.
         let one_line = reset_button_size(RESET_PRESETS, 10.0);
         assert!((one_line.y - 24.0).abs() < 1e-4);
-        assert!((one_line.x - 220.0).abs() < 1e-4, "a tiny label should still be 220 wide");
+        assert!(
+            (one_line.x - 220.0).abs() < 1e-4,
+            "a tiny label should still be 220 wide"
+        );
 
         let wide = reset_button_size(RESET_PRESETS, 1000.0);
         assert!((wide.x - 315.0).abs() < 1e-4, "{wide:?}");
@@ -1846,7 +1885,10 @@ mod tests {
         // points of text in a 291-point line is two lines.
         let translated = reset_button_size(RESET_PRESETS, 400.0);
         assert!((translated.y - 48.0).abs() < 1e-4, "{translated:?}");
-        assert!((wide.y - 72.0).abs() < 1e-4, "1000 points wraps to the three-line cap: {wide:?}");
+        assert!(
+            (wide.y - 72.0).abs() < 1e-4,
+            "1000 points wraps to the three-line cap: {wide:?}"
+        );
 
         // Height is 24 per line, up to three; a fourth line does not make it taller.
         let two = reset_button_size("Reset presets to\nfactory defaults", 10.0);
@@ -1860,7 +1902,10 @@ mod tests {
         // docs/spec/06-dialogs.md §1.7 for a 389 x 40 row: buttons at y 11, the combo 150 wide.
         let row = Rect::from_min_size(pos2(0.0, 0.0), vec2(389.0, 40.0));
         let middle_up = up_button_rect(row, 1, 3);
-        assert!((middle_up.min - pos2(5.0, 11.0)).length() < 1e-4, "{middle_up:?}");
+        assert!(
+            (middle_up.min - pos2(5.0, 11.0)).length() < 1e-4,
+            "{middle_up:?}"
+        );
         assert!((middle_up.size() - vec2(18.0, 18.0)).length() < 1e-4);
 
         let middle_down = down_button_rect(row, 1, 3);
@@ -1886,7 +1931,10 @@ mod tests {
         // which would put a 389 point row's ✕ at x 366 instead of 364. This port corrects it.
         let row = Rect::from_min_size(pos2(0.0, 0.0), vec2(389.0, 40.0));
         let remove = remove_button_rect(row);
-        assert!((remove.right() - (389.0 - 2.0 - 5.0)).abs() < 1e-4, "{remove:?}");
+        assert!(
+            (remove.right() - (389.0 - 2.0 - 5.0)).abs() < 1e-4,
+            "{remove:?}"
+        );
         assert!((remove.size() - vec2(18.0, 18.0)).length() < 1e-4);
         assert!((remove.top() - 11.0).abs() < 1e-4);
     }
@@ -1931,7 +1979,10 @@ mod tests {
     fn the_general_pane_keeps_the_originals_hotkey_column_geometry() {
         let pane = original_pane();
         let language = local(pane, language_rect(pane));
-        assert!((language.min - pos2(20.0, 50.0)).length() < 1e-4, "{language:?}");
+        assert!(
+            (language.min - pos2(20.0, 50.0)).length() < 1e-4,
+            "{language:?}"
+        );
         assert!((language.size() - vec2(300.0, 30.0)).length() < 1e-4);
 
         // Exactly where the original puts them once `launch_toggle_` is visible: 20 below the
@@ -1992,7 +2043,11 @@ mod tests {
             ("Open/Close FxSound", "cmd_open_close", "Ctrl+Shift+E"),
             ("Use Next Preset", "cmd_next_preset", "Ctrl+Shift+A"),
             ("Use Previous Preset", "cmd_previous_preset", "Ctrl+Shift+Z"),
-            ("Change Playback Device", "cmd_change_output", "Ctrl+Shift+W"),
+            (
+                "Change Playback Device",
+                "cmd_change_output",
+                "Ctrl+Shift+W",
+            ),
         ];
         let settings = Settings::default();
         for (command, (label, key, chord)) in HotkeyCommand::ALL.into_iter().zip(expected) {
@@ -2022,10 +2077,19 @@ mod tests {
 
     #[test]
     fn the_language_switch_wraps_in_both_directions() {
-        assert_eq!(LanguageChoice::System.step(-1), LanguageChoice::Code("zh-TW"));
-        assert_eq!(LanguageChoice::Code("zh-TW").step(1), LanguageChoice::System);
+        assert_eq!(
+            LanguageChoice::System.step(-1),
+            LanguageChoice::Code("zh-TW")
+        );
+        assert_eq!(
+            LanguageChoice::Code("zh-TW").step(1),
+            LanguageChoice::System
+        );
         assert_eq!(LanguageChoice::System.step(1), LanguageChoice::Code("en"));
-        assert_eq!(LanguageChoice::Code("en").step(1), LanguageChoice::Code("ar"));
+        assert_eq!(
+            LanguageChoice::Code("en").step(1),
+            LanguageChoice::Code("ar")
+        );
     }
 
     #[test]
@@ -2033,7 +2097,10 @@ mod tests {
         let mut settings = Settings::default();
         assert_eq!(LanguageChoice::current(&settings), LanguageChoice::System);
         settings.choose_language(Some("ru"));
-        assert_eq!(LanguageChoice::current(&settings), LanguageChoice::Code("ru"));
+        assert_eq!(
+            LanguageChoice::current(&settings),
+            LanguageChoice::Code("ru")
+        );
         assert_eq!(LanguageChoice::Code("ru").setting().as_deref(), Some("ru"));
         assert_eq!(LanguageChoice::System.setting(), None);
         // An explicit code without a table (an old settings file, say) is the system entry.
@@ -2044,9 +2111,15 @@ mod tests {
     #[test]
     fn the_switch_shows_native_names_and_names_the_system_language() {
         assert_eq!(LanguageChoice::Code("pt").label(), "Português");
-        assert_eq!(LanguageChoice::Code("pt-br").label(), "português brasileiro");
+        assert_eq!(
+            LanguageChoice::Code("pt-br").label(),
+            "português brasileiro"
+        );
         let system = LanguageChoice::System.label();
-        assert!(system.contains(i18n::native_name(i18n::system_language())), "{system}");
+        assert!(
+            system.contains(i18n::native_name(i18n::system_language())),
+            "{system}"
+        );
     }
 
     #[test]
@@ -2056,8 +2129,14 @@ mod tests {
         let [version_title, version_text, changelog] = help_rows(pane);
         let expect = |r: Rect, min: egui::Pos2, size: Vec2| {
             let r = local(pane, r);
-            assert!((r.min - min).length() < 1e-4, "{r:?} should start at {min:?}");
-            assert!((r.size() - size).length() < 1e-4, "{r:?} should be {size:?}");
+            assert!(
+                (r.min - min).length() < 1e-4,
+                "{r:?} should start at {min:?}"
+            );
+            assert!(
+                (r.size() - size).length() < 1e-4,
+                "{r:?} should be {size:?}"
+            );
         };
         expect(version_title, pos2(20.0, 50.0), vec2(429.0, 24.0));
         expect(version_text, pos2(20.0, 84.0), vec2(429.0, 20.0));

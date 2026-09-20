@@ -292,10 +292,7 @@ where
 #[must_use]
 pub fn language_for_locale(locale: &str) -> Option<&'static str> {
     let locale = locale.trim().to_ascii_lowercase();
-    let locale = locale
-        .split(['.', '@'])
-        .next()
-        .unwrap_or_default();
+    let locale = locale.split(['.', '@']).next().unwrap_or_default();
     if locale.is_empty() {
         return None;
     }
@@ -353,12 +350,29 @@ mod tests {
         // `assets/translations/port/<code>.txt` layers the strings the Windows build never had.
         for language in &LANGUAGES[1..] {
             let table = Catalogue::for_language(language);
-            for key in ["System language", "Input: ", "Output", "Input", "Keyboard shortcuts"] {
+            for key in [
+                "System language",
+                "Input: ",
+                "Output",
+                "Input",
+                "Keyboard shortcuts",
+            ] {
                 let value = table.get(key);
-                assert!(value.is_some_and(|v| !v.is_empty()), "{}: {key:?}", language.code);
+                assert!(
+                    value.is_some_and(|v| !v.is_empty()),
+                    "{}: {key:?}",
+                    language.code
+                );
             }
             // Placeholders survive translation.
-            assert_eq!(table.get("Could not load %s").map_or(0, |v| v.matches("%s").count()), 1, "{}", language.code);
+            assert_eq!(
+                table
+                    .get("Could not load %s")
+                    .map_or(0, |v| v.matches("%s").count()),
+                1,
+                "{}",
+                language.code
+            );
         }
     }
 
@@ -387,7 +401,10 @@ mod tests {
         // The C++ passes `"Enhances and elevates high end\r\nfidelity and presence"`; this port
         // writes the same key with a bare `\n`, and the fold makes both spellings meet.
         let ru = Catalogue::for_language(language("ru").expect("ru"));
-        assert!(ru.get("Enhances and elevates high end\nfidelity and presence").is_some());
+        assert!(
+            ru.get("Enhances and elevates high end\nfidelity and presence")
+                .is_some()
+        );
     }
 
     #[test]
@@ -430,7 +447,11 @@ mod tests {
         assert_eq!(language_for_locale("de_AT.UTF-8@euro"), Some("de"));
         assert_eq!(language_for_locale("C.UTF-8"), Some(ENGLISH));
         assert_eq!(language_for_locale("POSIX"), Some(ENGLISH));
-        assert_eq!(language_for_locale("hu_HU.UTF-8"), None, "no Hungarian table");
+        assert_eq!(
+            language_for_locale("hu_HU.UTF-8"),
+            None,
+            "no Hungarian table"
+        );
         assert_eq!(language_for_locale("xx"), None);
         assert_eq!(language_from_locales(["hu_HU".to_owned()]), ENGLISH);
     }

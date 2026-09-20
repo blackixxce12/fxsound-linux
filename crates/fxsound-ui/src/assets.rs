@@ -330,7 +330,8 @@ mod tests {
         for image in ALL {
             for theme in [ThemeMode::Dark, ThemeMode::Light] {
                 let raster = rasterise(svg_bytes(image, theme), 32, 32);
-                let raster = raster.unwrap_or_else(|| panic!("{image:?} {theme:?} failed to render"));
+                let raster =
+                    raster.unwrap_or_else(|| panic!("{image:?} {theme:?} failed to render"));
                 assert_eq!(raster.size, [32, 32]);
                 assert_eq!(raster.pixels.len(), 32 * 32);
             }
@@ -341,8 +342,8 @@ mod tests {
     fn a_rasterised_icon_is_not_blank() {
         // The power button is a solid glyph; if it comes out fully transparent the renderer is
         // silently doing nothing.
-        let raster = rasterise(svg_bytes(FxImage::PowerOnButton, ThemeMode::Dark), 48, 48)
-            .expect("render");
+        let raster =
+            rasterise(svg_bytes(FxImage::PowerOnButton, ThemeMode::Dark), 48, 48).expect("render");
         assert!(
             raster.pixels.iter().any(|p| p.a() > 0),
             "the rendered icon was entirely transparent"
@@ -365,7 +366,11 @@ mod tests {
             if shared.contains(&image) {
                 assert_eq!(dark.as_ptr(), light.as_ptr(), "{image:?} should be shared");
             } else {
-                assert_ne!(dark.as_ptr(), light.as_ptr(), "{image:?} should differ per theme");
+                assert_ne!(
+                    dark.as_ptr(),
+                    light.as_ptr(),
+                    "{image:?} should differ per theme"
+                );
             }
         }
     }
@@ -383,8 +388,8 @@ mod tests {
 
     #[test]
     fn tinting_keeps_the_alpha_channel() {
-        let raster = rasterise(svg_bytes(FxImage::PowerOnButton, ThemeMode::Dark), 24, 24)
-            .expect("render");
+        let raster =
+            rasterise(svg_bytes(FxImage::PowerOnButton, ThemeMode::Dark), 24, 24).expect("render");
         let tint = Color32::from_rgb(255, 0, 0);
         let tinted = tinted(&raster, tint);
         assert_eq!(tinted.size, raster.size);
@@ -392,7 +397,10 @@ mod tests {
             assert_eq!(before.a(), after.a(), "alpha must survive a tint");
         }
         assert!(
-            tinted.pixels.iter().any(|p| p.r() > 0 && p.g() == 0 && p.b() == 0),
+            tinted
+                .pixels
+                .iter()
+                .any(|p| p.r() > 0 && p.g() == 0 && p.b() == 0),
             "the tint colour never appeared"
         );
     }
