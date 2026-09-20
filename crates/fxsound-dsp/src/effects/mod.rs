@@ -29,6 +29,33 @@ pub use ambience::Ambience;
 pub use bass::Bass;
 pub use dynamic_boost::DynamicBoost;
 pub use fidelity::Fidelity;
+
+/// Two distinct samples of one frame, by index.
+///
+/// Returns `None` when either index is out of range or they are the same channel, so a caller
+/// with a nonsensical layout simply does nothing rather than panicking on the audio thread.
+pub(crate) fn pair_mut(
+    frame: &mut [Real],
+    left: usize,
+    right: usize,
+) -> Option<(&mut Real, &mut Real)> {
+    if left == right || left >= frame.len() || right >= frame.len() {
+        return None;
+    }
+    let (low, high) = if left < right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let (head, tail) = frame.split_at_mut(high);
+    let first = head.get_mut(low)?;
+    let second = tail.first_mut()?;
+    Some(if left < right {
+        (first, second)
+    } else {
+        (second, first)
+    })
+}
 pub use surround::Surround;
 
 /// The largest block a single `process` call may carry (`DAW_MAX_BUFFER_SIZE`, `u_dfxp.h:46`).
@@ -117,6 +144,23 @@ impl Chain {
     #[must_use]
     pub const fn sample_rate(&self) -> Real {
         self.sample_rate
+    }
+
+    /// Tell the two stereo-by-nature stages which channels are the front pair.
+    ///
+    /// `None` means the layout does not name one, in which case they fall back to the first two
+    /// channels, which is what they always did.
+    pub fn set_front_pair(&mut self, pair: Option<(usize, usize)>) {
+        self.surround.set_front_pair(pair);
+        self.ambience.set_front_pair(pair);
+    }
+
+    /// Tell the stages that must not touch the subwoofer which channel it is.
+    ///
+    /// Only Fidelity acts on this today; Ambience and Surround already confine themselves to the
+    /// first two channels, and Bass and Dynamic Boost are meant to reach every channel.
+    pub fn set_lfe_channel(&mut self, channel: Option<usize>) {
+        self.fidelity.set_lfe_channel(channel);
     }
 
     pub fn set_sample_rate(&mut self, sample_rate: Real) {

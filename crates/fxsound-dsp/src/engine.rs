@@ -42,6 +42,8 @@ pub struct Engine {
     peak_left: Real,
     peak_right: Real,
     active: bool,
+    /// Index of the subwoofer channel in the current layout, when there is one.
+    lfe_channel: Option<usize>,
 }
 
 impl Engine {
@@ -71,6 +73,7 @@ impl Engine {
             peak_left: 0.0,
             peak_right: 0.0,
             active: false,
+            lfe_channel: None,
         };
         let params = DspParams::default();
         engine.apply_unconditionally(&params);
@@ -101,6 +104,24 @@ impl Engine {
         self.chain.set_sample_rate(sample_rate);
         self.spectrum.set_sample_rate(sample_rate);
         self.reset();
+    }
+
+    /// Name the subwoofer channel, so the stages that must not touch it can skip it.
+    ///
+    /// Passed as an index rather than derived from the channel count, because a device is free to
+    /// order its channels however it likes: the subwoofer sits at 3 in a standard 5.1 or 7.1
+    /// layout, and elsewhere in several real ones.
+    pub fn set_lfe_channel(&mut self, channel: Option<usize>) {
+        self.lfe_channel = channel;
+        self.chain.set_lfe_channel(channel);
+    }
+
+    /// Name the front pair, so the two stereo-by-nature stages run over the right channels.
+    ///
+    /// `None` keeps the historical behaviour of using the first two, which is correct for every
+    /// layout that starts `FL, FR` — that is, all the standard ones.
+    pub fn set_front_pair(&mut self, pair: Option<(usize, usize)>) {
+        self.chain.set_front_pair(pair);
     }
 
     /// Adopt a parameter snapshot, skipping anything that has not changed.
@@ -171,15 +192,44 @@ impl Engine {
             return;
         }
 
+        // Nothing between the client's bytes and the filters validates a sample, and every stage
+        // here has infinite memory: a NaN in a biquad's state reproduces itself forever, the
+        // reverb tank latches one into its delay arena, one `+inf` pins the leveller's peak so
+        // both ends of its gain ramp become exactly zero, and the same value freezes Dynamic
+        // Boost's level estimator — a stage that is never bypassed. None of it recovers on its
+        // own; the only escape is a preset change, and the meters hide it because `f32::min`
+        // discards NaN. One branch per sample is a rounding error against the block budget.
+        for sample in buffer.iter_mut() {
+            if !sample.is_finite() {
+                *sample = 0.0;
+            }
+        }
+
         if self.applied.power {
             self.eq.process(buffer, channels);
             self.apply_gain_stage(buffer, channels);
-            self.leveller.process(buffer, channels);
+            // The subwoofer is excluded from the detector: it carries a deliberately enormous
+            // amount of the programme's energy, so letting it into the level analysis pulls the
+            // gain down on bass-heavy material for reasons that have nothing to do with how loud
+            // the programme actually is.
+            self.leveller
+                .process_excluding(buffer, channels, self.lfe_channel);
             self.chain.process(buffer, channels);
         } else {
             // Bypassed, the master gain is still applied — it is the one stage that survives a
             // bypass in the original (`SosProcess.cpp:512-514`).
             self.apply_gain_stage(buffer, channels);
+        }
+
+        // A block that went in finite can still come out non-finite if a stage's own state has
+        // blown up — a coefficient designed from a parameter that reached the engine before it
+        // was sanitised, or a divergent filter at an extreme rate. Hand the device silence rather
+        // than a NaN and clear the history, so the next block starts clean instead of inheriting
+        // the failure for the rest of the session. This runs before the spectrum tap and the
+        // meters, so neither the visualizer nor the GUI ever sees the bad block.
+        if buffer.iter().any(|sample| !sample.is_finite()) {
+            buffer.fill(0.0);
+            self.reset();
         }
 
         self.spectrum.push(buffer, channels);
@@ -257,7 +307,11 @@ impl Engine {
 #[inline]
 #[must_use]
 pub fn db_to_linear(db: Real) -> Real {
-    if db == 0.0 { 1.0 } else { 10_f32.powf(db / 20.0) }
+    if db == 0.0 {
+        1.0
+    } else {
+        10_f32.powf(db / 20.0)
+    }
 }
 
 /// Balance in dB to a pair of per-channel attenuations.
@@ -346,7 +400,11 @@ mod tests {
 
         let mut buffer = vec![0.1_f32; 8];
         engine.process(&mut buffer, 2);
-        assert!(buffer[0] > 0.15, "the bypass swallowed the master gain: {}", buffer[0]);
+        assert!(
+            buffer[0] > 0.15,
+            "the bypass swallowed the master gain: {}",
+            buffer[0]
+        );
     }
 
     #[test]
@@ -601,5 +659,397 @@ mod tests {
         let mut buffer = tone(4096, 2, 0.9);
         engine.process(&mut buffer, 2);
         assert!(buffer.iter().all(|s| s.is_finite()));
+    }
+
+    /// The three stages that latch a bad sample do it in three different ways — the biquads and
+    /// the reverb tank go non-finite, the leveller goes silent, Dynamic Boost's gain sticks — so
+    /// each one is measured on the quantity that actually moves.
+    fn poison(buffer: &mut [f32], value: f32) {
+        buffer[0] = value;
+    }
+
+    fn peak_of(buffer: &[f32]) -> f32 {
+        buffer.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()))
+    }
+
+    /// Pins the premise of the app-level fix: a power cycle does not clear everything, so
+    /// something above the engine has to send `ResetFilterState`.
+    ///
+    /// `Chain::set_power` resets the five effects, so the reverb tail really does go — but the
+    /// equalizer and the volume leveller are outside the chain and keep their state, and the
+    /// leveller's is the one a listener notices, because its gain is built from seconds of
+    /// history. If anyone ever makes `apply` reset on a false→true transition, this fails and the
+    /// two fixes get reconciled in one place instead of quietly both existing.
+    /// Peak of one channel of an interleaved buffer.
+    fn channel_peak(buffer: &[f32], channels: usize, channel: usize) -> f32 {
+        buffer
+            .iter()
+            .skip(channel)
+            .step_by(channels)
+            .fold(0.0_f32, |acc, s| acc.max(s.abs()))
+    }
+
+    /// A buffer that is silent except for one full-scale sample in one channel.
+    fn impulse(frames: usize, channels: usize, channel: usize) -> Vec<f32> {
+        let mut buffer = vec![0.0_f32; frames * channels];
+        buffer[64 * channels + channel] = 1.0;
+        buffer
+    }
+
+    /// Wrong routing is worse than a wrong equalizer curve: the listener hears the left channel on
+    /// the right, or the centre from the subwoofer, and nothing in the interface suggests why.
+    /// Nothing asserted this before, so every divergence was invisible to the test suite.
+    #[test]
+    fn an_impulse_stays_in_the_channel_it_was_put_in() {
+        for channels in 1..=crate::biquad::MAX_CHANNELS {
+            let mut engine = Engine::new(48_000.0, 4096, channels);
+            // Every effect amount at zero. Surround and Ambience deliberately cross-mix the front
+            // pair and get their own test below; what is left — the equalizer, the gain stage, the
+            // leveller, and Dynamic Boost, which is never bypassed — must be strictly per-channel,
+            // at any channel count.
+            let mut params = DspParams {
+                volume_leveling_db: 2.0,
+                ..DspParams::default()
+            };
+            for band in 0..10 {
+                params.band_boost_db[band] = if band % 2 == 0 { 6.0 } else { -6.0 };
+            }
+            engine.apply(&params);
+
+            for source in 0..channels {
+                engine.reset();
+                let mut buffer = impulse(2048, channels, source);
+                engine.process(&mut buffer, channels);
+
+                assert!(
+                    channel_peak(&buffer, channels, source) > 0.01,
+                    "{channels}ch: the impulse vanished from channel {source}"
+                );
+                for other in (0..channels).filter(|c| *c != source) {
+                    let leak = channel_peak(&buffer, channels, other);
+                    assert!(
+                        leak < 1e-6,
+                        "{channels}ch: an impulse in channel {source} leaked {leak} into {other}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two effects that are inherently stereo run one instance over the front pair, which is
+    /// what the original does. That is a deliberate divergence from per-channel processing, so it
+    /// is pinned rather than left to be rediscovered — and it is exactly why a device that reports
+    /// its channels in a non-standard order is a routing hazard: "the front pair" is currently
+    /// "channels 0 and 1", not "whichever channels are FL and FR".
+    #[test]
+    fn the_two_effects_that_mix_channels_only_touch_the_first_two() {
+        for channels in 2..=crate::biquad::MAX_CHANNELS {
+            for (effect, name) in [
+                (EffectId::Surround, "Surround"),
+                (EffectId::Ambience, "Ambience"),
+            ] {
+                let mut engine = Engine::new(48_000.0, 4096, channels);
+                let mut params = DspParams::default();
+                params.set_effect(effect, 1.0);
+                engine.apply(&params);
+
+                // An impulse in the left of the pair must reach the right of the pair.
+                engine.reset();
+                let mut buffer = impulse(2048, channels, 0);
+                engine.process(&mut buffer, channels);
+                assert!(
+                    channel_peak(&buffer, channels, 1) > 1e-4,
+                    "{channels}ch: {name} did not reach the other half of the front pair"
+                );
+                for rear in 2..channels {
+                    assert!(
+                        channel_peak(&buffer, channels, rear) < 1e-6,
+                        "{channels}ch: {name} spilled the front pair into channel {rear}"
+                    );
+                }
+
+                // And a rear channel must be left alone in both directions.
+                engine.reset();
+                let mut buffer = impulse(2048, channels, channels - 1);
+                engine.process(&mut buffer, channels);
+                if channels > 2 {
+                    assert!(
+                        channel_peak(&buffer, channels, 0) < 1e-6
+                            && channel_peak(&buffer, channels, 1) < 1e-6,
+                        "{channels}ch: {name} pulled a rear channel into the front pair"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A 5.1 layout in the order every consumer device uses: FL FR FC LFE RL RR.
+    const LFE: usize = 3;
+
+    /// The failure this prevents is the one a listener notices instantly and cannot attribute to
+    /// FxSound: a device that reports `FL, FC, FR, LFE, SL, SR` — front right at index 2, not 1 —
+    /// had its stereo widener applied across front-left and *centre*, pulling dialogue out of the
+    /// centre channel and into a phantom image.
+    #[test]
+    fn the_stereo_stages_follow_the_layout_rather_than_the_first_two_channels() {
+        let channels = 6;
+        const FL: usize = 0;
+        const FC: usize = 1;
+        const FR: usize = 2;
+
+        for (effect, name) in [
+            (EffectId::Surround, "Surround"),
+            (EffectId::Ambience, "Ambience"),
+        ] {
+            let mut engine = Engine::new(48_000.0, 4096, channels);
+            engine.set_front_pair(Some((FL, FR)));
+            let mut params = DspParams::default();
+            params.set_effect(effect, 1.0);
+            engine.apply(&params);
+
+            let mut buffer = impulse(2048, channels, FL);
+            engine.process(&mut buffer, channels);
+
+            assert!(
+                channel_peak(&buffer, channels, FR) > 1e-4,
+                "{name} did not reach front right at index {FR}"
+            );
+            assert!(
+                channel_peak(&buffer, channels, FC) < 1e-6,
+                "{name} reached the centre channel, which is the dialogue"
+            );
+        }
+    }
+
+    #[test]
+    fn the_harmonic_generator_is_kept_out_of_the_subwoofer() {
+        // `docs/spec/08-dsp-api.md:905-906` — the original sends Fidelity to the front, rear, side
+        // and centre instances and explicitly not to the LFE. Putting sine-fold harmonics on the
+        // one channel that exists to carry only the bottom two octaves is the clearest possible
+        // case of the wrong signal in the wrong place.
+        let channels = 6;
+        let mut params = DspParams::default();
+        params.set_effect(EffectId::Fidelity, 1.0);
+
+        let mut without = Engine::new(48_000.0, 4096, channels);
+        without.apply(&params);
+        let mut with = Engine::new(48_000.0, 4096, channels);
+        with.set_lfe_channel(Some(LFE));
+        with.apply(&params);
+
+        let mut a = tone(2048, channels, 0.5);
+        let mut b = a.clone();
+        let reference = a.clone();
+        without.process(&mut a, channels);
+        with.process(&mut b, channels);
+
+        let latency = with.latency_frames();
+        let sample = |buf: &[f32], frame: usize, ch: usize| buf[frame * channels + ch];
+        let mut touched = 0.0_f32;
+        let mut untouched = 0.0_f32;
+        for frame in latency..2000 {
+            let dry = sample(&reference, frame - latency, LFE);
+            untouched = untouched.max((sample(&b, frame, LFE) - dry * 0.966_051).abs());
+            touched = touched.max((sample(&a, frame, LFE) - dry * 0.966_051).abs());
+        }
+        assert!(
+            touched > 1e-3,
+            "the fixture is wrong: Fidelity did not change the subwoofer even without the exclusion"
+        );
+        assert!(
+            untouched < 1e-4,
+            "Fidelity still reached the subwoofer: {untouched} away from the dry signal"
+        );
+
+        // And the channels it is supposed to reach must still be reached.
+        let mut front = 0.0_f32;
+        for frame in latency..2000 {
+            let dry = sample(&reference, frame - latency, 0);
+            front = front.max((sample(&b, frame, 0) - dry * 0.966_051).abs());
+        }
+        assert!(
+            front > 1e-3,
+            "Fidelity stopped reaching the front channels too"
+        );
+    }
+
+    #[test]
+    fn the_subwoofer_does_not_drag_the_leveller_down_with_it() {
+        // The LFE channel carries a deliberately enormous share of a film's energy. Letting it
+        // into the level detector pulls the gain down on everything else for a reason that has
+        // nothing to do with how loud the programme is.
+        let channels = 6;
+        let params = DspParams {
+            volume_leveling_db: 4.0,
+            ..DspParams::default()
+        };
+
+        let mut quiet_sub = Engine::new(48_000.0, 4096, channels);
+        quiet_sub.set_lfe_channel(Some(LFE));
+        quiet_sub.apply(&params);
+        let mut loud_sub = Engine::new(48_000.0, 4096, channels);
+        loud_sub.set_lfe_channel(Some(LFE));
+        loud_sub.apply(&params);
+
+        let mut last_quiet = Vec::new();
+        let mut last_loud = Vec::new();
+        for _ in 0..30 {
+            let mut a = tone(2048, channels, 0.1);
+            let mut b = a.clone();
+            for frame in b.chunks_exact_mut(channels) {
+                frame[LFE] *= 9.0;
+            }
+            quiet_sub.process(&mut a, channels);
+            loud_sub.process(&mut b, channels);
+            last_quiet = a;
+            last_loud = b;
+        }
+
+        let front_quiet = channel_peak(&last_quiet, channels, 0);
+        let front_loud = channel_peak(&last_loud, channels, 0);
+        assert!(
+            (front_quiet - front_loud).abs() < front_quiet * 0.02,
+            "a loud subwoofer moved the front channels: {front_loud} against {front_quiet}"
+        );
+    }
+
+    #[test]
+    fn a_power_cycle_alone_does_not_clear_the_levellers_gain() {
+        let params = DspParams {
+            volume_leveling_db: 4.0,
+            ..DspParams::default()
+        };
+
+        // Drive the leveller with a loud passage until its gain has settled downwards.
+        let mut used = Engine::new(48_000.0, 4096, 2);
+        used.apply(&params);
+        for _ in 0..40 {
+            let mut loud = tone(4096, 2, 0.9);
+            used.process(&mut loud, 2);
+        }
+
+        let off = DspParams {
+            power: false,
+            ..params
+        };
+        used.apply(&off);
+        used.apply(&params);
+
+        let mut fresh = Engine::new(48_000.0, 4096, 2);
+        fresh.apply(&params);
+
+        let mut after_cycle = tone(4096, 2, 0.1);
+        let mut from_fresh = tone(4096, 2, 0.1);
+        used.process(&mut after_cycle, 2);
+        fresh.process(&mut from_fresh, 2);
+
+        assert!(
+            (peak_of(&after_cycle) - peak_of(&from_fresh)).abs() > 1e-4,
+            "the power cycle already produced a fresh leveller, so the app need not send \
+             ResetFilterState"
+        );
+
+        used.handle_event(DspEvent::ResetFilterState);
+        let mut after_reset = tone(4096, 2, 0.1);
+        used.process(&mut after_reset, 2);
+        assert!(
+            (peak_of(&after_reset) - peak_of(&from_fresh)).abs() < 1e-4,
+            "ResetFilterState did not bring the leveller back to its initial gain"
+        );
+    }
+
+    #[test]
+    fn one_bad_sample_does_not_poison_the_filters_for_the_rest_of_the_session() {
+        // With Ambience up, a single non-finite sample used to reach the 663 kB delay arena and
+        // every later block came out non-finite on both channels, for good.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut engine = Engine::new(48_000.0, 4096, 2);
+            let mut params = DspParams::default();
+            params.set_effect(EffectId::Ambience, 1.0);
+            for band in 0..10 {
+                params.band_boost_db[band] = 6.0;
+            }
+            engine.apply(&params);
+
+            let mut first = tone(512, 2, 0.25);
+            poison(&mut first, bad);
+            engine.process(&mut first, 2);
+            assert!(
+                first.iter().all(|s| s.is_finite()),
+                "{bad:?} reached the output"
+            );
+
+            for _ in 0..200 {
+                let mut block = tone(512, 2, 0.25);
+                engine.process(&mut block, 2);
+                assert!(
+                    block.iter().all(|s| s.is_finite()),
+                    "{bad:?} was still poisoning the chain 200 blocks later"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_infinity_does_not_silence_the_volume_leveller_for_good() {
+        // `+inf` pinned the side-chain peak, and the peak-safety division then made both ends of
+        // the gain ramp exactly zero — finite, so nothing downstream could notice, and silent
+        // until the next preset change.
+        let mut engine = Engine::new(48_000.0, 4096, 2);
+        let params = DspParams {
+            volume_leveling_db: 4.0,
+            ..DspParams::default()
+        };
+        engine.apply(&params);
+
+        let mut warm = tone(4096, 2, 0.25);
+        engine.process(&mut warm, 2);
+        let reference = peak_of(&warm);
+        assert!(reference > 0.01, "the reference block should not be silent");
+
+        let mut bad = tone(4096, 2, 0.25);
+        poison(&mut bad, f32::INFINITY);
+        engine.process(&mut bad, 2);
+
+        let mut recovered = 0.0_f32;
+        for _ in 0..40 {
+            let mut block = tone(4096, 2, 0.25);
+            engine.process(&mut block, 2);
+            recovered = peak_of(&block);
+        }
+        assert!(
+            recovered > reference * 0.5,
+            "the leveller stayed silent: {recovered} against a reference of {reference}"
+        );
+    }
+
+    #[test]
+    fn an_infinity_does_not_stick_dynamic_boosts_auto_gain() {
+        // Dynamic Boost is never bypassed, so a stuck level estimator changed the output level
+        // for every user with the default preset. The symptom was a permanent +1.06 factor.
+        let mut clean = Engine::new(48_000.0, 4096, 2);
+        let mut dirty = Engine::new(48_000.0, 4096, 2);
+
+        for _ in 0..20 {
+            let mut block = tone(4096, 2, 0.2);
+            clean.process(&mut block, 2);
+        }
+        let mut bad = tone(4096, 2, 0.2);
+        poison(&mut bad, f32::INFINITY);
+        dirty.process(&mut bad, 2);
+        for _ in 0..19 {
+            let mut block = tone(4096, 2, 0.2);
+            dirty.process(&mut block, 2);
+        }
+
+        let mut a = tone(4096, 2, 0.2);
+        let mut b = tone(4096, 2, 0.2);
+        clean.process(&mut a, 2);
+        dirty.process(&mut b, 2);
+        let (want, got) = (peak_of(&a), peak_of(&b));
+        assert!(
+            (got - want).abs() < want * 0.01,
+            "the auto-gain did not come back: {got} against {want}"
+        );
     }
 }

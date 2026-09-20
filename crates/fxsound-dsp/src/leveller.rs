@@ -558,6 +558,24 @@ impl VolumeLeveller {
             }
         }
 
+        // The side-chain high-pass and the tone filters above are recursions with no escape: once
+        // a non-finite value reaches `sc_prev_out` or `tone_lp_state` it stays there, `peak` is
+        // `+inf` on every later buffer, and the peak-safety division at `:714` then drives both
+        // ends of the gain ramp to exactly zero — permanent digital silence, for the rest of the
+        // session, that the engine's own output check cannot catch because zero is perfectly
+        // finite. `Engine::process` sanitises the audio this stage is handed, so what is guarded
+        // here is the stage's own arithmetic. Re-arming costs one bypassed buffer.
+        if !(sum_squares.is_finite()
+            && peak.is_finite()
+            && low_energy.is_finite()
+            && body_energy.is_finite()
+            && presence_energy.is_finite()
+            && air_energy.is_finite())
+        {
+            self.reset();
+            return;
+        }
+
         // -- Targets and authorities (`SosProcess.cpp:205-244`). --------------------------------
         let current_power = sum_squares / analysed_samples;
         let current_rms = current_power.sqrt();
@@ -823,8 +841,8 @@ impl VolumeLeveller {
             SLOW_ALPHA_MIN,
             SLOW_ALPHA_MAX,
         );
-        self.headroom_score = self.headroom_score * (1.0 - headroom_alpha)
-            + target_headroom_score * headroom_alpha;
+        self.headroom_score =
+            self.headroom_score * (1.0 - headroom_alpha) + target_headroom_score * headroom_alpha;
     }
 
     /// `updateVolumeLevelingCoefficients` (`SosProcess.cpp:90-103`): redesign the four detector
@@ -845,7 +863,11 @@ impl VolumeLeveller {
     ///
     /// The `while` is bounded: `buffer_duration_seconds` is at most `frames / 1000` by the sample
     /// rate guard, so even a pathological block retires a finite number of buckets.
-    fn update_quiet_peak_window(&mut self, post_gain_peak_abs: Real, buffer_duration_seconds: Real) {
+    fn update_quiet_peak_window(
+        &mut self,
+        post_gain_peak_abs: Real,
+        buffer_duration_seconds: Real,
+    ) {
         self.quiet_peak_bucket_max = self.quiet_peak_bucket_max.max(post_gain_peak_abs);
         self.quiet_peak_bucket_seconds += buffer_duration_seconds;
 
@@ -1253,8 +1275,14 @@ mod tests {
         assert_eq!(gain_alpha(2.0, 2.0, 0.0, 0.0, 0.0), RELEASE_ALPHA_FAST);
 
         // Tonality scales the release only, by clamp(1 + 0.20*muffled - 0.35*clear, 0.55, 1.20).
-        assert_eq!(gain_alpha(2.2, 2.0, 1.0, 0.0, 0.0), RELEASE_ALPHA_FAST * 1.20);
-        assert_eq!(gain_alpha(2.4, 2.0, 1.0, 0.0, 0.0), RELEASE_ALPHA_SLOW * 1.20);
+        assert_eq!(
+            gain_alpha(2.2, 2.0, 1.0, 0.0, 0.0),
+            RELEASE_ALPHA_FAST * 1.20
+        );
+        assert_eq!(
+            gain_alpha(2.4, 2.0, 1.0, 0.0, 0.0),
+            RELEASE_ALPHA_SLOW * 1.20
+        );
         assert_eq!(
             gain_alpha(2.2, 2.0, 0.0, 1.0, 0.0),
             RELEASE_ALPHA_FAST * 0.65

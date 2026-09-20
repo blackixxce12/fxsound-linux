@@ -36,9 +36,16 @@ pub struct Surround {
     intensity: Real,
     side_gain: Real,
     mid_gain: Real,
+    /// Which channels the single stereo instance runs over; `None` means the first two.
+    front_pair: Option<(usize, usize)>,
 }
 
 impl Surround {
+    /// Which channels are the front pair. `None` falls back to the first two.
+    pub fn set_front_pair(&mut self, pair: Option<(usize, usize)>) {
+        self.front_pair = pair;
+    }
+
     #[must_use]
     pub fn new(_sample_rate: Real) -> Self {
         let mut effect = Self {
@@ -46,6 +53,7 @@ impl Surround {
             intensity: 0.0,
             side_gain: 1.0,
             mid_gain: 1.0,
+            front_pair: None,
         };
         effect.set_amount(0.0);
         effect
@@ -101,14 +109,18 @@ impl Effect for Surround {
         if channels < 2 {
             return;
         }
+        let (li, ri) = self.front_pair.unwrap_or((0, 1));
         for frame in buffer.chunks_exact_mut(channels) {
-            let (left, right) = (frame[0], frame[1]);
+            let Some((left_slot, right_slot)) = super::pair_mut(frame, li, ri) else {
+                continue;
+            };
+            let (left, right) = (*left_slot, *right_slot);
             let mid = (left + right) * 0.5;
             let side_left = left - mid;
             let side_right = right - mid;
             let mid = mid * self.mid_gain;
-            frame[0] = mid + self.side_gain * side_left;
-            frame[1] = mid + self.side_gain * side_right;
+            *left_slot = mid + self.side_gain * side_left;
+            *right_slot = mid + self.side_gain * side_right;
         }
     }
 }
@@ -128,7 +140,10 @@ mod tests {
             (127, 0.7000, 3.1000, 0.7900),
         ] {
             s.set_amount(fxsound_core::scale::midi_to_value(midi));
-            assert!((s.intensity() - intensity).abs() < 1e-3, "midi {midi} intensity");
+            assert!(
+                (s.intensity() - intensity).abs() < 1e-3,
+                "midi {midi} intensity"
+            );
             assert!((s.side_gain() - side).abs() < 1e-3, "midi {midi} side gain");
             assert!((s.mid_gain() - mid).abs() < 1e-3, "midi {midi} mid gain");
         }

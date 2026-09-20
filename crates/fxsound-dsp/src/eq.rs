@@ -105,7 +105,11 @@ pub fn band_frequency_range(
     } else {
         let exponent = ((one_based as f64 - 1.0) * 2.0 - 1.0) / denominator;
         let edge = (f64::from(min_hz) * ratio.powf(exponent)).round() as Real;
-        if edge < 1000.0 { edge + 1.0 } else { edge + 10.0 }
+        if edge < 1000.0 {
+            edge + 1.0
+        } else {
+            edge + 10.0
+        }
     };
 
     let high = if one_based == num_bands {
@@ -392,7 +396,7 @@ mod tests {
     fn q_matches_the_reference_table() {
         // docs/spec/09-dsp-eq.md §4.1
         let cases = [
-            (5, 62.5, 16000.0, 1.0_f32),           // clamped up from 0.6667
+            (5, 62.5, 16000.0, 1.0_f32), // clamped up from 0.6667
             (10, 62.5, 16000.0, 1.597_641_2),
             (15, 25.0, 16000.0, 2.147_578_5),
             (20, 20.0, 16000.0, 2.827_742_6),
@@ -534,7 +538,8 @@ mod tests {
     fn applying_a_preset_curve_installs_both_frequencies_and_gains() {
         let mut eq = GraphicEq::new();
         eq.set_sample_rate(48_000.0);
-        // The Jazz preset's curve.
+        // A preset-shaped curve: ten bands, a fractional gain, both signs. Written out
+        // here rather than lifted from a shipped `.fac`, which is free to be retuned.
         let centers = [
             62.5, 115.0, 250.0, 450.0, 630.0, 1250.0, 2700.0, 5300.0, 7500.0, 13000.0,
         ];
@@ -571,7 +576,10 @@ mod tests {
         for band in 0..n {
             let (low, high) = eq.band_range(band);
             let center = eq.center_frequencies()[band];
-            assert!(low <= center && center <= high, "band {band}: {low}..{high} excludes {center}");
+            assert!(
+                low <= center && center <= high,
+                "band {band}: {low}..{high} excludes {center}"
+            );
             if band + 1 < n {
                 let (next_low, _) = eq.band_range(band + 1);
                 assert!(next_low > high, "band {band} overlaps its successor");

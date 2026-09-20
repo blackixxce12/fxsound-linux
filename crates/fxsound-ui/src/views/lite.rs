@@ -142,6 +142,7 @@ mod tests {
                 description: "Scarlett 2i2 Analogue Stereo".to_owned(),
                 is_default: false,
                 direction: fxsound_core::DeviceDirection::Output,
+                form_factor: "speaker".into(),
             }],
             selected_device: Some(0),
             ..UiState::default()

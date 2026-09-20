@@ -97,7 +97,12 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
                 .devices
                 .iter()
                 .position(|d| d.name == *name)
-                .or_else(|| app.state.devices.iter().position(|d| d.description == *name));
+                .or_else(|| {
+                    app.state
+                        .devices
+                        .iter()
+                        .position(|d| d.description == *name)
+                });
             if let Some(index) = index {
                 app.handle(&[UiAction::SelectDevice(index)]);
             }
@@ -147,7 +152,10 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
         // (`FxController.cpp:536-553`) rather than applying a prefix, so that a command line
         // written for a 31-band layout cannot half-apply to a 10-band one.
         Command::BandFrequencies(pairs) => {
-            if pairs.iter().all(|(band, _)| *band < app.state.eq_bands.len()) {
+            if pairs
+                .iter()
+                .all(|(band, _)| *band < app.state.eq_bands.len())
+            {
                 let actions: Vec<_> = pairs
                     .iter()
                     .map(|(band, hz)| UiAction::SetBandFrequency(*band, *hz))
@@ -156,7 +164,10 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
             }
         }
         Command::BandGains(pairs) => {
-            if pairs.iter().all(|(band, _)| *band < app.state.eq_bands.len()) {
+            if pairs
+                .iter()
+                .all(|(band, _)| *band < app.state.eq_bands.len())
+            {
                 let actions: Vec<_> = pairs
                     .iter()
                     .map(|(band, db)| UiAction::SetBandGain(*band, *db))
@@ -279,7 +290,10 @@ fn status_report(app: &App) -> String {
     let _ = writeln!(
         out,
         "direction: {}",
-        match state.device().map_or(DeviceDirection::Output, |d| d.direction) {
+        match state
+            .device()
+            .map_or(DeviceDirection::Output, |d| d.direction)
+        {
             DeviceDirection::Output => "output",
             DeviceDirection::Input => "input",
         }
@@ -335,7 +349,10 @@ mod tests {
         run(&mut a, &[Command::Power(PowerCommand::On)]);
         assert!(a.state.power);
         run(&mut a, &[Command::Power(PowerCommand::On)]);
-        assert!(a.state.power, "a second --power=on must not toggle it back off");
+        assert!(
+            a.state.power,
+            "a second --power=on must not toggle it back off"
+        );
 
         run(&mut a, &[Command::Power(PowerCommand::Off)]);
         assert!(!a.state.power);
@@ -362,10 +379,7 @@ mod tests {
     fn a_band_list_longer_than_the_layout_is_dropped_whole() {
         let mut a = app();
         assert_eq!(a.state.eq_bands.len(), 10);
-        run(
-            &mut a,
-            &[Command::BandGains(vec![(0, 6.0), (30, 6.0)])],
-        );
+        run(&mut a, &[Command::BandGains(vec![(0, 6.0), (30, 6.0)])]);
         assert!(
             a.state.eq_bands.iter().all(|b| b.boost_db == 0.0),
             "band 30 does not exist, so the whole list must be refused"
@@ -374,7 +388,10 @@ mod tests {
         // The same list applies once the layout is big enough, and --num_bands comes first.
         run(
             &mut a,
-            &[Command::NumBands(31), Command::BandGains(vec![(0, 6.0), (30, 6.0)])],
+            &[
+                Command::NumBands(31),
+                Command::BandGains(vec![(0, 6.0), (30, 6.0)]),
+            ],
         );
         assert_eq!(a.state.eq_bands.len(), 31);
         assert_eq!(a.state.eq_bands[0].boost_db, 6.0);
@@ -415,6 +432,7 @@ mod tests {
                 description: "Built-in Speakers".into(),
                 is_default: true,
                 direction: fxsound_core::DeviceDirection::Output,
+                form_factor: "speaker".into(),
             },
             AudioDevice {
                 id: 2,
@@ -422,28 +440,41 @@ mod tests {
                 description: "Headphones".into(),
                 is_default: false,
                 direction: fxsound_core::DeviceDirection::Output,
+                form_factor: "speaker".into(),
             },
         ];
 
-        run(&mut a, &[Command::Output(OutputCommand::Select("Headphones".into()))]);
+        run(
+            &mut a,
+            &[Command::Output(OutputCommand::Select("Headphones".into()))],
+        );
         assert_eq!(a.state.selected_device, Some(1));
 
-        run(&mut a, &[Command::Output(OutputCommand::Select(
-            "alsa_output.pci-0000_00_1f.3".into(),
-        ))]);
+        run(
+            &mut a,
+            &[Command::Output(OutputCommand::Select(
+                "alsa_output.pci-0000_00_1f.3".into(),
+            ))],
+        );
         assert_eq!(a.state.selected_device, Some(0));
 
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
         assert_eq!(a.state.selected_device, Some(1));
     }
 
-    fn device(id: u32, name: &str, description: &str, direction: fxsound_core::DeviceDirection) -> AudioDevice {
+    fn device(
+        id: u32,
+        name: &str,
+        description: &str,
+        direction: fxsound_core::DeviceDirection,
+    ) -> AudioDevice {
         AudioDevice {
             id,
             name: name.into(),
             description: description.into(),
             is_default: false,
             direction,
+            form_factor: "speaker".into(),
         }
     }
 
@@ -453,10 +484,30 @@ mod tests {
     fn mixed_devices() -> Vec<AudioDevice> {
         use fxsound_core::DeviceDirection::{Input, Output};
         vec![
-            device(57, "alsa_output.pci", "Ryzen HD Audio Controller Analogue Stereo", Output),
-            device(55, "alsa_output.usb-fifine", "fifine Microphone Analogue Stereo", Output),
-            device(56, "alsa_input.usb-fifine", "fifine Microphone Analogue Stereo", Input),
-            device(58, "alsa_input.pci", "Ryzen HD Audio Controller Analogue Stereo", Input),
+            device(
+                57,
+                "alsa_output.pci",
+                "Ryzen HD Audio Controller Analogue Stereo",
+                Output,
+            ),
+            device(
+                55,
+                "alsa_output.usb-fifine",
+                "fifine Microphone Analogue Stereo",
+                Output,
+            ),
+            device(
+                56,
+                "alsa_input.usb-fifine",
+                "fifine Microphone Analogue Stereo",
+                Input,
+            ),
+            device(
+                58,
+                "alsa_input.pci",
+                "Ryzen HD Audio Controller Analogue Stereo",
+                Input,
+            ),
         ]
     }
 
@@ -468,7 +519,12 @@ mod tests {
 
         // The node name is unambiguous and can name a source: this is the CLI's way into the
         // input mode.
-        run(&mut a, &[Command::Output(OutputCommand::Select("alsa_input.usb-fifine".into()))]);
+        run(
+            &mut a,
+            &[Command::Output(OutputCommand::Select(
+                "alsa_input.usb-fifine".into(),
+            ))],
+        );
         assert_eq!(a.state.selected_device, Some(2));
         assert_eq!(a.state.device().map(|d| d.direction), Some(Input));
 
@@ -495,15 +551,28 @@ mod tests {
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
         assert_eq!(a.state.selected_device, Some(1));
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
-        assert_eq!(a.state.selected_device, Some(0), "wraps among the outputs, skipping the inputs");
+        assert_eq!(
+            a.state.selected_device,
+            Some(0),
+            "wraps among the outputs, skipping the inputs"
+        );
 
         // In input mode the same keybind cycles among the microphones.
-        run(&mut a, &[Command::Output(OutputCommand::Select("alsa_input.usb-fifine".into()))]);
+        run(
+            &mut a,
+            &[Command::Output(OutputCommand::Select(
+                "alsa_input.usb-fifine".into(),
+            ))],
+        );
         assert_eq!(a.state.selected_device, Some(2));
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
         assert_eq!(a.state.selected_device, Some(3));
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
-        assert_eq!(a.state.selected_device, Some(2), "wraps among the inputs, never back to a sink");
+        assert_eq!(
+            a.state.selected_device,
+            Some(2),
+            "wraps among the inputs, never back to a sink"
+        );
 
         // A lone device in the current direction is a no-op, as a lone device always was.
         a.state.devices.truncate(3);
@@ -517,18 +586,38 @@ mod tests {
         a.state.devices = mixed_devices();
         let outcome = run(&mut a, &[Command::Status]);
         assert!(outcome.stdout.contains("output: (none)"));
-        assert!(outcome.stdout.contains("direction: output"), "{}", outcome.stdout);
+        assert!(
+            outcome.stdout.contains("direction: output"),
+            "{}",
+            outcome.stdout
+        );
 
-        run(&mut a, &[Command::Output(OutputCommand::Select("alsa_input.pci".into()))]);
+        run(
+            &mut a,
+            &[Command::Output(OutputCommand::Select(
+                "alsa_input.pci".into(),
+            ))],
+        );
         let outcome = run(&mut a, &[Command::Status]);
-        assert!(outcome.stdout.contains("output: Ryzen HD Audio Controller Analogue Stereo"));
-        assert!(outcome.stdout.contains("direction: input"), "{}", outcome.stdout);
+        assert!(
+            outcome
+                .stdout
+                .contains("output: Ryzen HD Audio Controller Analogue Stereo")
+        );
+        assert!(
+            outcome.stdout.contains("direction: input"),
+            "{}",
+            outcome.stdout
+        );
     }
 
     #[test]
     fn an_unknown_output_name_changes_nothing() {
         let mut a = app();
-        run(&mut a, &[Command::Output(OutputCommand::Select("nope".into()))]);
+        run(
+            &mut a,
+            &[Command::Output(OutputCommand::Select("nope".into()))],
+        );
         assert!(a.state.selected_device.is_none());
     }
 
@@ -537,7 +626,11 @@ mod tests {
         let mut a = app();
         assert_eq!(a.state.view, ViewMode::Pro);
         run(&mut a, &[Command::View(ViewMode::Pro)]);
-        assert_eq!(a.state.view, ViewMode::Pro, "asking for the current view is a no-op");
+        assert_eq!(
+            a.state.view,
+            ViewMode::Pro,
+            "asking for the current view is a no-op"
+        );
         run(&mut a, &[Command::View(ViewMode::Lite)]);
         assert_eq!(a.state.view, ViewMode::Lite);
     }

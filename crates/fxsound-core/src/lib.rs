@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod atomic;
 pub mod i18n;
 pub mod messages;
 pub mod settings;
@@ -100,7 +101,9 @@ impl Effect {
             Self::Fidelity => "Enhances and elevates high end\nfidelity and presence",
             Self::Ambience => "Thickens and smooths audio\nwith controlled reverberation",
             Self::Surround => "Widens the left-right balance\nfor expansive, wide sound",
-            Self::DynamicBoost => "Increases overall volume and balance\nwith responsive processing",
+            Self::DynamicBoost => {
+                "Increases overall volume and balance\nwith responsive processing"
+            }
             Self::Bass => "Boosts low end for full,\nimpactful response",
         }
     }
@@ -166,6 +169,58 @@ pub mod scale {
     pub fn slider_to_value(slider: f32) -> f32 {
         (slider / SLIDER_MAX).clamp(0.0, 1.0)
     }
+
+    /// The highest stored value Dynamic Boost's mapping still responds to.
+    ///
+    /// Two independent ceilings sit in the original's quantiser and only one of them is
+    /// deliberate. `PLY_OPTIMIZER_BOOST_MAX_SCALE = 0.7` (`c_play.h:90`) caps the gain table's
+    /// index at `(int)(127 × 0.7) = 88`, which is +11.60 dB — a limiter is not meant to be asked
+    /// for the table's 30 dB top, so that one reads as intended. The other is an accident:
+    /// `DFXP_MUSIC_MODE2_DYNAMIC_BOOST_FACTOR = 1.8` is applied *before* a clamp written to keep a
+    /// 128-entry array lookup in range (`dfxpComm.cpp:709-721`), and `f32(1.8 × 70)` rounds to
+    /// exactly 126.0 — so every stored value from 70 to 127, all 58 of them, lands on the same
+    /// index and the same +11.60 dB.
+    ///
+    /// The Windows build has the identical dead top: its slider is `setRange(0, 10, 1.0)` for all
+    /// five effects with no per-effect case (`FxAudioControls.cpp:113`), and the path from there
+    /// to MIDI is plain linear. This is inherited, not introduced.
+    pub const DYNAMIC_BOOST_MAX_MIDI: u8 = 70;
+
+    /// Slider position to engine value, for one effect.
+    ///
+    /// Identical to [`slider_to_value`] for four of the five. Dynamic Boost's eleven positions are
+    /// spread over `0..=DYNAMIC_BOOST_MAX_MIDI` instead of the full MIDI range, so that every one
+    /// of them is a different amount of gain rather than five of them being the same one.
+    ///
+    /// **This changes no preset and no sound.** The mapping from a *stored* value to a gain is
+    /// untouched, so every `.fac` — this port's, and any imported from Windows — produces exactly
+    /// the gain it always did. What changes is only which value the application writes when a user
+    /// moves that one slider, and the positions it shows a stored value at.
+    #[inline]
+    #[must_use]
+    pub fn slider_to_value_for(effect: crate::Effect, slider: f32) -> f32 {
+        match effect {
+            crate::Effect::DynamicBoost => {
+                let top = f32::from(DYNAMIC_BOOST_MAX_MIDI) / f32::from(MIDI_MAX);
+                (slider / SLIDER_MAX).clamp(0.0, 1.0) * top
+            }
+            _ => slider_to_value(slider),
+        }
+    }
+
+    /// The inverse of [`slider_to_value_for`]. A stored value past the dead point shows at the top
+    /// of the slider, which is where it actually sounds.
+    #[inline]
+    #[must_use]
+    pub fn value_to_slider_for(effect: crate::Effect, value: f32) -> f32 {
+        match effect {
+            crate::Effect::DynamicBoost => {
+                let top = f32::from(DYNAMIC_BOOST_MAX_MIDI) / f32::from(MIDI_MAX);
+                (value.clamp(0.0, 1.0) / top * SLIDER_MAX).min(SLIDER_MAX)
+            }
+            _ => value_to_slider(value),
+        }
+    }
 }
 
 /// One band of the graphic equalizer.
@@ -183,6 +238,45 @@ impl EqBand {
         Self {
             center_hz,
             boost_db,
+        }
+    }
+}
+
+/// Hard limits on the DSP state that lives outside a preset.
+///
+/// These are the ranges the GUI sliders and the command line already enforce; they are collected
+/// here so that the settings file and the real-time snapshot can be held to the same numbers.
+/// Without a single source of truth the three disagree, and the one path that skips validation —
+/// a hand-edited `settings.toml`, where TOML happily spells `nan` and `inf` — reaches the filter
+/// designs with a value no slider could ever produce.
+pub mod limits {
+    /// `--master_gain`, and the Pro view's gain slider.
+    pub const MASTER_GAIN_DB: std::ops::RangeInclusive<f32> = -20.0..=20.0;
+    /// `--balance`. Negative is left.
+    pub const BALANCE_DB: std::ops::RangeInclusive<f32> = -20.0..=20.0;
+    /// `--volume_leveling`. An abstract amount, not decibels, despite the original's field name.
+    pub const VOLUME_LEVELING: std::ops::RangeInclusive<f32> = 0.0..=4.0;
+    /// `--filter_q`, the multiplier applied to each band's derived Q.
+    pub const FILTER_Q: std::ops::RangeInclusive<f32> = 1.0..=3.0;
+    /// Peak-normalisation target.
+    pub const NORMALIZATION_DB: std::ops::RangeInclusive<f32> = -20.0..=0.0;
+
+    /// Clamp into `range`, and substitute `fallback` for a value that is not a number at all.
+    ///
+    /// `f32::clamp` propagates NaN, so it cannot be used on its own here: the point of this
+    /// function is that NaN never survives it.
+    ///
+    /// The two cases are treated differently on purpose. A finite value outside the range is a
+    /// value someone meant, just too large, so it is clamped. A non-finite one carries no
+    /// intent at all and falls back to the default — clamping `+inf` would hand a user whose
+    /// settings file was corrupted the *maximum* master gain, which is the worst possible
+    /// reading of a value that means nothing.
+    #[must_use]
+    pub fn finite(value: f32, range: std::ops::RangeInclusive<f32>, fallback: f32) -> f32 {
+        if value.is_finite() {
+            value.clamp(*range.start(), *range.end())
+        } else {
+            fallback
         }
     }
 }
@@ -288,7 +382,9 @@ impl Default for Preset {
 /// The Windows build only ever sat in front of a *playback* endpoint. The Linux port can also sit
 /// behind a *capture* device — a microphone — and publish the processed signal as a virtual
 /// source, so a device is one or the other and FxSound runs in exactly one direction at a time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum DeviceDirection {
     /// A playback device: FxSound is a virtual sink in front of it.
@@ -322,6 +418,12 @@ pub struct AudioDevice {
     pub is_default: bool,
     /// Playback device or capture device.
     pub direction: DeviceDirection,
+    /// What kind of device this is — `speaker`, `headphone`, `hdmi`, and so on.
+    ///
+    /// Derived from PipeWire's `device.form-factor`, `device.icon-name` and `device.bus`. Carried
+    /// here so the application layer can record it against a device the user has chosen; the
+    /// backend is the only place that can work it out, and it does not outlive the device list.
+    pub form_factor: String,
 }
 
 /// Live state the audio engine publishes for the GUI to draw.
@@ -401,5 +503,80 @@ mod tests {
         p.set_effect(Effect::Bass, 0.0);
         assert_eq!(p.app_ints[Effect::Bass.app_depend_index()], 0);
         assert!(!p.is_effect_on(Effect::Bass));
+    }
+
+    #[test]
+    fn sanitising_a_snapshot_leaves_nothing_non_finite() {
+        use crate::messages::DspParams;
+
+        let mut params = DspParams {
+            filter_q: f32::NAN,
+            master_gain_db: f32::INFINITY,
+            balance: f32::NEG_INFINITY,
+            volume_leveling_db: f32::NAN,
+            normalization_db: f32::NAN,
+            num_bands: 200,
+            ..DspParams::default()
+        };
+        params.effects[0] = f32::NAN;
+        params.band_boost_db[0] = f32::INFINITY;
+        params.band_center_hz[0] = f32::NAN;
+
+        params.sanitise();
+
+        let default = DspParams::default();
+        assert_eq!(params.filter_q, default.filter_q, "NaN survives f32::clamp");
+        assert_eq!(params.master_gain_db, default.master_gain_db);
+        assert_eq!(params.balance, default.balance);
+        assert_eq!(params.volume_leveling_db, default.volume_leveling_db);
+        assert_eq!(params.effects[0], default.effects[0]);
+        assert_eq!(params.band_boost_db[0], 0.0);
+        assert!(params.band_center_hz[0].is_finite());
+        assert_eq!(usize::from(params.num_bands), eq::MAX_BANDS);
+        assert!(
+            params.effects.iter().all(|v| v.is_finite())
+                && params.band_boost_db.iter().all(|v| v.is_finite())
+                && params.band_center_hz.iter().all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn clamping_a_finite_value_is_left_alone() {
+        use crate::messages::DspParams;
+
+        let before = DspParams {
+            filter_q: 2.0,
+            master_gain_db: -6.0,
+            balance: 3.0,
+            volume_leveling_db: 1.5,
+            ..DspParams::default()
+        };
+        let mut after = before;
+        after.sanitise();
+        assert_eq!(
+            after, before,
+            "sanitising must be a no-op on a valid snapshot"
+        );
+    }
+
+    #[test]
+    fn a_finite_value_outside_its_range_is_clamped_rather_than_defaulted() {
+        use crate::messages::DspParams;
+
+        let mut params = DspParams {
+            master_gain_db: 500.0,
+            balance: -99.0,
+            filter_q: 0.2,
+            volume_leveling_db: 12.0,
+            ..DspParams::default()
+        };
+        params.band_boost_db[0] = 40.0;
+        params.sanitise();
+
+        assert_eq!(params.master_gain_db, 20.0);
+        assert_eq!(params.balance, -20.0);
+        assert_eq!(params.filter_q, 1.0);
+        assert_eq!(params.volume_leveling_db, 4.0);
+        assert_eq!(params.band_boost_db[0], eq::MAX_GAIN_DB);
     }
 }

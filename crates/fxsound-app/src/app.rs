@@ -189,7 +189,8 @@ impl App {
                 }
                 AudioToUi::Status(_) => {}
                 AudioToUi::Disconnected { reason } => {
-                    self.state.notification = Some(format!("{} {reason}", tr("Audio disconnected:")));
+                    self.state.notification =
+                        Some(format!("{} {reason}", tr("Audio disconnected:")));
                     // `"Output Disconnected"` (`FxController.cpp:1170`). A field access, not
                     // `Self::notify`, because the engine handle is still borrowed here.
                     if self.notifications_armed {
@@ -209,7 +210,9 @@ impl App {
             self.handle_one(action.clone());
         }
         if self.settings_dirty {
-            if self.persist && let Err(err) = self.settings.save() {
+            if self.persist
+                && let Err(err) = self.settings.save()
+            {
                 log::warn!("could not save settings: {err}");
             }
             self.settings_dirty = false;
@@ -223,6 +226,16 @@ impl App {
                 self.settings.power = self.state.power;
                 self.settings_dirty = true;
                 self.sync_params_from_state();
+                // Coming back from a bypass, the filters still hold whatever was in them when the
+                // power went off, and `Chain::set_power` clears only the five effects — never the
+                // equalizer or the leveller. That also makes the power button the one recovery a
+                // user with broken-sounding audio will reach for first, so it has to be the one
+                // that actually clears the history. Both the tray and `--power` route here.
+                if self.state.power
+                    && let Some(engine) = &self.engine
+                {
+                    engine.send_event(DspEvent::ResetFilterState);
+                }
             }
             UiAction::ToggleView => {
                 self.state.view = match self.state.view {
@@ -250,23 +263,50 @@ impl App {
             UiAction::DeletePreset => self.delete_preset(),
 
             UiAction::SelectDevice(index) => {
-                if let Some(device) = self.state.devices.get(index) {
-                    self.state.selected_device = Some(index);
-                    self.settings
-                        .set_selected_device(&device.name, device.direction);
-                    self.settings_dirty = true;
-                    if let Some(engine) = &self.engine {
-                        engine.send(UiToAudio::SelectDevice {
-                            node_name: device.name.clone(),
-                            direction: device.direction,
-                        });
-                        self.announced_device = Some((device.name.clone(), device.direction));
-                    }
-                    // `"Output: "` + name, and the preset in use with it (`FxController.cpp:1150`).
-                    let description = device.description.clone();
-                    let preset = self.state.preset().map(|p| p.name.clone());
-                    self.notify(Message::output_selected(&description, preset.as_deref()));
+                // Everything needed from the device is taken before anything borrows `self`
+                // mutably, because restoring the remembered preset calls back into
+                // `select_preset`.
+                let Some((name, description, direction)) = self
+                    .state
+                    .devices
+                    .get(index)
+                    .map(|d| (d.name.clone(), d.description.clone(), d.direction))
+                else {
+                    return;
+                };
+
+                self.state.selected_device = Some(index);
+                self.settings.set_selected_device(&name, direction);
+                self.settings_dirty = true;
+                if let Some(engine) = &self.engine {
+                    engine.send(UiToAudio::SelectDevice {
+                        node_name: name.clone(),
+                        direction,
+                    });
+                    self.announced_device = Some((name.clone(), direction));
                 }
+
+                // A device the user has used before brings its preset back with it. Only a
+                // *remembered* one does: the first time something is plugged in, whatever is
+                // selected stays selected, because guessing then would be changing the sound on
+                // no evidence at all.
+                let remembered = self
+                    .settings
+                    .preset_for_device(&name)
+                    .map(ToOwned::to_owned);
+                if let Some(preset) = remembered
+                    && self
+                        .state
+                        .preset()
+                        .is_none_or(|current| current.name != preset)
+                    && let Some(at) = self.state.presets.iter().position(|e| e.name == preset)
+                {
+                    self.select_preset(at);
+                }
+
+                // `"Output: "` + name, and the preset in use with it (`FxController.cpp:1150`).
+                let preset = self.state.preset().map(|p| p.name.clone());
+                self.notify(Message::output_selected(&description, preset.as_deref()));
             }
 
             UiAction::SetEffect(effect, value) => {
@@ -276,10 +316,8 @@ impl App {
             }
             UiAction::SetBandGain(band, gain_db) => {
                 if let Some(slot) = self.state.eq_bands.get_mut(band) {
-                    slot.boost_db = gain_db.clamp(
-                        fxsound_core::eq::MIN_GAIN_DB,
-                        fxsound_core::eq::MAX_GAIN_DB,
-                    );
+                    slot.boost_db =
+                        gain_db.clamp(fxsound_core::eq::MIN_GAIN_DB, fxsound_core::eq::MAX_GAIN_DB);
                     self.mark_preset_modified();
                     self.sync_params_from_state();
                 }
@@ -388,6 +426,20 @@ impl App {
                 }
                 // `"Preset: "` + name on every change (`FxController.cpp:1101`).
                 self.notify(Message::preset_selected(&name));
+                // Record it against whatever is playing, so plugging the headphones back in
+                // brings this preset with them. `DeviceConfig` and its two accessors were written
+                // and tested for exactly this and then never called by anything.
+                if let Some((node, description, form_factor)) =
+                    self.state.selected_device.and_then(|at| {
+                        self.state
+                            .devices
+                            .get(at)
+                            .map(|d| (d.name.clone(), d.description.clone(), d.form_factor.clone()))
+                    })
+                {
+                    self.settings
+                        .remember_device_preset(&node, &description, &name, &form_factor);
+                }
                 self.settings.preset = name;
                 self.settings_dirty = true;
                 // A new band layout means the old filter history is meaningless.
@@ -404,7 +456,8 @@ impl App {
 
     fn apply_preset(&mut self, preset: &Preset) {
         for effect in Effect::ALL {
-            self.state.effects[effect as usize] = scale::value_to_slider(preset.effect(effect));
+            self.state.effects[effect as usize] =
+                scale::value_to_slider_for(effect, preset.effect(effect));
         }
         self.state.eq_bands = preset.eq_bands.clone();
         self.state.eq_on = preset.eq_on;
@@ -419,7 +472,7 @@ impl App {
         for effect in Effect::ALL {
             preset.set_effect(
                 effect,
-                scale::slider_to_value(self.state.effects[effect as usize]),
+                scale::slider_to_value_for(effect, self.state.effects[effect as usize]),
             );
         }
         preset.eq_bands = self.state.eq_bands.clone();
@@ -560,7 +613,7 @@ impl App {
         for effect in Effect::ALL {
             self.params.set_effect(
                 effect,
-                scale::slider_to_value(self.state.effects[effect as usize]),
+                scale::slider_to_value_for(effect, self.state.effects[effect as usize]),
             );
         }
         self.params.eq_on = self.state.eq_on;
@@ -618,7 +671,9 @@ impl App {
         {
             log::warn!("could not autosave on exit: {err}");
         }
-        if self.persist && let Err(err) = self.settings.save() {
+        if self.persist
+            && let Err(err) = self.settings.save()
+        {
             log::warn!("could not save settings on exit: {err}");
         }
         if let Some(engine) = self.engine.take() {
@@ -868,7 +923,8 @@ impl App {
                 match self.import_presets(&folder) {
                     Some(summary) => state.summary = Some(summary),
                     None => {
-                        state.notice = Some(fxsound_ui::dialogs::presets::NO_PRESETS_FOUND.to_owned());
+                        state.notice =
+                            Some(fxsound_ui::dialogs::presets::NO_PRESETS_FOUND.to_owned());
                     }
                 }
                 false
@@ -902,9 +958,7 @@ impl App {
     pub fn handle_export(&mut self, action: &PresetsAction, state: &mut ExportState) -> bool {
         match action {
             PresetsAction::ToggleExport(index) => {
-                if !state.exporting
-                    && *index < state.presets.len()
-                    && !state.selected.remove(index)
+                if !state.exporting && *index < state.presets.len() && !state.selected.remove(index)
                 {
                     state.selected.insert(*index);
                 }
@@ -915,8 +969,11 @@ impl App {
                     return false;
                 }
                 state.exporting = true;
-                let names: Vec<String> =
-                    state.selected_names().into_iter().map(str::to_owned).collect();
+                let names: Vec<String> = state
+                    .selected_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
                 let collisions = self.export_collisions(&names);
                 if collisions.is_empty() {
                     let written = self.export_presets(&names);
@@ -987,7 +1044,8 @@ impl App {
                 Ok(_) => written += 1,
                 Err(err) => {
                     log::warn!("could not export {name}: {err}");
-                    self.state.notification = Some(tr_args("Could not export %s", &[name.as_str()]));
+                    self.state.notification =
+                        Some(tr_args("Could not export %s", &[name.as_str()]));
                 }
             }
         }
@@ -1071,7 +1129,13 @@ fn default_export_dir() -> PathBuf {
 fn export_file_name(name: &str) -> String {
     let stem: String = name
         .chars()
-        .map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c })
+        .map(|c| {
+            if matches!(c, '/' | '\\' | '\0') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     format!("{stem}.{}", fxsound_ui::dialogs::presets::PRESET_EXTENSION)
 }
@@ -1124,9 +1188,20 @@ impl App {
             .map(|config| DevicePriority {
                 id: config.device_id.clone(),
                 name: config.device_name.clone(),
-                preset: self.state.presets.iter().position(|p| p.name == config.preset),
-                connected: self.state.device().is_some_and(|d| d.name == config.device_id),
-                present: self.state.devices.iter().any(|d| d.name == config.device_id),
+                preset: self
+                    .state
+                    .presets
+                    .iter()
+                    .position(|p| p.name == config.preset),
+                connected: self
+                    .state
+                    .device()
+                    .is_some_and(|d| d.name == config.device_id),
+                present: self
+                    .state
+                    .devices
+                    .iter()
+                    .any(|d| d.name == config.device_id),
             })
             .collect();
         state
@@ -1222,7 +1297,10 @@ impl App {
             A::RemoveDevice(index) => {
                 if *index < self.settings.device_configs.len() {
                     self.settings.device_configs.remove(*index);
-                    state.settings.device_configs.clone_from(&self.settings.device_configs);
+                    state
+                        .settings
+                        .device_configs
+                        .clone_from(&self.settings.device_configs);
                     self.persist_settings();
                 }
             }
@@ -1234,7 +1312,10 @@ impl App {
                     (self.settings.device_configs.get_mut(*device), name)
                 {
                     config.preset = name;
-                    state.settings.device_configs.clone_from(&self.settings.device_configs);
+                    state
+                        .settings
+                        .device_configs
+                        .clone_from(&self.settings.device_configs);
                     self.persist_settings();
                 }
             }
@@ -1276,13 +1357,18 @@ impl App {
         let len = self.settings.device_configs.len();
         if a < len && b < len {
             self.settings.device_configs.swap(a, b);
-            state.settings.device_configs.clone_from(&self.settings.device_configs);
+            state
+                .settings
+                .device_configs
+                .clone_from(&self.settings.device_configs);
             self.persist_settings();
         }
     }
 
     fn persist_settings(&mut self) {
-        if self.persist && let Err(err) = self.settings.save() {
+        if self.persist
+            && let Err(err) = self.settings.save()
+        {
             log::warn!("could not save settings: {err}");
         }
     }
@@ -1309,7 +1395,10 @@ pub fn autostart_enabled() -> bool {
 
 /// Hand a URL to the desktop. Never fatal — a missing `xdg-open` is not worth a crash.
 fn open_url(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("xdg-open").arg(url).spawn().map(|_| ())
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
 }
 
 /// Create or remove `~/.config/autostart/fxsound.desktop`.
@@ -1535,7 +1624,129 @@ mod tests {
             description: name.to_owned(),
             is_default,
             direction,
+            form_factor: "speaker".into(),
         }
+    }
+
+    /// Builds a store with two real presets on disk, so `select_preset` has something to load.
+    ///
+    /// `tag` names the caller, because the directory has to be the caller's alone: these tests run
+    /// on threads of one process, and a path shared between them meant each one wiped the presets
+    /// another was in the middle of listing — a failure that only showed up under load.
+    fn app_with_two_presets(tag: &str) -> App {
+        use fxsound_core::Preset;
+
+        let dir = std::env::temp_dir().join(format!(
+            "fxsound-device-memory-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the preset directory");
+        for name in ["Alpha", "Beta"] {
+            let preset = Preset {
+                name: name.to_owned(),
+                ..Preset::default()
+            };
+            fxsound_preset::save(&preset, &dir.join(format!("{name}.fac"))).expect("write");
+        }
+
+        let mut app = App::headless_for_tests();
+        app.presets = fxsound_preset::PresetStore::with_dirs(
+            vec![dir],
+            std::env::temp_dir().join(format!(
+                "fxsound-device-memory-user-{}-{tag}",
+                std::process::id()
+            )),
+        );
+        app.presets.rescan();
+        app.state.presets = app
+            .presets
+            .entries()
+            .iter()
+            .map(|e| fxsound_ui::state::PresetEntry {
+                name: e.name.clone(),
+                modified: e.modified,
+                factory: true,
+            })
+            .collect();
+        app.state.devices = vec![
+            device("alsa_output.headphones", DeviceDirection::Output, false),
+            device("alsa_output.speakers", DeviceDirection::Output, true),
+        ];
+        app
+    }
+
+    #[test]
+    fn a_device_brings_back_the_preset_it_was_last_used_with() {
+        let mut app = app_with_two_presets("restores");
+        let index_of = |app: &App, name: &str| {
+            app.state
+                .presets
+                .iter()
+                .position(|e| e.name == name)
+                .expect("the preset is listed")
+        };
+
+        let alpha = index_of(&app, "Alpha");
+        let beta = index_of(&app, "Beta");
+
+        app.handle(&[UiAction::SelectDevice(0), UiAction::SelectPreset(alpha)]);
+        app.handle(&[UiAction::SelectDevice(1), UiAction::SelectPreset(beta)]);
+
+        // Back to the first device: its own preset should come with it.
+        app.handle(&[UiAction::SelectDevice(0)]);
+        assert_eq!(
+            app.state.preset().map(|p| p.name.as_str()),
+            Some("Alpha"),
+            "the headphones should have brought Alpha back"
+        );
+
+        app.handle(&[UiAction::SelectDevice(1)]);
+        assert_eq!(
+            app.state.preset().map(|p| p.name.as_str()),
+            Some("Beta"),
+            "and the speakers should have brought Beta back"
+        );
+    }
+
+    #[test]
+    fn a_device_seen_for_the_first_time_leaves_the_preset_alone() {
+        // Guessing here would change the sound on no evidence. Only a remembered device restores.
+        let mut app = app_with_two_presets("first-seen");
+        let beta = app
+            .state
+            .presets
+            .iter()
+            .position(|e| e.name == "Beta")
+            .expect("listed");
+
+        app.handle(&[UiAction::SelectPreset(beta)]);
+        app.handle(&[UiAction::SelectDevice(0)]);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Beta"));
+    }
+
+    #[test]
+    fn the_device_memory_records_what_kind_of_device_it_was() {
+        let mut app = app_with_two_presets("form-factor");
+        let alpha = app
+            .state
+            .presets
+            .iter()
+            .position(|e| e.name == "Alpha")
+            .expect("listed");
+        app.handle(&[UiAction::SelectDevice(0), UiAction::SelectPreset(alpha)]);
+
+        let config = app
+            .settings
+            .device_configs
+            .iter()
+            .find(|c| c.device_id == "alsa_output.headphones")
+            .expect("the device was remembered");
+        assert_eq!(config.preset, "Alpha");
+        assert_eq!(
+            config.device_form_factor, "speaker",
+            "the form factor was dead data before this"
+        );
     }
 
     #[test]
@@ -1651,7 +1862,10 @@ mod tests {
         assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Yours"));
         assert!(!app.state.preset().is_some_and(|p| p.modified));
         assert_eq!(app.settings.preset, "Yours");
-        assert_eq!(app.loaded_preset.as_ref().map(|p| p.name.as_str()), Some("Yours"));
+        assert_eq!(
+            app.loaded_preset.as_ref().map(|p| p.name.as_str()),
+            Some("Yours")
+        );
         assert!(dir.path().join("user/Yours.fac").is_file());
         assert!(!dir.path().join("user/Mine.fac").exists());
     }

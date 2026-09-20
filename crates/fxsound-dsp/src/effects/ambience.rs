@@ -293,7 +293,8 @@ impl Layout {
         // of its own line would read a neighbour's memory. Neither can happen at any rate in
         // 16k..192k — the ratios are fixed — but the clamp makes that a property of the code
         // rather than of arithmetic the reader has to redo.
-        let tap = |offset: f64, line: usize| samples_in_room(room_rate, offset).clamp(1, lengths[line]);
+        let tap =
+            |offset: f64, line: usize| samples_in_room(room_rate, offset).clamp(1, lengths[line]);
 
         Self {
             lengths,
@@ -354,9 +355,16 @@ pub struct Ambience {
     sample_rate: Real,
     amount: Real,
     active: bool,
+    /// Which channels the single stereo instance runs over; `None` means the first two.
+    front_pair: Option<(usize, usize)>,
 }
 
 impl Ambience {
+    /// Which channels are the front pair. `None` falls back to the first two.
+    pub fn set_front_pair(&mut self, pair: Option<(usize, usize)>) {
+        self.front_pair = pair;
+    }
+
     /// Build the reverb, sized for the worst case the original supports.
     #[must_use]
     pub fn new(sample_rate: Real) -> Self {
@@ -387,6 +395,7 @@ impl Ambience {
             sample_rate: clamp_rate(sample_rate),
             amount: 0.0,
             active: false,
+            front_pair: None,
         };
         effect.design();
         effect.set_amount(0.0);
@@ -474,7 +483,13 @@ impl Ambience {
     /// The original reads the taps *after* writing; both offsets are strictly inside the line, so
     /// reading them first touches the same memory and keeps every read in one place.
     #[inline(always)]
-    fn allpass_tapped(&mut self, line: usize, x: Real, k: Real, taps: [usize; 2]) -> (Real, Real, Real) {
+    fn allpass_tapped(
+        &mut self,
+        line: usize,
+        x: Real,
+        k: Real,
+        taps: [usize; 2],
+    ) -> (Real, Real, Real) {
         let d_out = self.read_oldest(line);
         let tap1 = self.read(line, taps[0]);
         let tap2 = self.read(line, taps[1]);
@@ -633,7 +648,8 @@ impl Effect for Ambience {
             self.wet_gain = WET_MAX;
             self.dry_gain = DRY_MIN;
         } else {
-            self.wet_gain = (f64::from(warped - 12) * (1.0 / WARP_SPAN) * f64::from(WET_MAX)) as Real;
+            self.wet_gain =
+                (f64::from(warped - 12) * (1.0 / WARP_SPAN) * f64::from(WET_MAX)) as Real;
             self.dry_gain =
                 DRY_MIN + (f64::from(40 - warped) * (1.0 / WARP_SPAN)) as Real * DRY_SPAN;
         }
@@ -687,11 +703,9 @@ impl Effect for Ambience {
             return;
         }
 
+        let (li, ri) = self.front_pair.unwrap_or((0, 1));
         for frame in buffer.chunks_exact_mut(channels) {
-            let Some((left, rest)) = frame.split_first_mut() else {
-                continue;
-            };
-            let Some(right) = rest.first_mut() else {
+            let Some((left, right)) = super::pair_mut(frame, li, ri) else {
                 continue;
             };
             let in1 = *left + DENORM_BIAS;
@@ -772,14 +786,18 @@ mod tests {
         let at_44 = Layout::for_rate(44_100.0);
         assert_eq!(
             at_44.lengths,
-            [4410, 210, 158, 561, 410, 1089, 6623, 2678, 5534, 1439, 6273, 3949, 4706]
+            [
+                4410, 210, 158, 561, 410, 1089, 6623, 2678, 5534, 1439, 6273, 3949, 4706
+            ]
         );
         assert_eq!(at_44.total(), 38_040);
 
         let at_48 = Layout::for_rate(48_000.0);
         assert_eq!(
             at_48.lengths,
-            [4800, 228, 172, 611, 446, 1186, 7209, 2915, 6023, 1566, 6828, 4298, 5122]
+            [
+                4800, 228, 172, 611, 446, 1186, 7209, 2915, 6023, 1566, 6828, 4298, 5122
+            ]
         );
         assert_eq!(at_48.total(), 41_404);
 
@@ -924,12 +942,13 @@ mod tests {
     fn amount_zero_is_an_exact_bypass() {
         let mut reverb = Ambience::new(48_000.0);
         reverb.set_amount(0.0);
-        let original: Vec<Real> = (0..2048)
-            .map(|n| (n as Real * 0.037).sin() * 0.7)
-            .collect();
+        let original: Vec<Real> = (0..2048).map(|n| (n as Real * 0.037).sin() * 0.7).collect();
         let mut buffer = original.clone();
         reverb.process(&mut buffer, 2);
-        assert_eq!(buffer, original, "a bypassed reverb must not touch a sample");
+        assert_eq!(
+            buffer, original,
+            "a bypassed reverb must not touch a sample"
+        );
     }
 
     #[test]
@@ -1081,7 +1100,10 @@ mod tests {
             assert_eq!(reverb.sample_rate, rate);
             // The tank must be empty after a format change, not holding the old rate's tail.
             let dirty = reverb.arena.iter().filter(|s| **s != 0.0).count();
-            assert!(dirty == 0, "rate {rate}: {dirty} non-zero samples left in the arena");
+            assert!(
+                dirty == 0,
+                "rate {rate}: {dirty} non-zero samples left in the arena"
+            );
             let mut buffer = vec![0.0; 8192];
             buffer[0] = 0.9;
             buffer[1] = -0.9;
@@ -1137,14 +1159,19 @@ mod tests {
                 "frame {n}: mono {m} against folded stereo {s}"
             );
         }
-        assert!(mono.iter().any(|s| s.abs() > 1e-6), "the mono path was silent");
+        assert!(
+            mono.iter().any(|s| s.abs() > 1e-6),
+            "the mono path was silent"
+        );
     }
 
     #[test]
     fn extra_channels_are_left_alone() {
         let mut reverb = Ambience::new(48_000.0);
         reverb.set_amount(1.0);
-        let mut buffer: Vec<Real> = (0..1024).flat_map(|n| [0.5, -0.5, 0.25, n as Real]).collect();
+        let mut buffer: Vec<Real> = (0..1024)
+            .flat_map(|n| [0.5, -0.5, 0.25, n as Real])
+            .collect();
         let before: Vec<Real> = buffer.iter().skip(2).step_by(4).copied().collect();
         reverb.process(&mut buffer, 4);
         let after: Vec<Real> = buffer.iter().skip(2).step_by(4).copied().collect();
@@ -1168,7 +1195,10 @@ mod tests {
 
         let mut buffer = vec![0.0; 4096];
         reverb.process(&mut buffer, 2);
-        assert!(buffer.iter().all(|s| s.abs() < 1e-30), "a tail survived reset");
+        assert!(
+            buffer.iter().all(|s| s.abs() < 1e-30),
+            "a tail survived reset"
+        );
     }
 
     #[test]
@@ -1250,7 +1280,10 @@ mod tests {
         // -> D1/D3 tap 1 at 10.1 ms -> output scale -> wet gain.
         let rate = 48_000.0;
         let layout = Layout::for_rate(rate);
-        assert_eq!(layout.d1_taps[0], layout.d3_taps[0], "both branches tap 10.1 ms");
+        assert_eq!(
+            layout.d1_taps[0], layout.d3_taps[0],
+            "both branches tap 10.1 ms"
+        );
         let arrival = PRE_DELAY + layout.d1_taps[0];
 
         let bandwidth = one_pole_coeff(

@@ -198,7 +198,8 @@ impl SampleRing {
                 slot.store(sample.to_bits(), Ordering::Relaxed);
             }
         }
-        self.write.store(write.wrapping_add(take), Ordering::Release);
+        self.write
+            .store(write.wrapping_add(take), Ordering::Release);
 
         let dropped = (samples.len() - take) / channels;
         if dropped > 0 {
@@ -228,12 +229,41 @@ impl SampleRing {
         let write = self.write.load(Ordering::Acquire);
         let mut available = write.wrapping_sub(read);
 
-        let target = self.target_fill_frames.load(Ordering::Relaxed) * channels;
+        // The cushion has to be measured against the block the consumer actually takes, not
+        // against the quantum the nodes were *built* with. Those are the same number only while
+        // the graph runs at `DEFAULT_QUANTUM_FRAMES`: `node.force-quantum`, a Bluetooth or USB
+        // device that raises it, or a low-CPU configuration all move the real quantum without
+        // changing the format, so nothing rebuilds the nodes and nothing calls `reconfigure`.
+        // Sized from a fixed 512 this ring measured 21504 underrun frames and 20 resyncs at a
+        // 2048-frame quantum; told the truth it measures zero at every quantum from 256 to 2048.
+        //
+        // `out.len()` is that truth and it is already in hand, so the target is derived here
+        // rather than plumbed in — no atomics to coordinate, no `reconfigure` from the real-time
+        // thread (it is main-loop only), and it adapts on the first callback after a change
+        // rather than on the next supervisor tick. The stored value is kept in step for
+        // `fill_frames` instrumentation and the supervisor's log.
+        // The target only ever grows inside one format: shrinking it the moment PipeWire hands
+        // over a short block would let the cushion collapse and then underrun on the next full
+        // one, which is the transition glitch this is meant to remove. `reconfigure` puts it back
+        // to the configured quantum whenever the nodes are rebuilt, so it cannot creep for ever.
+        let block_frames = (out.len() / channels).max(1);
+        let want_frames = block_frames * TARGET_FILL_HALF_QUANTA / 2;
+        let target_frames = self
+            .target_fill_frames
+            .fetch_max(want_frames, Ordering::Relaxed)
+            .max(want_frames);
+        let target = target_frames * channels;
+
         if !self.primed.load(Ordering::Relaxed) {
             if available < target {
                 for sample in out.iter_mut() {
                     *sample = 0.0;
                 }
+                // Priming silence is still silence the device played. Counting it keeps the
+                // supervisor's underrun figure honest about the start-up gap instead of
+                // reporting a clean stream that began with a hole.
+                self.underrun_frames
+                    .fetch_add((out.len() / channels) as u64, Ordering::Relaxed);
                 return 0;
             }
             self.primed.store(true, Ordering::Relaxed);
@@ -257,16 +287,16 @@ impl SampleRing {
         for sample in out.iter_mut().skip(take) {
             *sample = 0.0;
         }
-        self.read
-            .store(read.wrapping_add(take), Ordering::Release);
+        self.read.store(read.wrapping_add(take), Ordering::Release);
 
         if take < out.len() {
             self.underrun_frames
                 .fetch_add(((out.len() - take) / channels) as u64, Ordering::Relaxed);
-            if take == 0 {
-                // The ring ran dry: wait for it to refill before emitting again.
-                self.primed.store(false, Ordering::Relaxed);
-            }
+            // Any short read means the cushion is gone, not just a completely empty one. Staying
+            // primed after a partial read leaves a consumer that is persistently a few frames
+            // short clicking on every cycle; dropping out of primed costs one silent block and
+            // then the cushion is back.
+            self.primed.store(false, Ordering::Relaxed);
         }
         take
     }
@@ -481,6 +511,16 @@ struct Shared {
     direction: DeviceDirection,
     /// Every sink and source the registry reports, both directions, keyed by registry global id.
     devices: Vec<DeviceInfo>,
+    /// One bound proxy per device, kept alive only to receive the node's `info` event.
+    ///
+    /// The registry global for a node carries `node.name`, `node.description` and `media.class`
+    /// and nothing else — verified against a live daemon — so `audio.channels` and
+    /// `audio.position` are simply not knowable from the registry. They live in the node's own
+    /// info, which arrives once the node is bound. Without this, every device looked like it had
+    /// an unknown channel count, `clamped_channels()` answered the stereo minimum for all of
+    /// them, and a 5.1 or 7.1 device was driven as a stereo pair with the rest of its channels
+    /// silent — the whole `ChannelMap` path was unreachable in practice.
+    node_probes: std::collections::HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
     /// The device names of the active direction seen at the previous rules run —
     /// `pwszIDPreviousRealDevices` (`audiopassthru/include/sndDevices.h:349`).
     previous_names: Vec<String>,
@@ -535,6 +575,7 @@ impl Shared {
             session: None,
             direction: DeviceDirection::Output,
             devices: Vec::new(),
+            node_probes: std::collections::HashMap::new(),
             previous_names: Vec::new(),
             defaults: PerDirection::default(),
             graph_rate: DEFAULT_SAMPLE_RATE,
@@ -838,7 +879,10 @@ fn handle_control(
 // Connection and the reconnect state machine
 // ---------------------------------------------------------------------------------------------
 
-fn connect(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) -> Result<(), AudioError> {
+fn connect(
+    shared: &Rc<RefCell<Shared>>,
+    context: &pw::context::ContextRc,
+) -> Result<(), AudioError> {
     let remote = shared.borrow().remote.clone();
     let props = remote.map(|name| {
         properties! {
@@ -943,7 +987,10 @@ fn disconnect(shared: &mut Shared, reason: &str) {
     shared.state = State::Disconnected;
     shared.devices.clear();
     shared.previous_names.clear();
-    shared.status.output_streaming.store(false, Ordering::Relaxed);
+    shared
+        .status
+        .output_streaming
+        .store(false, Ordering::Relaxed);
 
     let step = BACKOFF_MS
         .get(shared.attempts as usize)
@@ -1044,12 +1091,47 @@ fn on_global(
                 device.name
             );
             let affects_rules = device.direction == guard.direction;
+            let object_id = device.object_id;
             guard
                 .devices
                 .retain(|existing| existing.object_id != device.object_id);
             guard.devices.push(device);
             guard.needs_publish = true;
             guard.needs_rules |= affects_rules;
+
+            // Ask the node what it is actually made of. This is the only way to learn it; see
+            // `Shared::node_probes`.
+            match registry.bind::<pw::node::Node, _>(global) {
+                Ok(node) => {
+                    let listener = node
+                        .add_listener_local()
+                        .info({
+                            let shared = Rc::clone(shared);
+                            move |info| {
+                                let Some(props) = info.props() else {
+                                    return;
+                                };
+                                // Read the two values out here rather than handing the dictionary
+                                // on: its lifetime is the callback's, and the handler wants to
+                                // hold a mutable borrow of `Shared` across the update.
+                                let channels = props
+                                    .get("audio.channels")
+                                    .and_then(|value| value.parse::<u32>().ok())
+                                    .unwrap_or(0);
+                                let positions = props
+                                    .get("audio.position")
+                                    .and_then(ChannelMap::parse)
+                                    .filter(|map| map.len() == channels as usize);
+                                on_node_info(&shared, object_id, channels, positions);
+                            }
+                        })
+                        .register();
+                    guard.node_probes.insert(object_id, (node, listener));
+                }
+                Err(err) => {
+                    log::debug!("could not bind node {object_id} to read its format: {err}")
+                }
+            }
         }
         pw::types::ObjectType::Metadata => {
             let name = props.get("metadata.name").unwrap_or_default();
@@ -1095,6 +1177,7 @@ fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
         return;
     };
     let removed = guard.devices.remove(index);
+    guard.node_probes.remove(&id);
     log::debug!(
         "{} disappeared: {} ({})",
         noun(removed.direction),
@@ -1105,6 +1188,61 @@ fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
     // The target may have just been unplugged. Re-running the rules attaches the pair to another
     // device of the active direction (`docs/spec/12-audio-io.md` §22).
     guard.needs_rules |= removed.direction == guard.direction;
+}
+
+/// A bound node reported its format. Fill in what the registry could not tell us.
+///
+/// Arrives once per node shortly after it appears, and again whenever the node's info changes —
+/// a profile switch on an ALSA card, for instance, which really does change the channel count
+/// under a running stream.
+fn on_node_info(
+    shared: &Rc<RefCell<Shared>>,
+    object_id: u32,
+    channels: u32,
+    positions: Option<ChannelMap>,
+) {
+    let Ok(mut guard) = shared.try_borrow_mut() else {
+        return;
+    };
+    let Some(device) = guard.devices.iter_mut().find(|d| d.object_id == object_id) else {
+        return;
+    };
+
+    // Already learned, or nothing to learn: leave it alone. Taking only the first non-zero report
+    // is what makes this immune to the churn described above.
+    if device.channels != 0 || channels == 0 {
+        return;
+    }
+    let before = device.clamped_channels();
+    device.channels = channels;
+    if let Some(map) = positions {
+        device.positions = map;
+    } else if channels != 0 {
+        device.positions = ChannelMap::default_for(channels);
+    }
+    let after = device.clamped_channels();
+    let name = device.name.clone();
+    let device_direction = device.direction;
+
+    log::debug!(
+        "{name}: {channels} channels, {}",
+        device.positions.to_property_value()
+    );
+    guard.needs_publish = true;
+
+    // The one rebuild worth doing: the device was selected before its info arrived, so the nodes
+    // were built against the stereo fallback, and the truth is something else. Only the device the
+    // nodes are attached to matters — reacting to every device of the direction would rebuild the
+    // running stream because some *other* sink reported something.
+    let attached = guard
+        .session
+        .as_ref()
+        .and_then(|session| session.nodes.as_ref())
+        .is_some_and(|nodes| nodes.direction == device_direction && nodes.target == name);
+    if attached && after != before {
+        log::info!("{name} reports {after} channels rather than {before}; rebuilding for it");
+        guard.needs_rules = true;
+    }
 }
 
 fn on_metadata_property(shared: &Rc<RefCell<Shared>>, key: Option<&str>, value: Option<&str>) {
@@ -1265,7 +1403,10 @@ fn drop_nodes(shared: &mut Shared) {
         session.nodes = None;
     }
     drain_recycled_dsp(shared);
-    shared.status.output_streaming.store(false, Ordering::Relaxed);
+    shared
+        .status
+        .output_streaming
+        .store(false, Ordering::Relaxed);
 }
 
 /// Hand the active direction's default back, *then* destroy its nodes — the order
@@ -1447,12 +1588,19 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
         return Err(AudioError::PipewireDisconnected);
     };
     dsp.engine.set_format(rate as f32, channels as usize);
+    dsp.engine.set_lfe_channel(positions.lfe_index());
+    dsp.engine.set_front_pair(positions.front_pair());
+    // Read before the engine is handed to the node's user data, where it can no longer be reached
+    // from the main loop.
+    let dsp_latency_frames = dsp.engine.latency_frames();
+    // `set_format` returns early when neither the rate nor the channel count moved, so switching
+    // between two devices that are both 48 kHz stereo — the common case — would otherwise carry
+    // the previous device's filter history, reverb tail and leveller gain straight into the new
+    // one. The engine is recycled deliberately, but its *state* should not be.
+    dsp.engine.reset();
 
     shared.ring.reconfigure(channels as usize, quantum as usize);
-    shared
-        .counters
-        .sample_rate
-        .store(rate, Ordering::Relaxed);
+    shared.counters.sample_rate.store(rate, Ordering::Relaxed);
     shared.counters.channels.store(channels, Ordering::Relaxed);
 
     let first_data = SinkData {
@@ -1492,6 +1640,19 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
             &mut [first_pod],
         )
         .map_err(|error| AudioError::PipewireUnavailable(error.to_string()))?;
+
+    // Declare the delay the DSP adds, now that the node exists. Reported on NODE 1 because that
+    // is where the processing happens. A failure here is not worth refusing to play over: the
+    // audio path is fine, the graph's latency arithmetic is merely as wrong as it was before.
+    let latency_values = process_latency_pod(dsp_latency_frames);
+    match Pod::from_bytes(&latency_values) {
+        Some(pod) => {
+            if let Err(error) = first.update_params(&mut [pod]) {
+                log::warn!("could not declare the processing latency: {error}");
+            }
+        }
+        None => log::warn!("could not build the processing-latency parameter"),
+    }
 
     // ---- NODE 2: the node that drains the ring -----------------------------------------------
     //
@@ -1674,6 +1835,34 @@ fn stream_props(direction: DeviceDirection, target: &str, latency: &str) -> Prop
 /// `AudioInfoRaw` starts out flagged `UNPOSITIONED` and only clears the flag when
 /// `position[0] != 0` (`libspa-0.10.1/src/param/audio/raw.rs:70-74`), which is why
 /// [`ChannelMap::to_spa_position`] never yields a zero in slot 0.
+/// A `SPA_PARAM_ProcessLatency` pod carrying a fixed delay in frames.
+///
+/// Without this, the only latency FxSound ever declares is the static `node.latency` property,
+/// which describes the buffering, not the processing — so a recording application is told the
+/// virtual microphone is instantaneous. Today the figure is small (the limiter's 0.75 ms
+/// look-ahead), but it is the quantity a voice chain grows: a 10 ms denoiser block plus a VAD
+/// grace ring would otherwise make FxSound lie to OBS and Discord by enough to show up as
+/// lip-sync drift the user cannot diagnose.
+fn process_latency_pod(frames: usize) -> Vec<u8> {
+    use libspa::pod::{Object, Property, PropertyFlags, Value};
+
+    let frames = u32::try_from(frames).unwrap_or(u32::MAX);
+    libspa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &Value::Object(Object {
+            type_: libspa::utils::SpaTypes::ObjectParamProcessLatency.as_raw(),
+            id: libspa::param::ParamType::ProcessLatency.as_raw(),
+            properties: vec![Property {
+                key: libspa::sys::SPA_PARAM_PROCESS_LATENCY_rate,
+                flags: PropertyFlags::empty(),
+                value: Value::Int(frames as i32),
+            }],
+        }),
+    )
+    .map(|(cursor, _)| cursor.into_inner())
+    .unwrap_or_default()
+}
+
 fn format_pod(rate: u32, channels: u32, positions: &ChannelMap) -> Vec<u8> {
     let mut info = AudioInfoRaw::new();
     info.set_format(AudioFormat::F32LE);
@@ -1809,16 +1998,11 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
         let Some(scratch) = dsp.scratch.get_mut(..samples) else {
             break;
         };
-        for (slot, raw) in scratch
-            .iter_mut()
-            .zip(block.chunks_exact(std::mem::size_of::<f32>()))
-        {
-            // `chunks_exact` guarantees four bytes; the match is how that is spelled without an
-            // `unwrap` on the audio path.
-            *slot = match <[u8; 4]>::try_from(raw) {
-                Ok(four) => f32::from_le_bytes(four),
-                Err(_) => 0.0,
-            };
+        // `as_chunks` hands over fixed-size arrays, so the four-byte guarantee is in the type
+        // rather than in a `try_from` the audio path has to check every sample.
+        let (words, _) = block.as_chunks::<{ std::mem::size_of::<f32>() }>();
+        for (slot, raw) in scratch.iter_mut().zip(words) {
+            *slot = f32::from_le_bytes(*raw);
         }
         dsp.engine.process(scratch, channels);
         data.ring.push(scratch);
@@ -1879,11 +2063,9 @@ fn on_output_process(stream: &pw::stream::Stream, data: &mut OutData) {
             let Some(target) = bytes.get_mut(start..start + take * stride) else {
                 break;
             };
-            for (raw, &sample) in target
-                .chunks_exact_mut(std::mem::size_of::<f32>())
-                .zip(scratch.iter())
-            {
-                raw.copy_from_slice(&sample.to_le_bytes());
+            let (words, _) = target.as_chunks_mut::<{ std::mem::size_of::<f32>() }>();
+            for (raw, &sample) in words.iter_mut().zip(scratch.iter()) {
+                *raw = sample.to_le_bytes();
             }
             done += take;
         }
@@ -2004,20 +2186,34 @@ mod tests {
 
     #[test]
     fn samples_come_back_out_of_the_ring_exactly_as_they_went_in() {
-        let ring = ring_for(2, 4);
-        // Target fill is 1.5 quanta = 6 frames = 12 samples.
-        let input: Vec<f32> = (0..32).map(|i| i as f32 * 0.25 - 4.0).collect();
-        assert_eq!(ring.push(&input), 32);
+        // The quantum and the block the consumer asks for are the same number in production —
+        // `on_output_process` pops exactly the frames PipeWire requested — so the fixture says so
+        // too. 16-frame quantum, target fill 1.5 quanta = 24 frames = 48 samples.
+        let ring = ring_for(2, 16);
+        let input: Vec<f32> = (0..48).map(|i| i as f32 * 0.25 - 4.0).collect();
+        assert_eq!(ring.push(&input), 48);
 
+        // One cycle is one quantum: 16 frames = 32 samples.
         let mut out = vec![0.0; 32];
         assert_eq!(ring.pop(&mut out), 32);
-        assert_eq!(out, input, "bit patterns must survive the AtomicU32 round trip");
-        // Including the awkward ones.
+        assert_eq!(
+            out,
+            input[..32],
+            "bit patterns must survive the AtomicU32 round trip"
+        );
+        // Including the awkward ones. A fresh ring, because the one above still holds the tail
+        // of its input and the odd values would come out behind it.
         let odd = [f32::MIN, -0.0, 0.0, f32::MAX, 1.0e-30, -1.0e-30];
-        ring.push(&odd);
-        let mut back = [1.0; 6];
-        ring.pop(&mut back);
-        assert_eq!(back.map(f32::to_bits), odd.map(f32::to_bits));
+        let ring = ring_for(2, 4); // target fill = 6 frames = 12 samples
+        let mut pushed = odd.to_vec();
+        pushed.extend_from_slice(&[0.0; 10]); // pad past the target so the ring primes
+        ring.push(&pushed);
+        let mut back = [1.0_f32; 8];
+        assert_eq!(ring.pop(&mut back), 8);
+        assert_eq!(
+            back[..6].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            odd.map(f32::to_bits).to_vec()
+        );
     }
 
     #[test]
@@ -2028,7 +2224,10 @@ mod tests {
         ring.push(&[1.0; 16]); // 8 frames — not enough
         let mut out = vec![9.0; 16];
         assert_eq!(ring.pop(&mut out), 0);
-        assert!(out.iter().all(|&s| s == 0.0), "must emit silence, not garbage");
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "must emit silence, not garbage"
+        );
 
         ring.push(&[1.0; 16]); // now 16 frames, past the target
         let mut out = vec![0.0; 16];
@@ -2050,32 +2249,86 @@ mod tests {
         assert_eq!(ring.dropped_frames.load(Ordering::Relaxed), 1);
     }
 
+    /// `build_nodes` always configures the ring for `DEFAULT_QUANTUM_FRAMES`, but the graph
+    /// quantum moves without a format change — `node.force-quantum`, a Bluetooth or USB device
+    /// that raises it, a low-CPU configuration — and nothing rebuilds the nodes when it does. A
+    /// cushion and a resync limit derived from the wrong number then fight the stream for as long
+    /// as it lasts.
+    #[test]
+    fn a_steady_stream_is_clean_at_every_quantum_not_just_the_one_the_nodes_were_built_with() {
+        const CHANNELS: usize = 2;
+        for graph_quantum in [256_usize, 512, 1024, 2048] {
+            let ring = ring_for(CHANNELS, DEFAULT_QUANTUM_FRAMES as usize);
+            let block = vec![0.25_f32; graph_quantum * CHANNELS];
+            let mut out = vec![0.0_f32; graph_quantum * CHANNELS];
+
+            // The producer runs before the consumer is linked, which is what fills the cushion at
+            // startup; after that the two run one block each per graph cycle.
+            for _ in 0..3 {
+                ring.push(&block);
+            }
+            for _ in 0..200 {
+                ring.pop(&mut out);
+                ring.push(&block);
+            }
+
+            assert_eq!(
+                ring.underrun_frames.load(Ordering::Relaxed),
+                0,
+                "a steady {graph_quantum}-frame stream underran"
+            );
+            assert_eq!(
+                ring.resyncs.load(Ordering::Relaxed),
+                0,
+                "a steady {graph_quantum}-frame stream was resynced, which drops audio"
+            );
+            assert!(
+                out.iter().all(|&s| (s - 0.25).abs() < 1e-6),
+                "a steady {graph_quantum}-frame stream produced something other than the signal"
+            );
+        }
+    }
+
     #[test]
     fn a_partial_underrun_is_zero_filled_and_counted() {
-        let ring = ring_for(2, 2); // target fill = 3 frames = 6 samples
-        ring.push(&[1.0; 8]); // 4 frames
+        let ring = ring_for(2, 6); // target fill = 9 frames = 18 samples
+        ring.push(&[1.0; 18]); // 9 frames: exactly enough to prime
         let mut out = [9.0_f32; 12]; // asking for 6 frames
-        assert_eq!(ring.pop(&mut out), 8);
-        assert!(out[..8].iter().all(|&s| s == 1.0));
+        assert_eq!(
+            ring.pop(&mut out),
+            12,
+            "primed, so the whole block is served"
+        );
+        assert_eq!(ring.underrun_frames.load(Ordering::Relaxed), 0);
+
+        // Three frames are left; the next block of six is served short.
+        let mut out = [9.0_f32; 12];
+        assert_eq!(ring.pop(&mut out), 6);
+        assert!(out[..6].iter().all(|&s| s == 1.0));
         assert!(
-            out[8..].iter().all(|&s| s == 0.0),
+            out[6..].iter().all(|&s| s == 0.0),
             "the tail must be silence, not the caller's stale buffer"
         );
-        assert_eq!(ring.underrun_frames.load(Ordering::Relaxed), 2);
+        assert_eq!(ring.underrun_frames.load(Ordering::Relaxed), 3);
+        assert!(
+            !ring.primed.load(Ordering::Relaxed),
+            "a short read means the cushion is gone, so it must re-buffer rather than click \
+             its way through every later cycle"
+        );
     }
 
     #[test]
     fn a_dry_ring_re_primes_before_playing_again() {
-        let ring = ring_for(2, 2);
-        ring.push(&[1.0; 8]);
-        let mut out = [0.0_f32; 8];
+        let ring = ring_for(2, 4); // target fill = 6 frames = 12 samples
+        ring.push(&[1.0; 12]);
+        let mut out = [0.0_f32; 8]; // 4 frames per cycle
         assert_eq!(ring.pop(&mut out), 8);
-        assert_eq!(ring.pop(&mut out), 0, "now empty");
+        assert_eq!(ring.pop(&mut out), 4, "only two frames were left");
         assert!(!ring.primed.load(Ordering::Relaxed));
 
-        ring.push(&[1.0; 4]); // 2 frames, below the 3-frame target
+        ring.push(&[1.0; 8]); // 4 frames, below the 6-frame target
         assert_eq!(ring.pop(&mut out), 0, "still refilling");
-        ring.push(&[1.0; 4]); // 4 frames total, past the target
+        ring.push(&[1.0; 8]); // 8 frames total, past the target
         assert_eq!(ring.pop(&mut out), 8);
     }
 
@@ -2096,7 +2349,10 @@ mod tests {
             "the samples handed over must be the newest, not the oldest: got {}",
             out[0]
         );
-        assert!(ring.fill_frames() <= 24, "latency must be back under the limit");
+        assert!(
+            ring.fill_frames() <= 24,
+            "latency must be back under the limit"
+        );
     }
 
     #[test]
@@ -2181,7 +2437,9 @@ mod tests {
         assert_eq!(media_subtype, MediaSubtype::Raw);
 
         let mut parsed = AudioInfoRaw::new();
-        parsed.parse(pod).expect("the pod describes a raw audio format");
+        parsed
+            .parse(pod)
+            .expect("the pod describes a raw audio format");
         assert_eq!(parsed.rate(), 48_000);
         assert_eq!(parsed.channels(), 6);
         assert_eq!(parsed.format(), AudioFormat::F32LE);
@@ -2200,8 +2458,14 @@ mod tests {
         pw::init();
         let positions = ChannelMap::default_for(2);
 
-        let sink =
-            virtual_node_props(DeviceDirection::Output, None, 2, 48_000, &positions, "512/48000");
+        let sink = virtual_node_props(
+            DeviceDirection::Output,
+            None,
+            2,
+            48_000,
+            &positions,
+            "512/48000",
+        );
         assert_eq!(sink.get("media.class"), Some("Audio/Sink"));
         assert_eq!(sink.get("node.name"), Some(SINK_NODE_NAME));
         assert_eq!(sink.get("node.link-group"), Some(LINK_GROUP));
@@ -2218,9 +2482,19 @@ mod tests {
         assert!(description.starts_with("FxSound ("), "{description}");
         assert_eq!(sink.get("node.nick"), Some(description));
 
-        let source =
-            virtual_node_props(DeviceDirection::Input, None, 2, 48_000, &positions, "512/48000");
-        assert_eq!(source.get("media.class"), Some("Audio/Source"), "not Audio/Source/Virtual");
+        let source = virtual_node_props(
+            DeviceDirection::Input,
+            None,
+            2,
+            48_000,
+            &positions,
+            "512/48000",
+        );
+        assert_eq!(
+            source.get("media.class"),
+            Some("Audio/Source"),
+            "not Audio/Source/Virtual"
+        );
         assert_eq!(source.get("node.name"), Some(SOURCE_NODE_NAME));
         assert_eq!(source.get("node.link-group"), Some(LINK_GROUP));
         assert_eq!(source.get("node.virtual"), Some("true"));
@@ -2238,7 +2512,10 @@ mod tests {
         assert_eq!(output.get("media.category"), Some("Playback"));
         assert_eq!(output.get("media.role"), Some("Production"));
         assert_eq!(output.get("node.name"), Some(OUTPUT_NODE_NAME));
-        assert_eq!(output.get("node.description"), Some(OUTPUT_STREAM_DESCRIPTION));
+        assert_eq!(
+            output.get("node.description"),
+            Some(OUTPUT_STREAM_DESCRIPTION)
+        );
         assert_eq!(output.get("node.link-group"), Some(LINK_GROUP));
         assert_eq!(output.get("node.autoconnect"), Some("true"));
         assert_eq!(output.get("target.object"), Some("alsa_output.x"));
@@ -2249,7 +2526,10 @@ mod tests {
         assert_eq!(capture.get("media.category"), Some("Capture"));
         assert_eq!(capture.get("media.role"), Some("Production"));
         assert_eq!(capture.get("node.name"), Some(CAPTURE_NODE_NAME));
-        assert_eq!(capture.get("node.description"), Some(CAPTURE_STREAM_DESCRIPTION));
+        assert_eq!(
+            capture.get("node.description"),
+            Some(CAPTURE_STREAM_DESCRIPTION)
+        );
         assert_eq!(capture.get("node.link-group"), Some(LINK_GROUP));
         assert_eq!(capture.get("node.autoconnect"), Some("true"));
         assert_eq!(capture.get("target.object"), Some("alsa_input.mic"));
@@ -2289,14 +2569,26 @@ mod tests {
     fn only_the_release_sync_confirms_the_exit_hand_back() {
         assert_ne!(RELEASE_SEQ, 0, "must not collide with the registry sync");
         let mut shared = shared_for_tests();
-        assert!(!confirm_release(&mut shared, AsyncSeq::from_seq(RELEASE_SEQ)));
+        assert!(!confirm_release(
+            &mut shared,
+            AsyncSeq::from_seq(RELEASE_SEQ)
+        ));
 
         shared.release_pending = Some(AsyncSeq::from_seq(RELEASE_SEQ));
         assert!(!confirm_release(&mut shared, AsyncSeq::from_seq(0)));
-        assert!(shared.release_pending.is_some(), "the registry sync is not ours");
-        assert!(confirm_release(&mut shared, AsyncSeq::from_seq(RELEASE_SEQ)));
+        assert!(
+            shared.release_pending.is_some(),
+            "the registry sync is not ours"
+        );
+        assert!(confirm_release(
+            &mut shared,
+            AsyncSeq::from_seq(RELEASE_SEQ)
+        ));
         assert!(shared.release_pending.is_none());
-        assert!(!confirm_release(&mut shared, AsyncSeq::from_seq(RELEASE_SEQ)));
+        assert!(!confirm_release(
+            &mut shared,
+            AsyncSeq::from_seq(RELEASE_SEQ)
+        ));
     }
 
     /// The pump returns as soon as there is nothing pending, and a server that never answers
@@ -2314,15 +2606,34 @@ mod tests {
             mainloop.loop_(),
             started + Duration::from_secs(5),
         ));
-        assert!(started.elapsed() < Duration::from_secs(1), "nothing pending: no waiting");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "nothing pending: no waiting"
+        );
 
         shared.borrow_mut().release_pending = Some(AsyncSeq::from_seq(RELEASE_SEQ));
         let deadline = Instant::now() + Duration::from_millis(30);
-        assert!(!pump_until_release_confirmed(&shared, mainloop.loop_(), deadline));
-        assert!(Instant::now() >= deadline, "gives the server the whole window");
-        assert!(deadline.elapsed() < Duration::from_secs(2), "but not much more");
-        assert!(shared.borrow().release_pending.is_some(), "unanswered stays unanswered");
+        assert!(!pump_until_release_confirmed(
+            &shared,
+            mainloop.loop_(),
+            deadline
+        ));
+        assert!(
+            Instant::now() >= deadline,
+            "gives the server the whole window"
+        );
+        assert!(
+            deadline.elapsed() < Duration::from_secs(2),
+            "but not much more"
+        );
+        assert!(
+            shared.borrow().release_pending.is_some(),
+            "unanswered stays unanswered"
+        );
 
-        assert!(RELEASE_TIMEOUT <= Duration::from_secs(1), "a dead server must not stall exit");
+        assert!(
+            RELEASE_TIMEOUT <= Duration::from_secs(1),
+            "a dead server must not stall exit"
+        );
     }
 }

@@ -58,9 +58,16 @@ pub struct Fidelity {
     gain: Real,
     a1: Real,
     a0: Real,
+    /// Index of the low-frequency-effects channel, when the layout has one.
+    lfe_channel: Option<usize>,
 }
 
 impl Fidelity {
+    /// Tell the stage which channel is the subwoofer, so it can leave it alone.
+    pub fn set_lfe_channel(&mut self, channel: Option<usize>) {
+        self.lfe_channel = channel;
+    }
+
     #[must_use]
     pub fn new(sample_rate: Real) -> Self {
         let mut effect = Self {
@@ -71,6 +78,7 @@ impl Fidelity {
             gain: 0.0,
             a1: 0.0,
             a0: 0.0,
+            lfe_channel: None,
         };
         effect.design();
         effect
@@ -148,6 +156,14 @@ impl Effect for Fidelity {
         }
         for frame in buffer.chunks_exact_mut(channels) {
             for (channel, sample) in frame.iter_mut().enumerate() {
+                // The subwoofer never gets this. `docs/spec/08-dsp-api.md:905-906`: the original
+                // sends the harmonic generator to the front, rear, side and centre instances and
+                // explicitly not to the LFE — and it would not survive the trip anyway, since the
+                // waveshaper's whole output is high-frequency content on a channel that is
+                // low-passed downstream.
+                if Some(channel) == self.lfe_channel {
+                    continue;
+                }
                 *sample = self.tick(channel, *sample);
             }
         }
@@ -222,7 +238,10 @@ mod tests {
         let mut buffer = vec![0.0; 2048];
         f.process(&mut buffer, 2);
         // SOS_FLOAT_BIAS leaks a denormal-sized constant through, which is the point of it.
-        assert!(buffer.iter().all(|s| s.abs() < 1e-20), "silence was not preserved");
+        assert!(
+            buffer.iter().all(|s| s.abs() < 1e-20),
+            "silence was not preserved"
+        );
     }
 
     #[test]
@@ -279,10 +298,12 @@ mod tests {
         let mut f = Fidelity::new(48_000.0);
         f.set_amount(0.8);
         // Signal in the left channel only; the right must stay silent.
-        let mut buffer: Vec<Real> = (0..1024).flat_map(|n| [(n as Real * 0.3).sin(), 0.0]).collect();
+        let mut buffer: Vec<Real> = (0..1024)
+            .flat_map(|n| [(n as Real * 0.3).sin(), 0.0])
+            .collect();
         f.process(&mut buffer, 2);
         assert!(
-            buffer.chunks_exact(2).all(|f| f[1].abs() < 1e-20),
+            buffer.as_chunks::<2>().0.iter().all(|f| f[1].abs() < 1e-20),
             "the right channel picked up the left channel's signal"
         );
     }

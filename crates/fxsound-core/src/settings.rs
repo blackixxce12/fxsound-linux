@@ -41,7 +41,11 @@ pub struct DeviceConfig {
     pub device_name: String,
     /// Preset last selected while this device was active.
     pub preset: String,
-    /// `speaker`, `headphone`, `hdmi`, … — used to pick a default preset for new devices.
+    /// `speaker`, `headphone`, `hdmi`, … as PipeWire spells them.
+    ///
+    /// Recorded so a device can be recognised by kind rather than only by name. Nothing chooses a
+    /// preset from it yet — that would change which preset a user hears when they plug something
+    /// in, which is a decision worth making deliberately rather than inheriting from a comment.
     pub device_form_factor: String,
 }
 
@@ -209,8 +213,11 @@ impl Settings {
     pub fn load() -> Self {
         let path = Self::config_path();
         match std::fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str(&text) {
-                Ok(settings) => settings,
+            Ok(text) => match toml::from_str::<Self>(&text) {
+                Ok(mut settings) => {
+                    settings.sanitise();
+                    settings
+                }
                 Err(err) => {
                     log::warn!("{}: {err}; using defaults", path.display());
                     Self::default()
@@ -226,17 +233,43 @@ impl Settings {
 
     /// Write the settings file, creating the config directory if needed.
     ///
-    /// Writes to a temporary file and renames, so an interrupted save cannot truncate the
-    /// existing settings.
+    /// Durable replace (`crate::atomic`): an interrupted save cannot truncate the existing
+    /// settings, and the temporary file carries the process id rather than a fixed name, so two
+    /// instances saving at once cannot write over each other's half-finished file.
     pub fn save(&self) -> std::io::Result<()> {
-        let dir = Self::config_dir();
-        std::fs::create_dir_all(&dir)?;
-        let text = toml::to_string_pretty(self)
+        // Never write out a value the loader would have to repair; a `nan` in this file is
+        // indistinguishable from one the user typed.
+        let mut checked = self.clone();
+        checked.sanitise();
+        let text = toml::to_string_pretty(&checked)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-        let final_path = Self::config_path();
-        let tmp_path = final_path.with_extension("toml.tmp");
-        std::fs::write(&tmp_path, text)?;
-        std::fs::rename(&tmp_path, &final_path)
+        crate::atomic::write(&Self::config_path(), text.as_bytes())
+    }
+
+    /// Force the DSP fields into the ranges the controls enforce.
+    ///
+    /// This file is the one path into the engine with no validation on it: every other route goes
+    /// through a slider or a command-line parser, but `settings.toml` is plain TOML, which spells
+    /// `nan` and `inf` as ordinary floats and accepts any magnitude. Run on load, so a corrupt or
+    /// hand-edited file cannot reach a filter design, and on save, so the file never records a
+    /// value the loader would have to fix again.
+    pub fn sanitise(&mut self) {
+        use crate::limits::{self, finite};
+
+        let default = Self::default();
+        self.master_gain = finite(
+            self.master_gain,
+            limits::MASTER_GAIN_DB,
+            default.master_gain,
+        );
+        self.balance = finite(self.balance, limits::BALANCE_DB, default.balance);
+        self.volume_leveling = finite(
+            self.volume_leveling,
+            limits::VOLUME_LEVELING,
+            default.volume_leveling,
+        );
+        self.filter_q = finite(self.filter_q, limits::FILTER_Q, default.filter_q);
+        self.num_bands = self.num_bands.clamp(1, crate::eq::MAX_BANDS as u32);
     }
 
     /// The `node.name` FxSound should attach to on launch, for the saved direction.
@@ -286,7 +319,13 @@ impl Settings {
     }
 
     /// Remember which preset was in use for a device.
-    pub fn remember_device_preset(&mut self, node_name: &str, description: &str, preset: &str) {
+    pub fn remember_device_preset(
+        &mut self,
+        node_name: &str,
+        description: &str,
+        preset: &str,
+        form_factor: &str,
+    ) {
         if let Some(existing) = self
             .device_configs
             .iter_mut()
@@ -294,12 +333,18 @@ impl Settings {
         {
             existing.device_name = description.to_owned();
             existing.preset = preset.to_owned();
+            // A device can change what it looks like: a USB dock's port is `line-level` until its
+            // profile says otherwise, and a Bluetooth headset swaps between `headset` and
+            // `headphone` with its profile.
+            if !form_factor.is_empty() {
+                existing.device_form_factor = form_factor.to_owned();
+            }
         } else {
             self.device_configs.push(DeviceConfig {
                 device_id: node_name.to_owned(),
                 device_name: description.to_owned(),
                 preset: preset.to_owned(),
-                device_form_factor: String::new(),
+                device_form_factor: form_factor.to_owned(),
             });
         }
     }
@@ -334,10 +379,72 @@ mod tests {
     #[test]
     fn device_presets_are_remembered_and_updated() {
         let mut s = Settings::default();
-        s.remember_device_preset("alsa_output.pci-0000_00_1f.3", "Speakers", "Rock");
-        assert_eq!(s.preset_for_device("alsa_output.pci-0000_00_1f.3"), Some("Rock"));
-        s.remember_device_preset("alsa_output.pci-0000_00_1f.3", "Speakers", "Jazz");
+        s.remember_device_preset(
+            "alsa_output.pci-0000_00_1f.3",
+            "Speakers",
+            "Rock",
+            "speaker",
+        );
+        assert_eq!(
+            s.preset_for_device("alsa_output.pci-0000_00_1f.3"),
+            Some("Rock")
+        );
+        s.remember_device_preset(
+            "alsa_output.pci-0000_00_1f.3",
+            "Speakers",
+            "Jazz",
+            "headphone",
+        );
         assert_eq!(s.device_configs.len(), 1);
-        assert_eq!(s.preset_for_device("alsa_output.pci-0000_00_1f.3"), Some("Jazz"));
+        assert_eq!(
+            s.preset_for_device("alsa_output.pci-0000_00_1f.3"),
+            Some("Jazz")
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_file_cannot_put_a_non_finite_value_into_the_dsp() {
+        // TOML spells these as ordinary floats, and this file is the only route into the engine
+        // with no slider or argument parser in front of it.
+        let text = "\
+master_gain = nan
+balance = inf
+volume_leveling = -inf
+filter_q = nan
+num_bands = 4000000
+";
+        let mut parsed: Settings = toml::from_str(text).expect("TOML accepts nan and inf");
+        assert!(
+            parsed.master_gain.is_nan(),
+            "the hazard is real before sanitising"
+        );
+
+        parsed.sanitise();
+        let default = Settings::default();
+        // Non-finite falls back to the default rather than clamping: +inf on the master gain
+        // would otherwise mean "maximum boost" to a user whose file was merely corrupted.
+        assert_eq!(parsed.master_gain, default.master_gain);
+        assert_eq!(parsed.balance, default.balance);
+        assert_eq!(parsed.volume_leveling, default.volume_leveling);
+        assert_eq!(parsed.filter_q, default.filter_q);
+        assert_eq!(parsed.num_bands, crate::eq::MAX_BANDS as u32);
+    }
+
+    #[test]
+    fn out_of_range_values_are_pulled_back_to_what_the_controls_allow() {
+        let mut s = Settings {
+            master_gain: 500.0,
+            balance: -99.0,
+            volume_leveling: 12.0,
+            filter_q: 0.1,
+            num_bands: 0,
+            ..Settings::default()
+        };
+        s.sanitise();
+        assert_eq!(s.master_gain, 20.0);
+        assert_eq!(s.balance, -20.0);
+        assert_eq!(s.volume_leveling, 4.0);
+        assert_eq!(s.filter_q, 1.0);
+        assert_eq!(s.num_bands, 1);
     }
 }

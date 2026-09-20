@@ -183,7 +183,10 @@ mod tests {
         b.process(&mut processed_high, 2);
         let settled = processed_high.len() / 2;
         let ratio = rms(&processed_high[settled..]) / rms(&high[settled..]);
-        assert!((ratio - 1.0).abs() < 0.1, "4 kHz changed by a factor of {ratio}");
+        assert!(
+            (ratio - 1.0).abs() < 0.1,
+            "4 kHz changed by a factor of {ratio}"
+        );
     }
 
     #[test]
@@ -194,7 +197,11 @@ mod tests {
         b.set_amount(1.0);
         let expected = calc_parametric(44_100.0, CENTER_HZ, MAX_BOOST_DB, Q);
         assert_eq!(b.coeffs(), expected);
-        assert_eq!(b.coeffs().a1, b.coeffs().b1, "the TDF-II specialisation needs a1 == b1");
+        assert_eq!(
+            b.coeffs().a1,
+            b.coeffs().b1,
+            "the TDF-II specialisation needs a1 == b1"
+        );
     }
 
     #[test]
@@ -205,17 +212,22 @@ mod tests {
         b.set_sample_rate(96_000.0);
         assert_ne!(before, b.coeffs());
         let db = 20.0 * magnitude(&b.coeffs(), CENTER_HZ / 96_000.0).log10();
-        assert!((db - 15.0).abs() < 0.3, "measured {db} dB after the rate change");
+        assert!(
+            (db - 15.0).abs() < 0.3,
+            "measured {db} dB after the rate change"
+        );
     }
 
     #[test]
     fn channels_are_filtered_independently() {
         let mut b = Bass::new(48_000.0);
         b.set_amount(1.0);
-        let mut buffer: Vec<Real> = (0..1024).flat_map(|n| [(n as Real * 0.01).sin(), 0.0]).collect();
+        let mut buffer: Vec<Real> = (0..1024)
+            .flat_map(|n| [(n as Real * 0.01).sin(), 0.0])
+            .collect();
         b.process(&mut buffer, 2);
         assert!(
-            buffer.chunks_exact(2).all(|f| f[1].abs() < 1e-20),
+            buffer.as_chunks::<2>().0.iter().all(|f| f[1].abs() < 1e-20),
             "the right channel picked up the left channel's signal"
         );
     }

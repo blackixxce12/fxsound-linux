@@ -15,8 +15,7 @@
 //! thread and uses [`UiToAudio`] / [`AudioToUi`], which may allocate freely.
 
 use crate::{
-    AudioDevice, AudioStatus, DeviceDirection, Effect, EqBand, NUM_SPECTRUM_BARS, SpectrumFrame,
-    eq,
+    AudioDevice, AudioStatus, DeviceDirection, Effect, EqBand, NUM_SPECTRUM_BARS, SpectrumFrame, eq,
 };
 
 /// A complete, real-time-safe snapshot of everything the DSP engine needs.
@@ -77,15 +76,79 @@ impl DspParams {
     pub fn set_effect(&mut self, effect: Effect, value: f32) {
         self.effects[effect as usize] = value.clamp(0.0, 1.0);
     }
+
+    /// Force every field into a range the DSP can design a filter from.
+    ///
+    /// Called once on the way to the audio thread, so that no stage downstream has to defend
+    /// itself against a value no control could produce. The case that matters is a non-finite
+    /// one: `f32::clamp` returns NaN unchanged, and the equality guard in
+    /// `GraphicEq::set_q_multiplier` then sees `NaN != NaN`, redesigns every band, and installs
+    /// NaN coefficients — from a `filter_q = nan` that a hand-edited `settings.toml` can carry,
+    /// since TOML spells that as a plain float.
+    ///
+    /// Band centres are clamped to the equalizer's own 10 Hz–21 kHz window rather than to the
+    /// ladder, because a preset is allowed to carry its own frequencies.
+    pub fn sanitise(&mut self) {
+        use crate::limits::{self, finite};
+
+        let default = Self::default();
+        for (slot, fallback) in self.effects.iter_mut().zip(default.effects) {
+            *slot = if slot.is_finite() {
+                slot.clamp(0.0, 1.0)
+            } else {
+                fallback
+            };
+        }
+
+        self.num_bands = self.num_bands.clamp(1, eq::MAX_BANDS as u8);
+        // Only the first `num_bands` entries are live — `bands()` slices to exactly that — so the
+        // tail is padding that a default snapshot leaves at zero. Clamping it into the equalizer's
+        // frequency window would rewrite a perfectly valid snapshot, so the padding is only
+        // checked for finiteness.
+        let live = usize::from(self.num_bands).min(eq::MAX_BANDS);
+        for (index, slot) in self.band_center_hz.iter_mut().enumerate() {
+            *slot = if index < live {
+                finite(*slot, 10.0..=21_000.0, 1_000.0)
+            } else if slot.is_finite() {
+                *slot
+            } else {
+                0.0
+            };
+        }
+        for (index, slot) in self.band_boost_db.iter_mut().enumerate() {
+            *slot = if index < live {
+                finite(*slot, eq::MIN_GAIN_DB..=eq::MAX_GAIN_DB, 0.0)
+            } else if slot.is_finite() {
+                *slot
+            } else {
+                0.0
+            };
+        }
+
+        self.filter_q = finite(self.filter_q, limits::FILTER_Q, default.filter_q);
+        self.master_gain_db = finite(
+            self.master_gain_db,
+            limits::MASTER_GAIN_DB,
+            default.master_gain_db,
+        );
+        self.balance = finite(self.balance, limits::BALANCE_DB, default.balance);
+        self.normalization_db = finite(
+            self.normalization_db,
+            limits::NORMALIZATION_DB,
+            default.normalization_db,
+        );
+        self.volume_leveling_db = finite(
+            self.volume_leveling_db,
+            limits::VOLUME_LEVELING,
+            default.volume_leveling_db,
+        );
+    }
 }
 
 impl Default for DspParams {
     fn default() -> Self {
         let mut band_center_hz = [0.0; eq::MAX_BANDS];
-        for (slot, &hz) in band_center_hz
-            .iter_mut()
-            .zip(eq::DEFAULT_CENTERS_HZ.iter())
-        {
+        for (slot, &hz) in band_center_hz.iter_mut().zip(eq::DEFAULT_CENTERS_HZ.iter()) {
             *slot = hz;
         }
         Self {

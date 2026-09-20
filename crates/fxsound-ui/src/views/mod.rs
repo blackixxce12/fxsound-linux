@@ -30,9 +30,9 @@ use crate::layout;
 use crate::state::{PresetEntry, UiAction, UiResponse, UiState};
 use crate::theme::Palette;
 use crate::widgets::combo::SectionHeader;
-use fxsound_core::i18n::tr;
 use crate::widgets::{EqInteraction, FxComboBox, VisualizerAnimation, combo};
 use egui::{Pos2, Rect, Ui, Vec2};
+use fxsound_core::i18n::tr;
 use fxsound_core::{AudioDevice, DeviceDirection, ViewMode};
 
 /// The widget state that has to survive between frames.
@@ -252,6 +252,7 @@ mod tests {
             description: description.to_owned(),
             is_default: false,
             direction,
+            form_factor: "speaker".into(),
         }
     }
 
@@ -353,10 +354,7 @@ mod tests {
         let sections = device_sections(&devices);
         assert_eq!(
             sections.titles,
-            vec![
-                (0, DeviceDirection::Output),
-                (3, DeviceDirection::Input)
-            ]
+            vec![(0, DeviceDirection::Output), (3, DeviceDirection::Input)]
         );
         assert_eq!(sections.separator, Some(3));
         // The titles are the shared contract's words, not a spelling of this module's own.

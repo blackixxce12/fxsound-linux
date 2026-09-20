@@ -40,10 +40,10 @@ use crate::layout;
 use crate::state::{UiAction, UiResponse, UiState};
 use crate::theme::{self, FxColor, Palette};
 use crate::views::{self, ViewScratch, at, titlebar, window_origin, window_rect};
-use fxsound_core::i18n::tr;
 use crate::widgets::icon_button;
 use crate::widgets::{EqualizerWidget, FxSlider, VisualizerWidget};
 use egui::{Align2, CornerRadius, Rect, Ui, Vec2, pos2, vec2};
+use fxsound_core::i18n::tr;
 use fxsound_core::{Effect, ViewMode, scale};
 
 /// The effect captions' JUCE height: `getNormalFont().withHeight(14.0f)`
@@ -311,6 +311,7 @@ mod tests {
                 description: "Built-in Audio Analogue Stereo".to_owned(),
                 is_default: true,
                 direction: fxsound_core::DeviceDirection::Output,
+                form_factor: "speaker".into(),
             }],
             selected_device: Some(0),
             effects: [3.0, 5.0, 7.0, 4.0, 8.0],

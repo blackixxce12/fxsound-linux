@@ -328,7 +328,10 @@ impl AudioEngine {
         Self::start_with(remote, None)
     }
 
-    fn start_with(remote: Option<&str>, language: Option<&str>) -> Result<EngineHandle, AudioError> {
+    fn start_with(
+        remote: Option<&str>,
+        language: Option<&str>,
+    ) -> Result<EngineHandle, AudioError> {
         // Whether the *socket* exists is left to `pw_context_connect`, which resolves
         // `remote.name` itself and reports the failure precisely. What has to be checked first is
         // the thing PipeWire cannot report usefully: no runtime directory at all, which is what a
@@ -444,7 +447,12 @@ impl EngineHandle {
     /// swap, so this is safe to call on every GUI frame and cannot make the audio thread wait. If
     /// the audio thread has not read the previous snapshot yet, that snapshot is simply
     /// superseded — parameters are state, not events.
-    pub fn set_params(&mut self, params: DspParams) {
+    pub fn set_params(&mut self, mut params: DspParams) {
+        // The single gate between everything that can produce a snapshot — sliders, the command
+        // line, a preset file, `settings.toml` — and the filter designs. Doing it here rather
+        // than in each producer means a new caller cannot forget it, and it costs one pass over a
+        // `Copy` struct on the GUI thread, never on the audio thread.
+        params.sanitise();
         self.params.write(params);
     }
 
@@ -601,8 +609,14 @@ mod tests {
         assert_eq!(SINK_DESCRIPTION, "FxSound");
         assert_eq!(OUTPUT_STREAM_DESCRIPTION, "FxSound output");
         assert_eq!(CAPTURE_STREAM_DESCRIPTION, "FxSound capture");
-        assert_eq!(node_description(DeviceDirection::Output, Some("ru")), "FxSound (Вывод)");
-        assert_eq!(node_description(DeviceDirection::Input, Some("ru")), "FxSound (Ввод)");
+        assert_eq!(
+            node_description(DeviceDirection::Output, Some("ru")),
+            "FxSound (Вывод)"
+        );
+        assert_eq!(
+            node_description(DeviceDirection::Input, Some("ru")),
+            "FxSound (Ввод)"
+        );
     }
 
     /// Constructing against a socket that does not exist must return an error rather than panic,

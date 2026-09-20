@@ -20,7 +20,7 @@
 
 mod store;
 
-pub use store::{PresetEntry, PresetStore, PresetSource};
+pub use store::{PresetEntry, PresetSource, PresetStore};
 
 use fxsound_core::{EqBand, Preset, eq};
 use std::fmt::Write as _;
@@ -234,11 +234,22 @@ pub fn load(path: &std::path::Path) -> Result<Preset, PresetError> {
 }
 
 /// Write a preset to disk, creating parent directories as needed.
+///
+/// A durable replace rather than a plain write: this is the one function every preset write goes
+/// through, including the autosave that fires on each preset switch with unsaved edits and again
+/// on shutdown, so an interrupted one would regularly leave a truncated `.fac` where a readable
+/// preset used to be.
 pub fn save(preset: &Preset, path: &std::path::Path) -> Result<(), PresetError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, write(preset))?;
+    fxsound_core::atomic::write(path, write(preset).as_bytes())?;
+    Ok(())
+}
+
+/// As [`save`], but keeps the previous contents as `<path>.fac.bak`.
+///
+/// For the paths where a *user* replaces a preset they authored. The autosave deliberately does
+/// not use this: it rewrites the same files continuously and would bury the directory in copies.
+pub fn save_with_backup(preset: &Preset, path: &std::path::Path) -> Result<(), PresetError> {
+    fxsound_core::atomic::write_with_backup(path, write(preset).as_bytes())?;
     Ok(())
 }
 
@@ -278,10 +289,16 @@ pub fn format_g(value: f32) -> String {
 
     if !(-4..PRECISION).contains(&exponent) {
         let formatted = format!("{:.*e}", (PRECISION - 1) as usize, value);
-        let (mantissa, exp) = formatted.split_once('e').unwrap_or((formatted.as_str(), "0"));
+        let (mantissa, exp) = formatted
+            .split_once('e')
+            .unwrap_or((formatted.as_str(), "0"));
         let mantissa = trim_trailing_zeros(mantissa);
         let exp: i32 = exp.parse().unwrap_or(0);
-        format!("{mantissa}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
+        format!(
+            "{mantissa}e{}{:02}",
+            if exp < 0 { '-' } else { '+' },
+            exp.abs()
+        )
     } else {
         let decimals = (PRECISION - 1 - exponent).max(0) as usize;
         trim_trailing_zeros(&format!("{value:.decimals$}"))
@@ -397,7 +414,16 @@ fn scan_f32(line: &str) -> Option<f32> {
             end = probe;
         }
     }
-    s[..end].parse().ok()
+    // A literal `nan` or `inf` cannot get this far — the scan above requires an ASCII digit —
+    // but an overflowing magnitude can: `1e40` parses cleanly to `+inf`. That value rides into
+    // the preset, and the moment the application autosaves it, `format_g` writes it back as C's
+    // `%g` spelling of infinity, which this scanner then refuses. One bad import makes the
+    // preset permanently unreadable, by this port and by the Windows original alike. Refusing it
+    // here turns it into an error the user is told about at import time instead.
+    s[..end]
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
 }
 
 #[cfg(test)]
@@ -405,12 +431,86 @@ mod tests {
     use super::*;
     use fxsound_core::Effect;
 
-    const JAZZ: &str = include_str!("../../../assets/presets/BonusPresets/Jazz.fac");
+    /// A complete version 9 preset, written out here rather than read from `assets/presets`.
+    ///
+    /// The tests below are about the grammar and about which Main slot feeds which effect, and
+    /// neither has anything to do with how a particular preset is voiced. Reading a shipped `.fac`
+    /// for its expected numbers turned every retune of that file into a test failure, and the
+    /// tempting way out — editing the preset back — would have changed the product to suit the
+    /// suite. The shipped files are still covered, by `round_trips_every_shipped_preset` below and
+    /// by the checks in `fxsound-dsp`, both of which assert properties rather than particular
+    /// values.
+    ///
+    /// The shape is deliberately that of a real file: leading blanks on the indented lines, a
+    /// fractional first-band gain to exercise the `%g` scan, and a zero on the last band.
+    const FIXTURE: &str = "\
+CLASS1 : Effect Type
+9: Version
+Fixture
+0: Double Params Flag
+1: Total number of elements
+50: Main 0
+20: Main 1
+0: Main 2
+0: Main 3
+60: Main 4
+60: Main 5
+0: Element Number
+   0: Param 0
+   0: Param 1
+   0: Param 2
+   0: Param 3
+   0: Param 4
+   0: Param 5
+   0: Param 6
+7: Number of Application Dependent Integers
+0: Number of Application Dependent Reals
+0: Number of Application Dependent Strings
+1: Integer[0]
+1: Integer[1]
+0: Integer[2]
+1: Integer[3]
+1: Integer[4]
+0: Integer[5]
+2: Integer[6]
+10: Number of EQ Bands
+1: On/Off Flag
+Band 1
+   62.5: CF
+   4.72441: Boost/Cut
+Band 2
+   115: CF
+   3: Boost/Cut
+Band 3
+   215: CF
+   1: Boost/Cut
+Band 4
+   400: CF
+   0: Boost/Cut
+Band 5
+   900: CF
+   -2: Boost/Cut
+Band 6
+   1600: CF
+   0: Boost/Cut
+Band 7
+   2900: CF
+   1: Boost/Cut
+Band 8
+   5200: CF
+   2: Boost/Cut
+Band 9
+   9000: CF
+   1.5: Boost/Cut
+Band 10
+   13000: CF
+   0: Boost/Cut
+";
 
     #[test]
-    fn parses_a_shipped_preset() {
-        let preset = parse(JAZZ.as_bytes()).expect("parse Jazz.fac");
-        assert_eq!(preset.name, "Jazz");
+    fn parses_every_field_of_a_version_9_file() {
+        let preset = parse(FIXTURE.as_bytes()).expect("parse the fixture");
+        assert_eq!(preset.name, "Fixture");
         assert_eq!(preset.version, 9.0);
         // "50: Main 0" .. "60: Main 5"
         assert_eq!(preset.main_midi, [50, 20, 0, 0, 60, 60]);
@@ -424,7 +524,7 @@ mod tests {
 
     #[test]
     fn effect_values_use_the_right_slot() {
-        let preset = parse(JAZZ.as_bytes()).expect("parse");
+        let preset = parse(FIXTURE.as_bytes()).expect("parse");
         // Main 0 = 50 is Fidelity, Main 1 = 20 is Surround, Main 3 = 0 is Ambience.
         assert!((preset.effect(Effect::Fidelity) - 50.0 / 127.0).abs() < 1e-6);
         assert!((preset.effect(Effect::Surround) - 20.0 / 127.0).abs() < 1e-6);
@@ -469,11 +569,11 @@ mod tests {
 
     #[test]
     fn accepts_crlf_and_a_missing_final_newline() {
-        let crlf = JAZZ.replace('\n', "\r\n");
+        let crlf = FIXTURE.replace('\n', "\r\n");
         let parsed = parse(crlf.as_bytes()).expect("parse CRLF");
-        assert_eq!(parsed.name, "Jazz");
+        assert_eq!(parsed.name, "Fixture");
 
-        let truncated = JAZZ.trim_end_matches('\n');
+        let truncated = FIXTURE.trim_end_matches('\n');
         let parsed = parse(truncated.as_bytes()).expect("parse without final newline");
         assert_eq!(parsed.eq_bands.len(), 10);
     }
@@ -499,8 +599,7 @@ mod tests {
                 }
 
                 let bytes = std::fs::read(&path).expect("read preset");
-                let first = parse(&bytes)
-                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                let first = parse(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
                 let text = write(&first);
                 let second = parse(text.as_bytes())
                     .unwrap_or_else(|e| panic!("{} re-parse: {e}", path.display()));
@@ -510,5 +609,41 @@ mod tests {
             }
         }
         assert!(checked >= 30, "only found {checked} presets to check");
+    }
+
+    #[test]
+    fn a_gain_that_overflows_an_f32_is_refused_rather_than_becoming_infinity() {
+        // Before this was rejected the value became `+inf`, survived into the running preset, and
+        // was written back by `format_g` in a spelling neither this parser nor the Windows
+        // original can read — so a single bad import cost the user the preset for good.
+        let good = parse(FIXTURE.as_bytes()).expect("the fixture parses");
+
+        let poisoned = FIXTURE.to_owned();
+        let first_band = good.eq_bands[0].boost_db;
+        let needle = crate::format_g(first_band);
+        assert!(
+            poisoned.contains(&needle),
+            "the fixture should contain the first band's gain as written"
+        );
+        let poisoned = poisoned.replacen(&needle, "1e40", 1);
+
+        let err = parse(poisoned.as_bytes()).expect_err("1e40 must not parse");
+        assert!(
+            matches!(err, PresetError::Malformed { .. }),
+            "expected a Malformed error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn every_value_a_preset_can_carry_survives_being_written_and_read_again() {
+        // The property the previous test protects: `parse` and `write` are inverses over exactly
+        // the set of values `parse` can produce.
+        let preset = parse(FIXTURE.as_bytes()).expect("parse");
+        let text = write(&preset);
+        let again = parse(text.as_bytes()).expect("reparse what we just wrote");
+        assert_eq!(preset, again);
+        for band in &again.eq_bands {
+            assert!(band.boost_db.is_finite() && band.center_hz.is_finite());
+        }
     }
 }

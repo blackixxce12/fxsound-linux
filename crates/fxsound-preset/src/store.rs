@@ -53,7 +53,10 @@ impl PresetStore {
 
         // Running from the source tree.
         if let Ok(exe) = std::env::current_exe()
-            && let Some(target_dir) = exe.parent().and_then(|p| p.parent()).and_then(|p| p.parent())
+            && let Some(target_dir) = exe
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
         {
             factory_dirs.push(target_dir.join("assets/presets/Factsoft"));
             factory_dirs.push(target_dir.join("assets/presets/BonusPresets"));
@@ -144,13 +147,11 @@ impl PresetStore {
     /// Returns the preset and whether it came from the autosave, which is what makes the GUI show
     /// the `*` marker.
     pub fn load(&self, name: &str) -> Result<(Preset, bool), PresetError> {
-        let entry = self
-            .find(name)
-            .ok_or_else(|| PresetError::Malformed {
-                line: 0,
-                expected: "a known preset name",
-                found: name.to_owned(),
-            })?;
+        let entry = self.find(name).ok_or_else(|| PresetError::Malformed {
+            line: 0,
+            expected: "a known preset name",
+            found: name.to_owned(),
+        })?;
 
         let autosave = self.autosave_path(name);
         if autosave.is_file() {
@@ -160,7 +161,10 @@ impl PresetStore {
                     preset.name = entry.name.clone();
                     return Ok((preset, true));
                 }
-                Err(err) => log::warn!("{}: {err}; falling back to the original", autosave.display()),
+                Err(err) => log::warn!(
+                    "{}: {err}; falling back to the original",
+                    autosave.display()
+                ),
             }
         }
 
@@ -200,7 +204,8 @@ impl PresetStore {
         let mut to_save = preset.clone();
         to_save.name = name.to_owned();
         let path = self.user_dir.join(format!("{}.fac", sanitise(name)));
-        save(&to_save, &path)?;
+        // The user-facing overwrite: worth keeping the previous version, unlike the autosave.
+        crate::save_with_backup(&to_save, &path)?;
         self.clear_autosave(name);
         self.rescan();
         Ok(path)
@@ -310,7 +315,13 @@ fn collect(dir: &Path, source: PresetSource, out: &mut Vec<PresetEntry>) {
 /// Keep a user-chosen preset name usable as a filename.
 fn sanitise(name: &str) -> String {
     name.chars()
-        .map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c })
+        .map(|c| {
+            if matches!(c, '/' | '\\' | '\0') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -362,9 +373,18 @@ mod tests {
     fn finds_every_shipped_preset() {
         let tmp = tempdir("enumerate");
         let store = store_in(&tmp);
-        assert!(store.entries().len() >= 30, "found {}", store.entries().len());
+        assert!(
+            store.entries().len() >= 30,
+            "found {}",
+            store.entries().len()
+        );
         assert!(store.find("Jazz").is_some());
-        assert!(store.entries().iter().all(|e| e.source == PresetSource::Factory));
+        assert!(
+            store
+                .entries()
+                .iter()
+                .all(|e| e.source == PresetSource::Factory)
+        );
     }
 
     #[test]
@@ -379,12 +399,22 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} is missing from the list"));
             assert_eq!(entry.source, PresetSource::Factory);
             assert!(
-                entry.path.file_stem().unwrap().to_str().unwrap().parse::<u32>().is_ok(),
+                entry
+                    .path
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .parse::<u32>()
+                    .is_ok(),
                 "{name} should come from a numbered file"
             );
         }
         for digit in ["1", "2", "12"] {
-            assert!(store.find(digit).is_none(), "{digit} must not be shown as a name");
+            assert!(
+                store.find(digit).is_none(),
+                "{digit} must not be shown as a name"
+            );
         }
     }
 
@@ -418,7 +448,10 @@ mod tests {
 
         let entry = store.find("Jazz").expect("Jazz still listed");
         assert_eq!(entry.source, PresetSource::User);
-        assert_eq!(store.entries().iter().filter(|e| e.name == "Jazz").count(), 1);
+        assert_eq!(
+            store.entries().iter().filter(|e| e.name == "Jazz").count(),
+            1
+        );
 
         let (reloaded, _) = store.load("Jazz").expect("reload");
         assert_eq!(reloaded.effect(fxsound_core::Effect::Bass), 1.0);
@@ -473,5 +506,38 @@ mod tests {
         assert!(path.is_file());
         let (original, _) = store.load("Metal").expect("load");
         assert_eq!(crate::load(&path).expect("parse export"), original);
+    }
+
+    #[test]
+    fn overwriting_a_user_preset_keeps_the_previous_version_without_listing_it() {
+        let tmp = tempdir("overwrite-backup");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+
+        let mut preset = Preset {
+            name: "Mine".into(),
+            ..Preset::default()
+        };
+        preset.main_midi[0] = 10;
+        store.save_as(&preset, "Mine").expect("first save");
+
+        preset.main_midi[0] = 99;
+        let path = store.save_as(&preset, "Mine").expect("overwrite");
+
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(".bak");
+        let kept = crate::load(std::path::Path::new(&backup)).expect("the backup is a valid .fac");
+        assert_eq!(
+            kept.main_midi[0], 10,
+            "the backup should hold the old value"
+        );
+        assert_eq!(
+            crate::load(&path).expect("load").main_midi[0],
+            99,
+            "the live file should hold the new one"
+        );
+
+        // A `.bak` beside a preset must not become a second entry in the list.
+        let names: Vec<_> = store.entries().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, vec!["Mine".to_owned()], "listed: {names:?}");
     }
 }

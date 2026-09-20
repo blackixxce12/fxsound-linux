@@ -280,8 +280,7 @@ impl ChannelMap {
         use libspa::sys::{
             SPA_AUDIO_CHANNEL_FC, SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR,
             SPA_AUDIO_CHANNEL_LFE, SPA_AUDIO_CHANNEL_MONO, SPA_AUDIO_CHANNEL_RC,
-            SPA_AUDIO_CHANNEL_RL, SPA_AUDIO_CHANNEL_RR, SPA_AUDIO_CHANNEL_SL,
-            SPA_AUDIO_CHANNEL_SR,
+            SPA_AUDIO_CHANNEL_RL, SPA_AUDIO_CHANNEL_RR, SPA_AUDIO_CHANNEL_SL, SPA_AUDIO_CHANNEL_SR,
         };
         let layout: &[u32] = match channels {
             0 | 1 => &[SPA_AUDIO_CHANNEL_MONO],
@@ -343,7 +342,37 @@ impl ChannelMap {
     }
 
     /// Truncate or pad the layout so it describes exactly `channels` channels.
+    /// Index of the low-frequency-effects channel, if the layout has one.
+    ///
+    /// The stages that must not touch the subwoofer need a position, not an index: it sits at 3 in
+    /// a standard 5.1 or 7.1 layout, but a device is free to order its channels differently and
+    /// several do.
     #[must_use]
+    pub fn lfe_index(&self) -> Option<usize> {
+        self.ids()
+            .iter()
+            .position(|&id| id == libspa::sys::SPA_AUDIO_CHANNEL_LFE)
+    }
+
+    /// Indices of the front left and front right channels, when the layout names both.
+    ///
+    /// The two stereo-by-nature effects run one instance over this pair. Finding it by position
+    /// rather than assuming channels 0 and 1 is what stops a device that orders its channels
+    /// differently from having its widener applied across, say, front-left and centre — which is
+    /// audible immediately and impossible for the listener to attribute to FxSound.
+    #[must_use]
+    pub fn front_pair(&self) -> Option<(usize, usize)> {
+        let left = self
+            .ids()
+            .iter()
+            .position(|&id| id == libspa::sys::SPA_AUDIO_CHANNEL_FL)?;
+        let right = self
+            .ids()
+            .iter()
+            .position(|&id| id == libspa::sys::SPA_AUDIO_CHANNEL_FR)?;
+        (left != right).then_some((left, right))
+    }
+
     pub fn resized(self, channels: u32) -> Self {
         if usize::from(self.len) == channels as usize {
             return self;
@@ -510,6 +539,7 @@ impl DeviceInfo {
             description: self.description.clone(),
             is_default: default_for_direction == Some(self.name.as_str()),
             direction: self.direction,
+            form_factor: self.form_factor.key().to_owned(),
         }
     }
 
@@ -995,11 +1025,14 @@ mod tests {
                 }
                 _ => {
                     let start = self.pos;
-                    while self
-                        .bytes
-                        .get(self.pos)
-                        .is_some_and(|&b| b == b'-' || b == b'+' || b == b'.' || b.is_ascii_digit() || b == b'e' || b == b'E')
-                    {
+                    while self.bytes.get(self.pos).is_some_and(|&b| {
+                        b == b'-'
+                            || b == b'+'
+                            || b == b'.'
+                            || b.is_ascii_digit()
+                            || b == b'e'
+                            || b == b'E'
+                    }) {
                         self.pos += 1;
                     }
                     Json::Num(
@@ -1058,8 +1091,7 @@ mod tests {
             .iter()
             .find(|o| {
                 o.get("type") == Some(&Json::Str("PipeWire:Interface:Metadata".to_owned()))
-                    && o.get("props")
-                        .and_then(|p| p.get("metadata.name"))
+                    && o.get("props").and_then(|p| p.get("metadata.name"))
                         == Some(&Json::Str("default".to_owned()))
             })
             .expect("the `default` metadata object is in the fixture");
@@ -1213,7 +1245,10 @@ mod tests {
 
         assert_eq!(alc.object_id, 57);
         assert_eq!(alc.object_serial, Some(57));
-        assert_eq!(alc.description, "Ryzen HD Audio Controller Аналоговый стерео");
+        assert_eq!(
+            alc.description,
+            "Ryzen HD Audio Controller Аналоговый стерео"
+        );
         assert_eq!(alc.nick, "ALC294 Analog");
         assert_eq!(alc.channels, 2);
         assert_eq!(alc.positions.to_property_value(), "FL,FR");
@@ -1228,15 +1263,25 @@ mod tests {
             channels: 0,
             ..alc.clone()
         };
-        assert!(!unknown.is_mono(), "an unknown channel count must not be refused");
+        assert!(
+            !unknown.is_mono(),
+            "an unknown channel count must not be refused"
+        );
         assert!(unknown.channels_unknown());
-        assert_eq!(unknown.clamped_channels(), MIN_CHANNELS, "unknown falls back to stereo");
+        assert_eq!(
+            unknown.clamped_channels(),
+            MIN_CHANNELS,
+            "unknown falls back to stereo"
+        );
 
         let real_mono = DeviceInfo {
             channels: 1,
             ..alc.clone()
         };
-        assert!(real_mono.is_mono(), "a device that says it is mono is still refused");
+        assert!(
+            real_mono.is_mono(),
+            "a device that says it is mono is still refused"
+        );
         assert!(real_mono.is_refused_mono());
         assert_eq!(alc.clamped_channels(), 2);
     }
@@ -1280,7 +1325,12 @@ mod tests {
             MIN_CHANNELS,
             "the capture stream declares stereo and PipeWire's adapter up-mixes"
         );
-        assert_eq!(mono.positions.resized(mono.clamped_channels()).to_property_value(), "FL,FR");
+        assert_eq!(
+            mono.positions
+                .resized(mono.clamped_channels())
+                .to_property_value(),
+            "FL,FR"
+        );
     }
 
     #[test]
@@ -1290,11 +1340,16 @@ mod tests {
             .iter()
             .find(|(_, type_, props)| {
                 type_ == "PipeWire:Interface:Metadata"
-                    && props.iter().any(|(k, v)| k == "metadata.name" && v == "default")
+                    && props
+                        .iter()
+                        .any(|(k, v)| k == "metadata.name" && v == "default")
             })
             .expect("the `default` metadata object is in the fixture");
         assert_eq!(
-            props.iter().find(|(k, _)| k == "metadata.name").map(|(_, v)| v.as_str()),
+            props
+                .iter()
+                .find(|(k, _)| k == "metadata.name")
+                .map(|(_, v)| v.as_str()),
             Some("default")
         );
 
@@ -1331,12 +1386,16 @@ mod tests {
         // The fixture was captured with the USB microphone as the default source and no
         // configured source at all — the normal state of a machine where nobody ever picked one.
         assert_eq!(
-            value(default_key(DeviceDirection::Input)).and_then(parse_default_node_name).as_deref(),
+            value(default_key(DeviceDirection::Input))
+                .and_then(parse_default_node_name)
+                .as_deref(),
             Some("alsa_input.usb-3142_fifine_Microphone-00.analog-stereo")
         );
         assert_eq!(value(configured_default_key(DeviceDirection::Input)), None);
         assert_eq!(
-            value(default_key(DeviceDirection::Output)).and_then(parse_default_node_name).as_deref(),
+            value(default_key(DeviceDirection::Output))
+                .and_then(parse_default_node_name)
+                .as_deref(),
             Some("alsa_output.pci-0000_05_00.6.analog-stereo")
         );
 
@@ -1370,8 +1429,16 @@ mod tests {
             2,
             "one default per direction"
         );
-        assert!(published.iter().any(|d| d.id == 57 && d.is_default && d.direction == DeviceDirection::Output));
-        assert!(published.iter().any(|d| d.id == 56 && d.is_default && d.direction == DeviceDirection::Input));
+        assert!(
+            published
+                .iter()
+                .any(|d| d.id == 57 && d.is_default && d.direction == DeviceDirection::Output)
+        );
+        assert!(
+            published
+                .iter()
+                .any(|d| d.id == 56 && d.is_default && d.direction == DeviceDirection::Input)
+        );
         // The sink half of the USB microphone is not the default of anything.
         assert!(published.iter().any(|d| d.id == 55 && !d.is_default));
     }
@@ -1422,10 +1489,22 @@ mod tests {
             })
         };
 
-        assert_eq!(probe(&[("device.form-factor", "internal")]), FormFactor::Speakers);
-        assert_eq!(probe(&[("device.form-factor", "headphone")]), FormFactor::Headphones);
-        assert_eq!(probe(&[("device.form-factor", "headset")]), FormFactor::Headset);
-        assert_eq!(probe(&[("device.form-factor", "hands-free")]), FormFactor::Handset);
+        assert_eq!(
+            probe(&[("device.form-factor", "internal")]),
+            FormFactor::Speakers
+        );
+        assert_eq!(
+            probe(&[("device.form-factor", "headphone")]),
+            FormFactor::Headphones
+        );
+        assert_eq!(
+            probe(&[("device.form-factor", "headset")]),
+            FormFactor::Headset
+        );
+        assert_eq!(
+            probe(&[("device.form-factor", "hands-free")]),
+            FormFactor::Handset
+        );
         assert_eq!(probe(&[("device.form-factor", "tv")]), FormFactor::Hdmi);
         assert_eq!(
             probe(&[("node.name", "alsa_output.pci-0000_01_00.1.hdmi-stereo")]),
@@ -1437,11 +1516,17 @@ mod tests {
             FormFactor::Spdif
         );
         assert_eq!(
-            probe(&[("device.bus", "bluetooth"), ("api.bluez5.profile", "a2dp-sink")]),
+            probe(&[
+                ("device.bus", "bluetooth"),
+                ("api.bluez5.profile", "a2dp-sink")
+            ]),
             FormFactor::Headphones
         );
         assert_eq!(
-            probe(&[("device.bus", "bluetooth"), ("api.bluez5.profile", "headset-head-unit")]),
+            probe(&[
+                ("device.bus", "bluetooth"),
+                ("api.bluez5.profile", "headset-head-unit")
+            ]),
             FormFactor::Headset
         );
         assert_eq!(probe(&[("device.api", "raop")]), FormFactor::NetworkDevice);
@@ -1616,9 +1701,12 @@ mod tests {
 
         // The same holds for outputs, and a pick that is *not* present still lets rule 2 run.
         let sinks = [sink("speakers", 2), sink("usb-dac", 2)];
-        let selection = choose_output(&sinks, "fxsound_sink", Some("usb-dac"), &[], &memory)
-            .expect("a target");
-        assert_eq!(selection.target, "usb-dac", "internal-mic is not a sink; rule 2 applies");
+        let selection =
+            choose_output(&sinks, "fxsound_sink", Some("usb-dac"), &[], &memory).expect("a target");
+        assert_eq!(
+            selection.target, "usb-dac",
+            "internal-mic is not a sink; rule 2 applies"
+        );
     }
 
     #[test]
