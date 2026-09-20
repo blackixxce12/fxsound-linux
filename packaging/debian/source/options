@@ -1,0 +1,5 @@
+# Building the source package straight out of a git checkout, rather than from
+# an unpacked orig tarball, otherwise drowns in the build tree and in the
+# artefacts makepkg leaves behind. None of these are ever in the orig tarball.
+extend-diff-ignore = "^(target|dist|vendor|packaging/pkg|packaging/src)/"
+extend-diff-ignore = "^packaging/.*\.pkg\.tar\.zst$"

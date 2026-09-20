@@ -1,0 +1,132 @@
+#!/usr/bin/make -f
+# -*- makefile -*-
+#
+# Debian packaging for the FxSound Linux port.
+#
+# This is a plain dh sequence with the cargo steps overridden by hand. dh-cargo
+# is deliberately not used: it expects every dependency to exist as a
+# librust-*-dev package, which is not the case here and is not a gap this file
+# can close. See the long comment at the top of debian/control.
+
+export DH_VERBOSE = 1
+
+# rust-toolchain.toml pins channel = "1.98.1". Only rustup's proxies read that
+# file, and on a build host that happens to have rustup installed the proxy
+# tries to *download* the pinned toolchain — which fails on a builder with no
+# network, with an error that says nothing about rust-toolchain.toml. Setting
+# RUSTUP_TOOLCHAIN makes the pin a no-op and the build uses whatever cargo is
+# on PATH. packaging/PKGBUILD does the same thing for the same reason.
+#
+# This does NOT get past `rust-version = "1.98.1"` in Cargo.toml, which cargo
+# enforces itself against any rustc. Nothing in this file can; that is what the
+# versioned Build-Depends on rustc is for.
+export RUSTUP_TOOLCHAIN = stable
+
+# Keep cargo's scratch inside the build tree. A builder has no writable HOME,
+# and leaving CARGO_HOME at ~/.cargo makes the result depend on whatever the
+# machine downloaded for some other package.
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+export CARGO_TARGET_DIR = $(CURDIR)/target
+
+# The workspace's release profile already sets opt-level 3, thin LTO,
+# codegen-units = 1 and panic = "abort". Do not pass -C flags here that would
+# fight it; in particular panic = "abort" is load-bearing, because the audio
+# callback must not unwind across the PipeWire C frame above it.
+CARGO_FLAGS = --release --locked
+
+# `cargo vendor` + debian/cargo-config turns this into an offline build; see
+# README.Debian. It is opt-in because a plain local build should not need it.
+ifneq (,$(wildcard $(CURDIR)/vendor/.cargo-checksum-marker))
+CARGO_FLAGS += --offline
+endif
+
+ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+CARGO_FLAGS += -j$(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+endif
+
+%:
+	dh $@
+
+# There is no ./configure, and letting dh guess a build system here only leads
+# to it finding one of the crates' build scripts.
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	cargo build $(CARGO_FLAGS) --bin fxsound
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	# Nothing in the suite touches the live PipeWire graph, the session bus or
+	# the user's settings file, so it is safe in a chroot with no audio and no
+	# session.
+	cargo test $(CARGO_FLAGS) --workspace
+endif
+
+override_dh_auto_clean:
+	rm -rf $(CURDIR)/debian/cargo-home
+	rm -rf $(CURDIR)/target
+
+# Staged into debian/tmp rather than installed straight into the package,
+# because three of these files are renamed on the way in and dh_install cannot
+# rename. debian/fxsound-linux.install then picks the whole tree up, and
+# dh_missing will complain if anything staged here is left behind.
+#
+# The layout follows packaging/PKGBUILD, which is the authority on it. One part
+# is not a matter of taste: /usr/share/fxsound/presets is hardcoded in
+# crates/fxsound-preset/src/store.rs:65 and crates/fxsound-preset/src/input.rs:181
+# as one of two search prefixes. Move the presets to a path derived from the
+# package name and the application starts with an empty preset list.
+override_dh_auto_install:
+	install -D -m 0755 target/release/fxsound \
+		debian/tmp/usr/bin/fxsound
+
+	# `*.fac` and not the whole directory: assets/presets/BonusPresets also
+	# carries a zip of the same presets and a MeaningfulPresets/ subdirectory,
+	# and neither belongs in a package.
+	set -e; for dir in Factsoft BonusPresets; do \
+		install -d debian/tmp/usr/share/fxsound/presets/$$dir; \
+		install -m 0644 assets/presets/$$dir/*.fac \
+			-t debian/tmp/usr/share/fxsound/presets/$$dir/; \
+	done
+
+	# The voice presets are TOML, not .fac: the .fac format is a byte-for-byte
+	# contract with the Windows build and has nowhere to put a gate threshold.
+	install -d debian/tmp/usr/share/fxsound/presets/Input
+	install -m 0644 assets/presets/Input/*.toml \
+		-t debian/tmp/usr/share/fxsound/presets/Input/
+
+	install -D -m 0644 packaging/fxsound.desktop \
+		debian/tmp/usr/share/applications/com.fxsound.FxSound.desktop
+
+	# /usr/lib/systemd/user is where debhelper 13 puts user units, and it is
+	# correct for both Debian 13 and Ubuntu 24.04. See the note on
+	# dh_installsystemduser below for why this is installed by hand.
+	install -D -m 0644 packaging/fxsound.service \
+		debian/tmp/usr/lib/systemd/user/fxsound.service
+
+	install -D -m 0644 assets/images/fxsound_large.png \
+		debian/tmp/usr/share/icons/hicolor/256x256/apps/fxsound.png
+	install -D -m 0644 assets/images/fxsound.png \
+		debian/tmp/usr/share/icons/hicolor/32x32/apps/fxsound.png
+
+override_dh_installchangelogs:
+	dh_installchangelogs CHANGELOG.md
+
+# dh_installsystemduser would want the unit at
+# debian/fxsound-linux.fxsound.user.service — a second copy of
+# packaging/fxsound.service that would quietly drift out of sync with the one
+# the Arch package and the release tarball ship. It is installed in
+# override_dh_auto_install instead.
+#
+# The other half of this decision: the unit is not enabled on install. The
+# desktop entry already starts FxSound, and an enabled user unit on top of it
+# puts two instances in a race for the control socket in
+# $XDG_RUNTIME_DIR/fxsound — the loser exits, but which one that is depends on
+# the session's startup order. debian/fxsound-linux.postrm still cleans up
+# after someone who enabled it by hand.
+override_dh_installsystemduser:
+
+# dwz and the debug info a thin-LTO Rust build emits do not get on; this is a
+# standard override for Rust packages. dh_strip still produces the dbgsym
+# package, so the debug symbols are not lost, only left unshared.
+override_dh_dwz:

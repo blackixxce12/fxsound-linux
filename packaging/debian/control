@@ -1,0 +1,144 @@
+# Rust, and why this source package does not build on a stock Debian 13 or
+# Ubuntu 24.04 buildd
+# ---------------------------------------------------------------------------
+# This is the first question a Debian maintainer asks about a Rust package, so
+# it is answered here rather than buried in README.Debian.
+#
+# The workspace pins the toolchain twice, and the two pins fail differently.
+#
+#   1. rust-toolchain.toml says channel = "1.98.1". That file is read by
+#      rustup's proxy binaries and by nothing else — /usr/bin/cargo from
+#      Debian's `cargo` package ignores it completely. It does bite when the
+#      build host happens to have rustup installed: the proxy then tries to
+#      *download* 1.98.1, and on a network-isolated builder that fails with a
+#      message about a missing toolchain that looks nothing like the real
+#      problem. debian/rules exports RUSTUP_TOOLCHAIN=stable to defuse it,
+#      which is the same trick packaging/PKGBUILD uses.
+#
+#   2. Cargo.toml says rust-version = "1.98.1". Cargo enforces that one itself,
+#      with any rustc, and refuses the build outright: "package `fxsound-app
+#      v0.3.0` cannot be built because it requires rustc 1.98.1 or newer".
+#      Exporting RUSTUP_TOOLCHAIN does nothing about it. Neither does removing
+#      rust-toolchain.toml.
+#
+# Debian 13 (trixie) ships rustc 1.85; Ubuntu 24.04 (noble) ships 1.75, with
+# rustc-1.80 available alongside it. 1.85 is the first release to stabilise
+# edition 2024, which this workspace also requires — so trixie clears the
+# edition gate and still trips over the rust-version floor, and noble clears
+# neither. Until a rustc >= 1.98 reaches the archive (backports, or a later
+# release), the honest position is that this package is built against a
+# toolchain that is not the distribution's: rustup, `apt install rustup`, or a
+# container image. The build dependency below is therefore written with a
+# version that stock trixie cannot satisfy. That is deliberate: an unversioned
+# `rustc` would let apt install a toolchain that then fails deep inside cargo
+# with a message the person reading the log has to decode.
+#
+# Lowering rust-version in Cargo.toml to match the distribution's rustc is the
+# obvious-looking fix and it is not one: the floor is there because the code
+# uses edition-2024 and 1.98 language features, so the build fails later and
+# with worse errors instead of failing at the gate.
+#
+# The second question: this package vendors nothing and resolves crates from
+# crates.io through Cargo.lock. That is fine for a locally built .deb, a PPA or
+# a third-party repository, and it is NOT acceptable for an upload to the
+# Debian archive, which needs every dependency as a librust-*-dev package and a
+# dh-cargo build. Packaging several hundred crates is a separate project; this
+# tree does not pretend otherwise. See README.Debian for the `cargo vendor`
+# route, which gets as far as an offline, self-contained build without
+# attempting the archive's crate-per-package model.
+Source: fxsound-linux
+Section: sound
+Priority: optional
+Maintainer: FxSound Linux port contributors <blackixxce12@users.noreply.github.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ pkg-config,
+# pipewire-sys links against libpipewire and runs bindgen over its headers.
+ libpipewire-0.3-dev,
+# libclang-dev is not optional: bindgen loads libclang.so at build time and
+# fails with "Unable to find libclang" without it. A build only appears to work
+# without it on a machine that has clang installed for something else.
+ libclang-dev,
+# See the note at the top of this file before touching these two.
+ rustc (>= 1.98.1~),
+ cargo (>= 1.98.1~),
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+Homepage: https://github.com/blackixxce12/fxsound-linux
+Vcs-Git: https://github.com/blackixxce12/fxsound-linux.git
+Vcs-Browser: https://github.com/blackixxce12/fxsound-linux
+
+Package: fxsound-linux
+Architecture: any
+# Most of the graphics stack is opened with dlopen() rather than linked, so
+# dpkg-shlibdeps cannot see it and every one of those libraries has to be named
+# here by hand. `objdump -p target/release/fxsound` lists only libpipewire-0.3,
+# libgcc_s, libm and libc; everything below that line is a string inside the
+# binary that libloading resolves at startup. Drop one of them and the package
+# installs cleanly and then fails to open a window, which is the worst of both
+# worlds.
+#
+# ${shlibs:Depends} covers libc6, libgcc-s1 and libpipewire-0.3-0 with proper
+# version bounds, so those are deliberately not repeated here.
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+# The daemon, not just the client library: FxSound creates a virtual sink in
+# the PipeWire graph and has nothing to do without one.
+ pipewire (>= 1.0),
+# dlopen: libEGL.so.1 / libGL.so.1, through glutin.
+ libegl1,
+ libgl1,
+# dlopen: libwayland-client.so.0 / libwayland-egl.so.1, through winit.
+ libwayland-client0,
+ libwayland-egl1,
+# dlopen: libxkbcommon.so.0 and libxkbcommon-x11.so.0, for keyboard handling on
+# both backends.
+ libxkbcommon0,
+ libxkbcommon-x11-0,
+# dlopen: the X11 half of winit. eframe is built with both the `wayland` and
+# `x11` features, so an X11 or XWayland session uses these and a Wayland
+# session does not. They are Depends rather than Recommends because the
+# fallback happens at runtime, inside the binary, and a package that works only
+# on one of the two session types would be a surprise.
+ libx11-6,
+ libx11-xcb1,
+ libxcursor1,
+ libxi6,
+ libxrender1,
+# dlopen: libdbus-1.so.3, for the StatusNotifierItem tray and for desktop
+# notifications.
+ libdbus-1-3,
+Recommends:
+# Switching the session's default sink is a session-manager operation; without
+# one, FxSound creates its sink and nothing moves onto it.
+ wireplumber,
+# Native file dialogs for preset import and export, through the portal.
+ xdg-desktop-portal,
+# egui embeds its own base faces, so this is not required to start — it is what
+# lets the window fall back to a system face for a script the embedded fonts do
+# not cover.
+ fontconfig,
+Suggests:
+# Only relevant if something on the machine still speaks PulseAudio.
+ pipewire-pulse,
+Provides: fxsound
+Conflicts: fxsound
+Replaces: fxsound
+Description: system-wide audio enhancement for PipeWire
+ FxSound processes everything the machine plays — a ten-band equalizer plus
+ fidelity, ambience, surround, dynamic boost and bass — by presenting itself to
+ PipeWire as a virtual sink that applications play into and forwarding the
+ processed result to the real device. Pointing it at a microphone instead runs
+ a separate voice chain (denoise, high-pass, expander, EQ, de-esser, compressor,
+ limiter) and publishes a virtual source.
+ .
+ This is a native Linux port of the Windows application, written in Rust with
+ egui. It is a fork rather than a wrapper: the GUI, the device layer and the
+ persistence are new, but the DSP is ported line by line from the original C,
+ so a preset voiced on Windows sounds the same here. The factory and bonus
+ .fac presets are installed alongside it and are the upstream files unchanged.
+ .
+ A Wayland client cannot grab global shortcuts, so the keyboard bindings live
+ in the compositor and call back into the running instance over a control
+ socket; fxsound(1) documents the command line that makes that work.

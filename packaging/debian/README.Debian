@@ -1,0 +1,122 @@
+fxsound-linux for Debian and Ubuntu
+===================================
+
+Two things about this tree are unusual and both have reasons.
+
+
+1. debian/ lives under packaging/
+---------------------------------
+
+dpkg-buildpackage insists on ./debian at the root of the source tree. This
+repository keeps every distribution's packaging under packaging/ — the Arch
+PKGBUILD, the two AUR recipes, the desktop entry, the systemd unit — and
+putting a bare debian/ at the root next to Cargo.toml would be the one
+exception. So: symlink it before building.
+
+    cd /path/to/fxsound-linux
+    ln -sfn packaging/debian debian
+    dpkg-buildpackage -us -uc -b
+
+The symlink is in .gitignore's spirit but not in .gitignore; remove it when you
+are done, or add it. `dpkg-source` follows the symlink and the resulting source
+package has a normal debian/ directory, so nothing downstream sees the
+arrangement.
+
+
+2. The Rust toolchain
+---------------------
+
+The long version is at the top of debian/control and it is worth reading before
+filing a bug about the build failing. The short version:
+
+  * rust-toolchain.toml pins 1.98.1, and only rustup reads that file.
+    debian/rules exports RUSTUP_TOOLCHAIN=stable so a build host that happens
+    to have rustup installed does not try to download a toolchain it cannot
+    reach.
+
+  * Cargo.toml's `rust-version = "1.98.1"` is enforced by cargo itself against
+    any rustc, and nothing in debian/ can get past it.
+
+  * Debian 13 ships rustc 1.85, Ubuntu 24.04 ships 1.75. Neither satisfies the
+    floor, so Build-Depends names `rustc (>= 1.98.1~)` and apt will tell you so
+    up front rather than letting cargo fail halfway through.
+
+In practice that means building with a toolchain from rustup or from a
+container, not from the archive, until a rustc >= 1.98 lands. Do not "fix" it
+by lowering rust-version: the floor is there because the code uses edition-2024
+and 1.98 features, and lowering it just moves the failure somewhere less
+legible.
+
+
+Building offline
+----------------
+
+A builder with no network needs the crates vendored into the source package:
+
+    mkdir -p .cargo
+    cargo vendor vendor/ > .cargo/config.toml
+    touch vendor/.cargo-checksum-marker
+
+debian/rules adds --offline to the cargo invocation when
+vendor/.cargo-checksum-marker exists, so the marker file is the switch. Note
+that vendoring is enough for an offline build and is *not* enough for an upload
+to the Debian archive, which wants every crate as its own librust-*-dev source
+package. That is a different and much larger project.
+
+
+Building a .deb without dpkg-deb
+--------------------------------
+
+packaging/build-deb.sh assembles a working .deb out of an already-built binary
+using nothing but ar, tar and gzip. A .deb is an ar archive of three members —
+debian-binary, control.tar.gz, data.tar.gz — and that is entirely reproducible
+without any part of dpkg being installed. It exists for two situations: a
+developer on a non-Debian machine who wants to hand someone a .deb, and a CI
+runner where installing debhelper is more trouble than it is worth.
+
+    cargo build --release --bin fxsound
+    ./packaging/build-deb.sh
+
+The result lands in dist/. It reads its version from debian/changelog and its
+dependencies from debian/control, so the two stay in step, but it is not a
+substitute for dpkg-buildpackage: it does no dpkg-shlibdeps, so the library
+dependencies it writes have no version bounds, and it builds no source package
+and no dbgsym. Run `./packaging/build-deb.sh --help` for the options.
+
+
+Decisions you might otherwise have to rediscover
+------------------------------------------------
+
+* /usr/share/fxsound/presets is not a name this packaging chose. It is
+  hardcoded in crates/fxsound-preset/src/store.rs:65 and input.rs:181 as one of
+  two search prefixes (the other is /usr/local/share/fxsound). Install the
+  presets under a path derived from the package name instead and you get an
+  application that starts fine and has no presets.
+
+* The systemd user unit is installed and deliberately not enabled. The desktop
+  entry already starts FxSound; an enabled user unit on top of that puts two
+  processes in a race for the control socket in $XDG_RUNTIME_DIR/fxsound. The
+  loser exits cleanly, but which one loses depends on the session's startup
+  order, which is not a thing to leave to chance. `systemctl --user enable
+  --now fxsound` turns it on for anyone who wants it, and debian/*.postrm
+  cleans up after them on removal.
+
+* LICENSE is not installed into /usr/share/doc. The Arch package installs it
+  because that is Arch's convention; Debian's is debian/copyright, which
+  carries the full AGPL-3 text because base-files does not ship AGPL-3 in
+  /usr/share/common-licenses (it has GPL-3 and LGPL-3, but not this one).
+
+* There is no postinst. The icon cache and the desktop database are updated by
+  dpkg triggers that hicolor-icon-theme and desktop-file-utils declare on
+  /usr/share/icons/hicolor and /usr/share/applications; shipping files there is
+  all that is needed to activate them.
+
+* Almost the whole graphics stack is dlopen()ed rather than linked.
+  `objdump -p usr/bin/fxsound` lists five NEEDED entries; libEGL, libGL, the
+  Wayland client libraries, libxkbcommon and the X11 libraries are strings
+  inside the binary that libloading resolves at startup. dpkg-shlibdeps cannot
+  see any of them, which is why debian/control names them by hand. If the
+  package ever installs cleanly and then fails to open a window, that list is
+  the first place to look.
+
+ -- FxSound Linux port contributors <blackixxce12@users.noreply.github.com>  Mon, 21 Sep 2026 02:00:00 +0400

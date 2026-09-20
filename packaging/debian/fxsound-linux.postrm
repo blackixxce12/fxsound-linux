@@ -1,0 +1,38 @@
+#!/bin/sh
+#
+# The package installs /usr/lib/systemd/user/fxsound.service but does not
+# enable it (see debian/rules). Someone who enabled it by hand, though, has
+# symlinks under ~/.config/systemd/user or /etc/systemd/user pointing at a unit
+# file this package is about to remove, and systemd will complain about them on
+# every `systemctl --user daemon-reload` from then on. deb-systemd-user-helper
+# is the tool that knows where those symlinks can be and is allowed to remove
+# them; it is what dh_installsystemduser would have generated a call to.
+#
+# Nothing here touches the user's own configuration under ~/.config/fxsound or
+# their saved presets under ~/.local/share/fxsound. A package removal is not
+# consent to delete someone's work, and `purge` is about the package's files,
+# not about files the program wrote while it ran.
+set -e
+
+case "$1" in
+    remove)
+        if [ -x /usr/bin/deb-systemd-user-helper ]; then
+            deb-systemd-user-helper disable 'fxsound.service' >/dev/null || true
+        fi
+        ;;
+    purge)
+        if [ -x /usr/bin/deb-systemd-user-helper ]; then
+            deb-systemd-user-helper purge 'fxsound.service' >/dev/null || true
+        fi
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

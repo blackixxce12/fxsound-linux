@@ -1,0 +1,9 @@
+# Everything is staged into debian/tmp by override_dh_auto_install, because
+# three files are renamed on the way in and dh_install cannot rename. These
+# five lines have to cover the whole of debian/tmp or dh_missing fails the
+# build — which is the point of listing them rather than globbing.
+usr/bin/fxsound
+usr/share/fxsound/presets
+usr/share/applications/com.fxsound.FxSound.desktop
+usr/lib/systemd/user/fxsound.service
+usr/share/icons/hicolor

@@ -1,0 +1,8 @@
+version=4
+
+# Upstream tags releases as vX.Y.Z and GitHub generates the tarball; there is
+# no separate upstream tarball to watch for. The binary tarball attached to the
+# release is not a source tarball and is deliberately not matched here.
+opts="filenamemangle=s%(?:.*?)?v?(\d[\d.]*)\.tar\.gz%fxsound-linux-$1.tar.gz%" \
+  https://github.com/blackixxce12/fxsound-linux/tags \
+  (?:.*?/)?v?(\d[\d.]*)\.tar\.gz debian uupdate

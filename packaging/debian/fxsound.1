@@ -1,0 +1,326 @@
+.\" Manual page for the FxSound Linux port.
+.\"
+.\" Written for the Debian package because upstream ships none. The option list
+.\" is taken from crates/fxsound-app/src/cli.rs; if an option is added there and
+.\" not here, the two have drifted and cli.rs is the one that is right.
+.\"
+.\" Copyright (C) 2026 FxSound Linux port contributors
+.\" Licensed under the GNU Affero General Public License, version 3 or later.
+.TH FXSOUND 1 "2026-09-21" "fxsound 0.3.0" "User Commands"
+.SH NAME
+fxsound \- system-wide audio enhancement for PipeWire
+.SH SYNOPSIS
+.B fxsound
+.RI [ OPTION ]...
+.SH DESCRIPTION
+.B fxsound
+presents itself to PipeWire as a virtual sink, processes everything
+applications play into it \(en a ten-band equalizer plus fidelity, ambience,
+surround, dynamic boost and bass \(en and forwards the result to the real
+output device. Pointed at a microphone instead, it runs a separate voice chain
+(denoise, high-pass, downward expander, equalizer, de-esser, compressor, makeup
+gain, look-ahead limiter) and publishes a virtual source.
+.PP
+Run with no options,
+.B fxsound
+starts and shows its window. If an instance is already running, the second
+process does not start a second instance: it forwards its command line to the
+first over a control socket in
+.IR $XDG_RUNTIME_DIR/fxsound ,
+raises that instance's window and exits. Every option below therefore works
+both as a startup option and as a way to drive an instance that is already
+running.
+.PP
+The one exception is
+.BR \-\-status ,
+which prints and exits without raising anything.
+.PP
+This forwarding is what makes keyboard shortcuts possible. A Wayland client
+cannot grab global shortcuts, by design, so the compositor owns the binding and
+calls
+.B fxsound
+with the matching option; see
+.B EXAMPLES
+below.
+.SH OPTIONS
+.SS Processing
+.TP
+.BI \-\-power= 0|1|toggle
+Turn audio processing on or off. Any non-zero integer means on;
+.B toggle
+inverts the current state.
+.TP
+.BI \-\-set_effect= NAME:VALUE[,NAME:VALUE...]
+Set effect levels on the slider scale,
+.RB 0 \(en 10 .
+Accepted names are
+.BR fidelity " (also " clarity "), " ambience ", " surround ", "
+.BR dynamicboost " (also " dynamic_boost ") and " bass " (also"
+.BR bassboost ", " bass_boost ).
+At most five pairs, since there are five effects.
+.TP
+.BI \-\-num_bands= N
+Number of equalizer bands. Only 5, 10, 15, 20 and 31 are accepted; anything
+else is an error rather than a silent fallback.
+.TP
+.BI \-\-set_band_freq= BAND:HZ[,BAND:HZ...]
+Move band centre frequencies. Band indices are 0-based. The outer bound is
+20\(en20000 Hz; the usable range for any one band also depends on its
+neighbours and is enforced by the running instance.
+.TP
+.BI \-\-set_band_gain= BAND:DB[,BAND:DB...]
+Set band gains in dB, 0-based band indices, gain
+.RB \-12 \(en+12 .
+.TP
+.BI \-\-filter_q= Q
+Equalizer filter Q,
+.RB 1.0 \(en 3.0 ,
+rounded to the nearest 0.5 \(en the step size of the equivalent slider.
+.TP
+.BI \-\-balance= DB
+Stereo balance,
+.RB \-20 \(en+20
+dB, rounded to a whole number. Positive pans right.
+.TP
+.BI \-\-master_gain= DB
+Master gain,
+.RB \-20 \(en+20
+dB, rounded to a whole number.
+.TP
+.BI \-\-volume_leveling= AMOUNT
+Volume levelling amount,
+.RB 0.0 \(en 4.0 ,
+rounded to the nearest 0.5. The single-l American spelling is the Windows
+build's and is kept verbatim.
+.SS Presets
+.TP
+.BI \-\-preset= NAME
+Select a preset by its exact, case-sensitive name.
+.TP
+.BI \-\-save_preset= NAME
+Save the current modified settings as a new user preset.
+.TP
+.B \-\-overwrite_preset
+Overwrite the selected user preset with its unsaved changes.
+.TP
+.B \-\-undo_preset
+Discard the selected preset's unsaved changes.
+.TP
+.BI \-\-rename_preset= NAME
+Rename the selected user preset.
+.TP
+.B \-\-delete_preset
+Delete the selected user preset.
+.PP
+A preset name becomes a
+.I .fac
+filename, and preset files are meant to travel between Linux and Windows, so
+the Windows reserved characters
+.RB ( < " " > " " : " " \(dq " " / " " \e " " | " " ? " " * )
+are stripped from a name and the result is truncated to 64 characters.
+.SS Device and window
+.TP
+.BI \-\-output= DEVICE
+Select the device by its exact name \(en a playback device, or a microphone.
+The name is the PipeWire
+.IR node.description ;
+.I node.name
+is accepted too, because that is what the settings file persists. Naming a
+capture device switches FxSound into its input mode. The option keeps its
+Windows spelling regardless of which direction it selects.
+.TP
+.BI \-\-view= 1|2
+Switch the window between the Lite (1) and Pro (2) layouts.
+.TP
+.BI \-\-language= CODE
+Display language, for example
+.BR en ", " ru ", " fr .
+.TP
+.BR \-\-run_minimized ", " \-\-hide
+Start without showing the window, or hide the window of a running instance.
+This is what the systemd user unit and the autostart entry invoke.
+.TP
+.B \-\-show
+Show and raise the window of the running instance.
+.SS Shortcut targets
+.PP
+These exist so a compositor keybinding has something to call. They have no
+Windows counterpart, where the application registers global hotkeys itself.
+.TP
+.B \-\-toggle\-power
+Toggle audio processing.
+.TP
+.B \-\-toggle\-window
+Show the window if it is hidden, hide it if it is showing \(en the same toggle
+a left click on the tray icon performs.
+.TP
+.B \-\-next\-preset
+Select the next preset, wrapping.
+.TP
+.B \-\-prev\-preset
+Select the previous preset, wrapping.
+.TP
+.B \-\-next\-output
+Cycle to the next usable device of the current direction: the next playback
+device, or the next microphone while FxSound sits behind one. It never crosses
+from one direction into the other.
+.SS Control
+.TP
+.B \-\-status
+Print the running instance's state on standard output and exit, one
+.I key: value
+line per item. Every other option on the same command line is ignored.
+.TP
+.B \-\-json
+Print the
+.B \-\-status
+report as a single JSON object instead of as lines. Ignored unless
+.B \-\-status
+is given, and not the default: the line format is what existing scripts
+already grep.
+.TP
+.B \-\-quit
+Quit the running instance, autosaving a modified preset first.
+.TP
+.BR \-h ", " \-\-help
+Print a usage summary and exit.
+.TP
+.BR \-V ", " \-\-version
+Print the version and exit.
+.PP
+Options whose Windows spelling uses underscores also accept the hyphenated
+form:
+.B \-\-num\-bands
+and
+.B \-\-num_bands
+are the same option. The hyphenated spellings are hidden from
+.BR \-\-help .
+.SH EXIT STATUS
+.TP
+.B 0
+Success. For a forwarded command line, this means the running instance accepted
+it, not that the effect is audible yet.
+.TP
+.B 2
+The command line could not be parsed \(en an unknown option, or a value outside
+its range.
+.PP
+Any other non-zero status is a failure to start or a failure to reach a running
+instance.
+.SH ENVIRONMENT
+.TP
+.B XDG_RUNTIME_DIR
+Holds the instance lock and the control socket. When the session provides none,
+.IB /tmp/fxsound- uid
+is used instead.
+.TP
+.B XDG_CONFIG_HOME
+Settings live under
+.IR $XDG_CONFIG_HOME/fxsound ,
+defaulting to
+.IR ~/.config/fxsound .
+.TP
+.B XDG_DATA_HOME
+User presets live under
+.IR $XDG_DATA_HOME/fxsound/presets ,
+defaulting to
+.IR ~/.local/share/fxsound/presets .
+.TP
+.B RUST_LOG
+Log filter, in the usual
+.B env_logger
+syntax, for example
+.BR RUST_LOG=debug .
+.SH FILES
+.TP
+.I /usr/share/fxsound/presets/Factsoft/
+Factory presets, in the
+.I .fac
+format shared with the Windows build.
+.TP
+.I /usr/share/fxsound/presets/BonusPresets/
+Bonus presets, same format.
+.TP
+.I /usr/share/fxsound/presets/Input/
+Voice presets for the microphone chain, in TOML. They are TOML rather than
+.I .fac
+because the
+.I .fac
+format is a byte-for-byte contract with the Windows build and has nowhere to
+put a gate threshold.
+.TP
+.I ~/.local/share/fxsound/presets/
+Imported and user-saved presets.
+.TP
+.I ~/.config/fxsound/settings.toml
+Settings. A corrupt file is never fatal: the defaults are used and the audio
+still comes up.
+.TP
+.I $XDG_RUNTIME_DIR/fxsound/instance.lock
+Holds the running instance's pid under an exclusive
+.BR flock (2).
+.TP
+.I $XDG_RUNTIME_DIR/fxsound/instance.sock
+The control socket. One JSON line per request, one per reply.
+.TP
+.I /usr/lib/systemd/user/fxsound.service
+A systemd user unit, installed but not enabled. See
+.B NOTES
+below.
+.SH EXAMPLES
+Mute the processing from a compositor keybinding, in Hyprland:
+.PP
+.RS 4
+.EX
+bind = CTRL SHIFT, Q, exec, fxsound \-\-toggle\-power
+bind = CTRL SHIFT, E, exec, fxsound \-\-toggle\-window
+bind = CTRL SHIFT, A, exec, fxsound \-\-next\-preset
+.EE
+.RE
+.PP
+A worked set of these is installed at
+.IR /usr/share/doc/fxsound\-linux/examples/hyprland.conf.example .
+.PP
+Ask a running instance what it is doing:
+.PP
+.RS 4
+.EX
+fxsound \-\-status \-\-json | jq .
+.EE
+.RE
+.PP
+Select a preset and lift the bass without opening the window:
+.PP
+.RS 4
+.EX
+fxsound \-\-preset=Rock \-\-set_effect=bass:7,ambience:3
+.EE
+.RE
+.SH NOTES
+The systemd user unit is installed but deliberately not enabled. The desktop
+entry already starts FxSound when you launch it, and an enabled user unit on
+top of that puts two processes in a race for the control socket; the loser
+exits, but which one that is depends on the session's startup order. To have
+FxSound come up with the session instead of on demand:
+.PP
+.RS 4
+.EX
+systemctl \-\-user enable \-\-now fxsound
+.EE
+.RE
+.PP
+Switching the session's default sink onto the FxSound sink is a session-manager
+operation. Without
+.BR wireplumber (1)
+or an equivalent, the sink appears in the graph and nothing moves onto it.
+.SH SEE ALSO
+.BR pipewire (1),
+.BR wireplumber (1),
+.BR pw\-cli (1),
+.BR systemctl (1)
+.PP
+.I /usr/share/doc/fxsound\-linux/README.md.gz
+.SH BUGS
+Report at
+.UR https://github.com/blackixxce12/fxsound\-linux/issues
+.UE .

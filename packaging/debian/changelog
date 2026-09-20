@@ -1,0 +1,18 @@
+fxsound-linux (0.3.0-1) unstable; urgency=medium
+
+  * Initial Debian packaging, tracking upstream 0.3.0.
+  * The release that gives a microphone a chain of its own: denoise, high-pass,
+    downward expander, equalizer, de-esser, compressor, makeup gain and a
+    look-ahead limiter, separate from the music path. See the upstream
+    changelog in /usr/share/doc/fxsound-linux/changelog.gz.
+  * Ships the factory and bonus .fac presets and the TOML voice presets under
+    /usr/share/fxsound/presets, which is one of the two prefixes the binary
+    searches (crates/fxsound-preset/src/store.rs:65); installing them anywhere
+    else gives a working application with an empty preset list.
+  * The systemd user unit is installed but deliberately not enabled. The
+    desktop entry already starts FxSound, and having both would put two
+    instances in a race for the control socket in $XDG_RUNTIME_DIR/fxsound.
+    Enable it by hand with `systemctl --user enable --now fxsound` if you want
+    it to come up with the session instead.
+
+ -- FxSound Linux port contributors <blackixxce12@users.noreply.github.com>  Mon, 21 Sep 2026 02:00:00 +0400

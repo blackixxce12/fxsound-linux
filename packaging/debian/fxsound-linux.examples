@@ -1,0 +1,6 @@
+# A Wayland client cannot grab global shortcuts, so the keybindings live in the
+# compositor and call back into the running instance. These two are what that
+# looks like; neither is read by the application, so neither belongs anywhere
+# but the examples directory.
+packaging/hyprland.conf.example
+packaging/fxsound-autostart.desktop
