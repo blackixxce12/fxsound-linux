@@ -1,7 +1,7 @@
 # The reference the rest of the voice set is voiced against. Numbers and reasoning:
 # docs/voice-presets-research.md (the draft table) and docs/input-presets-decision.md.
 name = "Clean Voice"
-description = "A desk microphone, tidied rather than styled. The one to compare the others against."
+description = "A desk microphone, tidied rather than styled — Discord, Teams, Zoom or in-game. The one to compare the others against."
 rnnoise = false
 highpass_hz = 80.0
 highpass_order = 2
