@@ -60,6 +60,7 @@
 
 use super::Effect;
 use crate::biquad::{MAX_CHANNELS, Real};
+use crate::input::LookaheadLimiter;
 
 /// The permanent output ceiling, `MAXIMIZE_MAX_OUTPUT` (`Maxi32.c:91`, `Play32.c:411`).
 ///
@@ -88,9 +89,6 @@ const TARGET_LEVEL: Real = 0.32;
 /// The anti-pumping floor from `Maxi32.c:288-289` ("11/4/04 Modifications to help fix volume
 /// pumping"). Once the back-off engages it may not reduce the boost below +0.5 dB.
 const MIN_BACKOFF_GAIN: Real = 1.06;
-
-/// `MAXI_ENVELOPE_BIAS` (`c_max.h:48`) — keeps the release recursion out of f32 denormals.
-const ENVELOPE_BIAS: Real = 1.0e-24;
 
 /// `MAXIMIZE_LEVEL_FILT_CUTOFF` (`c_max.h:57`) — the level estimator's corner, in Hz.
 const LEVEL_FILT_CUTOFF: f64 = 0.1;
@@ -129,39 +127,13 @@ const MAX_TIME_CONST_MS: f64 = 100.0;
 /// Used when a caller hands over a sample rate that is not a usable number.
 const FALLBACK_SAMPLE_RATE: Real = 48_000.0;
 
-/// Per-channel limiter state (`c_max.h:101-112`, the `_l`/`_r` pairs).
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct ChannelState {
-    /// Index of the delay-line slot written next, `s->ptr_l` as an offset.
-    write: usize,
-    /// The peak envelope, `s->env_l`.
-    env: Real,
-    /// Per-sample increment of the attack ramp, `s->delta_l`. Never reset when a ramp ends —
-    /// the original leaves it standing until the next ramp assigns a fresh value.
-    delta: Real,
-    /// The peak the current ramp is climbing towards, `s->max_abs_l`.
-    max_abs: Real,
-    /// Frames left in the attack ramp, `s->ramp_count_l`.
-    ramp_count: usize,
-}
-
-impl ChannelState {
-    const SILENT: Self = Self {
-        write: 0,
-        env: 0.0,
-        delta: 0.0,
-        max_abs: 0.0,
-        ramp_count: 0,
-    };
-}
-
 /// The maximizer: auto-gain plus look-ahead brick-wall peak limiter.
 ///
 /// Allocates one delay buffer in [`DynamicBoost::new`], sized for 192 kHz and eight channels
 /// (8 × 144 floats = 4.6 kB), and nothing afterwards. The block size does not enter into it: the
 /// effect works a frame at a time in place, so a 16384-frame block costs no more state than a
 /// 64-frame one.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DynamicBoost {
     sample_rate: Real,
     amount: Real,
@@ -177,9 +149,10 @@ pub struct DynamicBoost {
     level: f64,
     a0: f64,
     filt_gain: f64,
-    /// `MAX_CHANNELS` delay lines laid end to end, each [`MAX_LOOK_AHEAD_FRAMES`] long.
-    delay: Box<[Real]>,
-    state: [ChannelState; MAX_CHANNELS],
+    /// The brick wall itself, which lives in [`crate::input::limiter`] so the voice chain can use
+    /// the same one. Driven here with the original's fixed ceiling, look-ahead and release; the
+    /// auto-gain above it is what makes this effect Dynamic Boost rather than a limiter.
+    limiter: LookaheadLimiter,
 }
 
 impl DynamicBoost {
@@ -197,8 +170,12 @@ impl DynamicBoost {
             level: 0.0,
             a0: 0.0,
             filt_gain: 0.0,
-            delay: vec![0.0; MAX_CHANNELS * MAX_LOOK_AHEAD_FRAMES].into_boxed_slice(),
-            state: [ChannelState::SILENT; MAX_CHANNELS],
+            limiter: LookaheadLimiter::new(
+                sample_rate,
+                MAX_OUTPUT,
+                LOOK_AHEAD_SECONDS * 1000.0,
+                10.0,
+            ),
         };
         effect.set_sample_rate(sample_rate);
         effect.set_amount(0.0);
@@ -229,7 +206,7 @@ impl DynamicBoost {
     /// otherwise.
     #[must_use]
     pub fn envelope(&self, channel: usize) -> Real {
-        self.state.get(channel).map_or(0.0, |state| state.env)
+        self.limiter.envelope(channel)
     }
 
     /// The one-pole level estimator's feedback coefficient, `s->a0`.
@@ -273,6 +250,14 @@ impl DynamicBoost {
         // look-ahead, and the top is the buffer this instance owns.
         let frames = (self.sample_rate * LOOK_AHEAD_SECONDS) as usize;
         self.max_delay = frames.clamp(1, MAX_LOOK_AHEAD_FRAMES);
+
+        // The limiter is told the same numbers rather than deriving its own: the beta goes across
+        // verbatim, because it came from the original's f32 table and converting it to a time and
+        // back would move it.
+        self.limiter.set_sample_rate(self.sample_rate);
+        self.limiter.set_lookahead_ms(LOOK_AHEAD_SECONDS * 1000.0);
+        self.limiter.set_ceiling(MAX_OUTPUT);
+        self.limiter.set_release_beta(self.release_time_beta);
     }
 
     /// One sample of the level estimator plus the auto-gain back-off (`Maxi32.c:258-294`).
@@ -285,7 +270,15 @@ impl DynamicBoost {
         // `float in_sqr = in1 * in1;` — squared in f32 and only then widened, so a −190 dBFS
         // input squares to zero here exactly as it does in the original.
         let in_sqr: Real = input * input;
-        self.level = self.level * self.a0 + f64::from(in_sqr) * self.filt_gain;
+        // `level` is a one-pole recursion with no upper bound, and the floor below is a `<`
+        // comparison — false for both NaN and `+inf`, so either value latches for the rest of the
+        // session. With NaN the back-off never engages again; with `+inf` it pins the gain at
+        // `MIN_BACKOFF_GAIN` forever. This stage is never bypassed (`is_active` is `true`
+        // unconditionally), so that would apply to every user at every slider position.
+        // `Engine::process` sanitises the block it is handed; this guards the stage's own
+        // arithmetic, which is why it is a branch here rather than a check upstream.
+        let next = self.level * self.a0 + f64::from(in_sqr) * self.filt_gain;
+        self.level = if next.is_finite() { next } else { 0.0 };
 
         // Deviation from the original, for real-time safety: with a truly silent input `level`
         // decays geometrically with nothing to stop it and eventually reaches f64 denormals,
@@ -393,8 +386,7 @@ impl Effect for DynamicBoost {
     }
 
     fn reset(&mut self) {
-        self.delay.fill(0.0);
-        self.state = [ChannelState::SILENT; MAX_CHANNELS];
+        self.limiter.reset();
         self.level = 0.0;
     }
 
@@ -411,86 +403,19 @@ impl Effect for DynamicBoost {
             return;
         }
 
-        let max_delay = self.max_delay.max(1);
-        // "Note that since envelope ramping starts immediately on this sample, divisor of delta
-        // calc is delay plus one" (`Maxi32.c:323-326`). Off by one here and the ramp lands early
-        // or late, so the gain still steps at the transient instead of arriving already reduced —
-        // the ceiling holds either way, the smoothness does not.
-        let ramp_divisor = max_delay as Real + 1.0;
-        let beta = self.release_time_beta;
-
         for frame in buffer.chunks_exact_mut(channels) {
             let input = frame.first().copied().unwrap_or(0.0);
+            // The auto-gain, and the permanent ceiling, folded into one multiply before the frame
+            // reaches the delay line — exactly where `Maxi32.c:296-301` applies them.
             let boost = self.update_gain(input) * MAX_OUTPUT;
-
-            // One fixed-length delay line per channel. Zipping against `frame` stops at whichever
-            // runs out first, which is how channels beyond MAX_CHANNELS end up untouched without
-            // an index or a branch.
-            let (lines, _) = self.delay.as_chunks_mut::<MAX_LOOK_AHEAD_FRAMES>();
-            for ((state, line), sample) in self
-                .state
-                .iter_mut()
-                .zip(lines.iter_mut())
-                .zip(frame.iter_mut())
-            {
-                // Look-ahead delay: read the frame written `max_delay` frames ago, then overwrite
-                // that slot with the boosted input (`Maxi32.c:296-301`).
-                let Some(slot) = line.get_mut(state.write) else {
-                    continue;
-                };
-                let delayed = *slot;
-                let boosted = boost * *sample;
-                *slot = boosted;
-                let new_abs = boosted.abs();
-                state.write += 1;
-                if state.write >= max_delay {
-                    state.write = 0;
-                }
-
-                if state.ramp_count != 0 {
-                    // Attack ramp in progress (`Maxi32.c:304-336`).
-                    let abs_out = delayed.abs();
-                    if abs_out > state.env {
-                        state.env = abs_out;
-                    }
-                    if new_abs > state.max_abs {
-                        // A louder peak arrived mid-ramp: retarget and restart the countdown, but
-                        // only steepen the slope, never flatten it — flattening would let the
-                        // previous peak through unlimited.
-                        state.max_abs = new_abs;
-                        state.ramp_count = max_delay;
-                        let tmp_delta = (new_abs - state.env) / ramp_divisor;
-                        if tmp_delta > state.delta {
-                            state.delta = tmp_delta;
-                        }
-                    } else {
-                        state.ramp_count -= 1;
-                    }
-                    state.env += state.delta;
-                } else {
-                    // Release (`Maxi32.c:338-362`). The bias keeps the recursion off denormals.
-                    state.env = state.env * beta + ENVELOPE_BIAS;
-                    let abs_out = delayed.abs();
-                    if abs_out > state.env {
-                        state.env = abs_out;
-                    }
-                    if new_abs > state.env {
-                        // Start a ramp that lands on `new_abs` exactly as it leaves the delay.
-                        state.max_abs = new_abs;
-                        state.delta = (new_abs - state.env) / ramp_divisor;
-                        state.env += state.delta;
-                        state.ramp_count = max_delay;
-                    }
-                }
-
-                // `env >= |delayed|` holds in both branches above, so this is a true brick wall
-                // (`Maxi32.c:366-386`). `env > MAX_OUTPUT > 0` guards the division.
-                *sample = if state.env > MAX_OUTPUT {
-                    delayed * MAX_OUTPUT / state.env
-                } else {
-                    delayed
-                };
+            // Only as far as the limiter reaches. A channel past `MAX_CHANNELS` has no delay
+            // line and no envelope, so boosting it would hand it an unlimited gain — it passes
+            // through untouched instead, which is what the original's per-pair host guarantees and
+            // what the test below pins.
+            for sample in frame.iter_mut().take(MAX_CHANNELS) {
+                *sample *= boost;
             }
+            self.limiter.process_frame(frame);
         }
     }
 
@@ -556,14 +481,63 @@ mod tests {
     }
 
     #[test]
-    fn sliders_six_through_ten_are_identical_because_the_music_warp_saturates() {
-        // Shipped quirk, spec §15.5 — worth a test so nobody "fixes" the clamp order later.
-        let six = gain_boost_for_amount(fxsound_core::scale::slider_to_value(6.0));
-        for slider in 7..=10 {
-            let got = gain_boost_for_amount(fxsound_core::scale::slider_to_value(slider as Real));
-            assert_eq!(got, six, "slider {slider}");
+    fn every_stored_value_past_seventy_is_the_same_gain() {
+        // The inherited quirk, spec §15.5. `DFXP_MUSIC_MODE2_DYNAMIC_BOOST_FACTOR = 1.8` is applied
+        // before a clamp written to keep a 128-entry lookup in range, and `f32(1.8 × 70)` rounds to
+        // exactly 126.0 — so 58 of the 128 storable values collapse onto one table index. The
+        // Windows build does the same; this is pinned so nobody "fixes" the clamp order later and
+        // silently changes what every preset ever made sounds like.
+        //
+        // The *slider* no longer walks into this dead zone — `scale::slider_to_value_for` spreads
+        // its eleven positions over 0..=70 — but the mapping from a stored value is untouched and
+        // must stay so.
+        let at_seventy = gain_boost_for_amount(fxsound_core::scale::midi_to_value(70));
+        for midi in 71..=127_u8 {
+            let got = gain_boost_for_amount(fxsound_core::scale::midi_to_value(midi));
+            assert_eq!(got, at_seventy, "stored {midi}");
         }
-        assert!((20.0 * six.log10() - 11.6).abs() < 1e-3, "{six}");
+        assert!(
+            (20.0 * at_seventy.log10() - 11.6).abs() < 1e-3,
+            "{at_seventy}"
+        );
+        // And 69 is still distinct, so 70 really is the first value of the dead zone.
+        let below = gain_boost_for_amount(fxsound_core::scale::midi_to_value(69));
+        assert_ne!(below, at_seventy, "69 should still be its own gain");
+    }
+
+    #[test]
+    fn the_slider_no_longer_has_a_dead_half() {
+        use fxsound_core::{Effect as EffectId, scale};
+
+        let mut previous = Real::NAN;
+        let mut ladder = Vec::new();
+        for position in 0..=10_u8 {
+            let value = scale::slider_to_value_for(EffectId::DynamicBoost, Real::from(position));
+            let gain = gain_boost_for_amount(value);
+            assert_ne!(
+                gain, previous,
+                "position {position} is the same gain as the one below it"
+            );
+            assert!(
+                gain >= previous || previous.is_nan(),
+                "position {position} went backwards"
+            );
+            previous = gain;
+            ladder.push(20.0 * gain.log10());
+        }
+        // The two ends are unchanged: nothing at all, and everything the effect has.
+        assert!((ladder[0] - 0.0).abs() < 1e-6);
+        assert!((ladder[10] - 11.6).abs() < 1e-3);
+
+        // A stored value past the dead point still shows at the top, which is where it sounds.
+        for midi in [70_u8, 76, 89, 127] {
+            let shown =
+                scale::value_to_slider_for(EffectId::DynamicBoost, scale::midi_to_value(midi));
+            assert!(
+                (shown - 10.0).abs() < 1e-3,
+                "stored {midi} shows at {shown}"
+            );
+        }
     }
 
     #[test]
@@ -926,7 +900,11 @@ mod tests {
         }
         boost.process(&mut buffer, 2);
 
-        assert_eq!(boost.level_rms(), 0.0, "a silent left channel must read zero");
+        assert_eq!(
+            boost.level_rms(),
+            0.0,
+            "a silent left channel must read zero"
+        );
         let right: Vec<Real> = buffer.as_chunks::<2>().0.iter().map(|f| f[1]).collect();
         assert!(peak(&right) <= MAX_OUTPUT + 1e-6);
         // 0.5·3.8019·0.966051 = 1.836 asked for, so the limiter must be doing real work.
@@ -949,7 +927,10 @@ mod tests {
         }
         boost.process(&mut buffer, 2);
 
-        assert!(buffer.iter().all(|s| s.is_finite()), "a sample went non-finite");
+        assert!(
+            buffer.iter().all(|s| s.is_finite()),
+            "a sample went non-finite"
+        );
         assert!(peak(&buffer) <= MAX_OUTPUT + 1e-6);
         assert!(boost.envelope(0).is_finite() && boost.level_rms().is_finite());
     }

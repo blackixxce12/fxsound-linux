@@ -103,6 +103,73 @@ fn bw_to_angle(a: Real, bandwidth: Real) -> Real {
     theta / (2.0 * PI_D as Real)
 }
 
+/// A second-order Butterworth high-pass, ported from `filtDesign2ndButHighPass`
+/// (`dsp/ptutil/Filt/Fil12But.cpp:130-141`).
+///
+/// A bilinear transform of `s²/(s² + √2ωs + ω²)` with **no frequency prewarping**, so the realised
+/// corner sits slightly below the nominal one and the error grows with `f0/fs`. That is the
+/// original's behaviour; `Fidelity` has depended on this exact design at 1745.4987 Hz since the
+/// port began, and its golden coefficients are what the tests here check against.
+///
+/// The result is a general biquad — `b1` is not `a1` — so it must be run through
+/// [`Section::tick_general`], not [`Section::tick`].
+#[must_use]
+pub fn calc_butterworth_highpass(fs: Real, f0: Real) -> BiquadCoeffs {
+    butterworth(fs, f0, Shape::HighPass)
+}
+
+/// A second-order Butterworth low-pass, ported from `filtDesign2ndButLowPass`
+/// (`dsp/ptutil/Filt/Fil12But.cpp:104-114`). Same denominator as the high-pass, different gain and
+/// a `+2` rather than a `−2` in the numerator.
+///
+/// Also a general biquad: use [`Section::tick_general`].
+#[must_use]
+pub fn calc_butterworth_lowpass(fs: Real, f0: Real) -> BiquadCoeffs {
+    butterworth(fs, f0, Shape::LowPass)
+}
+
+#[derive(Clone, Copy)]
+enum Shape {
+    HighPass,
+    LowPass,
+}
+
+fn butterworth(fs: Real, f0: Real, shape: Shape) -> BiquadCoeffs {
+    // A corner at or past Nyquist is not a filter, and one at zero is not either. Both come back
+    // as a bypass rather than as coefficients nothing downstream could use.
+    if !(fs.is_finite() && f0.is_finite()) || fs <= 0.0 || f0 <= 0.0 || 2.0 * f0 >= fs {
+        return BiquadCoeffs::UNITY;
+    }
+
+    let w = std::f32::consts::TAU * f0 / fs;
+    let w2 = w * w;
+    let two_root_two_w = 2.0 * std::f32::consts::SQRT_2 * w;
+    let t = 1.0 / (4.0 + w2 + two_root_two_w);
+
+    // The C returns its denominator coefficients already negated, "to simplify implementation".
+    // A `BiquadCoeffs` is the ordinary `1 + a1·z⁻¹ + a2·z⁻²`, so both flip sign on the way in.
+    let a1_negated = (8.0 - 2.0 * w2) * t;
+    let a0_negated = (two_root_two_w - 4.0 - w2) * t;
+
+    let gain = match shape {
+        Shape::HighPass => 4.0 * t,
+        Shape::LowPass => w2 * t,
+    };
+    let b1 = match shape {
+        Shape::HighPass => -2.0 * gain,
+        Shape::LowPass => 2.0 * gain,
+    };
+
+    BiquadCoeffs {
+        b0: gain,
+        b1,
+        b2: gain,
+        a1: -a1_negated,
+        a2: -a0_negated,
+        on: true,
+    }
+}
+
 /// `filtCalcParametric` (`FiltCalcBiqd.cpp:109-222`).
 ///
 /// `q` is taken by value because the original mutates only its local copy, so the equalizer's
@@ -312,22 +379,118 @@ mod tests {
     fn golden_vectors_48k_31band() {
         let fs = 48_000.0;
         let q = 4.333_365_4;
-        check(fs, 20.0, 3.0, q, [1.000_453_8, -1.997_792_7, 0.997_345_75, 0.997_799_63]);
-        check(fs, 20.0, -3.0, q, [0.999_546_35, -1.996_886_4, 0.997_347_0, 0.996_893_35]);
-        check(fs, 20.0, 6.0, q, [1.000_918_2, -1.998_148_0, 0.997_236_73, 0.998_154_88]);
-        check(fs, 20.0, 12.0, q, [1.003_643_3, -1.997_548_9, 0.993_912_52, 0.997_555_8]);
-        check(fs, 20.0, -12.0, q, [0.996_369_96, -1.990_297_7, 0.993_934_63, 0.990_304_6]);
-        check(fs, 100.0, 3.0, q, [1.000_523_6, -1.997_290_5, 0.996_937_99, 0.997_461_6]);
-        check(fs, 100.0, -12.0, q, [0.995_814_7, -1.988_650_9, 0.993_006_7, 0.988_821_4]);
-        check(fs, 1000.0, 3.0, q, [1.005_177_3, -1.958_005_3, 0.969_723_6, 0.974_900_7]);
-        check(fs, 1000.0, 12.0, q, [1.041_505_7, -1.955_281_7, 0.930_648_1, 0.972_153_7]);
-        check(fs, 1000.0, -12.0, q, [0.960_148_4, -1.877_360_7, 0.933_411_9, 0.893_560_3]);
-        check(fs, 10_000.0, 3.0, q, [1.046_831_3, -0.458_875_9, 0.726_129_0, 0.772_960_2]);
-        check(fs, 10_000.0, 12.0, q, [1.371_291_6, -0.453_166_46, 0.379_608_9, 0.750_900_5]);
-        check(fs, 10_000.0, -12.0, q, [0.729_239_4, -0.330_466_84, 0.547_586_26, 0.276_825_76]);
-        check(fs, 20_000.0, 3.0, q, [1.085_694_2, 1.372_261_4, 0.498_856_9, 0.584_551_04]);
-        check(fs, 20_000.0, 12.0, q, [1.672_465_0, 1.341_337_7, -0.123_621_62, 0.548_843_44]);
-        check(fs, 20_000.0, -12.0, q, [0.597_919_9, 0.802_012_44, 0.328_164_37, -0.073_915_82]);
+        check(
+            fs,
+            20.0,
+            3.0,
+            q,
+            [1.000_453_8, -1.997_792_7, 0.997_345_75, 0.997_799_63],
+        );
+        check(
+            fs,
+            20.0,
+            -3.0,
+            q,
+            [0.999_546_35, -1.996_886_4, 0.997_347, 0.996_893_35],
+        );
+        check(
+            fs,
+            20.0,
+            6.0,
+            q,
+            [1.000_918_2, -1.998_148, 0.997_236_7, 0.998_154_9],
+        );
+        check(
+            fs,
+            20.0,
+            12.0,
+            q,
+            [1.003_643_3, -1.997_548_9, 0.993_912_5, 0.997_555_8],
+        );
+        check(
+            fs,
+            20.0,
+            -12.0,
+            q,
+            [0.996_369_96, -1.990_297_7, 0.993_934_63, 0.990_304_6],
+        );
+        check(
+            fs,
+            100.0,
+            3.0,
+            q,
+            [1.000_523_6, -1.997_290_5, 0.996_938, 0.997_461_6],
+        );
+        check(
+            fs,
+            100.0,
+            -12.0,
+            q,
+            [0.995_814_7, -1.988_650_9, 0.993_006_7, 0.988_821_4],
+        );
+        check(
+            fs,
+            1000.0,
+            3.0,
+            q,
+            [1.005_177_3, -1.958_005_3, 0.969_723_6, 0.974_900_7],
+        );
+        check(
+            fs,
+            1000.0,
+            12.0,
+            q,
+            [1.041_505_7, -1.955_281_7, 0.930_648_1, 0.972_153_7],
+        );
+        check(
+            fs,
+            1000.0,
+            -12.0,
+            q,
+            [0.960_148_4, -1.877_360_7, 0.933_411_9, 0.893_560_3],
+        );
+        check(
+            fs,
+            10_000.0,
+            3.0,
+            q,
+            [1.046_831_3, -0.458_875_9, 0.726_129, 0.772_960_2],
+        );
+        check(
+            fs,
+            10_000.0,
+            12.0,
+            q,
+            [1.371_291_6, -0.453_166_46, 0.379_608_9, 0.750_900_5],
+        );
+        check(
+            fs,
+            10_000.0,
+            -12.0,
+            q,
+            [0.729_239_4, -0.330_466_84, 0.547_586_26, 0.276_825_76],
+        );
+        check(
+            fs,
+            20_000.0,
+            3.0,
+            q,
+            [1.085_694_2, 1.372_261_4, 0.498_856_9, 0.584_551_04],
+        );
+        check(
+            fs,
+            20_000.0,
+            12.0,
+            q,
+            [1.672_465, 1.341_337_7, -0.123_621_62, 0.548_843_44],
+        );
+        check(
+            fs,
+            20_000.0,
+            -12.0,
+            q,
+            [0.597_919_9, 0.802_012_44, 0.328_164_37, -0.073_915_82],
+        );
     }
 
     #[test]
@@ -335,16 +498,76 @@ mod tests {
         let fs = 44_100.0;
         let q = 1.597_641_2;
         let boost = 6.0;
-        check(fs, 62.5, boost, q, [1.001_952_8, -1.995_996_7, 0.994_123_16, 0.996_075_93]);
-        check(fs, 115.734, boost, q, [1.003_609_9, -1.992_474_6, 0.989_135_56, 0.992_745_6]);
-        check(fs, 214.311, boost, q, [1.006_664_4, -1.985_681_8, 0.979_943_45, 0.986_607_8]);
-        check(fs, 396.85, boost, q, [1.012_271_6, -1.972_183_2, 0.963_068_2, 0.975_339_8]);
-        check(fs, 734.867, boost, q, [1.022_493_5, -1.944_094_2, 0.932_305_5, 0.954_799_0]);
-        check(fs, 1360.79, boost, q, [1.040_899_8, -1.881_879_5, 0.876_911_6, 0.917_811_3]);
-        check(fs, 2519.84, boost, q, [1.073_377_7, -1.734_432_8, 0.779_168_0, 0.852_545_8]);
-        check(fs, 4666.12, boost, q, [1.129_007_3, -1.370_035_4, 0.611_749_5, 0.740_756_9]);
-        check(fs, 8640.48, boost, q, [1.221_388_7, -0.518_224_48, 0.333_726_47, 0.555_115_1]);
-        check(fs, 16_000.0, boost, q, [1.377_299_2, 0.808_339_18, -0.135_489_66, 0.241_809_56]);
+        check(
+            fs,
+            62.5,
+            boost,
+            q,
+            [1.001_952_8, -1.995_996_7, 0.994_123_16, 0.996_075_9],
+        );
+        check(
+            fs,
+            115.734,
+            boost,
+            q,
+            [1.003_609_9, -1.992_474_6, 0.989_135_56, 0.992_745_6],
+        );
+        check(
+            fs,
+            214.311,
+            boost,
+            q,
+            [1.006_664_4, -1.985_681_8, 0.979_943_45, 0.986_607_8],
+        );
+        check(
+            fs,
+            396.85,
+            boost,
+            q,
+            [1.012_271_6, -1.972_183_2, 0.963_068_2, 0.975_339_8],
+        );
+        check(
+            fs,
+            734.867,
+            boost,
+            q,
+            [1.022_493_5, -1.944_094_2, 0.932_305_5, 0.954_799],
+        );
+        check(
+            fs,
+            1360.79,
+            boost,
+            q,
+            [1.040_899_8, -1.881_879_5, 0.876_911_6, 0.917_811_3],
+        );
+        check(
+            fs,
+            2519.84,
+            boost,
+            q,
+            [1.073_377_7, -1.734_432_8, 0.779_168, 0.852_545_8],
+        );
+        check(
+            fs,
+            4666.12,
+            boost,
+            q,
+            [1.129_007_3, -1.370_035_4, 0.611_749_5, 0.740_756_9],
+        );
+        check(
+            fs,
+            8640.48,
+            boost,
+            q,
+            [1.221_388_7, -0.518_224_5, 0.333_726_47, 0.555_115_1],
+        );
+        check(
+            fs,
+            16_000.0,
+            boost,
+            q,
+            [1.377_299_2, 0.808_339_2, -0.135_489_66, 0.241_809_56],
+        );
     }
 
     #[test]
@@ -397,7 +620,10 @@ mod tests {
                 peak_late = peak_late.max(y.abs());
             }
         }
-        assert!(peak_late < 1e-3, "impulse response had not decayed: {peak_late}");
+        assert!(
+            peak_late < 1e-3,
+            "impulse response had not decayed: {peak_late}"
+        );
     }
 
     #[test]
@@ -406,9 +632,116 @@ mod tests {
         s.coeffs = calc_parametric(48_000.0, 1000.0, 6.0, 1.6);
         let left = s.tick(0, 1.0);
         let right = s.tick(1, 1.0);
-        assert_eq!(left, right, "a fresh channel must behave like a fresh filter");
+        assert_eq!(
+            left, right,
+            "a fresh channel must behave like a fresh filter"
+        );
         let left_second = s.tick(0, 0.0);
         let right_second = s.tick(1, 0.0);
         assert_eq!(left_second, right_second);
+    }
+
+    /// Ties the new constructor to a design the port has been shipping since the beginning: the
+    /// same numbers `Fidelity` has used at 1745.4987 Hz, tabulated in
+    /// `docs/spec/10-dsp-effects.md` §6.2 from the original C.
+    #[test]
+    fn the_butterworth_high_pass_matches_the_design_fidelity_already_uses() {
+        for (fs, gain, a1_negated, a0_negated) in [
+            (44_100.0, 0.839_410, 1.652_862, -0.704_777),
+            (48_000.0, 0.851_343, 1.680_463, -0.724_908),
+        ] {
+            let c = calc_butterworth_highpass(fs, 1745.4987);
+            assert!((c.b0 - gain).abs() < 1e-4, "{fs} Hz b0: {}", c.b0);
+            assert!((c.b1 + 2.0 * gain).abs() < 1e-4, "{fs} Hz b1: {}", c.b1);
+            assert!((c.b2 - gain).abs() < 1e-4, "{fs} Hz b2: {}", c.b2);
+            // The C keeps its denominator negated; a `BiquadCoeffs` does not.
+            assert!((c.a1 + a1_negated).abs() < 1e-4, "{fs} Hz a1: {}", c.a1);
+            assert!((c.a2 + a0_negated).abs() < 1e-4, "{fs} Hz a2: {}", c.a2);
+        }
+    }
+
+    /// Magnitude at a frequency, by running the section and measuring, rather than by evaluating a
+    /// transfer function the test would have to get right independently.
+    fn measured_magnitude(coeffs: BiquadCoeffs, fs: Real, hz: Real) -> Real {
+        let mut section = Section {
+            coeffs,
+            ..Section::default()
+        };
+        let frames = 24_000;
+        let settle = 4_000;
+        let mut peak: Real = 0.0;
+        for n in 0..frames {
+            let x = (n as Real * std::f32::consts::TAU * hz / fs).sin();
+            let y = section.tick_general(0, x);
+            if n >= settle {
+                peak = peak.max(y.abs());
+            }
+        }
+        peak
+    }
+
+    #[test]
+    fn a_butterworth_high_pass_passes_the_top_and_stops_the_bottom() {
+        const FS: Real = 48_000.0;
+        let hp = calc_butterworth_highpass(FS, 500.0);
+        assert!(
+            measured_magnitude(hp, FS, 4_000.0) > 0.98,
+            "the passband should be flat: {}",
+            measured_magnitude(hp, FS, 4_000.0)
+        );
+        // Two octaves below a second-order corner is about 24 dB down.
+        let low = measured_magnitude(hp, FS, 125.0);
+        assert!(low < 0.1, "125 Hz should be well down, got {low}");
+        // The corner itself sits near -3 dB, though the missing prewarping moves it a little.
+        let corner = measured_magnitude(hp, FS, 500.0);
+        assert!(
+            (0.55..0.85).contains(&corner),
+            "the corner should be near -3 dB, got {corner}"
+        );
+    }
+
+    #[test]
+    fn a_butterworth_low_pass_is_the_mirror_of_it() {
+        const FS: Real = 48_000.0;
+        let lp = calc_butterworth_lowpass(FS, 500.0);
+        assert!(
+            measured_magnitude(lp, FS, 50.0) > 0.98,
+            "the passband should be flat"
+        );
+        assert!(
+            measured_magnitude(lp, FS, 4_000.0) < 0.05,
+            "4 kHz should be well down"
+        );
+
+        // A high-pass and a low-pass at the same corner should cross at roughly the same level,
+        // which is what makes them usable as a de-esser's split.
+        let hp = calc_butterworth_highpass(FS, 500.0);
+        let (a, b) = (
+            measured_magnitude(lp, FS, 500.0),
+            measured_magnitude(hp, FS, 500.0),
+        );
+        assert!(
+            (a - b).abs() < 0.05,
+            "the two should cross: {a} against {b}"
+        );
+    }
+
+    #[test]
+    fn a_corner_that_is_not_a_corner_is_a_bypass() {
+        // Past Nyquist, at zero, or not a number at all: a section that passes its input through
+        // rather than coefficients nothing downstream could use.
+        for (fs, f0) in [
+            (48_000.0, 24_000.0),
+            (48_000.0, 30_000.0),
+            (48_000.0, 0.0),
+            (48_000.0, Real::NAN),
+            (0.0, 500.0),
+        ] {
+            assert!(
+                !calc_butterworth_highpass(fs, f0).on,
+                "{f0} Hz at {fs} should bypass"
+            );
+            assert!(!calc_butterworth_lowpass(fs, f0).on, "{f0} Hz at {fs}");
+        }
     }
 }

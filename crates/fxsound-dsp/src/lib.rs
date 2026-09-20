@@ -10,6 +10,7 @@ pub mod biquad;
 pub mod effects;
 pub mod engine;
 pub mod eq;
+pub mod input;
 pub mod leveller;
 pub mod spectrum;
 
