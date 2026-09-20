@@ -498,6 +498,21 @@ pub struct AudioStatus {
     pub channels: u16,
     /// Seconds of audio processed since the counter was last reset.
     pub processed_secs: u64,
+
+    // ---- how the ring between the two nodes is coping ------------------------------------
+    //
+    // Collected correctly since the port began and then thrown away: they crossed no process
+    // boundary and appeared in no message, so nothing could assert on them and nobody could see
+    // them. All three are cumulative since the stream was built.
+    /// Frames the producer had to throw away because the consumer had stalled.
+    pub dropped_frames: u64,
+    /// Frames of silence the consumer was handed because the ring had run dry.
+    pub underrun_frames: u64,
+    /// Times the ring was re-primed after running dry — each one is an audible gap.
+    pub resyncs: u64,
+    /// Times the two nodes negotiated different formats, which mutes audio until the supervisor
+    /// rebuilds them.
+    pub format_mismatches: u64,
 }
 
 impl Default for AudioStatus {
@@ -507,6 +522,10 @@ impl Default for AudioStatus {
             sample_rate: 48_000,
             channels: 2,
             processed_secs: 0,
+            dropped_frames: 0,
+            underrun_frames: 0,
+            resyncs: 0,
+            format_mismatches: 0,
         }
     }
 }

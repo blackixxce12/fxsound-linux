@@ -84,7 +84,13 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
     let mut outcome = Outcome::default();
 
     match command {
-        Command::Status => outcome.stdout = status_report(app),
+        Command::Status { json } => {
+            outcome.stdout = if *json {
+                status_json(app)
+            } else {
+                status_report(app)
+            };
+        }
 
         Command::Power(power) => {
             let want = match power {
@@ -362,7 +368,142 @@ fn status_report(app: &App) -> String {
         eq::MAX_BANDS
     );
 
+    // How the ring between the two audio nodes is coping. Collected since the port began and
+    // published nowhere until now, so nothing could assert on it and nobody whose audio crackled
+    // could say how often. All four are cumulative since the stream was built.
+    let audio = app.audio_status();
+    let _ = writeln!(out, "sample_rate: {} Hz", audio.sample_rate);
+    let _ = writeln!(out, "channels: {}", audio.channels);
+    let _ = writeln!(
+        out,
+        "ring: {} dropped, {} underrun, {} resyncs, {} format mismatches",
+        audio.dropped_frames, audio.underrun_frames, audio.resyncs, audio.format_mismatches
+    );
+
     out.trim_end().to_owned()
+}
+
+/// The same state as JSON, for anything that would otherwise parse the lines above.
+///
+/// The lines stay the default because scripts already grep them; this is the explicit format the
+/// help text has promised since 0.2.0 and never produced. Hand-rolled rather than pulling `serde`
+/// into this crate for one function: the shape is fixed, every value is a number, a bool or a
+/// string this code owns, and the only escaping needed is for a device description and a preset
+/// name.
+fn status_json(app: &App) -> String {
+    use std::fmt::Write as _;
+    let state = &app.state;
+    let audio = app.audio_status();
+    let mut out = String::new();
+
+    let _ = write!(out, "{{\"version\":\"{}\"", env!("CARGO_PKG_VERSION"));
+    let _ = write!(out, ",\"power\":{}", state.power);
+    let _ = write!(
+        out,
+        ",\"audio\":\"{}\"",
+        if !app.has_audio() {
+            "unavailable"
+        } else if state.audio_active {
+            "processing"
+        } else {
+            "idle"
+        }
+    );
+    let _ = write!(out, ",\"preset\":{}", json_string(&state.preset_label()));
+    let _ = write!(
+        out,
+        ",\"device\":{}",
+        state
+            .device()
+            .map_or_else(|| "null".to_owned(), |d| json_string(&d.description))
+    );
+    let _ = write!(
+        out,
+        ",\"direction\":\"{}\"",
+        match state
+            .device()
+            .map_or(DeviceDirection::Output, |d| d.direction)
+        {
+            DeviceDirection::Output => "output",
+            DeviceDirection::Input => "input",
+        }
+    );
+    let _ = write!(
+        out,
+        ",\"view\":\"{}\"",
+        match state.view {
+            ViewMode::Pro => "pro",
+            ViewMode::Lite => "lite",
+        }
+    );
+    let _ = write!(
+        out,
+        ",\"theme\":\"{}\"",
+        match state.theme {
+            ThemeMode::Dark => "dark",
+            ThemeMode::Light => "light",
+        }
+    );
+
+    let _ = write!(out, ",\"effects\":{{");
+    for (index, effect) in Effect::ALL.into_iter().enumerate() {
+        let _ = write!(
+            out,
+            "{}\"{}\":{:.0}",
+            if index == 0 { "" } else { "," },
+            effect.key(),
+            state.effect(effect)
+        );
+    }
+    let _ = write!(out, "}}");
+
+    let _ = write!(out, ",\"master_gain_db\":{:.0}", state.master_gain_db);
+    let _ = write!(out, ",\"balance_db\":{:.0}", state.balance_db);
+    let _ = write!(out, ",\"volume_leveling\":{:.1}", state.volume_leveling);
+    let _ = write!(out, ",\"filter_q\":{:.1}", state.filter_q);
+    let _ = write!(
+        out,
+        ",\"eq\":{{\"enabled\":{},\"bands\":{},\"max_bands\":{}}}",
+        state.eq_on,
+        state.eq_bands.len(),
+        eq::MAX_BANDS
+    );
+    let _ = write!(
+        out,
+        ",\"format\":{{\"sample_rate\":{},\"channels\":{}}}",
+        audio.sample_rate, audio.channels
+    );
+    let _ = write!(
+        out,
+        ",\"ring\":{{\"dropped_frames\":{},\"underrun_frames\":{},\"resyncs\":{},\"format_mismatches\":{}}}",
+        audio.dropped_frames, audio.underrun_frames, audio.resyncs, audio.format_mismatches
+    );
+    out.push('}');
+    out
+}
+
+/// A JSON string literal: quotes, backslashes and control characters escaped.
+///
+/// A device description is whatever the hardware calls itself, and a preset name is whatever the
+/// user typed. Neither is under this program's control, so neither can be interpolated raw.
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
@@ -441,10 +582,81 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_how_the_ring_is_coping() {
+        // Four counters that were collected correctly since the port began and then thrown away:
+        // they crossed no process boundary and appeared in no message, so nothing could assert on
+        // them and nobody whose audio crackled could say how often.
+        let mut a = app();
+        let outcome = run(&mut a, &[Command::Status { json: false }]);
+        assert!(
+            outcome
+                .stdout
+                .contains("ring: 0 dropped, 0 underrun, 0 resyncs, 0 format mismatches"),
+            "{}",
+            outcome.stdout
+        );
+        assert!(outcome.stdout.contains("sample_rate: 48000 Hz"));
+        assert!(outcome.stdout.contains("channels: 2"));
+    }
+
+    #[test]
+    fn status_can_come_back_as_json_and_the_lines_are_still_the_default() {
+        // The help text promised JSON since 0.2.0 and never produced any. It is real now, and it
+        // is opt-in: the line format is what every existing script greps.
+        let mut a = app();
+        let lines = run(&mut a, &[Command::Status { json: false }]);
+        assert!(lines.stdout.starts_with("power: "), "{}", lines.stdout);
+
+        let json = run(&mut a, &[Command::Status { json: true }]).stdout;
+        assert!(json.starts_with('{') && json.ends_with('}'), "{json}");
+        for key in [
+            "\"power\":",
+            "\"preset\":",
+            "\"effects\":",
+            "\"ring\":",
+            "\"underrun_frames\":",
+            "\"format\":",
+        ] {
+            assert!(json.contains(key), "{key} missing from {json}");
+        }
+        // Every brace opened is closed: the cheapest check that this is a document rather than a
+        // string that looks like one.
+        assert_eq!(
+            json.chars().filter(|&c| c == '{').count(),
+            json.chars().filter(|&c| c == '}').count(),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn a_device_name_with_a_quote_in_it_cannot_break_the_json() {
+        // A device description is whatever the hardware calls itself and a preset name is whatever
+        // the user typed; neither is this program's to trust.
+        let mut a = app();
+        a.state.devices = vec![AudioDevice {
+            id: 1,
+            name: "node".to_owned(),
+            description: "Bob\"s \\ Mic\ttab".to_owned(),
+            is_default: true,
+            direction: DeviceDirection::Output,
+            form_factor: "microphone".into(),
+        }];
+        a.state.selected_device = Some(0);
+
+        let json = run(&mut a, &[Command::Status { json: true }]).stdout;
+        assert!(json.contains(r#""device":"Bob\"s \\ Mic\ttab""#), "{json}");
+        assert_eq!(
+            json.chars().filter(|&c| c == '{').count(),
+            json.chars().filter(|&c| c == '}').count(),
+            "{json}"
+        );
+    }
+
+    #[test]
     fn status_reports_the_live_state_as_greppable_lines() {
         let mut a = app();
         run(&mut a, &[Command::Effects(vec![(Effect::Bass, 7.0)])]);
-        let outcome = run(&mut a, &[Command::Status]);
+        let outcome = run(&mut a, &[Command::Status { json: false }]);
 
         assert!(outcome.stdout.contains("power: on"));
         assert!(outcome.stdout.contains("bass: 7"));
@@ -615,7 +827,7 @@ mod tests {
     fn status_reports_the_direction_of_the_selected_device() {
         let mut a = app();
         a.state.devices = mixed_devices();
-        let outcome = run(&mut a, &[Command::Status]);
+        let outcome = run(&mut a, &[Command::Status { json: false }]);
         assert!(outcome.stdout.contains("output: (none)"));
         assert!(
             outcome.stdout.contains("direction: output"),
@@ -629,7 +841,7 @@ mod tests {
                 "alsa_input.pci".into(),
             ))],
         );
-        let outcome = run(&mut a, &[Command::Status]);
+        let outcome = run(&mut a, &[Command::Status { json: false }]);
         assert!(
             outcome
                 .stdout
@@ -692,7 +904,7 @@ mod tests {
             &[
                 Command::Effects(vec![(Effect::Ambience, 3.0)]),
                 Command::MasterGain(-6.0),
-                Command::Status,
+                Command::Status { json: false },
             ],
         );
         assert_eq!(a.state.effect(Effect::Ambience), 3.0);

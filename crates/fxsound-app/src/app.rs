@@ -70,6 +70,8 @@ pub struct App {
     /// finished enumerating. Until this is true, "no device is called that" and "no device list
     /// yet" are the same observation, and they call for opposite answers.
     devices_seen: bool,
+    /// The last thing the audio thread said about itself, for `--status`.
+    audio_status: fxsound_core::AudioStatus,
     /// A `--output` that arrived before the list did, waiting for it.
     pending_device: Option<String>,
     /// Persisted settings, saved when they change rather than on a timer.
@@ -130,6 +132,7 @@ impl App {
             input_params: InputDspParams::default(),
             input_presets: Vec::new(),
             devices_seen: false,
+            audio_status: fxsound_core::AudioStatus::default(),
             pending_device: None,
             settings,
             presets,
@@ -144,6 +147,16 @@ impl App {
             notifications_armed: false,
             tray_tip_shown: false,
         };
+
+        // Hand the audio thread what a previous run displaced, before it does anything: if that
+        // run was killed while holding the default, the metadata still names a node that is gone
+        // and only this can point it back at a real device.
+        if let Some(engine) = &app.engine {
+            engine.send(UiToAudio::SeedRememberedDefaults {
+                output: app.settings.remembered_default_output.clone(),
+                input: app.settings.remembered_default_input.clone(),
+            });
+        }
 
         app.input_presets = fxsound_preset::input::InputPreset::load_shipped();
         // The direction is settled before the list is built: they are two lists, and which one the
@@ -222,7 +235,7 @@ impl App {
                     }
                     self.state.devices = devices;
                 }
-                AudioToUi::Status(_) => {}
+                AudioToUi::Status(status) => self.audio_status = status,
                 AudioToUi::Disconnected { reason } => {
                     self.state.notification =
                         Some(format!("{} {reason}", tr("Audio disconnected:")));
@@ -234,6 +247,19 @@ impl App {
                 }
                 AudioToUi::Error { message } => {
                     self.state.notification = Some(message);
+                }
+                AudioToUi::RememberedDefault {
+                    direction,
+                    node_name,
+                } => {
+                    // Straight to the settings file. The audio thread's own copy dies with the
+                    // process, and the three ways a process dies without warning — SIGKILL, the
+                    // OOM killer, a power cut — are exactly the ones that leave the session
+                    // default naming a node that is gone.
+                    if self.settings.remembered_default(direction) != node_name {
+                        self.settings.set_remembered_default(direction, &node_name);
+                        self.settings_dirty = true;
+                    }
                 }
             }
         }
@@ -836,6 +862,13 @@ impl App {
         }
     }
 
+    /// What the audio thread last said about itself — the negotiated format, and how the ring
+    /// between the two nodes is coping.
+    #[must_use]
+    pub const fn audio_status(&self) -> &fxsound_core::AudioStatus {
+        &self.audio_status
+    }
+
     /// Whether a device list has ever arrived.
     #[must_use]
     pub const fn has_seen_devices(&self) -> bool {
@@ -877,6 +910,7 @@ impl App {
             input_params: InputDspParams::default(),
             input_presets: Vec::new(),
             devices_seen: false,
+            audio_status: fxsound_core::AudioStatus::default(),
             pending_device: None,
             settings: Settings::default(),
             presets: PresetStore::with_dirs(

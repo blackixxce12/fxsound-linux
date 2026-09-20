@@ -489,6 +489,13 @@ pub enum UiToAudio {
     Restart,
     /// Stop the audio engine and let the process exit.
     Shutdown,
+    /// What the session default was before FxSound last took it, one name per direction.
+    ///
+    /// Sent once at start-up, from the settings file. The audio thread keeps this memory on its
+    /// own heap, which is exactly what a `SIGKILL`, an OOM kill or a power cut destroys — and what
+    /// it leaves behind is a session default naming FxSound's node, which no longer exists. No
+    /// signal handler covers that case, because none of those three run one.
+    SeedRememberedDefaults { output: String, input: String },
 }
 
 /// Control-thread notifications for the GUI.
@@ -502,6 +509,14 @@ pub enum AudioToUi {
     Disconnected { reason: String },
     /// Something the user needs to be told about, in already-translated text.
     Error { message: String },
+    /// FxSound has taken the session default for this direction, and this is what it was before.
+    ///
+    /// Written to the settings file so the next start can repair a default that a kill left
+    /// pointing at a node that is gone.
+    RememberedDefault {
+        direction: DeviceDirection,
+        node_name: String,
+    },
 }
 
 #[cfg(test)]

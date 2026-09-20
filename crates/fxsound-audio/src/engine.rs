@@ -666,6 +666,12 @@ struct Shared {
     /// The Windows registry slots, one set per direction, so trying a microphone never forgets
     /// which speakers the user had.
     memory: PerDirection<SelectionMemory>,
+    /// Every format mismatch this session has seen.
+    ///
+    /// The supervisor `swap`s the live counter to zero to decide whether to rebuild, which is the
+    /// right thing for a trigger and the wrong thing for a report: a user asking why their audio
+    /// dropped out wants the total, not whatever has happened since the last 200 ms tick.
+    format_mismatches_total: u64,
     /// Whether to take the session default for the active direction once its nodes are up.
     /// `true` unless a caller opted out with [`UiToAudio::SetAsDefault`]`(false)`.
     want_default: bool,
@@ -715,6 +721,7 @@ impl Shared {
             previous_names: Vec::new(),
             defaults: PerDirection::default(),
             graph_rate: DEFAULT_SAMPLE_RATE,
+            format_mismatches_total: 0,
             memory: PerDirection::default(),
             want_default: true,
             needs_rules: false,
@@ -1047,6 +1054,36 @@ fn handle_control(
         UiToAudio::Restart => {
             shared.restart_requested = true;
         }
+        UiToAudio::SeedRememberedDefaults { output, input } => {
+            // Only ever fills a gap. If this run has already displaced something, that is the
+            // fresher truth and the settings file's copy is stale by a whole session.
+            //
+            // This is the whole repair, and it is smaller than it looks. A process that starts and
+            // finds the default naming `fxsound_sink` adopts that claim as its own — which is
+            // harmless *provided it knows what to hand back to*, and that knowledge is exactly
+            // what the killed run took with it. Seeding it from disk is what turns the next clean
+            // exit into the repair. There is deliberately no immediate hand-back here: by the time
+            // the metadata has been read the nodes are up, so the claim is no longer provably
+            // stale, and a guard that cannot fire is worse than no guard.
+            //
+            // What this does not cover, stated plainly: FxSound killed and never started again.
+            // Nothing inside the process can repair that.
+            for (direction, name) in [
+                (DeviceDirection::Output, output),
+                (DeviceDirection::Input, input),
+            ] {
+                if name.is_empty() {
+                    continue;
+                }
+                let memory = shared.memory.get_mut(direction);
+                if memory.original_default.is_empty() {
+                    memory.original_default.clone_from(&name);
+                }
+                if memory.most_recent_default.is_empty() {
+                    memory.most_recent_default = name;
+                }
+            }
+        }
         UiToAudio::Shutdown => unreachable!("handled above"),
     }
 }
@@ -1204,7 +1241,9 @@ fn supervise(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) {
         }
 
         // 3. Format mismatch between the two nodes: rebuild rather than play at the wrong stride.
-        if guard.counters.format_mismatches.swap(0, Ordering::Relaxed) > 0 {
+        let mismatches = guard.counters.format_mismatches.swap(0, Ordering::Relaxed);
+        guard.format_mismatches_total += mismatches;
+        if mismatches > 0 {
             log::warn!("the two nodes negotiated different formats; rebuilding");
             drop_nodes(&mut guard);
             guard.needs_rules = true;
@@ -1486,7 +1525,13 @@ fn claim_default(shared: &mut Shared) {
         if memory.original_default.is_empty() {
             memory.original_default.clone_from(&previous);
         }
-        memory.most_recent_default = previous;
+        memory.most_recent_default.clone_from(&previous);
+        // Say it out loud, so it reaches the settings file. This memory lives on the audio
+        // thread's heap and is exactly what a kill destroys.
+        shared.notify(AudioToUi::RememberedDefault {
+            direction,
+            node_name: previous,
+        });
     }
     if write_configured_default(shared, direction, ours) {
         shared.defaults.get_mut(direction).holding = true;
@@ -2287,6 +2332,13 @@ fn publish(shared: &mut Shared) {
         sample_rate: rate,
         channels: shared.counters.channels.load(Ordering::Relaxed) as u16,
         processed_secs: shared.counters.frames_processed.load(Ordering::Relaxed) / u64::from(rate),
+        // The ring's own account of how it is coping. Cumulative since the stream was built, and
+        // published rather than only logged: a user whose audio crackles can now say how often,
+        // and a test can assert on it.
+        dropped_frames: shared.ring.dropped_frames.load(Ordering::Relaxed),
+        underrun_frames: shared.ring.underrun_frames.load(Ordering::Relaxed),
+        resyncs: shared.ring.resyncs.load(Ordering::Relaxed),
+        format_mismatches: shared.format_mismatches_total,
     };
     if status != shared.last_status {
         shared.last_status = status;

@@ -123,6 +123,15 @@ pub struct Settings {
     pub device_configs_version: u32,
     /// Switch to a newly appeared output device automatically.
     pub prioritize_new_output: bool,
+    /// What the session default was before FxSound took it, one per direction.
+    ///
+    /// The audio thread keeps this on its own heap and hands the default back on exit, on a
+    /// direction switch and on `SIGTERM`/`SIGINT`. None of that survives a `SIGKILL`, an OOM kill
+    /// or a power cut — and what those leave behind is a session default naming FxSound's virtual
+    /// node, which is gone. Written here so the next start can repair it, which is the only place
+    /// the repair can live: no signal handler runs for any of the three.
+    pub remembered_default_output: String,
+    pub remembered_default_input: String,
 
     // ---- dsp state that lives outside the preset --------------------------------------------
     pub master_gain: f32,
@@ -179,6 +188,8 @@ impl Default for Settings {
             device_configs: Vec::new(),
             device_configs_version: 2,
             prioritize_new_output: false,
+            remembered_default_output: String::new(),
+            remembered_default_input: String::new(),
 
             master_gain: 0.0,
             balance: 0.0,
@@ -315,6 +326,27 @@ impl Settings {
         match self.device_direction {
             crate::DeviceDirection::Output => &self.output_device_name,
             crate::DeviceDirection::Input => &self.input_device_name,
+        }
+    }
+
+    /// What the session default was before FxSound took this direction.
+    #[must_use]
+    pub fn remembered_default(&self, direction: crate::DeviceDirection) -> &str {
+        match direction {
+            crate::DeviceDirection::Output => &self.remembered_default_output,
+            crate::DeviceDirection::Input => &self.remembered_default_input,
+        }
+    }
+
+    /// Record what the session default was before FxSound took this direction.
+    pub fn set_remembered_default(&mut self, direction: crate::DeviceDirection, node_name: &str) {
+        match direction {
+            crate::DeviceDirection::Output => {
+                node_name.clone_into(&mut self.remembered_default_output)
+            }
+            crate::DeviceDirection::Input => {
+                node_name.clone_into(&mut self.remembered_default_input)
+            }
         }
     }
 
@@ -463,6 +495,38 @@ mod tests {
             toml::from_str("preset = \"Rock\"\noutput_preset = \"Jazz\"\n").expect("parse");
         both.sanitise();
         assert_eq!(both.output_preset, "Jazz");
+    }
+
+    #[test]
+    fn each_direction_remembers_the_default_it_displaced() {
+        // The memory that has to outlive the process. A SIGKILL, an OOM kill and a power cut all
+        // run no signal handler, so what they leave behind is a session default naming FxSound's
+        // node, which is gone — and the only place to repair that is the next start.
+        let mut s = Settings::default();
+        assert_eq!(s.remembered_default(crate::DeviceDirection::Output), "");
+
+        s.set_remembered_default(
+            crate::DeviceDirection::Output,
+            "alsa_output.pci-0000_00_1f.3",
+        );
+        s.set_remembered_default(crate::DeviceDirection::Input, "alsa_input.usb-fifine");
+        assert_eq!(
+            s.remembered_default(crate::DeviceDirection::Output),
+            "alsa_output.pci-0000_00_1f.3"
+        );
+        assert_eq!(
+            s.remembered_default(crate::DeviceDirection::Input),
+            "alsa_input.usb-fifine"
+        );
+
+        // And it survives the file, which is the whole point.
+        let text = toml::to_string_pretty(&s).expect("serialise");
+        let mut back: Settings = toml::from_str(&text).expect("parse");
+        back.sanitise();
+        assert_eq!(
+            back.remembered_default(crate::DeviceDirection::Output),
+            "alsa_output.pci-0000_00_1f.3"
+        );
     }
 
     #[test]

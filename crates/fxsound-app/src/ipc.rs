@@ -710,7 +710,7 @@ mod tests {
         });
 
         let forwarded = wait_for(&server);
-        assert_eq!(forwarded.commands(), [Command::Status]);
+        assert_eq!(forwarded.commands(), [Command::Status { json: false }]);
         forwarded.reply(Response::output(r#"{"version":"0.1.0","power":true}"#));
 
         let response = sender.join().expect("client thread");

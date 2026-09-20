@@ -229,14 +229,28 @@ pub struct Cli {
     )]
     pub set_effect: Option<EffectPairs>,
 
-    /// Print the running instance's state as JSON and exit. Every other option is ignored.
+    /// Print the running instance's state and exit. Every other option is ignored.
+    ///
+    /// One `key: value` line per item, which is what scripts already grep; pass `--json`
+    /// alongside for a single JSON object instead.
     ///
     /// `--status` — `docs/COMMAND_LINE_OPTIONS.md:35`, `FxController.cpp:348-352`, `:635-700`.
-    /// Unlike Windows, the JSON comes back over the control socket and is printed on *this*
-    /// process's stdout; `$XDG_RUNTIME_DIR/fxsound/status.json` is still written as a courtesy
-    /// (`docs/spec/07-startup-tray.md` §4.6).
+    /// Unlike Windows, the answer comes back over the control socket and is printed on *this*
+    /// process's stdout. Earlier versions of this help promised JSON by default and a
+    /// `$XDG_RUNTIME_DIR/fxsound/status.json` written as a courtesy; neither was ever true. The
+    /// JSON is now real and explicit, and the file is not written at all — a status file that is
+    /// only refreshed when somebody asks for it is stale by definition, and a status bar is
+    /// better served by running this command than by reading a file nothing keeps current.
     #[arg(long = "status")]
     pub status: bool,
+
+    /// Print `--status` as a single JSON object rather than as lines.
+    ///
+    /// Ignored unless `--status` is given, and deliberately not the default: the line format is
+    /// what every existing script greps, and changing it under them would be a breaking change to
+    /// buy a format they did not ask for.
+    #[arg(long = "json", requires = "status")]
+    pub json: bool,
 
     /// Start without showing the window, or hide the window of a running instance.
     ///
@@ -322,7 +336,10 @@ pub struct EffectPairs(pub Vec<(Effect, f32)>);
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Report state and do nothing else (`FxController.cpp:348-352`).
-    Status,
+    Status {
+        /// One JSON object rather than one line per item.
+        json: bool,
+    },
     Power(PowerCommand),
     Preset(PresetCommand),
     Output(OutputCommand),
@@ -417,7 +434,7 @@ impl Cli {
     #[must_use]
     pub fn commands(&self) -> Vec<Command> {
         if self.status {
-            return vec![Command::Status];
+            return vec![Command::Status { json: self.json }];
         }
 
         let mut commands = Vec::new();
@@ -629,7 +646,7 @@ impl Command {
             Self::Preset(preset) => matches!(preset, PresetCommand::Select(_)),
             Self::Output(output) => matches!(output, OutputCommand::Select(_)),
             Self::Window(window) => matches!(window, WindowCommand::Hide),
-            Self::Status
+            Self::Status { .. }
             | Self::BandFrequencies(_)
             | Self::BandGains(_)
             | Self::Effects(_)
@@ -1091,7 +1108,7 @@ mod tests {
         // `FxController.cpp:348-352` returns before anything else runs, which is also why the
         // window is not raised.
         let commands = parse(&["--status", "--power=1", "--preset=Rock"]).commands();
-        assert_eq!(commands, vec![Command::Status]);
+        assert_eq!(commands, vec![Command::Status { json: false }]);
     }
 
     #[test]
