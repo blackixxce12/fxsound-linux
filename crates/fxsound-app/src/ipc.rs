@@ -352,6 +352,17 @@ impl Forwarded {
         self.reply(Response::output(stdout));
     }
 
+    /// Answer with everything running a command line produced: its output, its diagnostics, and
+    /// whether the forwarding process should exit non-zero.
+    pub fn respond_with(self, stdout: String, stderr: String, failed: bool) {
+        self.reply(Response {
+            v: PROTOCOL_VERSION,
+            ok: !failed,
+            stdout,
+            stderr,
+        });
+    }
+
     /// Answer with a whole [`Response`] — the way to refuse with [`Response::failed`].
     pub fn reply(mut self, response: Response) {
         self.send(response);

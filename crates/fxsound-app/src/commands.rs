@@ -44,6 +44,15 @@ impl WindowRequest {
 pub struct Outcome {
     /// Text for the invoking process's stdout — only `--status` produces any.
     pub stdout: String,
+    /// Text for its stderr: why a command did nothing.
+    pub stderr: String,
+    /// Whether the invoking process should exit non-zero.
+    ///
+    /// A command that silently does nothing is the worst of the three possible outcomes, and it is
+    /// what `--output` used to do before the device list had arrived. Anything scripted — a
+    /// systemd unit, a compositor keybind at login, an autostart entry — cannot tell that apart
+    /// from success.
+    pub failed: bool,
     /// What the window should do afterwards.
     pub window: WindowRequest,
 }
@@ -53,6 +62,13 @@ pub fn run(app: &mut App, commands: &[Command]) -> Outcome {
     let mut outcome = Outcome::default();
     for command in commands {
         let one = run_one(app, command);
+        if !one.stderr.is_empty() {
+            if !outcome.stderr.is_empty() {
+                outcome.stderr.push('\n');
+            }
+            outcome.stderr.push_str(&one.stderr);
+        }
+        outcome.failed |= one.failed;
         if !one.stdout.is_empty() {
             if !outcome.stdout.is_empty() {
                 outcome.stdout.push('\n');
@@ -105,6 +121,21 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
                 });
             if let Some(index) = index {
                 app.handle(&[UiAction::SelectDevice(index)]);
+            } else if app.has_seen_devices() {
+                // The list exists and nothing in it is called that. Say so, and exit non-zero:
+                // a script that asked for a device it did not get has to be able to find out.
+                return Outcome {
+                    stderr: format!("no audio device is called {name:?}"),
+                    failed: true,
+                    ..Outcome::default()
+                };
+            } else {
+                // The list has not arrived yet. This is the common case for anything that runs at
+                // login — the control socket answers as soon as the GUI thread is up, which is
+                // before PipeWire has finished enumerating — and a name that matches nothing in an
+                // *empty* list is not the same as a name that matches nothing. Hold it until the
+                // list exists rather than failing a command that is about to become valid.
+                app.select_device_when_listed(name);
             }
         }
         Command::Output(OutputCommand::Next) => {

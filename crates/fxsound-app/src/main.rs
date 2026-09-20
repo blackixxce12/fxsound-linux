@@ -165,6 +165,11 @@ fn main() -> eframe::Result<()> {
     if !cold.stdout.is_empty() {
         println!("{}", cold.stdout);
     }
+    // A cold start reports and carries on: the device list has not arrived yet, so `--output` has
+    // been held rather than refused, and there is nothing here worth refusing to start over.
+    if !cold.stderr.is_empty() {
+        eprintln!("{}", cold.stderr);
+    }
     // `--hide` and the saved "start minimised" preference start in the tray-only state; there is
     // no such thing as a hidden window here (see the module docs).
     let mut visibility = if cold.window.hide || app.settings_run_minimized() {
@@ -304,7 +309,7 @@ impl Runtime {
         for forwarded in self.server.drain() {
             let outcome = commands::run(&mut self.app, forwarded.commands());
             merge(&mut request, outcome.window);
-            forwarded.respond(outcome.stdout);
+            forwarded.respond_with(outcome.stdout, outcome.stderr, outcome.failed);
         }
         while let Ok(command) = self.tray_rx.try_recv() {
             match command {

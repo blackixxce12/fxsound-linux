@@ -64,6 +64,14 @@ pub struct App {
     /// preset describe different chains, and the only thing they share is that exactly one of them
     /// is selected at a time — whichever direction is live.
     input_presets: Vec<fxsound_preset::input::InputPreset>,
+    /// Whether a device list has ever arrived from the audio thread.
+    ///
+    /// The control socket answers as soon as the GUI thread is up, which is before PipeWire has
+    /// finished enumerating. Until this is true, "no device is called that" and "no device list
+    /// yet" are the same observation, and they call for opposite answers.
+    devices_seen: bool,
+    /// A `--output` that arrived before the list did, waiting for it.
+    pending_device: Option<String>,
     /// Persisted settings, saved when they change rather than on a timer.
     settings: Settings,
     /// Factory and user presets.
@@ -121,6 +129,8 @@ impl App {
             params: DspParams::default(),
             input_params: InputDspParams::default(),
             input_presets: Vec::new(),
+            devices_seen: false,
+            pending_device: None,
             settings,
             presets,
             loaded_preset: None,
@@ -186,6 +196,7 @@ impl App {
         while let Some(message) = engine.try_recv() {
             match message {
                 AudioToUi::Devices(devices) => {
+                    self.devices_seen = true;
                     // Keep the user's choice selected across a rescan when the device is still
                     // there; otherwise fall back to whatever the server calls the default.
                     let wanted = self.settings.selected_device_name().to_owned();
@@ -225,6 +236,12 @@ impl App {
                     self.state.notification = Some(message);
                 }
             }
+        }
+
+        // Outside the loop, where the engine is no longer borrowed: selecting a device calls back
+        // into the whole controller.
+        if self.devices_seen && self.pending_device.is_some() {
+            self.apply_pending_device();
         }
     }
 
@@ -791,6 +808,49 @@ impl App {
         self.input_params.deesser_on = self.state.deesser_on;
     }
 
+    /// Act on a `--output` that arrived before the device list did.
+    ///
+    /// Taken rather than retried: a name that is not in the list *now that there is one* is a name
+    /// that is not a device, and holding it for the next list would mean a typo at login quietly
+    /// changing the device half a minute later when something unrelated is plugged in.
+    fn apply_pending_device(&mut self) {
+        let Some(wanted) = self.pending_device.take() else {
+            return;
+        };
+        let index = self
+            .state
+            .devices
+            .iter()
+            .position(|d| d.name == wanted)
+            .or_else(|| {
+                self.state
+                    .devices
+                    .iter()
+                    .position(|d| d.description == wanted)
+            });
+        match index {
+            Some(index) => self.handle(&[UiAction::SelectDevice(index)]),
+            // The invoking process has long since exited, so there is nobody left to return a
+            // status to. The log is the only place this can be said.
+            None => log::warn!("no audio device is called {wanted:?}; --output did nothing"),
+        }
+    }
+
+    /// Whether a device list has ever arrived.
+    #[must_use]
+    pub const fn has_seen_devices(&self) -> bool {
+        self.devices_seen
+    }
+
+    /// Select this device as soon as a device list exists.
+    ///
+    /// Used by `--output` when it runs before enumeration has finished, which is what anything
+    /// started at login does. One pending name, not a queue: a second `--output` supersedes the
+    /// first exactly as a second one would if both had arrived after the list.
+    pub fn select_device_when_listed(&mut self, name: &str) {
+        self.pending_device = Some(name.to_owned());
+    }
+
     /// The microphone snapshot currently published, for tests and for `--status`.
     #[must_use]
     pub const fn input_params(&self) -> &InputDspParams {
@@ -816,6 +876,8 @@ impl App {
             params: DspParams::default(),
             input_params: InputDspParams::default(),
             input_presets: Vec::new(),
+            devices_seen: false,
+            pending_device: None,
             settings: Settings::default(),
             presets: PresetStore::with_dirs(
                 Vec::new(),
@@ -1911,6 +1973,90 @@ mod tests {
             app.state.preset().map(|p| p.name.as_str()),
             Some("Beta"),
             "picking another speaker changed the preset"
+        );
+    }
+
+    #[test]
+    fn an_output_command_before_the_device_list_waits_for_it() {
+        // The bug this closes: the control socket answers as soon as the GUI thread is up, which
+        // is before PipeWire has finished enumerating, so `fxsound --output "..."` at login
+        // returned 0, printed nothing and did nothing. Anything scripted hits it.
+        let mut app = App::headless_for_tests();
+        assert!(!app.has_seen_devices());
+
+        let outcome = crate::commands::run(
+            &mut app,
+            &[crate::cli::Command::Output(
+                crate::cli::OutputCommand::Select("alsa_input.mic".to_owned()),
+            )],
+        );
+        assert!(
+            !outcome.failed,
+            "a command that is about to become valid must not fail"
+        );
+        assert!(outcome.stderr.is_empty());
+        assert_eq!(app.state.selected_device, None, "nothing to select yet");
+
+        // The list arrives, and the command it was waiting for happens.
+        app.devices_seen = true;
+        app.state.devices = vec![
+            device("alsa_output.speakers", DeviceDirection::Output, true),
+            device("alsa_input.mic", DeviceDirection::Input, false),
+        ];
+        app.apply_pending_device();
+        assert_eq!(app.state.selected_device, Some(1));
+        assert_eq!(app.state.direction, DeviceDirection::Input);
+    }
+
+    #[test]
+    fn an_output_command_for_a_device_that_does_not_exist_says_so_and_fails() {
+        // The other half. Once the list exists, a name that matches nothing in it is a name that
+        // is not a device, and a script has to be able to find that out.
+        let mut app = App::headless_for_tests();
+        app.devices_seen = true;
+        app.state.devices = vec![device(
+            "alsa_output.speakers",
+            DeviceDirection::Output,
+            true,
+        )];
+
+        let outcome = crate::commands::run(
+            &mut app,
+            &[crate::cli::Command::Output(
+                crate::cli::OutputCommand::Select("nothing like this".to_owned()),
+            )],
+        );
+        assert!(outcome.failed, "it exited zero while doing nothing");
+        assert!(
+            outcome.stderr.contains("nothing like this"),
+            "the message should name what was asked for: {:?}",
+            outcome.stderr
+        );
+        assert_eq!(app.state.selected_device, None);
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_device_does_not_wait_for_the_next_list() {
+        // A typo held for the next device list would change the device half a minute later, when
+        // something unrelated is plugged in. Once a list has been seen, the pending name is spent.
+        let mut app = App::headless_for_tests();
+        app.select_device_when_listed("typo");
+        app.devices_seen = true;
+        app.state.devices = vec![device(
+            "alsa_output.speakers",
+            DeviceDirection::Output,
+            true,
+        )];
+        app.apply_pending_device();
+        assert_eq!(app.state.selected_device, None);
+
+        app.state
+            .devices
+            .push(device("typo", DeviceDirection::Output, false));
+        app.apply_pending_device();
+        assert_eq!(
+            app.state.selected_device, None,
+            "a spent name came back to life"
         );
     }
 
