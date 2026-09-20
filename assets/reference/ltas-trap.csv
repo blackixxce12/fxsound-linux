@@ -1,0 +1,80 @@
+# Reference long-term average spectrum for the "Trap" genre preset.
+#
+# Source: the Android Open Source Project's five-band equalizer preset table,
+#   frameworks/av/media/libeffects/lvm/wrapper/Bundle/EffectBundle.h,
+#   EQNB_5BandSoftPresets, entry "Hip Hop" = [5, 3, 0, 1, 3] dB
+#   at EQNB_5BandPresetsFrequencies = [60, 230, 910, 3600, 14000] Hz, Q = 0.96.
+#   Retrieved 2026-09-21 from android.googlesource.com, branch main.
+#   Scaling applied in step 1 below: x1.2751 (the raw shape's RMS was 1.57 dB).
+#
+# Derivation, in three steps, so that this file can be rebuilt by hand from the table cited above:
+#
+#   1. genre_eq_db: the published table's band gains interpolated onto the 29 third-octave
+#      centres, linearly in dB against log frequency, held flat outside the outermost published
+#      band. Then the mean over 40 Hz..16 kHz is subtracted, and the result is scaled so that its
+#      RMS deviation over 40 Hz..16 kHz is exactly 2.00 dB.
+#
+#      That rescaling is the one liberty taken with the source, and the reason for it is this:
+#      Winamp's sliders run to +-12 dB and Android's table to +-15, while this port's genre
+#      presets are voiced at about +-3. Comparing at the sources' own magnitude would measure how
+#      STRONGLY a preset voices rather than in WHICH DIRECTION, and direction is the only thing
+#      these sources establish. 2.00 dB is a round number at the strength this product voices at;
+#      it is identical for all five genres, so it cannot favour any one preset.
+#
+#   2. baseline_db: a long-term average spectrum for popular music with no genre applied. Pestana,
+#      Ma, Reiss, Barbosa and Black (AES 135, paper 8960, ~800 number-one singles 1950-2010) report
+#      "a consistent linear decay of about 5 dB per octave from 100 to 4000 Hz" -- the only number
+#      from that literature that is public rather than behind the AES paywall. Here: 0 dB at and
+#      below 100 Hz, -5 dB/octave above it. Both the hold below 100 Hz and the continuation of the
+#      same slope above 4 kHz are ASSUMPTIONS, not findings; real material falls faster at both
+#      ends. They are tolerable because the test that reads this file synthesises its material from
+#      the very same baseline, so the baseline cancels out of every comparison except through the
+#      engine's level-dependent stages -- which is precisely the part the test exists to exercise.
+#
+#   3. level_db = baseline_db + genre_eq_db, with the mean over 40 Hz..16 kHz subtracted again so
+#      the column is a shape rather than a level. Nothing downstream uses absolute level.
+#
+# What this is NOT: a measured spectrum of real recordings. No per-genre LTAS exists as numbers
+# anywhere -- Pestana/Reiss publish theirs only as plots behind a paywall, iZotope's and Har-Bal's
+# are proprietary and embedded in their plugins, and the Million Song Dataset's timbre coefficients
+# do not invert to a dB spectrum. What the table above records is a CONSENSUS TASTE CURVE: what
+# a widely-deployed product decided a genre should be shaped like. That is weaker than measurement
+# and it is what exists.
+#
+# Licence: the numbers reproduced here are the band gains of a published table, used as data.
+# The Android Open Source Project is Apache-2.0. See README.md in this directory for the second
+# published table (Winamp/XMMS 1997), which is used only as a cross-check and not by any file here.
+#
+# columns: center_hz -- third-octave centre in Hz
+#          level_db  -- the reference shape; this is what the test compares against
+#          baseline_db, genre_eq_db -- the decomposition above, so the file can be audited
+center_hz,level_db,baseline_db,genre_eq_db
+31.5,19.033,0.000,3.466
+40,19.033,0.000,3.466
+50,19.033,0.000,3.466
+63,18.940,0.000,3.373
+80,18.487,0.000,2.920
+100,18.063,0.000,2.497
+125,16.030,-1.610,2.073
+160,13.781,-3.390,1.605
+200,11.748,-5.000,1.181
+250,9.641,-6.610,0.684
+315,7.331,-8.277,0.041
+400,4.943,-10.000,-0.623
+500,2.713,-11.610,-1.244
+630,0.403,-13.277,-1.887
+800,-1.984,-15.000,-2.551
+1000,-3.865,-16.610,-2.822
+1250,-5.268,-18.219,-2.615
+1600,-6.819,-20.000,-2.386
+2000,-8.222,-21.610,-2.179
+2500,-9.625,-23.219,-1.972
+3150,-11.078,-24.886,-1.758
+4000,-12.479,-26.610,-1.436
+5000,-13.670,-28.219,-1.017
+6300,-14.903,-29.886,-0.583
+8000,-16.178,-31.610,-0.135
+10000,-17.369,-33.219,0.284
+12500,-18.559,-34.829,0.703
+16000,-20.127,-36.610,0.916
+20000,-21.737,-38.219,0.916

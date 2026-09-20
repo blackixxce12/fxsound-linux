@@ -159,7 +159,7 @@ fn selecting_a_device_builds_the_nodes_and_negotiates_its_format() {
     let Some(graph) = PrivateGraph::start("select") else {
         return;
     };
-    let mut handle =
+    let handle =
         AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
     wait_for(&handle, "a device list", |m| {
         matches!(m, AudioToUi::Devices(ref d) if !d.is_empty()).then_some(())
@@ -194,7 +194,7 @@ fn switching_direction_rebuilds_the_nodes_the_other_way_round() {
     let Some(graph) = PrivateGraph::start("direction") else {
         return;
     };
-    let mut handle =
+    let handle =
         AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
     wait_for(&handle, "a device list", |m| {
         matches!(m, AudioToUi::Devices(ref d) if !d.is_empty()).then_some(())

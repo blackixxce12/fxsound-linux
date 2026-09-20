@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod analysis;
 pub mod biquad;
 pub mod effects;
 pub mod engine;

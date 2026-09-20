@@ -1,0 +1,53 @@
+# The genre-neutral baseline: a long-term average spectrum for popular music with no
+# genre voicing applied. The test that reads this file synthesises its programme
+# material to exactly this shape, for every genre.
+#
+# That is a deliberate choice and it is worth stating, because the obvious alternative
+# is wrong: if each genre's material were pre-shaped to that genre's own reference,
+# the material would already sit on the target and the preset that changed it least
+# would win every column. Genre-shaped material makes the null preset the answer.
+# A genre preset's job is to take generic material and voice it, so generic material
+# is what it has to be given.
+#
+# Source: Pestana, Ma, Reiss, Barbosa and Black, "Spectral Characteristics of Popular
+# Commercial Recordings 1950-2010" (AES 135, paper 8960): "a consistent linear decay
+# of about 5 dB per octave from 100 to 4000 Hz", which is the only number from that
+# corpus published as text rather than as a plot behind the AES paywall.
+#
+# 0 dB at and below 100 Hz; -5 dB/octave above it. The hold below 100 Hz and the
+# continuation of the slope above 4 kHz are assumptions, not findings.
+#
+# columns: center_hz -- third-octave centre in Hz
+#          level_db  -- the baseline shape, mean-removed over 40 Hz..16 kHz
+#          baseline_db, genre_eq_db -- the same decomposition the genre files carry,
+#            with a genre_eq_db of zero, so every file in this directory parses the same way
+center_hz,level_db,baseline_db,genre_eq_db
+31.5,15.567,0.000,0.000
+40,15.567,0.000,0.000
+50,15.567,0.000,0.000
+63,15.567,0.000,0.000
+80,15.567,0.000,0.000
+100,15.567,0.000,0.000
+125,13.957,-1.610,0.000
+160,12.176,-3.390,0.000
+200,10.567,-5.000,0.000
+250,8.957,-6.610,0.000
+315,7.290,-8.277,0.000
+400,5.567,-10.000,0.000
+500,3.957,-11.610,0.000
+630,2.290,-13.277,0.000
+800,0.567,-15.000,0.000
+1000,-1.043,-16.610,0.000
+1250,-2.653,-18.219,0.000
+1600,-4.433,-20.000,0.000
+2000,-6.043,-21.610,0.000
+2500,-7.653,-23.219,0.000
+3150,-9.320,-24.886,0.000
+4000,-11.043,-26.610,0.000
+5000,-12.653,-28.219,0.000
+6300,-14.320,-29.886,0.000
+8000,-16.043,-31.610,0.000
+10000,-17.653,-33.219,0.000
+12500,-19.262,-34.829,0.000
+16000,-21.043,-36.610,0.000
+20000,-22.653,-38.219,0.000
