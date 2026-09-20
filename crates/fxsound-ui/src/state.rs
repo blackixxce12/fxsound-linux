@@ -6,7 +6,9 @@
 //! an action into a real effect — writing a preset, retuning the engine, switching a device — so
 //! the whole UI crate stays free of audio and file-system dependencies and can be tested headless.
 
-use fxsound_core::{AudioDevice, Effect, EqBand, SpectrumFrame, ThemeMode, ViewMode};
+use fxsound_core::{
+    AudioDevice, DeviceDirection, Effect, EqBand, SpectrumFrame, ThemeMode, ViewMode,
+};
 
 /// One preset as the combo box needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,9 +33,15 @@ pub struct UiState {
     /// Index into `presets`, or `None` when the list is empty.
     pub selected_preset: Option<usize>,
 
-    // ---- output ----------------------------------------------------------------------------
+    // ---- device ----------------------------------------------------------------------------
     pub devices: Vec<AudioDevice>,
     pub selected_device: Option<usize>,
+    /// Which chain the engine is running, which follows the selected device.
+    ///
+    /// The original had no such thing — it only ever sat in front of a playback endpoint — so
+    /// everything drawn differently because of this is drawn *only* in the input direction, where
+    /// there is no layout to be faithful to.
+    pub direction: DeviceDirection,
 
     // ---- effects ---------------------------------------------------------------------------
     /// The five knobs on the GUI's own `0..=10` scale, indexed by `Effect as usize`.
@@ -57,6 +65,29 @@ pub struct UiState {
     pub spectrum: SpectrumFrame,
     /// `true` while audio is actually flowing; the visualizer idles otherwise.
     pub audio_active: bool,
+    /// The rate the engine is running at, which is the device's, not a preference.
+    ///
+    /// Read for one purpose: an equalizer band centred at or above half of it cannot be built, so
+    /// the band is bypassed. A bypassed band that still *looks* live is a control that silently
+    /// does nothing, which is the one thing this port keeps refusing to ship.
+    pub sample_rate: u32,
+    /// Gain reduction of the three microphone stages, in dB, as positive numbers. Zero in the
+    /// output direction, which has none of them.
+    pub gate_reduction_db: f32,
+    pub compressor_reduction_db: f32,
+    pub deesser_reduction_db: f32,
+
+    // ---- the microphone chain --------------------------------------------------------------
+    /// Which of the voice chain's three dynamics stages are switched on.
+    ///
+    /// All three start off and stay off until an input preset turns them on, which is the whole
+    /// of the caution in `sync_input_params_from_state`: nobody has voiced them yet, and an
+    /// upgrade must not start gating someone's quiet talker. They live here rather than in the
+    /// mapping so that a preset, once there are any, moves them the same way it moves everything
+    /// else.
+    pub gate_on: bool,
+    pub compressor_on: bool,
+    pub deesser_on: bool,
 
     // ---- chrome ----------------------------------------------------------------------------
     /// Transient message shown in the notification strip, with the frame count left to live.
@@ -75,6 +106,7 @@ impl Default for UiState {
             selected_preset: None,
             devices: Vec::new(),
             selected_device: None,
+            direction: DeviceDirection::Output,
             effects: [0.0; Effect::COUNT],
             eq_on: true,
             eq_bands: fxsound_core::eq::default_bands(),
@@ -84,6 +116,13 @@ impl Default for UiState {
             volume_leveling: 0.0,
             spectrum: [0.0; fxsound_core::NUM_SPECTRUM_BARS],
             audio_active: false,
+            sample_rate: 48_000,
+            gate_reduction_db: 0.0,
+            compressor_reduction_db: 0.0,
+            deesser_reduction_db: 0.0,
+            gate_on: false,
+            compressor_on: false,
+            deesser_on: false,
             notification: None,
             hide_tooltips: false,
         }
@@ -124,6 +163,44 @@ impl UiState {
     #[must_use]
     pub const fn controls_enabled(&self) -> bool {
         self.power
+    }
+
+    /// Whether the five effect sliders do anything.
+    ///
+    /// They are the music chain's. A microphone runs the voice chain instead, and the two share
+    /// the ten-band equalizer and nothing else — reverberation, stereo widening and a bass lift
+    /// are the opposite of what a voice wants. So on a microphone these five are inert, and a
+    /// control that is inert has to *look* inert: the alternative is a slider that moves, reads
+    /// back the value it was given, and changes nothing anyone can hear.
+    #[must_use]
+    pub const fn music_effects_apply(&self) -> bool {
+        matches!(self.direction, DeviceDirection::Output)
+    }
+
+    /// Whether an equalizer band can be built at the current rate.
+    ///
+    /// A band centred at or above Nyquist has nowhere to sit: the design bypasses it, and the
+    /// fader would otherwise be a control that does nothing. The case is not hypothetical — a
+    /// Bluetooth headset captures at 16 kHz, where the top two bands of the standard ladder are
+    /// both past it.
+    #[must_use]
+    pub fn band_is_live(&self, band: usize) -> bool {
+        // Spelled `2·f0 < fs` rather than `f0 < fs/2` to match `GraphicEq::set_band_boost`
+        // character for character. The two are the same number in exact arithmetic and the same
+        // number in f32, but this rule is duplicated across a crate boundary — the equalizer
+        // cannot be reached from here — and a duplicated rule that is *written* differently is one
+        // that drifts. `fxsound-app` holds the test that keeps the two answering alike.
+        self.eq_bands
+            .get(band)
+            .is_some_and(|band| band.center_hz * 2.0 < self.sample_rate as f32)
+    }
+
+    /// How many of the equalizer's bands the current rate cannot carry.
+    #[must_use]
+    pub fn dead_band_count(&self) -> usize {
+        (0..self.eq_bands.len())
+            .filter(|&band| !self.band_is_live(band))
+            .count()
     }
 
     /// Index of the next preset, wrapping, or `None` when there are fewer than two.
@@ -230,6 +307,39 @@ impl UiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_band_above_the_devices_nyquist_limit_is_not_live() {
+        // The case is a Bluetooth headset, which captures at 16 kHz: the standard ladder's top two
+        // bands, 8640 and 16000 Hz, are both at or past 8 kHz and the design bypasses them. A
+        // fader that still looks live there is a control that does nothing.
+        let mut state = UiState {
+            sample_rate: 16_000,
+            ..UiState::default()
+        };
+        assert_eq!(state.eq_bands.len(), 10);
+        assert!(state.band_is_live(0), "62.5 Hz must survive anything");
+        assert!(!state.band_is_live(8), "8640 Hz is past 8 kHz");
+        assert!(!state.band_is_live(9), "16000 Hz is far past it");
+        assert_eq!(state.dead_band_count(), 2);
+
+        // And at a rate that can carry them, every band is live.
+        state.sample_rate = 48_000;
+        assert_eq!(state.dead_band_count(), 0);
+    }
+
+    #[test]
+    fn the_music_effects_apply_only_to_a_playback_device() {
+        let mut state = UiState::default();
+        assert!(state.music_effects_apply());
+        state.direction = DeviceDirection::Input;
+        assert!(
+            !state.music_effects_apply(),
+            "reverberation and a bass lift are not what a voice wants"
+        );
+        // The power switch is a different question and is not answered by this one.
+        assert!(state.controls_enabled());
+    }
 
     fn state_with_presets(count: usize) -> UiState {
         UiState {

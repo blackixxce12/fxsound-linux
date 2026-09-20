@@ -161,6 +161,13 @@ impl App {
         let meters = engine.meters();
         self.state.spectrum = meters.spectrum;
         self.state.audio_active = meters.active;
+        // The rate is the device's, and the interface needs it for one thing: an equalizer band
+        // centred at or above Nyquist cannot be built, and a fader that does nothing has to say
+        // so. A 16 kHz Bluetooth capture takes the top two bands of the standard ladder with it.
+        self.state.sample_rate = meters.sample_rate;
+        self.state.gate_reduction_db = meters.gate_reduction_db;
+        self.state.compressor_reduction_db = meters.compressor_reduction_db;
+        self.state.deesser_reduction_db = meters.deesser_reduction_db;
 
         while let Some(message) = engine.try_recv() {
             match message {
@@ -169,6 +176,7 @@ impl App {
                     // there; otherwise fall back to whatever the server calls the default.
                     let wanted = self.settings.selected_device_name().to_owned();
                     let direction = self.settings.device_direction;
+                    self.state.direction = direction;
                     self.state.selected_device = devices
                         .iter()
                         .position(|d| d.name == wanted && d.direction == direction)
@@ -278,6 +286,11 @@ impl App {
                 };
 
                 self.state.selected_device = Some(index);
+                // The interface follows the device immediately rather than waiting for the next
+                // device list: picking a microphone is exactly the moment the five effect sliders
+                // stop meaning anything, and a frame of them still looking live is a frame of
+                // lying.
+                self.state.direction = direction;
                 self.settings.set_selected_device(&name, direction);
                 self.settings_dirty = true;
                 if let Some(engine) = &self.engine {
@@ -664,9 +677,9 @@ impl App {
 
         self.input_params.highpass_hz = 80.0;
         self.input_params.highpass_order = 2;
-        self.input_params.gate_on = false;
-        self.input_params.compressor_on = false;
-        self.input_params.deesser_on = false;
+        self.input_params.gate_on = self.state.gate_on;
+        self.input_params.compressor_on = self.state.compressor_on;
+        self.input_params.deesser_on = self.state.deesser_on;
     }
 
     /// The microphone snapshot currently published, for tests and for `--status`.
@@ -1616,6 +1629,62 @@ mod tests {
         assert_eq!(app.state.theme, ThemeMode::Light);
         assert_eq!(app.settings.theme_mode, ThemeMode::Light);
         assert!(app.palette().mode() == ThemeMode::Light);
+    }
+
+    #[test]
+    fn the_interface_and_the_equalizer_agree_on_which_bands_the_device_can_carry() {
+        // `UiState::band_is_live` decides whether to strike a frequency label through;
+        // `GraphicEq::set_band_boost` decides whether the filter is built at all. They live in
+        // different crates and the interface cannot see the equalizer, so the rule is written
+        // twice — and this is what stops the two copies drifting into a label that says a band is
+        // live while the engine is quietly bypassing it.
+        //
+        // The equalizer is asked the only question that matters: does a boost change the curve.
+        use fxsound_dsp::GraphicEq;
+
+        for rate in [8_000_u32, 16_000, 22_050, 32_000, 44_100, 48_000, 96_000] {
+            let mut state = UiState {
+                sample_rate: rate,
+                ..UiState::default()
+            };
+            let mut eq = GraphicEq::new();
+            eq.set_sample_rate(rate as f32);
+
+            for band in 0..state.eq_bands.len() {
+                let centre = state.eq_bands[band].center_hz;
+                state.eq_bands[band].boost_db = 6.0;
+                eq.set_band_boost(band, 6.0);
+                let engine_built_it = eq.response_db(centre).abs() > 0.01;
+                assert_eq!(
+                    state.band_is_live(band),
+                    engine_built_it,
+                    "{rate} Hz, band {band} at {centre} Hz: the interface says {} and the \
+                     equalizer says {engine_built_it}",
+                    state.band_is_live(band),
+                );
+                state.eq_bands[band].boost_db = 0.0;
+                eq.set_band_boost(band, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn picking_a_microphone_switches_the_interface_in_the_same_frame() {
+        // Not on the next device list: picking a microphone is the moment the five effect sliders
+        // stop meaning anything, and a frame of them still looking live is a frame of lying.
+        let mut app = App::headless_for_tests();
+        app.state.devices = vec![
+            device("speakers", DeviceDirection::Output, true),
+            device("mic", DeviceDirection::Input, false),
+        ];
+        assert_eq!(app.state.direction, DeviceDirection::Output);
+        app.handle(&[UiAction::SelectDevice(1)]);
+        assert_eq!(app.state.direction, DeviceDirection::Input);
+        assert!(!app.state.music_effects_apply());
+
+        app.handle(&[UiAction::SelectDevice(0)]);
+        assert_eq!(app.state.direction, DeviceDirection::Output);
+        assert!(app.state.music_effects_apply());
     }
 
     #[test]

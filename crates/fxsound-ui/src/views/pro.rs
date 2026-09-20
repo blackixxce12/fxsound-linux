@@ -58,6 +58,16 @@ use fxsound_core::{Effect, ViewMode, scale};
 /// from creeping back.
 pub const CAPTION_FONT_PX: f32 = 14.0;
 
+/// The reduction readouts' text, bar height, gap and full scale.
+///
+/// 24 dB of full scale is past anything a voice preset asks for — the gate's range caps at 14 and
+/// the compressor rarely passes 12 — so a bar that is pinned means something has gone wrong rather
+/// than that the scale was too short.
+pub const METER_FONT_PX: f32 = 11.0;
+const METER_BAR_HEIGHT: f32 = 4.0;
+const METER_BAR_GAP: f32 = 6.0;
+const METER_FULL_SCALE_DB: f32 = 24.0;
+
 /// The floating value readout's JUCE height: `getNormalFont().withHeight(12.0f)`
 /// (`FxAudioControls.cpp:188`), converted the same way.
 pub const VALUE_FONT_PX: f32 = 12.0;
@@ -212,7 +222,84 @@ pub fn show(
         &mut response,
     );
 
+    if !state.music_effects_apply() {
+        input_meters(ui, state, palette, at(origin, layout::pro::input_meters()));
+    }
+
     response
+}
+
+/// The microphone chain's three gain-reduction readouts.
+///
+/// A voice chain that is working is a chain that is *changing* something, and none of its stages
+/// has a control the user can watch: the gate opens and closes on its own, the compressor rides
+/// the delivery, the de-esser fires on a syllable. Without this the only feedback is the sound
+/// itself, which is exactly the feedback someone setting up a microphone does not yet trust.
+///
+/// Drawn only in the input direction, in space the original leaves as padding.
+fn input_meters(ui: &Ui, state: &UiState, palette: Palette, strip: Rect) {
+    let stages = [
+        ("Gate", state.gate_on, state.gate_reduction_db),
+        (
+            "Compressor",
+            state.compressor_on,
+            state.compressor_reduction_db,
+        ),
+        ("De-esser", state.deesser_on, state.deesser_reduction_db),
+    ];
+
+    let label_colour = palette.color(FxColor::DefaultText);
+    let bar_colour = palette.color(FxColor::HighlightedText);
+    let font = caption_font(METER_FONT_PX);
+    let slot = strip.width() / stages.len() as f32;
+
+    for (index, (name, on, reduction)) in stages.into_iter().enumerate() {
+        let left = strip.left() + slot * index as f32;
+        // A stage nobody has switched on can only ever read zero, and a meter pinned at zero is
+        // noise. Say which it is instead: the chain has these three, and none of them is engaged
+        // until a preset engages it.
+        let text = if on {
+            format!("{}  −{:.1} dB", tr(name), reduction.max(0.0))
+        } else {
+            format!("{}  {}", tr(name), tr("off"))
+        };
+        let galley = ui
+            .painter()
+            .layout_no_wrap(text, font.clone(), label_colour);
+        let text_width = galley.size().x;
+        ui.painter().galley(
+            pos2(left, strip.center().y - galley.size().y / 2.0),
+            galley,
+            label_colour,
+        );
+
+        // A bar as well as a number: a number that changes twenty times a second is not something
+        // anyone reads. Full scale is 24 dB, past anything a voice preset asks for.
+        let bar = Rect::from_min_size(
+            pos2(
+                left + text_width + METER_BAR_GAP,
+                strip.center().y - METER_BAR_HEIGHT / 2.0,
+            ),
+            vec2(
+                (slot - text_width - METER_BAR_GAP * 2.0).max(0.0),
+                METER_BAR_HEIGHT,
+            ),
+        );
+        if !on {
+            continue;
+        }
+        // The unlit track needs a colour of its own: the panel's background is what it is drawn on
+        // top of, so painting it there makes an empty meter invisible — which is exactly what the
+        // first build did, and what a screenshot showed before anyone had to listen for it.
+        ui.painter()
+            .rect_filled(bar, 1.0, palette.color_alpha(FxColor::DefaultText, 0.15));
+        let filled = (reduction.max(0.0) / METER_FULL_SCALE_DB).clamp(0.0, 1.0);
+        if filled > 0.0 {
+            let mut lit = bar;
+            lit.set_width(bar.width() * filled);
+            ui.painter().rect_filled(lit, 1.0, bar_colour);
+        }
+    }
 }
 
 /// The five effect sliders, their captions and their value readouts (`FxEffects`,
@@ -225,7 +312,10 @@ fn effect_column(
     column: Rect,
     response: &mut UiResponse,
 ) {
-    let enabled = state.controls_enabled();
+    // Two different reasons to be grey, and they are not the same reason. The power switch turns
+    // the controls off; a microphone means these five controls are not *for* this chain at all.
+    let applies = state.music_effects_apply();
+    let enabled = state.controls_enabled() && applies;
     let caption_colour = palette.color(FxColor::DefaultText);
     let value_colour = palette.color(FxColor::HighlightedText);
 
@@ -252,9 +342,15 @@ fn effect_column(
             .show(ui, rect, palette, assets, effect.key());
         let changed = slider.changed();
         // The five help tips (`FxAudioControls.cpp:157-161`), cleared while the user has ticked
-        // "Hide help tips for audio controls" (`:169-176`).
+        // "Hide help tips for audio controls" (`:169-176`). On a microphone the tip is replaced
+        // rather than dropped: the question a greyed control raises is "why", and the answer has
+        // to be somewhere the user is already looking.
         if !state.hide_tooltips {
-            let _ = slider.on_hover_text(tr(effect.tooltip()));
+            let _ = if applies {
+                slider.on_hover_text(tr(effect.tooltip()))
+            } else {
+                slider.on_hover_text(tr(MICROPHONE_INERT_TIP))
+            };
         }
         if changed {
             response.push(UiAction::SetEffect(effect, value));
@@ -275,7 +371,32 @@ fn effect_column(
             );
         }
     }
+
+    // A hover tip is not enough on its own: nobody hovers a control they have already decided is
+    // broken. The sixth row's worth of space below the five sliders is where the original leaves
+    // padding, and it is drawn on only in the direction the original does not have.
+    if !applies {
+        ui.painter().text(
+            pos2(
+                column.left() + effects::X_MARGIN + crate::widgets::slider::THUMB_RADIUS,
+                effects::row_top(column, Effect::COUNT),
+            ),
+            Align2::LEFT_TOP,
+            tr(MICROPHONE_INERT_CAPTION),
+            caption_font(CAPTION_FONT_PX),
+            palette.color(FxColor::DefaultText),
+        );
+    }
 }
+
+/// Why the five effect sliders are grey while a microphone is selected.
+///
+/// English keys, like every other string the port added that the Windows catalogues never had:
+/// [`tr`] falls back to the key itself, so an untranslated build reads correctly rather than
+/// showing a placeholder.
+pub const MICROPHONE_INERT_CAPTION: &str = "Not used on a microphone";
+pub const MICROPHONE_INERT_TIP: &str = "These five belong to the playback chain. A microphone runs the voice chain instead: \
+     high-pass, gate, equalizer, de-esser, compressor and limiter.";
 
 #[cfg(test)]
 mod tests {
@@ -591,6 +712,116 @@ mod tests {
         }
 
         assert_eq!(actions, vec![UiAction::SetEffect(Effect::Fidelity, 5.0)]);
+    }
+
+    /// The same window with a microphone selected.
+    fn microphone_state() -> UiState {
+        let mut state = state();
+        state.devices = vec![AudioDevice {
+            id: 7,
+            name: "alsa_input.usb-fifine.analog-stereo".to_owned(),
+            description: "fifine Microphone".to_owned(),
+            is_default: true,
+            direction: fxsound_core::DeviceDirection::Input,
+            form_factor: "microphone".into(),
+        }];
+        state.direction = fxsound_core::DeviceDirection::Input;
+        state
+    }
+
+    #[test]
+    fn the_effect_sliders_do_nothing_on_a_microphone_and_do_not_pretend_otherwise() {
+        // They belong to the music chain. The point of this test is the *silence*: clicking a
+        // slider that is drawn live but changes nothing audible is the defect, so the assertion is
+        // that no action leaves the view at all.
+        let ctx = test_context();
+        let mut scratch = ViewScratch::new();
+        let mut assets = AssetCache::new();
+        let microphone = microphone_state();
+
+        let rect = effects::slider_rect(column(), 0);
+        let target = slider::track_rect(rect).center();
+        let mut actions = Vec::new();
+        for events in [
+            vec![Event::PointerMoved(target)],
+            vec![
+                Event::PointerMoved(target),
+                Event::PointerButton {
+                    pos: target,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        ] {
+            actions.extend(frame(&ctx, &microphone, &mut scratch, &mut assets, events));
+        }
+        assert!(
+            actions.is_empty(),
+            "a microphone's effect slider still moved: {actions:?}"
+        );
+
+        // And the same click on a playback device does move it, so this is the direction talking
+        // and not a broken slider.
+        let mut actions = Vec::new();
+        for events in [
+            vec![Event::PointerMoved(target)],
+            vec![
+                Event::PointerMoved(target),
+                Event::PointerButton {
+                    pos: target,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        ] {
+            actions.extend(frame(&ctx, &state(), &mut scratch, &mut assets, events));
+        }
+        assert_eq!(actions, vec![UiAction::SetEffect(Effect::Fidelity, 5.0)]);
+    }
+
+    #[test]
+    fn the_reason_has_a_place_to_be_written_inside_the_column() {
+        // A hover tip alone would not do: nobody hovers a control they have already written off.
+        // So the reason is painted where a sixth slider row would start — inside the column, clear
+        // of the fifth slider, in space the original leaves as padding.
+        let column = column();
+        let y = effects::row_top(column, Effect::COUNT);
+        assert!(
+            y + CAPTION_FONT_PX <= column.bottom(),
+            "the caption at {y} does not fit the column ending at {}",
+            column.bottom()
+        );
+        assert!(
+            y > effects::slider_rect(column, Effect::COUNT - 1).bottom(),
+            "the caption overlaps the last slider"
+        );
+    }
+
+    #[test]
+    fn the_reduction_meters_are_drawn_only_where_there_is_a_chain_to_meter() {
+        // Geometry, not pixels: the strip must sit in the panel's own padding, so that nothing
+        // that exists in the output direction moves by a point.
+        let strip = layout::pro::input_meters();
+        let panel = layout::pro::panel();
+        let controls = layout::pro::audio_controls();
+        let eq = layout::pro::equalizer();
+        assert!(
+            strip.top() >= controls.bottom(),
+            "the strip overlaps the sliders"
+        );
+        assert!(
+            strip.top() >= eq.bottom(),
+            "the strip overlaps the equalizer"
+        );
+        assert!(
+            strip.bottom() <= panel.bottom(),
+            "the strip leaves the panel"
+        );
+        assert!(strip.height() >= 10.0, "no room to draw a meter in");
+        assert_eq!(strip.left(), controls.left());
+        assert_eq!(strip.right(), eq.right());
     }
 
     #[test]

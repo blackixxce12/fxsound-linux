@@ -1024,13 +1024,35 @@ fn paint_freq_label(
         return;
     };
     let rect = translate(layout.freq_label_rect(band), ctx.origin);
+    // A band centred at or above Nyquist cannot be built, so the design bypasses it and the fader
+    // above this label does nothing at all. Struck through rather than merely greyed: grey already
+    // means "the equalizer is switched off" here, and this is a different thing — the control is
+    // on, and the *device* cannot carry it. A 16 kHz Bluetooth capture kills the top two bands of
+    // the standard ladder, which is not a hypothetical.
+    let live = state.band_is_live(band);
+    let colour = if live {
+        ctx.palette.color(FxColor::DefaultText)
+    } else {
+        ctx.palette.color_alpha(FxColor::DefaultText, 0.4)
+    };
     painter.text(
         rect.center_top(),
         Align2::CENTER_TOP,
         frequency_label(eq_band.center_hz, layout.num_bands),
         theme::semibold(layout.freq_label_size()),
-        ctx.palette.color(FxColor::DefaultText),
+        colour,
     );
+    if !live {
+        let y = rect.top() + layout.freq_label_size() * 0.62;
+        let half = layout.freq_label_size() * 1.1;
+        painter.line_segment(
+            [
+                pos2(rect.center().x - half, y),
+                pos2(rect.center().x + half, y),
+            ],
+            Stroke::new(1.0, colour),
+        );
+    }
 }
 
 /// Guides at the five round decibel values. Not part of the original.

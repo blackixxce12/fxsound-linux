@@ -149,6 +149,24 @@ pub mod pro {
         Rect::from_min_size(pos2(224.0, 285.0), vec2(776.0, 257.0))
     }
 
+    /// The microphone chain's gain-reduction readouts, drawn only in the input direction.
+    ///
+    /// The eighteen points between the bottom of the sliders and the bottom of the panel: padding
+    /// in the original, which has no input direction to draw here. Nothing that exists in the
+    /// output direction moves by a point.
+    #[must_use]
+    pub fn input_meters() -> Rect {
+        let controls = audio_controls();
+        let panel = panel();
+        Rect::from_min_size(
+            pos2(controls.left(), controls.bottom() + 2.0),
+            vec2(
+                equalizer().right() - controls.left(),
+                panel.bottom() - controls.bottom() - 4.0,
+            ),
+        )
+    }
+
     /// Where the error toast appears when a device fails.
     #[must_use]
     pub fn notification() -> Rect {
