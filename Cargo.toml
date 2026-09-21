@@ -24,9 +24,9 @@ fxsound-preset = { path = "crates/fxsound-preset" }
 fxsound-audio = { path = "crates/fxsound-audio" }
 fxsound-ui = { path = "crates/fxsound-ui" }
 
-egui = "=0.36.0"
-eframe = { version = "=0.36.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui_extras = { version = "=0.36.0", default-features = false }
+egui = "=0.36.2"
+eframe = { version = "=0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_extras = { version = "=0.36.2", default-features = false }
 
 pipewire = "0.10.1"
 libspa = "0.10.1"
@@ -49,10 +49,9 @@ tokio = { version = "1.53.1", default-features = false, features = ["rt"] }
 crossbeam-channel = "0.5.17"
 # A Wayland client gets no close request from `kill`, `systemctl --user stop` or a logout hook;
 # the flag this registers is what turns those into the same clean quit as the tray's Exit.
-signal-hook = "0.3.18"
+signal-hook = "0.4.4"
 triple_buffer = "9.0.0"
 arc-swap = "1.9.2"
-rtrb = "0.3.5"
 realfft = "3.5.0"
 
 serde = { version = "1.0.229", features = ["derive"] }
@@ -63,7 +62,7 @@ anyhow = "1.0.104"
 thiserror = "2.0.20"
 log = "0.4.34"
 env_logger = "0.11.11"
-clap = { version = "4.6.6", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 # RNNoise, as a pure-Rust port. `default-features = false` is not optional: the default features
 # pull in clap 3 alongside this workspace's clap 4. BSD-3-Clause, which an AGPL-3.0 work may
 # incorporate, and the model weights are embedded in the crate rather than loaded from a file.
