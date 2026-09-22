@@ -1,0 +1,361 @@
+name: Packages
+
+# Builds, installs and smoke-tests every package the tree can produce, each inside the
+# distribution it targets. A package that builds is not a package that installs, and a package
+# that installs is not one whose binary starts: the three failures are different and each leg
+# here fails on the first one it meets.
+#
+# Reusable on purpose. ci.yml calls it on every push and pull request, so a packaging change is
+# checked where it lands rather than at the next release; release.yml calls it for the tag and
+# publishes what it uploads. The artefact names ("package-<leg>") are the contract between the
+# two — the publish job downloads "package-*".
+#
+# Not here: RUSTFLAGS=-D warnings. A new rustc lint must not break packaging; the check job in
+# ci.yml is where warnings are errors.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build; empty means the caller's own ref
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build; empty means the branch or tag picked in the Run workflow dialog
+        required: false
+        type: string
+        default: ''
+
+# Nothing here writes to the repository or to a release; the artefacts go through
+# upload-artifact, which needs no token scope.
+permissions:
+  contents: read
+
+# One run per ref. The group carries the caller's workflow name so that it never collides with
+# the caller's own group (a called workflow sharing its caller's group waits on itself for ever).
+# A tag is never cancelled: a release run that is superseded mid-way leaves half a release behind.
+concurrency:
+  group: packages-${{ github.workflow }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ !startsWith(inputs.ref || github.ref, 'refs/tags/') && !startsWith(inputs.ref || github.ref, 'v') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 3
+  DEBIAN_FRONTEND: noninteractive
+  # The toolchain the workspace pins (rust-toolchain.toml, Cargo.toml rust-version). Every recipe
+  # now honours a RUSTUP_TOOLCHAIN that is already set, so the legs that build through rustup get
+  # exactly this and no download; the distributions whose own cargo is used (Arch, and Fedora when
+  # its rust is new enough) ignore the variable, which is harmless.
+  RUSTUP_TOOLCHAIN: '1.98.1'
+  # Inside the workspace so that one cache path serves every leg, and so that the Arch build
+  # user, who owns the workspace, can write to it. rustup-init puts its proxies under $CARGO_HOME/bin
+  # when the variable is set, which is why that directory is what goes on PATH below.
+  CARGO_HOME: ${{ github.workspace }}/.cargo-home
+
+jobs:
+  package:
+    name: ${{ matrix.leg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      # Every leg is a separate answer to "does this package work"; one failing must not hide the
+      # others.
+      fail-fast: false
+      matrix:
+        include:
+          # makepkg as an unprivileged user; Arch's rust is current stable (>= 1.98.1) and its
+          # cargo ignores rust-toolchain.toml, so no rustup here.
+          - leg: arch
+            family: arch
+            image: archlinux:base-devel
+            prefix: /usr
+            unitdir: /usr/lib/systemd/user
+            strict_desktop: true
+            cache: |
+              .cargo-home/registry
+              .cargo-home/git
+              target
+
+          # dpkg-buildpackage from packaging/debian; the two .debs are renamed with the codename
+          # so that they never clash in a release. Neither distribution ships a rustc >= 1.98.1,
+          # hence rustup and -d.
+          - leg: debian-trixie
+            family: deb
+            image: debian:trixie
+            prefix: /usr
+            unitdir: /usr/lib/systemd/user
+            strict_desktop: true
+            # debian/rules pins CARGO_HOME to debian/cargo-home, so that is the registry to keep.
+            cache: |
+              debian/cargo-home/registry
+              debian/cargo-home/git
+              target
+          - leg: ubuntu-noble
+            family: deb
+            image: ubuntu:24.04
+            prefix: /usr
+            unitdir: /usr/lib/systemd/user
+            strict_desktop: true
+            cache: |
+              debian/cargo-home/registry
+              debian/cargo-home/git
+              target
+
+          # rpmbuild with a vendored crate tarball, the way COPR would; the .src.rpm and the
+          # vendor tarball are kept as artefacts because COPR's SCM path needs both. The build
+          # tree is under ~/rpmbuild, so only the registry is worth caching.
+          - leg: fedora
+            family: rpm
+            image: fedora:latest
+            prefix: /usr
+            unitdir: /usr/lib/systemd/user
+            strict_desktop: true
+            cache: |
+              .cargo-home/registry
+              .cargo-home/git
+
+          # The binary tarball, built on the oldest glibc worth supporting (bookworm's 2.36) so
+          # that the binary runs on everything newer, and installed with its own install.sh.
+          # bookworm's desktop-file-utils predates desktop-entry-spec 1.5 and rejects
+          # SingleMainWindow, so its validation is advisory on this leg only.
+          - leg: tarball
+            family: tarball
+            image: debian:bookworm
+            prefix: /usr/local
+            unitdir: /usr/local/lib/systemd/user
+            strict_desktop: false
+            cache: |
+              .cargo-home/registry
+              .cargo-home/git
+              target
+
+    steps:
+      # Dependencies first, checkout second: actions/checkout needs git in the container to
+      # produce a .git directory, and the Fedora leg's `git archive` needs one. Without git the
+      # action silently falls back to an API tarball with no history.
+      - name: Install build dependencies (Arch)
+        if: matrix.family == 'arch'
+        run: |
+          pacman -Syu --noconfirm --needed \
+            rust clang pkgconf pipewire libpipewire wayland libxkbcommon libglvnd fontconfig \
+            dbus hicolor-icon-theme sudo git desktop-file-utils zstd
+          rustc --version
+          cargo --version
+
+      - name: Install build dependencies (Debian, Ubuntu)
+        if: matrix.family == 'deb' || matrix.family == 'tarball'
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential debhelper dpkg-dev pkg-config libpipewire-0.3-dev libclang-dev \
+            curl ca-certificates git desktop-file-utils zstd
+
+      - name: Install build dependencies (Fedora)
+        if: matrix.family == 'rpm'
+        run: |
+          dnf -y install \
+            rpm-build rpmdevtools cargo-rpm-macros systemd-rpm-macros desktop-file-utils \
+            appstream pipewire-devel clang-devel pkgconf-pkg-config git xz curl zstd rust cargo
+          rustc --version
+          cargo --version
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      # After the dependencies (the cache needs zstd and tar in the container) and before the
+      # Arch chown (the restore creates root-owned files).
+      - uses: actions/cache@v4
+        with:
+          path: ${{ matrix.cache }}
+          key: packages-${{ matrix.leg }}-${{ hashFiles('Cargo.lock') }}-1.98.1
+          restore-keys: |
+            packages-${{ matrix.leg }}-
+
+      # Fedora's own rust is preferred when it is new enough: the spec's BuildRequires are then
+      # real and the cargo-rpm-macros run the toolchain they were written for. Otherwise rustup,
+      # with the macro overrides the build step adds.
+      - name: Decide whether Fedora's rust is new enough
+        if: matrix.family == 'rpm'
+        id: fedora-rust
+        run: |
+          have=$(rustc --version | awk '{ print $2 }')
+          if [ "$(printf '%s\n' 1.98.1 "$have" | sort -V | head -1)" = 1.98.1 ]; then
+            echo "distro rustc $have satisfies rust-version 1.98.1; using it"
+            echo "use_rustup=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "distro rustc $have is older than 1.98.1; installing the pinned toolchain"
+            echo "use_rustup=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install the pinned toolchain through rustup
+        if: matrix.family == 'deb' || matrix.family == 'tarball' || steps.fedora-rust.outputs.use_rustup == 'true'
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain 1.98.1 --no-modify-path
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          "$CARGO_HOME/bin/rustc" --version
+          "$CARGO_HOME/bin/cargo" --version
+
+      # ------------------------------------------------------------------ Arch
+      - name: Build and install (Arch)
+        if: matrix.family == 'arch'
+        run: |
+          # makepkg refuses to run as root; the workspace (including the restored cache) goes to
+          # the build user. The PKGBUILD's prepare() does the `cargo fetch --locked`, so the
+          # --frozen build that follows has everything it needs.
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          cd packaging
+          sudo -u builder env HOME=/home/builder \
+            "CARGO_HOME=$CARGO_HOME" "RUSTUP_TOOLCHAIN=$RUSTUP_TOOLCHAIN" \
+            CARGO_TERM_COLOR=always CARGO_NET_RETRY=3 \
+            makepkg -f --noconfirm --nocheck
+          ls -la ./*.pkg.tar.zst
+          # Not the -debug package makepkg may split off.
+          pacman -U --noconfirm ./fxsound-linux-[0-9]*.pkg.tar.zst
+          mkdir -p ../dist
+          cp ./fxsound-linux-[0-9]*.pkg.tar.zst ../dist/
+
+      # ------------------------------------------------------------------ Debian, Ubuntu
+      - name: Build and install (Debian, Ubuntu)
+        if: matrix.family == 'deb'
+        run: |
+          # dpkg-buildpackage wants ./debian; merge rather than copy so a restored
+          # debian/cargo-home survives. -d because rustup cannot satisfy the versioned
+          # Build-Depends on rustc; -nc because the clean target would delete the cached
+          # target/ and cargo-home; nocheck because the tests belong to ci.yml's check job.
+          mkdir -p debian
+          cp -a packaging/debian/. debian/
+          DEB_BUILD_OPTIONS=nocheck dpkg-buildpackage -us -uc -b -d -nc
+          ls -la ../*.deb
+          # apt rather than dpkg -i, so the runtime Depends are pulled in and checked.
+          apt-get install -y ../fxsound-linux_*_amd64.deb
+          # Both distributions name the file identically; the codename keeps the two apart in a
+          # release. The -dbgsym package is not shipped.
+          codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          mkdir -p dist
+          for f in ../fxsound-linux_*_amd64.deb; do
+            mv "$f" "dist/$(basename "${f%.deb}").${codename}.deb"
+          done
+          ls -la dist/
+
+      # ------------------------------------------------------------------ Fedora
+      - name: Build and install (Fedora)
+        if: matrix.family == 'rpm'
+        run: |
+          set -x
+          rpmdev-setuptree
+          # The workspace is owned by the runner's uid, not the container's root.
+          git config --global --add safe.directory '*'
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # Source0 is what GitHub's archive URL would serve for the tag; Source1 is the vendored
+          # crate tree for that exact Cargo.lock, which no RPM build can fetch itself.
+          git archive --prefix="fxsound-linux-${ver}/" \
+            -o "$HOME/rpmbuild/SOURCES/fxsound-linux-${ver}.tar.gz" HEAD
+          cargo vendor --locked vendor
+          tar caf "$HOME/rpmbuild/SOURCES/fxsound-linux-${ver}-vendor.tar.xz" vendor
+          cp packaging/fedora/fxsound.spec "$HOME/rpmbuild/SPECS/"
+          extra=()
+          if [ "${{ steps.fedora-rust.outputs.use_rustup }}" = true ]; then
+            # cargo-rpm-macros hard-code %__cargo as /usr/bin/cargo and %cargo_prep writes
+            # `rustc = %{__rustc}` into .cargo/config.toml; without these the macros run the
+            # distribution's toolchain that was just found too old. --nodeps gets past
+            # `BuildRequires: rust >= 1.98.1`, which rustup cannot satisfy.
+            extra=(--nodeps
+              --define "__cargo $CARGO_HOME/bin/cargo"
+              --define "__rustc $CARGO_HOME/bin/rustc"
+              --define "__rustdoc $CARGO_HOME/bin/rustdoc")
+          fi
+          # -ba: the .src.rpm too, for COPR. --without check: the tests belong to ci.yml.
+          rpmbuild -ba --without check "${extra[@]}" "$HOME/rpmbuild/SPECS/fxsound.spec"
+          ls -la "$HOME"/rpmbuild/RPMS/*/ "$HOME"/rpmbuild/SRPMS/
+          # dnf rather than rpm -i, so Requires are resolved and checked. Not the -debuginfo and
+          # -debugsource subpackages.
+          dnf -y install "$HOME"/rpmbuild/RPMS/x86_64/fxsound-linux-"${ver}"-*.x86_64.rpm
+          mkdir -p dist
+          cp "$HOME"/rpmbuild/RPMS/x86_64/fxsound-linux-"${ver}"-*.x86_64.rpm \
+             "$HOME"/rpmbuild/SRPMS/fxsound-linux-*.src.rpm \
+             "$HOME/rpmbuild/SOURCES/fxsound-linux-${ver}-vendor.tar.xz" dist/
+          ls -la dist/
+
+      # ------------------------------------------------------------------ Tarball
+      - name: Build and install (tarball)
+        if: matrix.family == 'tarball'
+        run: |
+          cargo build --release --bin fxsound
+          packaging/build-tarball.sh
+          ls -la dist/
+          tar xf dist/fxsound-linux-*.tar.gz
+          ./fxsound-linux-*/install.sh /usr/local
+          test -x /usr/local/bin/fxsound
+
+      # ------------------------------------------------------------------ Smoke test, every leg
+      # No display, no PipeWire, no session bus: everything below has to hold in that setting,
+      # which is also the setting of a fresh install before the user logs in.
+      - name: Smoke test the installed package
+        shell: bash
+        run: |
+          set -euo pipefail
+          prefix='${{ matrix.prefix }}'
+          bin="$prefix/bin/fxsound"
+
+          echo "::group::fxsound --version"
+          "$bin" --version
+          echo "::endgroup::"
+
+          # Exits non-zero when any check that was not skipped failed; the JSON says which. Two
+          # things the binary has to get right for this line to hold on every leg: `--json` must
+          # parse without `--status` (cli.rs once tied the two together), and the desktop entry,
+          # icons, unit and man page must be looked for under the binary's own prefix — the
+          # directory two above current_exe() — because on the tarball leg that is /usr/local,
+          # and a self-test that only knows /usr would fail a correct install.
+          echo "::group::fxsound --self-test --json"
+          "$bin" --self-test --json
+          echo "::endgroup::"
+
+          echo "::group::files"
+          desktop="$prefix/share/applications/com.fxsound.FxSound.desktop"
+          test -f "$desktop"
+          if [ '${{ matrix.strict_desktop }}' = true ]; then
+            desktop-file-validate "$desktop"
+          else
+            desktop-file-validate "$desktop" \
+              || echo "::warning::desktop-file-validate failed on $desktop (this image's desktop-file-utils predates SingleMainWindow)"
+          fi
+          test -f '${{ matrix.unitdir }}/fxsound.service'
+          ls "$prefix"/share/man/man1/fxsound.1*
+          test -f "$prefix/share/metainfo/com.fxsound.FxSound.metainfo.xml"
+          for state in off on processing; do
+            test -f "$prefix/share/icons/hicolor/scalable/status/com.fxsound.FxSound-$state.svg"
+          done
+          test -f "$prefix/share/icons/hicolor/256x256/apps/fxsound.png"
+          test -f "$prefix/share/icons/hicolor/32x32/apps/fxsound.png"
+          echo "::endgroup::"
+
+          # The expected counts come from the checkout, not from a number written here, so a new
+          # preset in the tree is a new preset that has to be installed.
+          echo "::group::presets"
+          for pair in Factsoft:fac BonusPresets:fac Input:toml; do
+            dir=${pair%%:*}; ext=${pair#*:}
+            want=$(ls "$GITHUB_WORKSPACE/assets/presets/$dir"/*."$ext" | wc -l)
+            have=$(ls "$prefix/share/fxsound/presets/$dir"/*."$ext" | wc -l)
+            echo "$dir: $have installed, $want in the tree"
+            if [ "$have" -ne "$want" ]; then
+              echo "::error::$dir has $have *.$ext installed but the tree has $want"
+              exit 1
+            fi
+          done
+          echo "::endgroup::"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.leg }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

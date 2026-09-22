@@ -9,3 +9,5 @@
 *.swp
 .DS_Store
 /dist/
+# Claude Code session state, never part of the source tree
+/.claude/

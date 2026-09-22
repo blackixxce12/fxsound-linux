@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metainfo for the FxSound Linux port.
+
+  Without this file GNOME Software and KDE Discover do not list the application at all, and a
+  Fedora review asks for it. It is kept to what the specification requires plus what the
+  validators recommend, and nothing that would have to be maintained twice: the description
+  paraphrases debian/control, the release list is the CHANGELOG's headings, and the id is the
+  desktop-entry id the window's app_id and the D-Bus name already use.
+
+  Every package installs it to /usr/share/metainfo/. Check it with
+  `appstreamcli validate packaging/com.fxsound.FxSound.metainfo.xml`.
+
+  Copyright (C) 2026 FxSound Linux port contributors
+  Licensed under the GNU Affero General Public License, version 3 or later.
+-->
+<component type="desktop-application">
+  <id>com.fxsound.FxSound</id>
+  <!-- CC0 for the metadata only, so distributions may merge and redistribute it freely; the
+       program itself stays AGPL. -->
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
+  <name>FxSound</name>
+  <summary>System-wide audio enhancement for PipeWire</summary>
+  <developer id="io.github.blackixxce12">
+    <name>FxSound Linux port contributors</name>
+  </developer>
+  <description>
+    <p>
+      FxSound processes everything the machine plays — a ten-band equalizer plus fidelity,
+      ambience, surround, dynamic boost and bass — by presenting itself to PipeWire as a
+      virtual sink that applications play into and forwarding the processed result to the real
+      device. A second lane does the same for a microphone: denoising, a high-pass, an expander,
+      the equalizer, a de-esser, a compressor and a limiter, published as a virtual source.
+    </p>
+    <p>
+      It is a native Linux port of the Windows application, written in Rust with egui. The DSP
+      is ported line by line from the original, so a preset voiced on Windows sounds the same
+      here, and the factory and bonus presets are the upstream files unchanged. A running
+      instance can be driven from the command line, over D-Bus and from compositor keybindings.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.fxsound.FxSound.desktop</launchable>
+  <url type="homepage">https://github.com/blackixxce12/fxsound-linux</url>
+  <url type="bugtracker">https://github.com/blackixxce12/fxsound-linux/issues</url>
+  <url type="vcs-browser">https://github.com/blackixxce12/fxsound-linux</url>
+  <provides>
+    <binary>fxsound</binary>
+    <dbus type="user">org.fxsound.FxSound</dbus>
+  </provides>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Mixer</category>
+  </categories>
+  <keywords>
+    <keyword>equalizer</keyword>
+    <keyword>audio</keyword>
+    <keyword>dsp</keyword>
+    <keyword>pipewire</keyword>
+  </keywords>
+  <content_rating type="oars-1.1"/>
+  <!-- Newest first, as the specification wants. A release's date is its CHANGELOG heading's
+       date, and release.yml's verify job refuses a tag where the two differ — so the
+       version-bump phase must set 0.4.0's date here when it dates the CHANGELOG heading; the
+       0.4.0 date below is a placeholder until then. -->
+  <releases>
+    <release version="0.4.0" date="2026-09-21">
+      <url>https://github.com/blackixxce12/fxsound-linux/blob/main/CHANGELOG.md</url>
+    </release>
+    <release version="0.3.0" date="2026-09-21">
+      <url>https://github.com/blackixxce12/fxsound-linux/blob/main/CHANGELOG.md</url>
+    </release>
+  </releases>
+</component>
