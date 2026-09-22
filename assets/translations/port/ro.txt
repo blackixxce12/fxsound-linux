@@ -32,7 +32,6 @@ countries: ro
 "De-esser" = "De-esser"
 "Denoise" = "Reducere zgomot"
 "unavailable at this rate" = "indisponibil la această rată de eșantionare"
-"voice" = "voce"
 "Not used on a microphone" = "Nefolosit pe un microfon"
 "These five belong to the playback chain. A microphone runs the voice chain instead: high-pass, gate, equalizer, de-esser, compressor and limiter." = "Aceste cinci aparțin lanțului de redare. Un microfon trece în schimb prin lanțul vocal: filtru trece-sus, gate, egalizator, de-esser, compresor și limitator."
 "FxSound is still running, but this session has no tray icon.\nRun 'fxsound --show' to bring the window back." = "FxSound încă rulează, dar această sesiune nu are pictogramă în bara de sistem.\nRulați 'fxsound --show' pentru a readuce fereastra."
@@ -71,3 +70,5 @@ countries: ro
 "Apply" = "Aplică"
 "Retry" = "Reîncearcă"
 "Calibration failed" = "Calibrarea a eșuat"
+"on" = "pornit"
+"Output: " = "Ieșire: "

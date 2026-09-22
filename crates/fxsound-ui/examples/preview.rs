@@ -10,11 +10,13 @@
 //! cargo run -p fxsound-ui --example preview
 //! cargo run -p fxsound-ui --example preview -- --light --input --notice
 //! cargo run -p fxsound-ui --example preview -- --lite
+//! cargo run -p fxsound-ui --example preview -- --input --lang=de
 //! ```
 //!
 //! Flags: `--light`, `--input` (edit the microphone lane), `--lite`, `--notice[=TEXT]`,
-//! `--detached` (both lanes off), `--exit-after-paint`. Keys while it runs: `I` switches the edit
-//! direction, `N` puts a notice up, `L` flips Pro/Lite, `T` flips the palette, `Esc` quits.
+//! `--detached` (both lanes off), `--lang=CODE` (one of the translation tables' codes; English
+//! otherwise), `--exit-after-paint`. Keys while it runs: `I` switches the edit direction, `N` puts
+//! a notice up, `L` flips Pro/Lite, `T` flips the palette, `Esc` quits.
 
 use eframe::egui;
 use fxsound_core::{AudioDevice, DeviceDirection, ThemeMode, ViewMode};
@@ -28,6 +30,12 @@ fn main() -> eframe::Result<()> {
         a.strip_prefix("--notice")
             .map(|rest| rest.strip_prefix('=').unwrap_or(DEFAULT_NOTICE).to_owned())
     });
+
+    if let Some(code) = args.iter().find_map(|a| a.strip_prefix("--lang="))
+        && !fxsound_core::i18n::set_language(code)
+    {
+        eprintln!("no translation table for {code:?}; showing English");
+    }
 
     let mut state = demo_state();
     if flag("--light") {

@@ -1920,6 +1920,128 @@ mod tests {
         assert!(slot.contains_rect(text));
     }
 
+    /// Every reading the strip can make in English, from the widest states and the ones where a
+    /// stage says `off`, `on` or `unavailable` instead of a number, with whether it is metered.
+    fn every_english_reading() -> Vec<(String, bool)> {
+        let off = UiState {
+            denoise_on: false,
+            gate_on: false,
+            compressor_on: false,
+            deesser_on: false,
+            ..strip_state()
+        };
+        let detached = UiState {
+            selected_input: None,
+            ..off.clone()
+        };
+        let echo_running = UiState {
+            gate_on: false,
+            echo_cancel_on: true,
+            echo_cancel_running: true,
+            ..strip_state()
+        };
+        let mut states = widest_states();
+        states.extend([off, detached, echo_running]);
+        states
+            .iter()
+            .flat_map(strip_slots)
+            .map(|slot| (slot.text, slot.bar.is_some()))
+            .collect()
+    }
+
+    #[test]
+    fn every_language_fits_every_reading_whole_beside_its_bar() {
+        // The English test above, in every table: a reading is a stage's name, two spaces and a
+        // number or a status word, so each English reading is rebuilt with its name and its word
+        // translated and its number as it is. The strip elides what still does not fit, but a
+        // stage named "Rauschunterdrü…" is the translation's doing, not the strip's, so the
+        // translations were chosen short enough that nothing is.
+        use fxsound_core::i18n::{Catalogue, LANGUAGES};
+        let readings = every_english_reading();
+        assert!(
+            readings.iter().any(|(text, _)| text.ends_with("  off"))
+                && readings.iter().any(|(text, _)| text.ends_with("  on"))
+                && readings
+                    .iter()
+                    .any(|(text, _)| text.ends_with("  unavailable")),
+            "{readings:?}"
+        );
+        let ctx = test_context();
+        let slot = strip_slot_rect(layout::pro::input_meters(), 0);
+        let mut problems = Vec::new();
+        ctx.run_ui(raw_input(Vec::new()), |ui| {
+            for language in &LANGUAGES[1..] {
+                let table = Catalogue::for_language(language);
+                let translate = |key: &str| table.get(key).unwrap_or(key).to_owned();
+                for (english, metered) in &readings {
+                    let (name, value) = english.split_once("  ").expect("a name and a value");
+                    let value = match value {
+                        "off" | "on" | "unavailable" => translate(value),
+                        number => number.to_owned(),
+                    };
+                    let text = format!("{}  {value}", translate(name));
+                    let width = ui
+                        .painter()
+                        .layout_no_wrap(
+                            text.clone(),
+                            caption_font(METER_FONT_PX),
+                            egui::Color32::PLACEHOLDER,
+                        )
+                        .size()
+                        .x;
+                    let (room, _) = strip_slot_parts(slot, width, *metered);
+                    if room.width() + 1e-3 < width {
+                        problems.push(format!(
+                            "{}: {text:?} is {width:.0} points in {:.0}",
+                            language.code,
+                            room.width()
+                        ));
+                    }
+                }
+            }
+        })
+        .drop_without_applying_deltas();
+        problems.dedup();
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn every_language_fits_the_microphone_note_in_the_room_the_captions_above_it_have() {
+        // The note is painted with no width of its own, so a translation longer than the five
+        // captions' 160 points runs into the equalizer panel and is cut there: German's
+        // "Bei einem Mikrofon ohne Wirkung" lost its last letters that way.
+        use fxsound_core::i18n::{Catalogue, LANGUAGES};
+        let ctx = test_context();
+        let column = layout::pro::audio_controls();
+        let room = effects::caption_rect(column, Effect::COUNT).width();
+        let mut problems = Vec::new();
+        ctx.run_ui(raw_input(Vec::new()), |ui| {
+            for language in &LANGUAGES[1..] {
+                let table = Catalogue::for_language(language);
+                let text = table
+                    .get(MICROPHONE_INERT_CAPTION)
+                    .unwrap_or(MICROPHONE_INERT_CAPTION);
+                let width = ui
+                    .painter()
+                    .layout_no_wrap(
+                        text.to_owned(),
+                        caption_font(CAPTION_FONT_PX),
+                        egui::Color32::PLACEHOLDER,
+                    )
+                    .size()
+                    .x;
+                if width > room {
+                    problems.push(format!(
+                        "{}: {text:?} is {width:.0} points in {room:.0}",
+                        language.code
+                    ));
+                }
+            }
+        })
+        .drop_without_applying_deltas();
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
     #[test]
     fn the_strip_is_painted_in_the_input_direction_and_not_in_the_output_one() {
         let mut harness = Harness::new(ThemeMode::Dark);

@@ -9,9 +9,13 @@
 //! with the port's additions layered over it.
 //!
 //! A source scan rather than a hand-kept list, because a hand-kept list is the thing that was
-//! missing. It follows a literal, a `const NAME: &str` and a `const NAME: [&str; N]` table; a
-//! value that arrives through a variable it cannot follow, and those are named in
-//! [`INDIRECT_KEYS`] instead.
+//! missing. It reads a literal, an `if` or a `match` whose every branch is a literal, and a
+//! `const NAME: &str` or `const NAME: [&str; N]` declared anywhere in the two crates. What it
+//! cannot read — a variable, a method call, a branch that is either — it does not pass over in
+//! silence, which is how the 0.3.0 strings slipped by (they reached `tr` as a meter's `name`):
+//! every such argument is listed in [`INDIRECT_CALLS`] with the strings it can carry, and a new
+//! one fails `every_argument_the_scan_cannot_read_is_listed_with_its_strings` until someone
+//! lists it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -25,35 +29,45 @@ use fxsound_core::{
 /// The crates that draw text, relative to this one. Everything else passes strings *to* them.
 const DRAWING_CRATES: [&str; 2] = ["../fxsound-ui/src", "../fxsound-app/src"];
 
-/// Strings that reach `tr` through a variable rather than a literal, which the source scan
-/// cannot follow. When a new one is written, it goes here, or the audit does not cover it.
-const INDIRECT_KEYS: &[&str] = &[
-    // `Stage::meter(name, …)` in `views/pro.rs`: the readout strip's stage names.
-    "Gate",
-    "Compressor",
-    "De-esser",
-    "Denoise",
-    // `tr(if on { "on" } else { "off" })` in `tray.rs` and `notify.rs`.
-    "on",
-    "off",
+/// Every argument the drawing crates pass to `tr` that the scan cannot read, as written (spaces
+/// collapsed), with the strings it can carry.
+///
+/// An empty list means the strings are audited by another route: a core enum's labels by
+/// `every_label_a_core_enum_hands_to_tr_is_translated_in_every_language`, and `tip` — one of
+/// the equalizer's band tooltips — through the string table the scan gathers whole.
+const INDIRECT_CALLS: &[(&str, &[&str])] = &[
     // `SettingsTab::nav_label` and `pane_title` in `dialogs/settings.rs`.
-    "Audio",
-    "General",
-    "Help",
-    "General Preferences",
-    "Microphone",
+    (
+        "tab.nav_label()",
+        &["Audio", "General", "Help", "Microphone"],
+    ),
+    (
+        "self.state.tab.pane_title()",
+        &["Audio", "General Preferences", "Help", "Microphone"],
+    ),
     // `HotkeyCommand::label` in `dialogs/settings.rs`.
-    "Turn FxSound On/Off",
-    "Open/Close FxSound",
-    "Use Next Preset",
-    "Use Previous Preset",
-    "Change Playback Device",
-    // The preset name editor's hint in `main.rs`.
-    "Enter your preset name",
-    "Enter new preset name",
+    (
+        "command.label()",
+        &[
+            "Turn FxSound On/Off",
+            "Open/Close FxSound",
+            "Use Next Preset",
+            "Use Previous Preset",
+            "Change Playback Device",
+        ],
+    ),
     // The tray tooltip's device line in `tray.rs`.
-    "Output: ",
-    "Input: ",
+    ("key", &["Output: ", "Input: "]),
+    // `widgets/equalizer.rs`: an element of `BAND_TOOLTIPS`.
+    ("tip", &[]),
+    // Core enums.
+    ("direction.label()", &[]),
+    ("noise.label()", &[]),
+    ("channels.label()", &[]),
+    ("deesser.label()", &[]),
+    ("dereverb.label()", &[]),
+    ("effect.label()", &[]),
+    ("effect.tooltip()", &[]),
 ];
 
 // ---------------------------------------------------------------------------------------------
@@ -102,6 +116,177 @@ fn string_literal(src: &str) -> Option<(String, usize)> {
         }
     }
     None
+}
+
+/// How many bytes the character literal `src` starts with takes — `'"'`, `'\''`, `'\u{2026}'` —
+/// or `None` when the quote begins a lifetime instead.
+fn char_literal(src: &str) -> Option<usize> {
+    let rest = src.strip_prefix('\'')?;
+    let mut chars = rest.chars();
+    let body = match chars.next()? {
+        '\\' => match chars.next()? {
+            'u' => rest.find('}')? + 1,
+            escaped => 1 + escaped.len_utf8(),
+        },
+        c => c.len_utf8(),
+    };
+    rest.get(body..)?.starts_with('\'').then_some(1 + body + 1)
+}
+
+/// Where in `src` the first place that `stop` accepts is, looking only at places outside a
+/// string literal, a character literal and a `//` comment, and not inside a bracket opened in
+/// `src`. `None` when there is none, when a bracket closes that `src` did not open, or when a
+/// literal never closes. Raw strings are not read; the interface passes none to `tr`.
+fn top_level(src: &str, stop: impl Fn(&str) -> bool) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut at = 0;
+    while let Some(c) = src[at..].chars().next() {
+        let rest = &src[at..];
+        if depth == 0 && stop(rest) {
+            return Some(at);
+        }
+        match c {
+            '"' => {
+                let (_, used) = string_literal(&rest[1..])?;
+                at += 1 + used;
+                continue;
+            }
+            '\'' => {
+                if let Some(used) = char_literal(rest) {
+                    at += used;
+                    continue;
+                }
+            }
+            '/' if rest.starts_with("//") => {
+                at += rest.find('\n').unwrap_or(rest.len());
+                continue;
+            }
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+        at += c.len_utf8();
+    }
+    None
+}
+
+/// The first argument of a call, `src` starting just after its opening parenthesis: everything up
+/// to the comma or the closing parenthesis that is not inside a bracket, a literal or a comment.
+/// `None` for a call that never closes.
+fn first_argument(src: &str) -> Option<&str> {
+    top_level(src, |rest| rest.starts_with([',', ')', ']', '}'])).map(|end| &src[..end])
+}
+
+/// `src` without the whitespace and `//` comments it starts with.
+fn skip_space(mut src: &str) -> &str {
+    loop {
+        src = src.trim_start();
+        match src.strip_prefix("//") {
+            Some(comment) => src = comment.split_once('\n').map_or("", |(_, next)| next),
+            None => return src,
+        }
+    }
+}
+
+/// `src` after the keyword `word` it starts with; `None` when it does not start with it, which
+/// `iffy` does not with `if`.
+fn keyword<'a>(src: &'a str, word: &str) -> Option<&'a str> {
+    let rest = src.strip_prefix(word)?;
+    (!rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')).then_some(rest)
+}
+
+/// The inside of the `{ … }` block `src` starts with, and what follows its closing brace.
+fn block(src: &str) -> Option<(&str, &str)> {
+    let inner = skip_space(src).strip_prefix('{')?;
+    let close = top_level(inner, |rest| rest.starts_with([')', ']', '}']))?;
+    Some((&inner[..close], &inner[close + 1..]))
+}
+
+/// The keys an expression made of nothing but string literals can be: a literal, a block around
+/// one, or an `if` or a `match` whose every branch is one of these, in the order written.
+///
+/// `None` for anything else, and for an `if` or a `match` with a single branch the scan cannot
+/// read — `if c { "On" } else { name }` — because taking its literals as all it can be is exactly
+/// the silence the audit exists to break: `name` is a string no test would look at.
+fn expression_keys(expr: &str) -> Option<Vec<String>> {
+    let expr = skip_space(expr).trim_end();
+    if let Some(body) = expr.strip_prefix('"') {
+        let (text, used) = string_literal(body)?;
+        return skip_space(&body[used..]).is_empty().then(|| vec![text]);
+    }
+    if expr.starts_with('{') {
+        let (inner, after) = block(expr)?;
+        return if skip_space(after).is_empty() {
+            expression_keys(inner)
+        } else {
+            None
+        };
+    }
+    if let Some(rest) = keyword(expr, "if") {
+        return if_keys(rest);
+    }
+    if let Some(rest) = keyword(expr, "match") {
+        return match_keys(rest);
+    }
+    None
+}
+
+/// The keys of `if … { a } else if … { b } else { c }`, `src` starting after the first `if`.
+///
+/// A condition that holds a brace outside brackets — `if let Mode { level } = mode {` — is taken
+/// as ending at it; the branch read is then the pattern's, which is not a literal, so the argument
+/// is named rather than misread.
+fn if_keys(src: &str) -> Option<Vec<String>> {
+    let mut keys = Vec::new();
+    let mut condition = src;
+    loop {
+        let open = top_level(condition, |rest| rest.starts_with('{'))?;
+        let (branch, after) = block(&condition[open..])?;
+        keys.extend(expression_keys(branch)?);
+        // Without an `else`, an `if` is `()`, not a string.
+        let otherwise = keyword(skip_space(after), "else")?;
+        match keyword(skip_space(otherwise), "if") {
+            Some(next) => condition = next,
+            None => {
+                let (branch, after) = block(otherwise)?;
+                keys.extend(expression_keys(branch)?);
+                return skip_space(after).is_empty().then_some(keys);
+            }
+        }
+    }
+}
+
+/// The keys of `match … { P => a, Q if g => { b } … }`, `src` starting after `match`.
+fn match_keys(src: &str) -> Option<Vec<String>> {
+    let open = top_level(src, |rest| rest.starts_with('{'))?;
+    let (mut arms, after) = block(&src[open..])?;
+    if !skip_space(after).is_empty() {
+        return None;
+    }
+    let mut keys = Vec::new();
+    loop {
+        arms = skip_space(arms);
+        if arms.is_empty() {
+            // A `match` with no arms is `!`, not a string.
+            return (!keys.is_empty()).then_some(keys);
+        }
+        let arrow = top_level(arms, |rest| rest.starts_with("=>"))?;
+        // A pattern and its guard hold no comma outside brackets: one here is the tail of the
+        // previous arm's body, `{ "x" }.to_uppercase(),`, which the scan did not read.
+        if top_level(&arms[..arrow], |rest| rest.starts_with([',', ';'])).is_some() {
+            return None;
+        }
+        let body = skip_space(&arms[arrow + "=>".len()..]);
+        let end = if body.starts_with('{') {
+            let (_, after) = block(body)?;
+            body.len() - after.len()
+        } else {
+            top_level(body, |rest| rest.starts_with(',')).unwrap_or(body.len())
+        };
+        keys.extend(expression_keys(&body[..end])?);
+        arms = skip_space(&body[end..]);
+        arms = arms.strip_prefix(',').unwrap_or(arms);
+    }
 }
 
 /// An identifier spelled the way a constant is: `SCREAMING_SNAKE_CASE`, digits allowed.
@@ -164,35 +349,71 @@ fn constants(src: &str) -> BTreeMap<String, Vec<String>> {
     found
 }
 
-/// What one file passes to `tr` and `tr_args`: literals as they are, constants by name.
-fn keys_passed_to_tr(src: &str, consts: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
-    let mut keys = BTreeSet::new();
+/// What the scan made of one argument to `tr`.
+#[derive(Debug, PartialEq, Eq)]
+enum Argument {
+    /// The keys it can be: one for a literal or a string constant, several for a table or for an
+    /// `if` or a `match` whose every branch is a literal.
+    Keys(Vec<String>),
+    /// Something the scan cannot read, as written with its whitespace collapsed.
+    Unreadable(String),
+}
+
+/// Read one argument: `file` is the constants of the file it is in, `anywhere` those of every
+/// file in the drawing crates, for a constant declared in one module and used in another.
+fn read_argument(
+    arg: &str,
+    file: &BTreeMap<String, Vec<String>>,
+    anywhere: &BTreeMap<String, Vec<String>>,
+) -> Argument {
+    let arg = arg.trim();
+    let arg = arg.strip_prefix('&').unwrap_or(arg).trim_start();
+    if let Some(keys) = expression_keys(arg) {
+        return Argument::Keys(keys);
+    }
+    if !arg.is_empty()
+        && constant_name(arg) == arg
+        && let Some(items) = file.get(arg).or_else(|| anywhere.get(arg))
+    {
+        return Argument::Keys(items.clone());
+    }
+    Argument::Unreadable(arg.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// Every call to `tr` or `tr_args` in one file, its argument read. A `tr` that is part of a
+/// longer name (`str(`, `attr(`, `.tr(`), a definition (`fn tr(`) and a call in a `//` comment
+/// are not calls to it.
+fn calls_to_tr(
+    src: &str,
+    file: &BTreeMap<String, Vec<String>>,
+    anywhere: &BTreeMap<String, Vec<String>>,
+) -> Vec<Argument> {
+    let mut found = Vec::new();
     for call in ["tr(", "tr_args("] {
         let mut from = 0;
         while let Some(at) = src[from..].find(call) {
             let start = from + at;
             from = start + call.len();
-            // A word boundary before `tr`, so `str(` and `attr(` are not calls to it.
-            if src[..start]
+            let before = &src[..start];
+            if before
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                || before.trim_end().ends_with("fn")
             {
                 continue;
             }
-            let arg = src[from..].trim_start();
-            let arg = arg.strip_prefix('&').unwrap_or(arg).trim_start();
-            if let Some(body) = arg.strip_prefix('"') {
-                if let Some((text, _)) = string_literal(body) {
-                    keys.insert(text);
-                }
-            } else if let Some(items) = consts.get(constant_name(arg)) {
-                keys.extend(items.iter().cloned());
+            let line = &before[before.rfind('\n').map_or(0, |i| i + 1)..];
+            if line.trim_start().starts_with("//") {
+                continue;
             }
-            // Anything else is a variable: covered by `INDIRECT_KEYS`, or not at all.
+            let Some(arg) = first_argument(&src[from..]) else {
+                continue;
+            };
+            found.push(read_argument(arg, file, anywhere));
         }
     }
-    keys
+    found
 }
 
 /// Every `.rs` file under `dir`, recursively.
@@ -208,10 +429,9 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every string the drawing crates pass to `tr`, plus [`INDIRECT_KEYS`].
-fn interface_keys() -> BTreeSet<String> {
-    let mut keys: BTreeSet<String> = INDIRECT_KEYS.iter().map(|k| (*k).to_owned()).collect();
-    let mut tables_seen = 0;
+/// The drawing crates' source, file by file.
+fn drawing_sources() -> Vec<(PathBuf, String)> {
+    let mut sources = Vec::new();
     for crate_dir in DRAWING_CRATES {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(crate_dir);
         assert!(
@@ -221,15 +441,63 @@ fn interface_keys() -> BTreeSet<String> {
         );
         let mut files = Vec::new();
         rust_sources(&dir, &mut files);
+        files.sort();
         for file in files {
             let src = std::fs::read_to_string(&file)
                 .unwrap_or_else(|err| panic!("{}: {err}", file.display()));
-            let consts = constants(&src);
-            for (_, items) in consts.iter().filter(|(_, items)| items.len() > 1) {
-                tables_seen += 1;
-                keys.extend(items.iter().cloned());
+            sources.push((file, src));
+        }
+    }
+    sources
+}
+
+/// What the drawing crates pass to `tr`.
+struct Scan {
+    /// The keys read off the source, the band tooltip table's included.
+    keys: BTreeSet<String>,
+    /// The arguments that could not be read, each with the files it is written in.
+    unreadable: BTreeMap<String, BTreeSet<String>>,
+}
+
+fn scan() -> Scan {
+    let sources = drawing_sources();
+    let per_file: Vec<_> = sources.iter().map(|(_, src)| constants(src)).collect();
+    let mut anywhere = BTreeMap::new();
+    for consts in &per_file {
+        for (name, items) in consts {
+            anywhere
+                .entry(name.clone())
+                .or_insert_with(Vec::new)
+                .extend(items.iter().cloned());
+        }
+    }
+
+    let mut keys = BTreeSet::new();
+    let mut unreadable: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut tables_seen = 0;
+    for ((path, src), consts) in sources.iter().zip(&per_file) {
+        for items in consts.values().filter(|items| items.len() > 1) {
+            tables_seen += 1;
+            keys.extend(items.iter().cloned());
+        }
+        for argument in calls_to_tr(src, consts, &anywhere) {
+            match argument {
+                Argument::Keys(found) => keys.extend(found),
+                Argument::Unreadable(arg) => {
+                    let file = path
+                        .components()
+                        .rev()
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<PathBuf>();
+                    unreadable
+                        .entry(arg)
+                        .or_default()
+                        .insert(file.display().to_string());
+                }
             }
-            keys.extend(keys_passed_to_tr(&src, &consts));
         }
     }
     assert_eq!(
@@ -237,6 +505,35 @@ fn interface_keys() -> BTreeSet<String> {
         "the drawing crates declare one string table, the band tooltips; a second one needs a \
          look before its strings are taken as translation keys"
     );
+    Scan { keys, unreadable }
+}
+
+/// Every label a core enum hands to `tr`. These never appear as a literal in the drawing crates
+/// — the interface writes `tr(level.label())` — so the scan cannot see them.
+fn core_labels() -> BTreeSet<&'static str> {
+    let mut keys: BTreeSet<&str> = BTreeSet::new();
+    keys.extend(DenoiseLevel::ALL.iter().map(|v| v.label()));
+    keys.extend(DenoiseChannelMode::ALL.iter().map(|v| v.label()));
+    keys.extend(DeEsserMode::ALL.iter().map(|v| v.label()));
+    keys.extend(DereverbLevel::ALL.iter().map(|v| v.label()));
+    keys.extend(NoiseSuppressionOverride::ALL.iter().map(|v| v.label()));
+    keys.extend(DenoiseChannelsOverride::ALL.iter().map(|v| v.label()));
+    keys.extend(DeviceDirection::ALL.iter().map(|v| v.label()));
+    keys.extend(Effect::ALL.iter().map(|e| e.label()));
+    keys.extend(Effect::ALL.iter().map(|e| e.tooltip()));
+    keys
+}
+
+/// Every string the drawing crates pass to `tr`: what the scan reads, what [`INDIRECT_CALLS`]
+/// says the unreadable arguments carry, and the core enums' labels.
+fn interface_keys() -> BTreeSet<String> {
+    let mut keys = scan().keys;
+    keys.extend(
+        INDIRECT_CALLS
+            .iter()
+            .flat_map(|(_, strings)| strings.iter().map(|s| (*s).to_owned())),
+    );
+    keys.extend(core_labels().into_iter().map(str::to_owned));
     keys
 }
 
@@ -293,11 +590,55 @@ fn every_string_the_interface_passes_to_tr_is_translated_in_every_language() {
 }
 
 #[test]
-fn the_scan_sees_literals_constants_tables_and_continued_lines() {
+fn every_argument_the_scan_cannot_read_is_listed_with_its_strings() {
+    // A `tr(name)` whose `name` the scan cannot follow is a string no test looks at, which is the
+    // hole the 0.3.0 microphone strings fell through. So the list is exact both ways: a new one
+    // fails here until it is listed with what it carries, and a listed one that is gone goes.
+    let scan = scan();
+    let listed: BTreeSet<&str> = INDIRECT_CALLS.iter().map(|(arg, _)| *arg).collect();
+    let unlisted: Vec<String> = scan
+        .unreadable
+        .iter()
+        .filter(|(arg, _)| !listed.contains(arg.as_str()))
+        .map(|(arg, files)| format!("tr({arg}) in {files:?}"))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "the scan cannot read these; add each to INDIRECT_CALLS with the strings it can carry, \
+         or pass `tr` a literal:\n  {}",
+        unlisted.join("\n  ")
+    );
+    let gone: Vec<&&str> = listed
+        .iter()
+        .filter(|arg| !scan.unreadable.contains_key(**arg))
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "listed in INDIRECT_CALLS, no longer written: {gone:?}"
+    );
+}
+
+#[test]
+fn every_string_an_indirect_call_is_listed_with_is_still_written_in_the_interface() {
+    // The other half of keeping the list honest: a label renamed at its source and not here
+    // would leave the audit checking the old word.
+    let sources: String = drawing_sources().into_iter().map(|(_, src)| src).collect();
+    for (arg, strings) in INDIRECT_CALLS {
+        for string in *strings {
+            assert!(
+                sources.contains(&format!("{string:?}")),
+                "tr({arg}): {string:?} is not written anywhere in the drawing crates"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_scan_sees_literals_constants_tables_branches_and_continued_lines() {
     // An audit that had gone blind would pass, which is the one way it must not fail. Each of
     // these reaches `tr` by a different route through the source.
-    let keys = interface_keys();
-    assert!(keys.len() >= 80, "only {} keys found", keys.len());
+    let keys = scan().keys;
+    assert!(keys.len() >= 120, "only {} keys found", keys.len());
     for (route, key) in [
         ("a literal", "Settings"),
         (
@@ -323,6 +664,18 @@ fn the_scan_sees_literals_constants_tables_and_continued_lines() {
              audio's frequencies, without modifying the rest of your sound.",
         ),
         ("a name handed to a meter", "unavailable at this rate"),
+        ("one branch of an `if`", "on"),
+        ("the other branch of an `if`", "off"),
+        ("an arm of a `match`", "Enter new preset name"),
+        (
+            "the key of a `tr_args` on a line of its own",
+            "FxSound is %s.",
+        ),
+        ("a stage of the readout strip", "Compressor"),
+        (
+            "a line of the calibration dialog",
+            "Speak loudly for 2 seconds",
+        ),
     ] {
         assert!(keys.contains(key), "{route}: {key:?} was not gathered");
     }
@@ -333,23 +686,156 @@ fn the_scan_sees_literals_constants_tables_and_continued_lines() {
 
 #[test]
 fn every_label_a_core_enum_hands_to_tr_is_translated_in_every_language() {
-    // These never appear as a literal in the drawing crates — the interface writes
-    // `tr(level.label())` — so the scan above cannot see them and they are enumerated here.
-    let mut keys: BTreeSet<&str> = BTreeSet::new();
-    keys.extend(DenoiseLevel::ALL.iter().map(|v| v.label()));
-    keys.extend(DenoiseChannelMode::ALL.iter().map(|v| v.label()));
-    keys.extend(DeEsserMode::ALL.iter().map(|v| v.label()));
-    keys.extend(DereverbLevel::ALL.iter().map(|v| v.label()));
-    keys.extend(NoiseSuppressionOverride::ALL.iter().map(|v| v.label()));
-    keys.extend(DenoiseChannelsOverride::ALL.iter().map(|v| v.label()));
-    keys.extend(DeviceDirection::ALL.iter().map(|v| v.label()));
-    keys.extend(Effect::ALL.iter().map(|e| e.label()));
-    keys.extend(Effect::ALL.iter().map(|e| e.tooltip()));
+    let keys = core_labels();
     // The four levels, three channel modes, two de-esser modes, `Preset`, two directions, and
     // the five effects twice: the level and override enums share their words, deliberately.
     assert!(keys.len() >= 22, "only {} labels found", keys.len());
     let problems = untranslated(&tables(), keys.iter().copied());
     assert_all_translated("labels", &problems);
+}
+
+#[test]
+fn every_string_a_port_table_carries_is_one_the_interface_asks_for() {
+    // A translation nothing asks for is one that twenty-eight files keep up for nothing, and
+    // usually the sign of a string renamed in the source and not in the tables: 0.3.0's
+    // lower-case `voice` outlived the readout that showed it.
+    let asked = interface_keys();
+    let mut stale = BTreeSet::new();
+    for language in &LANGUAGES[1..] {
+        for key in language.port_catalogue().keys() {
+            if !asked.contains(key) {
+                stale.insert(format!("{}: {key:?}", language.code));
+            }
+        }
+    }
+    assert!(
+        stale.is_empty(),
+        "{} port translations of strings the interface no longer passes to tr:\n  {}",
+        stale.len(),
+        stale.into_iter().collect::<Vec<_>>().join("\n  ")
+    );
+}
+
+#[test]
+fn every_port_table_adds_the_same_strings() {
+    // The strings the Windows build never had are added to all twenty-eight tables at once; only
+    // a repair of a Windows string is particular to the table it repairs.
+    let windows: BTreeSet<String> = LANGUAGES[1..]
+        .iter()
+        .flat_map(|language| {
+            language
+                .original_catalogue()
+                .keys()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let ports: Vec<(&str, Catalogue)> = LANGUAGES[1..]
+        .iter()
+        .map(|language| (language.code, language.port_catalogue()))
+        .collect();
+    let added: BTreeSet<&str> = ports
+        .iter()
+        .flat_map(|(_, port)| port.keys())
+        .filter(|key| !windows.contains(*key))
+        .collect();
+    assert!(added.len() >= 60, "only {} added strings", added.len());
+    let mut missing = Vec::new();
+    for key in &added {
+        for (code, port) in &ports {
+            if port.get(key).is_none() {
+                missing.push(format!("{code}: {key:?}"));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
+}
+
+#[test]
+fn a_string_that_ends_in_a_space_keeps_the_space_in_every_language() {
+    // `"Output: "` and `"Preset: "` are followed by a name — in the tray tooltip and in the
+    // desktop notifications — and eleven Windows tables drop the space, which glued German into
+    // "Ausgabe:Lautsprecher". A CJK full-width colon carries its own spacing.
+    let keys: Vec<String> = interface_keys()
+        .into_iter()
+        .filter(|key| key.ends_with(' '))
+        .collect();
+    assert!(
+        keys.iter().any(|key| key == "Output: ") && keys.iter().any(|key| key == "Preset: "),
+        "{keys:?}"
+    );
+    let mut glued = Vec::new();
+    for table in tables() {
+        for key in &keys {
+            if let Some(value) = table.get(key)
+                && !(value.ends_with(char::is_whitespace) || value.ends_with('：'))
+            {
+                glued.push(format!("{}: {key:?} = {value:?}", table.code()));
+            }
+        }
+    }
+    assert!(glued.is_empty(), "{}", glued.join("\n"));
+}
+
+/// Strings some language writes exactly as English does: audio terms its engineers borrow
+/// (`Gate`, `De-esser`, `Mono`), words the two languages share (Dutch `Help`, Spanish `No`,
+/// Romanian `General`), and the effect names the Polish original keeps as FxSound's own. Any
+/// other string a table translates as itself is a string nobody translated.
+const SPELLED_AS_IN_ENGLISH: &[&str] = &[
+    "Ambience",
+    "Audio",
+    "Bass Boost",
+    "Clarity",
+    "Clipping",
+    "Compressor",
+    "De-esser",
+    "Dynamic Boost",
+    "Echo",
+    "Export",
+    "Filter Q",
+    "FxSound is %s.",
+    "Gate",
+    "General",
+    "Help",
+    "Import",
+    "Independent",
+    "Microphone",
+    "Mono",
+    "No",
+    "OK",
+    "Preset",
+    "Preset: ",
+    "Reverb",
+    "Start",
+    "Surround Sound",
+    "Version",
+];
+
+#[test]
+fn no_table_leaves_a_string_in_english_unless_the_language_spells_it_so() {
+    // `untranslated` cannot see this one: a value that *is* the key is present and not empty.
+    // Croatian's Windows table did it to "on" and "off", which the readout strip and the tray
+    // show, and a port entry copied from its key as a placeholder would do it again.
+    let keys = interface_keys();
+    let tables = tables();
+    let mut english = Vec::new();
+    for table in &tables {
+        for key in &keys {
+            if table.get(key) == Some(key.as_str())
+                && !SPELLED_AS_IN_ENGLISH.contains(&key.as_str())
+            {
+                english.push(format!("{}: {key:?}", table.code()));
+            }
+        }
+    }
+    assert!(english.is_empty(), "{}", english.join("\n"));
+    // The list is not a way round the check: every word on it is spelled so somewhere.
+    for word in SPELLED_AS_IN_ENGLISH {
+        assert!(
+            tables.iter().any(|table| table.get(word) == Some(*word)),
+            "{word:?} is translated in every table; it need not be listed"
+        );
+    }
 }
 
 #[test]
@@ -406,4 +892,158 @@ fn the_literal_decoder_reads_what_rustc_reads() {
     assert_eq!(constant_name("HOTKEY_TITLE)"), "HOTKEY_TITLE");
     assert_eq!(constant_name("Self::X"), "S");
     assert_eq!(constant_name("name)"), "");
+}
+
+#[test]
+fn an_argument_ends_at_its_own_comma_or_parenthesis_and_not_at_one_inside_it() {
+    assert_eq!(first_argument("\"a, (b)\", &[x])"), Some("\"a, (b)\""));
+    assert_eq!(
+        first_argument("match p { A => \"x)\", B => \"y\" }) + 1"),
+        Some("match p { A => \"x)\", B => \"y\" }")
+    );
+    assert_eq!(
+        first_argument("if c { ')' } else { '\\'' })"),
+        Some("if c { ')' } else { '\\'' }")
+    );
+    assert_eq!(first_argument("x.label::<'a>())"), Some("x.label::<'a>()"));
+    assert_eq!(first_argument("never closes"), None);
+    assert_eq!(char_literal("'\"' rest"), Some(3));
+    assert_eq!(char_literal("'\\u{2026}'"), Some(10));
+    assert_eq!(char_literal("'static str"), None);
+}
+
+#[test]
+fn a_literal_a_branch_and_a_constant_are_read_and_anything_else_is_named() {
+    let file: BTreeMap<String, Vec<String>> =
+        BTreeMap::from([("HERE".to_owned(), vec!["Here".to_owned()])]);
+    let anywhere: BTreeMap<String, Vec<String>> = BTreeMap::from([
+        ("HERE".to_owned(), vec!["Here".to_owned()]),
+        ("THERE".to_owned(), vec!["There".to_owned()]),
+    ]);
+    let read = |arg: &str| read_argument(arg, &file, &anywhere);
+    let keys = |k: &[&str]| Argument::Keys(k.iter().map(|s| (*s).to_owned()).collect());
+    assert_eq!(read(" &\"Save\""), keys(&["Save"]));
+    assert_eq!(
+        read("if on { \"on\" } else { \"off\" }"),
+        keys(&["on", "off"])
+    );
+    assert_eq!(
+        read("match purpose {\n    A => \"One\",\n    B => \"Two\",\n}"),
+        keys(&["One", "Two"])
+    );
+    assert_eq!(read("HERE"), keys(&["Here"]));
+    assert_eq!(read("THERE"), keys(&["There"]));
+    assert_eq!(read("NOWHERE"), Argument::Unreadable("NOWHERE".to_owned()));
+    assert_eq!(
+        read("self.state\n    .tab.pane_title()"),
+        Argument::Unreadable("self.state .tab.pane_title()".to_owned())
+    );
+    assert_eq!(read("name"), Argument::Unreadable("name".to_owned()));
+}
+
+#[test]
+fn an_if_or_a_match_with_one_branch_that_is_not_a_literal_is_named_not_half_read() {
+    // Taking `"On"` as all `tr(if c { "On" } else { name })` can be would leave `name` a string
+    // no test looks at, and say nothing: the 0.3.0 hole with a literal beside it.
+    let none = BTreeMap::new();
+    let read = |arg: &str| read_argument(arg, &none, &none);
+    let unread = |arg: &str| Argument::Unreadable(arg.to_owned());
+    assert_eq!(
+        read("if c { \"On\" } else { name }"),
+        unread("if c { \"On\" } else { name }")
+    );
+    assert_eq!(
+        read("if c { name } else { \"Off\" }"),
+        unread("if c { name } else { \"Off\" }")
+    );
+    assert_eq!(
+        read("if a { \"A\" } else if b { label() } else { \"C\" }"),
+        unread("if a { \"A\" } else if b { label() } else { \"C\" }")
+    );
+    assert_eq!(
+        read("match p {\n    A => \"One\",\n    B => mode.label(),\n}"),
+        unread("match p { A => \"One\", B => mode.label(), }")
+    );
+    assert_eq!(
+        read("match p { A => \"One\", B => { let s = \"Two\"; s } }"),
+        unread("match p { A => \"One\", B => { let s = \"Two\"; s } }")
+    );
+    assert_eq!(
+        read("match p { A => if c { \"x\" } else { y }, B => \"z\" }"),
+        unread("match p { A => if c { \"x\" } else { y }, B => \"z\" }")
+    );
+    // A literal with something done to it is not that literal.
+    assert_eq!(
+        read("if c { \"On\".trim() } else { \"Off\" }"),
+        unread("if c { \"On\".trim() } else { \"Off\" }")
+    );
+    assert_eq!(
+        read("match p { A => { \"x\" }.to_uppercase(), B => \"y\" }"),
+        unread("match p { A => { \"x\" }.to_uppercase(), B => \"y\" }")
+    );
+    assert_eq!(
+        read("if c { \"On\" } else { \"Off\" }.to_uppercase()"),
+        unread("if c { \"On\" } else { \"Off\" }.to_uppercase()")
+    );
+    // An `if` without an `else`, and a `match` without arms, are not strings at all.
+    assert_eq!(read("if c { \"On\" }"), unread("if c { \"On\" }"));
+    assert_eq!(read("match p {}"), unread("match p {}"));
+    // A brace in an `if let` pattern is not mistaken for the branch.
+    assert_eq!(
+        read("if let Mode { level } = mode { \"x\" } else { \"y\" }"),
+        unread("if let Mode { level } = mode { \"x\" } else { \"y\" }")
+    );
+}
+
+#[test]
+fn branches_that_are_all_literals_are_read_however_they_are_written() {
+    let none = BTreeMap::new();
+    let read = |arg: &str| read_argument(arg, &none, &none);
+    let keys = |k: &[&str]| Argument::Keys(k.iter().map(|s| (*s).to_owned()).collect());
+    assert_eq!(
+        read("if a { \"A\" } else if b { \"B\" } else { \"C\" }"),
+        keys(&["A", "B", "C"])
+    );
+    assert_eq!(
+        read("if let Some(x) = y.map(|v| { v }) {\n    \"Yes\"\n} else {\n    \"No\"\n}"),
+        keys(&["Yes", "No"])
+    );
+    assert_eq!(
+        read(
+            "match p {\n    // the one \"quoted\" => here is a comment\n    A => { \"x\" }\n    \
+             Some(B { .. }) | C if y >= 2 => \"y\",\n    _ => if z { \"z\" } else { \"w\" },\n}"
+        ),
+        keys(&["x", "y", "z", "w"])
+    );
+    assert_eq!(
+        read("match (a, b) { (1, _) => \"a, b\", _ => \"=> {\" }"),
+        keys(&["a, b", "=> {"])
+    );
+    assert_eq!(read("{ \"Block\" }"), keys(&["Block"]));
+    assert_eq!(read("\"Save\" // why\n"), keys(&["Save"]));
+}
+
+#[test]
+fn a_comment_inside_an_argument_does_not_end_it() {
+    assert_eq!(
+        first_argument("\n    // not \"here\", or here)\n    \"Key\",\n)"),
+        Some("\n    // not \"here\", or here)\n    \"Key\"")
+    );
+    assert_eq!(first_argument("a / b)"), Some("a / b"));
+}
+
+#[test]
+fn a_definition_a_comment_and_a_longer_name_are_not_calls() {
+    let none = BTreeMap::new();
+    let src = "pub fn tr(key: &str) {}\n// tr(\"Commented\")\nlet s = str(\"No\");\nx.tr(\"No\");\n\
+               let y = tr(\"Yes\");\nlet z = tr_args(\n    \"Also %s\",\n    &[&tr(v)],\n);\n";
+    let calls = calls_to_tr(src, &none, &none);
+    assert_eq!(
+        calls,
+        [
+            Argument::Keys(vec!["Yes".to_owned()]),
+            Argument::Unreadable("v".to_owned()),
+            Argument::Keys(vec!["Also %s".to_owned()]),
+        ]
+    );
 }

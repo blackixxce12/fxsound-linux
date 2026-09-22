@@ -7,8 +7,10 @@
 //! and `hu` was never built into the Windows binary — live in `assets/translations/` and are
 //! embedded here unchanged. `assets/translations/port/` carries the strings this port added, in
 //! the same file format, layered on top of the original's table for the same language — and,
-//! for the few strings a Windows table misspells or omits, a correctly keyed copy: a layer over
-//! a file that is embedded unchanged is the one place such a repair can live.
+//! for the few strings a Windows table misspells, omits or gets wrong where the port shows them
+//! (Croatian's `on`/`off` left in English, Italian's `on` as "su", eleven `"Output: "`s without
+//! the space the device name needs), a repaired copy: a layer over a file that is embedded
+//! unchanged is the one place such a repair can live.
 //!
 //! `tests/translations.rs` audits every string the interface passes to [`tr`] against every
 //! language's table, so a string added without its translations fails a test rather than
@@ -96,6 +98,21 @@ pub static LANGUAGES: [Language; 29] = [
     language!("zh-TW", "繁體中文", "zh-TW"),
 ];
 
+impl Language {
+    /// The Windows build's table for this language on its own, as it is embedded.
+    #[must_use]
+    pub fn original_catalogue(&self) -> Catalogue {
+        Catalogue::parse(self.code, self.original)
+    }
+
+    /// The strings this port layers over [`Self::original_catalogue`], on their own: the ones the
+    /// Windows build never had, and the repairs of the ones it misspells or mistranslates.
+    #[must_use]
+    pub fn port_catalogue(&self) -> Catalogue {
+        Catalogue::parse(self.code, self.port)
+    }
+}
+
 /// The language for `code`, if there is a table for it. Exact match, case-sensitive — the codes
 /// are ours, not the user's.
 #[must_use]
@@ -159,9 +176,8 @@ impl Catalogue {
     /// The original's table for `language`, with the port's additions merged over it.
     #[must_use]
     pub fn for_language(language: &Language) -> Self {
-        let mut catalogue = Self::parse(language.code, language.original);
-        let port = Self::parse(language.code, language.port);
-        catalogue.entries.extend(port.entries);
+        let mut catalogue = language.original_catalogue();
+        catalogue.entries.extend(language.port_catalogue().entries);
         catalogue
     }
 
@@ -186,6 +202,11 @@ impl Catalogue {
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&str> {
         self.entries.get(key).map(String::as_str)
+    }
+
+    /// Every English string the table translates, in no particular order.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
     }
 }
 
@@ -378,6 +399,43 @@ mod tests {
                 "Output",
                 "Input",
                 "Keyboard shortcuts",
+                // The six 0.3.0 microphone strings that shipped in English everywhere…
+                "Gate",
+                "Compressor",
+                "De-esser",
+                "Denoise",
+                "unavailable at this rate",
+                "unavailable",
+                // …the two device pickers and the readout strip…
+                "Off",
+                "Floor",
+                "Voice",
+                "Echo",
+                "Reverb",
+                // …the Microphone page and its values…
+                "Microphone",
+                "Noise suppression",
+                "Denoiser channels",
+                "De-reverb",
+                "Echo cancellation",
+                "Mild",
+                "Medium",
+                "Strong",
+                "Linked stereo",
+                "Adaptive",
+                "Preset",
+                // …and the calibration dialog.
+                "Calibrate microphone",
+                "Calibrate microphone…",
+                "Stay quiet for 3 seconds",
+                "Speak normally for 5 seconds",
+                "Speak loudly for 2 seconds",
+                "Speech",
+                "Peak",
+                "Clipping",
+                "Apply",
+                "Retry",
+                "Calibration failed",
             ] {
                 let value = table.get(key);
                 assert!(
@@ -396,6 +454,90 @@ mod tests {
                 language.code
             );
         }
+    }
+
+    #[test]
+    fn no_port_translation_drops_or_adds_a_placeholder() {
+        // `tr_args` fills `%s` in order; a translation with one too few shows the rest of the
+        // sentence without its name, and one too many prints a literal `%s`.
+        let mut checked = 0;
+        for language in &LANGUAGES[1..] {
+            let port = language.port_catalogue();
+            for key in port.keys() {
+                let value = port.get(key).expect("a key the table listed");
+                assert_eq!(
+                    value.matches("%s").count(),
+                    key.matches("%s").count(),
+                    "{}: {key:?} = {value:?}",
+                    language.code
+                );
+                checked += usize::from(key.contains("%s"));
+            }
+        }
+        // Nine strings with a placeholder, one of them with two, in each of 28 tables.
+        assert!(checked >= 9 * 28, "only {checked} placeholders checked");
+    }
+
+    #[test]
+    fn the_port_repairs_the_windows_words_the_new_readouts_show() {
+        // The readout strip and the tray show `on`/`off`, and the tray and the notifications put
+        // a device after `"Output: "` — three places where a Windows table's slip used to show.
+        let get = |code: &str, key: &str| {
+            Catalogue::for_language(language(code).expect(code))
+                .get(key)
+                .map(str::to_owned)
+        };
+        // Croatian left both words in English; Italian said "up", Romanian "upon".
+        assert_eq!(get("hr", "on").as_deref(), Some("uključen"));
+        assert_eq!(get("hr", "off").as_deref(), Some("isključen"));
+        assert_eq!(get("it", "on").as_deref(), Some("acceso"));
+        assert_eq!(get("ro", "on").as_deref(), Some("pornit"));
+        // Italian's output was "Produzione" (production); German's lost its space.
+        assert_eq!(get("it", "Output: ").as_deref(), Some("Uscita: "));
+        assert_eq!(get("de", "Output: ").as_deref(), Some("Ausgabe: "));
+        // …and the originals themselves are untouched.
+        let original = |code: &str, key: &str| {
+            language(code)
+                .expect(code)
+                .original_catalogue()
+                .get(key)
+                .map(str::to_owned)
+        };
+        assert_eq!(original("it", "on").as_deref(), Some("su"));
+        assert_eq!(original("de", "Output: ").as_deref(), Some("Ausgabe:"));
+    }
+
+    #[test]
+    fn finnish_says_output_and_input_the_way_its_windows_table_does() {
+        // The original writes `Ulostulo` for output throughout; the port's own pair follows it
+        // rather than setting `Lähtö` beside it in the same tooltip.
+        let fi = Catalogue::for_language(language("fi").expect("fi"));
+        assert_eq!(fi.get("Output: "), Some("Ulostulo: "));
+        assert_eq!(fi.get("Output"), Some("Ulostulo"));
+        assert_eq!(fi.get("Input"), Some("Sisääntulo"));
+        assert_eq!(fi.get("Input: "), Some("Sisääntulo: "));
+    }
+
+    #[test]
+    fn a_catalogue_lists_its_keys_and_a_language_its_two_layers() {
+        let table = Catalogue::parse("xx", "\"One\" = \"Eins\"\n\"Two\" = \"Zwei\"\n");
+        let mut keys: Vec<&str> = table.keys().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["One", "Two"]);
+        let ru = language("ru").expect("ru");
+        let merged = Catalogue::for_language(ru);
+        let (original, port) = (ru.original_catalogue(), ru.port_catalogue());
+        assert!(port.len() < original.len());
+        // The port wins where both have a string: Windows' Russian says "with Windows".
+        assert_ne!(
+            original.get("Launch on system startup"),
+            port.get("Launch on system startup")
+        );
+        assert_eq!(
+            merged.get("Launch on system startup"),
+            port.get("Launch on system startup")
+        );
+        assert!(merged.len() >= original.len().max(port.len()));
     }
 
     #[test]

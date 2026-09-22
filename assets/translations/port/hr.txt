@@ -32,7 +32,6 @@ countries: HR
 "De-esser" = "De-esser"
 "Denoise" = "Uklanjanje šuma"
 "unavailable at this rate" = "nedostupno pri ovoj frekvenciji uzorkovanja"
-"voice" = "glas"
 "Not used on a microphone" = "Ne koristi se za mikrofon"
 "These five belong to the playback chain. A microphone runs the voice chain instead: high-pass, gate, equalizer, de-esser, compressor and limiter." = "Ovih pet pripada lancu reprodukcije. Mikrofon umjesto toga koristi glasovni lanac: visokopropusni filtar, gate, ekvilajzer, de-esser, kompresor i limiter."
 "FxSound is still running, but this session has no tray icon.\nRun 'fxsound --show' to bring the window back." = "FxSound i dalje radi, ali ova sesija nema ikonu u sustavskoj traci.\nPokrenite 'fxsound --show' da vratite prozor."
@@ -72,3 +71,5 @@ countries: HR
 "Apply" = "Primijeni"
 "Retry" = "Pokušaj ponovno"
 "Calibration failed" = "Kalibracija nije uspjela"
+"on" = "uključen"
+"off" = "isključen"
