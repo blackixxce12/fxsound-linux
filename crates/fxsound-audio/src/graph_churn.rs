@@ -4,7 +4,8 @@
 //! quantum arithmetic, the channel map, the pod builders. None of them touches [`supervise`],
 //! [`connect`], `apply_rules` or `build_nodes` — the code that actually decides what FxSound does
 //! to somebody's audio graph — because those need a server, and pointing them at the developer's
-//! own graph would create nodes in it and take their default device away mid-test.
+//! own graph would create nodes in it and take their default device away mid-test. The one
+//! exception, `engine::live_session`, calls them by hand against a daemon of this module's.
 //!
 //! So each test here starts a **private** PipeWire: its own daemon, its own socket, its own
 //! synthetic devices, nothing shared with the session. Two things make that possible without
@@ -57,7 +58,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// How long to wait for anything the server has to do.
-const PATIENCE: Duration = Duration::from_secs(10);
+pub(crate) const PATIENCE: Duration = Duration::from_secs(10);
 
 /// Our nodes as the server lists them: each name with its `object.serial`.
 type OurNodes = Vec<(&'static str, u64)>;
@@ -79,8 +80,12 @@ fn skip(reason: &str) {
 
 /// A PipeWire daemon of our own: one stereo sink, one 7.1 sink, one virtual microphone, and the
 /// `default` metadata object a session manager would otherwise create — with no session manager
-/// behind it, so nothing links anything and nothing moves a default but us.
-struct PrivateGraph {
+/// behind it, so nothing links anything and nothing moves a default but us. Like every daemon it
+/// also publishes a `settings` object for its own clock, which is where a test forces its rate.
+///
+/// Crate-visible for `engine::live_session`, whose tests stand in for the engine's main loop
+/// rather than drive its handle.
+pub(crate) struct PrivateGraph {
     dir: PathBuf,
     child: Child,
 }
@@ -88,7 +93,7 @@ struct PrivateGraph {
 impl PrivateGraph {
     /// `None` when there is no `pipewire` to start, which is not a failure — unless
     /// [`REQUIRE_TOOLS`] says it is.
-    fn start(tag: &str) -> Option<Self> {
+    pub(crate) fn start(tag: &str) -> Option<Self> {
         Self::spawn(tag)
             .inspect_err(|why| skip(&format!("{why}, so {tag} cannot run")))
             .ok()
@@ -137,7 +142,7 @@ impl PrivateGraph {
         self.dir.join("run/fxsound-test-0")
     }
 
-    fn remote(&self) -> String {
+    pub(crate) fn remote(&self) -> String {
         self.socket().display().to_string()
     }
 
@@ -145,7 +150,7 @@ impl PrivateGraph {
     /// is named on the command line, and the child's runtime directory is the private one, so a
     /// tool that ignored `-r` would find no session socket to fall back on either. `None` when the
     /// tool is not installed or failed, which the callers treat as "cannot tell", not as a pass.
-    fn tool(&self, program: &str, args: &[&str]) -> Option<String> {
+    pub(crate) fn tool(&self, program: &str, args: &[&str]) -> Option<String> {
         let output = Command::new(program)
             .arg("-r")
             .arg(self.socket())
@@ -409,7 +414,7 @@ impl PrivateGraph {
     /// engine offers exactly one fixed format, and a stream offering one value runs at that
     /// value or not at all. A declaration with a range or more than one entry is reported as
     /// no format, because that would mean the engine stopped pinning it.
-    fn node_format(&self, node_name: &str) -> Option<Option<(u64, u64)>> {
+    pub(crate) fn node_format(&self, node_name: &str) -> Option<Option<(u64, u64)>> {
         let deadline = Instant::now() + PATIENCE;
         loop {
             let objects = self.dump()?;
@@ -453,7 +458,7 @@ fn serial_of(nodes: &[(&str, u64)], name: &str) -> Option<u64> {
 /// Say so, loudly, when a check had to be skipped because a PipeWire tool gave no answer — which
 /// is a missing tool on a contributor's machine, and under [`REQUIRE_TOOLS`] a failure whatever
 /// the reason.
-fn unless_skipped<T>(checked: Option<T>, tool: &str, what: &str) -> Option<T> {
+pub(crate) fn unless_skipped<T>(checked: Option<T>, tool: &str, what: &str) -> Option<T> {
     if checked.is_none() {
         skip(&format!(
             "{tool} is not available or failed, so {what} was not checked"

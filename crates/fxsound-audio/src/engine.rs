@@ -187,8 +187,15 @@ impl SampleRing {
         }
     }
 
-    /// Adopt a new format and start again from empty. **Main loop only** — called from
-    /// `param_changed` and from node creation, never from `process()`.
+    /// Adopt a new format and start again from empty. **Main loop only, and only while nothing
+    /// drains the ring** — [`build_nodes`] calls it after the lane's previous pair has gone and
+    /// before its new NODE 2 exists, and nothing else may.
+    ///
+    /// Starting from empty means moving the read cursor, and the read cursor is the consumer's.
+    /// Under a running NODE 2 that is two writers on one cursor — the one thing the whole ring's
+    /// wait-freedom rests on never happening. 0.3.0 also called this from NODE 1's
+    /// `param_changed`, which fires again whenever that node renegotiates, with NODE 2 still
+    /// popping on the data thread; [`adopt_sink_format`] now leaves the ring alone.
     pub(crate) fn reconfigure(&self, channels: usize, quantum_frames: usize) {
         self.channels.store(channels, Ordering::Relaxed);
         self.target_fill_frames.store(
@@ -345,9 +352,10 @@ pub(crate) struct Counters {
     sink_cycles: AtomicU64,
     output_cycles: AtomicU64,
     frames_processed: AtomicU64,
-    /// NODE 2 negotiated a different channel count than NODE 1 did. Audio is muted until the
-    /// supervisor rebuilds the nodes, because reinterpreting the ring at the wrong stride is the
-    /// one failure here that could be genuinely unpleasant to listen to.
+    /// One of the pair's nodes negotiated a channel count the ring was not built for — NODE 2 on
+    /// every cycle it refuses to play, NODE 1 once when its format arrives. Audio is muted until
+    /// the supervisor rebuilds the nodes, because reinterpreting the ring at the wrong stride is
+    /// the one failure here that could be genuinely unpleasant to listen to.
     format_mismatches: AtomicU64,
     sample_rate: AtomicU32,
     channels: AtomicU32,
@@ -405,9 +413,10 @@ pub(crate) struct SinkData {
     counters: Arc<Counters>,
     status: Arc<StreamStatus>,
     format: AudioInfoRaw,
-    /// Negotiated channel count, latched by `param_changed`. Zero until the format is agreed.
+    /// Negotiated channel count, latched by `param_changed`. Zero until the format is agreed, and
+    /// zero again if it was agreed at a stride the ring was not built for — which is what keeps
+    /// `process()` from pushing anything until the pair is rebuilt.
     channels: usize,
-    quantum: usize,
     /// The recycle channel of the lane `dsp` belongs to — never the other lane's, so the state
     /// comes back to the slot it was taken from.
     recycle: Sender<LaneDsp>,
@@ -421,7 +430,7 @@ impl SinkData {
     /// pair's direction is, so the only way to get a lane's state back into the other lane's
     /// slot — or to feed the voice chain's output into the speakers' ring — would be to build it
     /// as the other lane's to begin with.
-    fn new(shared: &Shared, dsp: LaneDsp, quantum: usize) -> Self {
+    fn new(shared: &Shared, dsp: LaneDsp) -> Self {
         let lane = shared.lanes.get(dsp.direction());
         Self {
             dsp: Some(dsp),
@@ -430,7 +439,6 @@ impl SinkData {
             status: Arc::clone(&lane.status),
             format: AudioInfoRaw::new(),
             channels: 0,
-            quantum,
             recycle: lane.recycle.0.clone(),
         }
     }
@@ -490,8 +498,116 @@ struct Nodes {
     _second: pw::stream::StreamRc,
     /// `node.name` of the real device NODE 2 renders to, or NODE 1 captures from.
     target: String,
+    /// What both nodes were declared at.
+    format: PairFormat,
+}
+
+/// The format a lane's pair runs at: decided once per build, declared on both of its nodes, and
+/// kept with the pair.
+///
+/// Kept so the rules can tell a pair that is still right from one built against what its device
+/// *used* to be. The target's name alone cannot: a card switched to another profile keeps its
+/// `node.name` and changes its channel count, a device picked before its node info arrived was
+/// built on the stereo fallback and turns out to be 7.1, and a graph forced to another rate is the
+/// same sink at a different rate. 0.3.0 compared names only, so none of those ever rebuilt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PairFormat {
+    /// The target's channel count, clamped to `2..=8` (`sndDevices.h:190-191`).
     channels: u32,
     rate: u32,
+    /// The target's own layout at that count.
+    positions: ChannelMap,
+}
+
+impl PairFormat {
+    /// The format a pair attached to `target` runs at, with the graph's clock at `graph_rate`.
+    ///
+    /// The target's channel count clamped to `2..=8`, its own channel positions, and — for the
+    /// output lane — the device's rate when it publishes one and the graph's clock rate when it
+    /// does not, which is most ALSA sinks. The input lane asks for [`CAPTURE_RATE`] whatever the
+    /// microphone runs at, and lets PipeWire resample. RNNoise exists at 48 kHz and nowhere else,
+    /// and a voice preset has to mean one thing on every device — a preset whose denoiser
+    /// silently drops out on a 44.1 kHz microphone is a preset describing half its own sound. The
+    /// cost is a resampler in the graph on devices that are not already at 48 kHz, which is a
+    /// little latency and a little CPU on a path that carries one or two channels.
+    fn for_target(target: &DeviceInfo, graph_rate: u32) -> Self {
+        let channels = target.clamped_channels();
+        let rate = match target.direction {
+            DeviceDirection::Input => CAPTURE_RATE,
+            DeviceDirection::Output => target.rate.unwrap_or(graph_rate),
+        };
+        Self {
+            channels,
+            rate,
+            positions: target.positions.resized(channels),
+        }
+    }
+}
+
+/// What the `settings` metadata object says about the graph's clock.
+///
+/// Two keys, because PipeWire has two: `clock.rate` is the rate the graph runs at when nothing says
+/// otherwise, and `clock.force-rate` — what `pw-metadata -n settings 0 clock.force-rate 44100`
+/// writes — overrides it until it is set back to `0`. They are kept apart rather than folded into
+/// one number as they arrive: the order they arrive in is the server's, and a `force-rate` of `0`
+/// has to put the plain rate back, not be ignored as out of range and leave the forced one in
+/// place for the rest of the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraphClock {
+    /// `clock.rate`.
+    rate: u32,
+    /// `clock.force-rate`, while it forces anything.
+    forced: Option<u32>,
+}
+
+impl Default for GraphClock {
+    /// What a graph that has said nothing yet is assumed to run at.
+    fn default() -> Self {
+        Self {
+            rate: DEFAULT_SAMPLE_RATE,
+            forced: None,
+        }
+    }
+}
+
+impl GraphClock {
+    /// The rate the graph runs at now.
+    const fn rate(self) -> u32 {
+        match self.forced {
+            Some(rate) => rate,
+            None => self.rate,
+        }
+    }
+
+    /// Adopt one key of the `settings` object. Keys about anything but the rate are ignored; so is
+    /// a `clock.rate` that is not a rate, whereas a `clock.force-rate` that is not one — `0`, or
+    /// the key deleted — means nothing is forced.
+    fn learn(&mut self, key: &str, value: Option<&str>) {
+        let rate = value
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|rate| (8_000..=crate::MAX_SAMPLE_RATE).contains(rate));
+        match key {
+            "clock.rate" => {
+                if let Some(rate) = rate {
+                    self.rate = rate;
+                }
+            }
+            "clock.force-rate" => self.forced = rate,
+            _ => {}
+        }
+    }
+}
+
+/// A bound node, held only to receive its `info` event ([`Shared::node_probes`]).
+///
+/// A struct rather than a `(Node, NodeListener)` tuple for its drop order. The listener unhooks
+/// itself from a list that lives inside the proxy, so it has to go while the proxy is still there,
+/// and fields drop in declaration order — a tuple drops the proxy first. 0.3.0 got the order right
+/// in exactly one place, an explicit drain on disconnect; a device unplugged and a node announced
+/// again under its id both dropped the tuple as it was.
+struct NodeProbe {
+    _listener: pw::node::NodeListener,
+    _node: pw::node::Node,
 }
 
 /// One PipeWire connection. Replaced wholesale on a reconnect.
@@ -500,9 +616,15 @@ struct Nodes {
 /// connection all the same, and every stream holds a reference to its core, so a pair outliving
 /// its session would hold the dead connection open under the new one. [`close_session`] is the
 /// one way a session ends, and it takes both lanes' pairs with it.
+///
+/// Every listener is declared before the proxy it hooks, for the reason [`NodeProbe`] gives.
 struct Session {
     _metadata_listener: Option<pw::metadata::MetadataListener>,
     metadata: Option<pw::metadata::Metadata>,
+    /// The `settings` object, only ever read — but held, because what is read from it arrives as
+    /// events on this proxy ([`on_global`]).
+    _settings_listener: Option<pw::metadata::MetadataListener>,
+    _settings: Option<pw::metadata::Metadata>,
     _registry_listener: pw::registry::Listener,
     /// Only held so the proxy outlives its listener; the `global` callback owns its own clone.
     _registry: pw::registry::RegistryRc,
@@ -685,10 +807,16 @@ struct Shared {
     /// an unknown channel count, `clamped_channels()` answered the stereo minimum for all of
     /// them, and a 5.1 or 7.1 device was driven as a stereo pair with the rest of its channels
     /// silent — the whole `ChannelMap` path was unreachable in practice.
-    node_probes: std::collections::HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
+    ///
+    /// Bound on the session's core, so they belong to the session: emptied when it closes
+    /// ([`close_session`]) and again as the next one is made ([`connect`]), so a probe on a dead
+    /// core is never kept, let alone kept beside a new one for the same device.
+    node_probes: std::collections::HashMap<u32, NodeProbe>,
     /// The session defaults, one per direction.
     defaults: PerDirection<DefaultState>,
-    graph_rate: u32,
+    /// The graph's clock, as the `settings` metadata object reports it: the rate an output pair is
+    /// built at when its sink does not publish one of its own ([`PairFormat::for_target`]).
+    clock: GraphClock,
     /// The Windows registry slots, one set per direction, so trying a microphone never forgets
     /// which speakers the user had.
     memory: PerDirection<SelectionMemory>,
@@ -742,7 +870,7 @@ impl Shared {
             devices: Vec::new(),
             node_probes: std::collections::HashMap::new(),
             defaults: PerDirection::default(),
-            graph_rate: DEFAULT_SAMPLE_RATE,
+            clock: GraphClock::default(),
             memory: PerDirection::default(),
             needs_publish: false,
             restart_requested: false,
@@ -768,10 +896,15 @@ impl Shared {
 
     /// Report a lane's error once: not on every 200 ms tick it persists, and not again on every
     /// rebuild of a pair that keeps failing. The same error is news again only once a pair has
-    /// proved itself ([`Lane::forgive_if_stable`]).
+    /// proved itself ([`Lane::forgive_if_stable`]). "The same" is [`same_failure`]'s.
     fn report_error(&mut self, direction: DeviceDirection, error: AudioError) {
         let lane = self.lanes.get_mut(direction);
-        if lane.last_error.as_ref() == Some(&error) {
+        if lane
+            .last_error
+            .as_ref()
+            .is_some_and(|last| same_failure(last, &error))
+        {
+            log::debug!("audio engine, {} lane, still: {error}", direction.key());
             return;
         }
         log::warn!("audio engine, {} lane: {error}", direction.key());
@@ -782,9 +915,15 @@ impl Shared {
         });
     }
 
-    /// Report an error about the connection itself — no lane can do anything about it — once.
+    /// Report an error about the connection itself — no lane can do anything about it — once,
+    /// however many reconnects it takes to go away.
     fn report_connection_error(&mut self, error: AudioError) {
-        if self.connection_error.as_ref() == Some(&error) {
+        if self
+            .connection_error
+            .as_ref()
+            .is_some_and(|last| same_failure(last, &error))
+        {
+            log::debug!("audio engine, still: {error}");
             return;
         }
         log::warn!("audio engine: {error}");
@@ -816,6 +955,18 @@ impl Shared {
             self.mark_lane_for_rules(direction);
         }
     }
+}
+
+/// Whether two errors are the same failure, for the purpose of telling the GUI about it once.
+///
+/// By kind, not by text. [`AudioError::PipewireUnavailable`] carries whatever libpipewire said at
+/// the time, and one outage is not always described the same way twice — a socket that refuses,
+/// then a socket that is not there, then a stream the half-started server would not create.
+/// Compared whole, every change of wording was news, and a server slow to come back told the user
+/// again each time its answer changed. The first description is the one they get; the rest go to
+/// the debug log.
+fn same_failure(a: &AudioError, b: &AudioError) -> bool {
+    std::mem::discriminant(a) == std::mem::discriminant(b)
 }
 
 /// Republish a lane's NODE 1 `ProcessLatency` when the DSP's delay has moved under it.
@@ -1276,13 +1427,21 @@ fn connect(
     let _ = core.sync(0);
 
     let mut guard = shared.borrow_mut();
+    // Everything learned from a server is learned again from this one. The probes went with the
+    // last session ([`close_session`]); emptying them here as well means a probe can only ever
+    // belong to the connection being made, whatever path led here. The clock is assumed to be the
+    // default until this server's `settings` object says otherwise.
     guard.devices.clear();
+    guard.node_probes.clear();
     guard.defaults = PerDirection::default();
+    guard.clock = GraphClock::default();
     guard.state = State::Connecting;
     guard.registry_ready = false;
     guard.session = Some(Session {
         _metadata_listener: None,
         metadata: None,
+        _settings_listener: None,
+        _settings: None,
         _registry_listener: registry_listener,
         _registry: registry,
         _core_listener: core_listener,
@@ -1306,19 +1465,17 @@ fn connect(
 /// Both lanes' pairs first: every stream holds a reference to the core, so a pair left behind
 /// would keep the dead connection open under the next one — and dropping a pair is also what
 /// hands its DSP back through the lane's recycle channel. Then the node probes, each listener
-/// before its proxy, while the core they were bound on is still there to destroy them. Then the
-/// session itself. Each lane keeps whether it is enabled, its memory and its DSP, so whatever
-/// comes next — a reconnect, or the end of the thread — finds the lanes as the user left them.
+/// before its proxy ([`NodeProbe`]), while the core they were bound on is still there to destroy
+/// them. Then the session itself. Each lane keeps whether it is enabled, its memory and its DSP,
+/// so whatever comes next — a reconnect, or the end of the thread — finds the lanes as the user
+/// left them.
 fn close_session(shared: &mut Shared) {
     for (_, lane) in shared.lanes.iter_mut() {
         lane.nodes = None;
         lane.built_at = None;
         lane.status.clear();
     }
-    for (_, (node, listener)) in shared.node_probes.drain() {
-        drop(listener);
-        drop(node);
-    }
+    shared.node_probes.clear();
     shared.session = None;
     shared.registry_ready = false;
     drain_recycled_dsp(shared);
@@ -1427,17 +1584,22 @@ fn supervise_lane(shared: &mut Shared, direction: DeviceDirection, now: Instant)
     }
 
     // b. The two nodes negotiated different formats: rebuild rather than play at the wrong
-    //    stride.
+    //    stride — on the lane's backoff, like a stream in error. The new pair declares the format
+    //    the old one failed to agree on, so a server that disagrees once disagrees again, and
+    //    0.3.0 handed it a fresh pair on every tick for as long as it did. Not reported as an
+    //    error: the lane's status carries every mismatch, so one that a rebuild cures stays a
+    //    number rather than a notification.
     let lane = shared.lanes.get_mut(direction);
     let mismatches = lane.counters.format_mismatches.swap(0, Ordering::Relaxed);
     lane.format_mismatches_total += mismatches;
     if mismatches > 0 {
         log::warn!(
-            "the {} lane's two nodes negotiated different formats; rebuilding",
-            direction.key()
+            "the {} lane's two nodes negotiated different formats; rebuilding them after {:?}",
+            direction.key(),
+            backoff(lane.attempts)
         );
         drop_nodes(shared, direction);
-        shared.lanes.get_mut(direction).needs_rules = true;
+        shared.lanes.get_mut(direction).retry_later(now);
     }
 
     // c. Rules and node creation, once the lane's backoff allows.
@@ -1513,7 +1675,13 @@ fn on_global(
                             }
                         })
                         .register();
-                    guard.node_probes.insert(object_id, (node, listener));
+                    guard.node_probes.insert(
+                        object_id,
+                        NodeProbe {
+                            _listener: listener,
+                            _node: node,
+                        },
+                    );
                 }
                 Err(err) => {
                     log::debug!("could not bind node {object_id} to read its format: {err}")
@@ -1539,17 +1707,24 @@ fn on_global(
                     }
                 })
                 .register();
+            let Some(session) = guard.session.as_mut() else {
+                return;
+            };
+            // Each slot's listener before its proxy: an object announced again — a session
+            // manager that restarted — replaces what is there, and the old listener has to unhook
+            // itself while the proxy it hooks still exists ([`NodeProbe`]).
             if name == "default" {
-                if let Some(session) = guard.session.as_mut() {
-                    session.metadata = Some(metadata);
-                    session._metadata_listener = Some(listener);
-                }
+                session._metadata_listener = Some(listener);
+                session.metadata = Some(metadata);
             } else {
-                // The `settings` object only has to be watched, never written; keeping the
-                // listener alive is enough, and dropping the proxy with it is fine because the
-                // values we want arrive in the initial burst.
-                drop(listener);
-                drop(metadata);
+                // The `settings` object is only ever read, but it has to be *kept*. Its properties
+                // are not in the registry global; they arrive after the bind, as events on this
+                // proxy. 0.3.0 dropped the proxy here, on the grounds that the values arrive in
+                // the initial burst — they do, addressed to a proxy that no longer existed, so
+                // `clock.rate` never reached the engine and every sink that does not publish a
+                // rate of its own got an output pair at 48 kHz, whatever the graph ran at.
+                session._settings_listener = Some(listener);
+                session._settings = Some(metadata);
             }
         }
         _ => {}
@@ -1600,59 +1775,68 @@ fn remove_device(shared: &mut Shared, id: u32) -> Option<DeviceInfo> {
     Some(removed)
 }
 
-/// A bound node reported its format. Fill in what the registry could not tell us.
+/// A bound node reported its format. Fill in what the registry could not tell us — and whatever
+/// has changed since.
 ///
-/// Arrives once per node shortly after it appears, and again whenever the node's info changes —
-/// a profile switch on an ALSA card, for instance, which really does change the channel count
-/// under a running stream.
+/// Arrives once per node shortly after it appears, and again on every change to the node's info:
+/// its state, as it is suspended and woken, which says nothing new about its format; and a profile
+/// switch on an ALSA card, which really does change the channel count under a running stream.
+/// 0.3.0 took only the first report, which made it immune to the first kind and deaf to the
+/// second: a card switched from stereo to 5.1 stayed stereo to FxSound until it was unplugged. So
+/// each report is compared with what is known instead. The same format again is churn and changes
+/// nothing; a different one is the device's new truth.
 fn on_node_info(
     shared: &Rc<RefCell<Shared>>,
     object_id: u32,
     channels: u32,
     positions: Option<ChannelMap>,
 ) {
+    // A report without a channel count says nothing about the format; what was learned stands.
+    if channels == 0 {
+        return;
+    }
+    let positions = positions.unwrap_or_else(|| ChannelMap::default_for(channels));
     let Ok(mut guard) = shared.try_borrow_mut() else {
         return;
     };
     let Some(device) = guard.devices.iter_mut().find(|d| d.object_id == object_id) else {
         return;
     };
-
-    // Already learned, or nothing to learn: leave it alone. Taking only the first non-zero report
-    // is what makes this immune to the churn described above.
-    if device.channels != 0 || channels == 0 {
+    if device.channels == channels && device.positions == positions {
         return;
     }
-    let before = device.clamped_channels();
+    let before = device.channels;
     device.channels = channels;
-    if let Some(map) = positions {
-        device.positions = map;
-    } else if channels != 0 {
-        device.positions = ChannelMap::default_for(channels);
-    }
-    let after = device.clamped_channels();
-    let name = device.name.clone();
-    let device_direction = device.direction;
+    device.positions = positions;
+    let device = device.clone();
 
     log::debug!(
-        "{name}: {channels} channels, {}",
+        "{}: {channels} channels, {}",
+        device.name,
         device.positions.to_property_value()
     );
     guard.needs_publish = true;
 
-    // The one rebuild worth doing: the device was selected before its info arrived, so the nodes
-    // were built against the stereo fallback, and the truth is something else. Only the device a
-    // lane's nodes are attached to matters — reacting to every device of the direction would
-    // rebuild the running stream because some *other* sink reported something.
-    let attached = guard
+    // Rebuild a pair attached to this device when it was built for something else: a device
+    // selected before its info arrived, whose pair runs the stereo fallback, or a card whose
+    // profile just changed. Only the device a lane's pair is attached to matters — reacting to
+    // every device of the direction would rebuild the running stream because some *other* sink
+    // reported something — and only a change the pair's format actually follows: nine channels
+    // and ten are both the eight the pair is clamped to.
+    let wanted = PairFormat::for_target(&device, guard.clock.rate());
+    let stale = guard
         .lanes
-        .get(device_direction)
+        .get(device.direction)
         .nodes
         .as_ref()
-        .is_some_and(|nodes| nodes.target == name);
-    if attached && after != before {
-        log::info!("{name} reports {after} channels rather than {before}; rebuilding for it");
-        guard.mark_lane_for_rules(device_direction);
+        .is_some_and(|nodes| nodes.target == device.name && nodes.format != wanted);
+    if stale {
+        log::info!(
+            "{} reports {channels} channels (it had {before}); rebuilding the {} lane's pair for it",
+            device.name,
+            device.direction.key()
+        );
+        guard.mark_lane_for_rules(device.direction);
     }
 }
 
@@ -1681,11 +1865,16 @@ fn on_metadata_property(shared: &Rc<RefCell<Shared>>, key: Option<&str>, value: 
             return;
         }
     }
-    if matches!(key, "clock.rate" | "clock.force-rate")
-        && let Some(rate) = value.and_then(|v| v.trim().parse::<u32>().ok())
-        && (8_000..=crate::MAX_SAMPLE_RATE).contains(&rate)
-    {
-        guard.graph_rate = rate;
+    // The `settings` object. A graph that moved to another rate is news for the output lane only,
+    // and only for a pair on a sink that publishes no rate of its own — the rules find out which
+    // ([`apply_rules`] compares the pair's format). The capture stream asks for 48 kHz whatever
+    // the clock does.
+    let before = guard.clock.rate();
+    guard.clock.learn(key, value);
+    let now = guard.clock.rate();
+    if now != before {
+        log::info!("the graph's clock runs at {now} Hz (was {before} Hz)");
+        guard.mark_lane_for_rules(DeviceDirection::Output);
     }
 }
 
@@ -1974,18 +2163,6 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
         }
     };
 
-    let already = shared
-        .lanes
-        .get(direction)
-        .nodes
-        .as_ref()
-        .is_some_and(|nodes| nodes.target == selection.target);
-    if already {
-        // Nothing to do. An error this lane reported is forgotten once its pair has proved
-        // itself (`Lane::forgive_if_stable`), not because the rules ran again in the meantime.
-        return;
-    }
-
     let Some(target) = shared
         .devices
         .iter()
@@ -1996,12 +2173,30 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
         return;
     };
 
+    // Attached already means attached to this device *at the format it wants now*. The name
+    // alone is not enough: a card that switched profile, a device whose info arrived after its
+    // pair was built on the stereo fallback, and a graph forced to another rate all keep the name
+    // and change the format, and in 0.3.0 the name matched, the rules returned here, and the
+    // rebuild `on_node_info` asked for never happened.
+    let format = PairFormat::for_target(&target, shared.clock.rate());
+    let already = shared
+        .lanes
+        .get(direction)
+        .nodes
+        .as_ref()
+        .is_some_and(|nodes| nodes.target == target.name && nodes.format == format);
+    if already {
+        // Nothing to do. An error this lane reported is forgotten once its pair has proved
+        // itself (`Lane::forgive_if_stable`), not because the rules ran again in the meantime.
+        return;
+    }
+
     // Rebuilding replaces both nodes. The old pair goes first so its DSP state — filter history,
     // scratch — comes back through the recycle channel for the new pair to adopt, and so the
     // server never sees two nodes with the same `node.name`. The default is kept: the same node
     // is about to reappear under the same name, and `default.configured.audio.*` survives the gap.
     drop_nodes(shared, direction);
-    match build_nodes(shared, &target) {
+    match build_nodes(shared, &target, format) {
         Ok(nodes) => {
             log::info!(
                 "{} {} ({} ch @ {} Hz)",
@@ -2010,8 +2205,8 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
                     DeviceDirection::Input => "capturing from",
                 },
                 target.description,
-                nodes.channels,
-                nodes.rate
+                nodes.format.channels,
+                nodes.format.rate
             );
             // The lane's error and backoff stay until this pair has proved itself
             // (`Lane::forgive_if_stable`): one that fails again a moment from now is the same
@@ -2040,14 +2235,17 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
 
 /// Create both nodes of the lane of the target's direction, on that lane's ring, counters and DSP.
 ///
-/// The format is decided here, once, and declared on **both** nodes so the ring is always read at
-/// the stride it was written at: the target's channel count clamped to `2..=8`
-/// (`sndDevices.h:190-191`), its own channel positions, and the graph's clock rate. That replaces
-/// §8 of the Windows design wholesale — no `IPolicyConfigVista::SetDeviceFormat`, no rate pushed
-/// onto a driver, no zero-order-hold upsampler. If the real device wants something else, the
-/// adapter in front of it converts — which is also how a mono microphone arrives here as the
-/// stereo pair the DSP runs on.
-fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioError> {
+/// `format` — [`PairFormat::for_target`], decided once by the rules — is declared on **both**
+/// nodes so the ring is always read at the stride it was written at. That replaces §8 of the
+/// Windows design wholesale — no `IPolicyConfigVista::SetDeviceFormat`, no rate pushed onto a
+/// driver, no zero-order-hold upsampler. If the real device wants something else, the adapter in
+/// front of it converts — which is also how a mono microphone arrives here as the stereo pair the
+/// DSP runs on.
+fn build_nodes(
+    shared: &mut Shared,
+    target: &DeviceInfo,
+    format: PairFormat,
+) -> Result<Nodes, AudioError> {
     let Some(session) = shared.session.as_ref() else {
         return Err(AudioError::PipewireDisconnected);
     };
@@ -2057,18 +2255,11 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
         return Err(AudioError::NoValidOutput);
     }
     let direction = target.direction;
-    let channels = target.clamped_channels();
-    // The capture stream asks for 48 kHz whatever the microphone runs at, and lets PipeWire
-    // resample. RNNoise exists at 48 kHz and nowhere else, and a voice preset has to mean one
-    // thing on every device — a preset whose denoiser silently drops out on a 44.1 kHz microphone
-    // is a preset describing half its own sound. The cost is a resampler in the graph on devices
-    // that are not already at 48 kHz, which is a little latency and a little CPU on a path that
-    // carries one or two channels.
-    let rate = match direction {
-        DeviceDirection::Input => CAPTURE_RATE,
-        DeviceDirection::Output => target.rate.unwrap_or(shared.graph_rate),
-    };
-    let positions = target.positions.resized(channels);
+    let PairFormat {
+        channels,
+        rate,
+        positions,
+    } = format;
     let quantum = DEFAULT_QUANTUM_FRAMES.min(MAX_QUANTUM_FRAMES as u32);
     let latency = format!("{quantum}/{rate}");
 
@@ -2135,12 +2326,14 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
     // one. The engine is recycled deliberately, but its *state* should not be.
     dsp.reset();
 
+    // The one place the ring is reconfigured, because it is the one moment nothing reads it: the
+    // lane's previous pair has gone, and this pair's NODE 2 does not exist yet.
     let lane = shared.lanes.get(direction);
     lane.ring.reconfigure(channels as usize, quantum as usize);
     lane.counters.sample_rate.store(rate, Ordering::Relaxed);
     lane.counters.channels.store(channels, Ordering::Relaxed);
 
-    let first_data = SinkData::new(shared, dsp, quantum as usize);
+    let first_data = SinkData::new(shared, dsp);
     let first_listener = first
         .add_local_listener_with_user_data(first_data)
         .state_changed(move |_stream, data, _old, new| {
@@ -2259,8 +2452,7 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
         first,
         _second: second,
         target: target.name.clone(),
-        channels,
-        rate,
+        format,
     })
 }
 
@@ -2416,18 +2608,46 @@ fn format_pod(rate: u32, channels: u32, positions: &ChannelMap) -> Vec<u8> {
 // The two process callbacks — RT thread from here down
 // ---------------------------------------------------------------------------------------------
 
-/// Latch the negotiated format. Main loop, never the data thread — which is exactly why the
+/// NODE 1's `param_changed`. Main loop, never the data thread — which is exactly why the
 /// process callbacks can assume `channels` is constant for the life of a buffer.
 fn on_sink_format(_stream: &pw::stream::Stream, data: &mut SinkData, id: u32, param: Option<&Pod>) {
+    adopt_sink_format(data, id, param);
+}
+
+/// Latch the format NODE 1 negotiated — without touching the ring.
+///
+/// This is not a once-per-pair event. A node can negotiate again at any point in its life —
+/// PipeWire clears a suspended node's format and sets it again when the node wakes, and a session
+/// manager suspends a sink a few seconds after its last client leaves — and NODE 2 goes on popping
+/// the ring on the data thread through all of it. 0.3.0 reconfigured the ring here, which writes
+/// the read cursor NODE 2 owns. The ring needs nothing from this callback in any case:
+/// [`build_nodes`] sized it for the one format both nodes declare, and the format negotiated is
+/// that one.
+///
+/// Unless it is not — and then it is the same failure as NODE 2 negotiating a stride the ring was
+/// not built for: counted as a format mismatch for the supervisor, which rebuilds the pair on the
+/// lane's backoff, and in the meantime nothing is pushed, because `channels` stays zero.
+fn adopt_sink_format(data: &mut SinkData, id: u32, param: Option<&Pod>) {
     let Some((rate, channels)) = parse_audio_format(&mut data.format, id, param) else {
         return;
     };
+    let ring_channels = data.ring.channels();
+    if channels != ring_channels {
+        data.channels = 0;
+        data.counters
+            .format_mismatches
+            .fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "NODE 1 negotiated {channels} ch @ {rate} Hz, but its ring carries {ring_channels} ch; \
+             muting it until the pair is rebuilt"
+        );
+        return;
+    }
     data.channels = channels;
     data.counters.sample_rate.store(rate, Ordering::Relaxed);
     data.counters
         .channels
         .store(channels as u32, Ordering::Relaxed);
-    data.ring.reconfigure(channels, data.quantum);
     if let Some(dsp) = data.dsp.as_mut() {
         dsp.set_format(rate as f32, channels);
     }
@@ -2500,7 +2720,8 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
     if channels == 0 || size == 0 || corrupted {
         // A zero-sized chunk is PipeWire's silent packet, the analogue of
         // `AUDCLNT_BUFFERFLAGS_SILENT` (`sndDevicesDoCapture.cpp:186-191`). Pushing nothing lets
-        // the ring drain and NODE 2 emit silence, which is the same outcome with less work.
+        // the ring drain and NODE 2 emit silence, which is the same outcome with less work. No
+        // channels is no format yet, or one the ring was not built for ([`adopt_sink_format`]).
         return;
     }
     let Some(dsp) = data.dsp.as_mut() else {
@@ -2716,6 +2937,9 @@ fn published_devices(shared: &Shared) -> Vec<AudioDevice> {
     }
     published
 }
+
+#[cfg(test)]
+mod live_session;
 
 #[cfg(test)]
 mod tests {
@@ -3355,7 +3579,7 @@ mod tests {
                     .dsp
                     .take()
                     .expect("on the main loop");
-                SinkData::new(&shared, dsp, 512)
+                SinkData::new(&shared, dsp)
             });
             assert!(shared.lanes.output.dsp.is_none() && shared.lanes.input.dsp.is_none());
 
@@ -4118,6 +4342,258 @@ mod tests {
         assert_eq!(
             shared.lanes.input.next_attempt,
             failed + Duration::from_millis(200)
+        );
+    }
+
+    // ---- the 0.3.0 audit's engine bugs (`docs/0.4.0-design.md` §1.3) --------------------------
+    //
+    // The ones that need a pair of nodes, a bound proxy or a server's `settings` object are in
+    // `live_session`, against a private daemon.
+
+    /// The output lane's NODE 1 user data, with the ring as [`build_nodes`] leaves it: stereo,
+    /// sized for a 16-frame quantum, before either node exists.
+    fn node_one_for_tests(shared: &mut Shared) -> SinkData {
+        let dsp = shared.lanes.output.dsp.take().expect("on the main loop");
+        shared.lanes.output.ring.reconfigure(2, 16);
+        SinkData::new(shared, dsp)
+    }
+
+    /// A `Format` param as PipeWire hands it to `param_changed`.
+    fn negotiated(channels: u32) -> Vec<u8> {
+        format_pod(48_000, channels, &ChannelMap::default_for(channels))
+    }
+
+    const FORMAT: u32 = libspa::sys::SPA_PARAM_Format;
+
+    #[test]
+    fn a_format_negotiated_again_leaves_the_ring_and_its_read_cursor_alone() {
+        let mut shared = shared_with_dsp_for_tests();
+        let mut node_one = node_one_for_tests(&mut shared);
+        let ring = Arc::clone(&node_one.ring);
+        let stereo = negotiated(2);
+        adopt_sink_format(&mut node_one, FORMAT, Pod::from_bytes(&stereo));
+        assert_eq!(node_one.channels, 2);
+
+        // The pair is running: NODE 1 has pushed, NODE 2 has primed and taken a block.
+        ring.push(&[0.25; 96]);
+        let mut block = [0.0; 32];
+        assert_eq!(ring.pop(&mut block), 32);
+        let fill = ring.fill_frames();
+        assert_eq!(fill, 32);
+
+        // The sink is suspended and woken: its format is cleared, and the same one negotiated
+        // again, while NODE 2 goes on popping on the data thread.
+        adopt_sink_format(&mut node_one, FORMAT, None);
+        adopt_sink_format(&mut node_one, FORMAT, Pod::from_bytes(&stereo));
+
+        assert_eq!(
+            ring.fill_frames(),
+            fill,
+            "the main loop moved the read cursor, which is NODE 2's"
+        );
+        assert!(
+            ring.primed.load(Ordering::Relaxed),
+            "the cushion NODE 2 was playing from was thrown away"
+        );
+        assert_eq!(node_one.channels, 2);
+        assert_eq!(
+            shared
+                .lanes
+                .output
+                .counters
+                .format_mismatches
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn a_format_the_ring_was_not_built_for_mutes_node_one_and_counts_as_a_mismatch() {
+        let mut shared = shared_with_dsp_for_tests();
+        let mut node_one = node_one_for_tests(&mut shared);
+        let ring = Arc::clone(&node_one.ring);
+        ring.push(&[0.25; 64]);
+
+        let surround = negotiated(6);
+        adopt_sink_format(&mut node_one, FORMAT, Pod::from_bytes(&surround));
+
+        assert_eq!(
+            node_one.channels, 0,
+            "NODE 1 would push six-channel frames into a stereo ring"
+        );
+        assert_eq!(
+            ring.channels(),
+            2,
+            "the ring keeps the format both nodes declared"
+        );
+        assert_eq!(ring.fill_frames(), 32, "and what is in it");
+        assert_eq!(
+            shared
+                .lanes
+                .output
+                .counters
+                .format_mismatches
+                .load(Ordering::Relaxed),
+            1,
+            "a mismatch, for the supervisor to rebuild the pair on"
+        );
+    }
+
+    #[test]
+    fn a_pair_whose_nodes_disagree_about_the_format_is_rebuilt_on_the_lanes_backoff() {
+        let (mut shared, messages) = shared_with_messages();
+        let mut now = Instant::now();
+        let mut waits = Vec::new();
+        for _ in 0..7 {
+            shared
+                .lanes
+                .output
+                .counters
+                .format_mismatches
+                .store(2, Ordering::Relaxed);
+            supervise_lane(&mut shared, DeviceDirection::Output, now);
+            let lane = &shared.lanes.output;
+            assert!(lane.needs_rules, "the pair is coming back, after the wait");
+            waits.push((lane.next_attempt - now).as_millis());
+            now = lane.next_attempt;
+        }
+        assert_eq!(
+            waits,
+            [200, 400, 800, 1600, 3200, 5000, 5000],
+            "a server that keeps disagreeing got a fresh pair on every tick"
+        );
+        assert_eq!(
+            shared.lanes.output.format_mismatches_total, 14,
+            "every mismatch is in the report"
+        );
+        assert_eq!(
+            drained(&messages),
+            [],
+            "a count in the lane's status, not a notification"
+        );
+        assert_eq!(shared.lanes.input.attempts, 0);
+    }
+
+    #[test]
+    fn a_node_that_reports_a_new_channel_count_is_taken_at_its_word() {
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        add_device(
+            &mut shared.borrow_mut(),
+            device(41, "alsa_output.pci", DeviceDirection::Output),
+        );
+        shared.borrow_mut().needs_publish = false;
+        assert_eq!(shared.borrow().devices[0].channels, 2);
+
+        // The card is switched from its analog stereo profile to 5.1 surround.
+        let surround = ChannelMap::parse("FL,FR,FC,LFE,RL,RR");
+        on_node_info(&shared, 41, 6, surround);
+        {
+            let guard = shared.borrow();
+            let card = &guard.devices[0];
+            assert_eq!(
+                card.channels, 6,
+                "the first count a node reports is not its last"
+            );
+            assert_eq!(Some(card.positions), surround);
+            assert!(guard.needs_publish, "and the device list says so");
+        }
+
+        // The same info again — the node was only suspended and woken — and a report that says
+        // nothing about the format: neither is news.
+        shared.borrow_mut().needs_publish = false;
+        on_node_info(&shared, 41, 6, surround);
+        on_node_info(&shared, 41, 0, None);
+        let guard = shared.borrow();
+        assert!(!guard.needs_publish);
+        assert_eq!(guard.devices[0].channels, 6);
+        assert_eq!(Some(guard.devices[0].positions), surround);
+    }
+
+    #[test]
+    fn a_failure_is_reported_once_however_its_description_varies_from_one_attempt_to_the_next() {
+        let (mut shared, messages) = shared_with_messages();
+        let refused = AudioError::PipewireUnavailable(
+            "could not connect to PipeWire: Connection refused".to_owned(),
+        );
+        shared.report_connection_error(refused.clone());
+        for why in [
+            "No such file or directory",
+            "Connection refused",
+            "Host is down",
+        ] {
+            shared.report_connection_error(AudioError::PipewireUnavailable(format!(
+                "could not connect to PipeWire: {why}"
+            )));
+        }
+        assert_eq!(
+            drained(&messages),
+            [AudioToUi::Error {
+                direction: None,
+                message: refused.to_string(),
+            }],
+            "one outage, one notification"
+        );
+
+        for why in ["Creation failed", "Invalid argument"] {
+            shared.report_error(
+                DeviceDirection::Input,
+                AudioError::PipewireUnavailable(why.to_owned()),
+            );
+        }
+        assert_eq!(drained(&messages).len(), 1, "a lane's failures too");
+
+        // A different failure is news.
+        shared.report_error(DeviceDirection::Input, AudioError::DeviceUnavailable);
+        assert_eq!(drained(&messages).len(), 1);
+    }
+
+    #[test]
+    fn a_forced_rate_overrides_the_graphs_clock_until_it_is_released() {
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        shared.borrow_mut().lanes.input.enabled = true;
+        let say = |key: &str, value: &str| on_metadata_property(&shared, Some(key), Some(value));
+        let rate = || shared.borrow().clock.rate();
+        let rules = || {
+            let mut guard = shared.borrow_mut();
+            let asked = PerDirection::from_fn(|direction| guard.lanes.get(direction).needs_rules);
+            for (_, lane) in guard.lanes.iter_mut() {
+                lane.needs_rules = false;
+            }
+            (asked.output, asked.input)
+        };
+
+        // What a server's `settings` object says first, in the order it says it.
+        say("clock.rate", "48000");
+        say("clock.force-rate", "0");
+        assert_eq!(rate(), 48_000);
+        assert_eq!(rules(), (false, false), "nothing moved");
+
+        say("clock.force-rate", "44100");
+        assert_eq!(rate(), 44_100);
+        assert_eq!(
+            rules(),
+            (true, false),
+            "the output pair may have to follow; the capture stream never does"
+        );
+
+        // The plain rate moving under a forced one changes nothing that runs.
+        say("clock.rate", "96000");
+        assert_eq!(rate(), 44_100);
+        assert_eq!(rules(), (false, false));
+
+        say("clock.force-rate", "0");
+        assert_eq!(rate(), 96_000, "released, the plain rate is back");
+        assert_eq!(rules(), (true, false));
+
+        // Only a sink that publishes no rate of its own runs at the graph's.
+        let mut sink = device(41, "alsa_output.pci", DeviceDirection::Output);
+        assert_eq!(PairFormat::for_target(&sink, 44_100).rate, 44_100);
+        sink.rate = Some(48_000);
+        assert_eq!(PairFormat::for_target(&sink, 44_100).rate, 48_000);
+        let microphone = device(40, "alsa_input.usb-fifine", DeviceDirection::Input);
+        assert_eq!(
+            PairFormat::for_target(&microphone, 44_100).rate,
+            CAPTURE_RATE
         );
     }
 }
