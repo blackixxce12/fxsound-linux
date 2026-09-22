@@ -700,7 +700,8 @@ fn find<'a>(devices: &'a [&DeviceInfo], name: &str) -> Option<&'a DeviceInfo> {
 ///
 /// `previous_names` is the snapshot of real device names of this direction from the previous
 /// enumeration, the equivalent of `pwszIDPreviousRealDevices` (`sndDevices.h:349`); pass an empty
-/// slice on the first call — and after a direction switch — so rule 5 cannot fire.
+/// slice on the first call — and on the first call after a lane is switched on again — so rule 5
+/// cannot fire.
 ///
 /// # Errors
 /// Returns the same four states the Windows rules could end in, so the GUI's existing error

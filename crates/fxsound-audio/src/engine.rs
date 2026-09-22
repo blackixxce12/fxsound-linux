@@ -14,29 +14,36 @@
 //!
 //! The two never share a `RefCell`. The main loop's mutable state lives in [`Shared`], which no
 //! `process()` closure can reach; the data thread's state lives in the streams' user data, and
-//! the only things that cross between them are a wait-free ring of `AtomicU32` samples, a handful
-//! of counters, and the running lane's own paths to the GUI — the `triple_buffer` endpoints that
-//! carry its parameters in and its meters out, and its bounded event queue (`crate::lane_dsp`).
+//! the only things that cross between them are, per lane, a wait-free ring of `AtomicU32`
+//! samples, a handful of counters, and the lane's own paths to the GUI — the `triple_buffer`
+//! endpoints that carry its parameters in and its meters out, and its bounded event queue
+//! (`crate::lane_dsp`).
 //!
-//! # One engine, two directions
+//! # One engine, two lanes
 //!
-//! The engine is in exactly one [`DeviceDirection`] at a time. In the output direction NODE 1 is
-//! the virtual sink and NODE 2 the playback stream; in the input direction NODE 1 is a capture
-//! stream on the chosen microphone and NODE 2 the virtual source (`crate` docs, "Topology").
-//! Only the node *properties*, the metadata keys and the bookkeeping differ: NODE 1 always runs
-//! [`on_sink_process`] (DSP in place, push to the ring) and NODE 2 always runs
-//! [`on_output_process`] (pop the ring), so the real-time code is the same in both directions and
-//! is never touched by a direction switch.
+//! The engine keeps one [`Lane`] per [`DeviceDirection`] (`docs/0.4.0-design.md` §1.1), and the
+//! two run at the same time. In the output lane NODE 1 is the virtual sink and NODE 2 the
+//! playback stream; in the input lane NODE 1 is a capture stream on the chosen microphone and
+//! NODE 2 the virtual source (`crate` docs, "Topology"). Each lane owns everything its pair
+//! touches — the ring, the counters, the stream flags, the DSP — and everything the main loop
+//! decides about it: whether it is enabled, its backoff, its error, its claim on the session
+//! default, what the GUI was last told. So a microphone that fails backs off on its own while the
+//! speakers keep playing, and nothing one lane does can be undone by the other.
+//!
+//! Only the node *properties*, the metadata keys and the bookkeeping differ between the lanes:
+//! NODE 1 always runs [`on_sink_process`] (DSP in place, push to the ring) and NODE 2 always runs
+//! [`on_output_process`] (pop the ring), so the real-time code is the same in both lanes and
+//! nothing in it knows there is another one.
 //!
 //! # The 200 ms supervisor
 //!
 //! `AudioPassthruPrivate::processTimer` (`audiopassthru/src/AudioPassthru/AudioPassthruPrivate.cpp:359`)
 //! polled every 100 ms because Windows gave it no event for "the processing thread died". PipeWire
 //! gives us events for everything, so the timer here does much less: it drains counters, publishes
-//! changes to the GUI, and drives the reconnect state machine. It is still a timer rather than
-//! pure event handling for one reason — it is the natural home for the "don't hammer" backoff of
-//! `docs/spec/12-audio-io.md` §22, the direct descendant of the `INVALID_HANDLE_VALUE` pause
-//! sentinel at `AudioPassthruPrivate.cpp:452-460`.
+//! changes to the GUI, and drives the reconnect state machine — the socket's, and each lane's own.
+//! It is still a timer rather than pure event handling for one reason — it is the natural home for
+//! the "don't hammer" backoff of `docs/spec/12-audio-io.md` §22, the direct descendant of the
+//! `INVALID_HANDLE_VALUE` pause sentinel at `AudioPassthruPrivate.cpp:452-460`.
 
 use std::cell::RefCell;
 use std::ffi::OsStr;
@@ -64,9 +71,9 @@ use crate::lane_dsp::{self, ChainHandover, LaneDsp};
 use crate::per_direction::PerDirection;
 use crate::{
     AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION, DEFAULT_QUANTUM_FRAMES,
-    DEFAULT_SAMPLE_RATE, LINK_GROUP, MAX_CHANNELS, MAX_QUANTUM_FRAMES, OUTPUT_NODE_NAME,
-    OUTPUT_STREAM_DESCRIPTION, RING_CAPACITY_FRAMES, SINK_DESCRIPTION, SINK_NODE_NAME,
-    SOURCE_NODE_NAME, locale, our_node_name,
+    DEFAULT_SAMPLE_RATE, LINK_GROUP, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS,
+    OUTPUT_NODE_NAME, OUTPUT_STREAM_DESCRIPTION, RING_CAPACITY_FRAMES, SINK_DESCRIPTION,
+    SINK_NODE_NAME, SOURCE_NODE_NAME, locale, our_node_name,
 };
 
 /// The rate the capture stream asks for, whatever the microphone runs at.
@@ -80,8 +87,18 @@ const CAPTURE_RATE: u32 = DEFAULT_SAMPLE_RATE;
 /// "never retry faster than 200 ms" floor of `docs/spec/12-audio-io.md` §22.
 const SUPERVISOR_PERIOD: Duration = Duration::from_millis(200);
 
-/// Reconnect backoff in milliseconds, then flat at the last value.
+/// Retry backoff in milliseconds, then flat at the last value. The socket and each lane keep their
+/// own count against it.
 const BACKOFF_MS: [u64; 6] = [200, 400, 800, 1600, 3200, 5000];
+
+/// How long to wait before the next try, after `attempts` failed ones.
+fn backoff(attempts: u32) -> Duration {
+    let ms = BACKOFF_MS
+        .get(attempts as usize)
+        .copied()
+        .unwrap_or(BACKOFF_MS[BACKOFF_MS.len() - 1]);
+    Duration::from_millis(ms)
+}
 
 /// How long the exit path waits for the server to acknowledge the hand-back of the session
 /// default before closing the socket regardless. A live server answers a `sync` in well under a
@@ -344,6 +361,19 @@ pub(crate) struct Counters {
     dsp_latency_frames: AtomicU32,
 }
 
+impl Counters {
+    /// The counters of a lane that has never had a pair of nodes. The format starts as the one a
+    /// status is assumed to have until something is negotiated ([`AudioStatus::default`]), so a
+    /// lane that never runs has nothing to report and reports nothing.
+    fn new() -> Self {
+        Self {
+            sample_rate: AtomicU32::new(DEFAULT_SAMPLE_RATE),
+            channels: AtomicU32::new(MIN_CHANNELS),
+            ..Self::default()
+        }
+    }
+}
+
 /// Stream state, published by `state_changed` (main loop) for the supervisor to act on.
 ///
 /// `state_changed` deliberately touches nothing but this: `Stream::connect` can emit it
@@ -356,8 +386,19 @@ pub(crate) struct StreamStatus {
     output_streaming: AtomicBool,
 }
 
-/// User data of NODE 1 — the virtual sink, or the capture stream in the input direction. Either
-/// way it is the node the DSP runs in, and the DSP it runs is its lane's.
+impl StreamStatus {
+    /// Forget what the lane's previous pair said about itself. Main loop, once that pair is gone:
+    /// an error flag it raised on its way out describes nodes that no longer exist, and acting on
+    /// it would tear down the *next* pair for nothing.
+    fn clear(&self) {
+        self.sink_error.store(false, Ordering::Relaxed);
+        self.output_error.store(false, Ordering::Relaxed);
+        self.output_streaming.store(false, Ordering::Relaxed);
+    }
+}
+
+/// User data of NODE 1 — the virtual sink, or the capture stream in the input lane. Either way it
+/// is the node the DSP runs in, and the DSP it runs is its lane's.
 pub(crate) struct SinkData {
     dsp: Option<LaneDsp>,
     ring: Arc<SampleRing>,
@@ -373,22 +414,24 @@ pub(crate) struct SinkData {
 }
 
 impl SinkData {
-    /// NODE 1's user data for a lane's DSP, wired to send it home to that same lane.
+    /// NODE 1's user data for a lane's DSP, wired to that same lane: its ring, its counters, its
+    /// stream flags, and its recycle channel to send the DSP home on.
     ///
-    /// The recycle channel is chosen from the DSP itself rather than from whatever the caller
-    /// thinks the pair's direction is, so the only way to get a lane's state back into the other
-    /// lane's slot would be to build it as the other lane's to begin with.
+    /// The lane is chosen from the DSP itself rather than from whatever the caller thinks the
+    /// pair's direction is, so the only way to get a lane's state back into the other lane's
+    /// slot — or to feed the voice chain's output into the speakers' ring — would be to build it
+    /// as the other lane's to begin with.
     fn new(shared: &Shared, dsp: LaneDsp, quantum: usize) -> Self {
-        let recycle = shared.recycle.get(dsp.direction()).0.clone();
+        let lane = shared.lanes.get(dsp.direction());
         Self {
             dsp: Some(dsp),
-            ring: Arc::clone(&shared.ring),
-            counters: Arc::clone(&shared.counters),
-            status: Arc::clone(&shared.status),
+            ring: Arc::clone(&lane.ring),
+            counters: Arc::clone(&lane.counters),
+            status: Arc::clone(&lane.status),
             format: AudioInfoRaw::new(),
             channels: 0,
             quantum,
-            recycle,
+            recycle: lane.recycle.0.clone(),
         }
     }
 }
@@ -408,7 +451,7 @@ impl Drop for SinkData {
     }
 }
 
-/// User data of NODE 2 — the playback stream, or the virtual source in the input direction.
+/// User data of NODE 2 — the playback stream, or the virtual source in the input lane.
 pub(crate) struct OutData {
     ring: Arc<SampleRing>,
     counters: Arc<Counters>,
@@ -434,7 +477,7 @@ pub(crate) struct Config {
     pub(crate) ready: Sender<Result<(), AudioError>>,
 }
 
-/// The two PipeWire nodes of the active direction and everything that must die with them.
+/// One lane's two PipeWire nodes and everything that must die with them.
 ///
 /// Field order is drop order and drop order matters: a `StreamListener` removes a `spa_hook` from
 /// a list that lives inside the stream, so every listener is declared before the stream it hooks.
@@ -445,10 +488,6 @@ struct Nodes {
     /// `ProcessLatency` when the DSP's delay changes under it.
     first: pw::stream::StreamRc,
     _second: pw::stream::StreamRc,
-    /// The last delay published on NODE 1, in frames.
-    published_latency: u32,
-    /// Which pair this is: sink + playback stream, or capture stream + source.
-    direction: DeviceDirection,
     /// `node.name` of the real device NODE 2 renders to, or NODE 1 captures from.
     target: String,
     channels: u32,
@@ -456,8 +495,12 @@ struct Nodes {
 }
 
 /// One PipeWire connection. Replaced wholesale on a reconnect.
+///
+/// The lanes' nodes are not in here: each lane keeps its own pair. They are made on this
+/// connection all the same, and every stream holds a reference to its core, so a pair outliving
+/// its session would hold the dead connection open under the new one. [`close_session`] is the
+/// one way a session ends, and it takes both lanes' pairs with it.
 struct Session {
-    nodes: Option<Nodes>,
     _metadata_listener: Option<pw::metadata::MetadataListener>,
     metadata: Option<pw::metadata::Metadata>,
     _registry_listener: pw::registry::Listener,
@@ -488,14 +531,149 @@ struct DefaultState {
     holding: bool,
 }
 
+/// One direction's worth of engine state (`docs/0.4.0-design.md` §1.1): its pair of nodes, its
+/// DSP, its ring, its counters, and everything the main loop decides about it.
+///
+/// Everything in here is the lane's alone. The other lane's copy of each field is a different
+/// value in a different place, so no path through the supervisor can read one lane's error flag,
+/// backoff or status and act on the other's.
+struct Lane {
+    /// Whether the lane should have a pair of nodes. The output lane starts enabled — FxSound in
+    /// front of the speakers is the Windows behaviour — and the input lane only once a microphone
+    /// is picked. A disabled lane never builds nodes, whatever the registry says.
+    enabled: bool,
+    /// The lane's pair, while it has one. Dropped with the session ([`close_session`]).
+    nodes: Option<Nodes>,
+    /// The lane's DSP while it is on the main loop — between pairs of nodes, or for the whole time
+    /// the lane has none. `None` while a NODE 1 holds it in its user data.
+    dsp: Option<LaneDsp>,
+    /// The lane's own way home for its DSP: NODE 1's user data sends on it when it is dropped, and
+    /// [`drain_recycled_dsp`] puts what arrives back here. One per lane rather than one shared, so
+    /// a recycled DSP cannot land in the other lane's slot.
+    recycle: (Sender<LaneDsp>, Receiver<LaneDsp>),
+    /// Where this lane's two process callbacks meet. Each lane has its own: the voice chain's
+    /// output must never be popped into the speakers.
+    ring: Arc<SampleRing>,
+    counters: Arc<Counters>,
+    status: Arc<StreamStatus>,
+    /// The device names of this lane's direction seen at its previous rules run —
+    /// `pwszIDPreviousRealDevices` (`audiopassthru/include/sndDevices.h:349`).
+    previous_names: Vec<String>,
+    /// Whether to take the session default for this lane's direction once its nodes are up.
+    /// `true` unless a caller opted out with [`UiToAudio::SetAsDefault`] with `want: false`.
+    want_default: bool,
+    /// Something this lane's device choice depends on changed. Only ever set on an enabled lane.
+    needs_rules: bool,
+    /// Consecutive failed tries at this lane's pair, for its own backoff
+    /// (`docs/spec/12-audio-io.md` §22). The socket keeps a separate count.
+    attempts: u32,
+    /// No rules run for this lane before this instant.
+    next_attempt: Instant,
+    /// When this lane's current pair was built; `None` while it has none. What the backoff and the
+    /// last error are forgiven against ([`Lane::forgive_if_stable`]): the time a pair has actually
+    /// been up, not the time a rebuild was first allowed, which can be much earlier — a rebuild
+    /// waits for the registry's first dump as well as for its backoff.
+    built_at: Option<Instant>,
+    /// Every format mismatch this lane has seen.
+    ///
+    /// The supervisor `swap`s the live counter to zero to decide whether to rebuild, which is the
+    /// right thing for a trigger and the wrong thing for a report: a user asking why their audio
+    /// dropped out wants the total, not whatever has happened since the last 200 ms tick.
+    format_mismatches_total: u64,
+    /// The delay last declared on this lane's NODE 1, in frames.
+    published_latency: u32,
+    last_status: AudioStatus,
+    last_sink_cycles: u64,
+    last_underruns: u64,
+    /// The last error the GUI was told about for this lane, so the same error is not told again
+    /// while it is still the same failure ([`Shared::report_error`]). Forgotten once a pair has
+    /// proved itself, on a new choice of device, on detach and on every connect.
+    last_error: Option<AudioError>,
+    /// What the GUI was last told this lane is attached to ([`AudioToUi::Attached`]).
+    attached: Option<String>,
+}
+
+impl Lane {
+    fn new(enabled: bool, dsp: Option<LaneDsp>) -> Self {
+        Self {
+            enabled,
+            nodes: None,
+            dsp,
+            recycle: crossbeam_channel::unbounded(),
+            ring: Arc::new(SampleRing::new()),
+            counters: Arc::new(Counters::new()),
+            status: Arc::new(StreamStatus::default()),
+            previous_names: Vec::new(),
+            want_default: true,
+            needs_rules: false,
+            attempts: 0,
+            next_attempt: Instant::now(),
+            built_at: None,
+            format_mismatches_total: 0,
+            published_latency: 0,
+            last_status: AudioStatus::default(),
+            last_sink_cycles: 0,
+            last_underruns: 0,
+            last_error: None,
+            attached: None,
+        }
+    }
+
+    /// Try this lane's pair again later: after 200 ms the first time, twice as long each time
+    /// after that, never longer than five seconds.
+    fn retry_later(&mut self, now: Instant) {
+        self.next_attempt = now + backoff(self.attempts);
+        self.attempts = self.attempts.saturating_add(1);
+        self.needs_rules = true;
+    }
+
+    /// Forget the backoff, and the error it was serving, once the lane's pair has stayed up for as
+    /// long as the wait that came before it.
+    ///
+    /// Not on the build itself: creating two streams succeeds on almost anything, and the failure
+    /// that needs backing off from — a device that refuses the stream — arrives as an error a
+    /// moment *later*. Forgiven at build time, that pair would be retried every 200 ms for ever
+    /// and the GUI told about it on every retry; forgiven only once it has proved itself, each
+    /// quick failure doubles the wait, the whole run of them is reported once, and a pair that has
+    /// recovered starts from 200 ms again, its next failure news again.
+    ///
+    /// Timed from the build, not from when the rebuild was allowed: a rebuild held up by a
+    /// registry that was not ready yet would otherwise be forgiven the moment it came up, having
+    /// proved nothing.
+    fn forgive_if_stable(&mut self, now: Instant) {
+        let Some(built_at) = self.built_at else {
+            return;
+        };
+        // `retry_later` has already counted the failure the last wait was for, so the wait before
+        // this pair is one step back down the table. With no failure behind it, the shortest one:
+        // an error reported by the rules is forgotten once a pair has been up for a tick.
+        if now >= built_at + backoff(self.attempts.saturating_sub(1)) {
+            self.attempts = 0;
+            self.last_error = None;
+        }
+    }
+
+    /// Record what the lane is attached to now. Returns what to tell the GUI when that differs
+    /// from what it was last told, and `None` when there is nothing new to say.
+    fn note_attachment(&mut self, now: Option<&str>) -> Option<Option<String>> {
+        if self.attached.as_deref() == now {
+            return None;
+        }
+        self.attached = now.map(str::to_owned);
+        Some(self.attached.clone())
+    }
+}
+
 /// Everything the main loop mutates. Reachable only from main-loop callbacks — never from
 /// `process()`.
 struct Shared {
     state: State,
     session: Option<Session>,
-    /// The direction the engine is running in. Starts as [`DeviceDirection::Output`], the only
-    /// one the Windows build had.
-    direction: DeviceDirection,
+    /// The initial registry dump of this session has been delivered, so a device choice made now
+    /// is made against the whole graph rather than whatever part of it has arrived so far.
+    registry_ready: bool,
+    /// The output lane and the input lane. Both can run at once.
+    lanes: PerDirection<Lane>,
     /// Every sink and source the registry reports, both directions, keyed by registry global id.
     devices: Vec<DeviceInfo>,
     /// One bound proxy per device, kept alive only to receive the node's `info` event.
@@ -508,42 +686,22 @@ struct Shared {
     /// them, and a 5.1 or 7.1 device was driven as a stereo pair with the rest of its channels
     /// silent — the whole `ChannelMap` path was unreachable in practice.
     node_probes: std::collections::HashMap<u32, (pw::node::Node, pw::node::NodeListener)>,
-    /// The device names of the active direction seen at the previous rules run —
-    /// `pwszIDPreviousRealDevices` (`audiopassthru/include/sndDevices.h:349`).
-    previous_names: Vec<String>,
     /// The session defaults, one per direction.
     defaults: PerDirection<DefaultState>,
     graph_rate: u32,
     /// The Windows registry slots, one set per direction, so trying a microphone never forgets
     /// which speakers the user had.
     memory: PerDirection<SelectionMemory>,
-    /// Every format mismatch this session has seen.
-    ///
-    /// The supervisor `swap`s the live counter to zero to decide whether to rebuild, which is the
-    /// right thing for a trigger and the wrong thing for a report: a user asking why their audio
-    /// dropped out wants the total, not whatever has happened since the last 200 ms tick.
-    format_mismatches_total: u64,
-    /// Whether to take the session default for the active direction once its nodes are up.
-    /// `true` unless a caller opted out with [`UiToAudio::SetAsDefault`] with `want: false`.
-    want_default: bool,
 
-    needs_rules: bool,
     needs_publish: bool,
     restart_requested: bool,
-    attempts: u32,
-    next_attempt: Instant,
-    /// The `sync` the exit path put behind its hand-back of the session default, until the
+    /// Consecutive failed connections, for the socket's backoff. Each lane counts its own.
+    connect_attempts: u32,
+    next_connect: Instant,
+    /// The `sync` the exit path put behind its hand-back of the session defaults, until the
     /// server's `done` for it arrives ([`release_defaults_before_exit`]).
     release_pending: Option<AsyncSeq>,
 
-    /// Each lane's DSP while it is on the main loop — between pairs of nodes, or for the whole
-    /// time the lane has none. `None` while a NODE 1 holds it in its user data.
-    dsp: PerDirection<Option<LaneDsp>>,
-    /// Each lane's own way home for its DSP: NODE 1's user data sends on the lane's sender when
-    /// it is dropped, and [`drain_recycled_dsp`] puts what arrives back in the lane it came from.
-    /// One channel per lane rather than one shared, so a recycled DSP cannot land in the other
-    /// lane's slot.
-    recycle: PerDirection<(Sender<LaneDsp>, Receiver<LaneDsp>)>,
     /// The stage ordering the voice preset names ([`UiToAudio::SetInputChain`]); `voice` until
     /// one does. What the voice engine runs, or is about to.
     input_spec: ChainSpec,
@@ -552,23 +710,19 @@ struct Shared {
     /// through the recycle channel and is brought up to date when it arrives.
     input_spec_pending: bool,
     handover: ChainHandover,
-    ring: Arc<SampleRing>,
-    counters: Arc<Counters>,
-    status: Arc<StreamStatus>,
     notify: Sender<AudioToUi>,
     remote: Option<String>,
     /// See [`Config::language`].
     language: Option<String>,
 
-    last_status: AudioStatus,
     last_devices: Vec<AudioDevice>,
-    last_sink_cycles: u64,
-    last_underruns: u64,
-    last_error: Option<AudioError>,
+    /// The last error about the connection as a whole, rather than about one lane.
+    connection_error: Option<AudioError>,
 }
 
 impl Shared {
-    /// The state of a thread that has not connected yet.
+    /// The state of a thread that has not connected yet: the output lane enabled, the input lane
+    /// waiting for a microphone.
     fn new(
         notify: Sender<AudioToUi>,
         remote: Option<String>,
@@ -576,40 +730,33 @@ impl Shared {
         dsp: PerDirection<Option<LaneDsp>>,
         handover: ChainHandover,
     ) -> Self {
+        let PerDirection { output, input } = dsp;
         Self {
             state: State::Disconnected,
             session: None,
-            direction: DeviceDirection::Output,
+            registry_ready: false,
+            lanes: PerDirection {
+                output: Lane::new(true, output),
+                input: Lane::new(false, input),
+            },
             devices: Vec::new(),
             node_probes: std::collections::HashMap::new(),
-            previous_names: Vec::new(),
             defaults: PerDirection::default(),
             graph_rate: DEFAULT_SAMPLE_RATE,
-            format_mismatches_total: 0,
             memory: PerDirection::default(),
-            want_default: true,
-            needs_rules: false,
             needs_publish: false,
             restart_requested: false,
-            attempts: 0,
-            next_attempt: Instant::now(),
+            connect_attempts: 0,
+            next_connect: Instant::now(),
             release_pending: None,
-            dsp,
-            recycle: PerDirection::from_fn(|_| crossbeam_channel::unbounded()),
             input_spec: ChainSpec::voice(),
             input_spec_pending: false,
             handover,
-            ring: Arc::new(SampleRing::new()),
-            counters: Arc::new(Counters::default()),
-            status: Arc::new(StreamStatus::default()),
             notify,
             remote,
             language,
-            last_status: AudioStatus::default(),
             last_devices: Vec::new(),
-            last_sink_cycles: 0,
-            last_underruns: 0,
-            last_error: None,
+            connection_error: None,
         }
     }
 
@@ -619,29 +766,59 @@ impl Shared {
         }
     }
 
-    /// Report an error once, rather than every 200 ms for as long as it persists.
-    fn report_error(&mut self, error: AudioError) {
-        if self.last_error.as_ref() == Some(&error) {
+    /// Report a lane's error once: not on every 200 ms tick it persists, and not again on every
+    /// rebuild of a pair that keeps failing. The same error is news again only once a pair has
+    /// proved itself ([`Lane::forgive_if_stable`]).
+    fn report_error(&mut self, direction: DeviceDirection, error: AudioError) {
+        let lane = self.lanes.get_mut(direction);
+        if lane.last_error.as_ref() == Some(&error) {
+            return;
+        }
+        log::warn!("audio engine, {} lane: {error}", direction.key());
+        lane.last_error = Some(error.clone());
+        self.notify(AudioToUi::Error {
+            direction: Some(direction),
+            message: error.to_string(),
+        });
+    }
+
+    /// Report an error about the connection itself — no lane can do anything about it — once.
+    fn report_connection_error(&mut self, error: AudioError) {
+        if self.connection_error.as_ref() == Some(&error) {
             return;
         }
         log::warn!("audio engine: {error}");
+        self.connection_error = Some(error.clone());
         self.notify(AudioToUi::Error {
-            direction: Some(self.direction),
+            direction: None,
             message: error.to_string(),
         });
-        self.last_error = Some(error);
     }
 
-    fn clear_error(&mut self) {
-        self.last_error = None;
+    /// Whether a device choice can be made and acted on right now: connected, and the registry's
+    /// first dump is in.
+    fn ready(&self) -> bool {
+        self.session.is_some() && self.registry_ready
     }
 
-    fn has_nodes(&self) -> bool {
-        self.session.as_ref().is_some_and(|s| s.nodes.is_some())
+    /// Ask for the rules to run for a lane, if it is enabled. A detached lane ignores the registry
+    /// entirely — a microphone plugged in while the input lane is off must not switch it on.
+    fn mark_lane_for_rules(&mut self, direction: DeviceDirection) {
+        let lane = self.lanes.get_mut(direction);
+        if lane.enabled {
+            lane.needs_rules = true;
+        }
+    }
+
+    /// [`Self::mark_lane_for_rules`] for both lanes.
+    fn mark_enabled_lanes_for_rules(&mut self) {
+        for direction in DeviceDirection::ALL {
+            self.mark_lane_for_rules(direction);
+        }
     }
 }
 
-/// Republish NODE 1's `ProcessLatency` when the DSP's delay has moved under it.
+/// Republish a lane's NODE 1 `ProcessLatency` when the DSP's delay has moved under it.
 ///
 /// The figure is fixed at build time for the output chain — the limiter's look-ahead does not
 /// change — but the microphone chain's denoiser is a per-preset switch worth ten milliseconds, and
@@ -651,16 +828,13 @@ impl Shared {
 ///
 /// Once per supervisor tick, so the correction is at most 200 ms late, and only when the number
 /// actually changed: `update_params` on an unchanged pod would be churn in the graph.
-fn republish_latency(shared: &mut Shared) {
-    let current = shared.counters.dsp_latency_frames.load(Ordering::Relaxed);
-    let Some(nodes) = shared
-        .session
-        .as_mut()
-        .and_then(|session| session.nodes.as_mut())
-    else {
+fn republish_latency(shared: &mut Shared, direction: DeviceDirection) {
+    let lane = shared.lanes.get_mut(direction);
+    let current = lane.counters.dsp_latency_frames.load(Ordering::Relaxed);
+    let Some(nodes) = lane.nodes.as_ref() else {
         return;
     };
-    if current == nodes.published_latency || current == 0 {
+    if current == lane.published_latency || current == 0 {
         return;
     }
 
@@ -674,10 +848,11 @@ fn republish_latency(shared: &mut Shared) {
         return;
     }
     log::info!(
-        "DSP latency is now {current} frames (was {})",
-        nodes.published_latency
+        "{} lane: DSP latency is now {current} frames (was {})",
+        direction.key(),
+        lane.published_latency
     );
-    nodes.published_latency = current;
+    lane.published_latency = current;
 }
 
 /// The word for a direction in log lines.
@@ -773,7 +948,7 @@ pub(crate) fn run(config: Config) {
     let first = connect(&shared, &context);
     let _ = ready.send(first.as_ref().copied().map_err(Clone::clone));
     if let Err(error) = first {
-        shared.borrow_mut().report_error(error);
+        shared.borrow_mut().report_connection_error(error);
     }
 
     let timer = mainloop.loop_().add_timer({
@@ -786,16 +961,16 @@ pub(crate) fn run(config: Config) {
     mainloop.run();
 
     // Teardown order is the one `docs/spec/12-audio-io.md` §21.5 insists on: hand the session
-    // default — sink or source, whichever we hold — back to a real device *first*, while our
-    // metadata proxy is still alive, and only then destroy the nodes. Otherwise there is a window
-    // in which the default names a node that no longer exists.
+    // defaults — the sink, the source, both when both lanes hold theirs — back to real devices
+    // *first*, while our metadata proxy is still alive, and only then destroy the nodes.
+    // Otherwise there is a window in which a default names a node that no longer exists.
     //
     // Nothing else may run while that happens: a supervisor tick would re-run the rules and take
-    // the default straight back, and a late control message could do the same.
+    // a default straight back, and a late control message could do the same.
     drop(timer);
     drop(control_source);
     release_defaults_before_exit(&shared, &mainloop);
-    shared.borrow_mut().session = None;
+    close_session(&mut shared.borrow_mut());
     log::info!("FxSound audio thread stopped");
 }
 
@@ -893,53 +1068,46 @@ fn handle_control(
         log::error!("dropping {message:?}: the audio supervisor is already running");
         return;
     };
+    control(&mut shared, message);
+}
+
+/// Act on one control message. Everything but `Shutdown`, which needs the loop and is handled by
+/// [`handle_control`] before this is reached.
+///
+/// A message that names a lane touches that lane and nothing else: picking a microphone while the
+/// speakers are being processed leaves the speakers exactly as they were.
+fn control(shared: &mut Shared, message: UiToAudio) {
     match message {
         UiToAudio::SelectDevice {
             node_name,
             direction,
-        } => {
-            // Windows expressed user choice by forcing the system default
-            // (`AudioPassthruPrivate.cpp:657`) and then letting the rules pick it up. Recording
-            // the preference instead is what `docs/spec/12-audio-io.md` open question 8 asks for:
-            // it does the same thing without mutating global state.
-            shared.memory.get_mut(direction).user_selected = node_name;
-            if direction != shared.direction {
-                switch_direction(&mut shared, direction);
-            }
-            shared.needs_rules = true;
-        }
+        } => select_device(shared, direction, node_name),
+        UiToAudio::DetachLane(direction) => detach_lane(shared, direction),
         UiToAudio::RescanDevices => {
             shared.needs_publish = true;
-            shared.needs_rules = true;
+            shared.mark_enabled_lanes_for_rules();
         }
-        // One lane in this engine still, so the direction named is the one it is in; the
-        // per-lane claim is the two-lane work.
-        UiToAudio::SetAsDefault { direction: _, want } => {
-            shared.want_default = want;
+        UiToAudio::SetAsDefault { direction, want } => {
+            shared.lanes.get_mut(direction).want_default = want;
             if want {
                 // With no nodes yet the claim happens when they come up; writing the key now
                 // would point the default at a node that does not exist.
-                if shared.has_nodes() {
-                    claim_default(&mut shared);
+                if shared.lanes.get(direction).nodes.is_some() {
+                    claim_default(shared, direction);
                 }
             } else {
-                let direction = shared.direction;
-                release_default(&mut shared, direction);
+                release_default(shared, direction);
             }
         }
         UiToAudio::Restart => {
             shared.restart_requested = true;
         }
-        // Neither exists until the engine has two lanes and an echo-cancel module to load; until
-        // then they are acknowledged and do nothing, which is what an engine with one lane and no
-        // canceller can honestly say.
-        UiToAudio::DetachLane(direction) => {
-            log::debug!("DetachLane({direction:?}) is not supported by the single-lane engine");
-        }
+        // There is no canceller to load yet; until there is, the request is acknowledged and does
+        // nothing, which is what an engine without one can honestly say.
         UiToAudio::SetEchoCancel(want) => {
-            log::debug!("SetEchoCancel({want}) is not supported by the single-lane engine");
+            log::debug!("SetEchoCancel({want}): echo cancellation is not in this engine yet");
         }
-        UiToAudio::SetInputChain(name) => set_input_chain(&mut shared, &name),
+        UiToAudio::SetInputChain(name) => set_input_chain(shared, &name),
         UiToAudio::SeedRememberedDefaults { output, input } => {
             // Only ever fills a gap. If this run has already displaced something, that is the
             // fresher truth and the settings file's copy is stale by a whole session.
@@ -970,8 +1138,67 @@ fn handle_control(
                 }
             }
         }
-        UiToAudio::Shutdown => unreachable!("handled above"),
+        UiToAudio::Shutdown => unreachable!("handled by handle_control"),
     }
+}
+
+/// Attach a lane to the device the user picked, enabling the lane if it was detached.
+///
+/// Windows expressed user choice by forcing the system default (`AudioPassthruPrivate.cpp:657`)
+/// and then letting the rules pick it up. Recording the preference instead is what
+/// `docs/spec/12-audio-io.md` open question 8 asks for: it does the same thing without mutating
+/// global state.
+///
+/// The rules run here and now rather than on the next supervisor tick, and the GUI hears what the
+/// lane is attached to as soon as they have: the user is looking at the device list waiting for
+/// the pick to take, and 200 ms is long enough to see. Only when the
+/// registry has not finished its first dump are they left to the barrier that ends it, because a
+/// choice made against half a graph would report "no input devices" for a microphone that is
+/// merely not listed yet.
+fn select_device(shared: &mut Shared, direction: DeviceDirection, node_name: String) {
+    shared.memory.get_mut(direction).user_selected = node_name;
+    let lane = shared.lanes.get_mut(direction);
+    if !lane.enabled {
+        log::info!("enabling the {} lane", direction.key());
+        lane.enabled = true;
+        // What the lane saw the last time it ran is stale by however long it was off; an empty
+        // snapshot keeps rule 5 from treating every device plugged in since as the new one.
+        lane.previous_names.clear();
+    }
+    // A choice the user just made is not a retry: whatever backoff the lane was serving is over,
+    // and if this choice fails too, the user who made it is told, whatever failed before it.
+    lane.attempts = 0;
+    lane.next_attempt = Instant::now();
+    lane.last_error = None;
+    if shared.ready() {
+        shared.lanes.get_mut(direction).needs_rules = false;
+        apply_rules(shared, direction);
+        publish_attachment(shared, direction);
+    } else {
+        shared.lanes.get_mut(direction).needs_rules = true;
+    }
+}
+
+/// Hand a lane's default back, destroy its nodes and disable it (`docs/0.4.0-design.md` §1.3).
+///
+/// Always answered with an [`AudioToUi::Attached`] carrying `None` — even for a lane that had no
+/// nodes to destroy — so the GUI that asked is told, not left to infer it from silence. The other
+/// lane is not touched: its pair, its default and its backoff are exactly as they were.
+fn detach_lane(shared: &mut Shared, direction: DeviceDirection) {
+    log::info!("detaching the {} lane", direction.key());
+    // The default goes back before the nodes go, as on every other path that ends a pair.
+    teardown_nodes(shared, direction);
+    let lane = shared.lanes.get_mut(direction);
+    lane.enabled = false;
+    lane.needs_rules = false;
+    lane.previous_names.clear();
+    lane.attempts = 0;
+    lane.last_error = None;
+    lane.attached = None;
+    shared.notify(AudioToUi::Attached {
+        direction,
+        node_name: None,
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1021,8 +1248,9 @@ fn connect(
                     return;
                 }
                 // The initial registry dump has been delivered: it is now meaningful to choose a
-                // device.
-                shared.needs_rules = true;
+                // device, for every lane that wants one.
+                shared.registry_ready = true;
+                shared.mark_enabled_lanes_for_rules();
                 shared.needs_publish = true;
             }
         })
@@ -1049,11 +1277,10 @@ fn connect(
 
     let mut guard = shared.borrow_mut();
     guard.devices.clear();
-    guard.previous_names.clear();
     guard.defaults = PerDirection::default();
     guard.state = State::Connecting;
+    guard.registry_ready = false;
     guard.session = Some(Session {
-        nodes: None,
         _metadata_listener: None,
         metadata: None,
         _registry_listener: registry_listener,
@@ -1061,8 +1288,40 @@ fn connect(
         _core_listener: core_listener,
         core,
     });
-    guard.clear_error();
+    guard.connection_error = None;
+    // A new connection is a fresh start for every lane: whatever backoff a lane was serving was
+    // against a server that is gone, and an error it reported is re-reported if it still holds.
+    let now = Instant::now();
+    for (_, lane) in guard.lanes.iter_mut() {
+        lane.previous_names.clear();
+        lane.attempts = 0;
+        lane.next_attempt = now;
+        lane.last_error = None;
+    }
     Ok(())
+}
+
+/// End the connection and everything made on it, in the only order that is safe.
+///
+/// Both lanes' pairs first: every stream holds a reference to the core, so a pair left behind
+/// would keep the dead connection open under the next one — and dropping a pair is also what
+/// hands its DSP back through the lane's recycle channel. Then the node probes, each listener
+/// before its proxy, while the core they were bound on is still there to destroy them. Then the
+/// session itself. Each lane keeps whether it is enabled, its memory and its DSP, so whatever
+/// comes next — a reconnect, or the end of the thread — finds the lanes as the user left them.
+fn close_session(shared: &mut Shared) {
+    for (_, lane) in shared.lanes.iter_mut() {
+        lane.nodes = None;
+        lane.built_at = None;
+        lane.status.clear();
+    }
+    for (_, (node, listener)) in shared.node_probes.drain() {
+        drop(listener);
+        drop(node);
+    }
+    shared.session = None;
+    shared.registry_ready = false;
+    drain_recycled_dsp(shared);
 }
 
 /// Tear the connection down and arm the backoff.
@@ -1074,29 +1333,23 @@ fn disconnect(shared: &mut Shared, reason: &str) {
     // No hand-back from here. The connection goes in this same callback, and libpipewire only
     // writes to the socket from the loop (see `release_defaults_before_exit`), so a metadata
     // write issued now would never leave the process. That is harmless: this path is only
-    // reached when the connection or our node is already broken — the core error means the
-    // server is gone and the key with it as far as we can reach it, WirePlumber falls back on
-    // its own once our node vanishes, and the reconnect claims the default again
-    // (`claim_default` skips the stale value that still names us). What the session knew about
-    // the defaults dies with it; `connect` reads them afresh.
+    // reached when the connection is already broken — the core error means the server is gone
+    // and the keys with it as far as we can reach them, WirePlumber falls back on its own once
+    // our nodes vanish, and the reconnect claims the defaults again (`claim_default` skips the
+    // stale value that still names us). What the session knew about the defaults dies with it;
+    // `connect` reads them afresh.
     shared.defaults = PerDirection::default();
-    // Dropping the session drops the stream listeners, whose `Drop` hands the DSP state back.
-    shared.session = None;
-    drain_recycled_dsp(shared);
+    // Both lanes' pairs go with the connection. Each lane stays enabled or detached as it was, so
+    // the reconnect rebuilds exactly the lanes that were running.
+    close_session(shared);
     shared.state = State::Disconnected;
     shared.devices.clear();
-    shared.previous_names.clear();
-    shared
-        .status
-        .output_streaming
-        .store(false, Ordering::Relaxed);
+    for (_, lane) in shared.lanes.iter_mut() {
+        lane.previous_names.clear();
+    }
 
-    let step = BACKOFF_MS
-        .get(shared.attempts as usize)
-        .copied()
-        .unwrap_or_else(|| BACKOFF_MS[BACKOFF_MS.len() - 1]);
-    shared.attempts = shared.attempts.saturating_add(1);
-    shared.next_attempt = Instant::now() + Duration::from_millis(step);
+    shared.next_connect = Instant::now() + backoff(shared.connect_attempts);
+    shared.connect_attempts = shared.connect_attempts.saturating_add(1);
     shared.notify(AudioToUi::Disconnected {
         reason: reason.to_owned(),
     });
@@ -1116,57 +1369,88 @@ fn supervise(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) {
         reconcile_input_chain(&mut guard);
         apply_idle_lane_events(&mut guard);
 
-        // 2. A core error, an explicit Restart, or a stream that went into error.
+        // 2. A core error or an explicit Restart: the connection itself goes.
         if guard.restart_requested {
             guard.restart_requested = false;
             disconnect(&mut guard, "restart requested");
-        } else if guard.status.sink_error.swap(false, Ordering::Relaxed) {
-            disconnect(&mut guard, "the virtual node reported an error");
-        } else if guard.status.output_error.swap(false, Ordering::Relaxed) {
-            // Only NODE 2 failed. Drop the pair and let the rules pick a different device; the
-            // default stays ours because the pair is about to come back.
-            drop_nodes(&mut guard);
-            guard.needs_rules = true;
-            guard.report_error(AudioError::DeviceUnavailable);
         }
 
-        // 3. Format mismatch between the two nodes: rebuild rather than play at the wrong stride.
-        let mismatches = guard.counters.format_mismatches.swap(0, Ordering::Relaxed);
-        guard.format_mismatches_total += mismatches;
-        if mismatches > 0 {
-            log::warn!("the two nodes negotiated different formats; rebuilding");
-            drop_nodes(&mut guard);
-            guard.needs_rules = true;
+        // 3. Each lane on its own: its streams' errors, its format check, its rules, its
+        //    published delay.
+        let now = Instant::now();
+        for direction in DeviceDirection::ALL {
+            supervise_lane(&mut guard, direction, now);
         }
 
-        // 4. Rules and node creation.
-        if guard.needs_rules && guard.session.is_some() {
-            guard.needs_rules = false;
-            apply_rules(&mut guard);
-        }
-
-        // 5. Keep the published delay honest. Switching the denoiser on adds ten milliseconds,
-        //    and only the audio thread knows it happened.
-        republish_latency(&mut guard);
-
-        // 6. Tell the GUI what changed.
+        // 4. Tell the GUI what changed.
         publish(&mut guard);
 
-        guard.session.is_none() && Instant::now() >= guard.next_attempt
+        guard.session.is_none() && now >= guard.next_connect
     };
 
     if should_connect
         && let Err(error) = connect(shared, context)
         && let Ok(mut guard) = shared.try_borrow_mut()
     {
-        guard.report_error(error);
-        let step = BACKOFF_MS
-            .get(guard.attempts as usize)
-            .copied()
-            .unwrap_or_else(|| BACKOFF_MS[BACKOFF_MS.len() - 1]);
-        guard.attempts = guard.attempts.saturating_add(1);
-        guard.next_attempt = Instant::now() + Duration::from_millis(step);
+        guard.report_connection_error(error);
+        guard.next_connect = Instant::now() + backoff(guard.connect_attempts);
+        guard.connect_attempts = guard.connect_attempts.saturating_add(1);
     }
+}
+
+/// One lane's share of the supervisor tick.
+///
+/// Nothing here reaches the other lane. A stream in error takes down its own pair and nothing
+/// else — not the socket, which the other lane's pair is still running on, and not the other
+/// pair — and the lane tries again on its own backoff, 200 ms doubling to five seconds, while the
+/// other lane plays on. The default is kept through the gap, as on every transient rebuild: the
+/// same node is about to come back under the same name.
+fn supervise_lane(shared: &mut Shared, direction: DeviceDirection, now: Instant) {
+    let lane = shared.lanes.get_mut(direction);
+    if !lane.enabled {
+        return;
+    }
+
+    // a. Either node of the pair went into error.
+    let first_failed = lane.status.sink_error.swap(false, Ordering::Relaxed);
+    let second_failed = lane.status.output_error.swap(false, Ordering::Relaxed);
+    if first_failed || second_failed {
+        log::warn!(
+            "the {} lane's {} reported an error; rebuilding it after {:?}",
+            direction.key(),
+            if first_failed { "NODE 1" } else { "NODE 2" },
+            backoff(lane.attempts)
+        );
+        drop_nodes(shared, direction);
+        shared.lanes.get_mut(direction).retry_later(now);
+        shared.report_error(direction, AudioError::DeviceUnavailable);
+    }
+
+    // b. The two nodes negotiated different formats: rebuild rather than play at the wrong
+    //    stride.
+    let lane = shared.lanes.get_mut(direction);
+    let mismatches = lane.counters.format_mismatches.swap(0, Ordering::Relaxed);
+    lane.format_mismatches_total += mismatches;
+    if mismatches > 0 {
+        log::warn!(
+            "the {} lane's two nodes negotiated different formats; rebuilding",
+            direction.key()
+        );
+        drop_nodes(shared, direction);
+        shared.lanes.get_mut(direction).needs_rules = true;
+    }
+
+    // c. Rules and node creation, once the lane's backoff allows.
+    let lane = shared.lanes.get_mut(direction);
+    lane.forgive_if_stable(now);
+    if lane.needs_rules && now >= lane.next_attempt && shared.ready() {
+        shared.lanes.get_mut(direction).needs_rules = false;
+        apply_rules(shared, direction);
+    }
+
+    // d. Keep the published delay honest. Switching the denoiser on adds ten milliseconds, and
+    //    only the audio thread knows it happened.
+    republish_latency(shared, direction);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1199,14 +1483,8 @@ fn on_global(
                 device.description,
                 device.name
             );
-            let affects_rules = device.direction == guard.direction;
             let object_id = device.object_id;
-            guard
-                .devices
-                .retain(|existing| existing.object_id != device.object_id);
-            guard.devices.push(device);
-            guard.needs_publish = true;
-            guard.needs_rules |= affects_rules;
+            add_device(&mut guard, device);
 
             // Ask the node what it is actually made of. This is the only way to learn it; see
             // `Shared::node_probes`.
@@ -1278,25 +1556,48 @@ fn on_global(
     }
 }
 
+/// A device joined the graph, or reported itself again under the same id.
+///
+/// Only the lane of the device's direction can care, and only while it is enabled: a new sink
+/// has nothing to say to the microphone's lane, and a microphone plugged in while the input lane
+/// is detached must not attach it.
+fn add_device(shared: &mut Shared, device: DeviceInfo) {
+    let direction = device.direction;
+    shared
+        .devices
+        .retain(|existing| existing.object_id != device.object_id);
+    shared.devices.push(device);
+    shared.needs_publish = true;
+    shared.mark_lane_for_rules(direction);
+}
+
 fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
     let Ok(mut guard) = shared.try_borrow_mut() else {
         return;
     };
-    let Some(index) = guard.devices.iter().position(|d| d.object_id == id) else {
+    let Some(removed) = remove_device(&mut guard, id) else {
         return;
     };
-    let removed = guard.devices.remove(index);
-    guard.node_probes.remove(&id);
     log::debug!(
         "{} disappeared: {} ({})",
         noun(removed.direction),
         removed.description,
         removed.name
     );
-    guard.needs_publish = true;
-    // The target may have just been unplugged. Re-running the rules attaches the pair to another
-    // device of the active direction (`docs/spec/12-audio-io.md` §22).
-    guard.needs_rules |= removed.direction == guard.direction;
+}
+
+/// A registry global went away. Returns the device it was, when it was one.
+///
+/// The target may have just been unplugged. Re-running the rules attaches that lane's pair to
+/// another device of its direction (`docs/spec/12-audio-io.md` §22); the other lane is not asked,
+/// because nothing it depends on changed.
+fn remove_device(shared: &mut Shared, id: u32) -> Option<DeviceInfo> {
+    let index = shared.devices.iter().position(|d| d.object_id == id)?;
+    let removed = shared.devices.remove(index);
+    shared.node_probes.remove(&id);
+    shared.needs_publish = true;
+    shared.mark_lane_for_rules(removed.direction);
+    Some(removed)
 }
 
 /// A bound node reported its format. Fill in what the registry could not tell us.
@@ -1340,17 +1641,18 @@ fn on_node_info(
     guard.needs_publish = true;
 
     // The one rebuild worth doing: the device was selected before its info arrived, so the nodes
-    // were built against the stereo fallback, and the truth is something else. Only the device the
-    // nodes are attached to matters — reacting to every device of the direction would rebuild the
-    // running stream because some *other* sink reported something.
+    // were built against the stereo fallback, and the truth is something else. Only the device a
+    // lane's nodes are attached to matters — reacting to every device of the direction would
+    // rebuild the running stream because some *other* sink reported something.
     let attached = guard
-        .session
+        .lanes
+        .get(device_direction)
+        .nodes
         .as_ref()
-        .and_then(|session| session.nodes.as_ref())
-        .is_some_and(|nodes| nodes.direction == device_direction && nodes.target == name);
+        .is_some_and(|nodes| nodes.target == name);
     if attached && after != before {
         log::info!("{name} reports {after} channels rather than {before}; rebuilding for it");
-        guard.needs_rules = true;
+        guard.mark_lane_for_rules(device_direction);
     }
 }
 
@@ -1361,12 +1663,14 @@ fn on_metadata_property(shared: &Rc<RefCell<Shared>>, key: Option<&str>, value: 
     let Ok(mut guard) = shared.try_borrow_mut() else {
         return;
     };
-    for direction in [DeviceDirection::Output, DeviceDirection::Input] {
+    for direction in DeviceDirection::ALL {
         if key == devices::default_key(direction) {
             guard.defaults.get_mut(direction).current =
                 value.and_then(devices::parse_default_node_name);
             guard.needs_publish = true;
-            guard.needs_rules |= direction == guard.direction;
+            // A direction's default moving is news for that direction's lane and for nothing
+            // else: the default sink says nothing about which microphone to hear.
+            guard.mark_lane_for_rules(direction);
             return;
         }
         if key == devices::configured_default_key(direction) {
@@ -1389,9 +1693,12 @@ fn on_metadata_property(shared: &Rc<RefCell<Shared>>, key: Option<&str>, value: 
 // The session default
 // ---------------------------------------------------------------------------------------------
 
-/// Become the session default for the active direction, politely: remember what was there first.
-fn claim_default(shared: &mut Shared) {
-    let direction = shared.direction;
+/// Become the session default for a lane's direction, politely: remember what was there first.
+///
+/// Each lane holds its own claim — `default.configured.audio.sink` for the output lane,
+/// `default.configured.audio.source` for the input lane — so claiming one never touches the
+/// other.
+fn claim_default(shared: &mut Shared, direction: DeviceDirection) {
     let ours = our_node_name(direction);
     if shared.defaults.get(direction).holding {
         return;
@@ -1467,9 +1774,9 @@ fn release_default(shared: &mut Shared, direction: DeviceDirection) -> bool {
     written
 }
 
-/// [`release_default`] for both directions — the exit path, where whichever default we hold has
-/// to go back before the metadata proxy does. Returns whether anything was written, i.e. whether
-/// there is a write to wait for.
+/// [`release_default`] for both directions — the exit path, where every default we hold, one per
+/// lane that claimed its own, has to go back before the metadata proxy does. Returns whether
+/// anything was written, i.e. whether there is a write to wait for.
 fn release_all_defaults(shared: &mut Shared) -> bool {
     let output = release_default(shared, DeviceDirection::Output);
     let input = release_default(shared, DeviceDirection::Input);
@@ -1496,7 +1803,7 @@ fn write_configured_default(shared: &Shared, direction: DeviceDirection, node_na
 }
 
 // ---------------------------------------------------------------------------------------------
-// Device selection, direction switching and node creation
+// Device selection and node creation, per lane
 // ---------------------------------------------------------------------------------------------
 
 /// Take back whatever DSP state a dropped NODE 1 handed through its lane's recycle channel, into
@@ -1506,14 +1813,14 @@ fn write_configured_default(shared: &Shared, direction: DeviceDirection, node_na
 /// dropped the state is already waiting here; draining before every `build_nodes` is what lets a
 /// pair be rebuilt within one supervisor tick instead of failing once and waiting for the next.
 fn drain_recycled_dsp(shared: &mut Shared) {
-    for (direction, (_, recycled)) in shared.recycle.iter() {
-        while let Ok(dsp) = recycled.try_recv() {
+    for (direction, lane) in shared.lanes.iter_mut() {
+        while let Ok(dsp) = lane.recycle.1.try_recv() {
             debug_assert_eq!(
                 dsp.direction(),
                 direction,
                 "a lane's recycle channel only ever carries that lane's DSP"
             );
-            *shared.dsp.get_mut(direction) = Some(dsp);
+            lane.dsp = Some(dsp);
         }
     }
 }
@@ -1526,8 +1833,8 @@ fn drain_recycled_dsp(shared: &mut Shared) {
 /// the main loop where the DSP is, the event has the effect it would have had on the next block,
 /// and the queue stays empty for when the lane does run.
 fn apply_idle_lane_events(shared: &mut Shared) {
-    for (_, dsp) in shared.dsp.iter_mut() {
-        if let Some(dsp) = dsp {
+    for (_, lane) in shared.lanes.iter_mut() {
+        if let Some(dsp) = lane.dsp.as_mut() {
             dsp.drain_events();
         }
     }
@@ -1559,13 +1866,16 @@ fn set_input_chain(shared: &mut Shared, name: &str) {
 
 /// Bring the voice engine up to date with `input_spec`, wherever the input lane's DSP is.
 ///
-/// Three places it can be. On the main loop — the lane has no nodes, whichever pair is running:
-/// rebuilt in place, which is the only place a rebuild is allowed. With a running *input* pair: a
-/// replacement is built here at the negotiated format and sent over; the audio thread swaps it in
-/// on its next block and retires the old one back to this loop. On its way back through the
-/// recycle channel: owed, and settled in place on the tick that finds it back — or by the
-/// `build_nodes` that takes it next, whichever comes first — so `input_spec_pending` stays set
-/// until then and this is a cheap check per tick.
+/// Three places it can be. On the main loop — the input lane has no nodes, whatever the output
+/// lane is doing: rebuilt in place, which is the only place a rebuild is allowed. With the input
+/// lane's pair running: a replacement is built here at that pair's negotiated format and sent
+/// over; the audio thread swaps it in on its next block and retires the old one back to this loop.
+/// On its way back through the recycle channel: owed, and settled in place on the tick that finds
+/// it back — or by the `build_nodes` that takes it next, whichever comes first — so
+/// `input_spec_pending` stays set until then and this is a cheap check per tick.
+///
+/// The input lane only, throughout: the output lane runs the music chain, which has no stages to
+/// reorder, and its pair has nothing to say about the voice engine's format.
 ///
 /// Called from the control message and from every supervisor tick, so a replacement that found
 /// the slot full — the user picked two presets within one block — goes on the next tick.
@@ -1575,21 +1885,17 @@ fn reconcile_input_chain(shared: &mut Shared) {
         return;
     }
     let spec = shared.input_spec;
-    if let Some(dsp) = shared.dsp.input.as_mut().and_then(LaneDsp::as_input_mut) {
+    let lane = &mut shared.lanes.input;
+    if let Some(dsp) = lane.dsp.as_mut().and_then(LaneDsp::as_input_mut) {
         dsp.set_spec(spec);
         shared.input_spec_pending = false;
         return;
     }
-    let input_pair_is_up = shared
-        .session
-        .as_ref()
-        .and_then(|session| session.nodes.as_ref())
-        .is_some_and(|nodes| nodes.direction == DeviceDirection::Input);
-    if !input_pair_is_up {
+    if lane.nodes.is_none() {
         return;
     }
-    let rate = shared.counters.sample_rate.load(Ordering::Relaxed) as f32;
-    let channels = shared.counters.channels.load(Ordering::Relaxed) as usize;
+    let rate = lane.counters.sample_rate.load(Ordering::Relaxed) as f32;
+    let channels = lane.counters.channels.load(Ordering::Relaxed) as usize;
     let engine = Box::new(InputEngine::new_with_spec(
         rate,
         MAX_QUANTUM_FRAMES,
@@ -1610,62 +1916,46 @@ fn reconcile_input_chain(shared: &mut Shared) {
     }
 }
 
-/// Destroy the active pair of nodes and recover the DSP state, **keeping** the default. For the
-/// transient rebuilds — a new target, a format mismatch, NODE 2 erroring — where the pair is about
-/// to come straight back under the same name.
-fn drop_nodes(shared: &mut Shared) {
-    if let Some(session) = shared.session.as_mut() {
-        session.nodes = None;
-    }
+/// Destroy a lane's pair of nodes and recover its DSP state, **keeping** the lane's default. For
+/// the transient rebuilds — a new target, a format mismatch, a stream in error — where the pair is
+/// about to come straight back under the same name. The other lane's pair is not touched.
+fn drop_nodes(shared: &mut Shared, direction: DeviceDirection) {
+    let lane = shared.lanes.get_mut(direction);
+    lane.nodes = None;
+    lane.built_at = None;
+    lane.status.clear();
+    // Mismatches the pair counted on its way out belong in the report, not in a trigger that
+    // would tear down the next pair for them.
+    lane.format_mismatches_total += lane.counters.format_mismatches.swap(0, Ordering::Relaxed);
     drain_recycled_dsp(shared);
-    shared
-        .status
-        .output_streaming
-        .store(false, Ordering::Relaxed);
 }
 
-/// Hand the active direction's default back, *then* destroy its nodes — the order
-/// `docs/spec/12-audio-io.md` §21.5 requires. For the cases where the pair is not coming back as
-/// it was: a direction switch, or rules that ended in an error.
-fn teardown_nodes(shared: &mut Shared) {
-    let direction = shared.direction;
+/// Hand a lane's default back, *then* destroy its nodes — the order `docs/spec/12-audio-io.md`
+/// §21.5 requires. For the cases where the pair is not coming back as it was: the lane detached,
+/// or its rules ended in an error. Only this lane's default is handed back.
+fn teardown_nodes(shared: &mut Shared, direction: DeviceDirection) {
     release_default(shared, direction);
-    drop_nodes(shared);
+    drop_nodes(shared, direction);
 }
 
-/// Leave the active direction and enter the other one.
+/// Choose a lane's device and make sure its pair is attached to it (`docs/spec/12-audio-io.md`
+/// §19.5, per direction as §28.5 describes).
 ///
-/// The old pair goes first, with its default handed back, so the system only ever sees one
-/// FxSound device: switching to a microphone makes "FxSound (Output)" disappear from the sinks
-/// before "FxSound (Input)" appears among the sources, and vice versa.
-fn switch_direction(shared: &mut Shared, direction: DeviceDirection) {
-    log::info!(
-        "switching from the {} to the {} direction",
-        noun(shared.direction),
-        noun(direction)
-    );
-    teardown_nodes(shared);
-    shared.direction = direction;
-    // `pwszIDPreviousRealDevices` is per direction; an empty snapshot keeps rule 5 from treating
-    // every device of the new direction as freshly plugged in.
-    shared.previous_names.clear();
-    shared.clear_error();
-    shared.needs_publish = true;
-    shared.needs_rules = true;
-}
-
-fn apply_rules(shared: &mut Shared) {
-    let direction = shared.direction;
+/// A disabled lane is left alone, whatever asked: it has no pair and must not grow one.
+fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
+    if !shared.lanes.get(direction).enabled {
+        return;
+    }
     let ours = our_node_name(direction);
     let selection = devices::choose_device(
         &shared.devices,
         direction,
         ours,
         shared.defaults.get(direction).current.as_deref(),
-        &shared.previous_names,
+        &shared.lanes.get(direction).previous_names,
         shared.memory.get(direction),
     );
-    shared.previous_names = shared
+    shared.lanes.get_mut(direction).previous_names = shared
         .devices
         .iter()
         .filter(|d| d.direction == direction)
@@ -1675,22 +1965,24 @@ fn apply_rules(shared: &mut Shared) {
     let selection = match selection {
         Ok(selection) => selection,
         Err(error) => {
-            // No device to attach to: the pair goes, and so does our claim on the default —
+            // No device to attach to: the pair goes, and so does this lane's claim on the default —
             // leaving `default.configured.audio.*` pointing at a node that no longer exists is the
-            // one thing §21 forbids.
-            teardown_nodes(shared);
-            shared.report_error(error);
+            // one thing §21 forbids. Nothing to retry: the registry says when a device appears.
+            teardown_nodes(shared, direction);
+            shared.report_error(direction, error);
             return;
         }
     };
 
     let already = shared
-        .session
+        .lanes
+        .get(direction)
+        .nodes
         .as_ref()
-        .and_then(|s| s.nodes.as_ref())
-        .is_some_and(|nodes| nodes.direction == direction && nodes.target == selection.target);
+        .is_some_and(|nodes| nodes.target == selection.target);
     if already {
-        shared.clear_error();
+        // Nothing to do. An error this lane reported is forgotten once its pair has proved
+        // itself (`Lane::forgive_if_stable`), not because the rules ran again in the meantime.
         return;
     }
 
@@ -1700,7 +1992,7 @@ fn apply_rules(shared: &mut Shared) {
         .find(|d| d.direction == direction && d.name == selection.target)
         .cloned()
     else {
-        shared.report_error(AudioError::DeviceNotPresent);
+        shared.report_error(direction, AudioError::DeviceNotPresent);
         return;
     };
 
@@ -1708,7 +2000,7 @@ fn apply_rules(shared: &mut Shared) {
     // scratch — comes back through the recycle channel for the new pair to adopt, and so the
     // server never sees two nodes with the same `node.name`. The default is kept: the same node
     // is about to reappear under the same name, and `default.configured.audio.*` survives the gap.
-    drop_nodes(shared);
+    drop_nodes(shared, direction);
     match build_nodes(shared, &target) {
         Ok(nodes) => {
             log::info!(
@@ -1721,27 +2013,32 @@ fn apply_rules(shared: &mut Shared) {
                 nodes.channels,
                 nodes.rate
             );
-            if let Some(session) = shared.session.as_mut() {
-                session.nodes = Some(nodes);
-            }
+            // The lane's error and backoff stay until this pair has proved itself
+            // (`Lane::forgive_if_stable`): one that fails again a moment from now is the same
+            // failure, not news, and not a reason to start again from 200 ms.
+            let lane = shared.lanes.get_mut(direction);
+            lane.nodes = Some(nodes);
+            lane.built_at = Some(Instant::now());
             shared.state = State::Running;
-            shared.attempts = 0;
-            shared.clear_error();
+            shared.connect_attempts = 0;
             // Claim before committing: `claim_default` records the default that was there *before*
             // us in `original_default` / `most_recent_default`, and `commit` only fills those slots
             // when they are still empty — so this order keeps them honest on a first run.
-            if shared.want_default {
-                claim_default(shared);
+            if shared.lanes.get(direction).want_default {
+                claim_default(shared, direction);
             }
             devices::commit(shared.memory.get_mut(direction), &selection);
         }
         Err(error) => {
-            shared.report_error(error);
+            // Not left for an unrelated registry event to retry: nothing may ever come, and the
+            // lane would sit without a pair until the user unplugged something.
+            shared.report_error(direction, error);
+            shared.lanes.get_mut(direction).retry_later(Instant::now());
         }
     }
 }
 
-/// Create both nodes of the target's direction.
+/// Create both nodes of the lane of the target's direction, on that lane's ring, counters and DSP.
 ///
 /// The format is decided here, once, and declared on **both** nodes so the ring is always read at
 /// the stride it was written at: the target's channel count clamped to `2..=8`
@@ -1807,7 +2104,7 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
     // Only now take the lane's DSP state: from here on every failure path drops it inside
     // `SinkData`, whose `Drop` hands it straight back through the lane's recycle channel.
     drain_recycled_dsp(shared);
-    let Some(mut dsp) = shared.dsp.get_mut(direction).take() else {
+    let Some(mut dsp) = shared.lanes.get_mut(direction).dsp.take() else {
         log::error!(
             "the {} lane's DSP state has not come back from its previous pair of nodes",
             direction.key()
@@ -1838,9 +2135,10 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
     // one. The engine is recycled deliberately, but its *state* should not be.
     dsp.reset();
 
-    shared.ring.reconfigure(channels as usize, quantum as usize);
-    shared.counters.sample_rate.store(rate, Ordering::Relaxed);
-    shared.counters.channels.store(channels, Ordering::Relaxed);
+    let lane = shared.lanes.get(direction);
+    lane.ring.reconfigure(channels as usize, quantum as usize);
+    lane.counters.sample_rate.store(rate, Ordering::Relaxed);
+    lane.counters.channels.store(channels, Ordering::Relaxed);
 
     let first_data = SinkData::new(shared, dsp, quantum as usize);
     let first_listener = first
@@ -1883,6 +2181,8 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
         }
         None => log::warn!("could not build the processing-latency parameter"),
     }
+    shared.lanes.get_mut(direction).published_latency =
+        u32::try_from(dsp_latency_frames).unwrap_or(u32::MAX);
 
     // ---- NODE 2: the node that drains the ring -----------------------------------------------
     //
@@ -1913,10 +2213,11 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
     let second = pw::stream::StreamRc::new(core, second_name, second_props)
         .map_err(|error| AudioError::PipewireUnavailable(error.to_string()))?;
 
+    let lane = shared.lanes.get(direction);
     let second_data = OutData {
-        ring: Arc::clone(&shared.ring),
-        counters: Arc::clone(&shared.counters),
-        status: Arc::clone(&shared.status),
+        ring: Arc::clone(&lane.ring),
+        counters: Arc::clone(&lane.counters),
+        status: Arc::clone(&lane.status),
         format: AudioInfoRaw::new(),
         channels: 0,
         scratch: vec![0.0; MAX_QUANTUM_FRAMES * MAX_CHANNELS as usize],
@@ -1957,16 +2258,14 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
         _second_listener: second_listener,
         first,
         _second: second,
-        published_latency: u32::try_from(dsp_latency_frames).unwrap_or(u32::MAX),
-        direction,
         target: target.name.clone(),
         channels,
         rate,
     })
 }
 
-/// The properties of FxSound's virtual device — the sink in the output direction, the source in
-/// the input direction (`docs/spec/12-audio-io.md` §20 NODE 1, §28.2 NODE 2).
+/// The properties of FxSound's virtual device — the sink of the output lane, the source of
+/// the input lane (`docs/spec/12-audio-io.md` §20 NODE 1, §28.2 NODE 2).
 ///
 /// Property spellings are the verified ones from `docs/api/pipewire-0.10-rust.md` §14 — every key
 /// after the first dot is hyphenated, and `audio.position` has no Rust constant because it has no
@@ -2013,9 +2312,9 @@ fn virtual_node_props(
     }
 }
 
-/// The properties of the stream that touches the real device — the playback stream in the output
-/// direction, the capture stream in the input direction (`docs/spec/12-audio-io.md` §20 NODE 2,
-/// §28.2 NODE 1). `target` is the real device's `node.name`.
+/// The properties of the stream that touches the real device — the playback stream of the output
+/// lane, the capture stream of the input lane (`docs/spec/12-audio-io.md` §20 NODE 2, §28.2
+/// NODE 1). `target` is the real device's `node.name`.
 fn stream_props(direction: DeviceDirection, target: &str, latency: &str) -> PropertiesBox {
     let (media_class, category, name, description) = match direction {
         DeviceDirection::Output => (
@@ -2242,8 +2541,8 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
         .fetch_add(frames, Ordering::Relaxed);
 }
 
-/// NODE 2's `process()`: drain the ring into the buffer the real device is about to play — or, in
-/// the input direction, into the buffer an application is about to record.
+/// NODE 2's `process()`: drain the lane's ring into the buffer the real device is about to play —
+/// or, in the input lane, into the buffer an application is about to record.
 ///
 /// Same real-time rules as [`on_sink_process`]. The DSP is deliberately *not* run here: if this
 /// node underruns we emit silence rather than re-processing stale samples, and NODE 1 is the node
@@ -2315,31 +2614,11 @@ fn on_output_process(stream: &pw::stream::Stream, data: &mut OutData) {
 // Publishing to the GUI
 // ---------------------------------------------------------------------------------------------
 
+/// Tell the GUI what changed since the last tick: each lane's status and attachment, and the
+/// device list. Nothing is sent that the GUI was already told.
 fn publish(shared: &mut Shared) {
-    let cycles = shared.counters.sink_cycles.load(Ordering::Relaxed);
-    let processing = cycles != shared.last_sink_cycles;
-    shared.last_sink_cycles = cycles;
-
-    let rate = shared.counters.sample_rate.load(Ordering::Relaxed).max(1);
-    let status = AudioStatus {
-        processing: processing && shared.state == State::Running,
-        sample_rate: rate,
-        channels: shared.counters.channels.load(Ordering::Relaxed) as u16,
-        processed_secs: shared.counters.frames_processed.load(Ordering::Relaxed) / u64::from(rate),
-        // The ring's own account of how it is coping. Cumulative since the stream was built, and
-        // published rather than only logged: a user whose audio crackles can now say how often,
-        // and a test can assert on it.
-        dropped_frames: shared.ring.dropped_frames.load(Ordering::Relaxed),
-        underrun_frames: shared.ring.underrun_frames.load(Ordering::Relaxed),
-        resyncs: shared.ring.resyncs.load(Ordering::Relaxed),
-        format_mismatches: shared.format_mismatches_total,
-    };
-    if status != shared.last_status {
-        shared.last_status = status;
-        shared.notify(AudioToUi::Status {
-            direction: shared.direction,
-            status,
-        });
+    for direction in DeviceDirection::ALL {
+        publish_lane(shared, direction);
     }
 
     if shared.needs_publish {
@@ -2350,18 +2629,71 @@ fn publish(shared: &mut Shared) {
             shared.notify(AudioToUi::Devices(devices));
         }
     }
+}
+
+/// One lane's [`AudioToUi::Attached`] and [`AudioToUi::Status`], each only when it changed.
+///
+/// The attachment comes first: it is what the GUI shows as the selected device, and a status that
+/// arrived before it would describe a device the window does not know the lane is on yet.
+fn publish_lane(shared: &mut Shared, direction: DeviceDirection) {
+    publish_attachment(shared, direction);
+
+    let lane = shared.lanes.get_mut(direction);
+    let cycles = lane.counters.sink_cycles.load(Ordering::Relaxed);
+    let processing = cycles != lane.last_sink_cycles;
+    lane.last_sink_cycles = cycles;
+    let rate = lane.counters.sample_rate.load(Ordering::Relaxed).max(1);
+    let status = AudioStatus {
+        processing: processing && lane.nodes.is_some(),
+        sample_rate: rate,
+        channels: lane.counters.channels.load(Ordering::Relaxed) as u16,
+        processed_secs: lane.counters.frames_processed.load(Ordering::Relaxed) / u64::from(rate),
+        // The ring's own account of how it is coping. Cumulative since the lane was created, and
+        // published rather than only logged: a user whose audio crackles can now say how often,
+        // and a test can assert on it.
+        dropped_frames: lane.ring.dropped_frames.load(Ordering::Relaxed),
+        underrun_frames: lane.ring.underrun_frames.load(Ordering::Relaxed),
+        resyncs: lane.ring.resyncs.load(Ordering::Relaxed),
+        format_mismatches: lane.format_mismatches_total,
+    };
+    let status = (status != lane.last_status).then(|| {
+        lane.last_status = status;
+        status
+    });
 
     // Ring health, per `docs/spec/12-audio-io.md` open question 3: instrument the fill level from
     // day one so drift is detected in the field rather than guessed at.
-    let underruns = shared.ring.underrun_frames.load(Ordering::Relaxed);
-    if underruns != shared.last_underruns {
+    let underruns = lane.ring.underrun_frames.load(Ordering::Relaxed);
+    if underruns != lane.last_underruns {
         log::debug!(
-            "ring: fill {} frames, underruns {underruns}, dropped {}, resyncs {}",
-            shared.ring.fill_frames(),
-            shared.ring.dropped_frames.load(Ordering::Relaxed),
-            shared.ring.resyncs.load(Ordering::Relaxed),
+            "{} ring: fill {} frames, underruns {underruns}, dropped {}, resyncs {}",
+            direction.key(),
+            lane.ring.fill_frames(),
+            lane.ring.dropped_frames.load(Ordering::Relaxed),
+            lane.ring.resyncs.load(Ordering::Relaxed),
         );
-        shared.last_underruns = underruns;
+        lane.last_underruns = underruns;
+    }
+
+    if let Some(status) = status {
+        shared.notify(AudioToUi::Status { direction, status });
+    }
+}
+
+/// Tell the GUI what a lane is attached to, if that is not what it was last told — a new target,
+/// or `None` once the pair is gone for whatever reason.
+///
+/// Separate from the status so that a pick can be answered the moment it takes
+/// ([`select_device`]) without also judging `processing` over a fraction of a tick, which would
+/// flap on a long quantum.
+fn publish_attachment(shared: &mut Shared, direction: DeviceDirection) {
+    let lane = shared.lanes.get_mut(direction);
+    let target = lane.nodes.as_ref().map(|nodes| nodes.target.clone());
+    if let Some(node_name) = lane.note_attachment(target.as_deref()) {
+        shared.notify(AudioToUi::Attached {
+            direction,
+            node_name,
+        });
     }
 }
 
@@ -2371,8 +2703,8 @@ fn publish(shared: &mut Shared) {
 /// stay in.
 fn published_devices(shared: &Shared) -> Vec<AudioDevice> {
     let mut published = Vec::with_capacity(shared.devices.len());
-    for direction in [DeviceDirection::Output, DeviceDirection::Input] {
-        let default = shared.defaults.get(direction).current.as_deref();
+    for (direction, default) in shared.defaults.iter() {
+        let default = default.current.as_deref();
         let mut group: Vec<AudioDevice> = shared
             .devices
             .iter()
@@ -2422,8 +2754,9 @@ mod tests {
     /// The chain the input lane's DSP runs, when that DSP is on the main loop.
     fn input_spec_on_the_main_loop(shared: &mut Shared) -> Option<ChainSpec> {
         shared
-            .dsp
+            .lanes
             .input
+            .dsp
             .as_mut()
             .and_then(LaneDsp::as_input_mut)
             .map(|dsp| dsp.engine().spec())
@@ -2918,8 +3251,9 @@ mod tests {
         set_input_chain(&mut shared, "podcast");
 
         let dsp = shared
-            .dsp
+            .lanes
             .input
+            .dsp
             .as_mut()
             .and_then(LaneDsp::as_input_mut)
             .expect("the engine is on the main loop");
@@ -2945,8 +3279,9 @@ mod tests {
         set_input_chain(&mut shared, "karaoke");
         assert_eq!(shared.input_spec, ChainSpec::voice());
         let dsp = shared
-            .dsp
+            .lanes
             .input
+            .dsp
             .as_mut()
             .and_then(LaneDsp::as_input_mut)
             .expect("the engine is on the main loop");
@@ -2969,8 +3304,9 @@ mod tests {
 
         let (dsp, _handover) = lanes_for_tests();
         shared
-            .recycle
+            .lanes
             .input
+            .recycle
             .0
             .send(dsp.input)
             .expect("the main loop is listening");
@@ -2991,7 +3327,7 @@ mod tests {
     #[test]
     fn a_voice_chain_named_while_the_music_lane_is_away_is_rebuilt_in_place_at_once() {
         let mut shared = shared_with_dsp_for_tests();
-        let music = shared.dsp.output.take().expect("on the main loop");
+        let music = shared.lanes.output.dsp.take().expect("on the main loop");
 
         set_input_chain(&mut shared, "podcast");
 
@@ -3014,13 +3350,14 @@ mod tests {
             let mut shared = shared_with_dsp_for_tests();
             let node_ones = PerDirection::from_fn(|direction| {
                 let dsp = shared
-                    .dsp
+                    .lanes
                     .get_mut(direction)
+                    .dsp
                     .take()
                     .expect("on the main loop");
                 SinkData::new(&shared, dsp, 512)
             });
-            assert!(shared.dsp.output.is_none() && shared.dsp.input.is_none());
+            assert!(shared.lanes.output.dsp.is_none() && shared.lanes.input.dsp.is_none());
 
             let PerDirection { output, input } = node_ones;
             let (first_node, second_node) = match first {
@@ -3030,21 +3367,21 @@ mod tests {
             drop(first_node);
             drain_recycled_dsp(&mut shared);
             assert_eq!(
-                shared.dsp.get(first).as_ref().map(LaneDsp::direction),
+                shared.lanes.get(first).dsp.as_ref().map(LaneDsp::direction),
                 Some(first),
                 "the {} lane's DSP came home",
                 first.key()
             );
             assert!(
-                shared.dsp.get(first.other()).is_none(),
+                shared.lanes.get(first.other()).dsp.is_none(),
                 "…and nothing arrived in the {} lane's slot, whose DSP is still away",
                 first.other().key()
             );
 
             drop(second_node);
             drain_recycled_dsp(&mut shared);
-            for (direction, dsp) in shared.dsp.iter() {
-                assert_eq!(dsp.as_ref().map(LaneDsp::direction), Some(direction));
+            for (direction, lane) in shared.lanes.iter() {
+                assert_eq!(lane.dsp.as_ref().map(LaneDsp::direction), Some(direction));
             }
         }
     }
@@ -3102,5 +3439,685 @@ mod tests {
             "the music lane's DSP is away with a pair; its event waits for that pair's thread"
         );
         drop(dsp.output);
+    }
+
+    // ---- §1 of the 0.4.0 design: two lanes, side by side -------------------------------------
+
+    /// A thread that has not connected, with the receiving end of its notifications kept, so a
+    /// test can see exactly what the GUI would have been told.
+    fn shared_with_messages() -> (Shared, Receiver<AudioToUi>) {
+        let (notify, messages) = crossbeam_channel::unbounded();
+        let shared = Shared::new(
+            notify,
+            None,
+            None,
+            PerDirection::default(),
+            ChainHandover::new().0,
+        );
+        (shared, messages)
+    }
+
+    fn drained(messages: &Receiver<AudioToUi>) -> Vec<AudioToUi> {
+        messages.try_iter().collect()
+    }
+
+    /// A device as the registry would report it: a stereo sink, or a microphone.
+    fn device(object_id: u32, name: &str, direction: DeviceDirection) -> DeviceInfo {
+        let media_class = match direction {
+            DeviceDirection::Output => devices::SINK_MEDIA_CLASS,
+            DeviceDirection::Input => devices::SOURCE_MEDIA_CLASS,
+        };
+        DeviceInfo::from_props(object_id, &|key: &str| match key {
+            "media.class" => Some(media_class),
+            "node.name" => Some(name),
+            "audio.channels" => Some("2"),
+            _ => None,
+        })
+        .expect("a sink or a source that is not one of ours")
+    }
+
+    /// Everything the main loop decides about a lane, in a form two lanes can be compared in.
+    #[derive(Debug, PartialEq)]
+    struct LaneState {
+        enabled: bool,
+        needs_rules: bool,
+        previous_names: Vec<String>,
+        want_default: bool,
+        attempts: u32,
+        next_attempt: Instant,
+        built_at: Option<Instant>,
+        last_error: Option<AudioError>,
+        attached: Option<String>,
+        last_status: AudioStatus,
+    }
+
+    fn lane_state(shared: &Shared, direction: DeviceDirection) -> LaneState {
+        let lane = shared.lanes.get(direction);
+        LaneState {
+            enabled: lane.enabled,
+            needs_rules: lane.needs_rules,
+            previous_names: lane.previous_names.clone(),
+            want_default: lane.want_default,
+            attempts: lane.attempts,
+            next_attempt: lane.next_attempt,
+            built_at: lane.built_at,
+            last_error: lane.last_error.clone(),
+            attached: lane.attached.clone(),
+            last_status: lane.last_status,
+        }
+    }
+
+    /// An output lane that has been running a while: attached, holding the default sink, with a
+    /// failure behind it and an opinion about the default.
+    fn give_the_output_lane_a_history(shared: &mut Shared) {
+        let lane = &mut shared.lanes.output;
+        lane.previous_names = vec!["alsa_output.pci".to_owned()];
+        lane.want_default = false;
+        lane.attempts = 2;
+        lane.next_attempt = Instant::now() + Duration::from_secs(3);
+        lane.built_at = Some(Instant::now());
+        lane.last_error = Some(AudioError::DeviceUnavailable);
+        lane.attached = Some("alsa_output.pci".to_owned());
+        lane.last_status = AudioStatus {
+            sample_rate: 44_100,
+            ..AudioStatus::default()
+        };
+        shared.memory.output.user_selected = "alsa_output.pci".to_owned();
+        shared.defaults.output.holding = true;
+    }
+
+    #[test]
+    fn the_output_lane_starts_enabled_and_the_input_lane_waits_for_a_microphone() {
+        let shared = shared_for_tests();
+        assert!(
+            shared.lanes.output.enabled,
+            "FxSound in front of the speakers is the Windows behaviour"
+        );
+        assert!(
+            !shared.lanes.input.enabled,
+            "a microphone is only processed once the user picks one"
+        );
+        for (direction, lane) in shared.lanes.iter() {
+            assert!(lane.nodes.is_none(), "{} lane", direction.key());
+            assert!(lane.want_default, "{} lane", direction.key());
+        }
+        assert!(
+            !Arc::ptr_eq(&shared.lanes.output.ring, &shared.lanes.input.ring),
+            "each lane's callbacks meet in a ring of their own"
+        );
+        assert!(!Arc::ptr_eq(
+            &shared.lanes.output.counters,
+            &shared.lanes.input.counters
+        ));
+    }
+
+    #[test]
+    fn selecting_a_microphone_leaves_the_output_lanes_state_untouched() {
+        let (mut shared, messages) = shared_with_messages();
+        give_the_output_lane_a_history(&mut shared);
+        let output_before = lane_state(&shared, DeviceDirection::Output);
+        let memory_before = shared.memory.output.clone();
+
+        control(
+            &mut shared,
+            UiToAudio::SelectDevice {
+                node_name: "alsa_input.usb-fifine".to_owned(),
+                direction: DeviceDirection::Input,
+            },
+        );
+
+        assert_eq!(
+            lane_state(&shared, DeviceDirection::Output),
+            output_before,
+            "picking a microphone changed something about the speakers"
+        );
+        assert_eq!(shared.memory.output, memory_before);
+        assert!(
+            shared.defaults.output.holding,
+            "the default sink is still ours"
+        );
+
+        let input = &shared.lanes.input;
+        assert!(input.enabled, "picking a microphone enables its lane");
+        assert!(
+            input.needs_rules,
+            "with no graph yet, the rules run as soon as there is one"
+        );
+        assert_eq!(shared.memory.input.user_selected, "alsa_input.usb-fifine");
+        assert_eq!(
+            drained(&messages),
+            [],
+            "nothing to tell the GUI until the lane is attached"
+        );
+    }
+
+    #[test]
+    fn selecting_a_device_is_not_a_retry_and_starts_the_lanes_backoff_afresh() {
+        let mut shared = shared_for_tests();
+        shared.lanes.input.enabled = true;
+        shared.lanes.input.attempts = 5;
+        shared.lanes.input.next_attempt = Instant::now() + Duration::from_secs(5);
+        shared.lanes.input.last_error = Some(AudioError::DeviceUnavailable);
+        control(
+            &mut shared,
+            UiToAudio::SelectDevice {
+                node_name: "alsa_input.usb-fifine".to_owned(),
+                direction: DeviceDirection::Input,
+            },
+        );
+        assert_eq!(shared.lanes.input.attempts, 0);
+        assert!(shared.lanes.input.next_attempt <= Instant::now());
+        assert_eq!(
+            shared.lanes.input.last_error, None,
+            "if the new choice fails too, the user who made it hears about it"
+        );
+    }
+
+    #[test]
+    fn detaching_a_lane_hands_back_only_its_own_default_and_says_it_is_attached_to_nothing() {
+        let (mut shared, messages) = shared_with_messages();
+        give_the_output_lane_a_history(&mut shared);
+        let output_before = lane_state(&shared, DeviceDirection::Output);
+        shared.lanes.input.enabled = true;
+        shared.lanes.input.attached = Some("alsa_input.usb-fifine".to_owned());
+        shared.lanes.input.needs_rules = true;
+        shared.lanes.input.previous_names = vec!["alsa_input.usb-fifine".to_owned()];
+        shared.defaults.input.holding = true;
+
+        control(&mut shared, UiToAudio::DetachLane(DeviceDirection::Input));
+
+        let input = &shared.lanes.input;
+        assert!(!input.enabled);
+        assert!(!input.needs_rules, "a detached lane has no rules to run");
+        assert!(input.nodes.is_none());
+        assert!(
+            !shared.defaults.input.holding,
+            "the default source was handed back"
+        );
+        assert!(
+            shared.defaults.output.holding,
+            "the default sink is none of the input lane's business"
+        );
+        assert_eq!(lane_state(&shared, DeviceDirection::Output), output_before);
+        assert_eq!(
+            drained(&messages),
+            [AudioToUi::Attached {
+                direction: DeviceDirection::Input,
+                node_name: None,
+            }]
+        );
+
+        // Asked again, it answers again: the GUI that sent it is told, not left to infer it.
+        control(&mut shared, UiToAudio::DetachLane(DeviceDirection::Input));
+        assert_eq!(
+            drained(&messages),
+            [AudioToUi::Attached {
+                direction: DeviceDirection::Input,
+                node_name: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_source_appearing_asks_only_the_input_lane_for_its_rules() {
+        let mut shared = shared_for_tests();
+        shared.lanes.input.enabled = true;
+
+        add_device(
+            &mut shared,
+            device(40, "alsa_input.usb-fifine", DeviceDirection::Input),
+        );
+        assert!(shared.lanes.input.needs_rules);
+        assert!(
+            !shared.lanes.output.needs_rules,
+            "a new microphone has nothing to say to the speakers' lane"
+        );
+
+        shared.lanes.input.needs_rules = false;
+        add_device(
+            &mut shared,
+            device(41, "alsa_output.pci", DeviceDirection::Output),
+        );
+        assert!(shared.lanes.output.needs_rules);
+        assert!(!shared.lanes.input.needs_rules);
+
+        shared.lanes.output.needs_rules = false;
+        let removed = remove_device(&mut shared, 40).expect("a device with that id");
+        assert_eq!(removed.name, "alsa_input.usb-fifine");
+        assert!(shared.lanes.input.needs_rules, "the target may have gone");
+        assert!(!shared.lanes.output.needs_rules);
+        assert!(remove_device(&mut shared, 40).is_none());
+    }
+
+    #[test]
+    fn a_microphone_plugged_in_while_the_input_lane_is_detached_does_not_wake_it() {
+        let mut shared = shared_for_tests();
+        add_device(
+            &mut shared,
+            device(40, "alsa_input.usb-fifine", DeviceDirection::Input),
+        );
+        assert!(!shared.lanes.input.needs_rules);
+        assert!(!shared.lanes.input.enabled);
+
+        control(&mut shared, UiToAudio::RescanDevices);
+        assert!(
+            shared.lanes.output.needs_rules,
+            "a rescan asks the running lane"
+        );
+        assert!(!shared.lanes.input.needs_rules, "…and not the detached one");
+    }
+
+    #[test]
+    fn a_default_that_moves_is_news_for_its_own_lane_only() {
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        shared.borrow_mut().lanes.input.enabled = true;
+
+        on_metadata_property(
+            &shared,
+            Some(devices::default_key(DeviceDirection::Input)),
+            Some(r#"{"name":"alsa_input.usb-fifine"}"#),
+        );
+        {
+            let guard = shared.borrow();
+            assert!(guard.lanes.input.needs_rules);
+            assert!(!guard.lanes.output.needs_rules);
+            assert_eq!(
+                guard.defaults.input.current.as_deref(),
+                Some("alsa_input.usb-fifine")
+            );
+        }
+
+        shared.borrow_mut().lanes.input.needs_rules = false;
+        on_metadata_property(
+            &shared,
+            Some(devices::default_key(DeviceDirection::Output)),
+            Some(r#"{"name":"alsa_output.pci"}"#),
+        );
+        let guard = shared.borrow();
+        assert!(guard.lanes.output.needs_rules);
+        assert!(!guard.lanes.input.needs_rules);
+    }
+
+    #[test]
+    fn a_node_error_on_one_lane_backs_off_that_lane_only() {
+        let (mut shared, messages) = shared_with_messages();
+        shared.lanes.input.enabled = true;
+        let output_before = lane_state(&shared, DeviceDirection::Output);
+
+        let start = Instant::now();
+        shared
+            .lanes
+            .input
+            .status
+            .sink_error
+            .store(true, Ordering::Relaxed);
+        for direction in DeviceDirection::ALL {
+            supervise_lane(&mut shared, direction, start);
+        }
+
+        let input = &shared.lanes.input;
+        assert_eq!(input.attempts, 1);
+        assert_eq!(input.next_attempt, start + Duration::from_millis(200));
+        assert!(input.needs_rules, "the pair is coming back, after the wait");
+        assert!(
+            !input.status.sink_error.load(Ordering::Relaxed),
+            "the flag was acted on once"
+        );
+        assert_eq!(
+            lane_state(&shared, DeviceDirection::Output),
+            output_before,
+            "the microphone failing changed something about the speakers"
+        );
+        assert_eq!(
+            shared.state,
+            State::Disconnected,
+            "the connection is not the lane's to drop"
+        );
+        assert_eq!(
+            drained(&messages),
+            [AudioToUi::Error {
+                direction: Some(DeviceDirection::Input),
+                message: AudioError::DeviceUnavailable.to_string(),
+            }],
+            "reported against the lane, and no disconnection"
+        );
+
+        // Every failure that follows doubles the wait, up to five seconds, and is not re-reported.
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            let now = shared.lanes.input.next_attempt;
+            shared
+                .lanes
+                .input
+                .status
+                .output_error
+                .store(true, Ordering::Relaxed);
+            supervise_lane(&mut shared, DeviceDirection::Input, now);
+            waits.push((shared.lanes.input.next_attempt - now).as_millis());
+        }
+        assert_eq!(waits, [400, 800, 1600, 3200, 5000, 5000, 5000, 5000]);
+        assert_eq!(drained(&messages), []);
+        assert_eq!(lane_state(&shared, DeviceDirection::Output), output_before);
+    }
+
+    #[test]
+    fn a_failed_build_is_retried_on_the_lanes_backoff_rather_than_left_for_the_registry() {
+        let (mut shared, messages) = shared_with_messages();
+        shared.lanes.input.enabled = true;
+        add_device(
+            &mut shared,
+            device(40, "alsa_input.usb-fifine", DeviceDirection::Input),
+        );
+        shared.lanes.input.needs_rules = false;
+
+        // No connection, so the build fails after the rules have chosen the microphone.
+        let before = Instant::now();
+        apply_rules(&mut shared, DeviceDirection::Input);
+
+        let input = &shared.lanes.input;
+        assert!(input.nodes.is_none());
+        assert!(input.needs_rules, "a retry is scheduled");
+        assert_eq!(input.attempts, 1);
+        assert!(input.next_attempt >= before + Duration::from_millis(200));
+        assert_eq!(
+            drained(&messages),
+            [AudioToUi::Error {
+                direction: Some(DeviceDirection::Input),
+                message: AudioError::PipewireDisconnected.to_string(),
+            }]
+        );
+        assert!(!shared.lanes.output.needs_rules);
+        assert_eq!(shared.lanes.output.attempts, 0);
+    }
+
+    #[test]
+    fn a_disabled_lane_never_builds_nodes() {
+        let (mut shared, messages) = shared_with_messages();
+        add_device(
+            &mut shared,
+            device(40, "alsa_input.usb-fifine", DeviceDirection::Input),
+        );
+        // However it came to be asked.
+        shared.lanes.input.needs_rules = true;
+
+        supervise_lane(&mut shared, DeviceDirection::Input, Instant::now());
+        apply_rules(&mut shared, DeviceDirection::Input);
+
+        assert!(shared.lanes.input.nodes.is_none());
+        assert!(
+            shared.lanes.input.previous_names.is_empty(),
+            "the rules never ran"
+        );
+        assert_eq!(shared.memory.input, SelectionMemory::default());
+        assert_eq!(drained(&messages), [], "not even a failed attempt");
+
+        // The same call on the enabled lane does reach the build — and fails it, with no server.
+        shared.lanes.input.enabled = true;
+        apply_rules(&mut shared, DeviceDirection::Input);
+        assert_eq!(shared.lanes.input.previous_names, ["alsa_input.usb-fifine"]);
+        assert_eq!(drained(&messages).len(), 1);
+    }
+
+    #[test]
+    fn status_and_attachment_are_published_per_lane_and_only_when_they_change() {
+        let (mut shared, messages) = shared_with_messages();
+
+        publish(&mut shared);
+        assert_eq!(
+            drained(&messages),
+            [],
+            "two lanes that never ran have nothing to report"
+        );
+
+        shared
+            .lanes
+            .input
+            .counters
+            .sample_rate
+            .store(16_000, Ordering::Relaxed);
+        publish(&mut shared);
+        assert_eq!(
+            drained(&messages),
+            [AudioToUi::Status {
+                direction: DeviceDirection::Input,
+                status: AudioStatus {
+                    sample_rate: 16_000,
+                    ..AudioStatus::default()
+                },
+            }]
+        );
+        publish(&mut shared);
+        assert_eq!(drained(&messages), [], "unchanged: not sent again");
+
+        shared
+            .lanes
+            .output
+            .counters
+            .channels
+            .store(8, Ordering::Relaxed);
+        publish(&mut shared);
+        assert_eq!(
+            drained(&messages),
+            [AudioToUi::Status {
+                direction: DeviceDirection::Output,
+                status: AudioStatus {
+                    channels: 8,
+                    ..AudioStatus::default()
+                },
+            }],
+            "the output lane's change, and nothing about the input lane"
+        );
+
+        // A lane the GUI believes attached whose pair has gone is reported as attached to
+        // nothing, once.
+        shared.lanes.output.attached = Some("alsa_output.pci".to_owned());
+        publish(&mut shared);
+        assert_eq!(
+            drained(&messages),
+            [AudioToUi::Attached {
+                direction: DeviceDirection::Output,
+                node_name: None,
+            }]
+        );
+        publish(&mut shared);
+        assert_eq!(drained(&messages), []);
+    }
+
+    #[test]
+    fn an_attachment_is_reported_when_the_target_changes_and_not_otherwise() {
+        let mut lane = Lane::new(true, None);
+        assert_eq!(lane.note_attachment(None), None, "nothing to nothing");
+        assert_eq!(
+            lane.note_attachment(Some("t_71")),
+            Some(Some("t_71".to_owned()))
+        );
+        assert_eq!(lane.note_attachment(Some("t_71")), None);
+        assert_eq!(
+            lane.note_attachment(Some("t_stereo")),
+            Some(Some("t_stereo".to_owned())),
+            "a new target is news"
+        );
+        assert_eq!(lane.note_attachment(None), Some(None), "so is the teardown");
+        assert_eq!(lane.note_attachment(None), None);
+    }
+
+    #[test]
+    fn each_lane_holds_its_own_claim_on_the_default() {
+        let mut shared = shared_for_tests();
+        shared.defaults.output.holding = true;
+        shared.defaults.input.holding = true;
+
+        control(
+            &mut shared,
+            UiToAudio::SetAsDefault {
+                direction: DeviceDirection::Input,
+                want: false,
+            },
+        );
+        assert!(!shared.lanes.input.want_default);
+        assert!(!shared.defaults.input.holding, "handed back");
+        assert!(shared.lanes.output.want_default);
+        assert!(
+            shared.defaults.output.holding,
+            "not the input lane's to give"
+        );
+
+        control(
+            &mut shared,
+            UiToAudio::SetAsDefault {
+                direction: DeviceDirection::Input,
+                want: true,
+            },
+        );
+        assert!(shared.lanes.input.want_default);
+        assert!(
+            !shared.defaults.input.holding,
+            "with no nodes, the claim waits for them rather than naming a node that is not there"
+        );
+    }
+
+    #[test]
+    fn both_defaults_are_handed_back_on_exit() {
+        let mut shared = shared_for_tests();
+        shared.lanes.input.enabled = true;
+        shared.defaults.output.holding = true;
+        shared.defaults.input.holding = true;
+        // With no metadata object there is nothing to write to, so nothing to wait for; what
+        // matters here is that neither claim survives the exit path. `graph_churn` watches the
+        // real writes arrive.
+        release_all_defaults(&mut shared);
+        assert!(!shared.defaults.output.holding);
+        assert!(!shared.defaults.input.holding);
+    }
+
+    #[test]
+    fn losing_the_connection_keeps_which_lanes_are_enabled() {
+        let (mut shared, messages) = shared_with_messages();
+        shared.state = State::Connecting;
+        shared.lanes.input.enabled = true;
+        shared.lanes.input.previous_names = vec!["alsa_input.usb-fifine".to_owned()];
+
+        disconnect(&mut shared, "the server went away");
+
+        assert!(shared.lanes.output.enabled);
+        assert!(
+            shared.lanes.input.enabled,
+            "the reconnect rebuilds every lane that was running"
+        );
+        assert!(shared.lanes.input.previous_names.is_empty());
+        assert_eq!(
+            drained(&messages),
+            [AudioToUi::Disconnected {
+                reason: "the server went away".to_owned(),
+            }]
+        );
+
+        // And a detached lane stays detached through it.
+        shared.state = State::Connecting;
+        shared.lanes.input.enabled = false;
+        disconnect(&mut shared, "again");
+        assert!(!shared.lanes.input.enabled);
+    }
+
+    #[test]
+    fn a_lane_without_a_pair_is_not_forgiven_its_backoff() {
+        let mut lane = Lane::new(true, None);
+        let start = Instant::now();
+        lane.retry_later(start);
+        lane.retry_later(start);
+        assert_eq!(lane.attempts, 2);
+        // A lane still waiting to rebuild has not proved anything, however long it has been.
+        lane.forgive_if_stable(start + Duration::from_secs(60));
+        assert_eq!(lane.attempts, 2);
+    }
+
+    #[test]
+    fn a_pair_that_stays_up_as_long_as_the_wait_before_it_is_forgiven_its_backoff_and_its_error() {
+        let mut lane = Lane::new(true, None);
+        let start = Instant::now();
+        lane.retry_later(start);
+        lane.retry_later(start);
+        lane.last_error = Some(AudioError::DeviceUnavailable);
+        // The wait before the third try was the second step of the table, 400 ms.
+        assert_eq!(lane.next_attempt, start + Duration::from_millis(400));
+
+        // Built late — the registry was not ready when the wait ran out — which must not count
+        // as time the pair was up.
+        let built = start + Duration::from_secs(1);
+        lane.built_at = Some(built);
+        lane.forgive_if_stable(built + Duration::from_millis(399));
+        assert_eq!(lane.attempts, 2, "up for less than the wait before it");
+        assert_eq!(lane.last_error, Some(AudioError::DeviceUnavailable));
+
+        lane.forgive_if_stable(built + Duration::from_millis(400));
+        assert_eq!(lane.attempts, 0, "the next failure waits 200 ms again");
+        assert_eq!(lane.last_error, None, "and is reported again");
+    }
+
+    #[test]
+    fn a_pair_that_fails_sooner_than_the_wait_before_it_is_neither_forgiven_nor_reported_again() {
+        let (mut shared, messages) = shared_with_messages();
+        shared.lanes.input.enabled = true;
+        let fail = |shared: &mut Shared, at: Instant| {
+            shared
+                .lanes
+                .input
+                .status
+                .sink_error
+                .store(true, Ordering::Relaxed);
+            supervise_lane(shared, DeviceDirection::Input, at);
+        };
+        // What `apply_rules` leaves behind on a successful build, without a server to build on.
+        let build = |shared: &mut Shared, at: Instant| {
+            let lane = &mut shared.lanes.input;
+            lane.built_at = Some(at);
+            lane.needs_rules = false;
+        };
+        let reported = [AudioToUi::Error {
+            direction: Some(DeviceDirection::Input),
+            message: AudioError::DeviceUnavailable.to_string(),
+        }];
+
+        let start = Instant::now();
+        fail(&mut shared, start);
+        assert_eq!(drained(&messages), reported);
+
+        // Rebuilt when the 200 ms wait runs out, and refused again 100 ms later.
+        let built = shared.lanes.input.next_attempt;
+        build(&mut shared, built);
+        fail(&mut shared, built + Duration::from_millis(100));
+        let input = &shared.lanes.input;
+        assert_eq!(
+            input.attempts, 2,
+            "the wait doubles rather than starting again"
+        );
+        assert_eq!(
+            input.next_attempt,
+            built + Duration::from_millis(100) + Duration::from_millis(400)
+        );
+        assert_eq!(input.built_at, None, "the pair it was timing is gone");
+        assert_eq!(
+            drained(&messages),
+            [],
+            "the same failure as before, not news"
+        );
+
+        // A pair that then stays up long enough is forgiven by the tick, and its next failure is
+        // news again, backed off from 200 ms.
+        let built = shared.lanes.input.next_attempt;
+        build(&mut shared, built);
+        supervise_lane(
+            &mut shared,
+            DeviceDirection::Input,
+            built + Duration::from_millis(400),
+        );
+        assert_eq!(shared.lanes.input.attempts, 0);
+        let failed = built + Duration::from_secs(10);
+        fail(&mut shared, failed);
+        assert_eq!(drained(&messages), reported);
+        assert_eq!(
+            shared.lanes.input.next_attempt,
+            failed + Duration::from_millis(200)
+        );
     }
 }

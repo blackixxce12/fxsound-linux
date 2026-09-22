@@ -19,3 +19,8 @@ crossbeam-channel = { workspace = true }
 triple_buffer = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Only `graph_churn`'s tests use it, to read the format one of our nodes holds out of `pw-dump`'s
+# JSON rather than out of a status the engine is right not to send.
+serde_json = { workspace = true }

@@ -1753,10 +1753,15 @@ Because this module can silence a user's machine, the following must all be gree
 > `audiopassthru/` has no capture-device mode and `SoundDevice::isCaptureDevice`
 > (`AudioPassthru.h:34`) marks the FxSound endpoint itself, not a microphone. This section is the
 > authority for the port's second direction, implemented in `crates/fxsound-audio/src/engine.rs`
-> (`build_nodes`, `switch_direction`, `claim_default`, `release_default`) and
+> (`build_nodes`, `select_device`, `detach_lane`, `supervise_lane`, `claim_default`,
+> `release_default`; how the two directions run side by side is §29) and
 > `crates/fxsound-audio/src/devices.rs` (`choose_device`, `restore_default_candidate`).
 
 ### 28.1 One engine, one direction at a time
+
+> **Superseded in 0.4.0 by §29.** The engine now keeps one lane per direction and runs both at
+> once; what follows describes 0.3.0, and every rule in §28.2–§28.7 that is not about "one
+> direction at a time" still holds per lane.
 
 `fxsound_core::DeviceDirection { Output, Input }` is the axis. The engine starts in `Output` — the
 Windows behaviour of §19 — and enters `Input` when the GUI, the tray or `--output=<node.name>` names
@@ -1870,8 +1875,10 @@ happens *because* the user picked a microphone, and rule 2 would otherwise attac
 whatever WirePlumber had as the default source instead.
 
 `SelectionMemory` (§19.5's five registry slots) exists **once per direction**, so trying a
-microphone never forgets which speakers the user had, and `pwszIDPreviousRealDevices` is cleared on
-every direction switch so rule 5 cannot treat every device of the new direction as freshly plugged.
+microphone never forgets which speakers the user had. `pwszIDPreviousRealDevices` is kept per lane
+(`previous_names`) and cleared whenever the lane is switched on again, when it is detached, and on
+every connect and disconnect, so rule 5 cannot treat every device that appeared while the lane was
+not looking as freshly plugged.
 
 `--output NAME` matches a device of either direction (node name first, then description);
 `--next-output` cycles only within the selected device's direction so a compositor keybind never
@@ -1887,8 +1894,9 @@ keys:    default.audio.source              (in effect now — WirePlumber's, rea
 value:   Spa:String:JSON  {"name":"fxsound_source"}
 ```
 
-The engine **takes the default automatically** for its active direction as soon as its pair of
-nodes is up (`want_default` is `true` unless the GUI sent `SetAsDefault(false)`), after remembering
+The engine **takes the default automatically** for each lane as soon as that lane's pair of nodes
+is up (the lane's `want_default` is `true` unless the GUI sent `SetAsDefault { want: false }` for
+that direction), after remembering
 the previous default: the first of `default.configured.audio.*`, `default.audio.*` that is not one
 of our own names goes into `most_recent_default` (and `original_default` once). A stale configured
 value that already names us — left behind by a `SIGKILL`ed FxSound, which WirePlumber's state file
@@ -1898,19 +1906,28 @@ The default is **released before the nodes are destroyed**, always, on each of t
 
 | Path | Function | What happens, in order |
 | --- | --- | --- |
-| clean exit | `engine::run` tail | `release_all_defaults` → drop the session (nodes, metadata proxy) |
-| direction switch | `switch_direction` | `release_default(old)` → drop nodes → set direction → re-run rules → build → `claim_default(new)` |
-| rules end in an error (no devices, `-57`, `-58`) | `apply_rules` | `release_default(active)` → drop nodes → report |
-| reconnect / restart / NODE 1 error | `disconnect` | `release_all_defaults` → drop session → backoff → reconnect → claim again |
-| `SetAsDefault(false)` | `handle_control` | `release_default(active)`, nodes untouched |
+| clean exit | `engine::run` tail | `release_all_defaults`, confirmed by one server `sync` → `close_session` (both lanes' nodes, metadata proxy) |
+| `DetachLane(direction)` | `detach_lane` | `release_default(direction)` → drop that lane's nodes → disable the lane → `Attached { direction, None }`; the other lane untouched |
+| rules end in an error (no devices, `-57`, `-58`) | `apply_rules` | `release_default(direction)` → drop that lane's nodes → report |
+| `SetAsDefault { direction, want: false }` | `control` | `release_default(direction)`, nodes untouched |
 
 Release writes `restore_default_candidate(memory, devices, direction)` — `user_selected` →
 `most_recent_playback` → `most_recent_default` → `prior_default` → `original_default`, first one
 *present in that direction* — or leaves the key alone when nothing remembered is present.
 
+One path deliberately hands **nothing** back: `disconnect` (a core error, a server that went away,
+or `Restart`). The connection goes in the same callback, and libpipewire only writes to the socket
+from the loop, so a metadata write issued there would never leave the process. It forgets what the
+session knew about both defaults → `close_session` drops both lanes' pairs → arms the socket's
+backoff → the reconnect rebuilds every enabled lane and claims its default again (`claim_default`
+skips a stale value that still names us). WirePlumber falls back on its own in the gap, once our
+nodes vanish.
+
 Two rebuild paths deliberately **keep** the default, because the same node is about to reappear
 under the same name and `default.configured.audio.*` survives the gap: a target change within the
-same direction, and the supervisor's format-mismatch / NODE 2-error rebuilds.
+same lane, and the supervisor's format-mismatch / NODE 1- or NODE 2-error rebuilds. Since 0.4.0 a
+stream error is one of these, a rebuild of that lane alone on its own backoff (`supervise_lane`,
+§29.1), and no longer a path to `disconnect`.
 
 ### 28.7 What the GUI receives
 
@@ -1919,3 +1936,81 @@ every input sorted by description, each with `is_default` judged against the def
 direction*. Mono outputs are omitted (they could never be chosen); mono inputs are listed. The tray
 draws the same list as two radio groups under disabled "Output" / "Input" header rows, and its
 tooltip's second line reads `Output: …` or `Input: …` after the selected device's direction.
+
+## 29. 0.4.0: two lanes
+
+> **Scope.** Linux only; supersedes the "one direction at a time" rule of §28.1. Implemented in
+> `crates/fxsound-audio/src/engine.rs` (`Lane`, `supervise_lane`, `select_device`, `detach_lane`,
+> `close_session`); the contract is `docs/0.4.0-design.md` §1.
+
+### 29.1 The lane model
+
+A **lane** is one direction's worth of engine state, and the engine keeps two, `PerDirection<Lane>`:
+the **output lane** (`fxsound_sink` + `fxsound_output`, the music chain) and the **input lane**
+(`fxsound_capture` + `fxsound_source`, the voice chain). Both pairs of nodes can exist at once, so
+with both lanes on the system lists "FxSound (Output)" among its sinks *and* "FxSound (Input)"
+among its sources.
+
+| Event | What happens |
+| --- | --- |
+| start | The output lane is enabled (the Windows behaviour of §19) and attaches by the device rules; the input lane is disabled. |
+| `SelectDevice { direction, .. }` | Records `user_selected` for that direction, enables that lane, forgets its backoff and its last error (a choice that fails too is reported to the user who made it), and runs its rules **at once** — not on the next tick — once the registry's first dump is in. The other lane is not touched. |
+| `DetachLane(direction)` | `release_default(direction)` → drop that lane's nodes → disable it → `Attached { direction, None }`, always sent, even for a lane that had no nodes. |
+| `SetAsDefault { direction, want }` | Per lane: claims when the lane has nodes (otherwise when they come up), releases on `false`. |
+| a device appears, goes, or its direction's default moves | `needs_rules` on the lane of that direction, **only if that lane is enabled** — a microphone plugged in while the input lane is off does not switch it on. |
+| a lane's NODE 1 or NODE 2 goes into `Error` | That lane's nodes are dropped (its default kept, as on every transient rebuild of §28.6), `Error { Some(direction) }` is reported, and the lane is retried on **its own** backoff, 200 ms doubling to 5 s. The socket stays up and the other lane plays on. The count and the error are forgiven together (`Lane::forgive_if_stable`), and only once a rebuilt pair has stayed up — timed from its build, not from when the rebuild was allowed — for as long as the wait before it: a device that refuses every stream a moment after it is made is neither retried every 200 ms for ever nor reported on every retry, while one that has recovered starts from 200 ms again and its next failure is reported afresh. |
+| `build_nodes` fails | The same backoff, rather than waiting for an unrelated registry event that may never come. |
+| the connection drops, or `Restart` | Both lanes' pairs go with the session (`close_session`); each lane keeps whether it is enabled, its selection memory and its DSP; the reconnect rebuilds every enabled lane and no other. |
+| exit | `release_all_defaults` hands back the sink *and* the source, whichever this run holds, confirmed by one server `sync` (§21.5), and only then do the nodes go. |
+
+**Per lane:** enabled flag; the pair of nodes; the DSP (`LaneDsp`) and its recycle channel; the
+ring; the counters and stream flags the process callbacks write; `previous_names` (rule 5's
+snapshot); `want_default`; `needs_rules`; the backoff (`attempts`, `next_attempt`, and `built_at`,
+when the current pair came up); the format mismatch total; the published `ProcessLatency`; the last
+status, error and attachment the GUI was told. **Per direction but not in the lane:**
+`SelectionMemory` (§28.5) and the metadata's view of the default (`DefaultState`), which exist
+whether or not the lane runs. **Shared:** the connection, the registry's device list, the node
+probes, the graph rate and the socket's own backoff.
+
+Every per-lane path to the process callbacks — ring, counters, stream flags, recycle channel — is
+chosen from the lane of the DSP being handed to NODE 1 (`SinkData::new`), never from a direction the
+caller passes, so the voice chain's output can never be popped into the speakers' ring.
+
+What the GUI receives, per lane: `Status { direction, status }` when that lane's status changed;
+`Attached { direction, node_name }` whenever the lane's target changes, including `None` when its
+pair goes for any reason; `Error { direction: Some(d), .. }` for that lane's failures and
+`Error { direction: None, .. }` for the connection's. A lane that has never run reports the
+default status and is not announced at all.
+
+### 29.2 Why one link-group for all four nodes is still safe
+
+All four nodes keep `node.link-group = "fxsound"`. WirePlumber consults the group in exactly one
+place that matters here, `linking-utils.lua` `canLink` (0.5.17, verified on disk), and only when
+the node *being linked* carries a group — our two streams, `fxsound_output` and `fxsound_capture`;
+applications have none, so their links to `fxsound_sink` and from `fxsound_source` are never
+examined. For our two streams it refuses a target in the same group, which is the protection §28.3
+relies on, and it stays exactly as strong with four members as with two: neither stream can be
+linked into our own virtual device, whichever lane that device belongs to.
+
+What the shared group cannot do is refuse a link either lane needs, because **no such link joins
+two of our nodes**: `fxsound_output` → a real sink, a real source → `fxsound_capture`, applications
+→ `fxsound_sink`, `fxsound_source` → applications. The cross-lane links the group *would* refuse —
+`fxsound_output` into `fxsound_source` (not a sink), `fxsound_capture` from `fxsound_sink`'s monitor
+(`stream.capture.sink = false`, and our nodes are never offered as targets, `OUR_NODE_NAMES`) — are
+ones FxSound never asks for. The rings are per lane, so no signal crosses between the lanes inside
+the process either.
+
+One indirect case is refused, stated plainly. `canLink` also walks through a third-party filter to
+the far side of its own link-group, up to eight hops, and refuses a link that would reach our group
+again. So a user whose output lane targets one filter's sink half (say PipeWire's own
+`echo-cancel-sink`) while the input lane captures from *the same filter's* source half
+(`echo-cancel-source`) gets the second of those two links refused — WirePlumber reads it as FxSound
+feeding itself through the filter, which, audio-wise, it is not. Separate groups per lane would
+allow it; one group was kept because it is the design's contract, it is what `LINK_GROUP` and every
+node property test pin, and that topology is the one §7 of the 0.4.0 design replaces with its own
+echo canceller.
+
+That canceller is the one place the group needs care. §7 of the design gives its three nodes
+`node.link-group = fxsound`; taken literally, `fxsound_aec_source` would share a group with
+`fxsound_capture`, which targets it, and the direct same-group check — not even the walk — would
+refuse the capture link outright. The canceller's nodes need a group of their own.

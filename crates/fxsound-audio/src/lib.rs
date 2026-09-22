@@ -1,5 +1,6 @@
-//! The FxSound audio backend for Linux: a PipeWire virtual sink — or, behind a microphone, a
-//! PipeWire virtual source — with the DSP engine in its process callback.
+//! The FxSound audio backend for Linux: a PipeWire virtual sink in front of the speakers and a
+//! PipeWire virtual source behind the microphone, each with its own DSP chain in its process
+//! callback, running side by side.
 //!
 //! # What this replaces
 //!
@@ -13,13 +14,15 @@
 //!
 //! # Topology
 //!
-//! Two nodes, joined by `node.link-group = "fxsound"` — the design `docs/spec/12-audio-io.md` §18
-//! chose (Option A) and §19.1 draws. FxSound runs in exactly one **direction** at a time
-//! ([`fxsound_core::DeviceDirection`]); the two directions are mirror images of each other, and
-//! the two process callbacks and the ring between them are the same code in both:
+//! One pair of nodes per **lane** — one lane per [`fxsound_core::DeviceDirection`] — every node
+//! carrying `node.link-group = "fxsound"`: the design `docs/spec/12-audio-io.md` §18 chose (Option
+//! A), §19.1 draws, and §29 extends to two lanes. Either lane can be enabled or detached on its
+//! own, and both pairs can exist at once (`docs/0.4.0-design.md` §1). The two lanes are mirror
+//! images of each other, and the two process callbacks and the ring between them are the same
+//! code in both — each lane has its own ring, its own chain and its own paths to the GUI:
 //!
 //! ```text
-//!  OUTPUT (the Windows behaviour):
+//!  OUTPUT LANE (the Windows behaviour; enabled at start):
 //!
 //!  apps ──► fxsound_sink    (Audio/Sink, Direction::Input)    process(): DSP in place ──┐
 //!                                                                                       │ ring
@@ -28,7 +31,7 @@
 //!                ▼  target.object = <chosen sink's node.name>
 //!           alsa_output.…   (the user's real speakers)
 //!
-//!  INPUT (Linux only, `docs/spec/12-audio-io.md` §28):
+//!  INPUT LANE (Linux only, `docs/spec/12-audio-io.md` §28; enabled when a microphone is picked):
 //!
 //!           alsa_input.…    (the user's real microphone)
 //!                │
@@ -46,14 +49,15 @@
 //! `audiopassthru/`. Nodes owned by our own client connection disappear the instant the socket
 //! closes.
 //!
-//! The `node.link-group` is not decoration: it is how WirePlumber learns the two nodes are one
-//! logical device and refuses to link `fxsound_output` back into `fxsound_sink` — or, in the other
-//! direction, `fxsound_capture` into `fxsound_source` — which is otherwise exactly what happens the
-//! moment our node becomes the default.
+//! The `node.link-group` is not decoration: it is how WirePlumber learns our nodes are one
+//! logical device and refuses to link `fxsound_output` back into `fxsound_sink` — or, in the input
+//! lane, `fxsound_capture` into `fxsound_source` — which is otherwise exactly what happens the
+//! moment our node becomes the default. All four nodes share the one group, which is safe because
+//! no link either lane needs ever joins two of our own nodes (`docs/spec/12-audio-io.md` §29).
 //!
-//! Switching direction tears the active pair down and builds the other one, so the system only
-//! ever sees *one* FxSound device: "FxSound (Output)" under its sinks, or "FxSound (Input)" under
-//! its sources, with the word in the system language ([`locale`]).
+//! With both lanes enabled the system sees *two* FxSound devices: "FxSound (Output)" under its
+//! sinks and "FxSound (Input)" under its sources, each with the word in the system language
+//! ([`locale`]). Detaching a lane takes only its own device away.
 //!
 //! # Threads
 //!
@@ -78,16 +82,17 @@
 //!
 //! # The session default
 //!
-//! Once its pair of nodes is up, FxSound **does** make itself the session default for its
-//! direction — `default.configured.audio.sink = fxsound_sink`, or
-//! `default.configured.audio.source = fxsound_source` — because that is the whole point: the user
-//! picks *their* speakers or *their* microphone in FxSound and every application follows without
-//! being re-routed by hand, exactly as the Windows driver does. It does so politely, per
-//! `docs/spec/12-audio-io.md` §21: the default that was there before is remembered first and
-//! handed back — on exit, on every direction switch, and whenever the nodes go away for good —
-//! **before** the nodes are destroyed, so there is never a window in which the default names a
-//! node that no longer exists. Only the `configured` key is ever written; `default.audio.*` is
-//! WirePlumber's. A caller can opt out with [`UiToAudio::SetAsDefault`] with `want: false`.
+//! Once a lane's pair of nodes is up, FxSound **does** make itself the session default for that
+//! lane's direction — `default.configured.audio.sink = fxsound_sink` for the output lane,
+//! `default.configured.audio.source = fxsound_source` for the input lane — because that is the
+//! whole point: the user picks *their* speakers or *their* microphone in FxSound and every
+//! application follows without being re-routed by hand, exactly as the Windows driver does. Each
+//! lane holds its own claim. It does so politely, per `docs/spec/12-audio-io.md` §21: the default
+//! that was there before is remembered first and handed back — on exit (both lanes'), when a lane
+//! is detached (that lane's), and whenever a lane's nodes go away for good — **before** the nodes
+//! are destroyed, so there is never a window in which a default names a node that no longer
+//! exists. Only the `configured` keys are ever written; `default.audio.*` is WirePlumber's. A
+//! caller can opt out, lane by lane, with [`UiToAudio::SetAsDefault`] with `want: false`.
 //!
 //! # What it deliberately does not do
 //!
@@ -105,7 +110,10 @@
 //!   WirePlumber that has never been told a default picks real hardware, not us; the default is
 //!   taken only through the explicit metadata write above, which is also the only thing that can
 //!   be handed back.
-//! * **It never runs in both directions at once.** One pair of nodes, one default, one signal.
+//! * **It never feeds one lane from the other.** The two lanes share a link-group and nothing
+//!   else: each has its own ring, its own chain, its own counters and its own claim on a default,
+//!   so the music chain cannot reach the microphone's signal or the other way round, and one lane
+//!   failing leaves the other playing.
 //!
 //! [`DspParams`]: fxsound_core::messages::DspParams
 //! [`InputDspParams`]: fxsound_core::messages::InputDspParams
@@ -297,13 +305,14 @@ impl AudioEngine {
     /// device selection, creating the two nodes, taking the session default — happens in the
     /// background and is reported through [`EngineHandle::try_recv`].
     ///
-    /// The engine starts in the output direction. It attaches to the device the port of
-    /// `sndDevicesImplementDeviceRules` picks ([`devices::choose_device`]) and, as soon as the
-    /// nodes are up, makes `fxsound_sink` the configured default sink — remembering the previous
-    /// default so it can be handed back (`docs/spec/12-audio-io.md` §21). Send
-    /// [`UiToAudio::SelectDevice`] to attach to a specific device, or to a microphone, which
-    /// switches the engine into the input direction; send [`UiToAudio::SetAsDefault`] with `want: false`
-    /// to keep the default where it is.
+    /// The engine starts with the output lane enabled and the input lane detached. The output lane
+    /// attaches to the device the port of `sndDevicesImplementDeviceRules` picks
+    /// ([`devices::choose_device`]) and, as soon as its nodes are up, makes `fxsound_sink` the
+    /// configured default sink — remembering the previous default so it can be handed back
+    /// (`docs/spec/12-audio-io.md` §21). Send [`UiToAudio::SelectDevice`] to attach a lane to a
+    /// specific device — a microphone enables the input lane beside the output lane, never instead
+    /// of it — [`UiToAudio::DetachLane`] to switch a lane off, and [`UiToAudio::SetAsDefault`]
+    /// with `want: false` to keep a lane's default where it is.
     ///
     /// # Errors
     /// [`AudioError::PipewireUnavailable`] if there is no PipeWire session to connect to, or if
@@ -312,6 +321,7 @@ impl AudioEngine {
     /// [`AudioToUi`].
     ///
     /// [`UiToAudio::SelectDevice`]: fxsound_core::messages::UiToAudio::SelectDevice
+    /// [`UiToAudio::DetachLane`]: fxsound_core::messages::UiToAudio::DetachLane
     pub fn start() -> Result<EngineHandle, AudioError> {
         Self::start_with(None, None)
     }
@@ -557,9 +567,9 @@ impl EngineHandle {
 
     /// Stop the engine and wait for the PipeWire thread to finish tearing down.
     ///
-    /// Tearing down in order matters: if FxSound holds the session default — sink or source — it
-    /// is handed back to a real device *before* the nodes are destroyed, so there is never a
-    /// window in which the default points at a node that no longer exists
+    /// Tearing down in order matters: every session default FxSound holds — the sink, the source,
+    /// or both — is handed back to a real device *before* the nodes are destroyed, so there is
+    /// never a window in which a default points at a node that no longer exists
     /// (`docs/spec/12-audio-io.md` §21.5). The hand-back is confirmed by a server round trip
     /// before the socket closes — libpipewire does not flush on disconnect — so this returns only
     /// once `default.configured.audio.*` really has been rewritten, or after a short bounded wait
