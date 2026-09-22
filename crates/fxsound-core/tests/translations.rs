@@ -41,6 +41,7 @@ const INDIRECT_KEYS: &[&str] = &[
     "General",
     "Help",
     "General Preferences",
+    "Microphone",
     // `HotkeyCommand::label` in `dialogs/settings.rs`.
     "Turn FxSound On/Off",
     "Open/Close FxSound",

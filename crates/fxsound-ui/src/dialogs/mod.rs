@@ -32,11 +32,15 @@
 //! the pointer (so a title-bar drag has to be handed to the compositor with
 //! [`egui::ViewportCommand::StartDrag`], which is what [`ChromeResponse::drag_started`] is for).
 
+pub mod calibration;
 pub mod changelog;
 pub mod message;
 pub mod presets;
 pub mod settings;
 
+pub use calibration::{
+    CalibrationAction, CalibrationDialog, CalibrationPhase, CalibrationResultView, CalibrationView,
+};
 pub use message::{ConfirmChoice, ConfirmStyle, MessageBox, Toast, ToastLayout, ToastResponse};
 pub use presets::{
     ExportDialog, ExportState, ImportDialog, ImportState, ImportSummary, OverwriteChoice,
@@ -681,6 +685,41 @@ pub(crate) fn draw_wrapped(
     height
 }
 
+/// `−48 dB`: whole decibels, a real minus sign, and never `−0`.
+///
+/// The microphone pane and the calibration wizard both print levels this way; the readout strip
+/// has its own, which also does tenths.
+pub(crate) fn whole_db(db: f32) -> String {
+    if !db.is_finite() {
+        return "— dB".to_owned();
+    }
+    let rounded = db.round();
+    if rounded < 0.0 {
+        format!("−{:.0} dB", -rounded)
+    } else {
+        format!("{:.0} dB", rounded.abs())
+    }
+}
+
+/// A Unix time as an ISO date, `2026-09-23`, in UTC.
+///
+/// A date that reads the same in every language, without a time-zone database or a calendar
+/// crate for one line of text. Howard Hinnant's `civil_from_days`, which is exact over the whole
+/// proleptic Gregorian calendar.
+pub(crate) fn iso_date(unix_time: u64) -> String {
+    let days = (unix_time / 86_400) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +735,18 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_fonts(theme::font_definitions());
         ctx
+    }
+
+    /// `key` in English and in every language's table, read without touching the global table
+    /// the other tests are drawing with.
+    pub(super) fn every_translation(key: &str) -> Vec<(&'static str, String)> {
+        use fxsound_core::i18n::{Catalogue, LANGUAGES};
+        let mut all = vec![("en", key.to_owned())];
+        for language in &LANGUAGES[1..] {
+            let table = Catalogue::for_language(language);
+            all.push((language.code, table.get(key).unwrap_or(key).to_owned()));
+        }
+        all
     }
 
     #[test]
@@ -849,5 +900,30 @@ mod tests {
         assert!((normal_font().size - 17.0).abs() < 1e-6);
         assert!((small_font().size - 14.0).abs() < 1e-6);
         assert!((title_font().size - 17.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_level_prints_in_whole_decibels_with_a_real_minus_and_no_negative_zero() {
+        assert_eq!(whole_db(-48.2), "−48 dB");
+        assert_eq!(whole_db(-18.6), "−19 dB");
+        assert_eq!(whole_db(-0.3), "0 dB");
+        assert_eq!(whole_db(0.0), "0 dB");
+        assert_eq!(whole_db(3.4), "3 dB");
+        assert_eq!(whole_db(f32::NAN), "— dB");
+        assert_eq!(whole_db(f32::NEG_INFINITY), "— dB");
+    }
+
+    #[test]
+    fn a_unix_time_prints_as_the_iso_date_it_falls_on_in_utc() {
+        assert_eq!(iso_date(0), "1970-01-01");
+        assert_eq!(iso_date(86_399), "1970-01-01");
+        assert_eq!(iso_date(86_400), "1970-01-02");
+        // A leap day, the day after it, and the turn of a century that is a leap year.
+        assert_eq!(iso_date(951_782_400), "2000-02-29");
+        assert_eq!(iso_date(951_868_800), "2000-03-01");
+        assert_eq!(iso_date(1_709_164_800), "2024-02-29");
+        // The last second of a year and the first of the next.
+        assert_eq!(iso_date(1_798_761_599), "2026-12-31");
+        assert_eq!(iso_date(1_798_761_600), "2027-01-01");
     }
 }

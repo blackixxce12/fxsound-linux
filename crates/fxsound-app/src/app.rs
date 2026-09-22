@@ -113,6 +113,82 @@ impl LaneControls {
     }
 }
 
+/// What the selected voice preset itself says about the stages the Settings pane can override.
+///
+/// Captured when a preset is applied, because the published snapshot holds the *effective* values
+/// — the override written over the preset — and an override set back to `Preset` has to find what
+/// the preset said underneath it (0.4.0 design §2 & 3: the settings win when not `Preset`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PresetVoicing {
+    /// The master switch, which a preset with no `[denoise]` table and `rnnoise = false` leaves
+    /// off whatever its level says.
+    pub(crate) rnnoise: bool,
+    pub(crate) denoise_level: fxsound_core::DenoiseLevel,
+    pub(crate) denoise_channels: fxsound_core::DenoiseChannelMode,
+    /// The preset's own row, which may differ from its level's: kept whenever the level in force
+    /// is the preset's.
+    pub(crate) denoise_control: fxsound_core::DenoiseControl,
+    pub(crate) deesser_mode: fxsound_core::DeEsserMode,
+    pub(crate) dereverb: fxsound_core::DereverbLevel,
+}
+
+impl PresetVoicing {
+    fn of(params: &InputDspParams) -> Self {
+        Self {
+            rnnoise: params.rnnoise,
+            denoise_level: params.denoise_level,
+            denoise_channels: params.denoise_channels,
+            denoise_control: params.denoise_control,
+            deesser_mode: params.deesser_mode,
+            dereverb: params.dereverb,
+        }
+    }
+}
+
+/// Write the Settings pane's microphone settings over what the voice preset said.
+///
+/// - **Noise suppression** and **denoiser channels** are overrides: `Preset` follows the preset,
+///   anything else wins. A pinned level also decides the master switch — `Off` stops the stage,
+///   any other level runs it even on a preset that has no denoiser — and brings its own table
+///   row, unless it is the level the preset already names, whose tuned row is kept.
+/// - **De-esser mode** and **de-reverb** have no `Preset` choice, so they are read as "at least":
+///   `Classic` and `Off`, the defaults, leave the preset's choice alone, and `Adaptive` or a
+///   de-reverb level ask for more than a preset that says less. A shipped preset that asks for the
+///   adaptive de-esser (Gaming Headset) keeps it on a fresh install; the design's "off unless a
+///   preset or the setting asks" (§7) is the same rule for the de-reverb.
+pub(crate) fn apply_microphone_settings(
+    params: &mut InputDspParams,
+    preset: &PresetVoicing,
+    settings: &Settings,
+) {
+    use fxsound_core::{DeEsserMode, DenoiseLevel, DereverbLevel};
+
+    let level = settings.noise_suppression.resolve(preset.denoise_level);
+    params.denoise_level = level;
+    params.denoise_control = if level == preset.denoise_level {
+        preset.denoise_control
+    } else {
+        level.control()
+    };
+    params.rnnoise = match settings.noise_suppression.level() {
+        Some(pinned) => pinned != DenoiseLevel::Off,
+        None => preset.rnnoise,
+    };
+    params.denoise_channels = settings.denoise_channels.resolve(preset.denoise_channels);
+
+    params.deesser_mode = if settings.deesser_mode == DeEsserMode::Adaptive {
+        DeEsserMode::Adaptive
+    } else {
+        preset.deesser_mode
+    };
+    let rank = |level: DereverbLevel| DereverbLevel::ALL.iter().position(|l| *l == level);
+    params.dereverb = if rank(settings.dereverb) > rank(preset.dereverb) {
+        settings.dereverb
+    } else {
+        preset.dereverb
+    };
+}
+
 /// Everything the running application owns.
 pub struct App {
     /// What the views draw.
@@ -120,6 +196,11 @@ pub struct App {
     /// The snapshot published to the audio thread.
     params: DspParams,
     input_params: InputDspParams,
+    /// What the selected voice preset said before the Settings pane's overrides were written
+    /// over it (see [`apply_microphone_settings`]).
+    input_voicing: PresetVoicing,
+    /// The audio thread's reason the echo canceller is not running, for the Settings pane.
+    echo_cancel_detail: String,
     /// The stage ordering the selected voice preset names, as last told to the audio thread.
     /// Not part of the snapshot, because the audio thread cannot act on it in place: a chain is
     /// built, not set, and the building happens on its main loop.
@@ -202,6 +283,8 @@ impl App {
             },
             params: DspParams::default(),
             input_params: unvoiced_input_params(),
+            input_voicing: PresetVoicing::of(&unvoiced_input_params()),
+            echo_cancel_detail: String::new(),
             input_chain: fxsound_preset::input::DEFAULT_CHAIN.to_owned(),
             input_presets: Vec::new(),
             devices_seen: false,
@@ -223,14 +306,12 @@ impl App {
             parked: None,
         };
 
-        // Hand the audio thread what a previous run displaced, before it does anything: if that
-        // run was killed while holding the default, the metadata still names a node that is gone
-        // and only this can point it back at a real device.
+        // What the settings file asks of the audio thread before it does anything else. See
+        // [`startup_messages`].
         if let Some(engine) = &app.engine {
-            engine.send(UiToAudio::SeedRememberedDefaults {
-                output: app.settings.remembered_default_output.clone(),
-                input: app.settings.remembered_default_input.clone(),
-            });
+            for message in startup_messages(&app.settings) {
+                engine.send(message);
+            }
         }
 
         app.input_presets = fxsound_preset::input::InputPreset::load_shipped();
@@ -326,7 +407,10 @@ impl App {
                 AudioToUi::Error { message, .. } => {
                     self.state.notify(message);
                 }
-                AudioToUi::EchoCancel { running, .. } => self.state.echo_cancel_running = running,
+                AudioToUi::EchoCancel { running, detail } => {
+                    self.state.echo_cancel_running = running;
+                    self.echo_cancel_detail = detail;
+                }
                 // What a lane is really attached to. The selection shown is still the user's
                 // choice from the settings: the single-lane engine this crate runs against today
                 // reports its one lane moving between directions, which is not a lane going away.
@@ -614,6 +698,7 @@ impl App {
 
         // The stages the interface has no control for come straight from the preset, which is the
         // whole reason the voice set is navigated by preset rather than by knobs.
+        self.input_voicing = PresetVoicing::of(&params);
         self.input_params = params;
         self.sync_params_from_state();
 
@@ -887,6 +972,9 @@ impl App {
             DeviceDirection::Output => self.sync_output_params_from_state(),
             DeviceDirection::Input => self.sync_input_params_from_state(),
         }
+        // Whichever lane the window shows: the Settings pane's microphone settings are global, and
+        // changing one while the speakers are being edited must still reach the voice chain.
+        apply_microphone_settings(&mut self.input_params, &self.input_voicing, &self.settings);
         self.reflect_input_params();
 
         if let Some(engine) = self.engine.as_mut() {
@@ -915,6 +1003,9 @@ impl App {
     /// force, whether the de-reverb and the echo canceller are asked for, and the de-esser corner
     /// the preset asked for (so the strip can tell when the adaptive mode moved it).
     fn reflect_input_params(&mut self) {
+        // The switch in force, not only the preset's: a pinned noise-suppression level runs the
+        // denoiser on a preset that has none, and the strip has to say so.
+        self.state.denoise_on = self.input_params.rnnoise;
         self.state.denoise_level = self.input_params.denoise_level;
         self.state.dereverb_on = self.input_params.dereverb != fxsound_core::DereverbLevel::Off;
         self.state.deesser_requested_hz = self.input_params.deesser_hz;
@@ -1234,6 +1325,8 @@ impl App {
             state: UiState::default(),
             params: DspParams::default(),
             input_params: unvoiced_input_params(),
+            input_voicing: PresetVoicing::of(&unvoiced_input_params()),
+            echo_cancel_detail: String::new(),
             input_chain: fxsound_preset::input::DEFAULT_CHAIN.to_owned(),
             input_presets: Vec::new(),
             devices_seen: false,
@@ -1689,6 +1782,28 @@ fn unvoiced_input_params() -> InputDspParams {
     }
 }
 
+/// The control-plane requests a freshly started engine is sent from the settings file, in order.
+///
+/// The engine is created once per process and remembers nothing of the last run, so anything the
+/// settings file asks of it that is not carried by a parameter snapshot has to be said here:
+///
+/// - What a previous run displaced, first: if that run was killed while holding the default, the
+///   metadata still names a node that is gone and only this can point it back at a real device.
+/// - Echo cancellation, when it was left on. It is otherwise sent only when the checkbox is
+///   toggled, so a saved `echo_cancel = true` came back as a pane and a strip saying it had been
+///   asked for, while the engine was never told and `module-echo-cancel` never loaded. Off is the
+///   engine's own starting state and is not repeated.
+fn startup_messages(settings: &Settings) -> Vec<UiToAudio> {
+    let mut messages = vec![UiToAudio::SeedRememberedDefaults {
+        output: settings.remembered_default_output.clone(),
+        input: settings.remembered_default_input.clone(),
+    }];
+    if settings.echo_cancel {
+        messages.push(UiToAudio::SetEchoCancel(true));
+    }
+    messages
+}
+
 /// An equalizer as the window holds it, from a snapshot's two parallel arrays.
 fn bands_of(centres: &[f32], boosts: &[f32]) -> Vec<EqBand> {
     centres
@@ -1891,6 +2006,7 @@ impl App {
                     .any(|d| d.name == config.device_id),
             })
             .collect();
+        self.refresh_settings_state(&mut state);
         state
     }
 
@@ -2041,9 +2157,47 @@ impl App {
                 }
             }
 
+            // The microphone pane (0.4.0 design §1.4). Each is written, saved, and published to
+            // the voice chain at once, whichever lane the window is editing.
+            A::SetNoiseSuppression(choice) => {
+                self.settings.noise_suppression = *choice;
+                state.settings.noise_suppression = *choice;
+                self.microphone_setting_changed();
+            }
+            A::SetDenoiseChannels(choice) => {
+                self.settings.denoise_channels = *choice;
+                state.settings.denoise_channels = *choice;
+                self.microphone_setting_changed();
+            }
+            A::SetDeEsserMode(mode) => {
+                self.settings.deesser_mode = *mode;
+                state.settings.deesser_mode = *mode;
+                self.microphone_setting_changed();
+            }
+            A::SetDereverb(level) => {
+                self.settings.dereverb = *level;
+                state.settings.dereverb = *level;
+                self.microphone_setting_changed();
+            }
+            A::SetEchoCancel(on) => {
+                self.settings.echo_cancel = *on;
+                state.settings.echo_cancel = *on;
+                // A module the audio thread loads, not a stage in the snapshot; it answers with
+                // `AudioToUi::EchoCancel`, which is how "unavailable" reaches the pane.
+                if let Some(engine) = &self.engine {
+                    engine.send(UiToAudio::SetEchoCancel(*on));
+                }
+                self.microphone_setting_changed();
+            }
+
             // The window layer owns these: it has the viewport, the hotkey example is a
-            // dialog-local hint, and the changelog is a pane of its own.
-            A::ShowHotkeyExample | A::ShowChangelog | A::SelectDeviceRow(_) | A::Close => {}
+            // dialog-local hint, and the changelog and the calibration wizard are panes of their
+            // own.
+            A::ShowHotkeyExample
+            | A::ShowChangelog
+            | A::OpenCalibration
+            | A::SelectDeviceRow(_)
+            | A::Close => {}
         }
     }
 
@@ -2070,6 +2224,35 @@ impl App {
         {
             log::warn!("could not save settings: {err}");
         }
+    }
+
+    /// A microphone setting moved: save it, and publish the voice chain with it applied.
+    fn microphone_setting_changed(&mut self) {
+        self.persist_settings();
+        self.sync_params_from_state();
+    }
+
+    /// Bring the Settings pane's live fields up to date — what the audio thread has said about the
+    /// echo canceller since the pane opened, and whether there is still a microphone to calibrate.
+    /// The host calls this every frame the pane is open; everything else in the pane's working
+    /// copy changes only through [`App::handle_settings`].
+    pub fn refresh_settings_state(&self, state: &mut SettingsState) {
+        state.echo_cancel_running = self.state.echo_cancel_running;
+        if state.echo_cancel_detail != self.echo_cancel_detail {
+            state
+                .echo_cancel_detail
+                .clone_from(&self.echo_cancel_detail);
+        }
+        state.has_microphone = self.microphone_description().is_some();
+    }
+
+    /// The selected microphone's description, which the calibration wizard shows under its title,
+    /// or `None` with no microphone selected.
+    #[must_use]
+    pub fn microphone_description(&self) -> Option<&str> {
+        self.state
+            .device_for(DeviceDirection::Input)
+            .map(|device| device.description.as_str())
     }
 }
 
@@ -2967,9 +3150,11 @@ mod tests {
 
     #[test]
     fn the_strip_learns_what_the_voice_snapshot_asks_for() {
+        // The level and the de-reverb are what the *preset* asked for, underneath the Settings
+        // pane's overrides (which here all follow the preset), so that is where they are set.
         let mut app = headless();
-        app.input_params.dereverb = fxsound_core::DereverbLevel::Medium;
-        app.input_params.denoise_level = fxsound_core::DenoiseLevel::Strong;
+        app.input_voicing.dereverb = fxsound_core::DereverbLevel::Medium;
+        app.input_voicing.denoise_level = fxsound_core::DenoiseLevel::Strong;
         app.input_params.deesser_hz = 6_000.0;
         app.settings.echo_cancel = true;
         app.sync_params_from_state();
@@ -3854,5 +4039,400 @@ mod tests {
     fn the_export_file_name_only_touches_path_separators() {
         assert_eq!(export_file_name("Rock & Roll"), "Rock & Roll.fac");
         assert_eq!(export_file_name("a/b\\c"), "a_b_c.fac");
+    }
+
+    // ---- the Settings pane's microphone settings (0.4.0 design §1.4, §2 & 3, §7) -------------
+
+    use fxsound_core::{
+        DeEsserMode, DenoiseChannelMode, DenoiseChannelsOverride, DenoiseLevel, DereverbLevel,
+        NoiseSuppressionOverride,
+    };
+    use fxsound_ui::dialogs::settings::SettingsAction;
+
+    /// A preset's voicing: a Linked, Light denoiser with a tuned row, the adaptive de-esser and a
+    /// Light de-reverb.
+    fn tuned_voicing() -> PresetVoicing {
+        PresetVoicing {
+            rnnoise: true,
+            denoise_level: DenoiseLevel::Light,
+            denoise_channels: DenoiseChannelMode::Linked,
+            denoise_control: fxsound_core::DenoiseControl {
+                max_suppression_db: 9.0,
+                ..DenoiseLevel::Light.control()
+            },
+            deesser_mode: DeEsserMode::Adaptive,
+            dereverb: DereverbLevel::Light,
+        }
+    }
+
+    /// Default settings with one change; `Settings` has a private field, so no struct update.
+    fn settings_with(change: impl FnOnce(&mut Settings)) -> Settings {
+        let mut settings = Settings::default();
+        change(&mut settings);
+        settings
+    }
+
+    fn applied(voicing: &PresetVoicing, settings: &Settings) -> InputDspParams {
+        let mut params = unvoiced_input_params();
+        apply_microphone_settings(&mut params, voicing, settings);
+        params
+    }
+
+    #[test]
+    fn with_every_setting_at_its_default_the_voice_chain_runs_what_the_preset_says() {
+        let voicing = tuned_voicing();
+        let params = applied(&voicing, &Settings::default());
+        assert_eq!(PresetVoicing::of(&params), voicing);
+        // And an unvoiced chain stays unvoiced: the defaults switch nothing on.
+        let unvoiced = PresetVoicing::of(&unvoiced_input_params());
+        let params = applied(&unvoiced, &Settings::default());
+        assert!(!params.rnnoise);
+        assert_eq!(params.dereverb, DereverbLevel::Off);
+        assert_eq!(params.deesser_mode, DeEsserMode::Classic);
+    }
+
+    #[test]
+    fn a_pinned_noise_suppression_level_wins_and_brings_its_own_row() {
+        let voicing = tuned_voicing();
+        let settings = settings_with(|s| s.noise_suppression = NoiseSuppressionOverride::Strong);
+        let params = applied(&voicing, &settings);
+        assert_eq!(params.denoise_level, DenoiseLevel::Strong);
+        assert_eq!(params.denoise_control, DenoiseLevel::Strong.control());
+        assert!(params.rnnoise);
+        // The channel mode is a separate override and still follows the preset.
+        assert_eq!(params.denoise_channels, DenoiseChannelMode::Linked);
+    }
+
+    #[test]
+    fn pinning_the_level_the_preset_already_names_keeps_the_presets_tuned_row() {
+        let voicing = tuned_voicing();
+        let settings = settings_with(|s| s.noise_suppression = NoiseSuppressionOverride::Light);
+        let params = applied(&voicing, &settings);
+        assert_eq!(params.denoise_level, DenoiseLevel::Light);
+        assert_eq!(params.denoise_control.max_suppression_db, 9.0);
+    }
+
+    #[test]
+    fn a_pinned_level_runs_the_denoiser_on_a_preset_without_one_and_off_stops_it_on_one_with() {
+        let bare = PresetVoicing {
+            rnnoise: false,
+            denoise_level: DenoiseLevel::Off,
+            ..tuned_voicing()
+        };
+        let medium = settings_with(|s| s.noise_suppression = NoiseSuppressionOverride::Medium);
+        let params = applied(&bare, &medium);
+        assert!(params.rnnoise, "the override switched the stage on");
+        assert_eq!(params.denoise_level, DenoiseLevel::Medium);
+        assert_eq!(params.denoise_control, DenoiseLevel::Medium.control());
+
+        let off = settings_with(|s| s.noise_suppression = NoiseSuppressionOverride::Off);
+        let params = applied(&tuned_voicing(), &off);
+        assert!(!params.rnnoise, "Off is off, whatever the preset says");
+        assert_eq!(params.denoise_level, DenoiseLevel::Off);
+        assert!(!params.denoise_control.is_active());
+    }
+
+    #[test]
+    fn the_channel_override_wins_over_the_presets_mode() {
+        for (choice, mode) in [
+            (DenoiseChannelsOverride::Mono, DenoiseChannelMode::Mono),
+            (DenoiseChannelsOverride::Linked, DenoiseChannelMode::Linked),
+            (
+                DenoiseChannelsOverride::Independent,
+                DenoiseChannelMode::Independent,
+            ),
+            (DenoiseChannelsOverride::Preset, DenoiseChannelMode::Linked),
+        ] {
+            let settings = settings_with(|s| s.denoise_channels = choice);
+            assert_eq!(
+                applied(&tuned_voicing(), &settings).denoise_channels,
+                mode,
+                "{choice:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_adaptive_de_esser_is_asked_for_by_either_the_setting_or_the_preset() {
+        let classic_preset = PresetVoicing {
+            deesser_mode: DeEsserMode::Classic,
+            ..tuned_voicing()
+        };
+        let adaptive_setting = settings_with(|s| s.deesser_mode = DeEsserMode::Adaptive);
+        assert_eq!(
+            applied(&classic_preset, &adaptive_setting).deesser_mode,
+            DeEsserMode::Adaptive
+        );
+        assert_eq!(
+            applied(&classic_preset, &Settings::default()).deesser_mode,
+            DeEsserMode::Classic
+        );
+        // A preset that asks for it (Gaming Headset does) keeps it under the default setting.
+        assert_eq!(
+            applied(&tuned_voicing(), &Settings::default()).deesser_mode,
+            DeEsserMode::Adaptive
+        );
+    }
+
+    #[test]
+    fn the_de_reverb_runs_at_the_stronger_of_the_setting_and_the_preset() {
+        let light_preset = tuned_voicing();
+        for (setting, expected) in [
+            (DereverbLevel::Off, DereverbLevel::Light),
+            (DereverbLevel::Light, DereverbLevel::Light),
+            (DereverbLevel::Medium, DereverbLevel::Medium),
+            (DereverbLevel::Strong, DereverbLevel::Strong),
+        ] {
+            let settings = settings_with(|s| s.dereverb = setting);
+            assert_eq!(
+                applied(&light_preset, &settings).dereverb,
+                expected,
+                "{setting:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_microphone_setting_reaches_the_voice_chain_while_the_speakers_are_being_edited() {
+        let mut app = headless();
+        assert_eq!(app.state.direction, DeviceDirection::Output);
+        let mut pane = app.settings_state();
+        for action in [
+            SettingsAction::SetNoiseSuppression(NoiseSuppressionOverride::Strong),
+            SettingsAction::SetDenoiseChannels(DenoiseChannelsOverride::Mono),
+            SettingsAction::SetDeEsserMode(DeEsserMode::Adaptive),
+            SettingsAction::SetDereverb(DereverbLevel::Medium),
+        ] {
+            app.handle_settings(&action, &mut pane);
+        }
+
+        // Written to the settings, to the pane's working copy, and published.
+        assert_eq!(
+            app.settings().noise_suppression,
+            NoiseSuppressionOverride::Strong
+        );
+        assert_eq!(
+            app.settings().denoise_channels,
+            DenoiseChannelsOverride::Mono
+        );
+        assert_eq!(app.settings().deesser_mode, DeEsserMode::Adaptive);
+        assert_eq!(app.settings().dereverb, DereverbLevel::Medium);
+        assert_eq!(
+            pane.settings.noise_suppression,
+            NoiseSuppressionOverride::Strong
+        );
+        assert_eq!(
+            pane.settings.denoise_channels,
+            DenoiseChannelsOverride::Mono
+        );
+        assert_eq!(pane.settings.deesser_mode, DeEsserMode::Adaptive);
+        assert_eq!(pane.settings.dereverb, DereverbLevel::Medium);
+
+        let input = app.input_params();
+        assert!(input.rnnoise);
+        assert_eq!(input.denoise_level, DenoiseLevel::Strong);
+        assert_eq!(input.denoise_channels, DenoiseChannelMode::Mono);
+        assert_eq!(input.deesser_mode, DeEsserMode::Adaptive);
+        assert_eq!(input.dereverb, DereverbLevel::Medium);
+        // The readout strip hears about it too.
+        assert!(app.state.denoise_on);
+        assert_eq!(app.state.denoise_level, DenoiseLevel::Strong);
+        assert!(app.state.dereverb_on);
+    }
+
+    #[test]
+    fn setting_an_override_back_to_preset_restores_what_the_preset_said() {
+        use fxsound_preset::input::{Denoise, InputPreset};
+        let mut app = headless();
+        app.state.direction = DeviceDirection::Input;
+        app.input_presets = vec![InputPreset {
+            name: "Tuned".to_owned(),
+            rnnoise: true,
+            denoise: Some(Denoise {
+                level: DenoiseLevel::Light,
+                channels: DenoiseChannelMode::Linked,
+                max_suppression_db: Some(9.0),
+                ..Denoise::default()
+            }),
+            ..InputPreset::default()
+        }];
+        app.refresh_preset_list();
+        app.handle(&[UiAction::SelectPreset(0)]);
+        let voiced = *app.input_params();
+        assert_eq!(voiced.denoise_control.max_suppression_db, 9.0);
+
+        let mut pane = app.settings_state();
+        app.handle_settings(
+            &SettingsAction::SetNoiseSuppression(NoiseSuppressionOverride::Off),
+            &mut pane,
+        );
+        app.handle_settings(
+            &SettingsAction::SetDenoiseChannels(DenoiseChannelsOverride::Independent),
+            &mut pane,
+        );
+        assert!(!app.input_params().rnnoise);
+        assert!(!app.state.denoise_on, "the strip says the denoiser is off");
+        assert_eq!(
+            app.input_params().denoise_channels,
+            DenoiseChannelMode::Independent
+        );
+
+        app.handle_settings(
+            &SettingsAction::SetNoiseSuppression(NoiseSuppressionOverride::Preset),
+            &mut pane,
+        );
+        app.handle_settings(
+            &SettingsAction::SetDenoiseChannels(DenoiseChannelsOverride::Preset),
+            &mut pane,
+        );
+        assert_eq!(
+            *app.input_params(),
+            voiced,
+            "the preset's own voicing is back"
+        );
+        assert!(app.state.denoise_on);
+    }
+
+    #[test]
+    fn an_override_survives_picking_another_voice_preset() {
+        let mut app = headless();
+        with_voice_presets(&mut app);
+        app.state.direction = DeviceDirection::Input;
+        app.refresh_preset_list();
+        app.settings.noise_suppression = NoiseSuppressionOverride::Medium;
+        for index in [0, 1, 0] {
+            app.handle(&[UiAction::SelectPreset(index)]);
+            // Neither test preset has a denoiser of its own.
+            assert!(app.input_params().rnnoise, "preset {index}");
+            assert_eq!(app.input_params().denoise_level, DenoiseLevel::Medium);
+        }
+    }
+
+    #[test]
+    fn echo_cancellation_is_saved_shown_and_left_to_the_audio_thread_to_confirm() {
+        let mut app = headless();
+        let mut pane = app.settings_state();
+        app.handle_settings(&SettingsAction::SetEchoCancel(true), &mut pane);
+        assert!(app.settings().echo_cancel);
+        assert!(pane.settings.echo_cancel);
+        assert!(app.state.echo_cancel_on, "the strip knows it was asked for");
+        // Nothing has confirmed it: with no audio thread there is nobody to load the module.
+        assert!(!app.state.echo_cancel_running);
+        assert_eq!(pane.echo_cancel_status().as_deref(), Some("unavailable"));
+
+        app.handle_settings(&SettingsAction::SetEchoCancel(false), &mut pane);
+        assert!(!app.settings().echo_cancel);
+        assert!(!app.state.echo_cancel_on);
+        assert_eq!(pane.echo_cancel_status(), None);
+    }
+
+    #[test]
+    fn a_saved_echo_cancellation_is_asked_of_the_engine_as_soon_as_it_exists() {
+        // The restart the verifier described: `echo_cancel = true` in settings.toml, and an engine
+        // that starts knowing nothing of it.
+        let dir = std::env::temp_dir().join(format!("fxsound-startup-echo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("settings.toml");
+        let mut saved = Settings::default();
+        saved.echo_cancel = true;
+        saved.save_to(&path).expect("save");
+        let loaded = Settings::load_from(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let messages = startup_messages(&loaded);
+        let asked = messages
+            .iter()
+            .filter(|m| **m == UiToAudio::SetEchoCancel(true))
+            .count();
+        assert_eq!(
+            asked, 1,
+            "sent once, not zero times and not twice: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn echo_cancellation_left_off_is_not_mentioned_to_a_new_engine() {
+        let messages = startup_messages(&Settings::default());
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, UiToAudio::SetEchoCancel(_))),
+            "off is where the engine starts: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn the_remembered_defaults_are_still_the_first_thing_a_new_engine_hears() {
+        let mut settings = Settings::default();
+        settings.echo_cancel = true;
+        settings.remembered_default_output = "alsa_output.speakers".to_owned();
+        settings.remembered_default_input = "alsa_input.headset".to_owned();
+        assert_eq!(
+            startup_messages(&settings),
+            [
+                UiToAudio::SeedRememberedDefaults {
+                    output: "alsa_output.speakers".to_owned(),
+                    input: "alsa_input.headset".to_owned(),
+                },
+                UiToAudio::SetEchoCancel(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn echo_cancellation_ticked_in_the_pane_is_asked_for_again_by_the_next_run() {
+        let mut app = headless();
+        let mut pane = app.settings_state();
+        app.handle_settings(&SettingsAction::SetEchoCancel(true), &mut pane);
+        assert!(startup_messages(app.settings()).contains(&UiToAudio::SetEchoCancel(true)));
+
+        app.handle_settings(&SettingsAction::SetEchoCancel(false), &mut pane);
+        assert!(!startup_messages(app.settings()).contains(&UiToAudio::SetEchoCancel(true)));
+    }
+
+    #[test]
+    fn the_pane_is_refreshed_with_what_the_audio_thread_said_about_echo_cancellation() {
+        let mut app = headless();
+        let mut pane = app.settings_state();
+        pane.settings.echo_cancel = true;
+        app.state.echo_cancel_running = false;
+        app.echo_cancel_detail = "no libspa-aec-webrtc".to_owned();
+        app.refresh_settings_state(&mut pane);
+        assert_eq!(
+            pane.echo_cancel_status().as_deref(),
+            Some("unavailable · no libspa-aec-webrtc")
+        );
+        app.state.echo_cancel_running = true;
+        app.refresh_settings_state(&mut pane);
+        assert_eq!(pane.echo_cancel_status(), None);
+    }
+
+    #[test]
+    fn calibration_is_offered_only_with_a_microphone_attached() {
+        let mut app = headless();
+        app.state.devices = vec![
+            device("alsa_output.speakers", DeviceDirection::Output, true),
+            device("alsa_input.mic", DeviceDirection::Input, false),
+        ];
+        app.state.selected_output = Some(0);
+        assert!(!app.settings_state().has_microphone);
+        assert_eq!(app.microphone_description(), None);
+
+        app.state.selected_input = Some(1);
+        assert!(app.settings_state().has_microphone);
+        assert_eq!(app.microphone_description(), Some("alsa_input.mic"));
+
+        // An index that names a speaker is not a microphone.
+        app.state.selected_input = Some(0);
+        assert!(!app.settings_state().has_microphone);
+    }
+
+    #[test]
+    fn opening_the_wizard_changes_no_setting() {
+        let mut app = headless();
+        let mut pane = app.settings_state();
+        let before = (app.settings().clone(), pane.clone());
+        app.handle_settings(&SettingsAction::OpenCalibration, &mut pane);
+        assert_eq!((app.settings().clone(), pane), before);
     }
 }

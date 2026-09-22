@@ -1,9 +1,13 @@
-//! The Settings window: a side nav and three panes.
+//! The Settings window: a side nav and four panes.
 //!
 //! Port of `FxSettingsDialog` (`GUI/FxSettingsDialog.{h,cpp}`) and of the device-priority list it
-//! owns (`GUI/FxOutputPreference.{h,cpp}`). 610 × 597 outside, 600 × 510 of content, three tab
+//! owns (`GUI/FxOutputPreference.{h,cpp}`). 610 × 597 outside, 600 × 510 of content, four tab
 //! buttons down the left and one pane to the right of a vertical rule
-//! (`docs/spec/06-dialogs.md` §1).
+//! (`docs/spec/06-dialogs.md` §1). The original has three; the fourth, **Microphone**, is this
+//! port's (0.4.0 design §1.4, §8): the global overrides over every voice preset, echo
+//! cancellation and the calibration wizard's entry point. It takes the row a fourth button would
+//! have had in the original's own grid, and its pane is built from the same checkbox, stepper and
+//! text button as the other three.
 //!
 //! ## Pure view
 //!
@@ -51,10 +55,12 @@ use crate::theme::{FxColor, Palette};
 use crate::widgets::FxComboBox;
 use crate::widgets::icon_button::IconButton;
 use egui::{
-    Align2, Color32, Context, CornerRadius, CursorIcon, Id, Key, Rect, Sense, Stroke, StrokeKind,
-    TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2,
+    Align2, Color32, Context, CornerRadius, CursorIcon, Id, Key, Rangef, Rect, Sense, Stroke,
+    StrokeKind, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2,
 };
-use fxsound_core::Settings;
+use fxsound_core::{
+    DeEsserMode, DenoiseChannelsOverride, DereverbLevel, NoiseSuppressionOverride, Settings,
+};
 use std::collections::HashMap;
 
 // =============================================================================================
@@ -119,8 +125,9 @@ pub fn divider_x(content: Rect) -> f32 {
     pane_rect(content).left() - 1.0
 }
 
-/// One of the three tab buttons: `(20, 50, 150, 40)`, `(20, 110, …)`, `(20, 170, …)`
-/// (`FxSettingsDialog.cpp:121-123`).
+/// One of the four tab buttons: `(20, 50, 150, 40)`, `(20, 110, …)`, `(20, 170, …)`
+/// (`FxSettingsDialog.cpp:121-123`), and the port's Microphone at `(20, 230, …)` — the next row
+/// of the same grid.
 #[must_use]
 pub fn nav_button_rect(content: Rect, index: usize) -> Rect {
     Rect::from_min_size(
@@ -130,6 +137,55 @@ pub fn nav_button_rect(content: Rect, index: usize) -> Rect {
         ),
         BUTTON_SIZE,
     )
+}
+
+/// Where a tab button's caption goes: `(height + 5, 0, width - height + 5, height)` — note the
+/// label is allowed five points more than is left, so it may run one glyph past the button's right
+/// edge (`FxSettingsDialog.cpp:73-75`).
+#[must_use]
+pub fn nav_label_rect(button: Rect) -> Rect {
+    Rect::from_min_size(
+        pos2(
+            button.left() + button.height() + NAV_LABEL_GAP,
+            button.top(),
+        ),
+        vec2(
+            button.width() - button.height() + NAV_LABEL_GAP,
+            button.height(),
+        ),
+    )
+}
+
+/// The pieces of the vertical rule that are drawn: the content's height, less `gaps`.
+///
+/// The buttons are wider than the space left of the rule — 150 points from x 20 run to 170, and
+/// the rule is at 152 — so a caption longer than about 87 points crosses it. The original draws
+/// the rule through such a caption (§1.2); here the rule stops for it instead, the way a group
+/// box's frame stops for its title. The original's three English captions never reach it, but a
+/// translation of one already did (Bosnian `Opšte Opcije` for General, about 103 points), and
+/// the port's `Microphone` does in English and French (about 93): a shorter word would lose what
+/// the tab holds and the name §8 gives it, and running the rule through new text would be a new
+/// control overlapping an old one, so the break is the smaller departure.
+#[must_use]
+pub fn divider_segments(span: Rangef, gaps: &[Rangef]) -> Vec<Rangef> {
+    let mut gaps: Vec<Rangef> = gaps
+        .iter()
+        .map(|gap| gap.intersection(span))
+        .filter(|gap| gap.span() > 0.0)
+        .collect();
+    gaps.sort_by(|a, b| a.min.total_cmp(&b.min));
+    let mut segments = Vec::new();
+    let mut from = span.min;
+    for gap in gaps {
+        if gap.min > from {
+            segments.push(Rangef::new(from, gap.min));
+        }
+        from = from.max(gap.max);
+    }
+    if from < span.max {
+        segments.push(Rangef::new(from, span.max));
+    }
+    segments
 }
 
 /// A pane's title: `(20, 5, paneWidth - 20, 24)` (`FxSettingsDialog.cpp:168-172`).
@@ -152,11 +208,14 @@ pub enum SettingsTab {
     Audio,
     General,
     Help,
+    /// The port's fourth pane: the microphone's global settings and the calibration wizard.
+    /// Appended rather than slotted in beside Audio, so the original's three keep their rows.
+    Microphone,
 }
 
 impl SettingsTab {
     /// In nav order.
-    pub const ALL: [Self; 3] = [Self::Audio, Self::General, Self::Help];
+    pub const ALL: [Self; 4] = [Self::Audio, Self::General, Self::Help, Self::Microphone];
 
     /// The tab button's caption — also the component's name, which is what `TRANS` is given
     /// (`FxSettingsDialog.cpp:92-105`).
@@ -166,6 +225,7 @@ impl SettingsTab {
             Self::Audio => "Audio",
             Self::General => "General",
             Self::Help => "Help",
+            Self::Microphone => "Microphone",
         }
     }
 
@@ -177,6 +237,7 @@ impl SettingsTab {
             Self::Audio => "Audio",
             Self::General => "General Preferences",
             Self::Help => "Help",
+            Self::Microphone => "Microphone",
         }
     }
 
@@ -187,6 +248,7 @@ impl SettingsTab {
             Self::Audio => NavIcon::Speaker,
             Self::General => NavIcon::Settings,
             Self::Help => NavIcon::Question,
+            Self::Microphone => NavIcon::Microphone,
         }
     }
 
@@ -196,19 +258,22 @@ impl SettingsTab {
             Self::Audio => 0,
             Self::General => 1,
             Self::Help => 2,
+            Self::Microphone => 3,
         }
     }
 }
 
 // =============================================================================================
-// The three nav icons
+// The four nav icons
 // =============================================================================================
 
 /// The side-nav artwork.
 ///
-/// These three are the only images in the app that `FxTheme`'s table does not hold: the dialog
-/// loads them straight from `BinaryData` (`FxSettingsDialog.cpp:92-105`), and they have no
-/// per-theme variant — they are drawn in the same neutral grey in both palettes.
+/// The original's three are the only images in the app that `FxTheme`'s table does not hold: the
+/// dialog loads them straight from `BinaryData` (`FxSettingsDialog.cpp:92-105`), and they have no
+/// per-theme variant — they are drawn in the same neutral grey in both palettes. The fourth,
+/// `microphone.svg`, is the port's own, drawn to match: a 24-point grid, one `#7E7E7E` fill and
+/// 1.5-point round-capped strokes, like `speaker.svg`.
 /// [`crate::AssetCache`] is keyed by [`FxImage`] and has nowhere to put them, so [`NavIcons`] is
 /// the same rasterise-once-and-keep-the-texture cache with its own key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -219,12 +284,15 @@ pub enum NavIcon {
     Settings,
     /// `question.svg`.
     Question,
+    /// `microphone.svg`.
+    Microphone,
 }
 
-const NAV_SVGS: [&[u8]; 3] = [
+const NAV_SVGS: [&[u8]; 4] = [
     include_bytes!("../../../../assets/images/speaker.svg"),
     include_bytes!("../../../../assets/images/settings.svg"),
     include_bytes!("../../../../assets/images/question.svg"),
+    include_bytes!("../../../../assets/images/microphone.svg"),
 ];
 
 impl NavIcon {
@@ -235,7 +303,7 @@ impl NavIcon {
     }
 }
 
-/// Textures for the three nav icons, one per physical size.
+/// Textures for the four nav icons, one per physical size.
 ///
 /// Held by the application next to its [`crate::AssetCache`]; `load_texture` must never run per
 /// frame.
@@ -515,6 +583,14 @@ pub struct SettingsState {
     /// `~/.config/autostart/fxsound.desktop` with `Hidden=false`
     /// (`docs/spec/06-dialogs.md` §9.6). The app layer reads the file and fills this in.
     pub launch_on_startup: bool,
+    /// Whether PipeWire's echo canceller is actually loaded, and the engine's reason when it is
+    /// not — live state rather than a setting, so the app layer refreshes both while the window
+    /// is open. `settings.echo_cancel` is what the user asked for; these are what they got.
+    pub echo_cancel_running: bool,
+    pub echo_cancel_detail: String,
+    /// Whether a microphone is selected. Calibration measures one, so without it the button is
+    /// disabled rather than opening a wizard with nothing to listen to (0.4.0 design §8).
+    pub has_microphone: bool,
 }
 
 impl Default for SettingsState {
@@ -535,6 +611,9 @@ impl SettingsState {
             can_reset_presets: false,
             version: String::new(),
             launch_on_startup: false,
+            echo_cancel_running: false,
+            echo_cancel_detail: String::new(),
+            has_microphone: false,
         }
     }
 
@@ -542,6 +621,38 @@ impl SettingsState {
     #[must_use]
     pub fn version_text(&self) -> String {
         format!("v{}", self.version)
+    }
+
+    /// The line under "Echo cancellation", or `None` when there is nothing to say: it was asked
+    /// for and is not running. The engine's reason follows the word when it gave one — the same
+    /// honesty rule the readout strip keeps (0.4.0 design §7).
+    #[must_use]
+    pub fn echo_cancel_status(&self) -> Option<String> {
+        if !self.settings.echo_cancel || self.echo_cancel_running {
+            return None;
+        }
+        let detail = self.echo_cancel_detail.trim();
+        Some(if detail.is_empty() {
+            tr("unavailable")
+        } else {
+            format!("{} · {detail}", tr("unavailable"))
+        })
+    }
+
+    /// The last calibration, as the pane prints it: `Floor −48 dB · Speech −19 dB · 2026-09-23`.
+    #[must_use]
+    pub fn calibration_text(&self) -> String {
+        match &self.settings.calibration {
+            Some(record) => format!(
+                "{} {} · {} {} · {}",
+                tr("Floor"),
+                super::whole_db(record.noise_floor_db),
+                tr("Speech"),
+                super::whole_db(record.speech_rms_db),
+                super::iso_date(record.unix_time),
+            ),
+            None => tr(NOT_CALIBRATED),
+        }
     }
 
     /// The row above `index`, if it can move up.
@@ -607,6 +718,21 @@ pub enum SettingsAction {
     /// (`FxSettingsDialog.cpp:474-475`); this fork carries it in the package instead.
     ShowChangelog,
 
+    // ---- microphone pane ----------------------------------------------------------------------
+    /// The noise-suppression level over every voice preset, or `Preset` to follow each preset.
+    SetNoiseSuppression(NoiseSuppressionOverride),
+    /// The denoiser's channel mode over every voice preset, or `Preset` to follow each preset.
+    SetDenoiseChannels(DenoiseChannelsOverride),
+    /// Where the de-esser puts its band.
+    SetDeEsserMode(DeEsserMode),
+    /// Late-reverberation suppression on the microphone.
+    SetDereverb(DereverbLevel),
+    /// PipeWire's echo canceller in front of the microphone. The app layer also tells the audio
+    /// thread, which answers with whether the module actually loaded.
+    SetEchoCancel(bool),
+    /// Open the calibration wizard. Only emitted while a microphone is selected.
+    OpenCalibration,
+
     /// Close the window — the ✕ or Escape (`FxSettingsDialog.cpp:78-88`). The caller then runs
     /// the equivalent of `FxController::refreshOutputList()` (`FxMainWindow.cpp:454`).
     Close,
@@ -656,12 +782,32 @@ impl<'a> SettingsDialog<'a> {
             SettingsAction::Close,
         );
 
-        // §1.2's rule, drawn once and at the pane's edge.
-        ui.painter().vline(
-            divider_x(content),
-            content.y_range(),
-            Stroke::new(1.0, palette.color(FxColor::Outline)),
-        );
+        // §1.2's rule, drawn once and at the pane's edge, and broken where a caption crosses it.
+        let rule = divider_x(content);
+        let gaps: Vec<Rangef> = SettingsTab::ALL
+            .into_iter()
+            .filter_map(|tab| {
+                let label = nav_label_rect(nav_button_rect(content, tab.index()));
+                let size = ui
+                    .painter()
+                    .layout_no_wrap(tr(tab.nav_label()), normal_font(), Color32::PLACEHOLDER)
+                    .size();
+                (label.left() + size.x.min(label.width()) > rule).then(|| {
+                    Rangef::new(
+                        label.center().y - size.y / 2.0,
+                        label.center().y + size.y / 2.0,
+                    )
+                    .expand(1.0)
+                })
+            })
+            .collect();
+        for segment in divider_segments(content.y_range(), &gaps) {
+            ui.painter().vline(
+                rule,
+                segment,
+                Stroke::new(1.0, palette.color(FxColor::Outline)),
+            );
+        }
 
         for tab in SettingsTab::ALL {
             let rect = nav_button_rect(content, tab.index());
@@ -688,6 +834,9 @@ impl<'a> SettingsDialog<'a> {
                 general_pane(ui, pane, self.state, palette, assets, id, &mut response);
             }
             SettingsTab::Help => help_pane(ui, pane, self.state, palette, id, &mut response),
+            SettingsTab::Microphone => {
+                microphone_pane(ui, pane, self.state, palette, assets, id, &mut response);
+            }
         }
         response
     }
@@ -732,12 +881,7 @@ fn nav_button(
     } else {
         palette.color(FxColor::DefaultText)
     };
-    // `(height + 5, 0, width - height + 5, height)` — note the label is allowed five points more
-    // than is left, so it may run one glyph past the button's right edge.
-    let label = Rect::from_min_size(
-        pos2(rect.left() + rect.height() + NAV_LABEL_GAP, rect.top()),
-        vec2(rect.width() - rect.height() + NAV_LABEL_GAP, rect.height()),
-    );
+    let label = nav_label_rect(rect);
     draw_truncated(
         ui.painter(),
         &tr(tab.nav_label()),
@@ -1542,6 +1686,21 @@ fn language_switch(
     assets: &mut AssetCache,
     id: Id,
 ) -> Option<LanguageChoice> {
+    // Both directions wrap, so neither arrow is ever disabled (`FxLanguage.cpp:80-111`).
+    stepper(ui, rect, &choice.label(), palette, assets, id).map(|steps| choice.step(steps))
+}
+
+/// The language switch's box, for any short list: ‹ and › either side of the current value.
+/// Returns `-1` or `+1` when an arrow was pressed; the caller decides what that moves to, and
+/// every caller wraps, so neither arrow is ever disabled.
+fn stepper(
+    ui: &mut Ui,
+    rect: Rect,
+    label: &str,
+    palette: Palette,
+    assets: &mut AssetCache,
+    id: Id,
+) -> Option<isize> {
     ui.painter().rect_filled(
         rect,
         CornerRadius::same(5),
@@ -1573,22 +1732,296 @@ fn language_switch(
 
     draw_truncated(
         ui.painter(),
-        &choice.label(),
+        label,
         normal_font(),
         palette.color(FxColor::DefaultText),
-        Rect::from_min_size(
-            pos2(rect.left() + 24.0, rect.top() + 4.0),
-            vec2(rect.width() - 48.0, 22.0),
-        ),
+        stepper_label_rect(rect),
         Align2::CENTER_CENTER,
     );
 
-    // Both directions wrap, so neither arrow is ever disabled (`FxLanguage.cpp:80-111`).
     match (prev, next) {
-        (true, _) => Some(choice.step(-1)),
-        (_, true) => Some(choice.step(1)),
+        (true, _) => Some(-1),
+        (_, true) => Some(1),
         _ => None,
     }
+}
+
+/// Where a stepper's value is written: between the two arrows, as the language switch writes it.
+#[must_use]
+pub fn stepper_label_rect(rect: Rect) -> Rect {
+    Rect::from_min_size(
+        pos2(rect.left() + 24.0, rect.top() + 4.0),
+        vec2(rect.width() - 48.0, 22.0),
+    )
+}
+
+/// The value `steps` away from `current` in `all`, wrapping in both directions — what every
+/// stepper in this window does with an arrow press. A `current` not in the list steps from the
+/// first entry.
+#[must_use]
+pub fn cycle<T: Copy + PartialEq>(all: &[T], current: T, steps: isize) -> T {
+    let count = all.len() as isize;
+    let at = all.iter().position(|v| *v == current).unwrap_or(0) as isize;
+    all[(at + steps).rem_euclid(count) as usize]
+}
+
+// =============================================================================================
+// Microphone pane (0.4.0 design §1.4, §7, §8)
+// =============================================================================================
+
+/// Microphone-pane geometry. The original has no such pane, so these numbers are the port's,
+/// chosen from the other three panes' own: rows start at the same `y = 50`, a stepper is the
+/// language switch's 30 points tall, the checkbox is `TOGGLE_BUTTON_HEIGHT`, and the button is the
+/// reset button's shape.
+pub mod microphone {
+    /// y of the first row, as in every other pane.
+    pub const FIRST_ROW_Y: f32 = 50.0;
+    /// A stepper row: `FxLanguage`'s height…
+    pub const ROW_HEIGHT: f32 = 30.0;
+    /// …ten points apart, the General pane's gap between checkboxes.
+    pub const ROW_PITCH: f32 = ROW_HEIGHT + 10.0;
+    /// The stepper's width: `FxLanguage`'s 180 (`FxLanguage.h:31`) and twenty more, so that
+    /// "Linked stereo" and its translations fit between the arrows.
+    pub const STEPPER_WIDTH: f32 = 200.0;
+    /// Between a row's caption and its stepper.
+    pub const LABEL_GAP: f32 = 10.0;
+    /// The four stepper rows: noise suppression, denoiser channels, de-esser, de-reverb.
+    pub const STEPPER_ROWS: usize = 4;
+    /// The General pane's gap after its language switch, before the first checkbox.
+    pub const GAP_BEFORE_TOGGLE: f32 = 20.0;
+    /// `TOGGLE_BUTTON_HEIGHT`.
+    pub const TOGGLE_HEIGHT: f32 = 30.0;
+    /// One line of the small font, for the echo canceller's status and the last calibration.
+    pub const LINE_HEIGHT: f32 = 20.0;
+    /// Above the button, and above the last-calibration line.
+    pub const GAP_BEFORE_BUTTON: f32 = 20.0;
+    pub const GAP_BEFORE_RECORD: f32 = 10.0;
+}
+
+/// `"Noise suppression"`.
+pub const NOISE_SUPPRESSION: &str = "Noise suppression";
+/// `"Denoiser channels"`.
+pub const DENOISER_CHANNELS: &str = "Denoiser channels";
+/// `"De-esser"` — the readout strip's word for the same stage.
+pub const DE_ESSER: &str = "De-esser";
+/// `"De-reverb"`.
+pub const DE_REVERB: &str = "De-reverb";
+/// `"Echo cancellation"`.
+pub const ECHO_CANCELLATION: &str = "Echo cancellation";
+/// The wizard's entry point (0.4.0 design §8).
+pub const CALIBRATE_MICROPHONE: &str = "Calibrate microphone…";
+/// What the last-calibration line says before the wizard has ever run.
+pub const NOT_CALIBRATED: &str = "Not calibrated yet";
+
+/// One of the four stepper rows: the whole row, caption and stepper together.
+#[must_use]
+pub fn microphone_row_rect(pane: Rect, index: usize) -> Rect {
+    Rect::from_min_size(
+        pos2(
+            pane.left() + X_MARGIN,
+            pane.top() + microphone::FIRST_ROW_Y + index as f32 * microphone::ROW_PITCH,
+        ),
+        vec2(pane.width() - X_MARGIN * 2.0, microphone::ROW_HEIGHT),
+    )
+}
+
+/// A row's stepper, flush with the pane's right margin.
+#[must_use]
+pub fn microphone_stepper_rect(pane: Rect, index: usize) -> Rect {
+    let row = microphone_row_rect(pane, index);
+    Rect::from_min_size(
+        pos2(row.right() - microphone::STEPPER_WIDTH, row.top()),
+        vec2(microphone::STEPPER_WIDTH, row.height()),
+    )
+}
+
+/// A row's caption, from the margin to a gap short of its stepper.
+#[must_use]
+pub fn microphone_label_rect(pane: Rect, index: usize) -> Rect {
+    let row = microphone_row_rect(pane, index);
+    Rect::from_min_max(
+        row.min,
+        pos2(
+            microphone_stepper_rect(pane, index).left() - microphone::LABEL_GAP,
+            row.bottom(),
+        ),
+    )
+}
+
+/// The "Echo cancellation" checkbox, twenty points below the last stepper.
+#[must_use]
+pub fn echo_toggle_rect(pane: Rect) -> Rect {
+    let last = microphone_row_rect(pane, microphone::STEPPER_ROWS - 1);
+    Rect::from_min_size(
+        pos2(last.left(), last.bottom() + microphone::GAP_BEFORE_TOGGLE),
+        vec2(last.width(), microphone::TOGGLE_HEIGHT),
+    )
+}
+
+/// The echo canceller's status line, directly under the checkbox and indented to its caption.
+#[must_use]
+pub fn echo_status_rect(pane: Rect) -> Rect {
+    let toggle = echo_toggle_rect(pane);
+    let indent = TICK_BOX_SIDE + TICK_BOX_GAP;
+    Rect::from_min_size(
+        pos2(toggle.left() + indent, toggle.bottom()),
+        vec2(toggle.width() - indent, microphone::LINE_HEIGHT),
+    )
+}
+
+/// "Calibrate microphone…", sized like the reset button (see [`reset_button_size`]).
+#[must_use]
+pub fn calibrate_button_rect(pane: Rect, size: Vec2) -> Rect {
+    Rect::from_min_size(
+        pos2(
+            pane.left() + X_MARGIN,
+            echo_status_rect(pane).bottom() + microphone::GAP_BEFORE_BUTTON,
+        ),
+        size,
+    )
+}
+
+/// The last calibration's one line, under the button.
+#[must_use]
+pub fn calibration_record_rect(pane: Rect, button: Rect) -> Rect {
+    Rect::from_min_size(
+        pos2(
+            pane.left() + X_MARGIN,
+            button.bottom() + microphone::GAP_BEFORE_RECORD,
+        ),
+        vec2(pane.width() - X_MARGIN * 2.0, microphone::LINE_HEIGHT),
+    )
+}
+
+/// The four stepper rows as the pane draws them: caption, the value shown, and the action one
+/// step either way would emit. A function rather than four copies of the drawing code, and what
+/// the tests read to check that every arrow means what it says.
+#[must_use]
+pub fn microphone_rows(settings: &Settings) -> [(String, String, [SettingsAction; 2]); 4] {
+    let noise = settings.noise_suppression;
+    let channels = settings.denoise_channels;
+    let deesser = settings.deesser_mode;
+    let dereverb = settings.dereverb;
+    let all_noise = NoiseSuppressionOverride::ALL;
+    let all_channels = DenoiseChannelsOverride::ALL;
+    let all_deesser = DeEsserMode::ALL;
+    let all_dereverb = DereverbLevel::ALL;
+    [
+        (
+            tr(NOISE_SUPPRESSION),
+            tr(noise.label()),
+            [-1, 1].map(|s| SettingsAction::SetNoiseSuppression(cycle(&all_noise, noise, s))),
+        ),
+        (
+            tr(DENOISER_CHANNELS),
+            tr(channels.label()),
+            [-1, 1].map(|s| SettingsAction::SetDenoiseChannels(cycle(&all_channels, channels, s))),
+        ),
+        (
+            tr(DE_ESSER),
+            tr(deesser.label()),
+            [-1, 1].map(|s| SettingsAction::SetDeEsserMode(cycle(&all_deesser, deesser, s))),
+        ),
+        (
+            tr(DE_REVERB),
+            tr(dereverb.label()),
+            [-1, 1].map(|s| SettingsAction::SetDereverb(cycle(&all_dereverb, dereverb, s))),
+        ),
+    ]
+}
+
+/// The label "Calibrate microphone…" is given, and the size it is drawn at.
+fn calibrate_button_size(ui: &Ui) -> (String, Vec2) {
+    let label = tr(CALIBRATE_MICROPHONE);
+    let text_width = ui
+        .painter()
+        .layout_no_wrap(label.clone(), normal_font(), Color32::PLACEHOLDER)
+        .size()
+        .x;
+    let size = reset_button_size(&label, text_width);
+    (label, size)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn microphone_pane(
+    ui: &mut Ui,
+    pane: Rect,
+    state: &SettingsState,
+    palette: Palette,
+    assets: &mut AssetCache,
+    id: Id,
+    response: &mut DialogResponse<SettingsAction>,
+) {
+    for (index, (caption, value, [back, forward])) in
+        microphone_rows(&state.settings).into_iter().enumerate()
+    {
+        draw_truncated(
+            ui.painter(),
+            &caption,
+            normal_font(),
+            palette.color(FxColor::HighlightedText),
+            microphone_label_rect(pane, index),
+            Align2::LEFT_CENTER,
+        );
+        match stepper(
+            ui,
+            microphone_stepper_rect(pane, index),
+            &value,
+            palette,
+            assets,
+            id.with(("microphone-row", index)),
+        ) {
+            Some(steps) if steps < 0 => response.push(back),
+            Some(_) => response.push(forward),
+            None => {}
+        }
+    }
+
+    if toggle(
+        ui,
+        echo_toggle_rect(pane),
+        &tr(ECHO_CANCELLATION),
+        state.settings.echo_cancel,
+        true,
+        palette,
+        id.with("echo-cancel"),
+    ) {
+        response.push(SettingsAction::SetEchoCancel(!state.settings.echo_cancel));
+    }
+    if let Some(status) = state.echo_cancel_status() {
+        draw_truncated(
+            ui.painter(),
+            &status,
+            small_font(),
+            palette.color(FxColor::HintText),
+            echo_status_rect(pane),
+            Align2::LEFT_CENTER,
+        );
+    }
+
+    let (label, size) = calibrate_button_size(ui);
+    let button = calibrate_button_rect(pane, size);
+    if TextButton::new(&label)
+        .enabled(state.has_microphone)
+        .show(ui, button, palette, id.with("calibrate"))
+        .clicked()
+    {
+        response.push(SettingsAction::OpenCalibration);
+    }
+
+    let colour = if state.settings.calibration.is_some() {
+        palette.color(FxColor::DefaultText)
+    } else {
+        palette.color(FxColor::HintText)
+    };
+    draw_truncated(
+        ui.painter(),
+        &state.calibration_text(),
+        small_font(),
+        colour,
+        calibration_record_rect(pane, button),
+        Align2::LEFT_CENTER,
+    );
 }
 
 // =============================================================================================
@@ -1764,7 +2197,7 @@ fn toggle(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{frame, test_context};
+    use super::super::tests::{every_translation, frame, test_context};
     use super::*;
     use fxsound_core::ThemeMode;
 
@@ -1815,14 +2248,26 @@ mod tests {
     }
 
     #[test]
-    fn the_three_tab_buttons_land_on_the_originals_rows() {
-        // FxSettingsDialog.cpp:121-123, in content-local coordinates.
+    fn the_original_three_tab_buttons_keep_their_rows_and_the_microphone_takes_the_next() {
+        // FxSettingsDialog.cpp:121-123, in content-local coordinates, and the port's fourth on
+        // the same sixty-point pitch.
         let content = content();
-        for (index, top) in [(0, 50.0), (1, 110.0), (2, 170.0)] {
+        for (index, top) in [(0, 50.0), (1, 110.0), (2, 170.0), (3, 230.0)] {
             let button = local(content, nav_button_rect(content, index));
             assert!((button.min - pos2(20.0, top)).length() < 1e-4, "{button:?}");
             assert!((button.size() - vec2(150.0, 40.0)).length() < 1e-4);
         }
+        assert_eq!(
+            SettingsTab::ALL.map(SettingsTab::index),
+            [0, 1, 2, 3],
+            "the nav order is the index order"
+        );
+        assert_eq!(SettingsTab::ALL[3], SettingsTab::Microphone);
+        assert_eq!(SettingsTab::Microphone.icon(), NavIcon::Microphone);
+        // The fourth button ends well above the content's bottom, in the same column.
+        let last = nav_button_rect(content, 3);
+        assert!(last.bottom() < content.bottom());
+        assert!((last.left() - nav_button_rect(content, 0).left()).abs() < 1e-4);
     }
 
     #[test]
@@ -2203,12 +2648,12 @@ mod tests {
                 });
             }
         }
-        // The three nav icons were rasterised exactly once each per size.
+        // The four nav icons were rasterised exactly once each per size.
         assert!(!icons.is_empty());
         let cached = icons.len();
         icons.clear();
         assert!(icons.is_empty());
-        assert_eq!(cached, 3);
+        assert_eq!(cached, 4);
     }
 
     #[test]
@@ -2231,8 +2676,13 @@ mod tests {
     }
 
     #[test]
-    fn the_three_nav_icons_rasterise() {
-        for icon in [NavIcon::Speaker, NavIcon::Settings, NavIcon::Question] {
+    fn the_four_nav_icons_rasterise() {
+        for icon in [
+            NavIcon::Speaker,
+            NavIcon::Settings,
+            NavIcon::Question,
+            NavIcon::Microphone,
+        ] {
             let raster = rasterise(icon.svg_bytes(), 20, 20)
                 .unwrap_or_else(|| panic!("{icon:?} failed to render"));
             assert_eq!(raster.size, [20, 20]);
@@ -2241,5 +2691,544 @@ mod tests {
                 "{icon:?} rendered blank"
             );
         }
+    }
+
+    #[test]
+    fn the_microphone_icon_is_the_same_single_grey_as_the_others() {
+        // Every inked pixel of the port's icon is #7E7E7E, as in `speaker.svg`: no second colour,
+        // and nothing themed, because the nav icons have no per-theme variant.
+        let raster = rasterise(NavIcon::Microphone.svg_bytes(), 48, 48).expect("renders");
+        let mut inked = 0;
+        for pixel in &raster.pixels {
+            let [r, g, b, a] = pixel.to_srgba_unmultiplied();
+            if a > 64 {
+                inked += 1;
+                for channel in [r, g, b] {
+                    assert!(
+                        channel.abs_diff(0x7E) <= 2,
+                        "a pixel of {r:02x}{g:02x}{b:02x}"
+                    );
+                }
+            }
+        }
+        // A capsule, a cradle and a stand: a real share of the square, but far from all of it.
+        let share = inked as f32 / raster.pixels.len() as f32;
+        assert!(
+            (0.1..0.5).contains(&share),
+            "{share} of the square is inked"
+        );
+    }
+
+    // ---- the microphone pane ------------------------------------------------------------------
+
+    fn microphone_state() -> SettingsState {
+        SettingsState {
+            tab: SettingsTab::Microphone,
+            has_microphone: true,
+            ..populated()
+        }
+    }
+
+    /// Every rectangle the Microphone pane draws into, by name, for a button of `button_size`.
+    fn microphone_rects(pane: Rect, button_size: Vec2) -> Vec<(String, Rect)> {
+        let mut rects = Vec::new();
+        for index in 0..microphone::STEPPER_ROWS {
+            rects.push((
+                format!("caption {index}"),
+                microphone_label_rect(pane, index),
+            ));
+            rects.push((
+                format!("stepper {index}"),
+                microphone_stepper_rect(pane, index),
+            ));
+        }
+        let button = calibrate_button_rect(pane, button_size);
+        rects.extend([
+            ("echo".to_owned(), echo_toggle_rect(pane)),
+            ("echo status".to_owned(), echo_status_rect(pane)),
+            ("calibrate".to_owned(), button),
+            ("record".to_owned(), calibration_record_rect(pane, button)),
+        ]);
+        rects
+    }
+
+    #[test]
+    fn the_microphone_pane_lays_out_on_the_other_panes_grid() {
+        let pane = pane_rect(content());
+        // Four stepper rows forty apart from the y every pane starts at, captions from the margin.
+        for (index, top) in [(0, 50.0), (1, 90.0), (2, 130.0), (3, 170.0)] {
+            let caption = local(pane, microphone_label_rect(pane, index));
+            let stepper = local(pane, microphone_stepper_rect(pane, index));
+            assert!(
+                (caption.min - pos2(20.0, top)).length() < 1e-4,
+                "{caption:?}"
+            );
+            // 447 - 20 - 200: the stepper is flush with the right margin.
+            assert!(
+                (stepper.min - pos2(227.0, top)).length() < 1e-4,
+                "{stepper:?}"
+            );
+            assert!((stepper.size() - vec2(200.0, 30.0)).length() < 1e-4);
+            assert!((caption.right() - 217.0).abs() < 1e-4, "{caption:?}");
+        }
+        // The checkbox twenty below the last stepper, its status line under it and indented to
+        // its caption, the button twenty below that.
+        let echo = local(pane, echo_toggle_rect(pane));
+        assert!((echo.min - pos2(20.0, 220.0)).length() < 1e-4, "{echo:?}");
+        assert!((echo.size() - vec2(407.0, 30.0)).length() < 1e-4);
+        let status = local(pane, echo_status_rect(pane));
+        assert!(
+            (status.min - pos2(48.0, 250.0)).length() < 1e-4,
+            "{status:?}"
+        );
+        let button = local(pane, calibrate_button_rect(pane, vec2(220.0, 24.0)));
+        assert!(
+            (button.min - pos2(20.0, 290.0)).length() < 1e-4,
+            "{button:?}"
+        );
+        let record = local(
+            pane,
+            calibration_record_rect(pane, calibrate_button_rect(pane, vec2(220.0, 24.0))),
+        );
+        assert!(
+            (record.min - pos2(20.0, 324.0)).length() < 1e-4,
+            "{record:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_in_the_microphone_pane_overlaps_or_leaves_it_even_with_a_three_line_button() {
+        let pane = pane_rect(content());
+        // The smallest and the largest button `reset_button_size` can hand back.
+        for button in [vec2(220.0, 24.0), vec2(315.0, 72.0)] {
+            let rects = microphone_rects(pane, button);
+            for (name, rect) in &rects {
+                assert!(pane.contains_rect(*rect), "{name} {rect:?} leaves the pane");
+                assert!(
+                    rect.left() >= pane.left() + X_MARGIN - 1e-4
+                        && rect.right() <= pane.right() - X_MARGIN + 1e-4,
+                    "{name} {rect:?} is outside the margins"
+                );
+                assert!(
+                    rect.top() >= pane_title_rect(pane).bottom(),
+                    "{name} runs under the title"
+                );
+            }
+            for (i, (a_name, a)) in rects.iter().enumerate() {
+                for (b_name, b) in &rects[i + 1..] {
+                    // The status line sits inside the checkbox's own column, under it.
+                    assert!(
+                        a.intersect(*b).area() <= 1e-3 || !a.intersects(*b),
+                        "{a_name} {a:?} overlaps {b_name} {b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_english_captions_and_values_fit_the_microphone_pane_unelided() {
+        // Measured with the real faces. A translation may be elided; the source language must not.
+        let ctx = test_context();
+        let pane = pane_rect(content());
+        frame(&ctx, |ui| {
+            let width = |text: &str, font| {
+                ui.painter()
+                    .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER)
+                    .size()
+                    .x
+            };
+            for index in 0..microphone::STEPPER_ROWS {
+                let caption = [NOISE_SUPPRESSION, DENOISER_CHANNELS, DE_ESSER, DE_REVERB][index];
+                let room = microphone_label_rect(pane, index).width();
+                let used = width(caption, normal_font());
+                assert!(used <= room, "{caption:?} is {used} in {room}");
+            }
+            let values = NoiseSuppressionOverride::ALL
+                .map(NoiseSuppressionOverride::label)
+                .into_iter()
+                .chain(DenoiseChannelsOverride::ALL.map(DenoiseChannelsOverride::label))
+                .chain(DeEsserMode::ALL.map(DeEsserMode::label))
+                .chain(DereverbLevel::ALL.map(DereverbLevel::label));
+            let room = stepper_label_rect(microphone_stepper_rect(pane, 0)).width();
+            for value in values {
+                let used = width(value, normal_font());
+                assert!(
+                    used <= room,
+                    "{value:?} is {used} between arrows {room} apart"
+                );
+            }
+            let record = "Floor −48 dB · Speech −19 dB · 2026-09-23";
+            let used = width(record, small_font());
+            let room =
+                calibration_record_rect(pane, calibrate_button_rect(pane, vec2(220.0, 24.0)))
+                    .width();
+            assert!(used <= room, "the record line is {used} in {room}");
+        });
+    }
+
+    #[test]
+    fn every_arrow_on_a_microphone_row_steps_one_value_and_wraps() {
+        let mut settings = Settings::default();
+        let rows = microphone_rows(&settings);
+        assert_eq!(
+            rows.clone().map(|(_, value, _)| value),
+            ["Preset", "Preset", "Classic", "Off"].map(str::to_owned)
+        );
+        assert_eq!(
+            rows.map(|(_, _, actions)| actions),
+            [
+                [
+                    SettingsAction::SetNoiseSuppression(NoiseSuppressionOverride::Strong),
+                    SettingsAction::SetNoiseSuppression(NoiseSuppressionOverride::Off),
+                ],
+                [
+                    SettingsAction::SetDenoiseChannels(DenoiseChannelsOverride::Independent),
+                    SettingsAction::SetDenoiseChannels(DenoiseChannelsOverride::Mono),
+                ],
+                [
+                    SettingsAction::SetDeEsserMode(DeEsserMode::Adaptive),
+                    SettingsAction::SetDeEsserMode(DeEsserMode::Adaptive),
+                ],
+                [
+                    SettingsAction::SetDereverb(DereverbLevel::Strong),
+                    SettingsAction::SetDereverb(DereverbLevel::Light),
+                ],
+            ]
+        );
+
+        // From the far end, forward wraps back to the start.
+        settings.noise_suppression = NoiseSuppressionOverride::Strong;
+        settings.denoise_channels = DenoiseChannelsOverride::Linked;
+        settings.dereverb = DereverbLevel::Medium;
+        let rows = microphone_rows(&settings);
+        assert_eq!(
+            rows[0].2[1],
+            SettingsAction::SetNoiseSuppression(NoiseSuppressionOverride::Preset)
+        );
+        assert_eq!(
+            rows[1].2,
+            [
+                SettingsAction::SetDenoiseChannels(DenoiseChannelsOverride::Mono),
+                SettingsAction::SetDenoiseChannels(DenoiseChannelsOverride::Independent),
+            ]
+        );
+        assert_eq!(rows[3].1, "Medium");
+        // `Light` reads Mild, as it does everywhere else.
+        settings.noise_suppression = NoiseSuppressionOverride::Light;
+        assert_eq!(microphone_rows(&settings)[0].1, "Mild");
+    }
+
+    #[test]
+    fn cycle_wraps_both_ways_and_starts_from_the_top_for_a_stranger() {
+        let all = [1, 2, 3];
+        assert_eq!(cycle(&all, 1, -1), 3);
+        assert_eq!(cycle(&all, 3, 1), 1);
+        assert_eq!(cycle(&all, 2, 1), 3);
+        assert_eq!(cycle(&all, 2, 4), 3);
+        assert_eq!(cycle(&all, 9, 1), 2);
+    }
+
+    #[test]
+    fn the_echo_line_speaks_only_when_asked_for_and_not_running() {
+        let mut state = microphone_state();
+        assert_eq!(state.echo_cancel_status(), None, "not asked for");
+        state.settings.echo_cancel = true;
+        state.echo_cancel_running = true;
+        assert_eq!(state.echo_cancel_status(), None, "running");
+        state.echo_cancel_running = false;
+        assert_eq!(state.echo_cancel_status().as_deref(), Some("unavailable"));
+        state.echo_cancel_detail = "  libspa-aec-webrtc not found ".to_owned();
+        assert_eq!(
+            state.echo_cancel_status().as_deref(),
+            Some("unavailable · libspa-aec-webrtc not found")
+        );
+    }
+
+    #[test]
+    fn the_last_calibration_reads_floor_speech_and_date_or_says_there_is_none() {
+        let mut state = microphone_state();
+        assert_eq!(state.calibration_text(), "Not calibrated yet");
+        state.settings.calibration = Some(fxsound_core::settings::CalibrationRecord {
+            noise_floor_db: -48.3,
+            speech_rms_db: -18.6,
+            speech_peak_db: -4.0,
+            clipped_ratio: 0.0,
+            unix_time: 1_790_121_600,
+            preset: "Calibrated — fifine".to_owned(),
+            device: "alsa_input.usb-fifine".to_owned(),
+        });
+        assert_eq!(
+            state.calibration_text(),
+            "Floor −48 dB · Speech −19 dB · 2026-09-23"
+        );
+    }
+
+    /// Click `at` in a Settings window drawing `state`, and collect what the three frames emitted.
+    fn click_settings(state: &SettingsState, at: egui::Pos2) -> Vec<SettingsAction> {
+        let ctx = test_context();
+        let mut assets = AssetCache::new();
+        let mut icons = NavIcons::new();
+        let outer = Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut actions = Vec::new();
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![egui::Event::PointerMoved(at), button(true)],
+            vec![button(false)],
+        ] {
+            let input = egui::RawInput {
+                screen_rect: Some(outer),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                actions.extend(
+                    SettingsDialog::new(state)
+                        .show(
+                            ui,
+                            outer,
+                            Palette::new(ThemeMode::Dark),
+                            &mut assets,
+                            &mut icons,
+                        )
+                        .actions,
+                );
+            })
+            .drop_without_applying_deltas();
+        }
+        actions
+    }
+
+    /// The pane as `SettingsDialog::show` lays it out in a window at the origin.
+    fn shown_pane() -> Rect {
+        let outer = Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE);
+        pane_rect(super::super::content_rect(outer))
+    }
+
+    #[test]
+    fn the_microphone_tab_button_selects_the_microphone_pane() {
+        let outer = Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE);
+        let content = super::super::content_rect(outer);
+        let actions = click_settings(&populated(), nav_button_rect(content, 3).center());
+        assert_eq!(
+            actions,
+            [SettingsAction::SelectTab(SettingsTab::Microphone)]
+        );
+    }
+
+    #[test]
+    fn the_arrows_of_a_microphone_row_emit_that_rows_setting() {
+        let state = microphone_state();
+        let pane = shown_pane();
+        for index in 0..microphone::STEPPER_ROWS {
+            let stepper = microphone_stepper_rect(pane, index);
+            let [back, forward] = microphone_rows(&state.settings)[index].2.clone();
+            let left = pos2(stepper.left() + 17.0, stepper.center().y);
+            let right = pos2(stepper.right() - 17.0, stepper.center().y);
+            assert_eq!(click_settings(&state, left), [back], "‹ on row {index}");
+            assert_eq!(click_settings(&state, right), [forward], "› on row {index}");
+            // The value between the arrows is not a control.
+            assert!(click_settings(&state, stepper.center()).is_empty());
+        }
+    }
+
+    #[test]
+    fn the_echo_checkbox_asks_for_the_opposite_of_what_it_shows() {
+        let mut state = microphone_state();
+        let at = echo_toggle_rect(shown_pane()).left_center() + vec2(9.0, 0.0);
+        assert_eq!(
+            click_settings(&state, at),
+            [SettingsAction::SetEchoCancel(true)]
+        );
+        state.settings.echo_cancel = true;
+        assert_eq!(
+            click_settings(&state, at),
+            [SettingsAction::SetEchoCancel(false)]
+        );
+    }
+
+    #[test]
+    fn calibrate_opens_the_wizard_only_with_a_microphone_selected() {
+        let mut state = microphone_state();
+        // The button's top-left corner is where it starts whatever its measured width.
+        let at = calibrate_button_rect(shown_pane(), vec2(220.0, 24.0)).min + vec2(20.0, 12.0);
+        assert_eq!(
+            click_settings(&state, at),
+            [SettingsAction::OpenCalibration]
+        );
+        state.has_microphone = false;
+        assert!(
+            click_settings(&state, at).is_empty(),
+            "a disabled button clicked"
+        );
+    }
+
+    #[test]
+    fn the_microphone_pane_draws_every_state_without_asking_for_anything() {
+        let ctx = test_context();
+        let mut assets = AssetCache::new();
+        let mut icons = NavIcons::new();
+        let outer = Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE);
+        let mut calibrated = microphone_state();
+        calibrated.settings.echo_cancel = true;
+        calibrated.echo_cancel_detail = "x".repeat(400);
+        calibrated.settings.calibration =
+            Some(fxsound_core::settings::CalibrationRecord::default());
+        calibrated.settings.noise_suppression = NoiseSuppressionOverride::Strong;
+        calibrated.settings.denoise_channels = DenoiseChannelsOverride::Linked;
+        let no_microphone = SettingsState {
+            has_microphone: false,
+            ..microphone_state()
+        };
+        for state in [microphone_state(), calibrated, no_microphone] {
+            for mode in [ThemeMode::Dark, ThemeMode::Light] {
+                frame(&ctx, |ui| {
+                    let response = SettingsDialog::new(&state).show(
+                        ui,
+                        outer,
+                        Palette::new(mode),
+                        &mut assets,
+                        &mut icons,
+                    );
+                    assert!(response.is_empty(), "{:?}", response.actions);
+                });
+            }
+        }
+    }
+
+    // ---- fitting every language -----------------------------------------------------------------
+
+    #[test]
+    fn every_language_fits_the_microphone_captions_and_values_between_their_edges() {
+        // A translation that is elided in its own row is one the pane cannot show; the captions
+        // were chosen, and some translations shortened, until none is.
+        let ctx = test_context();
+        let pane = pane_rect(content());
+        let caption_room = microphone_label_rect(pane, 0).width();
+        let value_room = stepper_label_rect(microphone_stepper_rect(pane, 0)).width();
+        let echo_room = echo_toggle_rect(pane).width() - TICK_BOX_SIDE - TICK_BOX_GAP;
+        let values: Vec<&str> = NoiseSuppressionOverride::ALL
+            .map(NoiseSuppressionOverride::label)
+            .into_iter()
+            .chain(DenoiseChannelsOverride::ALL.map(DenoiseChannelsOverride::label))
+            .chain(DeEsserMode::ALL.map(DeEsserMode::label))
+            .chain(DereverbLevel::ALL.map(DereverbLevel::label))
+            .collect();
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            let mut check = |key: &str, room: f32| {
+                for (code, text) in every_translation(key) {
+                    let used = ui
+                        .painter()
+                        .layout_no_wrap(text.clone(), normal_font(), Color32::PLACEHOLDER)
+                        .size()
+                        .x;
+                    if used > room {
+                        problems.push(format!("{code}: {text:?} is {used:.0} in {room:.0}"));
+                    }
+                }
+            };
+            for caption in [NOISE_SUPPRESSION, DENOISER_CHANNELS, DE_ESSER, DE_REVERB] {
+                check(caption, caption_room);
+            }
+            for value in &values {
+                check(value, value_room);
+            }
+            check(ECHO_CANCELLATION, echo_room);
+            check(
+                CALIBRATE_MICROPHONE,
+                audio::RESET_MAX_WIDTH - audio::RESET_LINE_HEIGHT,
+            );
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn the_rule_is_whole_where_nothing_crosses_it_and_stops_where_a_caption_does() {
+        let span = Rangef::new(0.0, 100.0);
+        assert_eq!(divider_segments(span, &[]), vec![span]);
+        assert_eq!(
+            divider_segments(span, &[Rangef::new(40.0, 60.0)]),
+            vec![Rangef::new(0.0, 40.0), Rangef::new(60.0, 100.0)]
+        );
+        // Overlapping, unordered and out-of-range gaps are all taken as they fall.
+        assert_eq!(
+            divider_segments(
+                span,
+                &[
+                    Rangef::new(70.0, 80.0),
+                    Rangef::new(-10.0, 5.0),
+                    Rangef::new(75.0, 90.0),
+                    Rangef::new(200.0, 300.0),
+                ]
+            ),
+            vec![Rangef::new(5.0, 70.0), Rangef::new(90.0, 100.0)]
+        );
+        assert!(divider_segments(span, &[Rangef::new(-1.0, 101.0)]).is_empty());
+    }
+
+    #[test]
+    fn a_translation_of_the_originals_own_captions_reaches_the_rule_too() {
+        // So the break in the rule is not the microphone's alone: 0.3.0 drew it through one of
+        // these.
+        let ctx = test_context();
+        let content = content();
+        let label = nav_label_rect(nav_button_rect(content, 0));
+        let room = divider_x(content) - label.left();
+        frame(&ctx, |ui| {
+            let crossing: Vec<String> =
+                [SettingsTab::Audio, SettingsTab::General, SettingsTab::Help]
+                    .into_iter()
+                    .flat_map(|tab| every_translation(tab.nav_label()))
+                    .filter(|(_, text)| {
+                        ui.painter()
+                            .layout_no_wrap(text.clone(), normal_font(), Color32::PLACEHOLDER)
+                            .size()
+                            .x
+                            > room
+                    })
+                    .map(|(code, text)| format!("{code}: {text}"))
+                    .collect();
+            assert!(!crossing.is_empty());
+            assert!(
+                crossing.iter().all(|c| !c.starts_with("en:")),
+                "{crossing:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn only_the_microphone_caption_reaches_the_rule_in_english() {
+        // Which is why the rule has to make room for it: the original's three stop short.
+        let ctx = test_context();
+        let content = content();
+        frame(&ctx, |ui| {
+            for tab in SettingsTab::ALL {
+                let label = nav_label_rect(nav_button_rect(content, tab.index()));
+                let width = ui
+                    .painter()
+                    .layout_no_wrap(
+                        tab.nav_label().to_owned(),
+                        normal_font(),
+                        Color32::PLACEHOLDER,
+                    )
+                    .size()
+                    .x;
+                let crosses = label.left() + width > divider_x(content);
+                assert_eq!(
+                    crosses,
+                    tab == SettingsTab::Microphone,
+                    "{tab:?} is {width}"
+                );
+                // …and every caption still fits the label box the original allows it.
+                assert!(width <= label.width(), "{tab:?} is elided");
+            }
+        });
     }
 }
