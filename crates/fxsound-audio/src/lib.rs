@@ -59,14 +59,17 @@
 //!
 //! Nothing in `pipewire` or `libspa` is `Send`, so the whole PipeWire side lives on one thread
 //! that this crate spawns and owns. The GUI keeps an [`EngineHandle`], which is `Send` and talks
-//! over four channels chosen for what each one carries:
+//! over paths chosen for what each one carries. Every path that reaches a chain is **per lane** —
+//! the output lane's music chain and the input lane's voice chain each have their own — so an
+//! event meant for the microphone can never be consumed by the music chain, and the two chains'
+//! meters can never overwrite each other:
 //!
-//! | Direction | Carries | Mechanism | Why |
-//! | --- | --- | --- | --- |
-//! | GUI → DSP | [`DspParams`] snapshots | [`triple_buffer`] | Wait-free on both ends, no lock, no allocation. A coalesced intermediate snapshot is harmless: the next one supersedes it. |
-//! | GUI → DSP | [`DspEvent`] one-shots | bounded `crossbeam_channel` | Must not be coalesced. Pre-allocated array channel; `try_recv` never allocates and never parks. |
-//! | DSP → GUI | [`Meters`] | [`triple_buffer`] | Same reasoning, other way round. |
-//! | GUI ↔ control | [`UiToAudio`] / [`AudioToUi`] | `pipewire::channel` / `crossbeam_channel` | May allocate and block; never touched from the process callback. |
+//! | Direction | Carries | Mechanism | Per lane | Why |
+//! | --- | --- | --- | --- | --- |
+//! | GUI → DSP | [`DspParams`] / [`InputDspParams`] snapshots | [`triple_buffer`] | one per chain: [`EngineHandle::set_params`], [`EngineHandle::set_input_params`] | Wait-free on both ends, no lock, no allocation. A coalesced intermediate snapshot is harmless: the next one supersedes it. |
+//! | GUI → DSP | [`DspEvent`] one-shots | bounded `crossbeam_channel` | one per lane: [`EngineHandle::send_event`] | Must not be coalesced. Pre-allocated array channel; `try_recv` never allocates and never parks. |
+//! | DSP → GUI | [`Meters`] | [`triple_buffer`] | one per lane: [`EngineHandle::meters`] | Same reasoning, other way round. |
+//! | GUI ↔ control | [`UiToAudio`] / [`AudioToUi`] | `pipewire::channel` / `crossbeam_channel` | shared; messages name their lane | May allocate and block; never touched from the process callback. |
 //!
 //! The process callback itself allocates nothing, locks nothing and cannot panic: every buffer it
 //! needs is sized once in [`AudioEngine::start`] for the worst case in §24 of the spec (2048
@@ -105,6 +108,7 @@
 //! * **It never runs in both directions at once.** One pair of nodes, one default, one signal.
 //!
 //! [`DspParams`]: fxsound_core::messages::DspParams
+//! [`InputDspParams`]: fxsound_core::messages::InputDspParams
 //! [`DspEvent`]: fxsound_core::messages::DspEvent
 //! [`Meters`]: fxsound_core::messages::Meters
 //! [`UiToAudio`]: fxsound_core::messages::UiToAudio
@@ -115,7 +119,9 @@
 
 pub mod devices;
 pub mod engine;
+mod lane_dsp;
 pub mod locale;
+mod per_direction;
 
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -124,6 +130,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use fxsound_core::DeviceDirection;
 use fxsound_core::messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio};
 use triple_buffer::{Input, Output, TripleBuffer};
+
+use crate::per_direction::PerDirection;
 
 pub use devices::{
     BLUEZ_HEADSET_RATE, ChannelMap, DeviceInfo, FormFactor, MAX_CHANNELS, MAX_SAMPLE_RATE,
@@ -339,45 +347,14 @@ impl AudioEngine {
         // (`docs/spec/12-audio-io.md` §22).
         engine::preflight(std::env::var_os("XDG_RUNTIME_DIR").as_deref())?;
 
-        let (params_in, params_out) = TripleBuffer::new(&DspParams::default()).split();
-        let (input_params_in, input_params_out) =
-            TripleBuffer::new(&InputDspParams::default()).split();
-        let (meters_in, meters_out) = TripleBuffer::new(&Meters::default()).split();
-        let (events_tx, events_rx) = crossbeam_channel::bounded(EVENT_QUEUE_LEN);
-        let (ui_tx, ui_rx) = crossbeam_channel::unbounded();
-        let (control_tx, control_rx) = pipewire::channel::channel();
-        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
-
-        let config = engine::Config {
-            remote: remote.map(str::to_owned),
-            language: language.map(str::to_owned),
-            control: control_rx,
-            notify: ui_tx,
-            params: params_out,
-            input_params: input_params_out,
-            meters: meters_in,
-            events: events_rx,
-            ready: ready_tx,
-        };
+        let (mut handle, config, ready) = EngineHandle::wire(remote, language);
         let join = std::thread::Builder::new()
             .name("fxsound-audio".to_owned())
             .spawn(move || engine::run(config))
             .map_err(|e| AudioError::PipewireUnavailable(e.to_string()))?;
+        handle.engine.join = Some(join);
 
-        let engine = AudioEngine {
-            control: control_tx,
-            join: Some(join),
-        };
-        let handle = EngineHandle {
-            engine,
-            params: params_in,
-            input_params: input_params_in,
-            meters: meters_out,
-            events: events_tx,
-            notifications: ui_rx,
-        };
-
-        match ready_rx.recv_timeout(START_TIMEOUT) {
+        match ready.recv_timeout(START_TIMEOUT) {
             // Connected, or still trying — either way the caller gets a working handle.
             Ok(Ok(())) | Err(RecvTimeoutError::Timeout) => Ok(handle),
             Ok(Err(error)) => {
@@ -431,8 +408,10 @@ pub struct EngineHandle {
     engine: AudioEngine,
     params: Input<DspParams>,
     input_params: Input<InputDspParams>,
-    meters: Output<Meters>,
-    events: Sender<DspEvent>,
+    /// Each lane's meters, through a buffer of its own.
+    meters: PerDirection<Output<Meters>>,
+    /// Each lane's event queue.
+    events: PerDirection<Sender<DspEvent>>,
     notifications: Receiver<AudioToUi>,
 }
 
@@ -446,6 +425,53 @@ impl std::fmt::Debug for EngineHandle {
 }
 
 impl EngineHandle {
+    /// Every path between the GUI and the audio thread, both ends, with no thread yet: the handle
+    /// (its engine not yet joined to anything), the thread's [`engine::Config`], and the receiver
+    /// the thread reports its first connection attempt on.
+    ///
+    /// The one place the two sides are paired, so a lane's meters buffer and event queue are
+    /// created together with the lane's ends of them and cannot be crossed over. Also the seam the
+    /// tests use to drive both lanes' DSP through a real handle without a server.
+    fn wire(
+        remote: Option<&str>,
+        language: Option<&str>,
+    ) -> (Self, engine::Config, Receiver<Result<(), AudioError>>) {
+        let (params_in, params_out) = TripleBuffer::new(&DspParams::default()).split();
+        let (input_params_in, input_params_out) =
+            TripleBuffer::new(&InputDspParams::default()).split();
+        let (meters_in, meters_out) =
+            PerDirection::from_fn(|_| TripleBuffer::new(&Meters::default()).split()).unzip();
+        let (events_tx, events_rx) =
+            PerDirection::from_fn(|_| crossbeam_channel::bounded(EVENT_QUEUE_LEN)).unzip();
+        let (ui_tx, ui_rx) = crossbeam_channel::unbounded();
+        let (control_tx, control_rx) = pipewire::channel::channel();
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+
+        let config = engine::Config {
+            remote: remote.map(str::to_owned),
+            language: language.map(str::to_owned),
+            control: control_rx,
+            notify: ui_tx,
+            params: params_out,
+            input_params: input_params_out,
+            meters: meters_in,
+            events: events_rx,
+            ready: ready_tx,
+        };
+        let handle = Self {
+            engine: AudioEngine {
+                control: control_tx,
+                join: None,
+            },
+            params: params_in,
+            input_params: input_params_in,
+            meters: meters_out,
+            events: events_tx,
+            notifications: ui_rx,
+        };
+        (handle, config, ready_rx)
+    }
+
     /// Publish a new parameter snapshot.
     ///
     /// Wait-free: [`triple_buffer::Input::write`] is a move into a spare buffer plus one atomic
@@ -469,37 +495,51 @@ impl EngineHandle {
     /// equalizer — publishing both through one struct would mean every music preset carried a gate
     /// threshold, and the audio thread would have to know which half of its parameters to ignore.
     ///
-    /// Publishing while the engine is in the other direction is harmless and deliberate: the
-    /// snapshot is state, so whichever one the audio thread is reading is always current, and a
-    /// direction switch needs no handshake.
+    /// Publishing while the input lane has no nodes is harmless and deliberate: the snapshot is
+    /// state, so the voice chain reads a current one the moment the lane is attached, and
+    /// attaching needs no handshake.
     pub fn set_input_params(&mut self, mut params: InputDspParams) {
         params.sanitise();
         self.input_params.write(params);
     }
 
-    /// Fire a one-shot event: filter reset, spectrum reset, processed-time reset.
+    /// Fire a one-shot event at one lane's chain: filter reset, spectrum reset, processed-time
+    /// reset, capture-statistics reset.
+    ///
+    /// The lane is named here rather than in the event because each lane has its own queue, read
+    /// by its own chain and by nothing else: a reset meant for the microphone cannot clear the
+    /// music chain's history, whichever lanes are running. An event for a lane with no nodes is
+    /// applied on the audio thread's main loop, so it is neither lost nor left waiting.
     ///
     /// Unlike a parameter snapshot these must not be coalesced, so they go through a bounded
     /// queue. If the queue is full — which needs 64 unconsumed events, i.e. an audio thread that
     /// is not running — the event is dropped and logged rather than blocking the GUI.
-    pub fn send_event(&self, event: DspEvent) {
-        match self.events.try_send(event) {
+    pub fn send_event(&self, direction: DeviceDirection, event: DspEvent) {
+        match self.events.get(direction).try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(event)) => {
-                log::warn!("dropping {event:?}: the audio thread is not draining its event queue");
+                log::warn!(
+                    "dropping {event:?} for the {} lane: the audio thread is not draining its \
+                     event queue",
+                    direction.key()
+                );
             }
             Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
-    /// The most recent meters the audio thread published.
+    /// The most recent meters the lane's chain published.
+    ///
+    /// Each lane publishes through a buffer of its own, so the music chain's spectrum and the
+    /// voice chain's gate reduction never overwrite each other. A lane that is not running keeps
+    /// the last meters it published — [`Meters::default`] until it has run at all.
     ///
     /// Never blocks and never waits: one atomic swap. Returns the last published value again when
     /// nothing new has arrived, so a GUI that polls faster than the audio callback just redraws
     /// the same frame.
     #[must_use]
-    pub fn meters(&mut self) -> Meters {
-        *self.meters.read()
+    pub fn meters(&mut self, direction: DeviceDirection) -> Meters {
+        *self.meters.get_mut(direction).read()
     }
 
     /// Send a control-plane request. Non-blocking; wakes the PipeWire loop.
@@ -554,9 +594,27 @@ mod tests {
         fn param_channel_is_a_triple_buffer(handle: &mut EngineHandle) {
             let _: &mut Input<DspParams> = &mut handle.params;
             let _: &mut Input<InputDspParams> = &mut handle.input_params;
-            let _: &mut Output<Meters> = &mut handle.meters;
+            // Both lanes, not just the one a single-lane engine used to have: each lane's meters
+            // come back through a triple buffer of its own, and each lane's events go out through
+            // a sender of its own.
+            for direction in DeviceDirection::ALL {
+                let _: &mut Output<Meters> = handle.meters.get_mut(direction);
+                let _: &Sender<DspEvent> = handle.events.get(direction);
+            }
         }
         let _ = param_channel_is_a_triple_buffer;
+
+        // A bounded channel of non-zero capacity is crossbeam's array flavour: pre-allocated,
+        // and `try_recv` on the audio thread never allocates and never parks. Checked per lane.
+        let (handle, _config, _ready) = EngineHandle::wire(None, None);
+        for (direction, events) in handle.events.iter() {
+            assert_eq!(
+                events.capacity(),
+                Some(EVENT_QUEUE_LEN),
+                "the {} lane's event queue must be a bounded array channel",
+                direction.key()
+            );
+        }
 
         // A payload that owns heap memory would make the audio thread's `write`/`read` drop an
         // allocation. `Copy` rules that out for good. The microphone chain's snapshot is held to
@@ -593,6 +651,114 @@ mod tests {
             "the reader must always end up with the most recently written snapshot"
         );
         assert!(seen <= 9_999);
+    }
+
+    /// A handle wired to both lanes' DSP, as `engine::run` builds it, with no thread and no
+    /// server: the GUI's ends and the audio thread's ends of the same paths.
+    fn wired_lanes() -> (EngineHandle, PerDirection<lane_dsp::LaneDsp>) {
+        let (handle, config, _ready) = EngineHandle::wire(None, None);
+        let (lanes, _handover) = lane_dsp::build(
+            config.params,
+            config.input_params,
+            config.meters,
+            config.events,
+        );
+        (handle, lanes)
+    }
+
+    /// Run a block of a steady tone through a lane, so its counters have something to reset.
+    fn run_a_block(dsp: &mut lane_dsp::LaneDsp) {
+        let block: Vec<u8> = (0..512 * 2)
+            .flat_map(|i| (0.25 * ((i / 2) as f32 * 0.05).sin()).to_le_bytes())
+            .collect();
+        dsp.refresh();
+        dsp.process_bytes(&block, 2)
+            .expect("a quantum of stereo fits the scratch");
+    }
+
+    #[test]
+    fn an_event_sent_to_one_lane_is_never_consumed_by_the_other_lanes_engine() {
+        let (handle, mut lanes) = wired_lanes();
+        for (_, dsp) in lanes.iter_mut() {
+            dsp.set_format(48_000.0, 2);
+            run_a_block(dsp);
+            assert!(dsp.meters().processed_samples > 0);
+        }
+
+        // A reset for the microphone. The music chain runs first and must leave it where it is.
+        handle.send_event(DeviceDirection::Input, DspEvent::ResetProcessedTime);
+        lanes.output.refresh();
+        assert!(
+            lanes.output.meters().processed_samples > 0,
+            "the music chain consumed an event addressed to the voice chain"
+        );
+        lanes.input.refresh();
+        assert_eq!(
+            lanes.input.meters().processed_samples,
+            0,
+            "the voice chain never received its own event"
+        );
+
+        // And the other way round.
+        run_a_block(&mut lanes.input);
+        handle.send_event(DeviceDirection::Output, DspEvent::ResetProcessedTime);
+        lanes.input.refresh();
+        assert!(
+            lanes.input.meters().processed_samples > 0,
+            "the voice chain consumed an event addressed to the music chain"
+        );
+        lanes.output.refresh();
+        assert_eq!(lanes.output.meters().processed_samples, 0);
+    }
+
+    #[test]
+    fn an_event_that_fills_one_lanes_queue_leaves_the_other_lanes_queue_empty() {
+        let (handle, config, _ready) = EngineHandle::wire(None, None);
+        for _ in 0..EVENT_QUEUE_LEN {
+            handle.send_event(DeviceDirection::Output, DspEvent::ResetFilterState);
+        }
+        assert!(config.events.output.is_full());
+        assert!(
+            config.events.input.is_empty(),
+            "the voice chain's queue has room for its own events whatever the music chain's holds"
+        );
+        // Full is dropped and logged, never blocking the GUI, and still never spills over.
+        handle.send_event(DeviceDirection::Output, DspEvent::ResetFilterState);
+        assert!(config.events.input.is_empty());
+        handle.send_event(DeviceDirection::Input, DspEvent::ResetCaptureStats);
+        assert_eq!(config.events.input.len(), 1);
+    }
+
+    #[test]
+    fn each_lanes_meters_are_published_through_its_own_buffer_and_do_not_overwrite_the_others() {
+        let (mut handle, mut lanes) = wired_lanes();
+        assert_eq!(handle.meters(DeviceDirection::Output), Meters::default());
+        assert_eq!(handle.meters(DeviceDirection::Input), Meters::default());
+
+        // Two rates no default could be mistaken for, one per lane.
+        lanes.output.set_format(44_100.0, 2);
+        lanes.input.set_format(96_000.0, 2);
+        lanes.output.publish_meters();
+        assert_eq!(handle.meters(DeviceDirection::Output).sample_rate, 44_100);
+        assert_eq!(
+            handle.meters(DeviceDirection::Input),
+            Meters::default(),
+            "the music chain's meters reached the voice chain's buffer"
+        );
+
+        lanes.input.publish_meters();
+        assert_eq!(handle.meters(DeviceDirection::Input).sample_rate, 96_000);
+        assert_eq!(
+            handle.meters(DeviceDirection::Output).sample_rate,
+            44_100,
+            "the voice chain's meters overwrote the music chain's"
+        );
+
+        // A lane that publishes again moves only its own reading.
+        lanes.output.set_format(48_000.0, 2);
+        lanes.output.publish_meters();
+        assert_eq!(handle.meters(DeviceDirection::Output).sample_rate, 48_000);
+        assert_eq!(handle.meters(DeviceDirection::Input).sample_rate, 96_000);
     }
 
     #[test]

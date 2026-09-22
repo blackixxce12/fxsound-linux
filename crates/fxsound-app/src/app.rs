@@ -197,7 +197,10 @@ impl App {
             return;
         };
 
-        let meters = engine.meters();
+        // The lane the window is showing. Each lane publishes its own meters, so the voice
+        // chain's gate reduction can no longer arrive in the music chain's spectrum or the
+        // other way round.
+        let meters = engine.meters(self.state.direction);
         self.state.spectrum = meters.spectrum;
         self.state.audio_active = meters.active;
         // The rate is the device's, and the interface needs it for one thing: an equalizer band
@@ -311,10 +314,13 @@ impl App {
                 // equalizer or the leveller. That also makes the power button the one recovery a
                 // user with broken-sounding audio will reach for first, so it has to be the one
                 // that actually clears the history. Both the tray and `--power` route here.
+                // Power is one switch over both chains, so both lanes are reset.
                 if self.state.power
                     && let Some(engine) = &self.engine
                 {
-                    engine.send_event(DspEvent::ResetFilterState);
+                    for direction in DeviceDirection::ALL {
+                        engine.send_event(direction, DspEvent::ResetFilterState);
+                    }
                 }
             }
             UiAction::ToggleView => {
@@ -589,7 +595,7 @@ impl App {
             self.settings.set_selected_preset(&name);
             self.settings_dirty = true;
             if let Some(engine) = &self.engine {
-                engine.send_event(DspEvent::ResetFilterState);
+                engine.send_event(DeviceDirection::Input, DspEvent::ResetFilterState);
             }
             return;
         }
@@ -640,9 +646,10 @@ impl App {
                 }
                 self.settings.set_selected_preset(&name);
                 self.settings_dirty = true;
-                // A new band layout means the old filter history is meaningless.
+                // A new band layout means the old filter history is meaningless. A `.fac` preset
+                // is the music chain's.
                 if let Some(engine) = &self.engine {
-                    engine.send_event(DspEvent::ResetFilterState);
+                    engine.send_event(DeviceDirection::Output, DspEvent::ResetFilterState);
                 }
             }
             Err(err) => {
@@ -780,8 +787,12 @@ impl App {
         self.settings_dirty = true;
         self.mark_preset_modified();
         self.sync_params_from_state();
+        // The band count reaches both chains' equalizers — `sync_params_from_state` publishes
+        // both snapshots — so both lanes' filter history is stale.
         if let Some(engine) = &self.engine {
-            engine.send_event(DspEvent::ResetFilterState);
+            for direction in DeviceDirection::ALL {
+                engine.send_event(direction, DspEvent::ResetFilterState);
+            }
         }
     }
 
