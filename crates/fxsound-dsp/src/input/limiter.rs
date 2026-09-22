@@ -190,6 +190,18 @@ impl LookaheadLimiter {
         self.state.get(channel).map_or(0.0, |state| state.env)
     }
 
+    /// What a gain-reduction meter shows for one channel: `20·log10(envelope / ceiling)` while
+    /// the envelope is above the ceiling, as a positive number, and zero otherwise.
+    #[must_use]
+    pub fn reduction_db(&self, channel: usize) -> Real {
+        let envelope = self.envelope(channel);
+        if envelope > self.ceiling && self.ceiling > 0.0 {
+            20.0 * (envelope / self.ceiling).log10()
+        } else {
+            0.0
+        }
+    }
+
     pub fn reset(&mut self) {
         self.delay.fill(0.0);
         self.state = [ChannelState::SILENT; MAX_CHANNELS];
@@ -378,6 +390,27 @@ mod tests {
             out[at - 1].abs() < 0.2,
             "the run-up was not attenuated: {}",
             out[at - 1]
+        );
+    }
+
+    #[test]
+    fn the_meter_reads_how_far_over_the_ceiling_the_envelope_is() {
+        let mut l = limiter(-6.0);
+        assert_eq!(l.reduction_db(0), 0.0);
+        for _ in 0..200 {
+            let mut frame = [1.0_f32];
+            l.process_frame(&mut frame);
+        }
+        // Full scale against a −6 dB ceiling is six decibels of reduction.
+        assert!(
+            (l.reduction_db(0) - 6.0).abs() < 0.1,
+            "{}",
+            l.reduction_db(0)
+        );
+        assert_eq!(
+            l.reduction_db(MAX_CHANNELS + 1),
+            0.0,
+            "an unknown channel reads zero"
         );
     }
 

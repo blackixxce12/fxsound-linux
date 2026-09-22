@@ -19,9 +19,11 @@
 #![forbid(unsafe_code)]
 
 pub mod input;
+pub mod input_store;
 mod store;
 
-pub use store::{PresetEntry, PresetSource, PresetStore};
+pub use input_store::InputPresetStore;
+pub use store::{PresetEntry, PresetFile, PresetSource, PresetStore, Store};
 
 use fxsound_core::{EqBand, Preset, eq};
 use std::fmt::Write as _;
@@ -47,6 +49,22 @@ pub enum PresetError {
     },
     #[error("preset has no name")]
     MissingName,
+    /// A name the store's list does not hold. Its own variant rather than a `Malformed` at line
+    /// zero, because the string reaches the command line and D-Bus, and "line 0: expected a known
+    /// preset name" describes a file that was never opened.
+    #[error("no preset named {0:?}")]
+    Unknown(String),
+    /// A name whose file is already another listed preset's. The two names differ only in
+    /// characters a filename cannot hold — `Mu:sic` and `Music` are both `Music.fac` — so writing
+    /// the second would replace the first's file, or share its autosave when the first is a
+    /// factory preset kept under a numbered name, and the list would show one name where two had
+    /// been saved. [`crate::Store::save_as`] refuses it instead.
+    #[error("{name:?} and {existing:?} would share the file {file}")]
+    SharedFile {
+        name: String,
+        existing: String,
+        file: String,
+    },
     #[error("{0} equalizer bands, the engine supports at most {max}", max = eq::MAX_BANDS)]
     TooManyBands(usize),
     #[error(transparent)]
@@ -63,8 +81,44 @@ const NUM_ELEMENT_PARAMS: usize = 7;
 const NUM_APP_INTS: usize = 7;
 /// The first version that carries an equalizer block.
 const EQ_MIN_VERSION: f32 = 9.0;
-/// `DFXG_MAX_PRESET_NAME_LENGTH`.
+/// `DFXG_MAX_PRESET_NAME_LENGTH`: what the file format can hold.
 pub const MAX_NAME_LEN: usize = 128;
+
+/// Characters stripped from a preset name before it is used, from
+/// `FxController::sanitizePresetName` (`fxsound/Source/GUI/FxController.cpp:378`).
+///
+/// This is the Windows reserved-filename set and it stays reserved on Linux, because a preset name
+/// becomes a `.fac` filename (`FxController.cpp:805-808`) and preset files are meant to travel
+/// between the two platforms. NUL is stripped as well: no filesystem takes it, and the original
+/// never had to say so because a Windows text field cannot type it.
+pub const PRESET_NAME_RESERVED: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+
+/// Preset names are truncated to this many characters (`FxController.cpp:380-383`, and the
+/// interactive editor's `setInputRestrictions(64)` at `FxPresetNameEditor.cpp:52`). Shorter than
+/// [`MAX_NAME_LEN`], which is what the *file* can carry; this is what a person may type.
+pub const MAX_PRESET_NAME_LEN: usize = 64;
+
+/// Steps 1 and 2 of `FxController::sanitizePresetName` (`FxController.cpp:377-391`): strip the
+/// reserved characters, then truncate to [`MAX_PRESET_NAME_LEN`] characters. Surrounding
+/// whitespace goes too, because a name that is only spaces is not a name and a trailing space is
+/// a filename nobody can see.
+///
+/// The one sanitiser for every route a name takes to disk. 0.3.0 had two — the command line
+/// stripped nine characters and the store replaced three with underscores — and a name typed
+/// with a `:` in the window became a file the Windows build could not open. Step 3, the
+/// case-insensitive collision check against the existing names (`FxModel.cpp:142-153`), needs the
+/// preset list and so belongs to the controller. The order matters and is why
+/// `--save_preset="Mu:sic"` is a no-op when a preset named `Music` exists: stripping the `:`
+/// produces the collision (`docs/COMMAND_LINE_OPTIONS.md:52`).
+#[must_use]
+pub fn sanitise_preset_name(name: &str) -> String {
+    let stripped: String = name
+        .chars()
+        .filter(|c| *c != '\0' && !PRESET_NAME_RESERVED.contains(c))
+        .collect();
+    let cut: String = stripped.trim().chars().take(MAX_PRESET_NAME_LEN).collect();
+    cut.trim_end().to_owned()
+}
 
 /// Parse a `.fac` file.
 ///
@@ -646,5 +700,67 @@ Band 10
         for band in &again.eq_bands {
             assert!(band.boost_db.is_finite() && band.center_hz.is_finite());
         }
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_not_part_of_a_preset_name() {
+        // A trailing space is a filename nobody can see, and a name that is only spaces is not a
+        // name. Spaces inside stay: "Bass Boost" is a shipped preset.
+        assert_eq!(sanitise_preset_name("  Rock  "), "Rock");
+        assert_eq!(sanitise_preset_name("Bass  Boost"), "Bass  Boost");
+        assert_eq!(sanitise_preset_name("   "), "");
+    }
+
+    #[test]
+    fn nul_is_stripped_like_a_reserved_character() {
+        // Not in the original's list only because a Windows text field cannot type it; no
+        // filesystem takes it, and `--save_preset` can be handed one by a script.
+        assert_eq!(sanitise_preset_name("a\0b"), "ab");
+        assert_eq!(sanitise_preset_name("\0"), "");
+    }
+
+    #[test]
+    fn every_reserved_character_is_stripped_wherever_it_sits() {
+        for c in PRESET_NAME_RESERVED {
+            assert_eq!(
+                sanitise_preset_name(&format!("{c}Ro{c}ck{c}")),
+                "Rock",
+                "{c:?}"
+            );
+        }
+        assert_eq!(sanitise_preset_name(r#"<>:"/\|?*"#), "");
+        // And nothing else is: the set is deliberately the Windows one, not the shell's, and a
+        // shipped preset is called R&B.
+        assert_eq!(sanitise_preset_name("R&B"), "R&B");
+        assert_eq!(
+            sanitise_preset_name("Naïve 'Jazz' (live) #2"),
+            "Naïve 'Jazz' (live) #2"
+        );
+    }
+
+    #[test]
+    fn a_long_name_is_cut_to_sixty_four_characters_and_does_not_end_in_a_space() {
+        // 63 letters, a space, 6 more letters: the cut lands on the space, and a stem with a
+        // trailing space is the filename problem the trim exists for.
+        let name = format!("{} {}", "a".repeat(63), "b".repeat(6));
+        assert_eq!(name.chars().count(), 70);
+        assert_eq!(sanitise_preset_name(&name), "a".repeat(63));
+        // The limit is characters, not bytes: a name of two-byte letters keeps 64 of them.
+        let wide = "é".repeat(70);
+        assert_eq!(
+            sanitise_preset_name(&wide).chars().count(),
+            MAX_PRESET_NAME_LEN
+        );
+        // Exactly 64 is not cut at all.
+        let exact = "a".repeat(MAX_PRESET_NAME_LEN);
+        assert_eq!(sanitise_preset_name(&exact), exact);
+    }
+
+    #[test]
+    fn reserved_characters_are_stripped_before_the_cut_is_measured() {
+        // The original's order (`FxController.cpp:378` before `:380`): the characters that go
+        // do not count towards the 64, so ten colons in front of 64 letters leave all 64.
+        let name = format!("{}{}", ":".repeat(10), "a".repeat(MAX_PRESET_NAME_LEN));
+        assert_eq!(sanitise_preset_name(&name), "a".repeat(MAX_PRESET_NAME_LEN));
     }
 }

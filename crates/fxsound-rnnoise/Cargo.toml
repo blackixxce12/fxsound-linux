@@ -1,0 +1,21 @@
+[package]
+name = "fxsound-rnnoise"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+# BSD-3-Clause, not the workspace's AGPL: this is Joe Neeman's `nnnoiseless` 0.5.2 (itself a port
+# of Xiph's RNNoise), vendored with its `COPYING` and `AUTHORS`. See README.md for what was
+# changed and why; every change is marked `// fxsound:` in the source.
+license = "BSD-3-Clause"
+repository.workspace = true
+description = "RNNoise as a pure-Rust port (vendored nnnoiseless 0.5.2), with an in-place reset and a split analysis/synthesis path"
+
+[lib]
+bench = false
+
+[dependencies]
+# The same two dependencies nnnoiseless 0.5.2 had with its default features off. `easyfft` is the
+# FFT the port was written against (its planner is thread-local, which is the one first-use
+# allocation the denoiser documents); `once_cell` holds the window and DCT tables.
+easyfft = "0.4.1"
+once_cell = "1.9.0"

@@ -84,7 +84,7 @@
 //! handed back — on exit, on every direction switch, and whenever the nodes go away for good —
 //! **before** the nodes are destroyed, so there is never a window in which the default names a
 //! node that no longer exists. Only the `configured` key is ever written; `default.audio.*` is
-//! WirePlumber's. A caller can opt out with [`UiToAudio::SetAsDefault`]`(false)`.
+//! WirePlumber's. A caller can opt out with [`UiToAudio::SetAsDefault`] with `want: false`.
 //!
 //! # What it deliberately does not do
 //!
@@ -126,8 +126,8 @@ use fxsound_core::messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Met
 use triple_buffer::{Input, Output, TripleBuffer};
 
 pub use devices::{
-    ChannelMap, DeviceInfo, FormFactor, MAX_CHANNELS, MAX_SAMPLE_RATE, MIN_CHANNELS, Selection,
-    SelectionMemory,
+    BLUEZ_HEADSET_RATE, ChannelMap, DeviceInfo, FormFactor, MAX_CHANNELS, MAX_SAMPLE_RATE,
+    MIN_CHANNELS, Selection, SelectionMemory,
 };
 pub use locale::{node_description, sink_description, source_description};
 
@@ -294,7 +294,7 @@ impl AudioEngine {
     /// nodes are up, makes `fxsound_sink` the configured default sink — remembering the previous
     /// default so it can be handed back (`docs/spec/12-audio-io.md` §21). Send
     /// [`UiToAudio::SelectDevice`] to attach to a specific device, or to a microphone, which
-    /// switches the engine into the input direction; send [`UiToAudio::SetAsDefault`]`(false)`
+    /// switches the engine into the input direction; send [`UiToAudio::SetAsDefault`] with `want: false`
     /// to keep the default where it is.
     ///
     /// # Errors

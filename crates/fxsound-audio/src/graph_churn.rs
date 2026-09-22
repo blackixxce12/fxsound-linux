@@ -176,7 +176,7 @@ fn selecting_a_device_builds_the_nodes_and_negotiates_its_format() {
         &handle,
         "an eight-channel format",
         |message| match message {
-            AudioToUi::Status(status) if status.channels == 8 => Some(status),
+            AudioToUi::Status { status, .. } if status.channels == 8 => Some(status),
             _ => None,
         },
     )
@@ -209,7 +209,7 @@ fn switching_direction_rebuilds_the_nodes_the_other_way_round() {
         direction: DeviceDirection::Output,
     });
     wait_for(&handle, "the output format", |message| match message {
-        AudioToUi::Status(status) if status.channels == 8 => Some(status),
+        AudioToUi::Status { status, .. } if status.channels == 8 => Some(status),
         _ => None,
     })
     .expect("the 7.1 sink should be negotiated");
@@ -223,7 +223,7 @@ fn switching_direction_rebuilds_the_nodes_the_other_way_round() {
         direction: DeviceDirection::Input,
     });
     let status = wait_for(&handle, "the input format", |message| match message {
-        AudioToUi::Status(status) if status.channels != 8 => Some(status),
+        AudioToUi::Status { status, .. } if status.channels != 8 => Some(status),
         _ => None,
     })
     .expect("the microphone's format should be negotiated");

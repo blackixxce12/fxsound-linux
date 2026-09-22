@@ -44,11 +44,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, TrySendError};
 use fxsound_core::messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio};
 use fxsound_core::{AudioDevice, AudioStatus, DeviceDirection};
 use fxsound_dsp::Engine as DspEngine;
-use fxsound_dsp::InputEngine;
+use fxsound_dsp::{ChainSpec, InputEngine};
 use libspa::param::audio::{AudioFormat, AudioInfoRaw};
 use libspa::param::format::{MediaSubtype, MediaType};
 use libspa::param::format_utils;
@@ -368,16 +368,69 @@ pub(crate) struct SinkDsp {
     /// every filter again on the main loop, and would throw away the state of the chain the user
     /// is about to switch *back* to.
     engine: DspEngine,
-    input: InputEngine,
+    /// Boxed so that swapping it for a replacement is one pointer move on the audio thread — see
+    /// [`Self::adopt_replacement`] — rather than a copy of nine stages and a spectrum analyser.
+    input: Box<InputEngine>,
     params: Output<DspParams>,
     input_params: Output<InputDspParams>,
     meters: Input<Meters>,
     events: Receiver<DspEvent>,
+    /// A voice engine built on the main loop for a chain the preset named, waiting for the audio
+    /// thread to take it. Bounded, so `try_recv` is one atomic load per block and never allocates.
+    replacement: Receiver<Box<InputEngine>>,
+    /// The engine a replacement displaced, on its way back to the main loop to be dropped there:
+    /// its stages own heap — eight network states in the denoiser alone — and freeing them is as
+    /// much a real-time violation as allocating them was.
+    retired: Sender<Box<InputEngine>>,
+    /// A retired engine `retired` had no room for. Held rather than dropped, for the reason above,
+    /// and handed back on a later block; while it is here no further replacement is taken, so the
+    /// audio thread never owns more than two engines at once.
+    parked: Option<Box<InputEngine>>,
     /// Interleaved de-serialisation buffer, sized for the worst case and never resized.
     scratch: Vec<f32>,
     /// Which of the two engines the callback runs. Set when the nodes are built, never on the
     /// audio thread.
     direction: DeviceDirection,
+}
+
+/// The main loop's ends of the voice-chain hand-over, the one thing a voice preset can change
+/// that is not a parameter: the *set* of stages, which has to be allocated.
+///
+/// The pattern is the recycle channel's, in the other direction. The [`SinkDsp`] lives in NODE 1's
+/// user data while a pair of nodes is up, out of the main loop's reach, so a chain it should now
+/// be running is built here and sent over; the audio thread swaps it in and sends the old one
+/// back through `retired` to be dropped here. Both channels are bounded — array channels, whose
+/// `try_send` and `try_recv` never allocate — and small: one replacement in flight is all a
+/// preset change ever needs, and a second one only means the user clicked twice within a block.
+pub(crate) struct ChainHandover {
+    replacement: Sender<Box<InputEngine>>,
+    retired: Receiver<Box<InputEngine>>,
+}
+
+impl ChainHandover {
+    /// One replacement may wait for the audio thread at a time; the supervisor tries again on the
+    /// next tick when the slot is still full.
+    const REPLACEMENTS_IN_FLIGHT: usize = 1;
+    /// Room for a retired engine and a parked one, so the audio thread's `try_send` cannot find
+    /// the channel full as long as the main loop drains it before sending a replacement — which
+    /// [`reconcile_input_chain`] does. `parked` covers the case anyway.
+    const RETIRED_IN_FLIGHT: usize = 2;
+
+    /// The main loop's ends, with the audio thread's `(replacement receiver, retired sender)` to
+    /// hand to [`SinkDsp::new`].
+    fn new() -> (Self, Receiver<Box<InputEngine>>, Sender<Box<InputEngine>>) {
+        let (replacement_tx, replacement_rx) =
+            crossbeam_channel::bounded(Self::REPLACEMENTS_IN_FLIGHT);
+        let (retired_tx, retired_rx) = crossbeam_channel::bounded(Self::RETIRED_IN_FLIGHT);
+        (
+            Self {
+                replacement: replacement_tx,
+                retired: retired_rx,
+            },
+            replacement_rx,
+            retired_tx,
+        )
+    }
 }
 
 impl SinkDsp {
@@ -386,6 +439,8 @@ impl SinkDsp {
         input_params: Output<InputDspParams>,
         meters: Input<Meters>,
         events: Receiver<DspEvent>,
+        replacement: Receiver<Box<InputEngine>>,
+        retired: Sender<Box<InputEngine>>,
     ) -> Self {
         Self {
             engine: DspEngine::new(
@@ -393,15 +448,18 @@ impl SinkDsp {
                 MAX_QUANTUM_FRAMES,
                 MIN_CHANNELS as usize,
             ),
-            input: InputEngine::new(
+            input: Box::new(InputEngine::new(
                 DEFAULT_SAMPLE_RATE as f32,
                 MAX_QUANTUM_FRAMES,
                 MIN_CHANNELS as usize,
-            ),
+            )),
             params,
             input_params,
             meters,
             events,
+            replacement,
+            retired,
+            parked: None,
             scratch: vec![0.0; MAX_QUANTUM_FRAMES * MAX_CHANNELS as usize],
             direction: DeviceDirection::Output,
         }
@@ -413,11 +471,67 @@ impl SinkDsp {
         self.direction = direction;
     }
 
+    /// Rebuild the voice chain for a spec, in place. **Main loop only**, and only while this
+    /// struct is on the main loop — between pairs of nodes — because it allocates the new stages
+    /// and drops the old ones; with a pair up the same change goes through [`ChainHandover`].
+    ///
+    /// Anything still waiting in `replacement` was built for a spec the main loop has since moved
+    /// on from, and would otherwise be adopted by the next pair as if it were current; it is
+    /// drained and dropped here, where dropping is allowed. So is a parked engine.
+    fn set_input_spec(&mut self, spec: ChainSpec) {
+        while self.replacement.try_recv().is_ok() {}
+        self.parked = None;
+        self.input.set_spec(spec);
+    }
+
+    /// Take over a voice engine the main loop built for a chain the preset named, and send the
+    /// one it displaces back to be dropped there.
+    ///
+    /// Real-time safe: `try_recv` and `try_send` on bounded channels, two pointer moves, and a
+    /// `set_format` that is a no-op when the main loop built the replacement at the negotiated
+    /// format (it reads the same counters `on_sink_format` writes) and a redesign — never an
+    /// allocation — when it did not. The replacement's parameters catch up on the `apply` that
+    /// follows in [`Self::refresh`], because it starts from the defaults and the snapshot is
+    /// state. Nothing is dropped: a displaced engine that cannot be sent is parked, and while one
+    /// is parked no further replacement is taken.
+    #[inline]
+    fn adopt_replacement(&mut self) {
+        self.hand_back_retired();
+        if self.parked.is_some() {
+            return;
+        }
+        let Ok(mut fresh) = self.replacement.try_recv() else {
+            return;
+        };
+        fresh.set_format(self.input.sample_rate(), self.input.channels());
+        fresh.set_source_rate(self.input.source_rate());
+        self.parked = Some(std::mem::replace(&mut self.input, fresh));
+        self.hand_back_retired();
+    }
+
+    #[inline]
+    fn hand_back_retired(&mut self) {
+        if let Some(old) = self.parked.take()
+            && let Err(err) = self.retired.try_send(old)
+        {
+            self.parked = Some(err.into_inner());
+        }
+    }
+
     fn set_format(&mut self, sample_rate: f32, channels: usize) {
         match self.direction {
             DeviceDirection::Output => self.engine.set_format(sample_rate, channels),
             DeviceDirection::Input => self.input.set_format(sample_rate, channels),
         }
+    }
+
+    /// What the target's properties say it really runs at — [`DeviceInfo::native_rate`] — as
+    /// opposed to the 48 kHz NODE 1 negotiates for every microphone. Voice chain only: no stage
+    /// of the music chain cares, and a sink's rate is the one NODE 1 runs at anyway. Set when the
+    /// nodes are built, like the format; a replacement engine inherits it in
+    /// [`Self::adopt_replacement`].
+    fn set_source_rate(&mut self, rate: Option<f32>) {
+        self.input.set_source_rate(rate);
     }
 
     /// Where the subwoofer and the front pair sit in the negotiated layout.
@@ -459,6 +573,7 @@ impl SinkDsp {
                 }
             }
             DeviceDirection::Input => {
+                self.adopt_replacement();
                 self.input.apply(self.input_params.read());
                 while let Ok(event) = self.events.try_recv() {
                     self.input.handle_event(event);
@@ -505,6 +620,7 @@ impl std::fmt::Debug for SinkDsp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SinkDsp")
             .field("direction", &self.direction)
+            .field("input_spec", &self.input.spec())
             .field("scratch", &self.scratch.len())
             .finish_non_exhaustive()
     }
@@ -673,7 +789,7 @@ struct Shared {
     /// dropped out wants the total, not whatever has happened since the last 200 ms tick.
     format_mismatches_total: u64,
     /// Whether to take the session default for the active direction once its nodes are up.
-    /// `true` unless a caller opted out with [`UiToAudio::SetAsDefault`]`(false)`.
+    /// `true` unless a caller opted out with [`UiToAudio::SetAsDefault`] with `want: false`.
     want_default: bool,
 
     needs_rules: bool,
@@ -688,6 +804,14 @@ struct Shared {
     dsp: Option<SinkDsp>,
     recycle: Receiver<SinkDsp>,
     recycle_tx: Sender<SinkDsp>,
+    /// The stage ordering the voice preset names ([`UiToAudio::SetInputChain`]); `voice` until
+    /// one does. What the voice engine runs, or is about to.
+    input_spec: ChainSpec,
+    /// `input_spec` changed and the engine has not been told yet: either a replacement still has
+    /// to be sent over ([`reconcile_input_chain`]), or the engine is with an output pair and the
+    /// next `build_nodes` brings it up to date.
+    input_spec_pending: bool,
+    handover: ChainHandover,
     ring: Arc<SampleRing>,
     counters: Arc<Counters>,
     status: Arc<StreamStatus>,
@@ -710,6 +834,7 @@ impl Shared {
         remote: Option<String>,
         language: Option<String>,
         dsp: Option<SinkDsp>,
+        handover: ChainHandover,
     ) -> Self {
         let (recycle_tx, recycle) = crossbeam_channel::unbounded();
         Self {
@@ -733,6 +858,9 @@ impl Shared {
             dsp,
             recycle,
             recycle_tx,
+            input_spec: ChainSpec::voice(),
+            input_spec_pending: false,
+            handover,
             ring: Arc::new(SampleRing::new()),
             counters: Arc::new(Counters::default()),
             status: Arc::new(StreamStatus::default()),
@@ -760,6 +888,7 @@ impl Shared {
         }
         log::warn!("audio engine: {error}");
         self.notify(AudioToUi::Error {
+            direction: Some(self.direction),
             message: error.to_string(),
         });
         self.last_error = Some(error);
@@ -881,11 +1010,20 @@ pub(crate) fn run(config: Config) {
         }
     };
 
+    let (handover, replacement, retired) = ChainHandover::new();
     let shared = Rc::new(RefCell::new(Shared::new(
         notify,
         remote,
         language,
-        Some(SinkDsp::new(params, input_params, meters, events)),
+        Some(SinkDsp::new(
+            params,
+            input_params,
+            meters,
+            events,
+            replacement,
+            retired,
+        )),
+        handover,
     )));
 
     let control_source = control.attach(mainloop.loop_(), {
@@ -1038,7 +1176,9 @@ fn handle_control(
             shared.needs_publish = true;
             shared.needs_rules = true;
         }
-        UiToAudio::SetAsDefault(want) => {
+        // One lane in this engine still, so the direction named is the one it is in; the
+        // per-lane claim is the two-lane work.
+        UiToAudio::SetAsDefault { direction: _, want } => {
             shared.want_default = want;
             if want {
                 // With no nodes yet the claim happens when they come up; writing the key now
@@ -1054,6 +1194,16 @@ fn handle_control(
         UiToAudio::Restart => {
             shared.restart_requested = true;
         }
+        // Neither exists until the engine has two lanes and an echo-cancel module to load; until
+        // then they are acknowledged and do nothing, which is what an engine with one lane and no
+        // canceller can honestly say.
+        UiToAudio::DetachLane(direction) => {
+            log::debug!("DetachLane({direction:?}) is not supported by the single-lane engine");
+        }
+        UiToAudio::SetEchoCancel(want) => {
+            log::debug!("SetEchoCancel({want}) is not supported by the single-lane engine");
+        }
+        UiToAudio::SetInputChain(name) => set_input_chain(&mut shared, &name),
         UiToAudio::SeedRememberedDefaults { output, input } => {
             // Only ever fills a gap. If this run has already displaced something, that is the
             // fresher truth and the settings file's copy is stale by a whole session.
@@ -1223,8 +1373,10 @@ fn supervise(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) {
             return;
         };
 
-        // 1. Recover any DSP state a torn-down stream handed back.
+        // 1. Recover any DSP state a torn-down stream handed back, and any voice engine the
+        //    audio thread retired; hand over a chain the preset named if that is still owed.
         drain_recycled_dsp(&mut guard);
+        reconcile_input_chain(&mut guard);
 
         // 2. A core error, an explicit Restart, or a stream that went into error.
         if guard.restart_requested {
@@ -1620,6 +1772,77 @@ fn drain_recycled_dsp(shared: &mut Shared) {
     }
 }
 
+/// Drop the voice engines the audio thread has retired. This is the whole point of the return
+/// channel: the drop happens here, on the main loop, and never in `process()`.
+fn drain_retired_chains(shared: &mut Shared) {
+    while shared.handover.retired.try_recv().is_ok() {}
+}
+
+/// Run the voice chain a preset names. The name is resolved here, once, and an unknown one runs
+/// the `voice` chain and says so: a preset written for a later version that knows more chains
+/// must still load (`fxsound_preset::input::CHAIN_NAMES` is the list this build matches, and
+/// `ChainSpec::by_name` is what it matches against).
+fn set_input_chain(shared: &mut Shared, name: &str) {
+    let spec = ChainSpec::by_name(name).unwrap_or_else(|| {
+        log::warn!("the voice preset names a chain this build does not know ({name:?}); running the voice chain");
+        ChainSpec::voice()
+    });
+    if spec == shared.input_spec {
+        return;
+    }
+    log::info!("voice chain: {name}");
+    shared.input_spec = spec;
+    shared.input_spec_pending = true;
+    reconcile_input_chain(shared);
+}
+
+/// Bring the voice engine up to date with `input_spec`, wherever the engine is.
+///
+/// Three places it can be. On the main loop, between pairs of nodes: rebuilt in place, which is
+/// the only place a rebuild is allowed. With a running *input* pair: a replacement is built here
+/// at the negotiated format and sent over; the audio thread swaps it in on its next block and
+/// retires the old one back to this loop. With a running *output* pair: idle, and left alone
+/// until that pair comes down — `build_nodes` rebuilds it in place before the next pair takes
+/// it, so `input_spec_pending` stays set until then and this is a cheap check per tick.
+///
+/// Called from the control message and from every supervisor tick, so a replacement that found
+/// the slot full — the user picked two presets within one block — goes on the next tick.
+fn reconcile_input_chain(shared: &mut Shared) {
+    drain_retired_chains(shared);
+    if !shared.input_spec_pending {
+        return;
+    }
+    let spec = shared.input_spec;
+    if let Some(dsp) = shared.dsp.as_mut() {
+        dsp.set_input_spec(spec);
+        shared.input_spec_pending = false;
+        return;
+    }
+    if shared.direction != DeviceDirection::Input || !shared.has_nodes() {
+        return;
+    }
+    let rate = shared.counters.sample_rate.load(Ordering::Relaxed) as f32;
+    let channels = shared.counters.channels.load(Ordering::Relaxed) as usize;
+    let engine = Box::new(InputEngine::new_with_spec(
+        rate,
+        MAX_QUANTUM_FRAMES,
+        channels,
+        spec,
+    ));
+    match shared.handover.replacement.try_send(engine) {
+        Ok(()) => shared.input_spec_pending = false,
+        Err(TrySendError::Full(_)) => {
+            // The previous replacement has not been adopted yet; this one is dropped here, on the
+            // main loop, and rebuilt on the next tick.
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            // The receiver lives in the DSP state, which is never dropped while the engine runs;
+            // if it is gone, so is the recycle path, and that error has already been logged.
+            shared.input_spec_pending = false;
+        }
+    }
+}
+
 /// Destroy the active pair of nodes and recover the DSP state, **keeping** the default. For the
 /// transient rebuilds — a new target, a format mismatch, NODE 2 erroring — where the pair is about
 /// to come straight back under the same name.
@@ -1823,7 +2046,18 @@ fn build_nodes(shared: &mut Shared, target: &DeviceInfo) -> Result<Nodes, AudioE
     };
     // Before anything else: which chain this pair of nodes runs. Everything below reads it.
     dsp.set_direction(direction);
+    // The engine is on the main loop, so a chain the preset named while it was away with the
+    // previous pair can be built in place — a no-op when it already runs that chain.
+    dsp.set_input_spec(shared.input_spec);
+    shared.input_spec_pending = false;
     dsp.set_format(rate as f32, channels as usize);
+    // The capture stream negotiates 48 kHz whatever the microphone runs at, so the format alone
+    // cannot tell the voice chain how much bandwidth is in the signal; the device's properties
+    // can, and the adaptive de-esser places its corner from them (`docs/0.4.0-design.md` §6).
+    dsp.set_source_rate(match direction {
+        DeviceDirection::Input => target.native_rate(),
+        DeviceDirection::Output => None,
+    });
     dsp.set_layout(positions.lfe_index(), positions.front_pair());
     // Read before the engine is handed to the node's user data, where it can no longer be reached
     // from the main loop.
@@ -2342,7 +2576,10 @@ fn publish(shared: &mut Shared) {
     };
     if status != shared.last_status {
         shared.last_status = status;
-        shared.notify(AudioToUi::Status(status));
+        shared.notify(AudioToUi::Status {
+            direction: shared.direction,
+            status,
+        });
     }
 
     if shared.needs_publish {
@@ -2390,13 +2627,46 @@ fn published_devices(shared: &Shared) -> Vec<AudioDevice> {
 
 #[cfg(test)]
 mod tests {
+    use fxsound_core::DeEsserMode;
+
     use super::*;
 
     /// A thread's state before it has connected: no session, nothing held. Nothing in here
     /// touches PipeWire.
     fn shared_for_tests() -> Shared {
         let (notify, _) = crossbeam_channel::unbounded();
-        Shared::new(notify, None, None, None)
+        Shared::new(notify, None, None, None, ChainHandover::new().0)
+    }
+
+    /// A DSP state with nobody on the other end of its buffers, and the main loop's ends of the
+    /// chain hand-over it was built with.
+    fn sink_dsp_for_tests() -> (SinkDsp, ChainHandover) {
+        let (_, params) = triple_buffer::TripleBuffer::new(&DspParams::default()).split();
+        let (_, input_params) =
+            triple_buffer::TripleBuffer::new(&InputDspParams::default()).split();
+        let (meters, _) = triple_buffer::TripleBuffer::new(&Meters::default()).split();
+        let (_, events) = crossbeam_channel::bounded(crate::EVENT_QUEUE_LEN);
+        let (handover, replacement, retired) = ChainHandover::new();
+        (
+            SinkDsp::new(params, input_params, meters, events, replacement, retired),
+            handover,
+        )
+    }
+
+    /// A thread between pairs of nodes: the DSP state is back on the main loop.
+    fn shared_with_dsp_for_tests() -> Shared {
+        let (notify, _) = crossbeam_channel::unbounded();
+        let (dsp, handover) = sink_dsp_for_tests();
+        Shared::new(notify, None, None, Some(dsp), handover)
+    }
+
+    fn voice_engine(spec: ChainSpec) -> Box<InputEngine> {
+        Box::new(InputEngine::new_with_spec(
+            48_000.0,
+            MAX_QUANTUM_FRAMES,
+            1,
+            spec,
+        ))
     }
 
     fn ring_for(channels: usize, quantum: usize) -> SampleRing {
@@ -2873,6 +3143,222 @@ mod tests {
         assert!(
             RELEASE_TIMEOUT <= Duration::from_secs(1),
             "a dead server must not stall exit"
+        );
+    }
+
+    // ---- §4 of the 0.4.0 design: a voice preset names its chain, and the name reaches the engine
+
+    /// Between pairs of nodes the engine is on the main loop and is rebuilt there, in place: the
+    /// only place a rebuild is allowed, and no hand-over is needed.
+    #[test]
+    fn a_preset_naming_the_podcast_chain_rebuilds_the_voice_engine_between_pairs() {
+        let mut shared = shared_with_dsp_for_tests();
+        assert_eq!(shared.input_spec, ChainSpec::voice());
+
+        set_input_chain(&mut shared, "podcast");
+
+        let dsp = shared.dsp.as_ref().expect("the engine is on the main loop");
+        assert_eq!(dsp.input.spec(), ChainSpec::podcast());
+        assert!(
+            dsp.input.chain().gate().is_none(),
+            "the podcast ordering has no gate"
+        );
+        assert_eq!(shared.input_spec, ChainSpec::podcast());
+        assert!(
+            !shared.input_spec_pending,
+            "nothing is owed: the rebuild happened here"
+        );
+        // The same name again changes nothing and owes nothing.
+        set_input_chain(&mut shared, "podcast");
+        assert!(!shared.input_spec_pending);
+    }
+
+    #[test]
+    fn a_chain_name_this_build_does_not_know_runs_the_voice_chain() {
+        let mut shared = shared_with_dsp_for_tests();
+        set_input_chain(&mut shared, "podcast");
+        set_input_chain(&mut shared, "karaoke");
+        assert_eq!(shared.input_spec, ChainSpec::voice());
+        let dsp = shared.dsp.as_ref().expect("the engine is on the main loop");
+        assert_eq!(dsp.input.spec(), ChainSpec::voice());
+        assert!(dsp.input.chain().gate().is_some(), "the voice chain gates");
+    }
+
+    /// The engine is away with a pair of nodes when the preset changes, and comes back through
+    /// the recycle channel when that pair goes: the chain is owed until then and settled in place
+    /// on the tick that finds the engine here, which is what `build_nodes` relies on too.
+    #[test]
+    fn a_chain_named_while_the_engine_is_away_is_owed_until_it_comes_back() {
+        let mut shared = shared_for_tests();
+        set_input_chain(&mut shared, "streaming");
+        assert!(shared.input_spec_pending);
+        assert_eq!(shared.input_spec, ChainSpec::streaming());
+
+        let (dsp, _handover) = sink_dsp_for_tests();
+        shared
+            .recycle_tx
+            .send(dsp)
+            .expect("the main loop is listening");
+        drain_recycled_dsp(&mut shared);
+        reconcile_input_chain(&mut shared);
+
+        assert!(!shared.input_spec_pending);
+        let dsp = shared.dsp.as_ref().expect("recovered");
+        assert_eq!(dsp.input.spec(), ChainSpec::streaming());
+    }
+
+    /// With a pair up the engine is out of the main loop's reach, so the replacement travels:
+    /// built on the main loop, adopted by the audio thread on its next block at the format the
+    /// outgoing engine was running, and the displaced one sent back to be dropped here.
+    #[test]
+    fn a_replacement_engine_is_adopted_on_the_next_block_and_the_old_one_comes_back() {
+        let (mut dsp, handover) = sink_dsp_for_tests();
+        dsp.set_direction(DeviceDirection::Input);
+        dsp.set_format(48_000.0, 2);
+        dsp.input.set_source_rate(Some(16_000.0));
+
+        // Built at a different format on purpose: the audio thread, not the builder, knows what
+        // NODE 1 negotiated.
+        let fresh = Box::new(InputEngine::new_with_spec(
+            44_100.0,
+            MAX_QUANTUM_FRAMES,
+            1,
+            ChainSpec::podcast(),
+        ));
+        handover
+            .replacement
+            .try_send(fresh)
+            .expect("one slot, and it is empty");
+        dsp.refresh();
+
+        assert_eq!(dsp.input.spec(), ChainSpec::podcast());
+        assert!(dsp.input.chain().gate().is_none());
+        assert_eq!(dsp.input.sample_rate(), 48_000.0);
+        assert_eq!(dsp.input.channels(), 2);
+        assert_eq!(dsp.input.source_rate(), Some(16_000.0));
+        let old = handover
+            .retired
+            .try_recv()
+            .expect("the displaced engine came back");
+        assert_eq!(old.spec(), ChainSpec::voice());
+        assert!(dsp.parked.is_none());
+        assert!(
+            handover.retired.try_recv().is_err(),
+            "exactly one engine came back"
+        );
+    }
+
+    /// The capture stream is at 48 kHz whatever the microphone is, so a resampled headset looks
+    /// like any other source to `set_format`; the properties know better, and what they say has
+    /// to reach the de-esser for the adaptive mode to have anything to adapt to.
+    #[test]
+    fn a_bluetooth_headsets_native_rate_reaches_the_voice_engines_de_esser() {
+        let props = [
+            ("media.class", "Audio/Source"),
+            ("node.name", "bluez_input.00_11_22_33_44_55.0"),
+            ("device.bus", "bluetooth"),
+            ("api.bluez5.profile", "headset-head-unit"),
+        ];
+        let headset = DeviceInfo::from_props(7, &|key: &str| {
+            props.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+        })
+        .expect("a headset is a device");
+        assert_eq!(headset.native_rate(), Some(16_000.0));
+
+        let (mut dsp, _handover) = sink_dsp_for_tests();
+        dsp.set_direction(DeviceDirection::Input);
+        dsp.set_format(CAPTURE_RATE as f32, 2);
+        let mut params = InputDspParams {
+            deesser_mode: DeEsserMode::Adaptive,
+            ..InputDspParams::default()
+        };
+        params.sanitise();
+        dsp.input.apply(&params);
+        assert_eq!(
+            dsp.meters().deesser_hz,
+            5_500.0,
+            "at 48 kHz the preset's corner stands"
+        );
+
+        dsp.set_source_rate(headset.native_rate());
+        assert_eq!(dsp.input.source_rate(), Some(16_000.0));
+        assert_eq!(
+            dsp.meters().deesser_hz,
+            4_000.0,
+            "a quarter of the headset's 16 kHz, not the 5500 Hz the preset asked for"
+        );
+
+        // Back on a microphone that says nothing, the stream rate is all there is to know.
+        dsp.set_source_rate(None);
+        assert_eq!(dsp.meters().deesser_hz, 5_500.0);
+    }
+
+    /// The audio thread never drops an engine. When the return channel is full — the main loop
+    /// has not drained it yet — the displaced engine is parked, and no further replacement is
+    /// taken until the parked one has gone back.
+    #[test]
+    fn a_displaced_engine_is_parked_rather_than_dropped_while_the_return_channel_is_full() {
+        let (mut dsp, handover) = sink_dsp_for_tests();
+        dsp.set_direction(DeviceDirection::Input);
+        for _ in 0..ChainHandover::RETIRED_IN_FLIGHT {
+            dsp.retired
+                .try_send(voice_engine(ChainSpec::voice()))
+                .expect("room for this many");
+        }
+
+        handover
+            .replacement
+            .try_send(voice_engine(ChainSpec::podcast()))
+            .expect("empty slot");
+        dsp.refresh();
+        assert_eq!(dsp.input.spec(), ChainSpec::podcast(), "taken");
+        assert!(
+            dsp.parked
+                .as_ref()
+                .is_some_and(|e| e.spec() == ChainSpec::voice()),
+            "…and the displaced engine parked, because nothing could take it"
+        );
+
+        // A second replacement waits while one is parked.
+        handover
+            .replacement
+            .try_send(voice_engine(ChainSpec::broadcast()))
+            .expect("the slot was emptied by the adoption");
+        dsp.refresh();
+        assert_eq!(dsp.input.spec(), ChainSpec::podcast(), "not yet");
+        assert!(dsp.parked.is_some());
+
+        // The main loop drains; the parked engine goes back and the second replacement is taken.
+        while handover.retired.try_recv().is_ok() {}
+        dsp.refresh();
+        assert_eq!(dsp.input.spec(), ChainSpec::broadcast());
+        assert!(dsp.parked.is_none());
+        let back: Vec<ChainSpec> = std::iter::from_fn(|| handover.retired.try_recv().ok())
+            .map(|engine| engine.spec())
+            .collect();
+        assert_eq!(back, [ChainSpec::voice(), ChainSpec::podcast()]);
+    }
+
+    /// A replacement still in flight when its pair comes down was built for a spec the main loop
+    /// may since have moved on from. `set_input_spec` — the in-place path the next `build_nodes`
+    /// takes — drains it here rather than letting the next pair adopt it as if it were current.
+    #[test]
+    fn a_replacement_left_in_flight_is_dropped_on_the_main_loop_not_adopted_by_the_next_pair() {
+        let (mut dsp, handover) = sink_dsp_for_tests();
+        handover
+            .replacement
+            .try_send(voice_engine(ChainSpec::podcast()))
+            .expect("empty slot");
+
+        dsp.set_input_spec(ChainSpec::broadcast());
+        assert_eq!(dsp.input.spec(), ChainSpec::broadcast());
+
+        dsp.set_direction(DeviceDirection::Input);
+        dsp.refresh();
+        assert_eq!(
+            dsp.input.spec(),
+            ChainSpec::broadcast(),
+            "the stale podcast engine was drained, not adopted"
         );
     }
 }

@@ -8,7 +8,7 @@ description = "Real-time-safe port of the FxSound DSP engine"
 
 [dependencies]
 fxsound-core = { workspace = true }
-nnnoiseless = { workspace = true }
+fxsound-rnnoise = { workspace = true }
 realfft = { workspace = true }
 
 [dev-dependencies]

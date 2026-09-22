@@ -20,6 +20,7 @@
 //! with the Windows build is untouched.
 
 use fxsound_core::messages::InputDspParams;
+use fxsound_dsp::ChainSpec;
 use fxsound_dsp::eq::GraphicEq;
 use fxsound_preset::input::InputPreset;
 use std::path::{Path, PathBuf};
@@ -193,44 +194,30 @@ fn fingerprint(preset: &InputPreset) -> Vec<f32> {
     out
 }
 
-/// The chain a preset describes, with every stage it asks for.
+/// The chain a preset describes, with every stage it asks for, in the order it names.
+///
+/// Through [`fxsound_dsp::InputChain::apply`], which is the one place a snapshot becomes stage
+/// settings: 0.3.0 kept a second copy of that mapping here, and a field added to one and not the
+/// other would have been a preset whose sound this bench could not measure.
 fn chain_for(preset: &InputPreset) -> fxsound_dsp::InputChain {
-    let params = preset.to_params();
-    let mut chain = fxsound_dsp::InputChain::new(CAPTURE_RATE);
-    chain.set_highpass(params.highpass_hz, usize::from(params.highpass_order));
-    chain.set_denoise_enabled(params.rnnoise);
-
-    chain.set_gate_enabled(params.gate_on);
-    let gate = chain.gate_mut();
-    gate.set_threshold_db(params.gate_threshold_db);
-    gate.set_ratio(params.gate_ratio);
-    gate.set_range_db(params.gate_range_db);
-    gate.set_times(params.gate_attack_ms, params.gate_release_ms);
-    gate.set_hold_ms(params.gate_hold_ms);
-    gate.set_detection(params.gate_detection);
-
-    let eq = chain.eq_mut();
-    eq.set_enabled(params.eq_on);
-    eq.set_q_multiplier(params.filter_q);
-    let (centers, gains) = params.bands();
-    eq.set_bands(centers, gains);
-
-    chain.set_deesser_enabled(params.deesser_on);
-    let deesser = chain.deesser_mut();
-    deesser.set_frequency(params.deesser_hz);
-    deesser.set_threshold_db(params.deesser_threshold_db);
-
-    chain.set_compressor_enabled(params.compressor_on);
-    let compressor = chain.compressor_mut();
-    compressor.set_threshold_db(params.compressor_threshold_db);
-    compressor.set_ratio(params.compressor_ratio);
-    compressor.set_knee_db(params.compressor_knee_db);
-    compressor.set_times(params.compressor_attack_ms, params.compressor_release_ms);
-    compressor.set_detection(params.compressor_detection);
-
-    chain.set_makeup_db(params.makeup_db);
-    chain.set_ceiling_db(params.ceiling_db);
+    let spec = ChainSpec::by_name(&preset.chain)
+        .unwrap_or_else(|| panic!("{}: unknown chain {:?}", preset.name, preset.chain));
+    let mut chain = fxsound_dsp::InputChain::from_spec(spec, CAPTURE_RATE);
+    chain.apply(&preset.to_params());
     chain
+}
+
+#[test]
+fn every_preset_names_a_chain_that_exists() {
+    for preset in shipped() {
+        assert!(
+            ChainSpec::by_name(&preset.chain).is_some(),
+            "{}: chain {:?} is not one of {:?}",
+            preset.name,
+            preset.chain,
+            ChainSpec::NAMES
+        );
+    }
 }
 
 /// Run a block through a chain and report the settled level, in dB against the input.
@@ -478,7 +465,7 @@ fn what_each_preset_actually_does_is_printed() {
             .collect();
         println!(
             "{:<14} hpf {:>5.0} Hz/{}  gate {:<10} comp {:<10} de-ess {:<10} makeup {:+.1}  \
-             rnnoise {}",
+             denoise {}",
             preset.name,
             preset.highpass_hz,
             preset.highpass_order,
@@ -495,7 +482,7 @@ fn what_each_preset_actually_does_is_printed() {
                 |d| format!("{:.0}/{:.0}", d.frequency_hz, d.threshold_db)
             ),
             preset.makeup_db,
-            preset.rnnoise,
+            preset.denoise_level().key(),
         );
         println!("               realised curve: {}", curve.join(" "));
     }

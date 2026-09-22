@@ -2,20 +2,24 @@
 //!
 //! This exists so the DSP can be listened to and measured without a sound server in the loop — it
 //! is the quickest way to tell whether a change to a filter actually did what you meant. It also
-//! doubles as a worked example of driving [`fxsound_dsp::Engine`].
+//! doubles as a worked example of driving [`fxsound_dsp::Engine`] and, with `--input`, of
+//! driving [`fxsound_dsp::InputEngine`] — the microphone chain — from a voice preset, which is
+//! what the listening harness under `scripts/voicing/` renders its comparisons with.
 //!
 //! ```text
 //! cargo run -p fxsound-dsp --example process_wav -- in.wav out.wav \
 //!     --preset assets/presets/BonusPresets/Jazz.fac
 //! cargo run -p fxsound-dsp --example process_wav -- in.wav out.wav \
 //!     --bass 10 --fidelity 6 --master-gain -3
+//! cargo run -p fxsound-dsp --example process_wav -- mic.wav out.wav \
+//!     --input "assets/presets/Input/Laptop Mic.toml" [--chain podcast] [--source-rate 16000]
 //! ```
 //!
 //! Only 16-bit PCM WAV is handled, which is what `.wav` almost always means and what the original
 //! engine's `processAudio` took.
 
 use fxsound_core::{Effect, messages::DspParams};
-use fxsound_dsp::Engine;
+use fxsound_dsp::{ChainSpec, Engine, InputEngine};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,13 +28,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "usage: process_wav <in.wav> <out.wav> [--preset FILE] \
              [--fidelity N] [--ambience N] [--surround N] [--dynamic-boost N] [--bass N] \
-             [--master-gain DB] [--balance DB] [--no-eq]"
+             [--master-gain DB] [--balance DB] [--no-eq]\n       \
+             process_wav <mic.wav> <out.wav> --input <voice preset .toml> [--chain NAME] \
+             [--source-rate HZ]"
         );
         std::process::exit(2);
     };
 
-    let mut params = DspParams::default();
     let rest: Vec<String> = args.collect();
+    if rest.iter().any(|flag| flag == "--input") {
+        return process_input(&input, &output, &rest);
+    }
+
+    let mut params = DspParams::default();
     let mut i = 0;
     while i < rest.len() {
         let flag = rest[i].as_str();
@@ -108,6 +118,133 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
     }
     .write(Path::new(&output))?;
+    println!("wrote {output}");
+    Ok(())
+}
+
+/// The microphone chain: a voice preset's parameters through [`InputEngine`], block by block,
+/// with the chain the preset names unless `--chain` overrides it. Prints the meters at the end,
+/// which is what a listening session wants beside the file — how much the denoiser took, where
+/// the de-esser landed, what the floor was.
+fn process_input(
+    input: &str,
+    output: &str,
+    rest: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut preset_path: Option<&str> = None;
+    let mut chain: Option<&str> = None;
+    let mut source_rate: Option<f32> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--input" => {
+                i += 1;
+                preset_path = Some(rest.get(i).ok_or("--input needs a path")?);
+            }
+            "--chain" => {
+                i += 1;
+                chain = Some(rest.get(i).ok_or("--chain needs a name")?);
+            }
+            "--source-rate" => {
+                i += 1;
+                source_rate = Some(
+                    rest.get(i)
+                        .ok_or("--source-rate needs a rate in Hz")?
+                        .parse()?,
+                );
+            }
+            other => return Err(format!("unknown option {other} in --input mode").into()),
+        }
+        i += 1;
+    }
+    let preset_path = preset_path.ok_or("--input needs a path")?;
+    let preset = fxsound_preset::input::InputPreset::load(Path::new(preset_path))?;
+    let chain_name = chain.unwrap_or(&preset.chain);
+    let spec = ChainSpec::by_name(chain_name).ok_or_else(|| {
+        format!(
+            "unknown chain {chain_name:?}; one of {:?}",
+            ChainSpec::NAMES
+        )
+    })?;
+    let mut params = preset.to_params();
+    params.sanitise();
+    println!(
+        "preset: {} (denoise {}, chain {})",
+        preset.name,
+        preset.denoise_level().key(),
+        chain_name
+    );
+
+    let wav = Wav::read(Path::new(input))?;
+    println!(
+        "in:  {} Hz, {} ch, {} frames ({:.2} s)",
+        wav.sample_rate,
+        wav.channels,
+        wav.samples.len() / wav.channels as usize,
+        wav.samples.len() as f32 / wav.channels as f32 / wav.sample_rate as f32
+    );
+
+    const BLOCK: usize = 1024;
+    let channels = wav.channels as usize;
+    let mut engine = InputEngine::new_with_spec(wav.sample_rate as f32, BLOCK, channels, spec);
+    engine.set_source_rate(source_rate);
+    engine.apply(&params);
+    println!("latency: {} frames", engine.latency_frames());
+    if params.rnnoise && !engine.denoiser_running() {
+        println!(
+            "note: the denoiser runs at 48 kHz only; this file is {} Hz",
+            wav.sample_rate
+        );
+    }
+    if params.deesser_on && !engine.deesser_running() {
+        println!(
+            "note: the de-esser cannot be built at {} Hz",
+            wav.sample_rate
+        );
+    }
+
+    let mut floats: Vec<f32> = wav
+        .samples
+        .iter()
+        .map(|s| f32::from(*s) / 32768.0)
+        .collect();
+    for block in floats.chunks_mut(BLOCK * channels) {
+        engine.process(block, channels);
+    }
+
+    let meters = engine.meters();
+    println!(
+        "out: peak L {:.3} R {:.3}, {} frames processed",
+        meters.peak_left, meters.peak_right, meters.processed_samples
+    );
+    println!(
+        "mic: floor {:.1} dBFS, peak {:.3}, {} clipped of {} frames",
+        meters.noise_floor_db, meters.capture_peak, meters.capture_clipped, meters.capture_frames
+    );
+    println!(
+        "stages: denoise {} ({:.1} dB, voice {:.2}), dereverb {:.1} dB, gate {:.1} dB, \
+         compressor {:.1} dB, de-esser {} ({:.1} dB at {:.0} Hz)",
+        if meters.denoiser_running { "on" } else { "off" },
+        meters.denoise_reduction_db,
+        meters.voice_probability,
+        meters.dereverb_reduction_db,
+        meters.gate_reduction_db,
+        meters.compressor_reduction_db,
+        if meters.deesser_running { "on" } else { "off" },
+        meters.deesser_reduction_db,
+        meters.deesser_hz,
+    );
+
+    let samples: Vec<i16> = floats
+        .iter()
+        .map(|s| (s.clamp(-1.0, 1.0) * 32767.0).round() as i16)
+        .collect();
+    Wav {
+        sample_rate: wav.sample_rate,
+        channels: wav.channels,
+        samples,
+    }
+    .write(Path::new(output))?;
     println!("wrote {output}");
     Ok(())
 }

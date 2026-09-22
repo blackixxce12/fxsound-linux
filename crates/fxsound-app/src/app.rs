@@ -58,6 +58,10 @@ pub struct App {
     /// The snapshot published to the audio thread.
     params: DspParams,
     input_params: InputDspParams,
+    /// The stage ordering the selected voice preset names, as last told to the audio thread.
+    /// Not part of the snapshot, because the audio thread cannot act on it in place: a chain is
+    /// built, not set, and the building happens on its main loop.
+    input_chain: String,
     /// The shipped voice presets, read once at start-up.
     ///
     /// A separate list from `presets`, not a second source for the same one: a `.fac` and a voice
@@ -130,6 +134,7 @@ impl App {
             },
             params: DspParams::default(),
             input_params: InputDspParams::default(),
+            input_chain: fxsound_preset::input::DEFAULT_CHAIN.to_owned(),
             input_presets: Vec::new(),
             devices_seen: false,
             audio_status: fxsound_core::AudioStatus::default(),
@@ -212,8 +217,8 @@ impl App {
                     self.devices_seen = true;
                     // Keep the user's choice selected across a rescan when the device is still
                     // there; otherwise fall back to whatever the server calls the default.
-                    let wanted = self.settings.selected_device_name().to_owned();
                     let direction = self.settings.device_direction;
+                    let wanted = self.settings.device_name(direction).to_owned();
                     self.state.direction = direction;
                     self.state.selected_device = devices
                         .iter()
@@ -235,7 +240,12 @@ impl App {
                     }
                     self.state.devices = devices;
                 }
-                AudioToUi::Status(status) => self.audio_status = status,
+                // One status per lane in 0.4.0; until the second lane exists in this crate, the
+                // engine sends one and this keeps it.
+                AudioToUi::Status {
+                    direction: _,
+                    status,
+                } => self.audio_status = status,
                 AudioToUi::Disconnected { reason } => {
                     self.state.notification =
                         Some(format!("{} {reason}", tr("Audio disconnected:")));
@@ -245,9 +255,12 @@ impl App {
                         let _ = self.notifier.notify(Message::output_disconnected());
                     }
                 }
-                AudioToUi::Error { message } => {
+                AudioToUi::Error { message, .. } => {
                     self.state.notification = Some(message);
                 }
+                // Per-lane attachment and echo-cancellation state: the window that reads them is
+                // the two-lane work, which is not in this crate yet.
+                AudioToUi::Attached { .. } | AudioToUi::EchoCancel { .. } => {}
                 AudioToUi::RememberedDefault {
                     direction,
                     node_name,
@@ -350,7 +363,10 @@ impl App {
                 // stop meaning anything, and a frame of them still looking live is a frame of
                 // lying.
                 self.state.direction = direction;
-                self.settings.set_selected_device(&name, direction);
+                self.settings.set_device_name(direction, &name);
+                // Picking a device also makes its lane the one the window edits. Said explicitly:
+                // `set_selected_device` used to do it as a side effect.
+                self.settings.set_edit_direction(direction);
                 if crossed {
                     // Two lists, and the picker shows the one belonging to the live chain. The
                     // previous selection cannot survive: it is not in the new list.
@@ -377,7 +393,7 @@ impl App {
                 // still remembers what the user last had in it.
                 let remembered = self
                     .settings
-                    .preset_for_device(&name)
+                    .preset_for_device(&name, direction)
                     .map(ToOwned::to_owned)
                     .or_else(|| crossed.then(|| self.settings.selected_preset().to_owned()));
                 if let Some(preset) = remembered
@@ -539,6 +555,15 @@ impl App {
         // whole reason the voice set is navigated by preset rather than by knobs.
         self.input_params = params;
         self.sync_params_from_state();
+
+        // The chain goes with the settings, and separately from them: it is the one thing in a
+        // voice preset the snapshot cannot carry (see `input_chain`). Sent even when the name has
+        // not changed — the audio thread treats a repeat as a no-op, and the alternative is a
+        // second copy of its knowledge here that could drift from it.
+        self.input_chain.clone_from(&preset.chain);
+        if let Some(engine) = &self.engine {
+            engine.send(UiToAudio::SetInputChain(preset.chain.clone()));
+        }
     }
 
     fn select_preset(&mut self, index: usize) {
@@ -593,16 +618,25 @@ impl App {
                 // Record it against whatever is playing, so plugging the headphones back in
                 // brings this preset with them. `DeviceConfig` and its two accessors were written
                 // and tested for exactly this and then never called by anything.
-                if let Some((node, description, form_factor)) =
+                if let Some((node, description, form_factor, direction)) =
                     self.state.selected_device.and_then(|at| {
-                        self.state
-                            .devices
-                            .get(at)
-                            .map(|d| (d.name.clone(), d.description.clone(), d.form_factor.clone()))
+                        self.state.devices.get(at).map(|d| {
+                            (
+                                d.name.clone(),
+                                d.description.clone(),
+                                d.form_factor.clone(),
+                                d.direction,
+                            )
+                        })
                     })
                 {
-                    self.settings
-                        .remember_device_preset(&node, &description, &name, &form_factor);
+                    self.settings.remember_device_preset(
+                        &node,
+                        &description,
+                        &name,
+                        &form_factor,
+                        direction,
+                    );
                 }
                 self.settings.set_selected_preset(&name);
                 self.settings_dirty = true;
@@ -890,6 +924,12 @@ impl App {
         &self.input_params
     }
 
+    /// The voice chain the audio thread was last told to run, by the name the preset gave it.
+    #[must_use]
+    pub fn input_chain(&self) -> &str {
+        &self.input_chain
+    }
+
     /// The snapshot currently published, for tests and for the CLI's `--status`.
     #[must_use]
     pub const fn params(&self) -> &DspParams {
@@ -908,6 +948,7 @@ impl App {
             state: UiState::default(),
             params: DspParams::default(),
             input_params: InputDspParams::default(),
+            input_chain: fxsound_preset::input::DEFAULT_CHAIN.to_owned(),
             input_presets: Vec::new(),
             devices_seen: false,
             audio_status: fxsound_core::AudioStatus::default(),
@@ -1343,7 +1384,7 @@ impl App {
 /// The port of `FxController::init` step 5 (`docs/spec/05-controller-model.md` §9.2): once the
 /// device list is known, a device named by the saved `output_device_name` is adopted and
 /// `setOutput` forces it. Here the engine starts in the output direction and runs the device rules
-/// on its own, so the saved choice — `settings.selected_device_name()` in
+/// on its own, so the saved choice — `settings.device_name(..)` for
 /// `settings.device_direction` — is handed to it the first time that device is listed; rule 2 of
 /// `choose_device` yields to it (`docs/spec/12-audio-io.md` §28.5), and a saved input mode brings
 /// the engine round to the source direction.
@@ -1357,8 +1398,8 @@ fn saved_device_to_announce(
     devices: &[AudioDevice],
     announced: &mut Option<(String, DeviceDirection)>,
 ) -> Option<UiToAudio> {
-    let wanted = settings.selected_device_name();
     let direction = settings.device_direction;
+    let wanted = settings.device_name(direction);
     if !devices
         .iter()
         .any(|d| d.name == wanted && d.direction == direction)
@@ -1903,6 +1944,7 @@ mod tests {
             },
             makeup_db: 0.0,
             ceiling_db: -3.0,
+            ..InputPreset::default()
         };
         app.input_presets = vec![voice("Clean Voice", 80.0), voice("Flat", 75.0)];
     }
@@ -1944,6 +1986,46 @@ mod tests {
         assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Beta"));
     }
 
+    /// §4 of the 0.4.0 design: `chain = "podcast"` is the one thing in a voice preset the
+    /// parameter snapshot cannot carry, so it travels as a control message. What the app keeps is
+    /// the name it last sent; the engine builds it ([`fxsound_dsp::ChainSpec::by_name`]), which
+    /// is asserted here on the same chain the audio thread would build from that name.
+    #[test]
+    fn a_voice_preset_naming_a_chain_tells_the_audio_thread_which_one() {
+        use fxsound_preset::input::{DEFAULT_CHAIN, InputPreset};
+        let mut app = App::headless_for_tests();
+        app.state.direction = DeviceDirection::Input;
+        app.input_presets = vec![
+            InputPreset {
+                name: "Voice".to_owned(),
+                ..InputPreset::default()
+            },
+            InputPreset {
+                name: "Podcast".to_owned(),
+                chain: "podcast".to_owned(),
+                ..InputPreset::default()
+            },
+        ];
+        app.refresh_preset_list();
+        assert_eq!(app.input_chain(), DEFAULT_CHAIN);
+
+        app.handle(&[UiAction::SelectPreset(1)]);
+        assert_eq!(app.input_chain(), "podcast");
+        let spec =
+            fxsound_dsp::ChainSpec::by_name(app.input_chain()).expect("a chain the engine builds");
+        assert_eq!(spec, fxsound_dsp::ChainSpec::podcast());
+        let engine = fxsound_dsp::InputEngine::new_with_spec(48_000.0, 512, 1, spec);
+        assert_eq!(engine.spec(), fxsound_dsp::ChainSpec::podcast());
+        assert!(
+            engine.chain().gate().is_none(),
+            "the podcast ordering has no gate"
+        );
+
+        // Back to a preset that names none: the default chain, said again.
+        app.handle(&[UiAction::SelectPreset(0)]);
+        assert_eq!(app.input_chain(), DEFAULT_CHAIN);
+    }
+
     #[test]
     fn a_voice_preset_moves_the_stages_the_interface_has_no_control_for() {
         // The whole reason the voice set is navigated by preset: the gate, the compressor and the
@@ -1981,6 +2063,7 @@ mod tests {
             },
             makeup_db: 4.0,
             ceiling_db: -3.0,
+            ..InputPreset::default()
         }];
         app.refresh_preset_list();
         app.handle(&[UiAction::SelectPreset(0)]);
@@ -2386,7 +2469,8 @@ mod tests {
     #[test]
     fn the_saved_device_is_announced_once_each_time_it_appears() {
         let mut settings = Settings::default();
-        settings.set_selected_device("alsa_input.usb-fifine", DeviceDirection::Input);
+        settings.set_device_name(DeviceDirection::Input, "alsa_input.usb-fifine");
+        settings.set_edit_direction(DeviceDirection::Input);
         let without = vec![device("alsa_output.pci", DeviceDirection::Output, true)];
         let with = vec![
             device("alsa_output.pci", DeviceDirection::Output, true),
@@ -2422,7 +2506,8 @@ mod tests {
     #[test]
     fn a_saved_name_is_only_announced_in_its_own_direction() {
         let mut settings = Settings::default();
-        settings.set_selected_device("fifine", DeviceDirection::Input);
+        settings.set_device_name(DeviceDirection::Input, "fifine");
+        settings.set_edit_direction(DeviceDirection::Input);
         let devices = vec![device("fifine", DeviceDirection::Output, true)];
         let mut announced = None;
         assert_eq!(
@@ -2451,7 +2536,10 @@ mod tests {
             device("alsa_input.usb-fifine", DeviceDirection::Input, false),
         ];
         app.handle(&[UiAction::SelectDevice(1)]);
-        assert_eq!(app.settings.selected_device_name(), "alsa_input.usb-fifine");
+        assert_eq!(
+            app.settings.device_name(DeviceDirection::Input),
+            "alsa_input.usb-fifine"
+        );
         assert_eq!(app.settings.device_direction, DeviceDirection::Input);
         // No engine in a headless app, so nothing was sent and nothing is on record; the
         // announcement bookkeeping only follows an actual send.

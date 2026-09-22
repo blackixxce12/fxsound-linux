@@ -6,20 +6,31 @@
 //! seconds the programme leveller works over.
 //!
 //! ```text
-//! mic ─► high-pass ─► expander ─► 10-band EQ ─► de-esser ─► compressor ─► makeup ─► limiter ─► out
+//! mic ─► denoise ─► dereverb ─► high-pass ─► gate ─► 10-band EQ ─► de-esser ─► compressor ─► makeup ─► limiter ─► out
 //! ```
 //!
+//! That is the `voice` chain, and the default; [`ChainSpec`] names three others that reorder or
+//! drop a stage for a podcast, a broadcast and a live stream, each with its reasons. Every stage
+//! keeps one contract, [`AudioProcessor`], and [`InputChain`] is a list of them built from a
+//! spec on the main loop. [`chain`] argues the order.
+//!
 //! Every stage here is allocation-free after construction, like the rest of the crate, and is
-//! sized for the worst case rather than the current format.
+//! sized for the worst case rather than the current format. The denoiser and the de-reverb add
+//! latency while they run — 960 and 480 frames — and report it; nothing else delays the signal
+//! beyond the limiter's millisecond of look-ahead.
 
 pub mod chain;
 pub mod compressor;
 pub mod deesser;
 pub mod denoise;
+pub mod dereverb;
 pub mod detector;
 pub mod engine;
 pub mod gate;
+pub mod highpass;
 pub mod limiter;
+pub mod makeup;
+pub mod processor;
 
 use crate::biquad::Real;
 
@@ -63,14 +74,22 @@ fn prewarped(sample_rate: Real, hz: Real) -> Option<Real> {
 /// rather than merely finite. In practice this is the narrowband case: a 5500 Hz de-esser needs
 /// about 18 kHz of sample rate, so at a 16 kHz capture that stage reports itself inactive and
 /// passes the signal through instead of splitting it a kilohertz and a half below where the preset
-/// said.
+/// said — unless it is in its adaptive mode, which places the corner at a quarter of the
+/// bandwidth and so always under this line.
 pub const MAX_CORNER_FRACTION: Real = 0.3;
 
 pub use chain::InputChain;
 pub use compressor::Compressor;
 pub use deesser::DeEsser;
 pub use denoise::Denoiser;
+pub use dereverb::Dereverb;
 pub use detector::{Detection, Follower};
 pub use engine::InputEngine;
 pub use gate::Gate;
+pub use highpass::HighPass;
 pub use limiter::LookaheadLimiter;
+pub use makeup::Makeup;
+pub use processor::{
+    AudioProcessor, ChainSpec, MAX_STAGES, ProcessContext, Stage, StageAccess, StageKind,
+    StageMeter,
+};

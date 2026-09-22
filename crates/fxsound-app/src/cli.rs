@@ -35,17 +35,14 @@
 use clap::Parser;
 use fxsound_core::{Effect, ViewMode, eq};
 
-/// Characters stripped from a preset name before it is used, from
-/// `FxController::sanitizePresetName` (`fxsound/Source/GUI/FxController.cpp:378`).
+/// The reserved-character set, the length cap and the sanitiser a preset name goes through
+/// before it is used (`FxController::sanitizePresetName`, `fxsound/Source/GUI/FxController.cpp:378`).
 ///
-/// This is the Windows reserved-filename set and it stays reserved on Linux, because a preset name
-/// becomes a `.fac` filename (`FxController.cpp:805-808`) and preset files are meant to travel
-/// between the two platforms.
-pub const PRESET_NAME_RESERVED: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-
-/// Preset names are truncated to this many characters (`FxController.cpp:380-383`, and the
-/// interactive editor's `setInputRestrictions(64)` at `FxPresetNameEditor.cpp:52`).
-pub const MAX_PRESET_NAME_LEN: usize = 64;
+/// They live in `fxsound_preset` beside the store that turns a name into a filename, so that a
+/// name saved from the command line and one saved from the window become the same file. 0.3.0
+/// kept a second sanitiser here that stripped nine characters while the store replaced three,
+/// and a `--save_preset` name and a window-typed name could land in two files.
+pub use fxsound_preset::{MAX_PRESET_NAME_LEN, PRESET_NAME_RESERVED, sanitise_preset_name};
 
 /// The only band counts the equalizer accepts; anything else is `DEFAULT_NUM_EQ_BANDS = 10` on
 /// Windows (`FxController.cpp:283-293`, `FxController.h:45`) and an error here.
@@ -653,21 +650,6 @@ impl Command {
             | Self::Quit => false,
         }
     }
-}
-
-/// Steps 1 and 2 of `FxController::sanitizePresetName` (`FxController.cpp:377-391`): strip the
-/// reserved characters, then truncate to [`MAX_PRESET_NAME_LEN`] characters.
-///
-/// Step 3 — the case-insensitive collision check against the existing preset names
-/// (`FxModel.cpp:142-153`) — needs the preset list and so belongs to the controller. The order
-/// matters and is why `--save_preset="Mu:sic"` is a no-op when a preset named `Music` exists:
-/// stripping the `:` produces the collision (`docs/COMMAND_LINE_OPTIONS.md:52`).
-#[must_use]
-pub fn sanitise_preset_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| !PRESET_NAME_RESERVED.contains(c))
-        .take(MAX_PRESET_NAME_LEN)
-        .collect()
 }
 
 fn parse_power(value: &str) -> Result<PowerArg, String> {

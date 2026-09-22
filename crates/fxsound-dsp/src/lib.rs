@@ -19,6 +19,6 @@ pub use biquad::{BiquadCoeffs, Real, Section, cascade_db, magnitude};
 pub use effects::{Chain, Effect};
 pub use engine::Engine;
 pub use eq::GraphicEq;
-pub use input::{InputChain, InputEngine};
+pub use input::{AudioProcessor, ChainSpec, InputChain, InputEngine};
 pub use leveller::{Normaliser, VolumeLeveller};
 pub use spectrum::SpectrumAnalyser;

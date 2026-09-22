@@ -1,6 +1,8 @@
-# The only preset that turns RNNoise on, and the rule is the decision doc's own: a denoiser
+# The preset that turned RNNoise on in 0.3.0, and the rule is the decision doc's own: a denoiser
 # is a switch, never a voicing, and a preset sets it only where the named source's acoustics
-# force it. A laptop with a fan is that source. The 85 Hz corner is where the 4th-order
+# force it. A laptop with a fan is that source. The [denoise] table says Medium explicitly —
+# the row `rnnoise = true` always meant, so this sounds after the upgrade as it did before —
+# and `rnnoise` stays true beside it for a 0.3.0 binary. The 85 Hz corner is where the 4th-order
 # Linkwitz-Riley costs -6.0 dB rather than the -9.3 a 100 Hz corner would, and at far field
 # there is no proximity lift underneath to spare.
 name = "Laptop Mic"
@@ -10,6 +12,9 @@ highpass_hz = 85.0
 highpass_order = 4
 makeup_db = 8.0
 ceiling_db = -3.0
+
+[denoise]
+level = "medium"
 
 [gate]
 threshold_db = -42.0

@@ -23,11 +23,15 @@
 //!
 //! Real-time safe: fixed state, no allocation. It does spend a logarithm and an exponential per
 //! sample per channel — affordable here, where a microphone is one or two channels, and the reason
-//! this stage is not offered on the output path.
+//! this stage is not offered on the output path. Below the knee the static curve is exactly
+//! zero dB, so neither is spent there: the level is compared against the knee's foot in the
+//! linear domain, and a test holds that fast path to the slow one.
 
 use crate::biquad::{MAX_CHANNELS, Real};
 use crate::input::detector::{Detection, Follower, coefficient, db_to_linear, linear_to_db};
+use crate::input::processor::{AudioProcessor, ProcessContext, StageMeter};
 use crate::input::sane_rate;
+use fxsound_core::messages::InputDspParams;
 
 /// `1.0` is a straight wire; past about this the curve is a limiter, and the chain already has one
 /// that does the job properly with look-ahead.
@@ -49,8 +53,12 @@ pub struct Compressor {
     release_ms: Real,
     attack_coeff: Real,
     release_coeff: Real,
+    /// The foot of the knee as a linear level: below it the curve is unity and the logarithm is
+    /// not taken. Designed with the threshold and the knee.
+    below_knee: Real,
 
     gain: [Real; MAX_CHANNELS],
+    enabled: bool,
 }
 
 impl std::fmt::Debug for Compressor {
@@ -86,10 +94,25 @@ impl Compressor {
             release_ms: 150.0,
             attack_coeff: 0.0,
             release_coeff: 0.0,
+            below_knee: 0.0,
             gain: [1.0; MAX_CHANNELS],
+            enabled: true,
         };
         compressor.design();
         compressor
+    }
+
+    /// Switch the stage in or out. A transition resets it, so it does not come back mid-release.
+    pub fn set_enabled(&mut self, on: bool) {
+        if self.enabled != on {
+            self.enabled = on;
+            self.reset();
+        }
+    }
+
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     pub fn set_sample_rate(&mut self, sample_rate: Real) {
@@ -107,6 +130,7 @@ impl Compressor {
     /// [`Self::set_detection`] selected.
     pub fn set_threshold_db(&mut self, db: Real) {
         self.threshold_db = if db.is_finite() { db.min(0.0) } else { -18.0 };
+        self.design();
     }
 
     /// Decibels in per decibel out, above the threshold. `1.0` is a straight wire.
@@ -131,6 +155,7 @@ impl Compressor {
         } else {
             6.0
         };
+        self.design();
     }
 
     /// How fast the gain comes off and how fast it comes back, in milliseconds.
@@ -156,6 +181,7 @@ impl Compressor {
     fn design(&mut self) {
         self.attack_coeff = coefficient(self.attack_ms, self.sample_rate);
         self.release_coeff = coefficient(self.release_ms, self.sample_rate);
+        self.below_knee = db_to_linear(self.threshold_db - self.knee_db / 2.0);
     }
 
     pub fn reset(&mut self) {
@@ -200,7 +226,14 @@ impl Compressor {
         // the chain.
         for (channel, sample) in frame.iter_mut().enumerate().take(MAX_CHANNELS) {
             let level = self.detector.follow(channel, *sample);
-            let target = db_to_linear(self.curve_db(linear_to_db(level)));
+            // Below the foot of the knee the curve is zero decibels, which `db_to_linear` makes
+            // exactly `1.0`; the comparison is in the linear domain so that neither transcendental
+            // is spent on the quiet parts of a talker, which are most of them.
+            let target = if level < self.below_knee {
+                1.0
+            } else {
+                db_to_linear(self.curve_db(linear_to_db(level)))
+            };
 
             let Some(gain) = self.gain.get_mut(channel) else {
                 continue;
@@ -226,6 +259,47 @@ impl Compressor {
         }
         for frame in buffer.chunks_exact_mut(channels) {
             self.process_frame(frame);
+        }
+    }
+}
+
+impl AudioProcessor for Compressor {
+    fn prepare(&mut self, sample_rate: Real) {
+        self.set_sample_rate(sample_rate);
+    }
+
+    fn apply(&mut self, params: &InputDspParams) {
+        self.set_enabled(params.compressor_on);
+        self.set_threshold_db(params.compressor_threshold_db);
+        self.set_ratio(params.compressor_ratio);
+        self.set_knee_db(params.compressor_knee_db);
+        self.set_times(params.compressor_attack_ms, params.compressor_release_ms);
+        self.set_detection(params.compressor_detection);
+    }
+
+    fn reset(&mut self) {
+        Compressor::reset(self);
+    }
+
+    fn is_active(&self) -> bool {
+        self.enabled
+    }
+
+    fn latency_frames(&self) -> usize {
+        0
+    }
+
+    fn process(&mut self, buffer: &mut [Real], ctx: &ProcessContext) {
+        if self.enabled {
+            Compressor::process(self, buffer, ctx.channels);
+        }
+    }
+
+    fn meter(&self) -> StageMeter {
+        StageMeter {
+            reduction_db: self.reduction_db(0),
+            running: self.enabled,
+            aux: 0.0,
         }
     }
 }
@@ -448,6 +522,69 @@ mod tests {
             gap.abs() > 3.0,
             "peak and rms landed within {gap} dB of each other, so the field would be a lie"
         );
+    }
+
+    #[test]
+    fn the_fast_path_below_the_knee_is_the_slow_path() {
+        // Every level from silence up to the foot of the knee, in both a hard-kneed and a
+        // soft-kneed stage: the fast path answers `1.0`, and the full expression answers the
+        // same to within a float's rounding of the two transcendentals it skips.
+        for knee in [0.0_f32, 6.0, 12.0] {
+            let mut compressor = instant(-20.0, 4.0);
+            compressor.set_knee_db(knee);
+            let foot = compressor.threshold_db - knee / 2.0;
+            for step in 0..400 {
+                let level_db = -100.0 + step as Real * 0.2;
+                let level = db_to_linear(level_db);
+                let slow = db_to_linear(compressor.curve_db(linear_to_db(level)));
+                if level < compressor.below_knee {
+                    assert!(
+                        (slow - 1.0).abs() < 1.0e-7,
+                        "knee {knee} at {level_db} dB (foot {foot}): the slow path gives {slow}"
+                    );
+                } else if level_db > foot + 0.3 {
+                    assert!(
+                        knee == 0.0 && level_db <= compressor.threshold_db || slow < 1.0,
+                        "knee {knee} at {level_db} dB: the fast path would skip real reduction"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_quiet_signal_comes_out_identical_whichever_path_is_taken() {
+        // The same quiet drive through a compressor and through the curve by hand: the stage
+        // takes the fast path on every sample and the result is the input.
+        let mut compressor = instant(-20.0, 4.0);
+        compressor.set_knee_db(6.0);
+        let input: Vec<Real> = (0..4_800)
+            .map(|n| (n as Real * 0.03).sin() * db_to_linear(-30.0))
+            .collect();
+        let mut block = input.clone();
+        compressor.process(&mut block, 1);
+        for (n, (got, want)) in block.iter().zip(&input).enumerate() {
+            assert!(
+                (got - want).abs() < 1.0e-7,
+                "sample {n}: {got} against {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn switched_off_it_passes_the_signal_through_and_says_so() {
+        let mut compressor = instant(-40.0, 8.0);
+        compressor.set_enabled(false);
+        assert!(!AudioProcessor::is_active(&compressor));
+        let ctx = ProcessContext {
+            sample_rate: FS,
+            channels: 1,
+            voice_probability: 0.0,
+        };
+        let input = vec![0.5; 4_800];
+        let mut block = input.clone();
+        AudioProcessor::process(&mut compressor, &mut block, &ctx);
+        assert_eq!(block, input);
     }
 
     #[test]

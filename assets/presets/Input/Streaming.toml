@@ -1,13 +1,19 @@
 # Gate -42 dB is the researched value, not the -55 the first draft re-voiced it to. The
-# re-voicing assumed RNNoise would be on here; it is not, and a threshold aimed at a denoised
-# floor is a dead gate on an undenoised one.
+# re-voicing assumed the full network would be on here and aimed the threshold at its floor,
+# which is a dead gate on an undenoised one. 0.4.0 adds the denoiser at Light — a 12 dB floor
+# with most of the voice handed back, for a live send where the network's own artefacts would
+# cost more than the room — and -42 dB is still right against it: Light takes the floor from
+# about -52 to at most -64, and a gate that closes on -52 closes on -64.
 name = "Streaming"
 description = "A live send to Twitch, YouTube or Kick: dense and bright, at the level a phone speaker needs."
-rnnoise = false
+rnnoise = true
 highpass_hz = 100.0
 highpass_order = 2
 makeup_db = 9.0
 ceiling_db = -3.0
+
+[denoise]
+level = "light"
 
 [gate]
 threshold_db = -42.0

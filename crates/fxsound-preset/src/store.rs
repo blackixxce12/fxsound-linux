@@ -8,9 +8,17 @@
 //!   port sorts deterministically — factory presets in their numeric order, then everything else
 //!   by name;
 //! * paths follow the XDG base directory specification instead of `%APPDATA%`.
+//!
+//! The store is generic over the file it holds. 0.4.0 has two kinds of preset — the `.fac` set
+//! for the speakers and the TOML voice set for the microphone — and one discipline for listing
+//! them: which copy wins when a name appears twice, what order the list is in, where an autosave
+//! lives, when a `.bak` is kept. A rule that lives in two places is a rule that gets fixed in
+//! one place; the shadowing bug this module carried in 0.3.0 would have been copied along with
+//! it. [`PresetStore`] is the `.fac` store and [`crate::InputPresetStore`] the voice one.
 
-use crate::{PresetError, load, save};
+use crate::{PresetError, sanitise_preset_name};
 use fxsound_core::{Preset, Settings};
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 /// Where a preset came from, which decides whether it can be overwritten or deleted.
@@ -33,16 +41,90 @@ pub struct PresetEntry {
     pub modified: bool,
 }
 
+/// A preset file format a [`Store`] can hold.
+///
+/// The store asks five things of a format: its extension, how to read and write one file, and
+/// the name inside it — a preset is listed by the name it calls itself, never by its filename,
+/// because the factory `.fac` set ships as `1.fac`..`12.fac` and calls itself General, Music,
+/// Voice. The error constructors let the store report an unknown name, an unusable one and one
+/// that would take another preset's file in the format's own error type rather than in a third
+/// one every caller would have to convert.
+pub trait PresetFile: Clone {
+    /// The extension the store looks for and writes, without the dot.
+    const EXTENSION: &'static str;
+    /// What reading or writing one file can fail with.
+    type Error: From<std::io::Error> + std::fmt::Display;
+
+    fn load(path: &Path) -> Result<Self, Self::Error>;
+    /// Replace `path` atomically.
+    fn save(&self, path: &Path) -> Result<(), Self::Error>;
+    /// As [`PresetFile::save`], keeping any previous file as `<path>.bak`.
+    fn save_with_backup(&self, path: &Path) -> Result<(), Self::Error>;
+    fn name(&self) -> &str;
+    fn set_name(&mut self, name: &str);
+    /// The error for a name the list does not hold.
+    fn unknown(name: &str) -> Self::Error;
+    /// The error for a name with nothing left in it once it has been made safe as a filename.
+    fn empty_name() -> Self::Error;
+    /// The error for a name whose file, `file`, is already the listed preset `existing`'s.
+    fn shared_file(name: &str, existing: &str, file: &str) -> Self::Error;
+}
+
+impl PresetFile for Preset {
+    const EXTENSION: &'static str = "fac";
+    type Error = PresetError;
+
+    fn load(path: &Path) -> Result<Self, PresetError> {
+        crate::load(path)
+    }
+
+    fn save(&self, path: &Path) -> Result<(), PresetError> {
+        crate::save(self, path)
+    }
+
+    fn save_with_backup(&self, path: &Path) -> Result<(), PresetError> {
+        crate::save_with_backup(self, path)
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn set_name(&mut self, name: &str) {
+        self.name = name.to_owned();
+    }
+
+    fn unknown(name: &str) -> PresetError {
+        PresetError::Unknown(name.to_owned())
+    }
+
+    fn empty_name() -> PresetError {
+        PresetError::MissingName
+    }
+
+    fn shared_file(name: &str, existing: &str, file: &str) -> PresetError {
+        PresetError::SharedFile {
+            name: name.to_owned(),
+            existing: existing.to_owned(),
+            file: file.to_owned(),
+        }
+    }
+}
+
 /// The full preset list plus the directories it was built from.
 #[derive(Debug, Clone)]
-pub struct PresetStore {
+pub struct Store<F: PresetFile> {
     entries: Vec<PresetEntry>,
     factory_dirs: Vec<PathBuf>,
     user_dir: PathBuf,
     autosave_dir: PathBuf,
+    format: PhantomData<F>,
 }
 
-impl PresetStore {
+/// The `.fac` store: the speakers' presets.
+pub type PresetStore = Store<Preset>;
+
+impl Store<Preset> {
     /// Build a store from the standard locations.
     ///
     /// Factory presets are looked for next to the executable and in the usual install prefixes, so
@@ -67,17 +149,14 @@ impl PresetStore {
             factory_dirs.push(Path::new(prefix).join("presets/BonusPresets"));
         }
 
-        let user_dir = Settings::user_preset_dir();
-        let autosave_dir = user_dir.join("AutoSave");
-        Self {
-            entries: Vec::new(),
-            factory_dirs,
-            user_dir,
-            autosave_dir,
-        }
+        Self::with_dirs(factory_dirs, Settings::user_preset_dir())
     }
+}
 
+impl<F: PresetFile> Store<F> {
     /// Build a store from explicit directories. Used by the tests and by `--preset-dir`.
+    ///
+    /// Autosaves live in `AutoSave` under the user directory, whichever directory that is.
     #[must_use]
     pub fn with_dirs(factory_dirs: Vec<PathBuf>, user_dir: PathBuf) -> Self {
         let autosave_dir = user_dir.join("AutoSave");
@@ -86,6 +165,7 @@ impl PresetStore {
             factory_dirs,
             user_dir,
             autosave_dir,
+            format: PhantomData,
         }
     }
 
@@ -98,26 +178,17 @@ impl PresetStore {
     /// Re-scan every directory. Unreadable directories are skipped, not fatal: a missing factory
     /// directory must not stop the application from starting.
     pub fn rescan(&mut self) {
-        let mut entries = Vec::new();
-
+        let mut factory = Vec::new();
         for dir in &self.factory_dirs {
-            collect(dir, PresetSource::Factory, &mut entries);
+            collect::<F>(dir, PresetSource::Factory, &mut factory);
         }
-        collect(&self.user_dir, PresetSource::User, &mut entries);
+        let mut user = Vec::new();
+        collect::<F>(&self.user_dir, PresetSource::User, &mut user);
 
-        // A user preset with the same name as a factory one wins, matching the original's
-        // "load the user's copy" behaviour.
-        entries.sort_by(|a, b| {
-            sort_key(a)
-                .cmp(&sort_key(b))
-                .then(a.source.cmp(&b.source).reverse())
-        });
-        entries.dedup_by(|a, b| a.name == b.name);
-
+        let mut entries = merge(factory, user);
         for entry in &mut entries {
             entry.modified = self.autosave_path(&entry.name).is_file();
         }
-
         self.entries = entries;
     }
 
@@ -146,19 +217,18 @@ impl PresetStore {
     ///
     /// Returns the preset and whether it came from the autosave, which is what makes the GUI show
     /// the `*` marker.
-    pub fn load(&self, name: &str) -> Result<(Preset, bool), PresetError> {
-        let entry = self.find(name).ok_or_else(|| PresetError::Malformed {
-            line: 0,
-            expected: "a known preset name",
-            found: name.to_owned(),
-        })?;
+    ///
+    /// # Errors
+    /// The name is not in the list, or the file it names cannot be read.
+    pub fn load(&self, name: &str) -> Result<(F, bool), F::Error> {
+        let entry = self.find(name).ok_or_else(|| F::unknown(name))?;
 
         let autosave = self.autosave_path(name);
         if autosave.is_file() {
-            match load(&autosave) {
+            match F::load(&autosave) {
                 Ok(mut preset) => {
                     // The autosave carries the edited values but the canonical name.
-                    preset.name = entry.name.clone();
+                    preset.set_name(&entry.name);
                     return Ok((preset, true));
                 }
                 Err(err) => log::warn!(
@@ -168,20 +238,25 @@ impl PresetStore {
             }
         }
 
-        let mut preset = load(&entry.path)?;
-        preset.name = entry.name.clone();
+        let mut preset = F::load(&entry.path)?;
+        preset.set_name(&entry.name);
         Ok((preset, false))
     }
 
     /// Path of the autosave shadow copy for a preset.
     #[must_use]
     pub fn autosave_path(&self, name: &str) -> PathBuf {
-        self.autosave_dir.join(format!("{name}.fac"))
+        self.autosave_dir
+            .join(format!("{}.{}", sanitise_preset_name(name), F::EXTENSION))
     }
 
     /// Stash the user's unsaved edits so they survive a preset switch or a restart.
-    pub fn autosave(&self, preset: &Preset) -> Result<(), PresetError> {
-        save(preset, &self.autosave_path(&preset.name))
+    ///
+    /// # Errors
+    /// The preset's name leaves nothing to file it under, or the file cannot be written.
+    pub fn autosave(&self, preset: &F) -> Result<(), F::Error> {
+        let path = self.autosave_dir.join(Self::file_name(preset.name())?);
+        preset.save(&path)
     }
 
     /// Drop a preset's autosave, clearing its modified marker.
@@ -199,28 +274,44 @@ impl PresetStore {
 
     /// Save a preset under a name, as a user preset, and refresh the list.
     ///
-    /// Returns the path it was written to.
-    pub fn save_as(&mut self, preset: &Preset, name: &str) -> Result<PathBuf, PresetError> {
+    /// Returns the path it was written to. Saving under a name already in the list is the
+    /// overwrite: the user's copy replaces a factory one, or their own earlier one with a `.bak`
+    /// kept. Saving under a name that would take *another* listed preset's file — `Mu:sic`
+    /// beside `Music` — is refused, because that overwrite is one the list could never show
+    /// (`file_name` below says why one file can have two names).
+    ///
+    /// # Errors
+    /// The name leaves nothing to file it under, its file belongs to a preset of a different
+    /// name, or the file cannot be written.
+    pub fn save_as(&mut self, preset: &F, name: &str) -> Result<PathBuf, F::Error> {
+        let file = Self::file_name(name)?;
+        if let Some(other) = self.holder_of(&file, name) {
+            return Err(F::shared_file(name, &other.name, &file));
+        }
         let mut to_save = preset.clone();
-        to_save.name = name.to_owned();
-        let path = self.user_dir.join(format!("{}.fac", sanitise(name)));
+        to_save.set_name(name);
+        let path = self.user_dir.join(file);
         // The user-facing overwrite: worth keeping the previous version, unlike the autosave.
-        crate::save_with_backup(&to_save, &path)?;
+        to_save.save_with_backup(&path)?;
         self.clear_autosave(name);
         self.rescan();
         Ok(path)
     }
 
     /// Delete a user preset. Factory presets are refused, as in the original.
-    pub fn delete(&mut self, name: &str) -> Result<(), PresetError> {
+    ///
+    /// # Errors
+    /// The preset is a factory one, or its file cannot be removed.
+    pub fn delete(&mut self, name: &str) -> Result<(), F::Error> {
         let Some(entry) = self.find(name) else {
             return Ok(());
         };
         if entry.source == PresetSource::Factory {
-            return Err(PresetError::Io(std::io::Error::new(
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!("{name} is a factory preset"),
-            )));
+            )
+            .into());
         }
         let path = entry.path.clone();
         std::fs::remove_file(path)?;
@@ -229,28 +320,72 @@ impl PresetStore {
         Ok(())
     }
 
-    /// Import a `.fac` file into the user directory, rejecting anything that does not parse.
+    /// Import a preset file into the user directory, rejecting anything that does not parse.
     ///
-    /// Returns the imported preset's name.
-    pub fn import(&mut self, source: &Path) -> Result<String, PresetError> {
-        let preset = load(source)?;
+    /// Returns the imported preset's name, which is the file's stem: a file someone chose to
+    /// import is a file they know by its name on disk.
+    ///
+    /// # Errors
+    /// The file does not parse, or cannot be saved into the user directory.
+    pub fn import(&mut self, source: &Path) -> Result<String, F::Error> {
+        let preset = F::load(source)?;
         let name = source
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or(&preset.name)
+            .unwrap_or_else(|| preset.name())
             .to_owned();
         self.save_as(&preset, &name)?;
         Ok(name)
     }
 
     /// Export a preset to a directory chosen by the user.
-    pub fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, PresetError> {
+    ///
+    /// # Errors
+    /// The name is unknown, leaves nothing to file it under, or the file cannot be written.
+    pub fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, F::Error> {
         let (preset, _) = self.load(name)?;
-        let path = dir.join(format!("{}.fac", sanitise(name)));
-        save(&preset, &path)?;
+        let path = dir.join(Self::file_name(name)?);
+        preset.save(&path)?;
         Ok(path)
     }
+
+    /// The file a name is stored under: the sanitised stem and the format's extension.
+    ///
+    /// Every route from a name to a filename goes through here and so through
+    /// [`sanitise_preset_name`] — the same function the command line applies — which is what
+    /// keeps a preset saved from the window and one saved from a script in the same file.
+    ///
+    /// The sanitiser is not one-to-one, and that is the cost of keeping the typed name inside
+    /// the file: `Mu:sic` and `Music` are two names and one stem, so two listed presets can lay
+    /// claim to one file. Between two user presets it is the same `.fac`; beside a factory
+    /// preset, which lives under a numbered file, it is the same autosave and the same export,
+    /// so an edit to one would surface as the other's unsaved change. [`Self::save_as`] refuses
+    /// to create either state, through `holder_of`. The state can still arrive from files put in
+    /// the directory by hand, which `rescan` lists as the two names they are; the shared autosave
+    /// slot is then the one thing the list cannot tell apart. Stems are compared the way the
+    /// filesystem compares them, exactly; the case-insensitive rule between *names* is the
+    /// controller's, as the sanitiser's own note says.
+    fn file_name(name: &str) -> Result<String, F::Error> {
+        let stem = sanitise_preset_name(name);
+        if stem.is_empty() {
+            return Err(F::empty_name());
+        }
+        Ok(format!("{stem}.{}", F::EXTENSION))
+    }
+
+    /// The listed preset, if any, other than `name` itself whose file is `file`.
+    ///
+    /// An entry whose own name sanitises to nothing has no file to hold, so it can never be the
+    /// holder; the `Ok` filter is that, not an error swallowed.
+    fn holder_of(&self, file: &str, name: &str) -> Option<&PresetEntry> {
+        self.entries.iter().find(|entry| {
+            entry.name != name && Self::file_name(&entry.name).is_ok_and(|held| held == file)
+        })
+    }
 }
+
+/// The order the list is in: numbered factory files first, by number; everything else by name.
+type SortKey = (u8, u32, String);
 
 /// Factory presets first in the order the vendor numbered their files, then everything else by
 /// name.
@@ -258,7 +393,7 @@ impl PresetStore {
 /// The numbering is the only record of the intended order — `1.fac` is General, `2.fac` is Music —
 /// and it is more useful than sorting those twelve alphabetically. The original lists presets in
 /// filesystem-glob order, which is arbitrary; this is the deterministic version of the same intent.
-fn sort_key(entry: &PresetEntry) -> (u8, u32, String) {
+fn sort_key(entry: &PresetEntry) -> SortKey {
     let numbered_file = entry
         .path
         .file_stem()
@@ -270,37 +405,74 @@ fn sort_key(entry: &PresetEntry) -> (u8, u32, String) {
     }
 }
 
-fn collect(dir: &Path, source: PresetSource, out: &mut Vec<PresetEntry>) {
+/// One entry per name, with the user's copy winning, in display order.
+///
+/// The user's copy replaces the factory one *in place*: it takes the factory entry's sort key,
+/// so a user "General" still leads the list where the factory General did, rather than sinking
+/// into the alphabetical rest. 0.3.0 sorted first and then removed *consecutive* duplicates,
+/// which is why a user preset named like a numbered factory one survived beside it — the two
+/// sorted apart, both were listed, and `find` returned the factory copy. A name found in two
+/// factory directories (the source tree and an installed package, say) is listed from the first;
+/// two user files carrying the same name are listed from the first in path order, with a warning.
+fn merge(factory: Vec<PresetEntry>, user: Vec<PresetEntry>) -> Vec<PresetEntry> {
+    let mut keyed: Vec<(SortKey, PresetEntry)> = Vec::with_capacity(factory.len() + user.len());
+    for entry in factory {
+        if keyed.iter().any(|(_, kept)| kept.name == entry.name) {
+            continue;
+        }
+        keyed.push((sort_key(&entry), entry));
+    }
+    for entry in user {
+        match keyed.iter_mut().find(|(_, kept)| kept.name == entry.name) {
+            Some((_, kept)) if kept.source == PresetSource::Factory => *kept = entry,
+            Some((_, kept)) => log::warn!(
+                "{}: another user preset is already named {:?} ({}); skipping",
+                entry.path.display(),
+                entry.name,
+                kept.path.display()
+            ),
+            None => keyed.push((sort_key(&entry), entry)),
+        }
+    }
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.into_iter().map(|(_, entry)| entry).collect()
+}
+
+fn collect<F: PresetFile>(dir: &Path, source: PresetSource, out: &mut Vec<PresetEntry>) {
     let Ok(read_dir) = std::fs::read_dir(dir) else {
         return;
     };
+    let mut found = Vec::new();
     for entry in read_dir.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("fac") {
+        if !path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(F::EXTENSION))
+        {
             continue;
         }
         // The original calls getPresetInfo() and skips any file whose name decodes empty; parsing
         // is the equivalent check and also rejects files that are not presets at all.
-        match load(&path) {
+        match F::load(&path) {
             Ok(preset) => {
                 // The name lives INSIDE the file, not in its filename. The factory presets are
                 // shipped as `1.fac`..`12.fac` but call themselves General, Music, Voice and so on
                 // — `getPresetInfo()` reads the file (`DfxDspPreset.cpp:363-397`) and the combo box
                 // shows what it finds. Only fall back to the stem for a file with no name in it,
                 // which the original skips outright.
-                let name = if preset.name.trim().is_empty() {
+                let name = if preset.name().trim().is_empty() {
                     path.file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or_default()
                         .to_owned()
                 } else {
-                    preset.name.clone()
+                    preset.name().to_owned()
                 };
                 if name.is_empty() {
                     log::warn!("{}: no preset name; skipping", path.display());
                     continue;
                 }
-                out.push(PresetEntry {
+                found.push(PresetEntry {
                     name,
                     path,
                     source,
@@ -310,19 +482,9 @@ fn collect(dir: &Path, source: PresetSource, out: &mut Vec<PresetEntry>) {
             Err(err) => log::warn!("{}: {err}; skipping", path.display()),
         }
     }
-}
-
-/// Keep a user-chosen preset name usable as a filename.
-fn sanitise(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if matches!(c, '/' | '\\' | '\0') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect()
+    // `read_dir` order is whatever the filesystem feels like; the list must not depend on it.
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    out.extend(found);
 }
 
 #[cfg(test)]
@@ -458,6 +620,153 @@ mod tests {
     }
 
     #[test]
+    fn a_user_preset_named_like_a_numbered_factory_one_wins_and_keeps_its_place() {
+        // The 0.3.0 bug. `dedup_by` removes *consecutive* equals, and a user "General.fac" sorted
+        // among the alphabetical rest while the factory General led the list by its file number:
+        // both survived, and `find` returned the factory copy. "Jazz" above cannot see it — a
+        // bonus preset and its shadow sort alike — so this one uses a numbered name.
+        let tmp = tempdir("shadow-numbered");
+        let mut store = store_in(&tmp);
+        let (factory, _) = store.load("General").expect("load General");
+        assert_ne!(
+            factory.effect(fxsound_core::Effect::Bass),
+            1.0,
+            "the test needs a value the factory copy does not already hold"
+        );
+        let mut general = factory;
+        general.set_effect(fxsound_core::Effect::Bass, 1.0);
+        store.save_as(&general, "General").expect("save");
+
+        assert_eq!(
+            store
+                .entries()
+                .iter()
+                .filter(|e| e.name == "General")
+                .count(),
+            1,
+            "listed once"
+        );
+        let entry = store.find("General").expect("still listed");
+        assert_eq!(
+            entry.source,
+            PresetSource::User,
+            "and it is the user's copy"
+        );
+        assert_eq!(
+            store.index_of("General"),
+            Some(0),
+            "which leads the list where the factory copy did"
+        );
+        let (reloaded, _) = store.load("General").expect("reload");
+        assert_eq!(reloaded.effect(fxsound_core::Effect::Bass), 1.0);
+    }
+
+    #[test]
+    fn the_same_factory_preset_in_two_directories_is_listed_once() {
+        // `with_default_dirs` looks in the source tree and in the install prefixes, so a developer
+        // with the package installed sees every factory preset from two places. The first wins.
+        let tmp = tempdir("two-factory-dirs");
+        let assets = assets();
+        let copy = tmp.join("copy");
+        std::fs::create_dir_all(&copy).expect("mkdir");
+        std::fs::copy(assets.join("Factsoft/1.fac"), copy.join("1.fac")).expect("copy");
+        let mut store =
+            PresetStore::with_dirs(vec![assets.join("Factsoft"), copy], tmp.join("user"));
+        store.rescan();
+
+        assert_eq!(
+            store
+                .entries()
+                .iter()
+                .filter(|e| e.name == "General")
+                .count(),
+            1
+        );
+        assert!(store.find("General").unwrap().path.starts_with(&assets));
+    }
+
+    #[test]
+    fn two_user_files_carrying_the_same_name_are_listed_once() {
+        let tmp = tempdir("duplicate-user-name");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let preset = Preset {
+            name: "Twice".into(),
+            ..Preset::default()
+        };
+        crate::save(&preset, &tmp.join("user/a.fac")).expect("a");
+        crate::save(&preset, &tmp.join("user/b.fac")).expect("b");
+        store.rescan();
+
+        assert_eq!(store.entries().len(), 1);
+        assert!(
+            store.entries()[0].path.ends_with("a.fac"),
+            "the first in path order wins"
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_is_reported_as_unknown() {
+        // Not `Malformed { line: 0 }`: the string reaches the command line and D-Bus, and "line
+        // 0: expected a known preset name" describes a file that was never opened.
+        let tmp = tempdir("unknown");
+        let store = store_in(&tmp);
+        let err = store.load("No Such Preset").unwrap_err();
+        assert!(
+            matches!(&err, PresetError::Unknown(name) if name == "No Such Preset"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("No Such Preset"));
+    }
+
+    #[test]
+    fn a_name_becomes_a_filename_through_the_one_sanitiser() {
+        // 0.3.0 had two sanitisers: the command line stripped nine characters while this store
+        // replaced three with underscores, so a name with a `:` typed in the window became a
+        // file the Windows build could not open. Both routes now go through
+        // `sanitise_preset_name`; the name inside the file stays what was typed.
+        let tmp = tempdir("sanitise");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let preset = Preset {
+            name: "Mu:sic?".into(),
+            ..Preset::default()
+        };
+        let path = store.save_as(&preset, "Mu:sic?").expect("save");
+        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("Music.fac"));
+        assert_eq!(store.entries()[0].name, "Mu:sic?");
+
+        let exported = store.export("Mu:sic?", &tmp).expect("export");
+        assert_eq!(
+            exported.file_name().and_then(|n| n.to_str()),
+            Some("Music.fac")
+        );
+        assert!(
+            store
+                .autosave_path("Mu:sic?")
+                .ends_with("AutoSave/Music.fac"),
+            "{}",
+            store.autosave_path("Mu:sic?").display()
+        );
+    }
+
+    #[test]
+    fn a_name_with_nothing_safe_in_it_is_refused() {
+        // Stripping can leave nothing, and `.fac` is not a file anyone can find again.
+        let tmp = tempdir("empty-name");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let preset = Preset {
+            name: " : ".into(),
+            ..Preset::default()
+        };
+        let err = store.save_as(&preset, " : ").unwrap_err();
+        assert!(matches!(err, PresetError::MissingName), "{err}");
+        let err = store.autosave(&preset).unwrap_err();
+        assert!(matches!(err, PresetError::MissingName), "{err}");
+
+        let written = std::fs::read_dir(tmp.join("user")).map_or(0, Iterator::count);
+        assert_eq!(written, 0, "nothing was written");
+    }
+
+    #[test]
     fn autosave_marks_a_preset_modified_and_is_preferred_on_load() {
         let tmp = tempdir("autosave");
         let mut store = store_in(&tmp);
@@ -539,5 +848,66 @@ mod tests {
         // A `.bak` beside a preset must not become a second entry in the list.
         let names: Vec<_> = store.entries().iter().map(|e| e.name.clone()).collect();
         assert_eq!(names, vec!["Mine".to_owned()], "listed: {names:?}");
+    }
+
+    #[test]
+    fn a_name_that_would_take_another_presets_file_is_refused() {
+        // `Mu:sic` and `Music` are two names and one file: the sanitiser strips the `:` and both
+        // become `Music.fac`. Beside the factory Music the two would share an autosave slot;
+        // beside a user Music the save would replace its file — with a `.bak`, but the list
+        // would then show one name where two had been saved. Neither is a save, so neither
+        // happens.
+        let tmp = tempdir("shared-file");
+        let mut store = store_in(&tmp);
+        assert_eq!(
+            store.find("Music").map(|e| e.source),
+            Some(PresetSource::Factory)
+        );
+
+        let music = Preset {
+            name: "Mu:sic".into(),
+            ..Preset::default()
+        };
+        let err = store.save_as(&music, "Mu:sic").unwrap_err();
+        let PresetError::SharedFile {
+            name,
+            existing,
+            file,
+        } = &err
+        else {
+            panic!("expected SharedFile, got {err}");
+        };
+        assert_eq!(name, "Mu:sic");
+        assert_eq!(existing, "Music");
+        assert_eq!(file, "Music.fac");
+        assert!(store.find("Mu:sic").is_none());
+        assert!(!tmp.join("Music.fac").exists(), "nothing was written");
+
+        // Between two user presets the file really is the same one.
+        let mut mine = Preset {
+            name: "Mine".into(),
+            ..Preset::default()
+        };
+        mine.main_midi[0] = 10;
+        let path = store.save_as(&mine, "Mine").expect("save Mine");
+        let err = store.save_as(&mine, "Mi?ne").unwrap_err();
+        assert!(
+            matches!(&err, PresetError::SharedFile { existing, .. } if existing == "Mine"),
+            "{err}"
+        );
+        assert!(store.find("Mi?ne").is_none());
+        assert_eq!(crate::load(&path).expect("Mine is intact").main_midi[0], 10);
+        let mut backup = path.as_os_str().to_owned();
+        backup.push(".bak");
+        assert!(
+            !Path::new(&backup).exists(),
+            "a refused save leaves no backup either"
+        );
+
+        // The same name is the overwrite, and still goes through with its `.bak`.
+        mine.main_midi[0] = 99;
+        store.save_as(&mine, "Mine").expect("overwrite Mine");
+        assert!(Path::new(&backup).is_file());
+        assert_eq!(crate::load(&path).expect("reload").main_midi[0], 99);
     }
 }

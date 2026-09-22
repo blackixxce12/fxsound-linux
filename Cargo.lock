@@ -1354,6 +1354,7 @@ dependencies = [
  "dirs",
  "log",
  "serde",
+ "tempfile",
  "toml",
 ]
 
@@ -1363,7 +1364,7 @@ version = "0.3.0"
 dependencies = [
  "fxsound-core",
  "fxsound-preset",
- "nnnoiseless",
+ "fxsound-rnnoise",
  "realfft",
 ]
 
@@ -1377,6 +1378,14 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "toml",
+]
+
+[[package]]
+name = "fxsound-rnnoise"
+version = "0.3.0"
+dependencies = [
+ "easyfft",
+ "once_cell",
 ]
 
 [[package]]
@@ -2083,16 +2092,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
-]
-
-[[package]]
-name = "nnnoiseless"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "805d5964d1e7a0006a7fdced7dae75084d66d18b35f1dfe81bd76929b1f8da0c"
-dependencies = [
- "easyfft",
- "once_cell",
 ]
 
 [[package]]

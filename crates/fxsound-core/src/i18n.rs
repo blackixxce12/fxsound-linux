@@ -5,8 +5,14 @@
 //! and swapped in by `FxController::setLanguage()` (`fxsound/Source/GUI/FxController.cpp:2330-2457`).
 //! Those exact files — 28 of the 30 codes `FxLanguage.cpp:25` lists; `en` is the source language
 //! and `hu` was never built into the Windows binary — live in `assets/translations/` and are
-//! embedded here unchanged. `assets/translations/port/` carries the handful of strings this port
-//! added, in the same file format, layered on top of the original's table for the same language.
+//! embedded here unchanged. `assets/translations/port/` carries the strings this port added, in
+//! the same file format, layered on top of the original's table for the same language — and,
+//! for the few strings a Windows table misspells or omits, a correctly keyed copy: a layer over
+//! a file that is embedded unchanged is the one place such a repair can live.
+//!
+//! `tests/translations.rs` audits every string the interface passes to [`tr`] against every
+//! language's table, so a string added without its translations fails a test rather than
+//! shipping in English to twenty-eight languages, which is what happened in 0.3.0.
 //!
 //! Lookups go through [`tr`]: the English source string is the key, exactly as `TRANS("…")` is in
 //! the C++, and an unknown key comes back unchanged, so a missing translation degrades to English
@@ -330,7 +336,23 @@ pub fn resolve(follows_system: bool, chosen: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// `CURRENT` is one process-wide table, and cargo runs tests on parallel threads. Every test
+    /// that *swaps* the table holds this while it does, so that one test's `set_language("de")`
+    /// cannot land between another's `set_language("en")` and its assertion. Tests that only
+    /// build a `Catalogue` need nothing: they never touch the global.
+    static LANGUAGE_IN_EFFECT: Mutex<()> = Mutex::new(());
+
+    /// Hold the table for the duration of a test, whether or not a previous holder panicked — a
+    /// poisoned lock would otherwise turn one failure into two.
+    fn hold_the_table() -> std::sync::MutexGuard<'static, ()> {
+        LANGUAGE_IN_EFFECT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn every_embedded_table_parses_to_the_originals_hundred_odd_strings() {
@@ -409,6 +431,7 @@ mod tests {
 
     #[test]
     fn an_unknown_key_comes_back_as_itself_in_every_language() {
+        let _table = hold_the_table();
         assert!(set_language("de"));
         assert_eq!(tr("Port-only string"), "Port-only string");
         assert_eq!(tr("Settings"), "Einstellungen");
@@ -419,6 +442,7 @@ mod tests {
 
     #[test]
     fn placeholders_are_filled_in_order() {
+        let _table = hold_the_table();
         set_language(ENGLISH);
         assert_eq!(
             tr_args("Preset %s is deleted.", &["Jazz"]),

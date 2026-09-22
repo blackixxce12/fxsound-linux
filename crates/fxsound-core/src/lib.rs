@@ -299,6 +299,23 @@ pub mod limits {
     /// Any release or hold time in the chain.
     pub const RELEASE_MS: std::ops::RangeInclusive<f32> = 0.0..=2_000.0;
 
+    // ---- the denoiser's control surface ----
+    //
+    // The four numbers behind a [`crate::DenoiseLevel`]. A preset may override the level's row,
+    // which is the one route by which a hand-typed value reaches them, so they are held to the
+    // same ranges here that the level table itself stays inside.
+
+    /// How far below unity a band's gain may fall, in dB of suppression. `0` is a straight wire;
+    /// past 80 dB the floor sits below the network's own numerical noise and buys nothing.
+    pub const DENOISE_MAX_SUPPRESSION_DB: std::ops::RangeInclusive<f32> = 0.0..=80.0;
+    /// The voice probability below which a frame is treated as noise. A probability.
+    pub const DENOISE_VAD_THRESHOLD: std::ops::RangeInclusive<f32> = 0.0..=1.0;
+    /// How much of the gap between a band's gain and unity is given back in proportion to the
+    /// voice probability. A fraction.
+    pub const DENOISE_VOICE_PRESERVATION: std::ops::RangeInclusive<f32> = 0.0..=1.0;
+    /// The wet/dry mix; `1` is fully denoised. A fraction.
+    pub const DENOISE_WET_DRY: std::ops::RangeInclusive<f32> = 0.0..=1.0;
+
     /// Clamp into `range`, and substitute `fallback` for a value that is not a number at all.
     ///
     /// `f32::clamp` propagates NaN, so it cannot be used on its own here: the point of this
@@ -438,11 +455,495 @@ pub enum Detection {
     Rms,
 }
 
+/// How hard the denoiser is allowed to work.
+///
+/// A control surface over RNNoise rather than a choice between networks: the network always
+/// computes its twenty-two band gains and its voice probability, and the level decides how much
+/// of that opinion reaches the signal — the row is [`DenoiseLevel::control`]. `Off` is a level
+/// in its own right and not the absence of one, so that a preset can name it and a setting can
+/// override a preset with it.
+///
+/// `Medium` is the default because a 0.3.0 preset that said `rnnoise = true` meant the network
+/// as it was then, and that is the row `Medium` was voiced to reproduce.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DenoiseLevel {
+    /// The stage stands aside. Distinct from `rnnoise = false` only in that it can be said.
+    Off,
+    /// A gentle floor and most of the voice handed back: for a quiet room and a good microphone,
+    /// where the network's own artefacts would cost more than the noise it removes.
+    Light,
+    /// What 0.3.0 did.
+    #[default]
+    Medium,
+    /// The network's full opinion, with nothing handed back. For a mechanical keyboard or a fan
+    /// that never stops.
+    Strong,
+}
+
+impl DenoiseLevel {
+    /// Every level, in the order the interface lists them.
+    pub const ALL: [Self; 4] = [Self::Off, Self::Light, Self::Medium, Self::Strong];
+
+    /// The English label, and so the `tr` key.
+    ///
+    /// `Light` is labelled **Mild**. `"Light"` is already a key in every one of the Windows
+    /// build's tables, where it names the light *theme*, and a key has one translation per
+    /// language: "Hell" and "Светлая" describe a palette, not a noise floor, and a port entry
+    /// that said otherwise would re-label the theme switch. So the level takes a word of its
+    /// own. The socket, D-Bus and file spelling is [`DenoiseLevel::key`]'s `light` regardless.
+    #[inline]
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Light => "Mild",
+            Self::Medium => "Medium",
+            Self::Strong => "Strong",
+        }
+    }
+
+    /// Stable key used in files, on the control socket and on D-Bus.
+    #[inline]
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Light => "light",
+            Self::Medium => "medium",
+            Self::Strong => "strong",
+        }
+    }
+
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|level| level.key() == key)
+    }
+
+    /// The control surface this level stands for.
+    ///
+    /// The numbers are a design choice, not a measurement, and they are the one place the choice
+    /// is written down: every other crate asks here rather than carrying its own copy. `Off` is
+    /// all zeros, which [`DenoiseControl::is_active`] reads as "nothing to do".
+    #[must_use]
+    pub const fn control(self) -> DenoiseControl {
+        match self {
+            Self::Off => DenoiseControl {
+                max_suppression_db: 0.0,
+                vad_threshold: 0.0,
+                voice_preservation: 0.0,
+                wet_dry: 0.0,
+            },
+            Self::Light => DenoiseControl {
+                max_suppression_db: 12.0,
+                vad_threshold: 0.0,
+                voice_preservation: 0.5,
+                wet_dry: 1.0,
+            },
+            Self::Medium => DenoiseControl {
+                max_suppression_db: 24.0,
+                vad_threshold: 0.15,
+                voice_preservation: 0.3,
+                wet_dry: 1.0,
+            },
+            Self::Strong => DenoiseControl {
+                max_suppression_db: 60.0,
+                vad_threshold: 0.35,
+                voice_preservation: 0.0,
+                wet_dry: 1.0,
+            },
+        }
+    }
+}
+
+/// The four numbers behind a [`DenoiseLevel`].
+///
+/// Applied to the network's band gains before synthesis, in this order: the gains are floored at
+/// `10^(−max_suppression_db/20)`; a frame whose voice probability is below `vad_threshold` is
+/// attenuated toward that floor; `voice_preservation × probability` of the remaining gap to unity
+/// is handed back; and the result is mixed with the dry signal by `wet_dry`. A preset may carry a
+/// row of its own instead of a level's, which is why this is a value and not just an enum.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DenoiseControl {
+    /// Per-band gain floor, in dB of suppression: the floor itself is `10^(−x/20)`. Light 12,
+    /// Medium 24, Strong 60.
+    pub max_suppression_db: f32,
+    /// Below this voice probability the frame is treated as noise.
+    pub vad_threshold: f32,
+    /// `0..=1`: lift the gains toward unity in proportion to the voice probability.
+    pub voice_preservation: f32,
+    /// `0..=1` mix; `1` is fully denoised.
+    pub wet_dry: f32,
+}
+
+impl DenoiseControl {
+    /// Whether this row asks the stage to do anything at all.
+    ///
+    /// A floor of 0 dB is a straight wire, and a mix with no wet in it is the dry signal: either
+    /// one means the network's output never reaches the listener, so the stage may stand aside
+    /// and save its twenty milliseconds of latency.
+    #[inline]
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.max_suppression_db > 0.0 && self.wet_dry > 0.0
+    }
+
+    /// The linear gain floor, `10^(−max_suppression_db/20)`. `1.0` when nothing may be removed.
+    #[inline]
+    #[must_use]
+    pub fn gain_floor(&self) -> f32 {
+        10.0_f32.powf(-self.max_suppression_db / 20.0)
+    }
+
+    /// Force every field into its [`limits`] range, substituting `fallback`'s field for one that
+    /// is not a number at all — the same asymmetry every other snapshot field keeps.
+    ///
+    /// The fallback is a row rather than a constant because the right answer for a corrupt
+    /// override is the level it was overriding.
+    pub fn sanitise(&mut self, fallback: Self) {
+        use limits::finite;
+
+        self.max_suppression_db = finite(
+            self.max_suppression_db,
+            limits::DENOISE_MAX_SUPPRESSION_DB,
+            fallback.max_suppression_db,
+        );
+        self.vad_threshold = finite(
+            self.vad_threshold,
+            limits::DENOISE_VAD_THRESHOLD,
+            fallback.vad_threshold,
+        );
+        self.voice_preservation = finite(
+            self.voice_preservation,
+            limits::DENOISE_VOICE_PRESERVATION,
+            fallback.voice_preservation,
+        );
+        self.wet_dry = finite(self.wet_dry, limits::DENOISE_WET_DRY, fallback.wet_dry);
+    }
+}
+
+impl Default for DenoiseControl {
+    /// The default level's row, so that a snapshot built with `..Default::default()` and one
+    /// built from `DenoiseLevel::default().control()` say the same thing.
+    fn default() -> Self {
+        DenoiseLevel::default().control()
+    }
+}
+
+/// How the denoiser treats a multi-channel capture.
+///
+/// RNNoise is a mono network. `Independent` — one network per channel, which is what 0.3.0 did
+/// and so the default — costs a network per channel and lets the two sides of a stereo
+/// microphone disagree about what is voice, which smears the image. The other two run one
+/// network on a downmix and differ in what they do with its answer.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DenoiseChannelMode {
+    /// Downmix, denoise once, and send the same signal to every channel.
+    Mono,
+    /// Downmix for the analysis only: the one set of band gains is applied to each channel
+    /// through that channel's own transform, so the image survives and the mask is shared.
+    Linked,
+    /// One network per channel.
+    #[default]
+    Independent,
+}
+
+impl DenoiseChannelMode {
+    /// Every mode, in the order the interface lists them.
+    pub const ALL: [Self; 3] = [Self::Mono, Self::Linked, Self::Independent];
+
+    /// The English label, and so the `tr` key.
+    #[inline]
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Mono => "Mono",
+            Self::Linked => "Linked stereo",
+            Self::Independent => "Independent",
+        }
+    }
+
+    /// Stable key used in files, on the control socket and on D-Bus.
+    #[inline]
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Mono => "mono",
+            Self::Linked => "linked",
+            Self::Independent => "independent",
+        }
+    }
+
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.key() == key)
+    }
+}
+
+/// Where the de-esser puts its band.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DeEsserMode {
+    /// The corner the preset asks for, or nothing when the rate cannot carry it.
+    #[default]
+    Classic,
+    /// The corner is chosen relative to the source's bandwidth, so a 16 kHz headset profile
+    /// still gets a de-esser instead of a stage that says it is unavailable.
+    Adaptive,
+}
+
+impl DeEsserMode {
+    /// Every mode, in the order the interface lists them.
+    pub const ALL: [Self; 2] = [Self::Classic, Self::Adaptive];
+
+    /// The English label, and so the `tr` key.
+    #[inline]
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Classic => "Classic",
+            Self::Adaptive => "Adaptive",
+        }
+    }
+
+    /// Stable key used in files, on the control socket and on D-Bus.
+    #[inline]
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Adaptive => "adaptive",
+        }
+    }
+
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.key() == key)
+    }
+}
+
+/// How much late reverberation the de-reverb stage removes.
+///
+/// `Off` by default: the stage costs five milliseconds of latency and a room that is not
+/// reverberant gains nothing from it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DereverbLevel {
+    #[default]
+    Off,
+    Light,
+    Medium,
+    Strong,
+}
+
+impl DereverbLevel {
+    /// Every level, in the order the interface lists them.
+    pub const ALL: [Self; 4] = [Self::Off, Self::Light, Self::Medium, Self::Strong];
+
+    /// The English label, and so the `tr` key. `Light` reads **Mild** for the reason given on
+    /// [`DenoiseLevel::label`].
+    #[inline]
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Light => "Mild",
+            Self::Medium => "Medium",
+            Self::Strong => "Strong",
+        }
+    }
+
+    /// Stable key used in files, on the control socket and on D-Bus.
+    #[inline]
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Light => "light",
+            Self::Medium => "medium",
+            Self::Strong => "strong",
+        }
+    }
+
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|level| level.key() == key)
+    }
+}
+
+/// The Settings pane's global noise-suppression override.
+///
+/// A voice preset names a [`DenoiseLevel`]; this sits over every preset at once. `Preset` — the
+/// default — means "whatever the preset says", so a fresh install sounds like the preset it
+/// selected and the override is something the user reaches for, not something they inherit.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum NoiseSuppressionOverride {
+    /// Follow the voice preset.
+    #[default]
+    Preset,
+    Off,
+    Light,
+    Medium,
+    Strong,
+}
+
+impl NoiseSuppressionOverride {
+    /// Every choice, in the order the interface lists them.
+    pub const ALL: [Self; 5] = [
+        Self::Preset,
+        Self::Off,
+        Self::Light,
+        Self::Medium,
+        Self::Strong,
+    ];
+
+    /// The English label, and so the `tr` key. `Light` reads **Mild** for the reason given on
+    /// [`DenoiseLevel::label`].
+    #[inline]
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Preset => "Preset",
+            Self::Off => "Off",
+            Self::Light => "Mild",
+            Self::Medium => "Medium",
+            Self::Strong => "Strong",
+        }
+    }
+
+    /// Stable key used in the settings file, on the control socket and on D-Bus.
+    #[inline]
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Preset => "preset",
+            Self::Off => "off",
+            Self::Light => "light",
+            Self::Medium => "medium",
+            Self::Strong => "strong",
+        }
+    }
+
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|choice| choice.key() == key)
+    }
+
+    /// The level this override pins, or `None` for "follow the preset".
+    #[inline]
+    #[must_use]
+    pub const fn level(self) -> Option<DenoiseLevel> {
+        match self {
+            Self::Preset => None,
+            Self::Off => Some(DenoiseLevel::Off),
+            Self::Light => Some(DenoiseLevel::Light),
+            Self::Medium => Some(DenoiseLevel::Medium),
+            Self::Strong => Some(DenoiseLevel::Strong),
+        }
+    }
+
+    /// The level that takes effect: the override's, unless it says to follow `preset`.
+    #[inline]
+    #[must_use]
+    pub const fn resolve(self, preset: DenoiseLevel) -> DenoiseLevel {
+        match self.level() {
+            Some(level) => level,
+            None => preset,
+        }
+    }
+}
+
+/// The Settings pane's global denoiser channel-mode override; see [`NoiseSuppressionOverride`].
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DenoiseChannelsOverride {
+    /// Follow the voice preset.
+    #[default]
+    Preset,
+    Mono,
+    Linked,
+    Independent,
+}
+
+impl DenoiseChannelsOverride {
+    /// Every choice, in the order the interface lists them.
+    pub const ALL: [Self; 4] = [Self::Preset, Self::Mono, Self::Linked, Self::Independent];
+
+    /// The English label, and so the `tr` key.
+    #[inline]
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Preset => "Preset",
+            Self::Mono => DenoiseChannelMode::Mono.label(),
+            Self::Linked => DenoiseChannelMode::Linked.label(),
+            Self::Independent => DenoiseChannelMode::Independent.label(),
+        }
+    }
+
+    /// Stable key used in the settings file, on the control socket and on D-Bus.
+    #[inline]
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Preset => "preset",
+            Self::Mono => DenoiseChannelMode::Mono.key(),
+            Self::Linked => DenoiseChannelMode::Linked.key(),
+            Self::Independent => DenoiseChannelMode::Independent.key(),
+        }
+    }
+
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|choice| choice.key() == key)
+    }
+
+    /// The mode this override pins, or `None` for "follow the preset".
+    #[inline]
+    #[must_use]
+    pub const fn mode(self) -> Option<DenoiseChannelMode> {
+        match self {
+            Self::Preset => None,
+            Self::Mono => Some(DenoiseChannelMode::Mono),
+            Self::Linked => Some(DenoiseChannelMode::Linked),
+            Self::Independent => Some(DenoiseChannelMode::Independent),
+        }
+    }
+
+    /// The mode that takes effect: the override's, unless it says to follow `preset`.
+    #[inline]
+    #[must_use]
+    pub const fn resolve(self, preset: DenoiseChannelMode) -> DenoiseChannelMode {
+        match self.mode() {
+            Some(mode) => mode,
+            None => preset,
+        }
+    }
+}
+
 /// Which way audio flows through a device FxSound can attach to.
 ///
 /// The Windows build only ever sat in front of a *playback* endpoint. The Linux port can also sit
 /// behind a *capture* device — a microphone — and publish the processed signal as a virtual
-/// source, so a device is one or the other and FxSound runs in exactly one direction at a time.
+/// source. A device is one or the other, and FxSound keeps one lane per direction: a pair of
+/// nodes, a chain and a claim on the session default for each, which can run at the same time
+/// and are enabled and detached independently. Which lane the window is *editing* is a separate
+/// notion (`Settings::device_direction`) that the engine never sees.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
@@ -456,12 +957,44 @@ pub enum DeviceDirection {
 }
 
 impl DeviceDirection {
+    /// Both directions, outputs first — the order every device list and every per-lane table
+    /// keeps.
+    pub const ALL: [Self; 2] = [Self::Output, Self::Input];
+
     /// The English word the UI uses for the section header and the tray tooltip.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::Output => "Output",
             Self::Input => "Input",
+        }
+    }
+
+    /// Stable key used on the control socket and on D-Bus — the same spelling the settings file
+    /// uses, so one parser serves all three.
+    #[inline]
+    #[must_use]
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Output => "output",
+            Self::Input => "input",
+        }
+    }
+
+    #[must_use]
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|direction| direction.key() == key)
+    }
+
+    /// The other direction.
+    #[inline]
+    #[must_use]
+    pub const fn other(self) -> Self {
+        match self {
+            Self::Output => Self::Input,
+            Self::Input => Self::Output,
         }
     }
 }
@@ -658,5 +1191,283 @@ mod tests {
         assert_eq!(params.filter_q, 1.0);
         assert_eq!(params.volume_leveling_db, 4.0);
         assert_eq!(params.band_boost_db[0], eq::MAX_GAIN_DB);
+    }
+
+    // ---- the microphone's mode enums ------------------------------------------------------
+
+    /// What the settings file, the socket and D-Bus all agree on: a value's `key()` is exactly
+    /// what serde writes for it, so one parser serves all three.
+    fn serde_spelling<T: serde::Serialize>(value: T) -> String {
+        #[derive(serde::Serialize)]
+        struct Wrapper<T> {
+            v: T,
+        }
+        let text = toml::to_string(&Wrapper { v: value }).expect("serialise");
+        text.trim()
+            .strip_prefix("v = \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("a bare string")
+            .to_owned()
+    }
+
+    #[test]
+    fn every_mode_key_round_trips_and_matches_its_serde_spelling() {
+        for level in DenoiseLevel::ALL {
+            assert_eq!(DenoiseLevel::from_key(level.key()), Some(level));
+            assert_eq!(serde_spelling(level), level.key());
+        }
+        for mode in DenoiseChannelMode::ALL {
+            assert_eq!(DenoiseChannelMode::from_key(mode.key()), Some(mode));
+            assert_eq!(serde_spelling(mode), mode.key());
+        }
+        for mode in DeEsserMode::ALL {
+            assert_eq!(DeEsserMode::from_key(mode.key()), Some(mode));
+            assert_eq!(serde_spelling(mode), mode.key());
+        }
+        for level in DereverbLevel::ALL {
+            assert_eq!(DereverbLevel::from_key(level.key()), Some(level));
+            assert_eq!(serde_spelling(level), level.key());
+        }
+        for choice in NoiseSuppressionOverride::ALL {
+            assert_eq!(
+                NoiseSuppressionOverride::from_key(choice.key()),
+                Some(choice)
+            );
+            assert_eq!(serde_spelling(choice), choice.key());
+        }
+        for choice in DenoiseChannelsOverride::ALL {
+            assert_eq!(
+                DenoiseChannelsOverride::from_key(choice.key()),
+                Some(choice)
+            );
+            assert_eq!(serde_spelling(choice), choice.key());
+        }
+        for direction in DeviceDirection::ALL {
+            assert_eq!(DeviceDirection::from_key(direction.key()), Some(direction));
+            assert_eq!(serde_spelling(direction), direction.key());
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_parses_as_nothing_rather_than_as_a_default() {
+        assert_eq!(DenoiseLevel::from_key("Medium"), None, "keys are lowercase");
+        assert_eq!(DenoiseLevel::from_key(""), None);
+        assert_eq!(DenoiseChannelMode::from_key("linked_stereo"), None);
+        assert_eq!(DeEsserMode::from_key("auto"), None);
+        assert_eq!(DereverbLevel::from_key("on"), None);
+        assert_eq!(NoiseSuppressionOverride::from_key("default"), None);
+        assert_eq!(DenoiseChannelsOverride::from_key("stereo"), None);
+        assert_eq!(DeviceDirection::from_key("Output"), None);
+    }
+
+    #[test]
+    fn the_keys_of_one_enum_are_distinct_and_so_are_its_labels() {
+        fn distinct<'a>(items: impl Iterator<Item = &'a str>) -> bool {
+            let mut seen = std::collections::HashSet::new();
+            items.into_iter().all(|item| seen.insert(item))
+        }
+        assert!(distinct(DenoiseLevel::ALL.iter().map(|l| l.key())));
+        assert!(distinct(DenoiseLevel::ALL.iter().map(|l| l.label())));
+        assert!(distinct(DenoiseChannelMode::ALL.iter().map(|m| m.key())));
+        assert!(distinct(DenoiseChannelMode::ALL.iter().map(|m| m.label())));
+        assert!(distinct(DeEsserMode::ALL.iter().map(|m| m.key())));
+        assert!(distinct(DereverbLevel::ALL.iter().map(|l| l.key())));
+        assert!(distinct(
+            NoiseSuppressionOverride::ALL.iter().map(|c| c.key())
+        ));
+        assert!(distinct(
+            NoiseSuppressionOverride::ALL.iter().map(|c| c.label())
+        ));
+        assert!(distinct(
+            DenoiseChannelsOverride::ALL.iter().map(|c| c.key())
+        ));
+        assert!(distinct(
+            DenoiseChannelsOverride::ALL.iter().map(|c| c.label())
+        ));
+    }
+
+    #[test]
+    fn the_defaults_are_what_a_0_3_0_file_meant() {
+        // `rnnoise = true` meant the network as it then was, which is the Medium row; one network
+        // per channel; the corner the preset asked for; no de-reverb.
+        assert_eq!(DenoiseLevel::default(), DenoiseLevel::Medium);
+        assert_eq!(
+            DenoiseChannelMode::default(),
+            DenoiseChannelMode::Independent
+        );
+        assert_eq!(DeEsserMode::default(), DeEsserMode::Classic);
+        assert_eq!(DereverbLevel::default(), DereverbLevel::Off);
+        assert_eq!(
+            NoiseSuppressionOverride::default(),
+            NoiseSuppressionOverride::Preset
+        );
+        assert_eq!(
+            DenoiseChannelsOverride::default(),
+            DenoiseChannelsOverride::Preset
+        );
+        assert_eq!(DeviceDirection::default(), DeviceDirection::Output);
+    }
+
+    #[test]
+    fn the_level_table_is_the_one_in_the_design_record() {
+        let row = |level: DenoiseLevel| {
+            let c = level.control();
+            (
+                c.max_suppression_db,
+                c.vad_threshold,
+                c.voice_preservation,
+                c.wet_dry,
+            )
+        };
+        assert_eq!(row(DenoiseLevel::Off), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!(row(DenoiseLevel::Light), (12.0, 0.0, 0.5, 1.0));
+        assert_eq!(row(DenoiseLevel::Medium), (24.0, 0.15, 0.3, 1.0));
+        assert_eq!(row(DenoiseLevel::Strong), (60.0, 0.35, 0.0, 1.0));
+        // And every row is already inside the limits it will be clamped to, so a level never
+        // changes on its way to the audio thread.
+        for level in DenoiseLevel::ALL {
+            let mut checked = level.control();
+            checked.sanitise(DenoiseLevel::Strong.control());
+            assert_eq!(checked, level.control(), "{level:?}");
+        }
+    }
+
+    #[test]
+    fn off_is_the_only_level_whose_row_is_inactive() {
+        for level in DenoiseLevel::ALL {
+            assert_eq!(
+                level.control().is_active(),
+                level != DenoiseLevel::Off,
+                "{level:?}"
+            );
+        }
+        // Either half of the product switches the stage off: a floor at unity removes nothing, and
+        // a mix with no wet in it plays the dry signal.
+        let mut dry = DenoiseLevel::Strong.control();
+        dry.wet_dry = 0.0;
+        assert!(!dry.is_active());
+        let mut wire = DenoiseLevel::Strong.control();
+        wire.max_suppression_db = 0.0;
+        assert!(!wire.is_active());
+    }
+
+    #[test]
+    fn the_gain_floor_is_the_decibel_inverse_of_the_suppression() {
+        assert_eq!(DenoiseLevel::Off.control().gain_floor(), 1.0);
+        let strong = DenoiseLevel::Strong.control().gain_floor();
+        assert!(
+            (strong - 0.001).abs() < 1e-6,
+            "60 dB is a thousandth: {strong}"
+        );
+        let medium = DenoiseLevel::Medium.control().gain_floor();
+        assert!((medium - 0.063_095_7).abs() < 1e-5, "24 dB: {medium}");
+    }
+
+    #[test]
+    fn the_default_control_row_is_the_default_levels_row() {
+        assert_eq!(DenoiseControl::default(), DenoiseLevel::default().control());
+    }
+
+    #[test]
+    fn a_control_row_deserialises_from_a_partial_table() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            denoise: DenoiseControl,
+        }
+        // Only one field spelled out: the rest come from the default row rather than failing the
+        // parse, so a preset can override the one number it cares about.
+        let parsed: Wrapper =
+            toml::from_str("[denoise]\nmax_suppression_db = 40.0\n").expect("parse");
+        assert_eq!(parsed.denoise.max_suppression_db, 40.0);
+        assert_eq!(
+            parsed.denoise.vad_threshold,
+            DenoiseControl::default().vad_threshold
+        );
+    }
+
+    #[test]
+    fn a_corrupt_control_row_falls_back_to_its_level_and_an_excessive_one_is_clamped() {
+        let mut corrupt = DenoiseControl {
+            max_suppression_db: f32::NAN,
+            vad_threshold: f32::INFINITY,
+            voice_preservation: f32::NEG_INFINITY,
+            wet_dry: f32::NAN,
+        };
+        corrupt.sanitise(DenoiseLevel::Light.control());
+        assert_eq!(corrupt, DenoiseLevel::Light.control(), "NaN survives clamp");
+
+        let mut excessive = DenoiseControl {
+            max_suppression_db: 500.0,
+            vad_threshold: 3.0,
+            voice_preservation: -1.0,
+            wet_dry: 2.0,
+        };
+        excessive.sanitise(DenoiseLevel::Light.control());
+        assert_eq!(
+            excessive,
+            DenoiseControl {
+                max_suppression_db: *limits::DENOISE_MAX_SUPPRESSION_DB.end(),
+                vad_threshold: 1.0,
+                voice_preservation: 0.0,
+                wet_dry: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn an_override_of_preset_follows_the_preset_and_anything_else_pins_it() {
+        for level in DenoiseLevel::ALL {
+            assert_eq!(NoiseSuppressionOverride::Preset.resolve(level), level);
+            assert_eq!(
+                NoiseSuppressionOverride::Strong.resolve(level),
+                DenoiseLevel::Strong
+            );
+            assert_eq!(
+                NoiseSuppressionOverride::Off.resolve(level),
+                DenoiseLevel::Off
+            );
+        }
+        assert_eq!(NoiseSuppressionOverride::Preset.level(), None);
+        assert_eq!(
+            NoiseSuppressionOverride::Light.level(),
+            Some(DenoiseLevel::Light)
+        );
+        for mode in DenoiseChannelMode::ALL {
+            assert_eq!(DenoiseChannelsOverride::Preset.resolve(mode), mode);
+            assert_eq!(
+                DenoiseChannelsOverride::Mono.resolve(mode),
+                DenoiseChannelMode::Mono
+            );
+        }
+        assert_eq!(DenoiseChannelsOverride::Preset.mode(), None);
+        assert_eq!(
+            DenoiseChannelsOverride::Linked.mode(),
+            Some(DenoiseChannelMode::Linked)
+        );
+        // The override's keys are the mode's keys plus `preset`, so a CLI that accepts one accepts
+        // the other.
+        for mode in DenoiseChannelMode::ALL {
+            assert_eq!(
+                DenoiseChannelsOverride::from_key(mode.key()).and_then(|c| c.mode()),
+                Some(mode)
+            );
+        }
+        for level in DenoiseLevel::ALL {
+            assert_eq!(
+                NoiseSuppressionOverride::from_key(level.key()).and_then(|c| c.level()),
+                Some(level)
+            );
+        }
+    }
+
+    #[test]
+    fn each_direction_knows_the_other() {
+        assert_eq!(DeviceDirection::Output.other(), DeviceDirection::Input);
+        assert_eq!(DeviceDirection::Input.other(), DeviceDirection::Output);
+        assert_eq!(
+            DeviceDirection::ALL,
+            [DeviceDirection::Output, DeviceDirection::Input],
+            "outputs first, the order every device list keeps"
+        );
     }
 }

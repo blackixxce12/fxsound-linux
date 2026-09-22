@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/fxsound-core",
     "crates/fxsound-dsp",
+    "crates/fxsound-rnnoise",
     "crates/fxsound-preset",
     "crates/fxsound-audio",
     "crates/fxsound-ui",
@@ -20,6 +21,14 @@ authors = ["FxSound Linux port contributors"]
 [workspace.dependencies]
 fxsound-core = { path = "crates/fxsound-core" }
 fxsound-dsp = { path = "crates/fxsound-dsp" }
+# RNNoise, as a pure-Rust port: `nnnoiseless` 0.5.2, vendored into the tree rather than taken from
+# the registry. Three things the denoiser needs are not in the published crate's API — the
+# twenty-two band gains (a linked-stereo mask is built from them), an in-place `reset()` (the
+# registry crate can only be rebuilt, which is an allocation on the audio thread), and a
+# synthesis path without the network (the per-channel half of linked stereo). BSD-3-Clause, which
+# an AGPL-3.0 work may incorporate; its `COPYING` travels with it, and the model weights are
+# embedded in the crate rather than loaded from a file.
+fxsound-rnnoise = { path = "crates/fxsound-rnnoise" }
 fxsound-preset = { path = "crates/fxsound-preset" }
 fxsound-audio = { path = "crates/fxsound-audio" }
 fxsound-ui = { path = "crates/fxsound-ui" }
@@ -63,10 +72,6 @@ thiserror = "2.0.20"
 log = "0.4.34"
 env_logger = "0.11.11"
 clap = { version = "4.6.7", features = ["derive"] }
-# RNNoise, as a pure-Rust port. `default-features = false` is not optional: the default features
-# pull in clap 3 alongside this workspace's clap 4. BSD-3-Clause, which an AGPL-3.0 work may
-# incorporate, and the model weights are embedded in the crate rather than loaded from a file.
-nnnoiseless = { version = "0.5.2", default-features = false }
 tempfile = "3.27.0"
 
 [profile.release]

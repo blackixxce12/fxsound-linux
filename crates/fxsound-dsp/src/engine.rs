@@ -164,6 +164,8 @@ impl Engine {
             }
             DspEvent::ResetSpectrum => self.spectrum.reset(),
             DspEvent::ResetProcessedTime => self.processed_samples = 0,
+            // The music chain keeps no capture statistics; the event is the microphone's.
+            DspEvent::ResetCaptureStats => {}
         }
     }
 
@@ -301,6 +303,18 @@ impl Engine {
             deesser_running: false,
             denoiser_running: false,
             voice_probability: 0.0,
+            // Likewise the microphone's telemetry and the calibration accumulators.
+            input_peak: 0.0,
+            input_rms_db: 0.0,
+            noise_floor_db: 0.0,
+            denoise_reduction_db: 0.0,
+            deesser_hz: 0.0,
+            dereverb_reduction_db: 0.0,
+            latency_frames: 0,
+            capture_frames: 0,
+            capture_sum_squares: 0.0,
+            capture_peak: 0.0,
+            capture_clipped: 0,
         }
     }
 

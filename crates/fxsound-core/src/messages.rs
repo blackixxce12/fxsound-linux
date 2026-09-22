@@ -15,8 +15,9 @@
 //! thread and uses [`UiToAudio`] / [`AudioToUi`], which may allocate freely.
 
 use crate::{
-    AudioDevice, AudioStatus, Detection, DeviceDirection, Effect, EqBand, NUM_SPECTRUM_BARS,
-    SpectrumFrame, eq,
+    AudioDevice, AudioStatus, DeEsserMode, DenoiseChannelMode, DenoiseControl, DenoiseLevel,
+    DereverbLevel, Detection, DeviceDirection, Effect, EqBand, NUM_SPECTRUM_BARS, SpectrumFrame,
+    eq,
 };
 
 /// A complete, real-time-safe snapshot of everything the DSP engine needs.
@@ -193,7 +194,21 @@ pub struct InputDspParams {
     /// level. Whether it then runs also depends on the capture rate — RNNoise exists at 48 kHz
     /// and nowhere else — so a preset asking for it on a device that cannot have it gets a
     /// working chain and an interface that says which stages are running.
+    ///
+    /// Still the master switch. The three fields below shape what the network does once it is
+    /// on, and a 0.3.0 snapshot — which has none of them — reads as the level and mode that
+    /// version always used.
     pub rnnoise: bool,
+    /// How hard the denoiser may work. `Off` here and `rnnoise: true` is a stage that is on and
+    /// asked to do nothing, which the stage treats as off.
+    pub denoise_level: DenoiseLevel,
+    /// One network per channel, or one network on a downmix.
+    pub denoise_channels: DenoiseChannelMode,
+    /// The level's table row, unless a preset carries a row of its own. Whoever builds the
+    /// snapshot keeps this in step with `denoise_level`; the audio thread reads only this.
+    pub denoise_control: DenoiseControl,
+    /// Late-reverberation suppression, after the denoiser and before the high-pass.
+    pub dereverb: DereverbLevel,
 
     pub gate_on: bool,
     pub gate_threshold_db: f32,
@@ -207,6 +222,10 @@ pub struct InputDspParams {
     pub gate_release_ms: f32,
     pub gate_hold_ms: f32,
     pub gate_detection: Detection,
+    /// Let the denoiser's voice probability hold the gate open: a probability above one half arms
+    /// the hold timer as an above-threshold level would. A gate that closes on a quiet consonant
+    /// the network was sure about is a gate that swallows the ends of words.
+    pub vad_gate: bool,
 
     /// Whether the ten-band equalizer contributes. Its bands are the same ladder the output side
     /// uses — the same `GraphicEq`, with its own state.
@@ -221,6 +240,8 @@ pub struct InputDspParams {
     /// Measured **in the split band**, not in the whole signal, which is why it can sit at −22 dB
     /// without touching a voice that peaks at −6.
     pub deesser_threshold_db: f32,
+    /// Whether `deesser_hz` is a corner or a ceiling on one chosen from the source's bandwidth.
+    pub deesser_mode: DeEsserMode,
 
     pub compressor_on: bool,
     pub compressor_threshold_db: f32,
@@ -358,6 +379,11 @@ impl InputDspParams {
 
         self.makeup_db = finite(self.makeup_db, limits::MAKEUP_DB, default.makeup_db);
         self.ceiling_db = finite(self.ceiling_db, limits::CEILING_DB, default.ceiling_db);
+
+        // The control surface falls back to the *level's* row rather than to the default
+        // snapshot's: a corrupt override on a Strong preset should leave a Strong preset, not a
+        // Medium one. The enums cannot be corrupt — a `Copy` enum has no invalid value.
+        self.denoise_control.sanitise(self.denoise_level.control());
     }
 }
 
@@ -373,6 +399,12 @@ impl Default for InputDspParams {
             highpass_hz: 80.0,
             highpass_order: 2,
             rnnoise: false,
+            // What `rnnoise = true` meant in 0.3.0: the Medium row, one network per channel, no
+            // de-reverb. A snapshot from that version says exactly what it said.
+            denoise_level: DenoiseLevel::Medium,
+            denoise_channels: DenoiseChannelMode::Independent,
+            denoise_control: DenoiseLevel::Medium.control(),
+            dereverb: DereverbLevel::Off,
             gate_on: true,
             gate_threshold_db: -45.0,
             gate_ratio: 2.0,
@@ -381,6 +413,7 @@ impl Default for InputDspParams {
             gate_release_ms: 150.0,
             gate_hold_ms: 200.0,
             gate_detection: Detection::Rms,
+            vad_gate: false,
             eq_on: true,
             num_bands: eq::DEFAULT_BANDS as u8,
             band_center_hz,
@@ -389,6 +422,7 @@ impl Default for InputDspParams {
             deesser_on: true,
             deesser_hz: 5_500.0,
             deesser_threshold_db: -22.0,
+            deesser_mode: DeEsserMode::Classic,
             compressor_on: true,
             compressor_threshold_db: -18.0,
             compressor_ratio: 3.0,
@@ -414,6 +448,13 @@ pub enum DspEvent {
     ResetSpectrum,
     /// Zero the processed-audio-time accumulator.
     ResetProcessedTime,
+    /// Zero the calibration accumulators in [`Meters`] (`capture_frames` and the three beside
+    /// it). The wizard sends one on entering each phase and reads the totals on leaving it; the
+    /// output engine, which has no capture statistics, ignores it.
+    ///
+    /// Events are routed to one lane by the engine handle rather than tagged here, so the enum
+    /// stays direction-free and an engine never has to check whether an event was meant for it.
+    ResetCaptureStats,
 }
 
 /// What the audio thread publishes for the GUI, once per process callback.
@@ -433,9 +474,10 @@ pub struct Meters {
     pub active: bool,
     /// Gain reduction of the three input stages, in dB, as positive numbers.
     ///
-    /// Zero in the output direction, which has none of these stages. They live on the shared
-    /// snapshot rather than on a second one because the transport carries exactly one meter
-    /// structure and splitting it would double the plumbing to save twelve bytes.
+    /// Zero on the output lane, which has none of these stages. One structure serves both lanes
+    /// — each lane has a transport of its own, and the engine that fills it — because the
+    /// visualizer, the peaks and the sample rate are the same on both, and a second type for the
+    /// microphone's extra fields would make every consumer switch on direction to read a peak.
     pub gate_reduction_db: f32,
     pub compressor_reduction_db: f32,
     pub deesser_reduction_db: f32,
@@ -450,6 +492,43 @@ pub struct Meters {
     /// The denoiser's opinion of whether the last frame was voice, `0.0..=1.0`. Zero when it is
     /// not running.
     pub voice_probability: f32,
+
+    // ---- microphone telemetry ------------------------------------------------------------
+    //
+    // Filled by the input engine and zero on the output engine. The peak holds and decays and
+    // the clip counter is monotonic, because the transport coalesces: a window reading at 60 Hz
+    // would otherwise miss a ten-millisecond buffer entirely.
+    /// Pre-chain peak, held and decaying, linear `0.0..=1.0`.
+    pub input_peak: f32,
+    /// Pre-chain short-window RMS, dBFS.
+    pub input_rms_db: f32,
+    /// Running minimum-statistics floor of the pre-chain signal, dBFS: falls at once, rises at
+    /// half a decibel a second. Published always; the readout strip draws it.
+    pub noise_floor_db: f32,
+    /// `RMS(in) − RMS(out)` across the denoiser, positive dB, smoothed.
+    pub denoise_reduction_db: f32,
+    /// The corner the de-esser actually built — the adaptive mode may have lowered it. Zero
+    /// when the stage is not running.
+    pub deesser_hz: f32,
+    /// Gain reduction of the de-reverb stage, positive dB.
+    pub dereverb_reduction_db: f32,
+    /// What the chain reports for its own delay, in frames at `sample_rate`. RNNoise is 960
+    /// (its bridge and the library's own synthesis delay), not the 480 a frame count suggests.
+    pub latency_frames: u32,
+
+    // ---- calibration accumulators ------------------------------------------------------------
+    //
+    // Cumulative since the last `DspEvent::ResetCaptureStats`, and read as deltas by the
+    // calibration wizard, which owns the state machine; the audio thread only counts.
+    /// Frames accumulated since the reset.
+    pub capture_frames: u64,
+    /// Sum of squared samples since the reset. `f64` so that five seconds at 48 kHz do not lose
+    /// precision to the running total.
+    pub capture_sum_squares: f64,
+    /// Largest `|x|` since the reset.
+    pub capture_peak: f32,
+    /// Samples with `|x| >= 0.999` since the reset.
+    pub capture_clipped: u64,
 }
 
 impl Default for Meters {
@@ -467,6 +546,17 @@ impl Default for Meters {
             deesser_running: false,
             denoiser_running: false,
             voice_probability: 0.0,
+            input_peak: 0.0,
+            input_rms_db: 0.0,
+            noise_floor_db: 0.0,
+            denoise_reduction_db: 0.0,
+            deesser_hz: 0.0,
+            dereverb_reduction_db: 0.0,
+            latency_frames: 0,
+            capture_frames: 0,
+            capture_sum_squares: 0.0,
+            capture_peak: 0.0,
+            capture_clipped: 0,
         }
     }
 }
@@ -474,21 +564,33 @@ impl Default for Meters {
 /// Control-thread requests. These may allocate and may block; they never reach the RT thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiToAudio {
-    /// Attach FxSound to this device (`node.name`): in front of an output as a virtual sink, or
-    /// behind an input as a virtual source. Changing direction tears the nodes down and rebuilds
-    /// them the other way round; FxSound runs in one direction at a time.
+    /// Attach the lane of `direction` to this device (`node.name`) and enable it: in front of an
+    /// output as a virtual sink, or behind an input as a virtual source. Never touches the other
+    /// lane — picking a microphone while the speakers are being processed leaves the speakers
+    /// exactly as they were.
     SelectDevice {
         node_name: String,
         direction: DeviceDirection,
     },
+    /// Hand the lane's session default back, destroy its nodes and disable it. The other lane is
+    /// untouched. Answered with [`AudioToUi::Attached`] carrying `None`.
+    DetachLane(DeviceDirection),
     /// Re-scan the PipeWire graph for devices.
     RescanDevices,
-    /// Make FxSound's virtual device the session default for its direction, or hand it back.
-    SetAsDefault(bool),
+    /// Make FxSound's virtual device the session default for this lane's direction, or hand it
+    /// back. Each lane holds its own claim.
+    SetAsDefault {
+        direction: DeviceDirection,
+        want: bool,
+    },
     /// Tear down and rebuild the PipeWire nodes, e.g. after the server restarted.
     Restart,
     /// Stop the audio engine and let the process exit.
     Shutdown,
+    /// Echo cancellation on or off for the input lane: PipeWire's `module-echo-cancel`, loaded
+    /// into FxSound's own context, with the capture stream retargeted to its cancelled source.
+    /// Answered with [`AudioToUi::EchoCancel`], which is also how a missing backend is reported.
+    SetEchoCancel(bool),
     /// What the session default was before FxSound last took it, one name per direction.
     ///
     /// Sent once at start-up, from the settings file. The audio thread keeps this memory on its
@@ -496,6 +598,15 @@ pub enum UiToAudio {
     /// it leaves behind is a session default naming FxSound's node, which no longer exists. No
     /// signal handler covers that case, because none of those three run one.
     SeedRememberedDefaults { output: String, input: String },
+    /// The stage ordering the input lane runs, by the name a voice preset gives it: `"voice"`,
+    /// `"podcast"`, `"broadcast"` or `"streaming"`.
+    ///
+    /// A name and not a chain: the specs live in the DSP crate, which this one does not depend
+    /// on, and the chain is built on the audio thread's main loop in any case — it allocates,
+    /// which is why it is a control message and not a field of [`InputDspParams`]. A name this
+    /// build does not know falls back to `"voice"` on the audio side, and says so, rather than
+    /// refusing a preset written for a later version.
+    SetInputChain(String),
 }
 
 /// Control-thread notifications for the GUI.
@@ -503,12 +614,27 @@ pub enum UiToAudio {
 pub enum AudioToUi {
     /// The set of selectable devices changed. Carries both directions; each entry says which.
     Devices(Vec<AudioDevice>),
-    /// The engine's connection state or negotiated format changed.
-    Status(AudioStatus),
+    /// One lane's connection state or negotiated format changed. `status.processing` and the
+    /// counters describe that lane only.
+    Status {
+        direction: DeviceDirection,
+        status: AudioStatus,
+    },
+    /// What the lane is actually attached to, or `None` when it has no nodes. Sent whenever it
+    /// changes. This is what the window shows as the selected device: the engine says what it
+    /// did, and nothing on the GUI side has to infer it from a device list.
+    Attached {
+        direction: DeviceDirection,
+        node_name: Option<String>,
+    },
     /// The PipeWire connection dropped; the control thread is retrying.
     Disconnected { reason: String },
-    /// Something the user needs to be told about, in already-translated text.
-    Error { message: String },
+    /// Something the user needs to be told about, in already-translated text. `direction` names
+    /// the lane it concerns, or `None` for the connection as a whole.
+    Error {
+        direction: Option<DeviceDirection>,
+        message: String,
+    },
     /// FxSound has taken the session default for this direction, and this is what it was before.
     ///
     /// Written to the settings file so the next start can repair a default that a kill left
@@ -517,6 +643,10 @@ pub enum AudioToUi {
         direction: DeviceDirection,
         node_name: String,
     },
+    /// Whether echo cancellation is running — the module loaded and its source present — and,
+    /// when it is not, why: the load error verbatim, so a missing `libspa-aec-webrtc` reads as
+    /// `Echo  unavailable` in the strip rather than as a stage that silently did nothing.
+    EchoCancel { running: bool, detail: String },
 }
 
 #[cfg(test)]
@@ -550,6 +680,13 @@ mod tests {
             ceiling_db: f32::NAN,
             band_center_hz: [f32::NAN; eq::MAX_BANDS],
             band_boost_db: [f32::INFINITY; eq::MAX_BANDS],
+            denoise_level: DenoiseLevel::Strong,
+            denoise_control: DenoiseControl {
+                max_suppression_db: f32::NAN,
+                vad_threshold: f32::INFINITY,
+                voice_preservation: f32::NEG_INFINITY,
+                wet_dry: f32::NAN,
+            },
             ..InputDspParams::default()
         };
         params.sanitise();
@@ -562,6 +699,177 @@ mod tests {
         let (centers, boosts) = params.bands();
         assert!(centers.iter().all(|hz| hz.is_finite() && *hz > 0.0));
         assert!(boosts.iter().all(|db| db.is_finite()));
+        // The control surface falls back to the row of the level it was overriding — Strong —
+        // and not to the default snapshot's Medium.
+        assert_eq!(params.denoise_control, DenoiseLevel::Strong.control());
+    }
+
+    #[test]
+    fn the_denoise_control_surface_is_clamped_rather_than_replaced() {
+        let mut params = InputDspParams {
+            denoise_control: DenoiseControl {
+                max_suppression_db: 500.0,
+                vad_threshold: 3.0,
+                voice_preservation: -1.0,
+                wet_dry: 2.0,
+            },
+            ..InputDspParams::default()
+        };
+        params.sanitise();
+        assert_eq!(
+            params.denoise_control,
+            DenoiseControl {
+                max_suppression_db: *crate::limits::DENOISE_MAX_SUPPRESSION_DB.end(),
+                vad_threshold: 1.0,
+                voice_preservation: 0.0,
+                wet_dry: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_valid_control_surface_survives_sanitising_untouched() {
+        // A preset's own row, inside every range, is a value someone meant and must come out
+        // exactly as it went in — including one the level table would never produce.
+        let row = DenoiseControl {
+            max_suppression_db: 30.0,
+            vad_threshold: 0.2,
+            voice_preservation: 0.1,
+            wet_dry: 0.75,
+        };
+        let mut params = InputDspParams {
+            denoise_control: row,
+            ..InputDspParams::default()
+        };
+        params.sanitise();
+        assert_eq!(params.denoise_control, row);
+    }
+
+    #[test]
+    fn the_default_input_snapshot_means_what_a_0_3_0_snapshot_meant() {
+        // A snapshot from a version that had none of these fields must read as what that version
+        // always did: no denoiser unless asked, and when asked, the network as it then was — the
+        // Medium row — one network per channel, the corner the preset named, no de-reverb, and a
+        // gate that listens to level alone.
+        let default = InputDspParams::default();
+        assert!(!default.rnnoise);
+        assert_eq!(default.denoise_level, DenoiseLevel::Medium);
+        assert_eq!(default.denoise_channels, DenoiseChannelMode::Independent);
+        assert_eq!(default.denoise_control, DenoiseLevel::Medium.control());
+        assert_eq!(default.deesser_mode, DeEsserMode::Classic);
+        assert_eq!(default.dereverb, DereverbLevel::Off);
+        assert!(!default.vad_gate);
+        // And the default is already sane, so sanitising it changes nothing.
+        let mut checked = default;
+        checked.sanitise();
+        assert_eq!(checked, default);
+    }
+
+    #[test]
+    fn the_default_meters_are_all_zero_and_the_structure_stays_copy() {
+        // The transport is a triple buffer of `Copy` values; a field that owned heap memory
+        // would make the audio thread free an allocation. This is the same guard the audio crate
+        // keeps, repeated at the source so the type cannot drift away from it unnoticed.
+        const fn assert_copy<T: Copy>() {}
+        assert_copy::<Meters>();
+        assert_copy::<InputDspParams>();
+        assert_copy::<DspParams>();
+        assert_copy::<DspEvent>();
+
+        let meters = Meters::default();
+        assert_eq!(meters.input_peak, 0.0);
+        assert_eq!(meters.input_rms_db, 0.0);
+        assert_eq!(meters.noise_floor_db, 0.0);
+        assert_eq!(meters.denoise_reduction_db, 0.0);
+        assert_eq!(meters.deesser_hz, 0.0);
+        assert_eq!(meters.dereverb_reduction_db, 0.0);
+        assert_eq!(meters.latency_frames, 0);
+        assert_eq!(meters.capture_frames, 0);
+        assert_eq!(meters.capture_sum_squares, 0.0);
+        assert_eq!(meters.capture_peak, 0.0);
+        assert_eq!(meters.capture_clipped, 0);
+        assert!(!meters.active);
+        assert_eq!(meters.sample_rate, 48_000, "the rate the engine starts at");
+    }
+
+    #[test]
+    fn the_capture_accumulator_does_not_lose_precision_over_a_calibration_phase() {
+        // Five seconds at 48 kHz of a −20 dBFS tone summed in f32 drifts by parts in a thousand;
+        // the field is f64 so that it does not. Pin the type by using it as one.
+        let mut meters = Meters::default();
+        let amplitude = 0.1_f32;
+        let frames = 5 * 48_000_u64;
+        for _ in 0..frames {
+            meters.capture_frames += 1;
+            meters.capture_sum_squares += f64::from(amplitude * amplitude);
+        }
+        let rms = (meters.capture_sum_squares / meters.capture_frames as f64).sqrt();
+        assert!((rms - f64::from(amplitude)).abs() < 1e-6, "{rms}");
+    }
+
+    #[test]
+    fn the_control_messages_carry_their_lane() {
+        // Both lanes run at once, so every message that concerns one of them says which; a
+        // status without a direction would be a status the window cannot place.
+        let status = AudioToUi::Status {
+            direction: DeviceDirection::Input,
+            status: AudioStatus::default(),
+        };
+        assert!(matches!(
+            status,
+            AudioToUi::Status {
+                direction: DeviceDirection::Input,
+                ..
+            }
+        ));
+        let detached = AudioToUi::Attached {
+            direction: DeviceDirection::Output,
+            node_name: None,
+        };
+        assert_eq!(detached.clone(), detached, "messages compare by value");
+        let claim = UiToAudio::SetAsDefault {
+            direction: DeviceDirection::Input,
+            want: false,
+        };
+        assert_ne!(
+            claim,
+            UiToAudio::SetAsDefault {
+                direction: DeviceDirection::Output,
+                want: false,
+            }
+        );
+        // A connection-wide error has no lane.
+        let error = AudioToUi::Error {
+            direction: None,
+            message: "socket closed".to_owned(),
+        };
+        assert!(matches!(
+            error,
+            AudioToUi::Error {
+                direction: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            UiToAudio::DetachLane(DeviceDirection::Input),
+            UiToAudio::DetachLane(DeviceDirection::Input)
+        );
+        assert_ne!(
+            UiToAudio::SetEchoCancel(true),
+            UiToAudio::SetEchoCancel(false)
+        );
+        assert_eq!(
+            UiToAudio::SetInputChain("podcast".to_owned()),
+            UiToAudio::SetInputChain("podcast".to_owned())
+        );
+        let unavailable = AudioToUi::EchoCancel {
+            running: false,
+            detail: "libspa-aec-webrtc not found".to_owned(),
+        };
+        assert!(matches!(
+            unavailable,
+            AudioToUi::EchoCancel { running: false, .. }
+        ));
     }
 
     #[test]

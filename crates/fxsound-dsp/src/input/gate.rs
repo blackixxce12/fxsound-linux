@@ -16,11 +16,24 @@
 //! threshold *on* — the same number against peak and against RMS is three to seven decibels of
 //! different behaviour.
 //!
-//! Real-time safe: fixed state, no allocation, no branch on anything but its own numbers.
+//! **The denoiser's voice probability can hold it open** (`vad_gate`). A gate that closes on a
+//! quiet consonant the network was sure about is a gate that swallows the ends of words; with the
+//! side-chain on, a probability above one half arms the hold timer exactly as an above-threshold
+//! level would. It arms the hold and nothing else — the curve still measures the level — so the
+//! threshold keeps meaning what it meant.
+//!
+//! Real-time safe: fixed state, no allocation, no branch on anything but its own numbers. Above
+//! the threshold the curve is unity by construction, so the per-sample `powf` is skipped there;
+//! a test holds the fast path to the slow one bit for bit.
 
 use crate::biquad::{MAX_CHANNELS, Real};
 use crate::input::detector::{Detection, Follower, coefficient, db_to_linear, linear_to_db};
+use crate::input::processor::{AudioProcessor, ProcessContext, StageMeter};
 use crate::input::sane_rate;
+use fxsound_core::messages::InputDspParams;
+
+/// The voice probability above which the side-chain arms the hold.
+pub const VAD_OPEN: Real = 0.5;
 
 /// The deepest attenuation a range may ask for. Past this it is a gate with extra steps, and the
 /// design is on record that a gate is not what this stage is.
@@ -54,6 +67,9 @@ pub struct Gate {
     /// Per-channel smoothed gain, and the frames left on the hold timer.
     gain: [Real; MAX_CHANNELS],
     hold_left: [u32; MAX_CHANNELS],
+
+    enabled: bool,
+    vad_gate: bool,
 }
 
 impl std::fmt::Debug for Gate {
@@ -67,6 +83,8 @@ impl std::fmt::Debug for Gate {
             .field("attack_ms", &self.attack_ms)
             .field("hold_ms", &self.hold_ms)
             .field("release_ms", &self.release_ms)
+            .field("enabled", &self.enabled)
+            .field("vad_gate", &self.vad_gate)
             .finish()
     }
 }
@@ -96,9 +114,35 @@ impl Gate {
             hold_frames: 0,
             gain: [1.0; MAX_CHANNELS],
             hold_left: [0; MAX_CHANNELS],
+            enabled: true,
+            vad_gate: false,
         };
         gate.design();
         gate
+    }
+
+    /// Switch the stage in or out. A transition resets it: coming back half-closed would be
+    /// audible on the first word.
+    pub fn set_enabled(&mut self, on: bool) {
+        if self.enabled != on {
+            self.enabled = on;
+            self.reset();
+        }
+    }
+
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Let the voice probability handed to [`Gate::process_block`] arm the hold.
+    pub fn set_vad_gate(&mut self, on: bool) {
+        self.vad_gate = on;
+    }
+
+    #[must_use]
+    pub const fn vad_gate(&self) -> bool {
+        self.vad_gate
     }
 
     pub fn set_sample_rate(&mut self, sample_rate: Real) {
@@ -200,23 +244,38 @@ impl Gate {
         -linear_to_db(self.gain(channel))
     }
 
-    /// One interleaved frame, in place.
+    /// One interleaved frame, in place, with no voice probability to go on.
     #[inline]
     pub fn process_frame(&mut self, frame: &mut [Real]) {
+        self.process_frame_with_vad(frame, 0.0);
+    }
+
+    /// One interleaved frame, in place. `vad` is the denoiser's voice probability for this
+    /// frame, read only when the side-chain is on.
+    #[inline]
+    pub fn process_frame_with_vad(&mut self, frame: &mut [Real], vad: Real) {
+        let voiced = self.vad_gate && vad > VAD_OPEN;
         // Channels past the supported count are left exactly as they arrived — the same contract
         // the limiter keeps, and the reason a nine-channel device is quiet rather than wrong. The
         // bound is enforced twice over: here, so the detector is not driven for a channel it has no
         // state for, and again by the lookups below, which is what the borrow checker wants anyway.
         for (channel, sample) in frame.iter_mut().enumerate().take(MAX_CHANNELS) {
             let level = self.detector.follow(channel, *sample);
+            let above = level >= self.threshold;
 
             // The expander curve, in the linear domain. In decibels it reads
             //   gain_dB = clamp((level_dB − threshold_dB) · (ratio − 1), range_dB, 0)
             // and `(level/threshold)^(ratio−1)` is the same number with one transcendental instead
-            // of two. Above the threshold the base exceeds one, so the clamp returns unity.
-            let target = (level / self.threshold)
-                .powf(self.exponent)
-                .clamp(self.range, 1.0);
+            // of two. Above the threshold the base is at least one, its power at least one, and
+            // the clamp returns exactly unity — so the power is not computed there at all, which
+            // is most of the time on a live microphone.
+            let target = if above {
+                1.0
+            } else {
+                (level / self.threshold)
+                    .powf(self.exponent)
+                    .clamp(self.range, 1.0)
+            };
 
             let Some(gain) = self.gain.get_mut(channel) else {
                 continue;
@@ -225,9 +284,10 @@ impl Gate {
                 continue;
             };
 
-            if level >= self.threshold {
-                // Above the threshold is the only thing that arms the hold. A signal that is merely
-                // *less* expanded than it was has not said anything worth holding open for.
+            if above || voiced {
+                // Above the threshold is what arms the hold — or the network's word that this is
+                // a voice, when a preset lets it count. A signal that is merely *less* expanded
+                // than it was has not said anything worth holding open for.
                 *hold_left = self.hold_frames;
             }
 
@@ -242,13 +302,62 @@ impl Gate {
         }
     }
 
-    /// A whole interleaved block, in place.
+    /// A whole interleaved block, in place, with no voice probability to go on.
     pub fn process(&mut self, buffer: &mut [Real], channels: usize) {
+        self.process_block(buffer, channels, 0.0);
+    }
+
+    /// A whole interleaved block, in place. `vad` holds for the whole block: the denoiser
+    /// reports one probability per ten-millisecond frame, and the block is the engine's.
+    pub fn process_block(&mut self, buffer: &mut [Real], channels: usize, vad: Real) {
         if channels == 0 || buffer.is_empty() {
             return;
         }
         for frame in buffer.chunks_exact_mut(channels) {
-            self.process_frame(frame);
+            self.process_frame_with_vad(frame, vad);
+        }
+    }
+}
+
+impl AudioProcessor for Gate {
+    fn prepare(&mut self, sample_rate: Real) {
+        self.set_sample_rate(sample_rate);
+    }
+
+    fn apply(&mut self, params: &InputDspParams) {
+        self.set_enabled(params.gate_on);
+        self.set_threshold_db(params.gate_threshold_db);
+        self.set_ratio(params.gate_ratio);
+        self.set_range_db(params.gate_range_db);
+        self.set_times(params.gate_attack_ms, params.gate_release_ms);
+        self.set_hold_ms(params.gate_hold_ms);
+        self.set_detection(params.gate_detection);
+        self.set_vad_gate(params.vad_gate);
+    }
+
+    fn reset(&mut self) {
+        Gate::reset(self);
+    }
+
+    fn is_active(&self) -> bool {
+        self.enabled
+    }
+
+    fn latency_frames(&self) -> usize {
+        0
+    }
+
+    fn process(&mut self, buffer: &mut [Real], ctx: &ProcessContext) {
+        if self.enabled {
+            self.process_block(buffer, ctx.channels, ctx.voice_probability);
+        }
+    }
+
+    fn meter(&self) -> StageMeter {
+        StageMeter {
+            reduction_db: self.reduction_db(0),
+            running: self.enabled,
+            aux: 0.0,
         }
     }
 }
@@ -466,6 +575,101 @@ mod tests {
             gap.abs() > 3.0,
             "peak and rms landed within {gap} dB of each other, so the field would be a lie"
         );
+    }
+
+    #[test]
+    fn a_confident_voice_holds_the_gate_open_through_a_pause() {
+        // The side-chain: a word, then a −60 dB pause the gate would close on, during which the
+        // network keeps saying "voice". With `vad_gate` on the hold is re-armed every frame and
+        // the gate never starts to release; with it off, the same pause closes it.
+        let closed_after = |vad_gate: bool| {
+            let mut gate = Gate::new(FS);
+            gate.set_threshold_db(-45.0);
+            gate.set_range_db(-14.0);
+            gate.set_times(1.0, 20.0);
+            gate.set_hold_ms(50.0);
+            gate.set_vad_gate(vad_gate);
+            settled_gain(&mut gate, db_to_linear(-20.0), 0.2);
+            let pause = db_to_linear(-60.0);
+            for n in 0..(FS * 0.5) as usize {
+                let mut frame = [if n % 2 == 0 { pause } else { -pause }];
+                gate.process_frame_with_vad(&mut frame, 0.95);
+            }
+            gate.gain(0)
+        };
+        let held = closed_after(true);
+        assert!(
+            held > 0.99,
+            "the network's word did not hold the gate: {held}"
+        );
+        let closed = closed_after(false);
+        assert!(
+            closed < db_to_linear(-13.0),
+            "without the side-chain the pause should close it: {closed}"
+        );
+    }
+
+    #[test]
+    fn a_probability_that_is_not_a_voice_does_not_arm_the_hold() {
+        let mut gate = Gate::new(FS);
+        gate.set_threshold_db(-45.0);
+        gate.set_range_db(-14.0);
+        gate.set_times(1.0, 20.0);
+        gate.set_hold_ms(50.0);
+        gate.set_vad_gate(true);
+        settled_gain(&mut gate, db_to_linear(-20.0), 0.2);
+        for _ in 0..(FS * 0.5) as usize {
+            let mut frame = [0.0];
+            gate.process_frame_with_vad(&mut frame, 0.3);
+        }
+        assert!(
+            gate.gain(0) < db_to_linear(-13.0),
+            "a probability under one half held the gate: {}",
+            gate.gain(0)
+        );
+    }
+
+    #[test]
+    fn the_fast_path_above_the_threshold_is_the_slow_path_bit_for_bit() {
+        // Above the threshold the curve is unity by construction; the fast path skips the
+        // `powf` and has to land on exactly the number the full expression would.
+        let gate = instant(-30.0, 3.0, -40.0);
+        for level_db in [-29.9_f32, -20.0, -10.0, -3.0, 0.0] {
+            let level = db_to_linear(level_db);
+            let slow: Real = (level / gate.threshold)
+                .powf(gate.exponent)
+                .clamp(gate.range, 1.0);
+            assert_eq!(
+                slow.to_bits(),
+                1.0_f32.to_bits(),
+                "at {level_db} dB: {slow}"
+            );
+        }
+        // And exactly at the threshold, where the branch flips.
+        let slow: Real = (gate.threshold / gate.threshold)
+            .powf(gate.exponent)
+            .clamp(gate.range, 1.0);
+        assert_eq!(slow.to_bits(), 1.0_f32.to_bits());
+    }
+
+    #[test]
+    fn switched_off_it_passes_the_signal_through_and_says_so() {
+        let mut gate = instant(-20.0, 4.0, -40.0);
+        gate.set_enabled(false);
+        assert!(!gate.is_enabled());
+        assert!(!AudioProcessor::is_active(&gate));
+        let ctx = ProcessContext {
+            sample_rate: FS,
+            channels: 1,
+            voice_probability: 0.0,
+        };
+        let input = vec![1.0e-4; 4_800];
+        let mut block = input.clone();
+        AudioProcessor::process(&mut gate, &mut block, &ctx);
+        assert_eq!(block, input);
+        gate.set_enabled(true);
+        AudioProcessor::process(&mut gate, &mut block, &ctx);
+        assert!(block[4_000] < 1.0e-4, "switched back on it expands again");
     }
 
     #[test]

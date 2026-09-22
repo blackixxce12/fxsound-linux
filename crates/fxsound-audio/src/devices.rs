@@ -39,6 +39,13 @@ pub const MAX_CHANNELS: u32 = 8;
 /// `SND_DEVICES_MAX_SAMP_FREQ` (`sndDevices.h:189`).
 pub const MAX_SAMPLE_RATE: u32 = 192_000;
 
+/// The most a Bluetooth headset (HFP/HSP) profile carries: 16 kHz with mSBC, and CVSD is
+/// narrower still at 8 kHz. Neither figure is ever published as `audio.rate` — the node
+/// negotiates whatever the graph runs at and resamples inside bluez — so the profile name is the
+/// only place the link's real bandwidth shows. [`DeviceInfo::native_rate`] reports it so that
+/// the adaptive de-esser has something to adapt to (`docs/0.4.0-design.md` §6).
+pub const BLUEZ_HEADSET_RATE: u32 = 16_000;
+
 /// The `media.class` a node must carry to be a playback device we can render into.
 pub const SINK_MEDIA_CLASS: &str = "Audio/Sink";
 
@@ -173,9 +180,10 @@ impl FormFactor {
             || get("api.bluez5.profile").is_some()
             || get("api.bluez5.address").is_some()
         {
-            return match get("api.bluez5.profile") {
-                Some(p) if p.starts_with("headset") || p.starts_with("hfp") => Self::Headset,
-                _ => Self::Headphones,
+            return if is_bluez_headset_profile(get) {
+                Self::Headset
+            } else {
+                Self::Headphones
             };
         }
 
@@ -197,6 +205,15 @@ impl FormFactor {
             _ => Self::Unknown,
         }
     }
+}
+
+/// Whether a node's `api.bluez5.profile` is a headset profile (`headset-head-unit`,
+/// `headset-audio-gateway`), the one Bluetooth profile with a microphone in play.
+///
+/// Shared by the form factor and by [`DeviceInfo::native_rate`], so the icon and the bandwidth
+/// figure can never disagree about which nodes are headsets.
+fn is_bluez_headset_profile<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> bool {
+    get("api.bluez5.profile").is_some_and(|p| p.starts_with("headset") || p.starts_with("hfp"))
 }
 
 /// The most positioned channels FxSound will ever declare, `SND_DEVICES_MAX_NUM_CHANS`.
@@ -456,6 +473,10 @@ pub struct DeviceInfo {
     pub channels: u32,
     /// `audio.rate` when the node publishes one. ALSA nodes usually do not.
     pub rate: Option<u32>,
+    /// Whether the node runs a Bluetooth headset (HFP/HSP) profile. Such a link carries
+    /// [`BLUEZ_HEADSET_RATE`] at most and never says so in `audio.rate`; see
+    /// [`DeviceInfo::native_rate`].
+    pub bluez_headset: bool,
     /// `audio.position`, or the default layout for [`DeviceInfo::channels`].
     pub positions: ChannelMap,
     /// What the GUI should draw next to it.
@@ -500,6 +521,7 @@ impl DeviceInfo {
         let rate = get("audio.rate")
             .and_then(|r| r.parse::<u32>().ok())
             .filter(|&r| r > 0 && r <= MAX_SAMPLE_RATE);
+        let bluez_headset = is_bluez_headset_profile(get);
         let positions = get("audio.position")
             .and_then(ChannelMap::parse)
             .filter(|map| map.len() == channels as usize)
@@ -521,10 +543,30 @@ impl DeviceInfo {
             nick,
             channels,
             rate,
+            bluez_headset,
             positions,
             form_factor,
             direction,
         })
+    }
+
+    /// The rate the device really runs at, as far as its properties say: `audio.rate` when the
+    /// node publishes one, [`BLUEZ_HEADSET_RATE`] for a Bluetooth headset profile, and `None`
+    /// when the stream rate is all there is to know.
+    ///
+    /// The capture stream asks for 48 kHz whatever the microphone runs at, so the negotiated
+    /// format cannot tell the voice chain how much bandwidth is in the signal — a resampled
+    /// 16 kHz headset arrives at 48 kHz with nothing above 8 kHz, and a de-esser built for a
+    /// 5500 Hz split would be working on silence. The audio crate hands this to
+    /// `InputEngine::set_source_rate` when it builds the input lane's nodes, and the adaptive
+    /// de-esser places its corner from it (`docs/0.4.0-design.md` §6).
+    #[must_use]
+    pub fn native_rate(&self) -> Option<f32> {
+        match self.rate {
+            Some(rate) => Some(rate as f32),
+            None if self.bluez_headset => Some(BLUEZ_HEADSET_RATE as f32),
+            None => None,
+        }
     }
 
     /// Project into the type the GUI consumes over [`fxsound_core::messages::AudioToUi`].
@@ -1146,6 +1188,7 @@ mod tests {
             nick: name.to_owned(),
             channels,
             rate: None,
+            bluez_headset: false,
             positions: ChannelMap::default_for(channels),
             form_factor: FormFactor::Unknown,
             direction,
@@ -1536,6 +1579,79 @@ mod tests {
         );
         assert_eq!(probe(&[]), FormFactor::Unknown);
         assert_eq!(FormFactor::Unknown.key(), "unknown");
+    }
+
+    /// The capture stream runs at 48 kHz whatever the microphone does, so the negotiated format
+    /// says nothing about the bandwidth in the signal; the properties are where the truth is.
+    #[test]
+    fn a_bluetooth_headset_profile_has_a_sixteen_kilohertz_native_rate() {
+        let parse = |pairs: &[(&str, &str)]| {
+            let owned: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            DeviceInfo::from_props(1, &|key: &str| {
+                owned
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str())
+            })
+            .expect("a named source or sink is a device")
+        };
+
+        let headset = parse(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", "bluez_input.00_11_22_33_44_55.0"),
+            ("device.bus", "bluetooth"),
+            ("api.bluez5.profile", "headset-head-unit"),
+        ]);
+        assert!(headset.bluez_headset);
+        assert_eq!(headset.form_factor, FormFactor::Headset);
+        assert_eq!(
+            headset.rate, None,
+            "nothing published, as on a real bluez5 node"
+        );
+        assert_eq!(headset.native_rate(), Some(16_000.0));
+
+        // The same device on its A2DP profile is a pair of headphones with no microphone, and
+        // nothing about its rate is known.
+        let a2dp = parse(&[
+            ("media.class", "Audio/Sink"),
+            ("node.name", "bluez_output.00_11_22_33_44_55.1"),
+            ("device.bus", "bluetooth"),
+            ("api.bluez5.profile", "a2dp-sink"),
+        ]);
+        assert!(!a2dp.bluez_headset);
+        assert_eq!(a2dp.form_factor, FormFactor::Headphones);
+        assert_eq!(a2dp.native_rate(), None);
+
+        // A published `audio.rate` is the device's own word and wins over the profile's figure.
+        let published = parse(&[
+            ("media.class", "Audio/Source"),
+            (
+                "node.name",
+                "alsa_input.usb-0d8c_USB_Audio-00.mono-fallback",
+            ),
+            ("audio.rate", "44100"),
+        ]);
+        assert_eq!(published.native_rate(), Some(44_100.0));
+        let spoken_for = parse(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", "bluez_input.00_11_22_33_44_55.0"),
+            ("api.bluez5.profile", "headset-audio-gateway"),
+            ("audio.rate", "8000"),
+        ]);
+        assert!(spoken_for.bluez_headset);
+        assert_eq!(spoken_for.native_rate(), Some(8_000.0));
+
+        // An ALSA microphone that says nothing leaves the stream rate as all there is to know.
+        let mic = parse(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", "alsa_input.pci-0000_05_00.6.analog-stereo"),
+            ("device.icon-name", "audio-card"),
+        ]);
+        assert!(!mic.bluez_headset);
+        assert_eq!(mic.native_rate(), None);
     }
 
     #[test]
