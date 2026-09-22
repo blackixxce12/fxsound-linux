@@ -60,6 +60,14 @@ Summary:        System-wide audio enhancement: EQ, ambience, surround, bass and 
 #
 #   cargo2rpm --path Cargo.toml license-summary
 #
+# It has not been re-run since. The 0.4.0 dependency bump (egui/eframe 0.36.2, signal-hook 0.4,
+# clap 4.6.7 and the transitive refreshes that came with them) was checked against this list by
+# reading the `license` field of every crate in the new Cargo.lock out of the registry cache: no
+# crate changed its expression, and the two that dropped out (getrandom 0.2, tinyvec_macros)
+# only held expressions other crates still hold. That is a reading, not the macro. Before the
+# 0.4.0 tag is cut, re-run the command above and paste its output over the list below; if that
+# step is skipped, the %%build printout is what shows the drift.
+#
 # Running the `cargo tree` underneath it by hand gives three extra lines: cargo2rpm rewrites the
 # deprecated "MIT/Apache-2.0" slash form to "MIT OR Apache-2.0" before sorting, and the crates
 # that still use it (bitflags 1.x, pollster, signal-hook, siphasher and friends) then collapse
@@ -145,6 +153,9 @@ BuildRequires:  clang-devel
 # %%{_userunitdir} and the %%systemd_user_* scriptlet macros.
 BuildRequires:  systemd-rpm-macros
 BuildRequires:  desktop-file-utils
+# For `appstreamcli validate` in %%check, which the guidelines ask of every package that ships
+# metainfo.
+BuildRequires:  appstream
 
 # No ExclusiveArch: rust_arches. rpm itself now depends on Rust (rpm-sequoia), so every Fedora
 # architecture is a Rust architecture and rust-srpm-macros documents the tag as no longer needed.
@@ -191,8 +202,13 @@ Recommends:     libxkbcommon-x11
 Recommends:     libglvnd-glx
 # Claiming the default sink goes through the session manager rather than PipeWire itself.
 Recommends:     wireplumber
-# Preset import and export use native file dialogs, which are an XDG portal call.
+# Preset import and export use native file dialogs, which are an XDG portal call. The portal
+# itself only routes the request: a *backend* has to implement the file chooser, and wlroots' own
+# backend does not, so a bare compositor with only xdg-desktop-portal installed shows no dialog
+# at all. Any of the three desktop backends will do; the GTK one is the smallest and works under
+# every compositor. debian/control and the PKGBUILD name the same three.
 Recommends:     xdg-desktop-portal
+Recommends:     (xdg-desktop-portal-gtk or xdg-desktop-portal-kde or xdg-desktop-portal-gnome)
 
 Provides:       fxsound = %{version}-%{release}
 
@@ -236,8 +252,8 @@ install -Dpm0755 target/rpm/fxsound %{buildroot}%{_bindir}/fxsound
 # Factory and bonus presets. PresetStore::with_default_dirs
 # (crates/fxsound-preset/src/store.rs) looks under %%{_datadir}/fxsound/presets when the binary
 # is installed rather than run out of a build tree. Only the .fac files: the upstream
-# BonusPresets folder also carries a zip of the same presets and an empty MeaningfulPresets
-# directory, and neither belongs in a package.
+# BonusPresets folder also carries a zip of the same presets and a stray text file called
+# MeaningfulPresets, and neither belongs in a package.
 for dir in Factsoft BonusPresets; do
     install -Dpm0644 assets/presets/${dir}/*.fac \
         -t %{buildroot}%{_datadir}/fxsound/presets/${dir}
@@ -264,12 +280,23 @@ install -Dpm0644 assets/images/fxsound_large.png \
 install -Dpm0644 assets/images/fxsound.png \
     %{buildroot}%{_datadir}/icons/hicolor/32x32/apps/fxsound.png
 
-# No AppStream metainfo: upstream does not ship one yet, so none is installed rather than one
-# being invented here.
+# The tray icon's three states. A StatusNotifier host resolves an icon *name* through the theme,
+# so without these under hicolor's status context the tray shows a blank where the icon should be.
+install -Dpm0644 assets/icons/status/com.fxsound.FxSound-*.svg \
+    -t %{buildroot}%{_datadir}/icons/hicolor/scalable/status
+
+# The unit says Documentation=man:fxsound(1); shipping the page is what makes that line true.
+# rpm compresses it, hence the glob in %%files.
+install -Dpm0644 packaging/fxsound.1 %{buildroot}%{_mandir}/man1/fxsound.1
+
+# AppStream metadata, validated in %%check.
+install -Dpm0644 packaging/com.fxsound.FxSound.metainfo.xml \
+    %{buildroot}%{_metainfodir}/com.fxsound.FxSound.metainfo.xml
 
 
 %check
 desktop-file-validate %{buildroot}%{_datadir}/applications/com.fxsound.FxSound.desktop
+appstreamcli validate --no-net %{buildroot}%{_metainfodir}/com.fxsound.FxSound.metainfo.xml
 %if %{with check}
 %cargo_test
 %endif
@@ -310,6 +337,11 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/com.fxsound.FxSound.d
 %{_datadir}/fxsound/presets/Input/
 %{_datadir}/icons/hicolor/256x256/apps/fxsound.png
 %{_datadir}/icons/hicolor/32x32/apps/fxsound.png
+%{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-off.svg
+%{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-on.svg
+%{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-processing.svg
+%{_mandir}/man1/fxsound.1*
+%{_metainfodir}/com.fxsound.FxSound.metainfo.xml
 %{_userunitdir}/fxsound.service
 
 

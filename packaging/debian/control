@@ -12,8 +12,10 @@
 #      build host happens to have rustup installed: the proxy then tries to
 #      *download* 1.98.1, and on a network-isolated builder that fails with a
 #      message about a missing toolchain that looks nothing like the real
-#      problem. debian/rules exports RUSTUP_TOOLCHAIN=stable to defuse it,
-#      which is the same trick packaging/PKGBUILD uses.
+#      problem. debian/rules defaults RUSTUP_TOOLCHAIN to stable unless the
+#      caller set one (`?=`): that defuses it, and a CI container that
+#      installed exactly 1.98.1 can still name that toolchain instead.
+#      packaging/PKGBUILD does the same.
 #
 #   2. Cargo.toml says rust-version = "1.98.1". Cargo enforces that one itself,
 #      with any rustc, and refuses the build outright: "package `fxsound-app
@@ -113,8 +115,16 @@ Recommends:
 # Switching the session's default sink is a session-manager operation; without
 # one, FxSound creates its sink and nothing moves onto it.
  wireplumber,
-# Native file dialogs for preset import and export, through the portal.
+# Native file dialogs for preset import and export, through the portal. The
+# portal itself only routes the request: a *backend* has to implement the file
+# chooser, and wlroots' own backend does not. Any of the three desktop ones
+# will do; the GTK one is the smallest and works under every compositor.
  xdg-desktop-portal,
+ xdg-desktop-portal-gtk | xdg-desktop-portal-kde | xdg-desktop-portal-gnome,
+# The D-Bus interface, the tray and notifications all need a session bus. Every
+# desktop session starts one, but a bare compositor started from a tty does
+# not — dbus-user-session gives it one through systemd --user.
+ dbus-user-session,
 # egui embeds its own base faces, so this is not required to start — it is what
 # lets the window fall back to a system face for a script the embedded fonts do
 # not cover.

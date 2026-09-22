@@ -114,10 +114,16 @@ sudo ./fxsound-linux-0.3.0-x86_64/install.sh        # /usr/local unless you name
 `/usr/local` is searched for presets alongside `/usr`, so nothing needs configuring afterwards.
 
 A prebuilt tarball is attached to each [release](https://github.com/blackixxce12/fxsound-linux/releases);
-check it against its `.sha256` before unpacking. It unpacks to the same layout but is assembled by
-CI rather than by the script above, so it carries no `install.sh` — copy `bin/`, `lib/` and `share/`
-into your prefix by hand. That binary is linked against the glibc of the runner that built it, so on
-an older distribution build from source instead.
+check it against the release's `SHA256SUMS` before unpacking. It is this same script's output, built
+on Debian 12's glibc so the binary runs on anything newer, and it carries the same `install.sh`. The
+archive is a prefix in miniature: `bin/fxsound`, `lib/systemd/user/fxsound.service`,
+`share/applications/`, `share/icons/hicolor/` (the app icon and the tray's three status icons),
+`share/fxsound/presets/`, `share/man/man1/fxsound.1`, `share/metainfo/` and
+`share/doc/fxsound-linux/` (README, CHANGELOG, LICENSE, the Hyprland rules and the autostart
+entry). `install.sh` copies all of that into the prefix and rewrites the unit's `ExecStart` and
+`ExecStop` to `<prefix>/bin/fxsound`; it warns if the prefix is anything other than `/usr` or
+`/usr/local`, because those are the only two the binary searches for presets. On an older
+distribution than Debian 12, build from source instead.
 
 ### What lands where
 
@@ -125,7 +131,7 @@ an older distribution build from source instead.
 |---|---|
 | `/usr/bin/fxsound` | the binary |
 | `/usr/share/fxsound/presets/Factsoft/`, `BonusPresets/` | the 34 factory and bonus `.fac` presets |
-| `/usr/share/fxsound/presets/Input/` | the 10 voice presets, in TOML |
+| `/usr/share/fxsound/presets/Input/` | the 13 voice presets, in TOML |
 | `/usr/share/applications/com.fxsound.FxSound.desktop` | the launcher entry |
 | `/usr/lib/systemd/user/fxsound.service` | `systemctl --user enable --now fxsound` |
 | `/usr/share/icons/hicolor/*/apps/fxsound.png` | the icon |
@@ -142,9 +148,19 @@ rules from [`packaging/hyprland.conf.example`](packaging/hyprland.conf.example) 
 `hyprland.conf`:
 
 ```conf
-windowrulev2 = float,    class:^(com\.fxsound\.FxSound)$
-windowrulev2 = noborder, class:^(com\.fxsound\.FxSound)$
+windowrule {
+    name = fxsound
+    match:class = ^(com\.fxsound\.FxSound)$
+    float = true
+    border_size = 0
+}
 ```
+
+That is the block syntax Hyprland 0.53 and newer read: the release that rewrote window rules also
+dropped `windowrulev2` (a config error now, not a warning) and renamed the window rule's `no_border`
+to `border_size = 0`; the file passes `Hyprland --verify-config` on 0.56.2. The example keeps the
+old `windowrulev2` lines as comments for 0.52 and older, and the `hl.window_rule` / `hl.bind`
+spelling for the Lua config that Hyprland prefers over `hyprland.conf` from 0.55 on.
 
 Closing the window never quits. The ✕ button, the minimise button and the compositor's own close
 request (`killactive`, usually bound to `Super+Q`) all hide the window while the audio keeps

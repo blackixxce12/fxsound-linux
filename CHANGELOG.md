@@ -4,7 +4,7 @@ All notable changes to the FxSound Linux port. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-0.3.0
+## [0.3.0] — 2026-09-21
 
 ### Added
 - **A microphone chain of its own.** A voice runs through denoising, a high-pass, a downward

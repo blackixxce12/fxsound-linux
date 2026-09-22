@@ -2,7 +2,8 @@
 
 `fxsound.spec` builds FxSound for Linux on Fedora 43 and newer. It installs exactly what the
 Arch package in `packaging/PKGBUILD` installs: the binary, the `.fac` factory and bonus presets,
-the TOML input presets, the desktop entry, both icon sizes and the systemd **user** unit.
+the TOML input presets, the desktop entry, both icon sizes, the tray's status icons, the manual
+page, the AppStream metainfo and the systemd **user** unit.
 
 The Rust dependencies are vendored — `eframe`/`egui` 0.36, `pipewire`, `ksni`, `nnnoiseless`,
 `rfd` and `resvg` are not packaged as crates in Fedora, so a system-registry build cannot
@@ -48,6 +49,43 @@ The chroot needs `rust >= 1.98.1` (the workspace sets `edition = "2024"` and tha
 `rust-version`). Fedora 43 is the oldest release that ships it — 41 and 42 are too old, and the
 spec's `BuildRequires: rust >= 1.98.1` will say so instead of failing halfway through a build.
 
+## Build in a container
+
+What `.github/workflows/packages.yml` does on every push, and the quickest way to run the spec on
+a machine that is not Fedora. `fedora:latest` (43 at the time of writing) ships a `rust` new
+enough for `rust-version = "1.98.1"`; the `rustup` branch is for a release that does not, and
+for pinning the exact toolchain the workspace names:
+
+```bash
+podman run --rm -it -v "$PWD":/src:Z -w /src fedora:latest bash
+dnf -y install rpm-build rpmdevtools cargo-rpm-macros systemd-rpm-macros desktop-file-utils \
+    appstream pipewire-devel clang-devel pkgconf-pkg-config git xz curl rust cargo
+rpmdev-setuptree
+VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+git config --global --add safe.directory /src
+git archive --prefix=fxsound-linux-$VER/ -o ~/rpmbuild/SOURCES/fxsound-linux-$VER.tar.gz HEAD
+cargo vendor --locked vendor && tar caf ~/rpmbuild/SOURCES/fxsound-linux-$VER-vendor.tar.xz vendor
+cp packaging/fedora/fxsound.spec ~/rpmbuild/SPECS/
+rpmbuild -ba --without check ~/rpmbuild/SPECS/fxsound.spec
+dnf -y install ~/rpmbuild/RPMS/x86_64/fxsound-linux-$VER-1.fc*.x86_64.rpm
+```
+
+If `rustc --version` is older than 1.98.1, install the toolchain from rustup and tell the macros
+where it is — `cargo-rpm-macros` hard-codes `%__cargo /usr/bin/cargo`, and `%cargo_prep` writes
+`[build] rustc = %{__rustc}` into `.cargo/config.toml`, so without the defines the build silently
+uses the distribution's toolchain; `--nodeps` gets past `BuildRequires: rust >= 1.98.1`, which
+rustup cannot satisfy:
+
+```bash
+curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.1
+export PATH="$HOME/.cargo/bin:$PATH"
+rpmbuild -ba --nodeps --without check \
+    --define "__cargo $HOME/.cargo/bin/cargo" --define "__rustc $HOME/.cargo/bin/rustc" \
+    --define "__rustdoc $HOME/.cargo/bin/rustdoc" ~/rpmbuild/SPECS/fxsound.spec
+```
+
+The unpacked source carries `rust-toolchain.toml`, so rustup's proxies pick 1.98.1 on their own.
+
 ## COPR
 
 Simplest path, because the vendor tarball only exists locally — upload the SRPM:
@@ -64,12 +102,14 @@ then fetch both sources itself.
 
 ## Status
 
-This spec has never been fed to `rpmbuild`, `rpmspec` or `mock` — none of them exist on the
-machine it was written on, so there is not even a `rpmspec --parse` behind it. What *has* been
-checked, by running it rather than by reading:
+This spec was written on a machine with no `rpmbuild`, `rpmspec` or `mock`; the container build
+above, run by CI on every push, is what exercises it (with `--without check`, so `%check` is
+still only exercised by hand). What was checked locally before that, by running it rather than by
+reading:
 
 - every path and glob `%install` touches (15 `Factsoft/*.fac`, 19 `BonusPresets/*.fac`,
-  10 `Input/*.toml`, both icons at the sizes the hicolor paths claim, all six doc files);
+  10 `Input/*.toml`, both icons at the sizes the hicolor paths claim, the three status icons,
+  the manual page, the metainfo, all six doc files);
 - the macro behaviour, against `cargo-rpm-macros` 28.5 itself: `%cargo_prep -v <dir>` keeps
   `Cargo.lock`, writes `[net] offline`, creates `target/rpm` and symlinks `target/release` to
   it, and `%cargo_build` builds `--profile rpm` — hence `target/rpm/fxsound` in `%install`;
@@ -80,5 +120,6 @@ checked, by running it rather than by reading:
   `found a virtual manifest ... instead of a package manifest`;
 - the dlopen dependency list, read out of the built binary's own soname strings.
 
-The first real `mock` run is still the one that matters. The likeliest spot to fail is `%check`:
-the workspace test suite has not been run headless in a chroot here.
+The first real `mock` run is still the one that matters for a submission. The likeliest spot to
+fail is `%check`: the workspace test suite has not been run headless in a chroot here, and CI
+skips it.

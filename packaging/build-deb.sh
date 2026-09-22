@@ -331,8 +331,8 @@ if [ "$STRIP" -eq 1 ]; then
 fi
 
 # `*.fac` and not the whole directory: assets/presets/BonusPresets also carries
-# a zip of the same presets and a MeaningfulPresets/ subdirectory, and neither
-# belongs in a package.
+# a zip of the same presets and a stray text file called MeaningfulPresets, and
+# neither belongs in a package.
 for dir in Factsoft BonusPresets; do
     mkdir -p "$DATA/usr/share/fxsound/presets/$dir"
     for f in "$REPO/assets/presets/$dir"/*.fac; do
@@ -359,6 +359,19 @@ install -D -m 0644 "$REPO/assets/images/fxsound_large.png" \
 install -D -m 0644 "$REPO/assets/images/fxsound.png" \
     "$DATA/usr/share/icons/hicolor/32x32/apps/fxsound.png"
 
+# The tray icon's three states. A StatusNotifier host resolves an icon *name*
+# through the theme, so without these under hicolor's status context the tray
+# shows a blank where the icon should be.
+mkdir -p "$DATA/usr/share/icons/hicolor/scalable/status"
+for f in "$REPO/assets/icons/status"/com.fxsound.FxSound-*.svg; do
+    [ -f "$f" ] || die "no status icons under assets/icons/status/"
+    install -m 0644 "$f" "$DATA/usr/share/icons/hicolor/scalable/status/"
+done
+
+# AppStream metadata, so GNOME Software and Discover list the package.
+install -D -m 0644 "$REPO/packaging/com.fxsound.FxSound.metainfo.xml" \
+    "$DATA/usr/share/metainfo/com.fxsound.FxSound.metainfo.xml"
+
 DOCDIR="$DATA/usr/share/doc/$PACKAGE"
 mkdir -p "$DOCDIR/examples"
 # copyright is the one file in /usr/share/doc that is never compressed, however
@@ -381,11 +394,12 @@ if [ -f "$DEBIAN_DIR/README.Debian" ]; then
     chmod 0644 "$DOCDIR/README.Debian.gz"
 fi
 
-if [ -f "$DEBIAN_DIR/fxsound.1" ]; then
-    mkdir -p "$DATA/usr/share/man/man1"
-    gzip -9nc "$DEBIAN_DIR/fxsound.1" > "$DATA/usr/share/man/man1/fxsound.1.gz"
-    chmod 0644 "$DATA/usr/share/man/man1/fxsound.1.gz"
-fi
+# The page lives beside the other packaging files, not under debian/, because
+# every package ships it now; the unit's Documentation= line depends on it.
+[ -f "$REPO/packaging/fxsound.1" ] || die "packaging/fxsound.1 is missing"
+mkdir -p "$DATA/usr/share/man/man1"
+gzip -9nc "$REPO/packaging/fxsound.1" > "$DATA/usr/share/man/man1/fxsound.1.gz"
+chmod 0644 "$DATA/usr/share/man/man1/fxsound.1.gz"
 
 if [ -f "$DEBIAN_DIR/$PACKAGE.lintian-overrides" ]; then
     install -D -m 0644 "$DEBIAN_DIR/$PACKAGE.lintian-overrides" \

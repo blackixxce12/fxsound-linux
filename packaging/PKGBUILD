@@ -15,7 +15,8 @@ url="https://github.com/blackixxce12/fxsound-linux"
 license=('AGPL-3.0-or-later')
 # Runtime: PipeWire for audio, the Wayland/GL stack for the window, D-Bus for the tray and
 # notifications, fontconfig because egui asks it for fallback faces.
-depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus')
+depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus'
+         'hicolor-icon-theme')   # the icons install into its tree
 # `clang` is not optional: pipewire-sys runs bindgen in its build script and fails with
 # "Unable to find libclang" without it. The build only appears to work without it on a machine
 # that happens to have clang installed for something else — a clean chroot does not.
@@ -23,6 +24,7 @@ makedepends=('rust' 'cargo' 'pkgconf' 'clang')
 optdepends=(
   'wireplumber: session management, needed to switch the default sink'
   'xdg-desktop-portal: native file dialogs for preset import and export'
+  'xdg-desktop-portal-gtk: a file-chooser backend for those dialogs (or -kde, -gnome)'
   'libnotify: desktop notifications'
 )
 provides=('fxsound')
@@ -33,16 +35,32 @@ sha256sums=()
 
 _srcdir="$(cd "${startdir}/.." && pwd)"
 
+# rust-toolchain.toml pins channel = "1.98.1", which only rustup's proxies read: Arch's own
+# cargo ignores it (and RUSTUP_TOOLCHAIN with it), which is the case this recipe was written for.
+# On a machine that builds with rustup the pin would make the proxy download 1.98.1, so the
+# variable steers it to an installed channel instead — but only when the caller has not already
+# chosen one: CI sets RUSTUP_TOOLCHAIN=1.98.1 and expects it honoured.
+_toolchain="${RUSTUP_TOOLCHAIN:-stable}"
+
+prepare() {
+  cd "${_srcdir}"
+  export RUSTUP_TOOLCHAIN="${_toolchain}"
+  # build() and check() run --frozen, which refuses to touch the network, so the registry has to be
+  # filled in here where makepkg allows it. On a machine that has built the tree before this is a
+  # no-op; in a clean chroot or a container it is the difference between a build and an error.
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
 build() {
   cd "${_srcdir}"
-  export RUSTUP_TOOLCHAIN=stable
+  export RUSTUP_TOOLCHAIN="${_toolchain}"
   export CARGO_TARGET_DIR="${_srcdir}/target"
   cargo build --release --frozen --bin fxsound
 }
 
 check() {
   cd "${_srcdir}"
-  export RUSTUP_TOOLCHAIN=stable
+  export RUSTUP_TOOLCHAIN="${_toolchain}"
   export CARGO_TARGET_DIR="${_srcdir}/target"
   # Nothing here touches the live PipeWire graph or the user's settings file.
   cargo test --release --frozen --workspace
@@ -80,6 +98,19 @@ package() {
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fxsound.png"
   install -Dm644 "assets/images/fxsound.png" \
     "${pkgdir}/usr/share/icons/hicolor/32x32/apps/fxsound.png"
+
+  # The tray icon's three states. A StatusNotifier host resolves an icon *name* through the theme,
+  # so without these under hicolor's status context the tray shows a blank where the icon should
+  # be — which is exactly what every 0.3.0 package did.
+  install -Dm644 assets/icons/status/com.fxsound.FxSound-{off,on,processing}.svg \
+    -t "${pkgdir}/usr/share/icons/hicolor/scalable/status/"
+
+  # The unit says Documentation=man:fxsound(1); shipping the page is what makes that line true.
+  install -Dm644 "packaging/fxsound.1" "${pkgdir}/usr/share/man/man1/fxsound.1"
+
+  # AppStream metadata, so GNOME Software and Discover list the application at all.
+  install -Dm644 "packaging/com.fxsound.FxSound.metainfo.xml" \
+    "${pkgdir}/usr/share/metainfo/com.fxsound.FxSound.metainfo.xml"
 
   # The compositor rules and the keybind examples: a Wayland client cannot grab global shortcuts,
   # so the bindings live in the compositor and call back into the running instance.

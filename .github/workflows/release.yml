@@ -1,131 +1,234 @@
 name: Release
 
+# Three stages. `verify` refuses a tag that disagrees with any of the places the version is
+# written down — a mismatch is silent otherwise, and ends as a package named after one number that
+# reports another when asked. `packages` is packages.yml, the same matrix every push runs, at the
+# tag. `publish` attaches everything it uploaded, plus one SHA256SUMS, to the GitHub release, with
+# the matching CHANGELOG.md section as the body.
+
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build, e.g. v0.3.0'
+        description: 'Tag to build and publish, e.g. v0.4.0'
         required: true
+        type: string
 
+# Read-only by default; only `publish` writes, and only to the release.
 permissions:
-  contents: write
+  contents: read
 
-env:
-  CARGO_TERM_COLOR: always
+# Never cancel a release run: a superseded one that stops half-way leaves half a release.
+concurrency:
+  group: release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  tarball:
-    name: Binary tarball
+  verify:
+    name: Tag matches every version stamp
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
 
-      - name: Install build dependencies
+      - name: Compare the tag with every file that names the version
+        id: check
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev libclang-dev
-
-      - uses: Swatinem/rust-cache@v2
-
-      # The tag and the version in Cargo.toml disagreeing is the classic release mistake, and it
-      # is silent: the archive is named after one and reports the other when asked.
-      - name: Check the tag against the manifest
-        run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          manifest=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          if [ "$tag" != "v$manifest" ]; then
-            echo "tag $tag does not match Cargo.toml version $manifest" >&2
+          set -euo pipefail
+          tag='${{ inputs.tag || github.ref_name }}'
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "::error::'$tag' is not a release tag (expected v<major>.<minor>.<patch>)"; exit 1 ;;
+          esac
+          ver="${tag#v}"
+          fail=0
+          check() {
+            if [ "$2" = "$ver" ]; then
+              printf '  ok     %-52s %s\n' "$1" "$2"
+            else
+              printf '  WRONG  %-52s %s  (tag says %s)\n' "$1" "$2" "$ver"
+              fail=1
+            fi
+          }
+          # For a file that names the version more than once: every spelling found must be the
+          # tag, and at least one must be found, or a grep that matches nothing would pass.
+          check_all() {
+            if [ -z "${2// /}" ]; then
+              printf '  WRONG  %-52s (no version found at all)\n' "$1"
+              fail=1
+              return
+            fi
+            local v
+            for v in $2; do check "$1" "$v"; done
+          }
+          # The one the binary reports (env!("CARGO_PKG_VERSION")).
+          check "Cargo.toml [workspace.package] version" \
+            "$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p}' Cargo.toml | head -1)"
+          check "packaging/PKGBUILD pkgver" \
+            "$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)"
+          check "packaging/aur/fxsound-linux-bin/PKGBUILD pkgver" \
+            "$(sed -n 's/^pkgver=//p' packaging/aur/fxsound-linux-bin/PKGBUILD)"
+          # pkgver() recomputes this one from Cargo.toml at build time, so the placeholder can
+          # only mislead — it is what the AUR page shows — which is reason enough to keep it true.
+          check "packaging/aur/fxsound-linux-git/PKGBUILD pkgver" \
+            "$(sed -n 's/^pkgver=\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p' packaging/aur/fxsound-linux-git/PKGBUILD)"
+          # This line, not Cargo.toml, names the .deb.
+          deb=$(sed -n '1s/^[^ ]* *(\([^)]*\)).*/\1/p' packaging/debian/changelog)
+          check "packaging/debian/changelog head (upstream part)" "${deb%-*}"
+          check "packaging/fedora/fxsound.spec Version" \
+            "$(sed -n 's/^Version:[[:space:]]*//p' packaging/fedora/fxsound.spec)"
+          # rpmlint wants the newest %changelog entry to carry the package's own version; the
+          # line reads "* <date> <name> <email> - <version>-<release>".
+          check "packaging/fedora/fxsound.spec %changelog head" \
+            "$(sed -n '/^%changelog/{n;s/.* - \([^- ]*\)-[0-9]*$/\1/p}' packaging/fedora/fxsound.spec)"
+          check "packaging/fedora/README.md VER" \
+            "$(sed -n 's/^VER=//p' packaging/fedora/README.md | head -1)"
+          check "packaging/fxsound.1 .TH" \
+            "$(sed -n 's/^\.TH FXSOUND 1 "[^"]*" "fxsound \([^"]*\)".*/\1/p' packaging/fxsound.1)"
+          newest=$(grep -m1 -o '<release version="[^"]*" date="[^"]*"' packaging/com.fxsound.FxSound.metainfo.xml || true)
+          check "packaging/com.fxsound.FxSound.metainfo.xml newest <release>" \
+            "$(printf '%s' "$newest" | sed 's/.*version="\([^"]*\)".*/\1/')"
+          # The install commands name the artefacts by version, five times over.
+          check_all "README.md install commands" \
+            "$(grep -o 'fxsound-linux[-_][0-9]*\.[0-9]*\.[0-9]*' README.md | sed 's/^fxsound-linux[-_]//' | sort -u | tr '\n' ' ')"
+          # A comment quoting cargo's own refusal, "package `fxsound-app v0.4.0` cannot be built";
+          # the comment wraps between the name and the version, so the file is joined first.
+          check_all "packaging/debian/control quoted cargo error" \
+            "$(tr '\n' ' ' < packaging/debian/control | grep -o 'fxsound-app[^v]*v[0-9]*\.[0-9]*\.[0-9]*' | grep -o '[0-9]*\.[0-9]*\.[0-9]*$' | sort -u | tr '\n' ' ')"
+          # The metainfo's release date is a stamp too. It is meant to be the CHANGELOG heading's
+          # date, which is where a bump that leaves a placeholder in one of them shows.
+          chg_date=$(sed -n "s/^## \[$ver\][^0-9]*\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*/\1/p" CHANGELOG.md | head -1)
+          meta_date=$(printf '%s' "$newest" | sed 's/.*date="\([^"]*\)".*/\1/')
+          if [ -n "$chg_date" ] && [ "$chg_date" = "$meta_date" ]; then
+            printf '  ok     %-52s %s\n' "metainfo newest <release date> == CHANGELOG.md date" "$meta_date"
+          else
+            printf '  WRONG  %-52s %s  (CHANGELOG.md heading says %s)\n' \
+              "metainfo newest <release date> == CHANGELOG.md date" "${meta_date:-none}" "${chg_date:-none}"
+            fail=1
+          fi
+          # The app compiles CHANGELOG.md in and its pane only treats #-lines as headings, so the
+          # section has to exist under exactly this heading for the release body and for the app.
+          if grep -q "^## \[$ver\]" CHANGELOG.md; then
+            printf '  ok     %-52s\n' "CHANGELOG.md has a '## [$ver]' heading"
+          else
+            printf '  WRONG  %-52s\n' "CHANGELOG.md has no '## [$ver]' heading"
+            fail=1
+          fi
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::tag $tag does not match every version stamp; fix the WRONG lines above and re-tag"
             exit 1
           fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
 
-      - run: cargo build --release --bin fxsound
+      # The page is synced with cli.rs and dbus.rs by hand, and it was written to the design
+      # before the code landed, which is exactly how a page drifts. ci.yml runs the same script
+      # on every push; running it here too means a tag cannot ship a page that names an option
+      # or a bus member the binary does not have.
+      - name: Manual page agrees with cli.rs and dbus.rs
+        run: packaging/check-manpage.sh
 
-      # The same layout the Arch package installs, so the tarball is extractable over a prefix and
-      # a user who is not on Arch gets the presets, the desktop entry and the icons rather than a
-      # bare binary that then cannot find anything.
-      - name: Assemble
-        run: |
-          ver="${{ github.event.inputs.tag || github.ref_name }}"
-          ver="${ver#v}"
-          root="fxsound-linux-${ver}-x86_64"
-          install -Dm755 target/release/fxsound "$root/bin/fxsound"
-          for dir in Factsoft BonusPresets; do
-            install -d "$root/share/fxsound/presets/$dir"
-            install -Dm644 assets/presets/$dir/*.fac -t "$root/share/fxsound/presets/$dir/"
-          done
-          # The voice presets, which are TOML because they describe the microphone chain and a
-          # .fac has nowhere to put a gate threshold. Without these a tarball install has a
-          # microphone chain and no way to voice it.
-          install -d "$root/share/fxsound/presets/Input"
-          install -Dm644 assets/presets/Input/*.toml -t "$root/share/fxsound/presets/Input/"
-          install -Dm644 packaging/fxsound.desktop \
-            "$root/share/applications/com.fxsound.FxSound.desktop"
-          install -Dm644 packaging/fxsound.service \
-            "$root/lib/systemd/user/fxsound.service"
-          install -Dm644 assets/images/fxsound_large.png \
-            "$root/share/icons/hicolor/256x256/apps/fxsound.png"
-          install -Dm644 assets/images/fxsound.png \
-            "$root/share/icons/hicolor/32x32/apps/fxsound.png"
-          install -Dm644 README.md CHANGELOG.md LICENSE -t "$root/share/doc/fxsound-linux/"
-          install -Dm644 packaging/hyprland.conf.example \
-            -t "$root/share/doc/fxsound-linux/"
-          tar czf "$root.tar.gz" "$root"
-          sha256sum "$root.tar.gz" > "$root.tar.gz.sha256"
-          ls -la "$root.tar.gz"*
+  packages:
+    name: Packages
+    needs: verify
+    uses: ./.github/workflows/packages.yml
+    with:
+      ref: ${{ needs.verify.outputs.tag }}
+    permissions:
+      contents: read
 
-      # The one thing this archive does not promise: it is linked against the runner's glibc, so
-      # it runs on that release and newer, not on an older one. Anyone on an older distribution
-      # builds from source, which is what the source tarball GitHub attaches is for.
-      - name: Publish
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: |
-            fxsound-linux-*-x86_64.tar.gz
-            fxsound-linux-*-x86_64.tar.gz.sha256
-          fail_on_unmatched_files: true
-          generate_release_notes: false
-
-  deb:
-    name: Debian package
+  publish:
+    name: Publish the release
+    needs: [verify, packages]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.verify.outputs.tag }}
 
-      - name: Install build dependencies
+      # Every leg of packages.yml uploads "package-<leg>"; merged into one directory they are the
+      # release: the Arch package, the two .debs (codename-suffixed), the .rpm with its .src.rpm
+      # and vendor tarball, and the binary tarball.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+
+      - name: One SHA256SUMS for everything
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev libclang-dev
+          cd dist
+          rm -f SHA256SUMS
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
 
-      - uses: Swatinem/rust-cache@v2
-
-      - run: cargo build --release --bin fxsound
-
-      # `packaging/build-deb.sh` assembles the archive with `ar` and `tar` rather than `dpkg-deb`,
-      # so it produces the same package here as it does on the maintainer's Arch machine. The
-      # debhelper sources under `packaging/debian/` are for a Debian maintainer building from the
-      # source package; this is the binary anyone can install today.
-      - name: Build the .deb
+      # The body is the tag's own CHANGELOG.md section, verbatim — the same text the app shows in
+      # its changelog pane — followed by where the artefacts came from.
+      - name: Release notes from CHANGELOG.md
         run: |
-          packaging/build-deb.sh
-          ls -la dist/
-          ar t dist/*.deb
-          sha256sum dist/*.deb > "dist/$(basename dist/*.deb).sha256"
+          set -euo pipefail
+          ver='${{ needs.verify.outputs.version }}'
+          awk -v ver="$ver" '
+            /^## \[/ {
+              if (found) exit
+              if (index($0, "## [" ver "]") == 1) { found = 1; next }
+            }
+            # Keep-a-Changelog link references ("[0.4.0]: https://...") sit below the oldest
+            # section, so they belong to no section and must not become part of the body when
+            # the section wanted is the last one in the file.
+            found && /^\[[^]]*\]: / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::the '## [$ver]' section of CHANGELOG.md is empty"
+            exit 1
+          fi
+          {
+            echo
+            echo '## Packages'
+            echo
+            echo 'Every file below was built inside the distribution it is for, installed there and'
+            echo 'smoke-tested (`fxsound --self-test`) by the same workflow that runs on every push; the'
+            echo 'tarball was built on Debian 12 so its binary runs on anything with glibc 2.36 or newer.'
+            echo 'Check a download against `SHA256SUMS` before installing it.'
+          } >> release-notes.md
+          cat release-notes.md
 
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
-          files: |
-            dist/*.deb
-            dist/*.deb.sha256
+          tag_name: ${{ needs.verify.outputs.tag }}
+          body_path: release-notes.md
+          files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: false
+
+      # The -bin AUR recipe wants the tarball's checksum; print it so the bump is a paste.
+      - name: Job summary
+        run: |
+          ver='${{ needs.verify.outputs.version }}'
+          sum=$(awk '$2 ~ /^fxsound-linux-.*-x86_64\.tar\.gz$/ { print $1 }' dist/SHA256SUMS)
+          {
+            echo '## Published'
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+            echo
+            echo '## packaging/aur/fxsound-linux-bin/PKGBUILD'
+            echo
+            echo 'Paste over the placeholders, then regenerate .SRCINFO with `makepkg --printsrcinfo`:'
+            echo
+            echo '```'
+            echo "pkgver=$ver"
+            echo "sha256sums=('$sum')"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -6,19 +6,23 @@
 
 pkgname=fxsound-linux-git
 _pkgname=fxsound-linux
-pkgver=0.2.0.r0.g0000000
+# Recomputed by pkgver() below at build time; until then it is what the AUR page shows, so it
+# names the release main descends from. release.yml refuses a tag it disagrees with.
+pkgver=0.3.0.r0.g0000000
 pkgrel=1
 pkgdesc="System-wide audio enhancement for Linux: EQ, ambience, surround, bass and dynamic boost (Rust/egui port of FxSound) — development version"
 arch=('x86_64')
 url="https://github.com/blackixxce12/fxsound-linux"
 license=('AGPL-3.0-or-later')
-depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus')
+depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus'
+         'hicolor-icon-theme')   # the icons install into its tree
 # `clang` is not optional: pipewire-sys runs bindgen in its build script and fails with
 # "Unable to find libclang" without it.
 makedepends=('git' 'rust' 'cargo' 'pkgconf' 'clang')
 optdepends=(
   'wireplumber: session management, needed to switch the default sink'
   'xdg-desktop-portal: native file dialogs for preset import and export'
+  'xdg-desktop-portal-gtk: a file-chooser backend for those dialogs (or -kde, -gnome)'
   'libnotify: desktop notifications'
 )
 provides=("${_pkgname}" 'fxsound')
@@ -26,6 +30,11 @@ conflicts=("${_pkgname}" 'fxsound')
 options=('!lto')   # the workspace already sets `lto = "thin"` in its release profile
 source=("${_pkgname}::git+${url}.git")
 sha256sums=('SKIP')
+
+# Only rustup's proxies read rust-toolchain.toml; Arch's cargo ignores it and this variable with
+# it. Under rustup the variable steers the proxy to an installed channel instead of a download —
+# unless the caller (CI pinning 1.98.1) has already chosen one. Same as packaging/PKGBUILD.
+_toolchain="${RUSTUP_TOOLCHAIN:-stable}"
 
 pkgver() {
   cd "${srcdir}/${_pkgname}"
@@ -38,6 +47,7 @@ pkgver() {
 
 prepare() {
   cd "${srcdir}/${_pkgname}"
+  export RUSTUP_TOOLCHAIN="${_toolchain}"
   # Vendor up front so `build()` and `check()` can run with the network off, which is what a
   # clean chroot does.
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
@@ -45,14 +55,14 @@ prepare() {
 
 build() {
   cd "${srcdir}/${_pkgname}"
-  export RUSTUP_TOOLCHAIN=stable
+  export RUSTUP_TOOLCHAIN="${_toolchain}"
   export CARGO_TARGET_DIR=target
   cargo build --release --frozen --bin fxsound
 }
 
 check() {
   cd "${srcdir}/${_pkgname}"
-  export RUSTUP_TOOLCHAIN=stable
+  export RUSTUP_TOOLCHAIN="${_toolchain}"
   export CARGO_TARGET_DIR=target
   # Nothing here touches the live PipeWire graph, the session bus or the user's settings file.
   cargo test --release --frozen --workspace
@@ -85,6 +95,17 @@ package() {
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fxsound.png"
   install -Dm644 "assets/images/fxsound.png" \
     "${pkgdir}/usr/share/icons/hicolor/32x32/apps/fxsound.png"
+
+  # The tray icon's three states, resolved by name through the theme; without them the tray shows
+  # a blank where the icon should be.
+  install -Dm644 assets/icons/status/com.fxsound.FxSound-{off,on,processing}.svg \
+    -t "${pkgdir}/usr/share/icons/hicolor/scalable/status/"
+
+  # The unit says Documentation=man:fxsound(1); shipping the page is what makes that line true.
+  install -Dm644 "packaging/fxsound.1" "${pkgdir}/usr/share/man/man1/fxsound.1"
+
+  install -Dm644 "packaging/com.fxsound.FxSound.metainfo.xml" \
+    "${pkgdir}/usr/share/metainfo/com.fxsound.FxSound.metainfo.xml"
 
   install -Dm644 "packaging/hyprland.conf.example" \
     "${pkgdir}/usr/share/doc/${_pkgname}/hyprland.conf.example"

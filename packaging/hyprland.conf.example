@@ -2,12 +2,34 @@
 # The window is frameless and has a fixed design size (1040x588 for the Pro
 # view, 550x189 for the Lite view - content plus the 56px title bar, the 1px
 # divider and the 20px bottom pad), so let it float instead of tiling.
+#
+# Which spelling: Hyprland 0.53 rewrote window rules (hyprwm/Hyprland#12269):
+# `windowrulev2` is gone — a config *error*, not a warning, and 0.54 and newer
+# name it in the message — and a `windowrule` is a block keyed by name (or one
+# line of `field value` pairs). `no_border` did not survive as a window-rule
+# field, only as a workspace-rule one: a window rule spells it `border_size = 0`.
+# Since 0.55 the hyprland.conf format is itself deprecated in favour of a Lua
+# config, though it still parses; the Lua spelling is at the end. Every form
+# in this file passes `Hyprland --verify-config` on 0.56.2.
 
-windowrulev2 = float,        class:^(com\.fxsound\.FxSound)$
-windowrulev2 = noborder,     class:^(com\.fxsound\.FxSound)$
-windowrulev2 = rounding 8,   class:^(com\.fxsound\.FxSound)$
-# The app paints its own drop shadow; disable the compositor's to match Windows.
-windowrulev2 = noshadow,     class:^(com\.fxsound\.FxSound)$
+windowrule {
+    name = fxsound
+    match:class = ^(com\.fxsound\.FxSound)$
+    float = true
+    border_size = 0
+    rounding = 8
+    # The app paints its own drop shadow; disable the compositor's to match Windows.
+    no_shadow = true
+}
+
+# The same rule on one line, if you would rather not have a block:
+# windowrule = match:class ^(com\.fxsound\.FxSound)$, float true, border_size 0, rounding 8, no_shadow true
+
+# Hyprland 0.52 and older, where the keyword was still windowrulev2:
+# windowrulev2 = float,        class:^(com\.fxsound\.FxSound)$
+# windowrulev2 = noborder,     class:^(com\.fxsound\.FxSound)$
+# windowrulev2 = rounding 8,   class:^(com\.fxsound\.FxSound)$
+# windowrulev2 = noshadow,     class:^(com\.fxsound\.FxSound)$
 
 # Settings, the changelog and the preset dialogs are panes inside the main window, so there
 # are no extra toplevels to rule for. Fullscreen (e.g. `fullscreen` on Super+F) scales the
@@ -16,8 +38,21 @@ windowrulev2 = noshadow,     class:^(com\.fxsound\.FxSound)$
 # Global hotkeys ----------------------------------------------------------
 # A Wayland client cannot grab global shortcuts the way the Windows build does.
 # Bind them in the compositor instead; each one is forwarded over FxSound's
-# control socket to the running instance.
+# control socket to the running instance. The bind syntax has not changed.
 bind = CTRL SHIFT, F,   exec, fxsound --next-preset
 bind = CTRL SHIFT, D,   exec, fxsound --prev-preset
 bind = CTRL SHIFT, P,   exec, fxsound --toggle-power
 bind = CTRL SHIFT, O,   exec, fxsound --toggle-window
+
+# hyprland.lua (Hyprland 0.55 and newer) ----------------------------------
+# The same rule and binds for the Lua config. The backslashes are doubled
+# because a Lua string escapes them and the regex still needs them.
+#
+#   hl.window_rule({
+#       match = { class = "^(com\\.fxsound\\.FxSound)$" },
+#       float = true, border_size = 0, rounding = 8, no_shadow = true,
+#   })
+#   hl.bind("CTRL + SHIFT + F", hl.dsp.exec_cmd("fxsound --next-preset"))
+#   hl.bind("CTRL + SHIFT + D", hl.dsp.exec_cmd("fxsound --prev-preset"))
+#   hl.bind("CTRL + SHIFT + P", hl.dsp.exec_cmd("fxsound --toggle-power"))
+#   hl.bind("CTRL + SHIFT + O", hl.dsp.exec_cmd("fxsound --toggle-window"))

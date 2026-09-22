@@ -1,5 +1,12 @@
 # Building the source package straight out of a git checkout, rather than from
 # an unpacked orig tarball, otherwise drowns in the build tree and in the
 # artefacts makepkg leaves behind. None of these are ever in the orig tarball.
-extend-diff-ignore = "^(target|dist|vendor|packaging/pkg|packaging/src)/"
-extend-diff-ignore = "^packaging/.*\.pkg\.tar\.zst$"
+#
+# Keep this list in step with any new top-level directory a build can create:
+# vendor/ and .cargo/ are what the offline route in README.Debian produces,
+# .cargo-home/ is the CARGO_HOME the packages workflow keeps inside the
+# workspace, dist/ is where build-deb.sh and build-tarball.sh write.
+# debian/cargo-home is not listed: the clean target removes it before a
+# source build starts.
+extend-diff-ignore = "^(target|dist|vendor|\.cargo(-home)?|packaging/pkg|packaging/src)/"
+extend-diff-ignore = "^packaging/.*\.(pkg\.tar\.zst|log)$"

@@ -2,9 +2,22 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # release/** as well: the packages matrix has to have run on a release branch before the
+    # branch is tagged, because the tag is the wrong moment to learn that a leg is broken.
+    branches: [main, 'release/**']
   pull_request:
   workflow_dispatch:
+
+# Read-only by default; the one job that needs more says so itself.
+permissions:
+  contents: read
+
+# A push on top of a push cancels the older run: the older result would be stale before it
+# arrived. The group name is distinct from packages.yml's on purpose — a called workflow that
+# shares its caller's group waits on itself for ever.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -67,12 +80,36 @@ jobs:
       - name: Build
         run: cargo build --release --bin fxsound
 
+  # Every package the tree can produce, built inside the distribution it targets, installed
+  # there and smoke-tested — see packages.yml. Independent of `check`: a packaging failure and a
+  # test failure are different news, and waiting for the tests would only delay the first.
+  packages:
+    name: Packages
+    uses: ./.github/workflows/packages.yml
+    permissions:
+      contents: read
+
+  # packaging/fxsound.1 is synced with cli.rs and dbus.rs by hand. This refuses the drift on
+  # the push that causes it rather than at the tag, where release.yml runs the same script. No
+  # toolchain: the script only reads the sources.
+  manpage:
+    name: Manual page agrees with the code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: packaging/check-manpage.sh
+
   audit:
     name: Dependency audit
     runs-on: ubuntu-latest
     # Advisories appear without anything in this repository changing, so a red run here means
     # "look at this", not "your commit is broken".
     continue-on-error: true
+    # audit-check reports through a check run, which the read-only default above cannot create.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2

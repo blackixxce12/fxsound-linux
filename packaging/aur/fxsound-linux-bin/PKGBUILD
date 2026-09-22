@@ -3,9 +3,10 @@
 # Installs the prebuilt tarball from a GitHub release. For anyone who does not want a Rust
 # toolchain and a ten-minute build to get an audio equalizer.
 #
-# The binary in that tarball is linked against the glibc of the runner that built it, so this
-# package declares that dependency honestly rather than pretending to be portable: on a
-# distribution older than the one in `.github/workflows/release.yml`, build `fxsound-linux-git`
+# The binary in that tarball is linked against the glibc of the container that built it —
+# debian:bookworm's 2.36, chosen in `.github/workflows/packages.yml` as the oldest worth
+# supporting, so the binary runs on anything newer. This package declares that dependency
+# honestly rather than pretending to be portable: on anything older, build `fxsound-linux-git`
 # from source instead.
 
 pkgname=fxsound-linux-bin
@@ -16,19 +17,22 @@ pkgdesc="System-wide audio enhancement for Linux: EQ, ambience, surround, bass a
 arch=('x86_64')
 url="https://github.com/blackixxce12/fxsound-linux"
 license=('AGPL-3.0-or-later')
-depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus' 'glibc')
+depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus'
+         'glibc>=2.36' 'hicolor-icon-theme')
 optdepends=(
   'wireplumber: session management, needed to switch the default sink'
   'xdg-desktop-portal: native file dialogs for preset import and export'
+  'xdg-desktop-portal-gtk: a file-chooser backend for those dialogs (or -kde, -gnome)'
   'libnotify: desktop notifications'
 )
 provides=("${_pkgname}" 'fxsound')
 conflicts=("${_pkgname}" 'fxsound' 'fxsound-linux-git')
 options=('!strip')   # the release build is already stripped of what it can spare
 source=("${url}/releases/download/v${pkgver}/${_pkgname}-${pkgver}-x86_64.tar.gz")
-# Replace on every version bump with the value from the release's .sha256 file; `makepkg -g`
-# regenerates it. Never SKIP here — a checksum is the only thing standing between a user and a
-# tampered release asset.
+# Replace on every version bump with the tarball's line from the release's SHA256SUMS — the
+# release workflow prints the exact `sha256sums=(...)` line in its job summary — or let
+# `makepkg -g` regenerate it. Never SKIP here — a checksum is the only thing standing between a
+# user and a tampered release asset.
 sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
 
 package() {
@@ -36,9 +40,13 @@ package() {
 
   install -Dm755 "bin/fxsound" "${pkgdir}/usr/bin/fxsound"
 
-  find share/fxsound/presets -name '*.fac' -print0 | while IFS= read -r -d '' _preset; do
-    install -Dm644 "${_preset}" "${pkgdir}/usr/${_preset}"
-  done
+  # Both preset trees: the .fac files the Windows build shares and the TOML voice presets. The
+  # 0.3.0 recipe took only '*.fac', which gave a -bin user a microphone chain with nothing to
+  # voice it. find rather than a glob because the names carry spaces, quotes and ampersands.
+  find share/fxsound/presets \( -name '*.fac' -o -name '*.toml' \) -print0 \
+    | while IFS= read -r -d '' _preset; do
+      install -Dm644 "${_preset}" "${pkgdir}/usr/${_preset}"
+    done
 
   install -Dm644 "share/applications/com.fxsound.FxSound.desktop" \
     "${pkgdir}/usr/share/applications/com.fxsound.FxSound.desktop"
@@ -48,7 +56,15 @@ package() {
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fxsound.png"
   install -Dm644 "share/icons/hicolor/32x32/apps/fxsound.png" \
     "${pkgdir}/usr/share/icons/hicolor/32x32/apps/fxsound.png"
+  # The tray icon's three states, resolved by name through the theme.
+  install -Dm644 share/icons/hicolor/scalable/status/com.fxsound.FxSound-*.svg \
+    -t "${pkgdir}/usr/share/icons/hicolor/scalable/status/"
 
+  install -Dm644 "share/man/man1/fxsound.1" "${pkgdir}/usr/share/man/man1/fxsound.1"
+  install -Dm644 "share/metainfo/com.fxsound.FxSound.metainfo.xml" \
+    "${pkgdir}/usr/share/metainfo/com.fxsound.FxSound.metainfo.xml"
+
+  # README, CHANGELOG, LICENSE, the Hyprland rules and the autostart entry.
   install -Dm644 share/doc/fxsound-linux/* -t "${pkgdir}/usr/share/doc/${_pkgname}/"
   install -Dm644 "share/doc/fxsound-linux/LICENSE" \
     "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE"

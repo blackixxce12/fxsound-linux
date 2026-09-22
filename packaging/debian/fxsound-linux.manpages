@@ -1,1 +1,4 @@
-debian/fxsound.1
+# Relative to the top of the source tree, like every dh_* file list. The page
+# lives beside the other packaging files because every package ships it now,
+# not only the .deb.
+packaging/fxsound.1

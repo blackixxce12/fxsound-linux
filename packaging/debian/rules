@@ -17,10 +17,15 @@ export DH_VERBOSE = 1
 # RUSTUP_TOOLCHAIN makes the pin a no-op and the build uses whatever cargo is
 # on PATH. packaging/PKGBUILD does the same thing for the same reason.
 #
+# `?=` and not `=`: a caller that has already chosen a toolchain — the CI
+# container that installs exactly 1.98.1 through rustup and sets
+# RUSTUP_TOOLCHAIN=1.98.1 — must not have it overridden to a `stable` that is
+# either a different version or not installed at all.
+#
 # This does NOT get past `rust-version = "1.98.1"` in Cargo.toml, which cargo
 # enforces itself against any rustc. Nothing in this file can; that is what the
 # versioned Build-Depends on rustc is for.
-export RUSTUP_TOOLCHAIN = stable
+export RUSTUP_TOOLCHAIN ?= stable
 
 # Keep cargo's scratch inside the build tree. A builder has no writable HOME,
 # and leaving CARGO_HOME at ~/.cargo makes the result depend on whatever the
@@ -81,8 +86,8 @@ override_dh_auto_install:
 		debian/tmp/usr/bin/fxsound
 
 	# `*.fac` and not the whole directory: assets/presets/BonusPresets also
-	# carries a zip of the same presets and a MeaningfulPresets/ subdirectory,
-	# and neither belongs in a package.
+	# carries a zip of the same presets and a stray text file called
+	# MeaningfulPresets, and neither belongs in a package.
 	set -e; for dir in Factsoft BonusPresets; do \
 		install -d debian/tmp/usr/share/fxsound/presets/$$dir; \
 		install -m 0644 assets/presets/$$dir/*.fac \
@@ -108,6 +113,21 @@ override_dh_auto_install:
 		debian/tmp/usr/share/icons/hicolor/256x256/apps/fxsound.png
 	install -D -m 0644 assets/images/fxsound.png \
 		debian/tmp/usr/share/icons/hicolor/32x32/apps/fxsound.png
+
+	# The tray icon's three states. A StatusNotifier host resolves an icon
+	# *name* through the theme, so without these under hicolor's status
+	# context the tray shows a blank where the icon should be.
+	install -d debian/tmp/usr/share/icons/hicolor/scalable/status
+	install -m 0644 assets/icons/status/com.fxsound.FxSound-*.svg \
+		-t debian/tmp/usr/share/icons/hicolor/scalable/status/
+
+	# AppStream metadata, so GNOME Software and Discover list the package.
+	install -D -m 0644 packaging/com.fxsound.FxSound.metainfo.xml \
+		debian/tmp/usr/share/metainfo/com.fxsound.FxSound.metainfo.xml
+
+	# The manual page is not staged here: dh_installman takes it straight
+	# from packaging/fxsound.1 (see debian/fxsound-linux.manpages) and
+	# compresses it itself.
 
 override_dh_installchangelogs:
 	dh_installchangelogs CHANGELOG.md
