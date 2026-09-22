@@ -46,3 +46,8 @@ countries: tr
 "Classic" = "Klasik"
 "Adaptive" = "Uyarlanabilir"
 "Preset" = "Ön ayar"
+"Floor" = "Gürültü tabanı"
+"Voice" = "Ses"
+"Echo" = "Yankı"
+"Reverb" = "Yankılanma"
+"unavailable" = "kullanılamaz"

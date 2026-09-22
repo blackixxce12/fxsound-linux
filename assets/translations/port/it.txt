@@ -46,3 +46,8 @@ countries: it
 "Classic" = "Classico"
 "Adaptive" = "Adattivo"
 "Preset" = "Preimpostazione"
+"Floor" = "Rumore di fondo"
+"Voice" = "Voce"
+"Echo" = "Eco"
+"Reverb" = "Riverbero"
+"unavailable" = "non disponibile"

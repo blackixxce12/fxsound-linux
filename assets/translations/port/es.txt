@@ -46,3 +46,8 @@ countries: ar co es mx
 "Classic" = "Clásico"
 "Adaptive" = "Adaptativo"
 "Preset" = "Preajuste"
+"Floor" = "Ruido de fondo"
+"Voice" = "Voz"
+"Echo" = "Eco"
+"Reverb" = "Reverb"
+"unavailable" = "no disponible"

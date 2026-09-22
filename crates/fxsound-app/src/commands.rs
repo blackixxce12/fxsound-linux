@@ -252,7 +252,7 @@ fn next_device_in_direction(app: &App) -> Option<usize> {
     }
     let position = app
         .state
-        .selected_device
+        .selection(direction)
         .and_then(|selected| candidates.iter().position(|&i| i == selected));
     Some(match position {
         Some(position) => candidates[(position + 1) % candidates.len()],
@@ -641,7 +641,7 @@ mod tests {
             direction: DeviceDirection::Output,
             form_factor: "microphone".into(),
         }];
-        a.state.selected_device = Some(0);
+        a.state.selected_output = Some(0);
 
         let json = run(&mut a, &[Command::Status { json: true }]).stdout;
         assert!(json.contains(r#""device":"Bob\"s \\ Mic\ttab""#), "{json}");
@@ -691,7 +691,7 @@ mod tests {
             &mut a,
             &[Command::Output(OutputCommand::Select("Headphones".into()))],
         );
-        assert_eq!(a.state.selected_device, Some(1));
+        assert_eq!(a.state.selected_device(), Some(1));
 
         run(
             &mut a,
@@ -699,10 +699,10 @@ mod tests {
                 "alsa_output.pci-0000_00_1f.3".into(),
             ))],
         );
-        assert_eq!(a.state.selected_device, Some(0));
+        assert_eq!(a.state.selected_device(), Some(0));
 
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
-        assert_eq!(a.state.selected_device, Some(1));
+        assert_eq!(a.state.selected_device(), Some(1));
     }
 
     fn device(
@@ -768,7 +768,7 @@ mod tests {
                 "alsa_input.usb-fifine".into(),
             ))],
         );
-        assert_eq!(a.state.selected_device, Some(2));
+        assert_eq!(a.state.selected_device(), Some(2));
         assert_eq!(a.state.device().map(|d| d.direction), Some(Input));
 
         // The shared description matches the first entry in list order — an output, because the
@@ -779,7 +779,7 @@ mod tests {
                 "fifine Microphone Analogue Stereo".into(),
             ))],
         );
-        assert_eq!(a.state.selected_device, Some(1));
+        assert_eq!(a.state.selected_device(), Some(1));
         assert_eq!(a.state.device().map(|d| d.direction), Some(Output));
     }
 
@@ -790,12 +790,12 @@ mod tests {
 
         // Nothing selected: the first *output*, never an input.
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
-        assert_eq!(a.state.selected_device, Some(0));
+        assert_eq!(a.state.selected_device(), Some(0));
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
-        assert_eq!(a.state.selected_device, Some(1));
+        assert_eq!(a.state.selected_device(), Some(1));
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
         assert_eq!(
-            a.state.selected_device,
+            a.state.selected_device(),
             Some(0),
             "wraps among the outputs, skipping the inputs"
         );
@@ -807,12 +807,12 @@ mod tests {
                 "alsa_input.usb-fifine".into(),
             ))],
         );
-        assert_eq!(a.state.selected_device, Some(2));
+        assert_eq!(a.state.selected_device(), Some(2));
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
-        assert_eq!(a.state.selected_device, Some(3));
+        assert_eq!(a.state.selected_device(), Some(3));
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
         assert_eq!(
-            a.state.selected_device,
+            a.state.selected_device(),
             Some(2),
             "wraps among the inputs, never back to a sink"
         );
@@ -820,7 +820,7 @@ mod tests {
         // A lone device in the current direction is a no-op, as a lone device always was.
         a.state.devices.truncate(3);
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
-        assert_eq!(a.state.selected_device, Some(2));
+        assert_eq!(a.state.selected_device(), Some(2));
     }
 
     #[test]
@@ -861,7 +861,7 @@ mod tests {
             &mut a,
             &[Command::Output(OutputCommand::Select("nope".into()))],
         );
-        assert!(a.state.selected_device.is_none());
+        assert!(a.state.selected_device().is_none());
     }
 
     #[test]

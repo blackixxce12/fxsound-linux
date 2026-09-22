@@ -47,3 +47,8 @@ countries: br
 "Adaptive" = "Adaptativo"
 "Preset" = "Predefinição"
 "The core high-end range. Increase this to make your audio sound more like it's in an airy, large space, reduce it to help with room noises and unwanted echoing." = "Gama alta. Aumente isso para fazer com que seu áudio soe mais como se estivesse em um espaço amplo e arejado, reduza-o para ajudar com ruídos da sala e ecos indesejados."
+"Floor" = "Ruído de fundo"
+"Voice" = "Voz"
+"Echo" = "Eco"
+"Reverb" = "Reverb"
+"unavailable" = "indisponível"

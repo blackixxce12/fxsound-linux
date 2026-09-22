@@ -987,7 +987,10 @@ impl<'a> Shell<'a> {
             Ok(_) => self.folder_picker = Some(rx),
             Err(err) => {
                 log::warn!("could not start the folder picker: {err}");
-                self.rt.app.state.notification = Some(tr("Could not open the folder picker"));
+                self.rt
+                    .app
+                    .state
+                    .notify(tr("Could not open the folder picker"));
             }
         }
     }

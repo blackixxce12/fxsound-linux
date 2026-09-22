@@ -51,3 +51,8 @@ countries: no
 "This wheel allows you to adjust which frequencies this EQ band is affecting\nup or down to target different frequencies/pitches. The EQ slider above\ncontrols the volume of this EQ band. Increase or decrease to boost or cut\na portion of your audio's frequencies, without modifying the rest of your sound." = "Dette hjulet lar deg justere hvilke frekvenser dette EQ-båndet påvirker\nopp eller ned for å målrette mot forskjellige frekvenser/toner. EQ-glidebryteren ovenfor\nkontrollerer volumet til dette EQ-båndet. Øk eller reduser for å forsterke eller kutte\nen del av lydens frekvenser, uten å endre resten av lyden."
 "Select the presets to export..." = "Velg forhåndsinnstillingene som skal eksporteres…"
 "Select the folder which contains the presets..." = "Velg mappen som inneholder forhåndsinnstillingene…"
+"Floor" = "Støygulv"
+"Voice" = "Stemme"
+"Echo" = "Ekko"
+"Reverb" = "Romklang"
+"unavailable" = "utilgjengelig"

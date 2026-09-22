@@ -47,3 +47,8 @@ countries: fr
 "Adaptive" = "Adaptatif"
 "Preset" = "Préréglage"
 "Hyper-low Bass - First band for very low frequencies down to 20 Hz." = "Ultra-basses - Première bande pour les très basses fréquences jusqu’à 20 Hz."
+"Floor" = "Bruit de fond"
+"Voice" = "Voix"
+"Echo" = "Écho"
+"Reverb" = "Réverb"
+"unavailable" = "indisponible"

@@ -46,3 +46,8 @@ countries: se
 "Classic" = "Klassisk"
 "Adaptive" = "Adaptiv"
 "Preset" = "Förinställning"
+"Floor" = "Brusgolv"
+"Voice" = "Röst"
+"Echo" = "Eko"
+"Reverb" = "Efterklang"
+"unavailable" = "inte tillgängligt"

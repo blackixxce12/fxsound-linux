@@ -46,3 +46,8 @@ countries: EG sa
 "Classic" = "كلاسيكي"
 "Adaptive" = "تكيّفي"
 "Preset" = "القالب"
+"Floor" = "أرضية الضوضاء"
+"Voice" = "الصوت"
+"Echo" = "الصدى"
+"Reverb" = "الارتداد"
+"unavailable" = "غير متاح"

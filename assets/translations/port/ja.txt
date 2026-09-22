@@ -46,3 +46,8 @@ countries: ja
 "Classic" = "クラシック"
 "Adaptive" = "適応"
 "Preset" = "プリセット"
+"Floor" = "ノイズフロア"
+"Voice" = "音声"
+"Echo" = "エコー"
+"Reverb" = "残響"
+"unavailable" = "使用不可"

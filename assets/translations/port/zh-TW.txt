@@ -46,3 +46,8 @@ countries: Taiwan
 "Classic" = "經典"
 "Adaptive" = "自適應"
 "Preset" = "預設"
+"Floor" = "底噪"
+"Voice" = "人聲"
+"Echo" = "回音"
+"Reverb" = "殘響"
+"unavailable" = "無法使用"

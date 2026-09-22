@@ -47,3 +47,8 @@ countries: ua
 "Classic" = "Класичний"
 "Adaptive" = "Адаптивний"
 "Preset" = "Шаблон"
+"Floor" = "Фон"
+"Voice" = "Голос"
+"Echo" = "Відлуння"
+"Reverb" = "Реверб"
+"unavailable" = "недоступно"

@@ -46,3 +46,8 @@ countries: ir
 "Classic" = "کلاسیک"
 "Adaptive" = "تطبیقی"
 "Preset" = "پیش‌تنظیم"
+"Floor" = "نویز زمینه"
+"Voice" = "صدا"
+"Echo" = "اکو"
+"Reverb" = "ریورب"
+"unavailable" = "در دسترس نیست"

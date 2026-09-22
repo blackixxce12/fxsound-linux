@@ -48,3 +48,8 @@ countries: sl
 "Preset" = "Prednastavitev"
 "Output Device Preference" = "Prednostna izhodna naprava"
 "Select preset" = "Izberi prednastavitev"
+"Floor" = "Raven šuma"
+"Voice" = "Glas"
+"Echo" = "Odmev"
+"Reverb" = "Odzven"
+"unavailable" = "ni na voljo"

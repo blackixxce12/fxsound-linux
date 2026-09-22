@@ -46,3 +46,8 @@ countries: vn
 "Classic" = "Cổ điển"
 "Adaptive" = "Thích ứng"
 "Preset" = "Preset"
+"Floor" = "Nhiễu nền"
+"Voice" = "Giọng nói"
+"Echo" = "Tiếng vọng"
+"Reverb" = "Vang"
+"unavailable" = "không khả dụng"

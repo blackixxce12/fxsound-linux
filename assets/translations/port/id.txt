@@ -46,3 +46,8 @@ countries: id
 "Classic" = "Klasik"
 "Adaptive" = "Adaptif"
 "Preset" = "Preset"
+"Floor" = "Derau dasar"
+"Voice" = "Suara"
+"Echo" = "Gema"
+"Reverb" = "Gaung"
+"unavailable" = "tidak tersedia"

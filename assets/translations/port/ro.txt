@@ -46,3 +46,8 @@ countries: ro
 "Classic" = "Clasic"
 "Adaptive" = "Adaptiv"
 "Preset" = "Presetare"
+"Floor" = "Zgomot de fond"
+"Voice" = "Voce"
+"Echo" = "Ecou"
+"Reverb" = "Reverberație"
+"unavailable" = "indisponibil"

@@ -26,6 +26,7 @@ use fxsound_ui::{
     state::PresetEntry,
 };
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::notify::{Message, Notifier};
 use fxsound_core::i18n::{self, tr, tr_args};
@@ -49,6 +50,67 @@ pub fn preset_name_available(existing: &[PresetEntry], name: &str) -> bool {
     }
     let wanted = wanted.to_lowercase();
     !existing.iter().any(|p| p.name.to_lowercase() == wanted)
+}
+
+/// What the window shows for one lane, kept here while the other lane is the one being edited.
+///
+/// A lane's controls live in [`UiState`] while that lane is the edit direction. Switching the edit
+/// direction parks them here and puts the other lane's back, so a look at the speakers' list never
+/// costs an unsaved equalizer move on the microphone, and never re-applies a preset under a chain
+/// that is running. The published snapshots (`params`, `input_params`) are what the engine runs;
+/// this is only what the window shows. The 0.4.0 controller proper keeps a `PerDirection` of these
+/// and drops the parking.
+#[derive(Debug, Clone)]
+struct LaneControls {
+    presets: Vec<PresetEntry>,
+    selected_preset: Option<usize>,
+    effects: [f32; Effect::COUNT],
+    eq_on: bool,
+    eq_bands: Vec<EqBand>,
+    filter_q: f32,
+    master_gain_db: f32,
+    balance_db: f32,
+    volume_leveling: f32,
+    gate_on: bool,
+    compressor_on: bool,
+    deesser_on: bool,
+    denoise_on: bool,
+}
+
+impl LaneControls {
+    fn take(state: &UiState) -> Self {
+        Self {
+            presets: state.presets.clone(),
+            selected_preset: state.selected_preset,
+            effects: state.effects,
+            eq_on: state.eq_on,
+            eq_bands: state.eq_bands.clone(),
+            filter_q: state.filter_q,
+            master_gain_db: state.master_gain_db,
+            balance_db: state.balance_db,
+            volume_leveling: state.volume_leveling,
+            gate_on: state.gate_on,
+            compressor_on: state.compressor_on,
+            deesser_on: state.deesser_on,
+            denoise_on: state.denoise_on,
+        }
+    }
+
+    fn put(self, state: &mut UiState) {
+        state.presets = self.presets;
+        state.selected_preset = self.selected_preset;
+        state.effects = self.effects;
+        state.eq_on = self.eq_on;
+        state.eq_bands = self.eq_bands;
+        state.filter_q = self.filter_q;
+        state.master_gain_db = self.master_gain_db;
+        state.balance_db = self.balance_db;
+        state.volume_leveling = self.volume_leveling;
+        state.gate_on = self.gate_on;
+        state.compressor_on = self.compressor_on;
+        state.deesser_on = self.deesser_on;
+        state.denoise_on = self.denoise_on;
+    }
 }
 
 /// Everything the running application owns.
@@ -99,6 +161,10 @@ pub struct App {
     /// appearance of that device rather than on every device list (see
     /// [`saved_device_to_announce`]).
     announced_device: Option<(String, DeviceDirection)>,
+    /// The lane the user last picked a device for this session, which is the lane the single-lane
+    /// engine serves. Kept apart from the edit direction, which only says what the window shows
+    /// (see [`lane_to_announce`]). Not saved: after a restart the lanes' enabled flags decide.
+    last_picked_lane: Option<DeviceDirection>,
     /// The desktop-notification worker (`docs/spec/06-dialogs.md` §6.6).
     notifier: Notifier,
     /// Toasts are held back until construction is over: adopting the saved preset at start-up
@@ -106,10 +172,12 @@ pub struct App {
     notifications_armed: bool,
     /// The "FxSound in system tray" tip is shown once per process (`FxController.cpp:920-926`).
     tray_tip_shown: bool,
+    /// The controls of the lane that is not being edited, once it has been edited this session.
+    parked: Option<(DeviceDirection, LaneControls)>,
 }
 
 impl App {
-    /// Build the application state, load the settings and presets, and adopt the saved preset.
+    /// Build the application state, load the settings and presets, and adopt the saved presets.
     ///
     /// A missing sound server is not fatal: the UI comes up, says so, and keeps working, which is
     /// far more useful than refusing to start.
@@ -133,7 +201,7 @@ impl App {
                 ..UiState::default()
             },
             params: DspParams::default(),
-            input_params: InputDspParams::default(),
+            input_params: unvoiced_input_params(),
             input_chain: fxsound_preset::input::DEFAULT_CHAIN.to_owned(),
             input_presets: Vec::new(),
             devices_seen: false,
@@ -148,9 +216,11 @@ impl App {
             persist: true,
             export_dir: default_export_dir(),
             announced_device: None,
+            last_picked_lane: None,
             notifier,
             notifications_armed: false,
             tray_tip_shown: false,
+            parked: None,
         };
 
         // Hand the audio thread what a previous run displaced, before it does anything: if that
@@ -164,19 +234,26 @@ impl App {
         }
 
         app.input_presets = fxsound_preset::input::InputPreset::load_shipped();
-        // The direction is settled before the list is built: they are two lists, and which one the
-        // picker shows depends on which chain is live.
-        app.state.direction = app.settings.device_direction;
-        app.refresh_preset_list();
-        let saved = app.settings.selected_preset().to_owned();
-        if let Some(index) = app.state.presets.iter().position(|e| e.name == saved) {
-            app.select_preset(index);
-        } else if !app.state.presets.is_empty() {
-            app.select_preset(0);
-        }
-        app.sync_params_from_state();
+        app.adopt_saved_presets();
         app.notifications_armed = true;
         app
+    }
+
+    /// Bring **both** lanes up on the presets the settings file remembers for them.
+    ///
+    /// Both, not only the one the window was last editing: which lane the engine serves is not the
+    /// edit direction (see [`lane_to_announce`]), so a restart that loaded only the edit
+    /// direction's preset left the speakers flat — every effect at zero — for anyone whose window
+    /// was last on the microphone, and a microphone handed to the engine by switching the speakers
+    /// off ran unvoiced. The lane off screen goes first, loaded exactly the way a first visit loads
+    /// it, and is then parked; the edit direction is entered the same way, so each lane's controls
+    /// are seeded from its own chain and nothing of one reaches the other. Called while toasts are
+    /// still held back, so none of this is announced.
+    fn adopt_saved_presets(&mut self) {
+        let edit = self.settings.device_direction;
+        self.state.direction = edit.other();
+        self.enter_lane_for_the_first_time(edit.other());
+        self.set_edit_direction(edit);
     }
 
     /// The palette the views should use.
@@ -193,6 +270,10 @@ impl App {
 
     /// Pull everything the audio thread has published. Call once per frame, before rendering.
     pub fn poll_audio(&mut self) {
+        // A notice is up for four seconds (0.4.0 design, §11). The views only draw it; this is
+        // the one place that times it, engine or no engine.
+        self.state.expire_notification(Instant::now());
+
         let Some(engine) = self.engine.as_mut() else {
             return;
         };
@@ -210,45 +291,32 @@ impl App {
         self.state.voice_probability = meters.voice_probability;
         self.state.compressor_reduction_db = meters.compressor_reduction_db;
         self.state.deesser_reduction_db = meters.deesser_reduction_db;
+        // Copied as it is: `0.0` is what no measurement looks like (`Meters::default()`, and the
+        // running minimum before it has come down), and the strip reads it as a dash rather than
+        // as a room at full scale.
+        self.state.noise_floor_db = meters.noise_floor_db;
+        self.state.denoise_reduction_db = meters.denoise_reduction_db;
+        self.state.dereverb_reduction_db = meters.dereverb_reduction_db;
+        self.state.deesser_hz = meters.deesser_hz;
 
+        let mut device_lists = Vec::new();
         while let Some(message) = engine.try_recv() {
             match message {
-                AudioToUi::Devices(devices) => {
-                    self.devices_seen = true;
-                    // Keep the user's choice selected across a rescan when the device is still
-                    // there; otherwise fall back to whatever the server calls the default.
-                    let direction = self.settings.device_direction;
-                    let wanted = self.settings.device_name(direction).to_owned();
-                    self.state.direction = direction;
-                    self.state.selected_device = devices
-                        .iter()
-                        .position(|d| d.name == wanted && d.direction == direction)
-                        .or_else(|| {
-                            devices
-                                .iter()
-                                .position(|d| d.is_default && d.direction == direction)
-                        });
-                    // The engine starts in the output direction and picks by the device rules
-                    // alone; the saved choice — and with it a saved input mode — reaches it from
-                    // here, the first time that device is listed.
-                    if let Some(message) = saved_device_to_announce(
-                        &self.settings,
-                        &devices,
-                        &mut self.announced_device,
-                    ) {
-                        engine.send(message);
-                    }
-                    self.state.devices = devices;
-                }
+                // Taken after the loop, where the engine is no longer borrowed and the whole
+                // controller is free to look at the list.
+                AudioToUi::Devices(devices) => device_lists.push(devices),
                 // One status per lane in 0.4.0; until the second lane exists in this crate, the
-                // engine sends one and this keeps it.
-                AudioToUi::Status {
-                    direction: _,
-                    status,
-                } => self.audio_status = status,
+                // engine sends one and this keeps it for `--status`, and its lane's activity.
+                AudioToUi::Status { direction, status } => {
+                    match direction {
+                        DeviceDirection::Output => self.state.output_active = status.processing,
+                        DeviceDirection::Input => self.state.input_active = status.processing,
+                    }
+                    self.audio_status = status;
+                }
                 AudioToUi::Disconnected { reason } => {
-                    self.state.notification =
-                        Some(format!("{} {reason}", tr("Audio disconnected:")));
+                    self.state
+                        .notify(format!("{} {reason}", tr("Audio disconnected:")));
                     // `"Output Disconnected"` (`FxController.cpp:1170`). A field access, not
                     // `Self::notify`, because the engine handle is still borrowed here.
                     if self.notifications_armed {
@@ -256,11 +324,14 @@ impl App {
                     }
                 }
                 AudioToUi::Error { message, .. } => {
-                    self.state.notification = Some(message);
+                    self.state.notify(message);
                 }
-                // Per-lane attachment and echo-cancellation state: the window that reads them is
-                // the two-lane work, which is not in this crate yet.
-                AudioToUi::Attached { .. } | AudioToUi::EchoCancel { .. } => {}
+                AudioToUi::EchoCancel { running, .. } => self.state.echo_cancel_running = running,
+                // What a lane is really attached to. The selection shown is still the user's
+                // choice from the settings: the single-lane engine this crate runs against today
+                // reports its one lane moving between directions, which is not a lane going away.
+                // The two-lane controller reads this instead.
+                AudioToUi::Attached { .. } => {}
                 AudioToUi::RememberedDefault {
                     direction,
                     node_name,
@@ -277,11 +348,51 @@ impl App {
             }
         }
 
+        // In arrival order, so a device that vanished in one list and came back in the next is
+        // announced afresh.
+        for devices in device_lists {
+            if let Some(message) = self.adopt_device_list(devices)
+                && let Some(engine) = &self.engine
+            {
+                engine.send(message);
+            }
+        }
+
         // Outside the loop, where the engine is no longer borrowed: selecting a device calls back
         // into the whole controller.
         if self.devices_seen && self.pending_device.is_some() {
             self.apply_pending_device();
         }
+    }
+
+    /// Take a device list from the engine, and say what, if anything, the engine has to be told.
+    ///
+    /// Each lane keeps the user's choice across a rescan when the device is still there, and
+    /// otherwise falls back to whatever the server calls the default. A detached lane shows
+    /// nothing: that is what `Off` means.
+    fn adopt_device_list(&mut self, devices: Vec<AudioDevice>) -> Option<UiToAudio> {
+        self.devices_seen = true;
+        for direction in [DeviceDirection::Output, DeviceDirection::Input] {
+            self.state.set_selection(
+                direction,
+                lane_selection(&self.settings, &devices, direction),
+            );
+        }
+        self.state.devices = devices;
+        self.saved_device_for_engine()
+    }
+
+    /// The engine starts in the output direction and picks by the device rules alone; the saved
+    /// choice — and with it a saved microphone — reaches it from here, the first time that device
+    /// is listed, for the lane [`lane_to_announce`] names.
+    fn saved_device_for_engine(&mut self) -> Option<UiToAudio> {
+        let direction = lane_to_announce(&self.settings, self.last_picked_lane)?;
+        saved_device_to_announce(
+            &self.settings,
+            direction,
+            &self.state.devices,
+            &mut self.announced_device,
+        )
     }
 
     /// Act on everything the views reported this frame.
@@ -343,81 +454,20 @@ impl App {
             UiAction::DeletePreset => self.delete_preset(),
 
             UiAction::SelectDevice(index) => {
-                // Everything needed from the device is taken before anything borrows `self`
-                // mutably, because restoring the remembered preset calls back into
-                // `select_preset`.
-                let Some((name, description, direction)) = self
-                    .state
-                    .devices
-                    .get(index)
-                    .map(|d| (d.name.clone(), d.description.clone(), d.direction))
-                else {
-                    return;
-                };
-
-                let crossed = direction != self.settings.device_direction;
-
-                self.state.selected_device = Some(index);
-                // The interface follows the device immediately rather than waiting for the next
-                // device list: picking a microphone is exactly the moment the five effect sliders
-                // stop meaning anything, and a frame of them still looking live is a frame of
-                // lying.
-                self.state.direction = direction;
-                self.settings.set_device_name(direction, &name);
-                // Picking a device also makes its lane the one the window edits. Said explicitly:
-                // `set_selected_device` used to do it as a side effect.
-                self.settings.set_edit_direction(direction);
-                if crossed {
-                    // Two lists, and the picker shows the one belonging to the live chain. The
-                    // previous selection cannot survive: it is not in the new list.
-                    self.refresh_preset_list();
-                    self.state.selected_preset = None;
+                // The tray and the command line name a device, not a lane: the device's own
+                // direction says which lane it is for.
+                if let Some(direction) = self.state.devices.get(index).map(|d| d.direction) {
+                    self.select_device(index, direction);
                 }
-                self.settings_dirty = true;
-                if let Some(engine) = &self.engine {
-                    engine.send(UiToAudio::SelectDevice {
-                        node_name: name.clone(),
-                        direction,
-                    });
-                    self.announced_device = Some((name.clone(), direction));
-                }
-
-                // A device the user has used before brings its preset back with it. Only a
-                // *remembered* one does: the first time something is plugged in, whatever is
-                // selected stays selected, because guessing then would be changing the sound on
-                // no evidence at all.
-                //
-                // Crossing between a speaker and a microphone is the exception, and it is not a
-                // guess: the two chains share nothing but the equalizer, so a music preset on a
-                // voice is wrong by construction. When the device itself is new, the direction
-                // still remembers what the user last had in it.
-                let remembered = self
-                    .settings
-                    .preset_for_device(&name, direction)
-                    .map(ToOwned::to_owned)
-                    .or_else(|| crossed.then(|| self.settings.selected_preset().to_owned()));
-                if let Some(preset) = remembered
-                    && self
-                        .state
-                        .preset()
-                        .is_none_or(|current| current.name != preset)
-                    && let Some(at) = self.state.presets.iter().position(|e| e.name == preset)
-                {
-                    self.select_preset(at);
-                }
-                // A crossing swapped the list, so something in the new one has to be selected: the
-                // picker cannot sit blank in front of a chain that is running. This is not the
-                // guess the code refuses to make above — that one is about choosing *between*
-                // presets on no evidence, and here the alternative is showing none at all.
-                if crossed && self.state.selected_preset.is_none() && !self.state.presets.is_empty()
-                {
-                    self.select_preset(0);
-                }
-
-                // `"Output: "` + name, and the preset in use with it (`FxController.cpp:1150`).
-                let preset = self.state.preset().map(|p| p.name.clone());
-                self.notify(Message::output_selected(&description, preset.as_deref()));
             }
+            UiAction::SelectOutput(index) => self.select_device(index, DeviceDirection::Output),
+            UiAction::SelectInput(index) => self.select_device(index, DeviceDirection::Input),
+            UiAction::DetachOutput => self.detach_lane(DeviceDirection::Output),
+            UiAction::DetachInput => self.detach_lane(DeviceDirection::Input),
+            UiAction::SetEditDirection(direction) => {
+                self.set_edit_direction(direction);
+            }
+            UiAction::DismissNotice => self.state.dismiss_notification(),
 
             UiAction::SetEffect(effect, value) => {
                 self.state.effects[effect as usize] = value.clamp(0.0, scale::SLIDER_MAX);
@@ -449,28 +499,39 @@ impl App {
             }
             UiAction::SetFilterQ(q) => {
                 self.state.filter_q = q.clamp(1.0, 3.0);
-                self.settings.filter_q = self.state.filter_q;
-                self.settings_dirty = true;
+                // The four level settings are the music chain's. On a microphone the same controls
+                // are the voice preset's, and writing them here would hand the speakers a voice's
+                // numbers the next time they are edited.
+                if self.state.direction == DeviceDirection::Output {
+                    self.settings.filter_q = self.state.filter_q;
+                    self.settings_dirty = true;
+                }
                 self.sync_params_from_state();
             }
             UiAction::RestoreDefaults => self.restore_defaults(),
 
             UiAction::SetMasterGain(db) => {
                 self.state.master_gain_db = db.clamp(-20.0, 20.0);
-                self.settings.master_gain = self.state.master_gain_db;
-                self.settings_dirty = true;
+                if self.state.direction == DeviceDirection::Output {
+                    self.settings.master_gain = self.state.master_gain_db;
+                    self.settings_dirty = true;
+                }
                 self.sync_params_from_state();
             }
             UiAction::SetBalance(db) => {
                 self.state.balance_db = db.clamp(-20.0, 20.0);
-                self.settings.balance = self.state.balance_db;
-                self.settings_dirty = true;
+                if self.state.direction == DeviceDirection::Output {
+                    self.settings.balance = self.state.balance_db;
+                    self.settings_dirty = true;
+                }
                 self.sync_params_from_state();
             }
             UiAction::SetVolumeLeveling(amount) => {
                 self.state.volume_leveling = amount.clamp(0.0, 4.0);
-                self.settings.volume_leveling = self.state.volume_leveling;
-                self.settings_dirty = true;
+                if self.state.direction == DeviceDirection::Output {
+                    self.settings.volume_leveling = self.state.volume_leveling;
+                    self.settings_dirty = true;
+                }
                 self.sync_params_from_state();
             }
 
@@ -586,7 +647,10 @@ impl App {
             self.apply_input_preset(&preset);
             self.state.selected_preset = Some(index);
             self.notify(Message::preset_selected(&name));
-            self.settings.set_selected_preset(&name);
+            // Recorded against the lane rather than the edit direction, which start-up has not
+            // entered yet when it loads the lane off screen.
+            self.settings
+                .set_preset_for_direction(DeviceDirection::Input, &name);
             self.settings_dirty = true;
             if let Some(engine) = &self.engine {
                 engine.send_event(DspEvent::ResetFilterState);
@@ -619,7 +683,7 @@ impl App {
                 // brings this preset with them. `DeviceConfig` and its two accessors were written
                 // and tested for exactly this and then never called by anything.
                 if let Some((node, description, form_factor, direction)) =
-                    self.state.selected_device.and_then(|at| {
+                    self.state.selected_device().and_then(|at| {
                         self.state.devices.get(at).map(|d| {
                             (
                                 d.name.clone(),
@@ -638,7 +702,8 @@ impl App {
                         direction,
                     );
                 }
-                self.settings.set_selected_preset(&name);
+                self.settings
+                    .set_preset_for_direction(DeviceDirection::Output, &name);
                 self.settings_dirty = true;
                 // A new band layout means the old filter history is meaningless.
                 if let Some(engine) = &self.engine {
@@ -647,7 +712,8 @@ impl App {
             }
             Err(err) => {
                 log::warn!("could not load preset {name}: {err}");
-                self.state.notification = Some(tr_args("Could not load %s", &[name.as_str()]));
+                self.state
+                    .notify(tr_args("Could not load %s", &[name.as_str()]));
             }
         }
     }
@@ -707,12 +773,13 @@ impl App {
                 } else {
                     Message::preset_overwritten(&name)
                 };
-                self.state.notification = Some(message.body.clone());
+                self.state.notify(message.body.clone());
                 self.notify(message);
             }
             Err(err) => {
                 log::warn!("could not save preset {name}: {err}");
-                self.state.notification = Some(tr_args("Could not save %s", &[name.as_str()]));
+                self.state
+                    .notify(tr_args("Could not save %s", &[name.as_str()]));
             }
         }
     }
@@ -736,7 +803,7 @@ impl App {
             return;
         };
         if entry.factory {
-            self.state.notification = Some(tr("Factory presets cannot be deleted"));
+            self.state.notify(tr("Factory presets cannot be deleted"));
             return;
         }
         let name = entry.name.clone();
@@ -750,12 +817,13 @@ impl App {
                     self.select_preset(next);
                 }
                 let message = Message::preset_deleted(&name);
-                self.state.notification = Some(message.body.clone());
+                self.state.notify(message.body.clone());
                 self.notify(message);
             }
             Err(err) => {
                 log::warn!("could not delete preset {name}: {err}");
-                self.state.notification = Some(tr_args("Could not delete %s", &[name.as_str()]));
+                self.state
+                    .notify(tr_args("Could not delete %s", &[name.as_str()]));
             }
         }
     }
@@ -793,11 +861,13 @@ impl App {
         self.state.master_gain_db = 0.0;
         self.state.balance_db = 0.0;
         self.state.volume_leveling = 0.0;
-        self.settings.filter_q = 1.0;
-        self.settings.master_gain = 0.0;
-        self.settings.balance = 0.0;
-        self.settings.volume_leveling = 0.0;
-        self.settings_dirty = true;
+        if self.state.direction == DeviceDirection::Output {
+            self.settings.filter_q = 1.0;
+            self.settings.master_gain = 0.0;
+            self.settings.balance = 0.0;
+            self.settings.volume_leveling = 0.0;
+            self.settings_dirty = true;
+        }
         self.mark_preset_modified();
         self.sync_params_from_state();
     }
@@ -806,8 +876,27 @@ impl App {
     ///
     /// Called after every change rather than on a timer: publishing is wait-free, so there is no
     /// reason to batch it, and a slider drag should be audible immediately.
+    ///
+    /// Only the **edit direction's** snapshot is written from the window; the other lane's keeps
+    /// what it was last given, because the window is not showing it. The power switch is the one
+    /// control both share, and it reaches both.
     fn sync_params_from_state(&mut self) {
         self.params.power = self.state.power;
+        self.input_params.power = self.state.power;
+        match self.state.direction {
+            DeviceDirection::Output => self.sync_output_params_from_state(),
+            DeviceDirection::Input => self.sync_input_params_from_state(),
+        }
+        self.reflect_input_params();
+
+        if let Some(engine) = self.engine.as_mut() {
+            engine.set_params(self.params);
+            engine.set_input_params(self.input_params);
+        }
+    }
+
+    /// The window's controls, mapped onto the music chain.
+    fn sync_output_params_from_state(&mut self) {
         for effect in Effect::ALL {
             self.params.set_effect(
                 effect,
@@ -820,13 +909,212 @@ impl App {
         self.params.master_gain_db = self.state.master_gain_db;
         self.params.balance = self.state.balance_db;
         self.params.volume_leveling_db = self.state.volume_leveling;
+    }
 
-        self.sync_input_params_from_state();
+    /// What the readout strip reports about the voice chain that the meters do not: the level in
+    /// force, whether the de-reverb and the echo canceller are asked for, and the de-esser corner
+    /// the preset asked for (so the strip can tell when the adaptive mode moved it).
+    fn reflect_input_params(&mut self) {
+        self.state.denoise_level = self.input_params.denoise_level;
+        self.state.dereverb_on = self.input_params.dereverb != fxsound_core::DereverbLevel::Off;
+        self.state.deesser_requested_hz = self.input_params.deesser_hz;
+        self.state.echo_cancel_on = self.settings.echo_cancel;
+    }
 
-        if let Some(engine) = self.engine.as_mut() {
-            engine.set_params(self.params);
-            engine.set_input_params(self.input_params);
+    /// Attach `lane` to device `index` — the one path the window, the tray and the command line
+    /// all take.
+    ///
+    /// The other lane is left exactly as it is: picking a microphone no longer means the speakers
+    /// went away. Picking a device also makes its lane the edit direction, since that is the chain
+    /// the user has just shown an interest in.
+    fn select_device(&mut self, index: usize, lane: DeviceDirection) {
+        // Everything needed from the device is taken before anything borrows `self` mutably,
+        // because restoring the remembered preset calls back into `select_preset`.
+        let Some((name, description, direction)) = self
+            .state
+            .devices
+            .get(index)
+            .map(|d| (d.name.clone(), d.description.clone(), d.direction))
+        else {
+            return;
+        };
+        if direction != lane {
+            log::warn!("{name} is not an {lane:?} device; not selected");
+            return;
         }
+        // Read before anything below records a preset against this device.
+        let remembered = self
+            .settings
+            .preset_for_device(&name, direction)
+            .map(ToOwned::to_owned);
+
+        self.state.set_selection(direction, Some(index));
+        self.settings.set_device_name(direction, &name);
+        self.settings.set_lane_enabled(direction, true);
+        self.settings_dirty = true;
+        self.last_picked_lane = Some(direction);
+        // The interface follows the device immediately rather than waiting for the next device
+        // list: picking a microphone is exactly the moment the five effect sliders stop meaning
+        // anything, and a frame of them still looking live is a frame of lying.
+        self.set_edit_direction(direction);
+        if let Some(engine) = &self.engine {
+            engine.send(UiToAudio::SelectDevice {
+                node_name: name.clone(),
+                direction,
+            });
+            self.announced_device = Some((name.clone(), direction));
+        }
+
+        // A device the user has used before brings its preset back with it. Only a *remembered*
+        // one does: the first time something is plugged in, whatever is selected stays selected,
+        // because guessing then would be changing the sound on no evidence at all. (Moving to the
+        // other lane already brought back what that lane last had, in `set_edit_direction`.)
+        if let Some(preset) = remembered
+            && self
+                .state
+                .preset()
+                .is_none_or(|current| current.name != preset)
+            && let Some(at) = self.state.presets.iter().position(|e| e.name == preset)
+        {
+            self.select_preset(at);
+        }
+
+        // `"Output: "` + name, and the preset in use with it (`FxController.cpp:1150`).
+        let preset = self.state.preset().map(|p| p.name.clone());
+        self.notify(Message::output_selected(&description, preset.as_deref()));
+    }
+
+    /// Detach a lane: hand its default back, stop processing it, remember that it is off.
+    ///
+    /// The engine this crate runs against today has one lane and ignores `DetachLane`. So that
+    /// switching off the lane it serves still does something, it is then sent the other lane's
+    /// saved device when that lane is enabled — which is where the two-lane engine would be
+    /// running anyway. With both lanes off it keeps what it had until the two-lane engine lands.
+    fn detach_lane(&mut self, direction: DeviceDirection) {
+        self.state.set_selection(direction, None);
+        match direction {
+            DeviceDirection::Output => self.state.output_active = false,
+            DeviceDirection::Input => self.state.input_active = false,
+        }
+        self.settings.set_lane_enabled(direction, false);
+        self.settings_dirty = true;
+        if let Some(engine) = &self.engine {
+            engine.send(UiToAudio::DetachLane(direction));
+        }
+        // Picking the same device again has to reach the engine again.
+        if self
+            .announced_device
+            .as_ref()
+            .is_some_and(|(_, announced)| *announced == direction)
+        {
+            self.announced_device = None;
+        }
+        if self.last_picked_lane == Some(direction) {
+            self.last_picked_lane = None;
+        }
+        if self.engine.is_some()
+            && let Some(message) = self.saved_device_for_engine()
+            && let Some(engine) = &self.engine
+        {
+            engine.send(message);
+        }
+    }
+
+    /// Make `direction` the lane the window edits. Returns whether it changed.
+    ///
+    /// Nothing the engine runs changes: this swaps what the window *shows*. The lane being left is
+    /// parked as it is, unsaved edits and all; the lane being entered comes back as it was left, or
+    /// — the first time this session — with the preset the settings file remembers for it, loaded
+    /// the way start-up loads one, without a toast.
+    fn set_edit_direction(&mut self, direction: DeviceDirection) -> bool {
+        if direction == self.state.direction {
+            if self.settings.device_direction != direction {
+                self.settings.set_edit_direction(direction);
+                self.settings_dirty = true;
+            }
+            return false;
+        }
+        let leaving = (self.state.direction, LaneControls::take(&self.state));
+        self.state.direction = direction;
+        self.settings.set_edit_direction(direction);
+        self.settings_dirty = true;
+
+        match self.parked.take() {
+            Some((parked, controls)) if parked == direction => {
+                let selected = controls
+                    .selected_preset
+                    .and_then(|i| controls.presets.get(i))
+                    .map(|p| (p.name.clone(), p.modified));
+                controls.put(&mut self.state);
+                // The list may have changed while it was parked — an import, a rename — so it is
+                // rebuilt, and the selection found again by name with its unsaved-changes marker.
+                self.refresh_preset_list();
+                self.state.selected_preset = None;
+                if let Some((name, modified)) = selected
+                    && let Some(at) = self.state.presets.iter().position(|p| p.name == name)
+                {
+                    self.state.selected_preset = Some(at);
+                    self.state.presets[at].modified |= modified;
+                }
+                self.sync_params_from_state();
+            }
+            _ => self.enter_lane_for_the_first_time(direction),
+        }
+        self.parked = Some(leaving);
+        true
+    }
+
+    /// Show a lane the window has not edited yet this session.
+    fn enter_lane_for_the_first_time(&mut self, direction: DeviceDirection) {
+        // Start from what that lane's chain is running, so that a lane with no preset to load
+        // shows its own numbers rather than the other lane's.
+        match direction {
+            DeviceDirection::Output => {
+                self.state.filter_q = self.settings.filter_q;
+                self.state.master_gain_db = self.settings.master_gain;
+                self.state.balance_db = self.settings.balance;
+                self.state.volume_leveling = self.settings.volume_leveling;
+                for effect in Effect::ALL {
+                    self.state.effects[effect as usize] =
+                        scale::value_to_slider_for(effect, self.params.effect(effect));
+                }
+                self.state.eq_on = self.params.eq_on;
+                let (centres, boosts) = self.params.bands();
+                self.state.eq_bands = bands_of(centres, boosts);
+            }
+            DeviceDirection::Input => {
+                let params = self.input_params;
+                self.state.eq_on = params.eq_on;
+                let (centres, boosts) = params.bands();
+                self.state.eq_bands = bands_of(centres, boosts);
+                self.state.filter_q = params.filter_q;
+                self.state.master_gain_db = params.makeup_db;
+                self.state.denoise_on = params.rnnoise;
+                self.state.gate_on = params.gate_on;
+                self.state.compressor_on = params.compressor_on;
+                self.state.deesser_on = params.deesser_on;
+            }
+        }
+        self.refresh_preset_list();
+        self.state.selected_preset = None;
+        // By lane rather than through the edit direction: start-up loads the lane off screen
+        // through here too, before the edit direction has been entered.
+        let saved = self.settings.preset_for_direction(direction).to_owned();
+        let index = self
+            .state
+            .presets
+            .iter()
+            .position(|p| p.name == saved)
+            .or_else(|| (!self.state.presets.is_empty()).then_some(0));
+        if let Some(index) = index {
+            // Not something to announce: the user asked to look at a lane, not for a preset.
+            let armed = std::mem::replace(&mut self.notifications_armed, false);
+            self.select_preset(index);
+            self.notifications_armed = armed;
+        }
+        // Published whether or not a preset was loaded: with none to load, or one that failed to,
+        // the lane runs what it was seeded with above rather than what its snapshot last held.
+        self.sync_params_from_state();
     }
 
     /// The same controls, mapped onto the microphone chain.
@@ -855,8 +1143,6 @@ impl App {
     /// leveller, none of which has a counterpart in a voice chain. They are inert while a
     /// microphone is selected, and the interface says so.
     fn sync_input_params_from_state(&mut self) {
-        self.input_params.power = self.state.power;
-
         self.input_params.eq_on = self.state.eq_on;
         self.input_params.set_bands(&self.state.eq_bands);
         self.input_params.filter_q = self.state.filter_q;
@@ -947,7 +1233,7 @@ impl App {
         Self {
             state: UiState::default(),
             params: DspParams::default(),
-            input_params: InputDspParams::default(),
+            input_params: unvoiced_input_params(),
             input_chain: fxsound_preset::input::DEFAULT_CHAIN.to_owned(),
             input_presets: Vec::new(),
             devices_seen: false,
@@ -965,9 +1251,11 @@ impl App {
             persist: false,
             export_dir: std::env::temp_dir().join("fxsound-app-test-export"),
             announced_device: None,
+            last_picked_lane: None,
             notifier: Notifier::new(true),
             notifications_armed: true,
             tray_tip_shown: false,
+            parked: None,
         }
     }
 
@@ -1042,7 +1330,7 @@ impl App {
                     direction: d.direction,
                 })
                 .collect(),
-            selected_device: self.state.selected_device,
+            selected_device: self.state.selected_device(),
             language: i18n::current(),
             pixmaps: crate::tray::TrayPixmaps::default(),
         }
@@ -1118,7 +1406,7 @@ impl App {
             return;
         };
         if entry.factory {
-            self.state.notification = Some(tr("Factory presets cannot be renamed"));
+            self.state.notify(tr("Factory presets cannot be renamed"));
             return;
         }
         let old = entry.name.clone();
@@ -1126,8 +1414,8 @@ impl App {
             return;
         }
         if !self.is_preset_name_available(new_name) {
-            self.state.notification =
-                Some(tr_args("A preset named %s already exists", &[new_name]));
+            self.state
+                .notify(tr_args("A preset named %s already exists", &[new_name]));
             return;
         }
 
@@ -1135,14 +1423,16 @@ impl App {
             Ok(loaded) => loaded,
             Err(err) => {
                 log::warn!("could not load preset {old} to rename it: {err}");
-                self.state.notification = Some(tr_args("Could not rename %s", &[old.as_str()]));
+                self.state
+                    .notify(tr_args("Could not rename %s", &[old.as_str()]));
                 return;
             }
         };
         preset.name = new_name.to_owned();
         if let Err(err) = self.presets.save_as(&preset, new_name) {
             log::warn!("could not save preset {new_name}: {err}");
-            self.state.notification = Some(tr_args("Could not rename %s", &[old.as_str()]));
+            self.state
+                .notify(tr_args("Could not rename %s", &[old.as_str()]));
             return;
         }
         if let Err(err) = self.presets.delete(&old) {
@@ -1156,7 +1446,8 @@ impl App {
         self.state.selected_preset = self.presets.index_of(new_name);
         self.settings.set_selected_preset(new_name);
         self.settings_dirty = true;
-        self.state.notification = Some(tr_args("Renamed %s to %s", &[old.as_str(), new_name]));
+        self.state
+            .notify(tr_args("Renamed %s to %s", &[old.as_str(), new_name]));
         // Direct callers (the menu) do not go through `handle`, so flush here.
         self.handle(&[]);
     }
@@ -1314,7 +1605,7 @@ impl App {
             PresetsAction::RevealExportFolder => {
                 if let Err(err) = reveal_folder(&self.export_dir) {
                     log::warn!("could not open {}: {err}", self.export_dir.display());
-                    self.state.notification = Some(tr_args(
+                    self.state.notify(tr_args(
                         "Presets exported to %s",
                         &[&self.export_dir.display().to_string()],
                     ));
@@ -1343,7 +1634,7 @@ impl App {
     fn export_presets(&mut self, names: &[String]) -> usize {
         if let Err(err) = std::fs::create_dir_all(&self.export_dir) {
             log::warn!("could not create {}: {err}", self.export_dir.display());
-            self.state.notification = Some(tr("Could not create the export folder"));
+            self.state.notify(tr("Could not create the export folder"));
             return 0;
         }
         let mut written = 0;
@@ -1352,8 +1643,8 @@ impl App {
                 Ok(_) => written += 1,
                 Err(err) => {
                     log::warn!("could not export {name}: {err}");
-                    self.state.notification =
-                        Some(tr_args("Could not export %s", &[name.as_str()]));
+                    self.state
+                        .notify(tr_args("Could not export %s", &[name.as_str()]));
                 }
             }
         }
@@ -1379,15 +1670,94 @@ impl App {
     }
 }
 
-/// The saved device selection, when it is time to send it to the engine.
+/// The microphone snapshot before any voice preset is chosen: an 80 Hz second-order high-pass, a
+/// flat equalizer, no makeup, and every dynamics stage off.
+///
+/// Not `InputDspParams::default()`, which is Clean Voice with its gate, compressor, de-esser and
+/// 6 dB of makeup: nothing should start working on someone's voice before they have chosen it. The
+/// window used to get the same effect by overwriting the snapshot from its own controls on every
+/// change — whichever lane it was showing, which is how a music preset's equalizer and gain once
+/// reached a microphone.
+fn unvoiced_input_params() -> InputDspParams {
+    InputDspParams {
+        rnnoise: false,
+        gate_on: false,
+        compressor_on: false,
+        deesser_on: false,
+        makeup_db: 0.0,
+        ..InputDspParams::default()
+    }
+}
+
+/// An equalizer as the window holds it, from a snapshot's two parallel arrays.
+fn bands_of(centres: &[f32], boosts: &[f32]) -> Vec<EqBand> {
+    centres
+        .iter()
+        .zip(boosts)
+        .map(|(&center_hz, &boost_db)| EqBand {
+            center_hz,
+            boost_db,
+        })
+        .collect()
+}
+
+/// Which device a lane shows after a device list arrives: the one the settings name for it when it
+/// is listed, else the server's default of that direction; nothing at all for a detached lane.
+fn lane_selection(
+    settings: &Settings,
+    devices: &[AudioDevice],
+    direction: DeviceDirection,
+) -> Option<usize> {
+    if !settings.lane_enabled(direction) {
+        return None;
+    }
+    let wanted = settings.device_name(direction);
+    devices
+        .iter()
+        .position(|d| d.name == wanted && d.direction == direction)
+        .or_else(|| {
+            devices
+                .iter()
+                .position(|d| d.is_default && d.direction == direction)
+        })
+}
+
+/// Which lane the saved device choice is announced for, while the engine has one lane to give.
+///
+/// The lane the user last picked a device for this session, while it is still enabled; else the
+/// output lane when it is enabled — the engine starts there, and running it is the Windows
+/// behaviour; else the input lane when it is enabled; else none, and the engine's own device
+/// rules are left alone.
+///
+/// Never the edit direction. That says which chain the window shows, and looking at the other
+/// lane's list must not change what the engine runs (0.4.0 design, §1.1) — least of all attach a
+/// lane the user switched off. The 0.3.0 meaning of `device_direction` ("the live lane") is not
+/// read here either: the loader has already turned it into `input_enabled`, after which it cannot
+/// be told from a 0.4.0 edit direction, so on this single-lane engine a user who left 0.3.0 on a
+/// microphone comes back to the speakers until they pick the microphone again. The two-lane
+/// engine attaches every enabled lane, and this choice goes away with it.
+fn lane_to_announce(
+    settings: &Settings,
+    last_picked: Option<DeviceDirection>,
+) -> Option<DeviceDirection> {
+    last_picked
+        .filter(|&direction| settings.lane_enabled(direction))
+        .or_else(|| {
+            [DeviceDirection::Output, DeviceDirection::Input]
+                .into_iter()
+                .find(|&direction| settings.lane_enabled(direction))
+        })
+}
+
+/// The saved device of `direction`, when it is time to send it to the engine.
 ///
 /// The port of `FxController::init` step 5 (`docs/spec/05-controller-model.md` §9.2): once the
 /// device list is known, a device named by the saved `output_device_name` is adopted and
 /// `setOutput` forces it. Here the engine starts in the output direction and runs the device rules
-/// on its own, so the saved choice — `settings.device_name(..)` for
-/// `settings.device_direction` — is handed to it the first time that device is listed; rule 2 of
-/// `choose_device` yields to it (`docs/spec/12-audio-io.md` §28.5), and a saved input mode brings
-/// the engine round to the source direction.
+/// on its own, so the saved choice — `settings.device_name(direction)` — is handed to it the first
+/// time that device is listed; rule 2 of `choose_device` yields to it
+/// (`docs/spec/12-audio-io.md` §28.5), and a saved microphone brings the engine round to the
+/// source direction. A detached lane is never announced.
 ///
 /// `announced` is what was last sent. A device list that merely changed *around* the saved device
 /// sends nothing again; a device that vanished and came back is announced afresh, which the
@@ -1395,16 +1765,25 @@ impl App {
 /// matches a node, so nothing is sent on a first run.
 fn saved_device_to_announce(
     settings: &Settings,
+    direction: DeviceDirection,
     devices: &[AudioDevice],
     announced: &mut Option<(String, DeviceDirection)>,
 ) -> Option<UiToAudio> {
-    let direction = settings.device_direction;
+    let forget = |announced: &mut Option<(String, DeviceDirection)>| {
+        if announced.as_ref().is_some_and(|(_, dir)| *dir == direction) {
+            *announced = None;
+        }
+    };
+    if !settings.lane_enabled(direction) {
+        forget(announced);
+        return None;
+    }
     let wanted = settings.device_name(direction);
     if !devices
         .iter()
         .any(|d| d.name == wanted && d.direction == direction)
     {
-        *announced = None;
+        forget(announced);
         return None;
     }
     if announced
@@ -1608,7 +1987,8 @@ impl App {
                     Ok(()) => state.launch_on_startup = *on,
                     Err(err) => {
                         log::warn!("could not change the autostart entry: {err}");
-                        self.state.notification = Some(tr("Could not change the startup setting"));
+                        self.state
+                            .notify(tr("Could not change the startup setting"));
                     }
                 }
             }
@@ -1650,14 +2030,14 @@ impl App {
                     self.select_preset(index);
                 }
                 let message = Message::presets_restored();
-                self.state.notification = Some(message.body.clone());
+                self.state.notify(message.body.clone());
                 self.notify(message);
             }
 
             A::OpenUrl(url) => {
                 if let Err(err) = open_url(url) {
                     log::warn!("could not open {url}: {err}");
-                    self.state.notification = Some(tr("Could not open the link"));
+                    self.state.notify(tr("Could not open the link"));
                 }
             }
 
@@ -2143,7 +2523,7 @@ mod tests {
             "a command that is about to become valid must not fail"
         );
         assert!(outcome.stderr.is_empty());
-        assert_eq!(app.state.selected_device, None, "nothing to select yet");
+        assert_eq!(app.state.selected_device(), None, "nothing to select yet");
 
         // The list arrives, and the command it was waiting for happens.
         app.devices_seen = true;
@@ -2152,7 +2532,7 @@ mod tests {
             device("alsa_input.mic", DeviceDirection::Input, false),
         ];
         app.apply_pending_device();
-        assert_eq!(app.state.selected_device, Some(1));
+        assert_eq!(app.state.selected_device(), Some(1));
         assert_eq!(app.state.direction, DeviceDirection::Input);
     }
 
@@ -2180,7 +2560,7 @@ mod tests {
             "the message should name what was asked for: {:?}",
             outcome.stderr
         );
-        assert_eq!(app.state.selected_device, None);
+        assert_eq!(app.state.selected_device(), None);
     }
 
     #[test]
@@ -2196,14 +2576,15 @@ mod tests {
             true,
         )];
         app.apply_pending_device();
-        assert_eq!(app.state.selected_device, None);
+        assert_eq!(app.state.selected_device(), None);
 
         app.state
             .devices
             .push(device("typo", DeviceDirection::Output, false));
         app.apply_pending_device();
         assert_eq!(
-            app.state.selected_device, None,
+            app.state.selected_device(),
+            None,
             "a spent name came back to life"
         );
     }
@@ -2254,7 +2635,9 @@ mod tests {
 
     #[test]
     fn the_controls_a_voice_shares_with_music_reach_the_microphone_chain() {
+        // While the microphone is the lane being edited; the next test is the other half.
         let mut app = App::headless_for_tests();
+        app.state.direction = DeviceDirection::Input;
         app.state.power = true;
         app.state.eq_on = true;
         app.state.master_gain_db = -4.0;
@@ -2270,6 +2653,330 @@ mod tests {
         );
         let (_, boosts) = input.bands();
         assert_eq!(boosts[2], 3.5, "the equalizer is what the two chains share");
+    }
+
+    #[test]
+    fn editing_the_output_never_reaches_the_microphone_snapshot() {
+        // The other half of the test above: a music preset's equalizer and gain on a voice is the
+        // cross-direction leak the 0.3.0 audit found.
+        let mut app = App::headless_for_tests();
+        let before = *app.input_params();
+        app.handle(&[
+            UiAction::SetMasterGain(8.0),
+            UiAction::SetBandGain(2, 6.0),
+            UiAction::SetFilterQ(2.5),
+        ]);
+        assert_eq!(app.params().master_gain_db, 8.0);
+        assert_eq!(*app.input_params(), before, "the microphone chain moved");
+    }
+
+    #[test]
+    fn the_microphone_starts_unvoiced_whatever_the_speakers_are_doing() {
+        let app = App::headless_for_tests();
+        let input = app.input_params();
+        assert_eq!(input.makeup_db, 0.0);
+        assert!(input.bands().1.iter().all(|&gain| gain == 0.0));
+        assert!(!input.rnnoise);
+    }
+
+    /// Speakers, headphones and a microphone.
+    fn lanes() -> App {
+        let mut app = headless();
+        app.state.devices = vec![
+            device("alsa_output.speakers", DeviceDirection::Output, true),
+            device("alsa_output.headphones", DeviceDirection::Output, false),
+            device("alsa_input.mic", DeviceDirection::Input, false),
+        ];
+        app
+    }
+
+    #[test]
+    fn picking_a_microphone_leaves_the_speakers_selected() {
+        let mut app = lanes();
+        app.handle(&[UiAction::SelectOutput(1), UiAction::SelectInput(2)]);
+        assert_eq!(
+            app.state.selected_output,
+            Some(1),
+            "the output lane is still there"
+        );
+        assert_eq!(app.state.selected_input, Some(2));
+        assert_eq!(app.state.direction, DeviceDirection::Input);
+        assert!(app.settings.lane_enabled(DeviceDirection::Output));
+        assert!(app.settings.lane_enabled(DeviceDirection::Input));
+        assert_eq!(
+            app.settings.device_name(DeviceDirection::Output),
+            "alsa_output.headphones"
+        );
+        assert_eq!(
+            app.settings.device_name(DeviceDirection::Input),
+            "alsa_input.mic"
+        );
+    }
+
+    #[test]
+    fn select_device_resolves_to_the_lane_of_the_device_it_names() {
+        let mut app = lanes();
+        app.handle(&[UiAction::SelectDevice(0)]);
+        assert_eq!(app.state.selected_output, Some(0));
+        app.handle(&[UiAction::SelectDevice(2)]);
+        assert_eq!(app.state.selected_input, Some(2));
+        assert_eq!(
+            app.state.selected_output,
+            Some(0),
+            "a microphone is not a speaker"
+        );
+        assert_eq!(
+            app.state.selected_device(),
+            Some(2),
+            "and it is now being edited"
+        );
+    }
+
+    #[test]
+    fn a_device_offered_to_the_wrong_lane_is_refused() {
+        let mut app = lanes();
+        app.handle(&[UiAction::SelectOutput(2), UiAction::SelectInput(0)]);
+        assert_eq!(app.state.selected_output, None);
+        assert_eq!(app.state.selected_input, None);
+        assert!(app.settings.device_name(DeviceDirection::Output).is_empty());
+        assert!(app.settings.device_name(DeviceDirection::Input).is_empty());
+        assert_eq!(app.state.direction, DeviceDirection::Output);
+    }
+
+    #[test]
+    fn detaching_the_microphone_leaves_the_speakers_alone_and_is_remembered() {
+        let mut app = lanes();
+        app.handle(&[UiAction::SelectOutput(0), UiAction::SelectInput(2)]);
+        app.state.input_active = true;
+        app.handle(&[UiAction::DetachInput]);
+        assert_eq!(app.state.selected_input, None);
+        assert!(!app.state.input_active);
+        assert_eq!(app.state.selected_output, Some(0));
+        assert!(!app.settings.lane_enabled(DeviceDirection::Input));
+        assert!(app.settings.lane_enabled(DeviceDirection::Output));
+        // The device is remembered for the next time the lane is turned on.
+        assert_eq!(
+            app.settings.device_name(DeviceDirection::Input),
+            "alsa_input.mic"
+        );
+    }
+
+    #[test]
+    fn detaching_the_speakers_leaves_the_microphone_alone() {
+        let mut app = lanes();
+        app.handle(&[UiAction::SelectInput(2), UiAction::SelectOutput(1)]);
+        app.handle(&[UiAction::DetachOutput]);
+        assert_eq!(app.state.selected_output, None);
+        assert_eq!(app.state.selected_input, Some(2));
+        assert!(!app.settings.lane_enabled(DeviceDirection::Output));
+    }
+
+    #[test]
+    fn a_detached_lane_shows_nothing_after_a_rescan_and_an_enabled_one_its_device() {
+        let devices = vec![
+            device("alsa_output.speakers", DeviceDirection::Output, true),
+            device("alsa_input.mic", DeviceDirection::Input, true),
+            device("alsa_input.webcam", DeviceDirection::Input, false),
+        ];
+        let mut settings = Settings::default();
+        settings.set_lane_enabled(DeviceDirection::Input, false);
+        settings.set_device_name(DeviceDirection::Input, "alsa_input.webcam");
+        assert_eq!(
+            lane_selection(&settings, &devices, DeviceDirection::Output),
+            Some(0),
+            "no saved output: the server's default"
+        );
+        assert_eq!(
+            lane_selection(&settings, &devices, DeviceDirection::Input),
+            None,
+            "a detached lane stays off"
+        );
+        settings.set_lane_enabled(DeviceDirection::Input, true);
+        assert_eq!(
+            lane_selection(&settings, &devices, DeviceDirection::Input),
+            Some(2),
+            "the saved microphone, not the default one"
+        );
+        settings.set_device_name(DeviceDirection::Input, "unplugged");
+        assert_eq!(
+            lane_selection(&settings, &devices, DeviceDirection::Input),
+            Some(1),
+            "a missing device falls back to the default of its own direction"
+        );
+        settings.set_lane_enabled(DeviceDirection::Output, false);
+        assert_eq!(
+            lane_selection(&settings, &devices, DeviceDirection::Output),
+            None
+        );
+    }
+
+    #[test]
+    fn switching_the_edit_direction_swaps_the_preset_list_and_back() {
+        let mut app = app_with_two_presets("edit-direction");
+        with_voice_presets(&mut app);
+        app.settings.input_preset = "Flat".to_owned();
+        app.handle(&[UiAction::SelectPreset(1)]);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Beta"));
+
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
+        assert_eq!(app.state.direction, DeviceDirection::Input);
+        assert_eq!(app.settings.device_direction, DeviceDirection::Input);
+        let names: Vec<&str> = app.state.presets.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Clean Voice", "Flat"]);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Flat"));
+
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Output)]);
+        let names: Vec<&str> = app.state.presets.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "Beta"]);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Beta"));
+        assert_eq!(app.settings.output_preset, "Beta");
+        assert_eq!(app.settings.input_preset, "Flat");
+    }
+
+    #[test]
+    fn switching_the_edit_direction_keeps_unsaved_edits_on_both_lanes() {
+        let mut app = app_with_two_presets("edit-direction-edits");
+        with_voice_presets(&mut app);
+        app.handle(&[UiAction::SelectPreset(0)]);
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 7.0)]);
+
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
+        app.handle(&[UiAction::SetBandGain(4, 5.0)]);
+        assert_eq!(app.input_params().bands().1[4], 5.0);
+
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Output)]);
+        assert_eq!(
+            app.state.effect(Effect::Bass),
+            7.0,
+            "the music edit came back"
+        );
+        assert!(
+            app.state.preset().is_some_and(|p| p.modified),
+            "still marked unsaved"
+        );
+        assert_eq!(
+            app.input_params().bands().1[4],
+            5.0,
+            "the voice edit kept running"
+        );
+
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
+        assert_eq!(app.state.eq_bands[4].boost_db, 5.0, "and it is shown again");
+        assert!(!app.state.music_effects_apply());
+    }
+
+    #[test]
+    fn switching_the_edit_direction_changes_nothing_the_engine_runs() {
+        let mut app = app_with_two_presets("edit-direction-engine");
+        with_voice_presets(&mut app);
+        app.state
+            .devices
+            .push(device("alsa_input.mic", DeviceDirection::Input, false));
+        app.handle(&[UiAction::SelectOutput(0), UiAction::SelectInput(2)]);
+        app.handle(&[UiAction::SetBandGain(1, 3.0)]);
+        let (output, input) = (*app.params(), *app.input_params());
+        let devices = (app.state.selected_output, app.state.selected_input);
+
+        for direction in [
+            DeviceDirection::Output,
+            DeviceDirection::Input,
+            DeviceDirection::Output,
+            DeviceDirection::Input,
+        ] {
+            app.handle(&[UiAction::SetEditDirection(direction)]);
+            assert_eq!(
+                *app.params(),
+                output,
+                "{direction:?}: the music chain moved"
+            );
+            assert_eq!(
+                *app.input_params(),
+                input,
+                "{direction:?}: the voice chain moved"
+            );
+            assert_eq!(
+                (app.state.selected_output, app.state.selected_input),
+                devices,
+                "{direction:?}: a device moved"
+            );
+        }
+    }
+
+    #[test]
+    fn a_first_look_at_a_microphone_with_no_presets_shows_its_own_chain() {
+        let mut app = lanes();
+        app.handle(&[UiAction::SetBandGain(3, 6.0), UiAction::SetMasterGain(10.0)]);
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
+        assert!(app.state.presets.is_empty());
+        assert_eq!(
+            app.state.eq_bands[3].boost_db, 0.0,
+            "not the music's equalizer"
+        );
+        assert_eq!(app.state.master_gain_db, 0.0, "not the music's gain");
+    }
+
+    #[test]
+    fn the_level_settings_belong_to_the_music_chain() {
+        let mut app = lanes();
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
+        app.handle(&[
+            UiAction::SetMasterGain(9.0),
+            UiAction::SetFilterQ(3.0),
+            UiAction::SetBalance(4.0),
+            UiAction::SetVolumeLeveling(2.0),
+        ]);
+        assert_eq!(app.settings.master_gain, 0.0);
+        assert_eq!(app.settings.filter_q, 1.0);
+        assert_eq!(app.settings.balance, 0.0);
+        assert_eq!(app.settings.volume_leveling, 0.0);
+        assert_eq!(
+            app.input_params().makeup_db,
+            9.0,
+            "it is the voice's makeup"
+        );
+    }
+
+    #[test]
+    fn setting_the_same_edit_direction_again_is_a_no_op() {
+        let mut app = app_with_two_presets("edit-direction-same");
+        app.handle(&[UiAction::SelectPreset(1)]);
+        let before = app.state.clone();
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Output)]);
+        assert_eq!(app.state.selected_preset, before.selected_preset);
+        assert_eq!(app.state.presets, before.presets);
+        assert!(app.parked.is_none(), "nothing was parked");
+    }
+
+    #[test]
+    fn a_notice_can_be_dismissed_and_otherwise_expires_after_four_seconds() {
+        let mut app = headless();
+        app.state.notification = Some("Preset: Rock".to_owned());
+        app.handle(&[UiAction::DismissNotice]);
+        assert!(app.state.notification.is_none());
+
+        app.state.notification = Some("Preset: Jazz".to_owned());
+        app.poll_audio();
+        assert!(app.state.notification.is_some(), "just stamped");
+        let long_ago = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(5))
+            .expect("the clock has run for five seconds");
+        app.state.notice_clock = Some(("Preset: Jazz".to_owned(), long_ago));
+        app.poll_audio();
+        assert!(app.state.notification.is_none(), "four seconds are up");
+    }
+
+    #[test]
+    fn the_strip_learns_what_the_voice_snapshot_asks_for() {
+        let mut app = headless();
+        app.input_params.dereverb = fxsound_core::DereverbLevel::Medium;
+        app.input_params.denoise_level = fxsound_core::DenoiseLevel::Strong;
+        app.input_params.deesser_hz = 6_000.0;
+        app.settings.echo_cancel = true;
+        app.sync_params_from_state();
+        assert!(app.state.dereverb_on);
+        assert_eq!(app.state.denoise_level, fxsound_core::DenoiseLevel::Strong);
+        assert_eq!(app.state.deesser_requested_hz, 6_000.0);
+        assert!(app.state.echo_cancel_on);
     }
 
     #[test]
@@ -2306,6 +3013,204 @@ mod tests {
     }
 
     #[test]
+    fn the_same_refusal_clicked_again_stays_up_four_seconds_from_the_second_click() {
+        let mut app = with_presets(&["Jazz"]);
+        app.handle(&[UiAction::DeletePreset]);
+        let text = app.state.notification.clone().expect("the first refusal");
+        // The first click was three and a half seconds ago.
+        let first = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(3_500))
+            .expect("the clock has run for a few seconds");
+        app.state.notice_clock = Some((text.clone(), first));
+
+        app.handle(&[UiAction::DeletePreset]);
+        assert_eq!(app.state.notification.as_deref(), Some(text.as_str()));
+        // Where the first click's four seconds run out, half a second after the second click.
+        assert!(
+            !app.state
+                .expire_notification(first + std::time::Duration::from_millis(4_000)),
+            "the second click kept the first click's clock"
+        );
+        assert!(app.state.notification.is_some());
+    }
+
+    #[test]
+    fn a_rename_refusal_raised_again_restarts_its_clock_too() {
+        let mut app = with_presets(&["Jazz"]);
+        app.rename_preset("Blues");
+        let long_ago = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3))
+            .expect("the clock has run for a few seconds");
+        let text = app.state.notification.clone().expect("the refusal");
+        app.state.notice_clock = Some((text, long_ago));
+        app.rename_preset("Blues");
+        let (_, since) = app.state.notice_clock.clone().expect("a clock");
+        assert!(since > long_ago, "the clock was not restarted");
+    }
+
+    #[test]
+    fn every_notice_the_application_raises_goes_through_its_clock() {
+        // `UiState::notify` restarts the clock; a bare assignment of a text that is already up
+        // keeps the old one, and the notice vanishes early. Tests may still write the field.
+        let bare = concat!(".state.notification", " = ");
+        for (file, source) in [
+            ("app.rs", include_str!("app.rs")),
+            ("main.rs", include_str!("main.rs")),
+        ] {
+            for (number, line) in source.lines().enumerate() {
+                assert!(
+                    !(line.trim_start().starts_with("self") && line.contains(bare)),
+                    "{file}:{}: a notice written around UiState::notify",
+                    number + 1
+                );
+            }
+        }
+    }
+
+    /// A restart: a music store holding a flat `Alpha` and a bass-heavy `Beta`, the two voice
+    /// presets, `Beta` and `Flat` saved as the two lanes' presets, and the window last on `edit`.
+    fn restarted(tag: &str, edit: DeviceDirection) -> App {
+        restarted_with(tag, edit, ("Beta", "Flat"))
+    }
+
+    /// [`restarted`] with the two saved names, music first.
+    fn restarted_with(tag: &str, edit: DeviceDirection, saved: (&str, &str)) -> App {
+        use fxsound_core::Preset;
+
+        let dir =
+            std::env::temp_dir().join(format!("fxsound-restart-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the preset directory");
+        for (name, bass) in [("Alpha", 0.0), ("Beta", 0.6)] {
+            let mut preset = Preset {
+                name: name.to_owned(),
+                ..Preset::default()
+            };
+            preset.set_effect(Effect::Bass, bass);
+            fxsound_preset::save(&preset, &dir.join(format!("{name}.fac"))).expect("write");
+        }
+
+        let mut app = App::headless_for_tests();
+        app.presets = fxsound_preset::PresetStore::with_dirs(
+            vec![dir],
+            std::env::temp_dir().join(format!("fxsound-restart-user-{}-{tag}", std::process::id())),
+        );
+        app.presets.rescan();
+        with_voice_presets(&mut app);
+        app.settings.device_direction = edit;
+        saved.0.clone_into(&mut app.settings.output_preset);
+        saved.1.clone_into(&mut app.settings.input_preset);
+        app.adopt_saved_presets();
+        app
+    }
+
+    fn bass_of(app: &App) -> f32 {
+        app.params().effect(Effect::Bass)
+    }
+
+    #[test]
+    fn a_restart_editing_the_microphone_still_loads_the_speakers_saved_preset() {
+        // The engine serves the speakers whenever they are on, whatever the window last edited:
+        // loading only the edit direction's preset left them flat after this restart.
+        let app = restarted("edit-input", DeviceDirection::Input);
+        assert!(
+            (bass_of(&app) - 0.6).abs() < 0.02,
+            "the speakers run {} of bass, not Beta's",
+            bass_of(&app)
+        );
+        assert_eq!(app.state.direction, DeviceDirection::Input);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Flat"));
+        assert_eq!(
+            app.input_params().highpass_hz,
+            75.0,
+            "the microphone runs Flat"
+        );
+    }
+
+    #[test]
+    fn a_restart_editing_the_speakers_still_loads_the_microphones_saved_preset() {
+        // Switching the speakers off hands the single-lane engine the microphone, which has to be
+        // running its own preset by then, not the unvoiced chain.
+        let app = restarted("edit-output", DeviceDirection::Output);
+        assert_eq!(
+            app.input_params().highpass_hz,
+            75.0,
+            "the microphone runs Flat"
+        );
+        assert_eq!(app.state.direction, DeviceDirection::Output);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Beta"));
+        assert!((bass_of(&app) - 0.6).abs() < 0.02);
+    }
+
+    #[test]
+    fn the_lane_loaded_off_screen_at_start_comes_back_with_its_preset_selected() {
+        let mut app = restarted("edit-input-then-output", DeviceDirection::Input);
+        let (output, input) = (*app.params(), *app.input_params());
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Output)]);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Beta"));
+        assert!(
+            app.state.effect(Effect::Bass) > 0.0,
+            "the sliders show Beta"
+        );
+        assert_eq!(*app.params(), output, "looking at the speakers moved them");
+        assert_eq!(
+            *app.input_params(),
+            input,
+            "looking away moved the microphone"
+        );
+    }
+
+    #[test]
+    fn a_restart_records_each_lanes_preset_under_its_own_key() {
+        let app = restarted_with("keys", DeviceDirection::Input, ("Gone", "Flat"));
+        // A saved music preset that no longer exists falls back to the first, under the music's
+        // key; loading the speakers first wrote nothing into the microphone's, and the window
+        // still edits the microphone.
+        let first = app.presets.entries()[0].name.clone();
+        assert_eq!(app.settings.output_preset, first);
+        assert_eq!(app.settings.input_preset, "Flat");
+        assert_eq!(app.settings.device_direction, DeviceDirection::Input);
+    }
+
+    #[test]
+    fn a_restart_on_a_microphone_without_voice_presets_leaks_no_music_level_into_it() {
+        let mut app = App::headless_for_tests();
+        app.settings.device_direction = DeviceDirection::Input;
+        app.settings.filter_q = 3.0;
+        app.settings.master_gain = 9.0;
+        app.adopt_saved_presets();
+        assert_eq!(app.state.direction, DeviceDirection::Input);
+        let unvoiced = unvoiced_input_params();
+        assert_eq!(app.input_params().makeup_db, unvoiced.makeup_db);
+        assert_eq!(app.input_params().filter_q, unvoiced.filter_q);
+        assert_eq!(
+            app.state.master_gain_db, unvoiced.makeup_db,
+            "the window shows the voice"
+        );
+        assert_eq!(
+            app.params().master_gain_db,
+            9.0,
+            "the music keeps its own gain"
+        );
+        assert_eq!(app.params().filter_q, 3.0);
+    }
+
+    #[test]
+    fn a_restart_on_the_speakers_leaves_a_microphone_without_voice_presets_unvoiced() {
+        let mut app = App::headless_for_tests();
+        app.settings.master_gain = 9.0;
+        app.settings.filter_q = 3.0;
+        app.adopt_saved_presets();
+        assert_eq!(app.state.direction, DeviceDirection::Output);
+        let unvoiced = unvoiced_input_params();
+        assert_eq!(app.input_params().makeup_db, unvoiced.makeup_db);
+        assert_eq!(app.input_params().filter_q, unvoiced.filter_q);
+        assert!(app.input_params().bands().1.iter().all(|&gain| gain == 0.0));
+        assert_eq!(app.state.master_gain_db, 9.0);
+        assert_eq!(app.params().master_gain_db, 9.0);
+    }
+
+    #[test]
     fn window_level_actions_are_accepted_without_touching_the_dsp() {
         let mut app = headless();
         let before = *app.params();
@@ -2330,7 +3235,7 @@ mod tests {
     fn selecting_a_device_that_does_not_exist_is_ignored() {
         let mut app = headless();
         app.handle(&[UiAction::SelectDevice(7)]);
-        assert!(app.state.selected_device.is_none());
+        assert!(app.state.selected_device().is_none());
         assert!(app.settings.output_device_name.is_empty());
     }
 
@@ -2469,8 +3374,8 @@ mod tests {
     #[test]
     fn the_saved_device_is_announced_once_each_time_it_appears() {
         let mut settings = Settings::default();
-        settings.set_device_name(DeviceDirection::Input, "alsa_input.usb-fifine");
-        settings.set_edit_direction(DeviceDirection::Input);
+        settings.set_device_name(IN, "alsa_input.usb-fifine");
+        settings.set_lane_enabled(IN, true);
         let without = vec![device("alsa_output.pci", DeviceDirection::Output, true)];
         let with = vec![
             device("alsa_output.pci", DeviceDirection::Output, true),
@@ -2480,38 +3385,38 @@ mod tests {
 
         // Not listed yet: nothing to say.
         assert_eq!(
-            saved_device_to_announce(&settings, &without, &mut announced),
+            saved_device_to_announce(&settings, IN, &without, &mut announced),
             None
         );
         // Listed: announced exactly once…
         assert_eq!(
-            saved_device_to_announce(&settings, &with, &mut announced),
+            saved_device_to_announce(&settings, IN, &with, &mut announced),
             Some(UiToAudio::SelectDevice {
                 node_name: "alsa_input.usb-fifine".to_owned(),
                 direction: DeviceDirection::Input,
             })
         );
         assert_eq!(
-            saved_device_to_announce(&settings, &with, &mut announced),
+            saved_device_to_announce(&settings, IN, &with, &mut announced),
             None
         );
         // …and once more after it was unplugged and came back.
         assert_eq!(
-            saved_device_to_announce(&settings, &without, &mut announced),
+            saved_device_to_announce(&settings, IN, &without, &mut announced),
             None
         );
-        assert!(saved_device_to_announce(&settings, &with, &mut announced).is_some());
+        assert!(saved_device_to_announce(&settings, IN, &with, &mut announced).is_some());
     }
 
     #[test]
     fn a_saved_name_is_only_announced_in_its_own_direction() {
         let mut settings = Settings::default();
         settings.set_device_name(DeviceDirection::Input, "fifine");
-        settings.set_edit_direction(DeviceDirection::Input);
+        settings.set_lane_enabled(DeviceDirection::Input, true);
         let devices = vec![device("fifine", DeviceDirection::Output, true)];
         let mut announced = None;
         assert_eq!(
-            saved_device_to_announce(&settings, &devices, &mut announced),
+            saved_device_to_announce(&settings, DeviceDirection::Input, &devices, &mut announced),
             None
         );
         assert!(announced.is_none());
@@ -2523,9 +3428,203 @@ mod tests {
         let devices = vec![device("alsa_output.pci", DeviceDirection::Output, true)];
         let mut announced = None;
         assert_eq!(
-            saved_device_to_announce(&settings, &devices, &mut announced),
+            saved_device_to_announce(&settings, DeviceDirection::Output, &devices, &mut announced),
             None
         );
+    }
+
+    // ---- which lane the engine is told about -----------------------------------------------
+
+    const OUT: DeviceDirection = DeviceDirection::Output;
+    const IN: DeviceDirection = DeviceDirection::Input;
+
+    fn select(name: &str, direction: DeviceDirection) -> Option<UiToAudio> {
+        Some(UiToAudio::SelectDevice {
+            node_name: name.to_owned(),
+            direction,
+        })
+    }
+
+    fn both_devices() -> Vec<AudioDevice> {
+        vec![
+            device("alsa_output.pci", OUT, true),
+            device("alsa_input.usb-fifine", IN, false),
+        ]
+    }
+
+    /// An app whose settings name a speaker and a microphone, the microphone lane switched `on` or
+    /// off, and the window editing `edit` — the shape a restart comes back to.
+    fn app_remembering(input_on: bool, edit: DeviceDirection) -> App {
+        let mut app = headless();
+        app.settings.set_device_name(OUT, "alsa_output.pci");
+        app.settings.set_device_name(IN, "alsa_input.usb-fifine");
+        app.settings.set_lane_enabled(IN, input_on);
+        app.settings.set_edit_direction(edit);
+        app.state.direction = edit;
+        app
+    }
+
+    #[test]
+    fn looking_at_the_microphone_list_then_a_device_list_sends_no_select_device() {
+        let mut app = app_remembering(false, OUT);
+        // Start-up: the speakers the settings name go to the engine, once.
+        assert_eq!(
+            app.adopt_device_list(both_devices()),
+            select("alsa_output.pci", OUT)
+        );
+        // Opening the other lane's list to look at it is a SetEditDirection and nothing more…
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        assert_eq!(app.settings.device_direction, IN);
+        // …so the rescan that follows has nothing to tell the engine.
+        assert_eq!(app.adopt_device_list(both_devices()), None);
+        assert_eq!(app.adopt_device_list(both_devices()), None);
+        assert_eq!(
+            app.state.selected_input, None,
+            "the microphone still shows Off"
+        );
+    }
+
+    #[test]
+    fn a_detached_microphone_is_not_attached_by_a_restart_that_was_editing_it() {
+        // The settings file a restart reads after the user looked at the microphone list: the
+        // edit direction says Input, the microphone lane says off.
+        let mut app = app_remembering(false, IN);
+        assert_eq!(
+            app.adopt_device_list(both_devices()),
+            select("alsa_output.pci", OUT)
+        );
+        // With no speaker remembered either, the engine is left to its own device rules.
+        let mut app = app_remembering(false, IN);
+        app.settings.set_device_name(OUT, "");
+        assert_eq!(app.adopt_device_list(both_devices()), None);
+    }
+
+    #[test]
+    fn a_restart_with_both_lanes_on_announces_the_speakers_whatever_the_window_edited() {
+        for edit in [OUT, IN] {
+            let mut app = app_remembering(true, edit);
+            assert_eq!(
+                app.adopt_device_list(both_devices()),
+                select("alsa_output.pci", OUT),
+                "editing {edit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn with_the_speakers_switched_off_the_enabled_microphone_is_announced() {
+        let mut app = app_remembering(true, OUT);
+        app.settings.set_lane_enabled(OUT, false);
+        assert_eq!(
+            app.adopt_device_list(both_devices()),
+            select("alsa_input.usb-fifine", IN)
+        );
+    }
+
+    #[test]
+    fn with_both_lanes_off_nothing_is_announced() {
+        let mut app = app_remembering(false, IN);
+        app.settings.set_lane_enabled(OUT, false);
+        assert_eq!(app.adopt_device_list(both_devices()), None);
+    }
+
+    #[test]
+    fn the_lane_last_picked_stays_the_one_announced_while_the_window_looks_elsewhere() {
+        let mut app = app_remembering(true, OUT);
+        app.state.devices = both_devices();
+        app.handle(&[UiAction::SelectDevice(1)]);
+        assert_eq!(app.last_picked_lane, Some(IN));
+        app.handle(&[UiAction::SetEditDirection(OUT)]);
+        assert_eq!(app.settings.device_direction, OUT);
+        // Headless, so the pick itself sent nothing; the list after it names the microphone, the
+        // lane that was picked — never the speakers the window has moved to.
+        assert_eq!(
+            app.adopt_device_list(both_devices()),
+            select("alsa_input.usb-fifine", IN)
+        );
+        assert_eq!(app.adopt_device_list(both_devices()), None);
+    }
+
+    #[test]
+    fn a_device_list_that_changes_around_the_served_lane_sends_nothing_again() {
+        let mut app = app_remembering(true, IN);
+        assert!(app.adopt_device_list(both_devices()).is_some());
+        let mut more = both_devices();
+        more.push(device("bluez_output.headset", OUT, false));
+        assert_eq!(app.adopt_device_list(more), None);
+    }
+
+    #[test]
+    fn switching_off_the_microphone_the_engine_serves_hands_it_back_to_the_speakers() {
+        let mut app = app_remembering(true, OUT);
+        app.state.devices = both_devices();
+        app.handle(&[UiAction::SelectDevice(1)]);
+        // What a send would have recorded, since a headless app has no engine to send to.
+        app.announced_device = Some(("alsa_input.usb-fifine".to_owned(), IN));
+
+        app.handle(&[UiAction::DetachInput]);
+
+        assert_eq!(app.last_picked_lane, None);
+        assert!(!app.settings.lane_enabled(IN));
+        assert_eq!(
+            app.saved_device_for_engine(),
+            select("alsa_output.pci", OUT)
+        );
+    }
+
+    #[test]
+    fn switching_off_a_lane_the_engine_does_not_serve_leaves_the_served_one_alone() {
+        let mut app = app_remembering(true, IN);
+        app.state.devices = both_devices();
+        app.handle(&[UiAction::SelectDevice(0)]);
+        app.announced_device = Some(("alsa_output.pci".to_owned(), OUT));
+
+        app.handle(&[UiAction::DetachInput]);
+
+        assert_eq!(app.last_picked_lane, Some(OUT));
+        assert_eq!(app.saved_device_for_engine(), None);
+    }
+
+    #[test]
+    fn a_detached_lane_is_forgotten_by_the_announcement_bookkeeping() {
+        let mut settings = Settings::default();
+        settings.set_device_name(IN, "alsa_input.usb-fifine");
+        settings.set_lane_enabled(IN, false);
+        let mut announced = Some(("alsa_input.usb-fifine".to_owned(), IN));
+        assert_eq!(
+            saved_device_to_announce(&settings, IN, &both_devices(), &mut announced),
+            None
+        );
+        assert_eq!(announced, None);
+        // …and a detached lane says nothing about the other lane's record.
+        let mut announced = Some(("alsa_output.pci".to_owned(), OUT));
+        assert_eq!(
+            saved_device_to_announce(&settings, IN, &both_devices(), &mut announced),
+            None
+        );
+        assert!(announced.is_some());
+    }
+
+    #[test]
+    fn the_lane_to_announce_never_follows_the_edit_direction() {
+        let mut settings = Settings::default();
+        settings.set_lane_enabled(IN, false);
+        for edit in [OUT, IN] {
+            settings.set_edit_direction(edit);
+            assert_eq!(lane_to_announce(&settings, None), Some(OUT));
+            assert_eq!(
+                lane_to_announce(&settings, Some(IN)),
+                Some(OUT),
+                "IN is off"
+            );
+        }
+        settings.set_lane_enabled(IN, true);
+        assert_eq!(lane_to_announce(&settings, Some(IN)), Some(IN));
+        settings.set_lane_enabled(OUT, false);
+        assert_eq!(lane_to_announce(&settings, None), Some(IN));
+        assert_eq!(lane_to_announce(&settings, Some(OUT)), Some(IN));
+        settings.set_lane_enabled(IN, false);
+        assert_eq!(lane_to_announce(&settings, Some(IN)), None);
     }
 
     #[test]

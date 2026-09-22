@@ -47,3 +47,8 @@ countries: ru
 "Classic" = "Классический"
 "Adaptive" = "Адаптивный"
 "Preset" = "Шаблон"
+"Floor" = "Фон"
+"Voice" = "Голос"
+"Echo" = "Эхо"
+"Reverb" = "Реверб"
+"unavailable" = "недоступно"

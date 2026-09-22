@@ -46,3 +46,8 @@ countries: de at ch
 "Classic" = "Klassisch"
 "Adaptive" = "Adaptiv"
 "Preset" = "Voreinstellung"
+"Floor" = "Rauschpegel"
+"Voice" = "Stimme"
+"Echo" = "Echo"
+"Reverb" = "Hall"
+"unavailable" = "nicht verfügbar"

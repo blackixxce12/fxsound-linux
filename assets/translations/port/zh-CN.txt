@@ -46,3 +46,8 @@ countries: cn sg
 "Classic" = "经典"
 "Adaptive" = "自适应"
 "Preset" = "预设"
+"Floor" = "底噪"
+"Voice" = "人声"
+"Echo" = "回声"
+"Reverb" = "混响"
+"unavailable" = "不可用"

@@ -47,3 +47,8 @@ countries: HR
 "Adaptive" = "Prilagodljivo"
 "Preset" = "Preset"
 "The high-mid-range. Increase this to get more instrumental harmonics, reduce it to improve drums that have too much \"clickiness\" or orchestral instruments that are piercing." = "Visoki-srednji-raspon. Pojačajte da dobijete više instrumentalne harmonije, smanjite da poboljšate bubnjeve koji imaju previše \"klikavosti\" ili orkestralne instrumente koji su probadajući."
+"Floor" = "Razina šuma"
+"Voice" = "Glas"
+"Echo" = "Jeka"
+"Reverb" = "Odjek"
+"unavailable" = "nedostupno"

@@ -46,3 +46,8 @@ countries: cz
 "Classic" = "Klasický"
 "Adaptive" = "Adaptivní"
 "Preset" = "Předvolba"
+"Floor" = "Šum"
+"Voice" = "Hlas"
+"Echo" = "Ozvěna"
+"Reverb" = "Dozvuk"
+"unavailable" = "nedostupné"

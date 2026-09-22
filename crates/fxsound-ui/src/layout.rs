@@ -125,10 +125,32 @@ pub mod pro {
         Rect::from_min_size(pos2(40.0, 89.0), vec2(470.0, 40.0))
     }
 
-    /// Output-device picker (`FxProView.h:47`).
+    /// The two device pickers' size: the Lite view's width, the Pro view's height.
+    ///
+    /// The original's single 470-point playback list (`FxProView.h:47`) is split in two for the
+    /// two lanes (0.4.0 design, §1.4), each as wide as a Lite combo, with the same 20-point gutter
+    /// between them that the Lite view puts between its two.
+    pub const DEVICE_COMBO_SIZE: Vec2 = vec2(225.0, 40.0);
+
+    /// Output-device picker: the left half of the original's (`FxProView.h:47`).
     #[must_use]
     pub fn output_combo() -> Rect {
-        Rect::from_min_size(pos2(530.0, 89.0), vec2(470.0, 40.0))
+        Rect::from_min_size(pos2(530.0, 89.0), DEVICE_COMBO_SIZE)
+    }
+
+    /// Input-device picker: the right half, ending where the original's list ended.
+    #[must_use]
+    pub fn input_combo() -> Rect {
+        Rect::from_min_size(pos2(775.0, 89.0), DEVICE_COMBO_SIZE)
+    }
+
+    /// One lane's picker.
+    #[must_use]
+    pub fn device_combo(direction: fxsound_core::DeviceDirection) -> Rect {
+        match direction {
+            fxsound_core::DeviceDirection::Output => output_combo(),
+            fxsound_core::DeviceDirection::Input => input_combo(),
+        }
     }
 
     /// Spectrum visualizer (`FxVisualizer.h:51-52`).
@@ -167,7 +189,10 @@ pub mod pro {
         )
     }
 
-    /// Where the error toast appears when a device fails.
+    /// The largest the notice bubble can be: `FxNotification::MAX_WIDTH × MAX_HEIGHT`, five points
+    /// under the device pickers and right-aligned to them (`FxView.cpp:58-72`).
+    ///
+    /// A bubble sized to a short message keeps this rectangle's top-right corner.
     #[must_use]
     pub fn notification() -> Rect {
         Rect::from_min_size(pos2(440.0, 134.0), vec2(560.0, 120.0))
@@ -199,10 +224,25 @@ pub mod lite {
         Rect::from_min_size(pos2(40.0, 99.0), LIST_SIZE)
     }
 
-    /// Output-device picker (`FxLiteView.h:38`).
+    /// Output-device picker (`FxLiteView.h:38`). In 0.4.0 it lists both lanes' devices.
     #[must_use]
     pub fn output_combo() -> Rect {
         Rect::from_min_size(pos2(285.0, 99.0), LIST_SIZE)
+    }
+
+    /// The one-line notice strip: under the two pickers, inside the panel's 20-point bottom
+    /// padding, two points clear of the combos above and of the panel's edge below.
+    ///
+    /// The original placed its notice by subtracting its 560-point width from the combo's, which in
+    /// a 550-point window starts it at x = −50 (`docs/spec/01-window-layout.md` §5.1). This keeps
+    /// it inside instead.
+    #[must_use]
+    pub fn notification() -> Rect {
+        let combos = preset_combo().union(output_combo());
+        Rect::from_min_size(
+            pos2(combos.left(), combos.bottom() + 2.0),
+            vec2(combos.width(), 16.0),
+        )
     }
 }
 
@@ -286,15 +326,86 @@ mod tests {
     }
 
     #[test]
-    fn the_two_combos_sit_side_by_side_inside_the_panel() {
+    fn the_three_combos_sit_side_by_side_inside_the_panel() {
         let panel = pro::panel();
         assert!(panel.contains_rect(pro::preset_combo()));
         assert!(panel.contains_rect(pro::output_combo()));
-        // 20 px gutter between them
+        assert!(panel.contains_rect(pro::input_combo()));
+        // 20 px gutter between the preset list and the output list, as in the original…
         assert_eq!(
             pro::output_combo().left() - pro::preset_combo().right(),
             20.0
         );
+        // …and the same 20 between the output and input lists, as between the Lite view's two.
+        assert_eq!(
+            pro::input_combo().left() - pro::output_combo().right(),
+            20.0
+        );
+    }
+
+    #[test]
+    fn the_two_device_combos_are_lite_wide_and_pro_tall() {
+        for rect in [pro::output_combo(), pro::input_combo()] {
+            assert_eq!(rect.width(), lite::LIST_SIZE.x, "{rect:?}");
+            assert_eq!(rect.height(), pro::preset_combo().height(), "{rect:?}");
+            assert_eq!(rect.top(), pro::preset_combo().top(), "{rect:?}");
+        }
+    }
+
+    #[test]
+    fn the_two_device_combos_fill_exactly_the_originals_single_list() {
+        // The 470-point playback list at (530, 89): split, not moved and not grown.
+        let original = Rect::from_min_size(pos2(530.0, 89.0), vec2(470.0, 40.0));
+        assert_eq!(pro::output_combo().union(pro::input_combo()), original);
+        assert_eq!(pro::input_combo().right(), pro::visualizer().right());
+    }
+
+    #[test]
+    fn no_combo_overlaps_another_or_the_visualizer() {
+        let combos = [pro::preset_combo(), pro::output_combo(), pro::input_combo()];
+        for (i, a) in combos.iter().enumerate() {
+            for b in &combos[i + 1..] {
+                assert!(!a.intersects(*b), "{a:?} overlaps {b:?}");
+            }
+            assert!(
+                a.bottom() < pro::visualizer().top(),
+                "{a:?} reaches the visualizer"
+            );
+        }
+    }
+
+    #[test]
+    fn device_combo_names_each_lanes_rectangle() {
+        use fxsound_core::DeviceDirection;
+        assert_eq!(
+            pro::device_combo(DeviceDirection::Output),
+            pro::output_combo()
+        );
+        assert_eq!(
+            pro::device_combo(DeviceDirection::Input),
+            pro::input_combo()
+        );
+    }
+
+    #[test]
+    fn the_pro_notice_hangs_five_points_under_the_device_combos_and_right_aligned_to_them() {
+        let notice = pro::notification();
+        assert_eq!(notice.top(), pro::output_combo().bottom() + 5.0);
+        assert_eq!(notice.right(), pro::input_combo().right());
+        assert!(pro::panel().contains_rect(notice));
+    }
+
+    #[test]
+    fn the_lite_notice_strip_sits_under_the_combos_without_touching_them() {
+        let strip = lite::notification();
+        let window = Rect::from_min_size(pos2(0.0, 0.0), lite::WINDOW_SIZE);
+        assert!(window.contains_rect(strip));
+        assert!(strip.top() > lite::preset_combo().bottom());
+        assert!(strip.top() > lite::output_combo().bottom());
+        assert_eq!(strip.left(), lite::preset_combo().left());
+        assert_eq!(strip.right(), lite::output_combo().right());
+        // Inside the panel's 20-point padding under the combos (the panel ends at y = 169).
+        assert!(strip.bottom() <= lite::preset_combo().bottom() + 20.0);
     }
 
     #[test]
@@ -317,9 +428,12 @@ mod tests {
             pro::panel(),
             pro::preset_combo(),
             pro::output_combo(),
+            pro::input_combo(),
             pro::visualizer(),
             pro::audio_controls(),
             pro::equalizer(),
+            pro::input_meters(),
+            pro::notification(),
         ] {
             assert!(window.contains_rect(r), "{r:?} escapes the window");
         }

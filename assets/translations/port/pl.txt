@@ -46,3 +46,8 @@ countries: pl
 "Classic" = "Klasyczny"
 "Adaptive" = "Adaptacyjny"
 "Preset" = "Preset"
+"Floor" = "Poziom szumu"
+"Voice" = "Głos"
+"Echo" = "Echo"
+"Reverb" = "Pogłos"
+"unavailable" = "niedostępne"

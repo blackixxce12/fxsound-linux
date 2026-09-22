@@ -46,3 +46,8 @@ countries: ba
 "Classic" = "Klasično"
 "Adaptive" = "Adaptivno"
 "Preset" = "Profil"
+"Floor" = "Razina šuma"
+"Voice" = "Glas"
+"Echo" = "Eho"
+"Reverb" = "Odjek"
+"unavailable" = "nedostupno"

@@ -46,3 +46,8 @@ countries: fi
 "Classic" = "Klassinen"
 "Adaptive" = "Mukautuva"
 "Preset" = "Esiasetus"
+"Floor" = "Kohinataso"
+"Voice" = "Puhe"
+"Echo" = "Kaiku"
+"Reverb" = "Jälkikaiku"
+"unavailable" = "ei käytettävissä"

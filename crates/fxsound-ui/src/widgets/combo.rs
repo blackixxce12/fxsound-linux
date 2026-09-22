@@ -129,6 +129,9 @@ pub const HEADER_FONT_RATIO: f32 = 0.75;
 /// A section header's title is `MenuText` at this alpha **(port addition)**: legible, but clearly
 /// not one of the things that can be picked.
 pub const HEADER_TEXT_ALPHA: f32 = 0.6;
+/// The edit direction's device list is outlined in `HighlightedText` at this alpha **(port
+/// addition, 0.4.0 design §1.4)** — see [`FxComboBox::accent`].
+pub const ACCENT_ALPHA: f32 = 0.6;
 
 /// `cornerSize = (float) height / 5` (`FxTheme.cpp:138`).
 ///
@@ -272,6 +275,26 @@ pub fn outline_colour(palette: Palette, error: Option<bool>, focused: bool) -> C
     }
 }
 
+/// The outline actually stroked: [`outline_colour`], with the accent **(port addition)** in
+/// between.
+///
+/// Keyboard focus still wins, and so does a real error — an unavailable device is the one thing
+/// the outline must never stop saying. Below those, an accented box gets a one-point hairline in
+/// `HighlightedText` at [`ACCENT_ALPHA`]: white on the dark palette, black on the light one, so
+/// it reads in both without a colour of its own.
+#[must_use]
+pub fn box_outline_colour(
+    palette: Palette,
+    error: Option<bool>,
+    focused: bool,
+    accent: bool,
+) -> Color32 {
+    if accent && !focused && error != Some(true) {
+        return palette.color_alpha(FxColor::HighlightedText, ACCENT_ALPHA);
+    }
+    outline_colour(palette, error, focused)
+}
+
 /// The closed box's text colour (`FxComboBox::highlightText`, `FxComboBox.cpp:36-54`).
 ///
 /// The original flips to `highlightedText` from the *view's* mouse handlers
@@ -312,6 +335,7 @@ pub struct FxComboBox<'a> {
     separator_before: Option<usize>,
     headers: &'a [SectionHeader<'a>],
     row_height: Option<f32>,
+    accent: bool,
 }
 
 impl<'a> FxComboBox<'a> {
@@ -330,7 +354,19 @@ impl<'a> FxComboBox<'a> {
             separator_before: None,
             headers: &[],
             row_height: None,
+            accent: false,
         }
+    }
+
+    /// Outline the box as the one the window is editing **(port addition)**.
+    ///
+    /// The Pro view has a device list per lane, and the preset list and the equalizer address
+    /// whichever lane is being edited; this is how the window says which. See
+    /// [`box_outline_colour`] for what it gives way to.
+    #[must_use]
+    pub fn accent(mut self, accent: bool) -> Self {
+        self.accent = accent;
+        self
     }
 
     /// A disabled box shows the grey arrow and cannot be opened (`FxTheme.cpp:159-163`).
@@ -410,6 +446,7 @@ impl<'a> FxComboBox<'a> {
             separator_before,
             headers,
             row_height,
+            accent,
         } = self;
 
         let id = Id::new("fx_combo_box").with(id_salt);
@@ -433,6 +470,7 @@ impl<'a> FxComboBox<'a> {
             enabled,
             placeholder,
             error,
+            accent,
             &response,
         );
 
@@ -468,6 +506,7 @@ fn paint_box(
     enabled: bool,
     placeholder: &str,
     error: Option<bool>,
+    accent: bool,
     response: &Response,
 ) {
     let painter = ui.painter().clone();
@@ -479,7 +518,10 @@ fn paint_box(
     painter.rect_stroke(
         rect,
         corner,
-        Stroke::new(1.0, outline_colour(palette, error, response.has_focus())),
+        Stroke::new(
+            1.0,
+            box_outline_colour(palette, error, response.has_focus(), accent),
+        ),
         StrokeKind::Inside,
     );
 
@@ -913,6 +955,95 @@ mod tests {
     }
 
     #[test]
+    fn an_accented_box_is_outlined_in_the_highlight_colour_at_sixty_percent_in_both_palettes() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let palette = Palette::new(mode);
+            let accent = box_outline_colour(palette, None, false, true);
+            assert_eq!(
+                accent,
+                palette.color_alpha(FxColor::HighlightedText, ACCENT_ALPHA),
+                "{mode:?}"
+            );
+            assert_eq!(accent.a(), 153, "α 0.6 of 255");
+            // Visible against the box it outlines, which is the whole point.
+            assert_ne!(
+                Color32::from_rgb(accent.r(), accent.g(), accent.b()),
+                palette.color(FxColor::ComboBoxBackground),
+                "{mode:?}"
+            );
+            // And without the accent, nothing changes: the original's three-state outline.
+            for error in [None, Some(false), Some(true)] {
+                assert_eq!(
+                    box_outline_colour(palette, error, false, false),
+                    outline_colour(palette, error, false)
+                );
+            }
+        }
+        // The two palettes' accents differ: white on dark, black on light.
+        assert_ne!(
+            box_outline_colour(Palette::new(ThemeMode::Dark), None, false, true),
+            box_outline_colour(Palette::new(ThemeMode::Light), None, false, true)
+        );
+    }
+
+    #[test]
+    fn focus_and_a_real_error_both_outrank_the_accent() {
+        let palette = Palette::new(ThemeMode::Dark);
+        assert_eq!(
+            box_outline_colour(palette, None, true, true),
+            outline_colour(palette, None, true)
+        );
+        assert_eq!(
+            box_outline_colour(palette, Some(true), false, true),
+            palette.color(FxColor::SliderTrack)
+        );
+        // An error that has cleared is not an error, so the accent shows again.
+        assert_eq!(
+            box_outline_colour(palette, Some(false), false, true),
+            palette.color_alpha(FxColor::HighlightedText, ACCENT_ALPHA)
+        );
+    }
+
+    /// The colour of the one-point outline a frame stroked around `rect`.
+    fn stroked_outline(shapes: &[ClippedShape], rect: Rect) -> Option<Color32> {
+        shapes.iter().find_map(|clipped| match &clipped.shape {
+            Shape::Rect(shape)
+                if shape.stroke.width > 0.0 && (shape.rect.min - rect.min).length() < 1e-3 =>
+            {
+                Some(shape.stroke.color)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_accent_is_what_the_closed_box_actually_strokes() {
+        let items = [String::from("Speakers")];
+        let mut assets = AssetCache::new();
+        let ctx = test_context();
+        let palette = Palette::new(ThemeMode::Light);
+        for accent in [false, true] {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                FxComboBox::new(&items, Some(0)).accent(accent).show(
+                    ui,
+                    pro_combo(),
+                    palette,
+                    &mut assets,
+                    "accented",
+                );
+            });
+            let shapes = std::mem::take(&mut output.shapes);
+            output.drop_without_applying_deltas();
+            let stroke = stroked_outline(&shapes, pro_combo()).expect("the box was outlined");
+            assert_eq!(
+                stroke,
+                box_outline_colour(palette, None, false, accent),
+                "accent = {accent}"
+            );
+        }
+    }
+
+    #[test]
     fn keyboard_focus_outranks_the_error_outline() {
         let palette = Palette::new(ThemeMode::Dark);
         let focused = outline_colour(palette, Some(true), true);
@@ -1033,6 +1164,7 @@ mod tests {
         assert_eq!(combo.separator_before, None);
         assert!(combo.headers.is_empty());
         assert!(combo.row_height.is_none());
+        assert!(!combo.accent, "no box is accented unless it asks");
 
         let headers = [SectionHeader::new(0, "Output")];
         let combo = FxComboBox::new(&items, None)
@@ -1041,8 +1173,10 @@ mod tests {
             .error(true)
             .separator_before(Some(1))
             .headers(&headers)
-            .row_height(26.0);
+            .row_height(26.0)
+            .accent(true);
         assert!(!combo.enabled);
+        assert!(combo.accent);
         assert_eq!(combo.placeholder, "No device");
         assert_eq!(combo.error, Some(true));
         assert_eq!(combo.separator_before, Some(1));

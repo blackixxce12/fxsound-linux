@@ -46,3 +46,8 @@ countries: kr
 "Classic" = "클래식"
 "Adaptive" = "적응형"
 "Preset" = "프리셋"
+"Floor" = "노이즈 플로어"
+"Voice" = "음성"
+"Echo" = "에코"
+"Reverb" = "잔향"
+"unavailable" = "사용 불가"
