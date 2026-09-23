@@ -13,7 +13,8 @@
 //!    `fxsound --next-preset` usable as a compositor keybind. `--watch` subscribes instead and
 //!    prints the running instance's events until it quits. `--quit`, `--status` and `--watch`
 //!    with nobody to forward to report that FxSound is not running and stop right here, before
-//!    step 3 could claim the session default sink.
+//!    step 3 could claim the session default sink; `--list-apps` is answered from the store on
+//!    disk and stops here too.
 //! 3. Start the audio engine. A missing or broken PipeWire is **not** fatal: the window still
 //!    opens and says so. The Windows build quits hard when its driver is missing; on Linux the
 //!    same conditions are routine and recoverable (`docs/spec/00-architecture.md` §10, open
@@ -179,22 +180,25 @@ fn main() -> eframe::Result<()> {
         }
     };
 
-    // `--quit` addresses a running instance, and holding the lock means there is none. Say so
-    // and leave before step 3 claims the session default sink. `Command::Quit` is not on the
-    // cold-start list (`Command::honoured_at_cold_start`), so nothing further down would ever
-    // see it. Dropping `server` unlinks the socket again.
-    if cli.quit {
-        eprintln!("FxSound is not running");
-        return Ok(());
-    }
-    // `--status` is a question for a running instance as well (`docs/spec/00-architecture.md`
-    // §4.7): with none there is nothing to report, and starting one to answer would be the
-    // opposite of what was asked. `--watch` subscribes to one, and the same holds. Fail, after
-    // unlinking the socket `server` owns.
-    if cli.status || cli.watch {
-        eprintln!("FxSound is not running");
+    // Holding the lock means no FxSound is running. `--status`, `--watch` and `--quit` address
+    // one (`docs/spec/00-architecture.md` §4.7): say so and leave before step 3 claims the
+    // session default sink — starting FxSound to answer would be the opposite of what was asked.
+    // `--list-apps` is answered from the store on disk instead, which is the way to look up a
+    // name for `--app-preset` before FxSound runs. Which of them a line is, the same `commands()`
+    // decides that a running instance runs, so `--watch --list-apps` lists here as it does there
+    // (`commands::answer_without_an_instance`). Dropping `server` unlinks the socket again.
+    if let Some(answer) = commands::answer_without_an_instance(
+        &cli.commands(),
+        &fxsound_core::AppRules::config_path(),
+    ) {
         drop(server);
-        std::process::exit(1);
+        if !answer.stdout.is_empty() {
+            println!("{}", answer.stdout);
+        }
+        if !answer.stderr.is_empty() {
+            eprintln!("{}", answer.stderr);
+        }
+        std::process::exit(i32::from(answer.failed));
     }
 
     // The UI language, decided before anything is drawn or named: the desktop's unless the

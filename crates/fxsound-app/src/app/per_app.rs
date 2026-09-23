@@ -44,7 +44,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use fxsound_core::apps::unix_now;
+use fxsound_core::apps::{AppRule, unix_now};
 use fxsound_core::messages::{AppRoute, AppStream, DspParams, InputDspParams, RouteParams};
 use fxsound_core::{AppKey, AppPreset, AppRules, DeviceDirection, Preset, UiToAudio};
 use fxsound_preset::input::InputPreset;
@@ -131,8 +131,9 @@ enum Source {
     Voice(InputPreset),
 }
 
-/// Why [`App::set_app_preset`] changed nothing. The text is what the command line prints and a
-/// D-Bus caller is answered with: English, as every refusal of the command path is.
+/// Why [`App::set_app_preset`] or [`App::set_named_app_preset`] changed nothing. The text is what
+/// the command line prints and a D-Bus caller is answered with: English, as every refusal of the
+/// command path is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppRuleRefusal {
     /// The application was named by nothing: no binary, no name, no Flatpak id. No stream could
@@ -165,6 +166,149 @@ pub(super) fn followed_notice(preset: &str) -> String {
         "Applications that used %s now follow FxSound's preset",
         &[preset],
     )
+}
+
+/// What [`App::set_named_app_preset`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedAppRule {
+    /// The applications the name reached ([`apps_named`]); the program of that name when it
+    /// reached none. Empty when it reached none and there was nothing to choose.
+    pub apps: Vec<AppKey>,
+    /// Whether the name reached no application FxSound has seen, so that the preset was kept for
+    /// the program of that name.
+    pub unseen: bool,
+    /// Whether the store changed.
+    pub changed: bool,
+}
+
+/// One remembered application as the lists show it: its rule, and what its streams are doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListedApp<'a> {
+    /// The rule's place in the store.
+    pub index: usize,
+    pub rule: &'a AppRule,
+    /// Per lane, output first: whether a stream the rule answers for plays or records now.
+    pub running: [bool; 2],
+    /// Per lane: the preset of the route the engine has moved those streams onto, `None` while
+    /// they are on the lane's own chain.
+    pub routed: [Option<&'a str>; 2],
+}
+
+impl ListedApp<'_> {
+    /// Whether it plays or records now.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.running.contains(&true)
+    }
+}
+
+/// Every rule of `rules`, in the order Settings ▸ Applications and `--list-apps` show them: the
+/// ones some stream of `streams` answers to ([`AppRules::rule`]) first, by name, then the rest,
+/// the most recently seen first, then by name.
+#[must_use]
+pub fn list_apps<'a>(rules: &'a AppRules, streams: &'a [AppStream]) -> Vec<ListedApp<'a>> {
+    let mut listed: Vec<ListedApp<'a>> = rules
+        .apps
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| ListedApp {
+            index,
+            rule,
+            running: [false; 2],
+            routed: [None; 2],
+        })
+        .collect();
+    for stream in streams {
+        if let Some(index) = stream
+            .app
+            .best_match(rules.apps.iter().map(|rule| &rule.key))
+        {
+            let lane = lane_index(stream.direction);
+            let entry = &mut listed[index];
+            entry.running[lane] = true;
+            if entry.routed[lane].is_none() {
+                entry.routed[lane] = stream.route.as_deref();
+            }
+        }
+    }
+    listed.sort_by(|a, b| {
+        let by_name = || {
+            let name = |listed: &ListedApp<'_>| listed.rule.key.display().to_lowercase();
+            name(a).cmp(&name(b))
+        };
+        b.is_running().cmp(&a.is_running()).then_with(|| {
+            if a.is_running() {
+                by_name()
+            } else {
+                b.rule.last_seen.cmp(&a.rule.last_seen).then_with(by_name)
+            }
+        })
+    });
+    listed
+}
+
+/// The applications `text` names, the way `--app-preset` and D-Bus's `SetAppPreset` take one: by
+/// its Flatpak id, else by its program, else by its name, each without regard to case or
+/// surrounding whitespace, and the first of the three that answers decides. A program is compared
+/// by its last path component on both sides, as the store compares it.
+///
+/// The store is asked first, and every rule that answers is named, in the store's order, not only
+/// the first: `firefox` names both a native and a Flatpak Firefox when both have a rule, and the
+/// Flatpak id tells them apart. Only when no rule answers are the streams playing and recording
+/// now asked, in the engine's order: an application a rule covers under other identifiers — a
+/// Flatpak Firefox the rule written for the native one covers — is still reached by its own.
+/// Empty when nothing answers.
+#[must_use]
+pub fn apps_named(rules: &AppRules, streams: &[AppStream], text: &str) -> Vec<AppKey> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let fields: [fn(&AppKey) -> &str; 3] = [
+        |key| key.flatpak.trim(),
+        |key| basename(&key.binary),
+        |key| key.name.trim(),
+    ];
+    let wanted = [text, basename(text), text];
+    let answering = |keys: &[&AppKey]| {
+        for (field, wanted) in fields.into_iter().zip(wanted) {
+            let mut named: Vec<AppKey> = Vec::new();
+            for &key in keys {
+                let value = field(key);
+                if !value.is_empty() && same_ignoring_case(value, wanted) && !named.contains(key) {
+                    named.push(key.clone());
+                }
+            }
+            if !named.is_empty() {
+                return named;
+            }
+        }
+        Vec::new()
+    };
+    let from_rules = answering(&rules.apps.iter().map(|rule| &rule.key).collect::<Vec<_>>());
+    if !from_rules.is_empty() {
+        return from_rules;
+    }
+    answering(&streams.iter().map(|stream| &stream.app).collect::<Vec<_>>())
+}
+
+/// A program's last path component, trimmed: `/usr/lib/firefox/firefox` and `C:\Games\bf6.exe`
+/// are `firefox` and `bf6.exe`, as the store reads them.
+fn basename(program: &str) -> &str {
+    program
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim()
+}
+
+/// Whether the two are the same text in any case, character by character — which also gets a
+/// localised Windows game's non-ASCII program right.
+fn same_ignoring_case(a: &str, b: &str) -> bool {
+    a.chars()
+        .flat_map(char::to_lowercase)
+        .eq(b.chars().flat_map(char::to_lowercase))
 }
 
 /// The order the routes are sent in, so that the same set is the same message whatever order the
@@ -247,8 +391,8 @@ impl App {
         &self.apps.sent
     }
 
-    /// Settings ▸ Applications: a row per remembered application — the ones playing or
-    /// recording now first, by name, then the rest, the most recently seen first.
+    /// Settings ▸ Applications: a row per remembered application, in [`list_apps`]' order — the
+    /// ones playing or recording now first, by name, then the rest, the most recently seen first.
     ///
     /// A row is a rule of the store, and a running one is a rule some stream answers to
     /// ([`AppRules::rule`]), so a general rule — one for every program called `Discord` — is one
@@ -258,28 +402,21 @@ impl App {
     #[must_use]
     pub fn app_rows(&self) -> Vec<AppRow> {
         let rules = &self.apps.rules;
-        let keys = || rules.apps.iter().map(|rule| &rule.key);
-        // Which lanes each rule's applications were heard on: now, and this session.
-        let mut running = vec![[false; 2]; rules.apps.len()];
+        // Which lanes each rule's applications were heard on this session.
         let mut used = vec![[false; 2]; rules.apps.len()];
-        for stream in &self.apps.streams {
-            if let Some(index) = stream.app.best_match(keys()) {
-                running[index][lane_index(stream.direction)] = true;
-            }
-        }
         for (app, direction) in &self.apps.used {
-            if let Some(index) = app.best_match(keys()) {
+            if let Some(index) = app.best_match(rules.apps.iter().map(|rule| &rule.key)) {
                 used[index][lane_index(*direction)] = true;
             }
         }
 
-        let mut rows: Vec<(u64, AppRow)> = rules
-            .apps
-            .iter()
-            .enumerate()
-            .map(|(index, rule)| {
+        list_apps(rules, &self.apps.streams)
+            .into_iter()
+            .map(|listed| {
+                let rule = listed.rule;
                 let heard = |direction: DeviceDirection| {
-                    running[index][lane_index(direction)] || used[index][lane_index(direction)]
+                    listed.running[lane_index(direction)]
+                        || used[listed.index][lane_index(direction)]
                 };
                 let mut lanes: Vec<DeviceDirection> = DeviceDirection::ALL
                     .into_iter()
@@ -288,10 +425,10 @@ impl App {
                 if lanes.is_empty() {
                     lanes = DeviceDirection::ALL.to_vec();
                 }
-                let row = AppRow {
+                AppRow {
                     app: rule.key.clone(),
                     name: rule.key.display().to_owned(),
-                    running: running[index].contains(&true),
+                    running: listed.is_running(),
                     lanes: lanes
                         .into_iter()
                         .map(|direction| AppLane {
@@ -303,21 +440,87 @@ impl App {
                                 .then(|| rule.preset(direction).to_owned()),
                         })
                         .collect(),
-                };
-                (rule.last_seen, row)
-            })
-            .collect();
-        rows.sort_by(|(a_seen, a), (b_seen, b)| {
-            let by_name = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
-            b.running.cmp(&a.running).then_with(|| {
-                if a.running {
-                    by_name()
-                } else {
-                    b_seen.cmp(a_seen).then_with(by_name)
                 }
             })
-        });
-        rows.into_iter().map(|(_, row)| row).collect()
+            .collect()
+    }
+
+    /// The applications `text` names, the way the command line and D-Bus name one:
+    /// [`apps_named`] over the store and the streams playing and recording now.
+    #[must_use]
+    pub fn apps_named(&self, text: &str) -> Vec<AppKey> {
+        apps_named(&self.apps.rules, &self.apps.streams, text)
+    }
+
+    /// `--app-preset TEXT=PRESET` and D-Bus's `SetAppPreset`: choose the preset the applications
+    /// `text` names run through in `direction` — `None` or a blank name to follow the lane's
+    /// preset — and say so to the engine at once for the ones running.
+    ///
+    /// Each application [`App::apps_named`] finds for `text` gets it as the Settings pane gives it
+    /// ([`AppRules::upsert`]): a rule's own key changes that rule, and a running application's
+    /// key found only among the streams gets a rule of its own beside the one that covered it.
+    /// When `text` names nothing, a rule is added for the program called `text` — the `binary` of
+    /// its key — except to follow the lane, which an application with no rule does already. The
+    /// store is written at once when it changed.
+    ///
+    /// # Errors
+    ///
+    /// A blank `text` (or one that is only a path's separators), and a preset `direction`'s store
+    /// does not have, are refused and change nothing — not even a rule added for an application
+    /// FxSound has not seen.
+    pub fn set_named_app_preset(
+        &mut self,
+        text: &str,
+        direction: DeviceDirection,
+        preset: Option<&str>,
+    ) -> Result<NamedAppRule, AppRuleRefusal> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(AppRuleRefusal::NoApplication);
+        }
+        let preset = preset.map_or("", str::trim);
+        if !preset.is_empty() && !self.lane_has_preset(direction, preset) {
+            return Err(AppRuleRefusal::UnknownPreset {
+                direction,
+                name: preset.to_owned(),
+            });
+        }
+        let mut apps = self.apps_named(text);
+        let unseen = apps.is_empty();
+        if unseen {
+            if preset.is_empty() {
+                return Ok(NamedAppRule {
+                    apps,
+                    unseen,
+                    changed: false,
+                });
+            }
+            let program = AppKey {
+                binary: text.to_owned(),
+                ..AppKey::default()
+            };
+            // `/` names no program: its last component is empty, and no stream could match it.
+            if program.is_empty() {
+                return Err(AppRuleRefusal::NoApplication);
+            }
+            apps.push(program);
+        }
+        // A rule's key is that rule's own best match, so its upsert changes it in place; the
+        // others each add the one rule of their own.
+        let now = unix_now();
+        let mut changed = false;
+        for app in &apps {
+            changed |= self.apps.rules.upsert(app, direction, preset, now);
+        }
+        if changed {
+            self.save_app_rules();
+            self.app_presets_changed();
+        }
+        Ok(NamedAppRule {
+            apps,
+            unseen,
+            changed,
+        })
     }
 
     /// Choose the preset the application `app` names runs through in `direction` — `None` or a

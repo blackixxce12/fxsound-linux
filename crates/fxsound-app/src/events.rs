@@ -320,8 +320,9 @@ impl AppEvent {
     }
 }
 
-/// Append ` key=value` — or one such pair per leaf, with dotted keys, for an object.
-fn push_plain(out: &mut String, key: &str, value: &Value) {
+/// Append ` key=value` — or one such pair per leaf, with dotted keys, for an object. `--list-apps`
+/// writes its lines with it too.
+pub(crate) fn push_plain(out: &mut String, key: &str, value: &Value) {
     match value {
         Value::Object(map) => {
             for (inner, value) in map {
@@ -1760,6 +1761,56 @@ mod tests {
         );
         fan_out(&mut app, &[&watch, &bus], None);
         assert_eq!(watch.take(), [], "drained once");
+    }
+
+    #[test]
+    fn an_application_the_engine_moves_reaches_every_consumer_as_app_routed_once() {
+        let (mut app, engine, _dir) = started();
+        let (watch, bus) = (Recorder::default(), Recorder::default());
+        let game = AppKey {
+            binary: "bf6.exe".to_owned(),
+            name: "Battlefield 6".to_owned(),
+            flatpak: String::new(),
+        };
+        let playing = |route: Option<&str>| {
+            AudioToUi::AppStreams(vec![fxsound_core::messages::AppStream {
+                id: 7,
+                direction: OUT,
+                app: game.clone(),
+                route: route.map(str::to_owned),
+            }])
+        };
+        hear(&mut app, &engine, [playing(None), playing(Some("Beta"))]);
+        fan_out(&mut app, &[&watch, &bus], None);
+        let handed = watch.take();
+        assert_eq!(handed, bus.take());
+        let routed: Vec<String> = handed
+            .iter()
+            .filter(|event| event.name() == "app_routed")
+            .map(|event| event.to_json(1))
+            .collect();
+        assert_eq!(
+            routed,
+            [
+                r#"{"v":1,"event":"app_routed","ts":1,"app":"Battlefield 6","binary":"bf6.exe","flatpak":"","direction":"output","preset":"Beta"}"#
+            ]
+        );
+
+        // The same report again says nothing; the way back says so once.
+        hear(&mut app, &engine, [playing(Some("Beta")), playing(None)]);
+        fan_out(&mut app, &[&watch, &bus], None);
+        let back: Vec<String> = watch
+            .take()
+            .iter()
+            .filter(|event| event.name() == "app_routed")
+            .map(AppEvent::to_plain)
+            .collect();
+        assert_eq!(
+            back,
+            [
+                r#"app_routed app="Battlefield 6" binary=bf6.exe flatpak="" direction=output preset="#
+            ]
+        );
     }
 
     #[test]

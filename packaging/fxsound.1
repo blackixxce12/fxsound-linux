@@ -30,6 +30,10 @@ fxsound \- system-wide audio enhancement for PipeWire
 .B fxsound
 .B \-\-self\-test
 .RB [ \-\-json ]
+.br
+.B fxsound
+.B \-\-list\-apps
+.RB [ \-\-json ]
 .SH DESCRIPTION
 .B fxsound
 presents itself to PipeWire as a virtual sink, processes everything
@@ -39,7 +43,9 @@ output device. A second, independent lane does the same for a microphone: it
 runs a voice chain (denoise, high-pass, downward expander, equalizer,
 de-esser, compressor, makeup gain, look-ahead limiter) and publishes a virtual
 source. Both lanes can run at once; each has a device and a preset of its
-own, either can be detached, and one power switch covers both.
+own, either can be detached, and one power switch covers both. An application
+can have a preset of its own on either lane: FxSound runs that preset for it
+alone, beside the lane's, and remembers the choice.
 .PP
 Run with no options,
 .B fxsound
@@ -52,8 +58,13 @@ both as a startup option and as a way to drive an instance that is already
 running.
 .PP
 The exceptions are
-.BR \-\-status " and " \-\-watch ,
-which print and exit without raising anything, and
+.BR \-\-status ", " \-\-watch " and " \-\-list\-apps ,
+which print and exit without raising anything, the options a script or a
+keybinding runs (see
+.B Shortcut targets
+and
+.BR Applications ),
+which leave the window where it is, and
 .BR \-\-self\-test ,
 which never contacts a running instance at all.
 .PP
@@ -249,6 +260,71 @@ launcher is still starting does not hide its window.
 .TP
 .B \-\-show
 Show and raise the window of the running instance.
+.SS Applications
+.PP
+Every application that plays or records through FxSound is remembered, and
+each can have a preset of its own per lane: a game on
+.IR Gaming ,
+a browser on
+.IR "Volume Boost" ,
+a voice chat's microphone on
+.IR Headset ,
+all at once. FxSound moves the application's streams onto nodes of their own
+on the lane's device that run that preset, as
+.BR pavucontrol (1)
+moves a stream, and moves them back when the preset is taken away; the rest
+of the session keeps the lane's preset. At most four presets of one lane run
+this way at a time. Settings \(-> Applications offers the same choices. None
+of these options raises the window.
+.TP
+.BI \-\-app\-preset= APP=PRESET
+Give an application a playback preset of its own.
+.I APP
+is a remembered application's Flatpak id, program or name, in any case, as
+.B \-\-list\-apps
+shows them: the first of the three that any remembered application has
+decides, and every application it names gets the preset, so
+.B firefox
+reaches both a native and a Flatpak Firefox. One playing or recording now is
+reached by its own as well, even while a rule written for another install
+covers it. One that FxSound has not seen gets a rule for the program of that
+name, which applies from the first time it plays; a note on standard error
+says so, as a misspelt name would be new too.
+.I PRESET
+is an output preset's exact name, or
+.BR default " (also " follow ,
+in any case, or nothing after the
+.BR = )
+to have the application follow the output lane's preset again. A preset the
+output lane does not have is an error. May be given more than once.
+.TP
+.BI \-\-app\-input\-preset= APP=PRESET
+The same for what an application records, with a voice preset.
+.TP
+.B \-\-list\-apps
+Print the applications FxSound remembers and exit: the ones playing or
+recording now first, then the rest, the most recently heard first. One line
+per application of
+.I key=value
+pairs, spelled as
+.B \-\-watch
+spells them:
+.BR name " (the one the window shows), " binary ", " flatpak ", " running ,
+.BR output_preset " and " input_preset
+(empty while the application follows the lane),
+.BR routed.output " and " routed.input
+(the preset FxSound runs it through now, empty on the lane's own). With
+.BR \-\-json ,
+one object:
+.B schema
+and
+.BR apps ,
+described under
+.BR "STATUS DOCUMENT" .
+With no FxSound running, the list is read from the store,
+.IR ~/.config/fxsound/apps.toml ,
+nothing in it running, and nothing is started. Every other option on the
+same command line is ignored.
 .SS Shortcut targets
 .PP
 These exist so a compositor keybinding has something to call. They have no
@@ -293,14 +369,17 @@ lines. Every other option on the same command line is ignored.
 .TP
 .B \-\-json
 Print the
-.BR \-\-status ", " \-\-watch " or " \-\-self\-test
+.BR \-\-status ", " \-\-watch ", " \-\-self\-test " or " \-\-list\-apps
 report as JSON instead of as lines: one object for
 .B \-\-status
 (schema 2, described under
-.BR "STATUS DOCUMENT" )
-and for
+.BR "STATUS DOCUMENT" ),
+for
 .B \-\-self\-test
-.RB ( version ", " checks ", " ok ),
+.RB ( version ", " checks ", " ok )
+and for
+.B \-\-list\-apps
+.RB ( schema " and " apps ),
 one object per line for
 .BR \-\-watch .
 Not the default: the line format is what existing scripts already grep.
@@ -329,7 +408,7 @@ as they happen;
 .B app_routed
 says where an application's streams went
 .RB ( app ", " binary ", " flatpak ", " direction ", " preset ,
-the preset being empty once they are back on FxSound's own). Plain output is
+the preset being empty once they are back on the lane's own chain). Plain output is
 .I event key=value ...
 per line; with
 .B \-\-json
@@ -405,7 +484,10 @@ stream was cut off without the instance's
 .B quit
 event,
 .B \-\-self\-test
-found at least one failing check, or FxSound itself could not start.
+found at least one failing check,
+.B \-\-list\-apps
+with no FxSound running found a store it could not read, or FxSound itself
+could not start.
 .TP
 .B 2
 The command line could not be parsed \(en an unknown option, or a value outside
@@ -541,6 +623,32 @@ an array of
 .BR index ", " frequency " (Hz), " gain " (dB), " min_frequency " and " max_frequency ,
 the range the band's frequency can be tuned over, which the Windows build
 leaves out.
+.TP
+.B apps
+Every application FxSound remembers, in the order
+.B \-\-list\-apps
+prints them: an array of
+.B name
+(the one the window shows, which
+.B \-\-app\-preset
+takes back),
+.B binary
+and
+.B flatpak
+(empty when PipeWire did not say),
+.B running
+(playing or recording now),
+.BR output_preset " and " input_preset
+(the preset of its own for each lane, as chosen, or
+.B null
+while it follows the lane) and
+.BR routed :
+an object of
+.BR output " and " input ,
+the preset FxSound has moved its streams onto in each lane, or
+.B null
+while they run through the lane's own chain \(en it follows the lane, it is
+not playing or recording there, or its preset could not be run.
 .SH D\-BUS
 A running instance also serves an interface on the session bus, for status
 bars, compositor scripts and anything else that would rather hold a connection
@@ -575,6 +683,8 @@ Show()                     Hide()
 ToggleWindow()             Quit()
 Apply(as argv) \(-> (b ok, s stdout, s stderr)
 ListPresets() \(-> s          ListDevices() \(-> s
+SetAppPreset(s app, s direction, s preset)
+ListApps() \(-> s
 .EE
 .RE
 .PP
@@ -600,6 +710,14 @@ to detach the lane;
 .B SetEditDirection
 takes
 .BR output " or " input .
+.B SetAppPreset
+is
+.BR \-\-app\-preset " and " \-\-app\-input\-preset :
+the application as they take it, the direction as
+.B SetEditDirection
+takes it, and the preset by name, or
+.BR default ", " follow
+or the empty string to have the application follow the lane again.
 Unlike a typed command line, no method raises the window but
 .BR Show " and " ToggleWindow .
 A command the running instance refuses fails with
@@ -636,6 +754,12 @@ with its
 .BR schema ", " selected_output ", " selected_input ", "
 .BR output_device_list " and " input_device_list ,
 each as one JSON object.
+.B ListApps
+answers with what
+.B \-\-list\-apps \-\-json
+prints: the
+.BR schema " and " apps
+of the status document.
 .PP
 Properties:
 .BR Version " (s, constant), " Power " (b), " Preset " (s), "
@@ -655,13 +779,19 @@ Signals:
 .BR PowerChanged (b),
 .BR PresetChanged (s\ direction,\ s\ name),
 .BR DeviceChanged (s\ direction,\ s\ node_name,\ s\ description),
-.BR AudioStateChanged (s\ json)
+.BR AudioStateChanged (s\ json),
+.BR Notice (s\ message)
 and
-.BR Notice (s\ message).
+.BR AppRouted (s\ app,\ s\ direction,\ s\ preset).
 They follow the
 .B \-\-watch
 events
-.BR power ", " preset_changed ", " device_changed ", " audio_state " and " notice ;
+.BR power ", " preset_changed ", " device_changed ", " audio_state ", " notice
+and
+.BR app_routed ;
+.B AppRouted
+names the application as the window does, and its preset is empty once its
+streams are back on the lane's own chain;
 .B AudioStateChanged
 carries the line
 .B \-\-watch \-\-json
@@ -763,6 +893,12 @@ Imported and user-saved presets; voice presets under
 Settings. A corrupt file is never fatal: the defaults are used and the audio
 still comes up.
 .TP
+.I ~/.config/fxsound/apps.toml
+The applications FxSound remembers, at most 500, and the preset each has of
+its own. One that does not load is moved aside to
+.I apps.toml.bad
+when FxSound starts, and the list starts empty.
+.TP
 .I $XDG_RUNTIME_DIR/fxsound/instance.lock
 Holds the running instance's pid under an exclusive
 .BR flock (2).
@@ -825,6 +961,17 @@ Point the microphone lane at a headset and quieten a fan:
 .EX
 fxsound \-\-input='Jabra Evolve2' \-\-preset='Gaming Headset' \e
     \-\-noise\-suppression=strong
+.EE
+.RE
+.PP
+Give a game and a browser presets of their own, and a voice chat's
+microphone a voice preset, then check what runs where:
+.PP
+.RS 4
+.EX
+fxsound \-\-app\-preset='bf6.exe=Gaming' \-\-app\-preset='brave=Volume Boost' \e
+    \-\-app\-input\-preset='com.discordapp.Discord=Headset'
+fxsound \-\-list\-apps
 .EE
 .RE
 .PP

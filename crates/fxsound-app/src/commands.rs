@@ -10,13 +10,19 @@
 //! emits the commands in that order, so this module only has to execute them in sequence.
 //!
 //! It also owns what `--status` reports: [`StatusDocument`], which the event stream and D-Bus
-//! send as well.
+//! send as well, and what `--list-apps` reports: [`AppListing`], which D-Bus `ListApps` sends.
 
-use crate::app::{App, detach, select_on};
-use crate::cli::{Command, DeviceCommand, PowerCommand, PresetCommand, WindowCommand};
-use fxsound_core::{AudioDevice, DeviceDirection, Effect, ThemeMode, ViewMode, eq};
+use std::path::Path;
+
+use crate::app::{App, AppRuleRefusal, detach, list_apps, select_on};
+use crate::cli::{
+    AppPresetChoice, Command, DeviceCommand, PowerCommand, PresetCommand, WindowCommand,
+};
+use fxsound_core::messages::AppStream;
+use fxsound_core::{AppRules, AudioDevice, DeviceDirection, Effect, ThemeMode, ViewMode, eq};
 use fxsound_ui::{UiAction, state::UiState};
 use serde::Serialize;
+use serde_json::Value;
 
 /// What executing a command asks the window layer to do.
 ///
@@ -136,6 +142,10 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
             return self_test_outcome(&crate::selftest::Environment::detect(), *json);
         }
 
+        Command::ListApps { json } => {
+            outcome.stdout = app_listing(app_statuses(app.app_rules(), app.app_streams()), *json);
+        }
+
         Command::Power(power) => {
             let want = match power {
                 PowerCommand::On => true,
@@ -157,6 +167,11 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
             app.handle(&[UiAction::SetEditDirection(*direction)]);
         }
         Command::NoiseSuppression(choice) => app.set_noise_suppression(*choice),
+        Command::AppPreset {
+            direction,
+            app: name,
+            preset,
+        } => return run_app_preset(app, *direction, name, preset),
 
         Command::NumBands(count) => {
             app.handle(&[UiAction::SetBandCount(*count as usize)]);
@@ -415,6 +430,233 @@ fn run_preset(app: &mut App, command: &PresetCommand) -> Outcome {
     Outcome::default()
 }
 
+/// `--app-preset APP=PRESET` and `--app-input-preset APP=PRESET`, and D-Bus's `SetAppPreset`:
+/// the preset the applications `name` names run through in `lane` ([`App::set_named_app_preset`]).
+///
+/// A preset `lane`'s list does not have is refused, with a word on where it is when the other
+/// lane's list has it, as `--preset` says it. A name no remembered application answers to is not
+/// an error — FxSound keeps the preset for the program of that name, the game that has not been
+/// started yet — but it is said, on stderr, since a mistyped name is just as new to FxSound.
+fn run_app_preset(
+    app: &mut App,
+    lane: DeviceDirection,
+    name: &str,
+    preset: &AppPresetChoice,
+) -> Outcome {
+    match app.set_named_app_preset(name, lane, preset.name()) {
+        Ok(done) if done.apps.is_empty() => Outcome {
+            stderr: format!(
+                "note: FxSound has not seen an application called {name:?}, so it follows \
+                 FxSound's preset already"
+            ),
+            ..Outcome::default()
+        },
+        Ok(done) if done.unseen => Outcome {
+            stderr: format!(
+                "note: FxSound has not seen an application called {name:?}; the preset is kept for \
+                 the program {name:?} and runs once it {} (--list-apps shows the applications \
+                 FxSound knows)",
+                match lane {
+                    DeviceDirection::Output => "plays",
+                    DeviceDirection::Input => "records",
+                }
+            ),
+            ..Outcome::default()
+        },
+        Ok(_) => Outcome::default(),
+        Err(refusal) => {
+            let mut message = refusal.to_string();
+            if let AppRuleRefusal::UnknownPreset { direction, name } = &refusal
+                && app.lane_has_preset(direction.other(), name)
+            {
+                message.push_str(match direction {
+                    DeviceDirection::Output => {
+                        "; it is an input preset, which --app-input-preset gives"
+                    }
+                    DeviceDirection::Input => "; it is an output preset, which --app-preset gives",
+                });
+            }
+            Outcome::refused(message)
+        }
+    }
+}
+
+/// One remembered application, as the status document's `apps`, `--list-apps` and D-Bus
+/// `ListApps` list it: who it is, what the user chose for it, and what it runs through now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AppStatus {
+    /// The name the window shows: the application's own name, else its program, else its Flatpak
+    /// id. `--app-preset` takes it back.
+    pub name: String,
+    /// The program, as PipeWire reported it; empty when it did not.
+    pub binary: String,
+    /// The Flatpak id; empty for an application that is not one.
+    pub flatpak: String,
+    /// Whether it plays or records now.
+    pub running: bool,
+    /// Its playback preset of its own, as the store has it; `null` while it follows the output
+    /// lane's.
+    pub output_preset: Option<String>,
+    /// Its recording preset of its own; `null` while it follows the input lane's.
+    pub input_preset: Option<String>,
+    /// What it runs through now, per lane.
+    pub routed: RoutedStatus,
+}
+
+/// Per lane, the preset of the route FxSound has moved an application's streams onto — what
+/// `app_routed` last said. `null` while they are on the lane's own chain: it follows the lane,
+/// it is not playing or recording there, or its route could not be made.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RoutedStatus {
+    pub output: Option<String>,
+    pub input: Option<String>,
+}
+
+/// What `--list-apps --json` prints and D-Bus `ListApps` answers: the status document's
+/// `schema` and its `apps`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AppListing {
+    /// [`STATUS_SCHEMA`].
+    pub schema: u32,
+    pub apps: Vec<AppStatus>,
+}
+
+/// Every application of `rules`, in the order Settings ▸ Applications lists them
+/// ([`list_apps`]), with what `streams` — the engine's last report — say they are doing.
+#[must_use]
+pub fn app_statuses(rules: &AppRules, streams: &[AppStream]) -> Vec<AppStatus> {
+    list_apps(rules, streams)
+        .into_iter()
+        .map(|listed| {
+            let rule = listed.rule;
+            let own = |direction: DeviceDirection| {
+                rule.has_preset(direction)
+                    .then(|| rule.preset(direction).to_owned())
+            };
+            let routed = |direction: DeviceDirection| {
+                listed.routed[match direction {
+                    DeviceDirection::Output => 0,
+                    DeviceDirection::Input => 1,
+                }]
+                .map(str::to_owned)
+            };
+            AppStatus {
+                name: rule.key.display().to_owned(),
+                binary: rule.key.binary.clone(),
+                flatpak: rule.key.flatpak.clone(),
+                running: listed.is_running(),
+                output_preset: own(DeviceDirection::Output),
+                input_preset: own(DeviceDirection::Input),
+                routed: RoutedStatus {
+                    output: routed(DeviceDirection::Output),
+                    input: routed(DeviceDirection::Input),
+                },
+            }
+        })
+        .collect()
+}
+
+/// What `--list-apps` prints for `apps`: [`AppListing`] as one JSON object, or one line per
+/// application of `key=value` pairs, spelled as `fxsound --watch` spells them — a value with a
+/// space in it quoted, `null` left empty:
+///
+/// ```text
+/// name="Battlefield 6" binary=bf6.exe flatpak="" running=true output_preset=Gaming input_preset= routed.output=Gaming routed.input=
+/// ```
+///
+/// Nothing at all when no application is remembered.
+#[must_use]
+pub fn app_listing(apps: Vec<AppStatus>, json: bool) -> String {
+    if json {
+        let listing = AppListing {
+            schema: STATUS_SCHEMA,
+            apps,
+        };
+        return serde_json::to_string(&listing).unwrap_or_else(|err| {
+            log::error!("could not serialise the application listing: {err}");
+            "{}".to_owned()
+        });
+    }
+    let lines: Vec<String> = apps
+        .iter()
+        .map(|app| {
+            let mut line = String::new();
+            for (key, value) in [
+                ("name", Value::from(app.name.as_str())),
+                ("binary", Value::from(app.binary.as_str())),
+                ("flatpak", Value::from(app.flatpak.as_str())),
+                ("running", Value::from(app.running)),
+                ("output_preset", Value::from(app.output_preset.clone())),
+                ("input_preset", Value::from(app.input_preset.clone())),
+                ("routed.output", Value::from(app.routed.output.clone())),
+                ("routed.input", Value::from(app.routed.input.clone())),
+            ] {
+                crate::events::push_plain(&mut line, key, &value);
+            }
+            line.trim_start().to_owned()
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// `--list-apps` with no FxSound running: the store at `path` listed as [`app_listing`] lists
+/// it, with nothing running and nothing routed.
+///
+/// Read only: a file that does not load is reported and left where it is, rather than moved
+/// aside as the instance's own load does ([`AppRules::load_from`]) — a question does not tidy the
+/// user's files. A missing file is an empty store.
+#[must_use]
+pub fn store_listing(path: &Path, json: bool) -> Outcome {
+    let rules = match std::fs::read_to_string(path) {
+        Ok(text) => match toml::from_str::<AppRules>(&text) {
+            Ok(mut rules) => {
+                rules.sanitise();
+                rules
+            }
+            Err(err) => {
+                return Outcome::refused(format!("{} does not load: {err}", path.display()));
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => AppRules::default(),
+        Err(err) => return Outcome::refused(format!("{}: {err}", path.display())),
+    };
+    Outcome {
+        stdout: app_listing(app_statuses(&rules, &[]), json),
+        ..Outcome::default()
+    }
+}
+
+/// What `fxsound` says when it cannot find a running FxSound to answer.
+pub const NOT_RUNNING: &str = "FxSound is not running";
+
+/// The answer to a command line that has no FxSound to ask, or `None` when it starts one.
+///
+/// `main` asks this once it holds the lock, before the engine starts, with the line's
+/// [`Cli::commands`](crate::cli::Cli::commands): the same list a running instance would run, so a
+/// line means the same thing whether FxSound runs or not. `--watch --list-apps` is the listing
+/// either way, and so is `--quit --list-apps`.
+///
+/// * `--list-apps` is answered from the store at `store` ([`store_listing`]), and nothing
+///   starts.
+/// * `--status` and `--watch` have nobody to ask, and starting FxSound to answer would be the
+///   opposite of what was asked: [`NOT_RUNNING`], and a failure.
+/// * `--quit` has nothing to stop: [`NOT_RUNNING`] too, but what was asked for is true already,
+///   so not a failure. The rest of that line is not carried out.
+///
+/// `--self-test` is not here: `main` answers it before it tries the lock at all.
+#[must_use]
+pub fn answer_without_an_instance(commands: &[Command], store: &Path) -> Option<Outcome> {
+    match commands {
+        [Command::ListApps { json }] => Some(store_listing(store, *json)),
+        [Command::Status { .. } | Command::Watch { .. }] => Some(Outcome::refused(NOT_RUNNING)),
+        _ if commands.contains(&Command::Quit) => Some(Outcome {
+            stderr: NOT_RUNNING.to_owned(),
+            ..Outcome::default()
+        }),
+        _ => None,
+    }
+}
+
 /// The shape of [`StatusDocument`], as its `schema` key says it. 0.3.0's document had no number
 /// and is schema 1; 2 is 0.4.0's, every key of 1 kept and upstream's `printStatus` keys added.
 pub const STATUS_SCHEMA: u32 = 2;
@@ -489,6 +731,9 @@ pub struct StatusDocument {
     pub selected_input: Option<String>,
     /// The edit direction's equalizer and gain stage, band by band.
     pub equalizer: Equalizer,
+    /// Every application FxSound remembers, the ones playing or recording now first, with the
+    /// presets of their own and what they run through now (`docs/0.4.0-apps.md`).
+    pub apps: Vec<AppStatus>,
 }
 
 /// A value on a control's own scale, as the document prints it: exactly, and a whole number
@@ -787,6 +1032,7 @@ pub fn status_document(app: &App) -> StatusDocument {
             .device_for(DeviceDirection::Input)
             .map(|d| d.description.clone()),
         equalizer: equalizer(state),
+        apps: app_statuses(app.app_rules(), app.app_streams()),
     }
 }
 
@@ -3054,5 +3300,628 @@ mod tests {
         );
         assert!(!a.preset_menu().delete, "while the menu offers nothing");
         let _ = std::fs::remove_dir_all(user_dir(tag).parent().expect("the root"));
+    }
+
+    // ---- per-application presets --------------------------------------------------------------
+
+    use crate::audio_link::FakeEngine;
+    use fxsound_core::messages::AudioToUi;
+    use fxsound_core::{AppKey, UiToAudio};
+
+    const OUT: DeviceDirection = DeviceDirection::Output;
+    const IN: DeviceDirection = DeviceDirection::Input;
+
+    fn key(binary: &str, name: &str, flatpak: &str) -> AppKey {
+        AppKey {
+            binary: binary.to_owned(),
+            name: name.to_owned(),
+            flatpak: flatpak.to_owned(),
+        }
+    }
+
+    fn battlefield() -> AppKey {
+        key("bf6.exe", "Battlefield 6", "")
+    }
+
+    fn brave() -> AppKey {
+        key("brave", "Brave", "")
+    }
+
+    fn discord() -> AppKey {
+        key("Discord", "Discord", "com.discordapp.Discord")
+    }
+
+    fn stream(id: u32, direction: DeviceDirection, app: &AppKey) -> AppStream {
+        AppStream {
+            id,
+            direction,
+            app: app.clone(),
+            route: None,
+        }
+    }
+
+    fn on_route(id: u32, direction: DeviceDirection, app: &AppKey, preset: &str) -> AppStream {
+        AppStream {
+            route: Some(preset.to_owned()),
+            ..stream(id, direction, app)
+        }
+    }
+
+    /// An app started against a stand-in engine, both lanes on: the speakers' presets `Gaming`,
+    /// `Music` and `Volume Boost`, the microphone's `Clean` and `Headset`. What start-up said and
+    /// sent is taken already, and the store is kept in memory.
+    fn with_apps() -> (App, FakeEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let factory = dir.path().join("factory");
+        std::fs::create_dir_all(&factory).expect("factory directory");
+        for name in ["Gaming", "Music", "Volume Boost"] {
+            let preset = fxsound_core::Preset {
+                name: name.to_owned(),
+                ..fxsound_core::Preset::default()
+            };
+            fxsound_preset::save(&preset, &factory.join(format!("{name}.fac"))).expect("write");
+        }
+        let mut music =
+            fxsound_preset::PresetStore::with_dirs(vec![factory], dir.path().join("user"));
+        music.rescan();
+        let voice = |name: &str| fxsound_preset::input::InputPreset {
+            name: name.to_owned(),
+            ..fxsound_preset::input::InputPreset::default()
+        };
+        let voices = crate::app::voice_store_for_tests(
+            &[voice("Clean"), voice("Headset")],
+            &dir.path().join("voice-factory"),
+            dir.path().join("user").join("Input"),
+        );
+        let mut settings = fxsound_core::Settings::default();
+        settings.output_preset = "Music".to_owned();
+        settings.input_preset = "Clean".to_owned();
+        settings.set_lane_enabled(IN, true);
+        let engine = FakeEngine::new();
+        let mut app = App::start_for_tests(settings, music, voices, &engine);
+        let _ = engine.take_sent();
+        let _ = app.drain_events();
+        (app, engine, dir)
+    }
+
+    /// The engine reports these streams, and the app takes the report.
+    fn play(app: &mut App, engine: &FakeEngine, streams: Vec<AppStream>) {
+        engine.feed(AudioToUi::AppStreams(streams));
+        app.poll_audio();
+    }
+
+    /// The routes the controller last sent the engine since the last look, as (lane, application,
+    /// preset); `None` when it sent none.
+    fn routes_sent(engine: &FakeEngine) -> Option<Vec<(DeviceDirection, String, String)>> {
+        engine
+            .take_sent()
+            .into_iter()
+            .rev()
+            .find_map(|message| match message {
+                UiToAudio::SetAppRoutes(routes) => Some(
+                    routes
+                        .iter()
+                        .map(|route| {
+                            (
+                                route.direction,
+                                route.app.display().to_owned(),
+                                route.preset.clone(),
+                            )
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+    }
+
+    /// What the rule for `app` says for `lane`, as the store has it.
+    fn chosen(a: &App, app: &AppKey, lane: DeviceDirection) -> String {
+        a.app_rules()
+            .rule(app)
+            .map(|rule| rule.preset(lane).to_owned())
+            .unwrap_or_default()
+    }
+
+    fn triple(lane: DeviceDirection, app: &str, preset: &str) -> (DeviceDirection, String, String) {
+        (lane, app.to_owned(), preset.to_owned())
+    }
+
+    #[test]
+    fn app_preset_reaches_a_remembered_application_by_program_name_or_flatpak_id_in_any_case() {
+        let (mut a, engine, _dir) = with_apps();
+        play(
+            &mut a,
+            &engine,
+            vec![
+                stream(1, OUT, &battlefield()),
+                stream(2, OUT, &brave()),
+                stream(3, IN, &discord()),
+            ],
+        );
+        let _ = engine.take_sent();
+        let direction = a.state.direction;
+
+        let outcome = run_line(
+            &mut a,
+            &[
+                "--app-preset=BF6.EXE=Gaming",
+                "--app-preset=brave=Volume Boost",
+                "--app-input-preset=COM.DISCORDAPP.DISCORD=Headset",
+            ],
+        );
+        assert!(
+            !outcome.failed && outcome.stderr.is_empty(),
+            "{}",
+            outcome.stderr
+        );
+        assert!(outcome.window.is_empty(), "no window: {:?}", outcome.window);
+        assert_eq!(a.state.direction, direction, "the edit direction stays");
+        assert_eq!(a.app_rules().apps.len(), 3, "no rule was added");
+        assert_eq!(chosen(&a, &battlefield(), OUT), "Gaming");
+        assert_eq!(chosen(&a, &brave(), OUT), "Volume Boost");
+        assert_eq!(chosen(&a, &discord(), IN), "Headset");
+        assert_eq!(
+            routes_sent(&engine),
+            Some(vec![
+                triple(OUT, "Battlefield 6", "Gaming"),
+                triple(OUT, "Brave", "Volume Boost"),
+                triple(IN, "Discord", "Headset"),
+            ]),
+            "sent at once, the way the Settings pane's choice is"
+        );
+
+        // By the name the window shows, in another case.
+        let outcome = run_line(&mut a, &["--app-preset=battlefield 6=Music"]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(chosen(&a, &battlefield(), OUT), "Music");
+        assert_eq!(a.app_rules().apps.len(), 3);
+    }
+
+    #[test]
+    fn the_flatpak_id_decides_before_the_program_and_the_program_before_the_name() {
+        let (mut a, engine, _dir) = with_apps();
+        let vesktop = key("vesktop", "Discord", "");
+        let canary = key("Discord", "Discord Canary", "com.discordapp.DiscordCanary");
+        let spotify = key("", "Spotify", "");
+        play(
+            &mut a,
+            &engine,
+            vec![
+                stream(1, IN, &vesktop),
+                stream(2, IN, &canary),
+                stream(3, OUT, &spotify),
+            ],
+        );
+
+        // No Flatpak is called `discord`, and a program is: the one called `Discord Canary`.
+        run_line(&mut a, &["--app-input-preset=discord=Headset"]);
+        assert_eq!(chosen(&a, &canary, IN), "Headset");
+        assert_eq!(
+            chosen(&a, &vesktop, IN),
+            "",
+            "its name is Discord, its program is not"
+        );
+
+        run_line(
+            &mut a,
+            &["--app-input-preset=com.discordapp.discordcanary=Clean"],
+        );
+        assert_eq!(chosen(&a, &canary, IN), "Clean");
+        run_line(&mut a, &["--app-input-preset=/usr/bin/VESKTOP=Headset"]);
+        assert_eq!(
+            chosen(&a, &vesktop, IN),
+            "Headset",
+            "by the program's last component"
+        );
+        run_line(&mut a, &["--app-preset=SPOTIFY=Music"]);
+        assert_eq!(
+            chosen(&a, &spotify, OUT),
+            "Music",
+            "by its name, when that is all it has"
+        );
+        assert_eq!(a.app_rules().apps.len(), 3);
+    }
+
+    #[test]
+    fn a_name_two_remembered_applications_answer_to_gives_both_the_preset() {
+        let (mut a, engine, _dir) = with_apps();
+        let native = key("firefox", "Firefox", "");
+        let sandboxed = key("firefox", "Firefox", "org.mozilla.firefox");
+        play(&mut a, &engine, vec![stream(1, OUT, &native)]);
+        a.set_app_preset(&sandboxed, IN, Some("Headset"))
+            .expect("a rule of the sandboxed one's own");
+        assert_eq!(a.app_rules().apps.len(), 2);
+
+        run_line(&mut a, &["--app-preset=Firefox=Gaming"]);
+        assert_eq!(chosen(&a, &native, OUT), "Gaming");
+        assert_eq!(chosen(&a, &sandboxed, OUT), "Gaming");
+
+        run_line(&mut a, &["--app-preset=org.mozilla.firefox=Music"]);
+        assert_eq!(
+            chosen(&a, &sandboxed, OUT),
+            "Music",
+            "the Flatpak id tells them apart"
+        );
+        assert_eq!(chosen(&a, &native, OUT), "Gaming");
+    }
+
+    #[test]
+    fn a_running_application_a_rule_covers_under_other_names_is_still_reached_by_its_own() {
+        let (mut a, engine, _dir) = with_apps();
+        let native = key("firefox", "Firefox", "");
+        let sandboxed = key("firefox", "Firefox", "org.mozilla.firefox");
+        play(&mut a, &engine, vec![stream(1, OUT, &native)]);
+        a.set_app_preset(&native, IN, Some("Clean"))
+            .expect("chosen");
+        // The Flatpak one plays now, and the native one's rule covers it: its id is in no rule.
+        play(&mut a, &engine, vec![stream(2, OUT, &sandboxed)]);
+        assert_eq!(a.app_rules().apps.len(), 1);
+        let _ = engine.take_sent();
+
+        let outcome = run_line(&mut a, &["--app-preset=org.mozilla.firefox=Gaming"]);
+        assert!(
+            outcome.stderr.is_empty(),
+            "it is running: {}",
+            outcome.stderr
+        );
+        assert_eq!(a.app_rules().apps.len(), 2, "a rule of its own");
+        assert_eq!(chosen(&a, &sandboxed, OUT), "Gaming");
+        assert_eq!(chosen(&a, &sandboxed, IN), "Clean", "carried over");
+        assert_eq!(chosen(&a, &native, OUT), "", "the native one is untouched");
+        assert_eq!(
+            routes_sent(&engine),
+            Some(vec![triple(OUT, "Firefox", "Gaming")])
+        );
+    }
+
+    #[test]
+    fn an_application_not_seen_yet_gets_a_rule_for_the_program_of_that_name_and_a_note() {
+        let (mut a, engine, _dir) = with_apps();
+        let outcome = run_line(&mut a, &["--app-preset=bf6.exe=Gaming"]);
+        assert!(!outcome.failed, "not an error: {}", outcome.stderr);
+        assert!(
+            outcome
+                .stderr
+                .starts_with("note: FxSound has not seen an application called \"bf6.exe\"")
+                && outcome.stderr.contains("once it plays"),
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(a.app_rules().apps.len(), 1);
+        assert_eq!(a.app_rules().apps[0].key, key("bf6.exe", "", ""));
+        assert_eq!(a.app_rules().apps[0].output_preset, "Gaming");
+        assert_eq!(routes_sent(&engine), None, "nothing plays yet");
+
+        // The game starts: the rule was waiting for it.
+        play(&mut a, &engine, vec![stream(1, OUT, &battlefield())]);
+        assert_eq!(
+            routes_sent(&engine),
+            Some(vec![triple(OUT, "Battlefield 6", "Gaming")])
+        );
+        assert_eq!(
+            a.app_rules().apps.len(),
+            1,
+            "the game is the program of the rule"
+        );
+
+        let outcome = run_line(&mut a, &["--app-input-preset=OBS=Headset"]);
+        assert!(
+            outcome.stderr.contains("once it records"),
+            "{}",
+            outcome.stderr
+        );
+    }
+
+    #[test]
+    fn a_program_name_with_nothing_after_its_last_separator_names_no_application() {
+        let (mut a, _engine, _dir) = with_apps();
+        for app in ["/", "C:\\Games\\"] {
+            let outcome = run_line(&mut a, &["--app-preset", &format!("{app}=Gaming")]);
+            assert!(outcome.failed, "{app}");
+            assert_eq!(outcome.stderr, "no application was named", "{app}");
+        }
+        assert!(a.app_rules().apps.is_empty());
+    }
+
+    #[test]
+    fn following_the_lane_for_an_application_not_seen_adds_nothing() {
+        let (mut a, _engine, _dir) = with_apps();
+        let outcome = run_line(&mut a, &["--app-preset=ghost=default"]);
+        assert!(!outcome.failed);
+        assert!(
+            outcome.stderr.contains("follows FxSound's preset already"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(a.app_rules().apps.is_empty());
+    }
+
+    #[test]
+    fn default_takes_an_applications_preset_away_and_its_route_with_it() {
+        let (mut a, engine, _dir) = with_apps();
+        play(&mut a, &engine, vec![stream(1, OUT, &battlefield())]);
+        run_line(&mut a, &["--app-preset=bf6.exe=Gaming"]);
+        assert!(routes_sent(&engine).is_some_and(|routes| routes.len() == 1));
+
+        for follow in ["bf6.exe=default", "bf6.exe=follow", "bf6.exe="] {
+            run_line(&mut a, &["--app-preset=bf6.exe=Gaming"]);
+            let _ = engine.take_sent();
+            let outcome = run_line(&mut a, &["--app-preset", follow]);
+            assert!(
+                !outcome.failed && outcome.stderr.is_empty(),
+                "{follow}: {}",
+                outcome.stderr
+            );
+            assert_eq!(chosen(&a, &battlefield(), OUT), "", "{follow}");
+            assert_eq!(routes_sent(&engine), Some(Vec::new()), "{follow}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_preset_is_refused_and_changes_nothing_not_even_a_new_rule() {
+        let (mut a, engine, _dir) = with_apps();
+        play(&mut a, &engine, vec![stream(1, OUT, &battlefield())]);
+        let _ = engine.take_sent();
+
+        let outcome = run_line(&mut a, &["--app-preset=ghost=Nope"]);
+        assert!(outcome.failed);
+        assert_eq!(outcome.stderr, "no output preset is called \"Nope\"");
+        assert_eq!(a.app_rules().apps.len(), 1, "no rule for the ghost");
+
+        // A preset only the other lane has: said where it is, as `--preset` says it.
+        let outcome = run_line(&mut a, &["--app-preset=bf6.exe=Headset"]);
+        assert!(outcome.failed);
+        assert_eq!(
+            outcome.stderr,
+            "no output preset is called \"Headset\"; it is an input preset, which \
+             --app-input-preset gives"
+        );
+        let outcome = run_line(&mut a, &["--app-input-preset=bf6.exe=Gaming"]);
+        assert_eq!(
+            outcome.stderr,
+            "no input preset is called \"Gaming\"; it is an output preset, which --app-preset \
+             gives"
+        );
+        // Preset names are exact, as `--preset` takes them.
+        assert!(run_line(&mut a, &["--app-preset=bf6.exe=gaming"]).failed);
+        assert_eq!(chosen(&a, &battlefield(), OUT), "");
+        assert_eq!(routes_sent(&engine), None);
+
+        // A refusal does not stop the rest of the line, and still fails it.
+        let outcome = run_line(
+            &mut a,
+            &["--app-preset=bf6.exe=Nope", "--app-preset=bf6.exe=Gaming"],
+        );
+        assert!(outcome.failed);
+        assert_eq!(chosen(&a, &battlefield(), OUT), "Gaming");
+    }
+
+    #[test]
+    fn list_apps_puts_the_running_applications_first_with_what_they_run_through_now() {
+        let (mut a, engine, _dir) = with_apps();
+        // Brave played and quit; the game and the voice chat play now.
+        play(&mut a, &engine, vec![stream(1, OUT, &brave())]);
+        run_line(&mut a, &["--app-preset=brave=Volume Boost"]);
+        play(
+            &mut a,
+            &engine,
+            vec![
+                on_route(2, OUT, &battlefield(), "Gaming"),
+                stream(3, IN, &discord()),
+            ],
+        );
+        run_line(&mut a, &["--app-preset=bf6.exe=Gaming"]);
+
+        let outcome = run_line(&mut a, &["--list-apps", "--json"]);
+        assert!(!outcome.failed && outcome.window.is_empty());
+        let listing: Value = serde_json::from_str(&outcome.stdout).expect("one JSON object");
+        assert_eq!(listing["schema"], STATUS_SCHEMA);
+        assert_eq!(
+            listing["apps"],
+            serde_json::json!([
+                {
+                    "name": "Battlefield 6", "binary": "bf6.exe", "flatpak": "",
+                    "running": true, "output_preset": "Gaming", "input_preset": null,
+                    "routed": {"output": "Gaming", "input": null}
+                },
+                {
+                    "name": "Discord", "binary": "Discord", "flatpak": "com.discordapp.Discord",
+                    "running": true, "output_preset": null, "input_preset": null,
+                    "routed": {"output": null, "input": null}
+                },
+                {
+                    "name": "Brave", "binary": "brave", "flatpak": "",
+                    "running": false, "output_preset": "Volume Boost", "input_preset": null,
+                    "routed": {"output": null, "input": null}
+                },
+            ])
+        );
+
+        let plain = run_line(&mut a, &["--list-apps"]).stdout;
+        assert_eq!(
+            plain.lines().collect::<Vec<_>>(),
+            [
+                "name=\"Battlefield 6\" binary=bf6.exe flatpak=\"\" running=true \
+                 output_preset=Gaming input_preset= routed.output=Gaming routed.input=",
+                "name=Discord binary=Discord flatpak=com.discordapp.Discord running=true \
+                 output_preset= input_preset= routed.output= routed.input=",
+                "name=Brave binary=brave flatpak=\"\" running=false \
+                 output_preset=\"Volume Boost\" input_preset= routed.output= routed.input=",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_apps_with_nothing_remembered_prints_nothing_or_an_empty_list() {
+        let (mut a, _engine, _dir) = with_apps();
+        assert_eq!(run_line(&mut a, &["--list-apps"]).stdout, "");
+        assert_eq!(
+            run_line(&mut a, &["--list-apps", "--json"]).stdout,
+            format!(r#"{{"schema":{STATUS_SCHEMA},"apps":[]}}"#)
+        );
+    }
+
+    #[test]
+    fn the_status_document_carries_every_application_under_apps() {
+        let (mut a, engine, _dir) = with_apps();
+        play(
+            &mut a,
+            &engine,
+            vec![on_route(1, IN, &discord(), "Headset")],
+        );
+        run_line(&mut a, &["--app-input-preset=discord=Headset"]);
+        let document = status(&mut a);
+        let apps = document["apps"].as_array().expect("an array");
+        assert_eq!(apps.len(), 1);
+        let keys: Vec<&str> = apps[0]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut expected = [
+            "name",
+            "binary",
+            "flatpak",
+            "running",
+            "output_preset",
+            "input_preset",
+            "routed",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+        assert_eq!(apps[0]["input_preset"], "Headset");
+        assert_eq!(apps[0]["routed"]["input"], "Headset");
+        assert_eq!(
+            document["apps"],
+            serde_json::from_str::<Value>(&run_line(&mut a, &["--list-apps", "--json"]).stdout)
+                .expect("JSON")["apps"],
+            "the same list --list-apps prints"
+        );
+        // A headless instance remembers nothing, and says so with an empty list.
+        assert_eq!(status(&mut app())["apps"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn list_apps_without_an_instance_reads_the_store_and_leaves_a_bad_one_where_it_is() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("apps.toml");
+
+        let missing = store_listing(&path, true);
+        assert!(!missing.failed);
+        assert_eq!(
+            missing.stdout,
+            format!(r#"{{"schema":{STATUS_SCHEMA},"apps":[]}}"#)
+        );
+        assert!(!path.exists(), "a question creates nothing");
+
+        let mut rules = AppRules::default();
+        rules.upsert(&battlefield(), OUT, "Gaming", 20);
+        rules.seen(&brave(), 30);
+        rules.save_to(&path).expect("write the store");
+        let listed = store_listing(&path, false);
+        assert!(!listed.failed, "{}", listed.stderr);
+        assert_eq!(
+            listed.stdout.lines().collect::<Vec<_>>(),
+            [
+                "name=Brave binary=brave flatpak=\"\" running=false output_preset= \
+                 input_preset= routed.output= routed.input=",
+                "name=\"Battlefield 6\" binary=bf6.exe flatpak=\"\" running=false \
+                 output_preset=Gaming input_preset= routed.output= routed.input=",
+            ],
+            "nothing runs, so the most recently seen first"
+        );
+
+        std::fs::write(&path, "[[app]\nbinary = ").expect("write a broken store");
+        let broken = store_listing(&path, true);
+        assert!(broken.failed);
+        assert!(broken.stdout.is_empty());
+        assert!(broken.stderr.contains("does not load"), "{}", broken.stderr);
+        assert!(path.exists(), "left where it is");
+        assert!(!AppRules::bad_path(&path).exists(), "not moved aside");
+    }
+
+    /// What `main` does with `args` once it holds the lock and so knows no FxSound runs.
+    fn without_an_instance(args: &[&str], store: &Path) -> Option<Outcome> {
+        let cli =
+            crate::cli::Cli::try_parse_from(std::iter::once("fxsound").chain(args.iter().copied()))
+                .expect("parses");
+        answer_without_an_instance(&cli.commands(), store)
+    }
+
+    #[test]
+    fn a_line_with_watch_and_list_apps_is_the_store_listing_when_no_instance_runs() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("apps.toml");
+        let mut rules = AppRules::default();
+        rules.upsert(&battlefield(), OUT, "Gaming", 20);
+        rules.save_to(&path).expect("write the store");
+
+        for args in [
+            &["--watch", "--list-apps"][..],
+            &["--list-apps", "--watch", "--meters"][..],
+            &["--quit", "--list-apps"][..],
+        ] {
+            let answer = without_an_instance(args, &path).expect("answered, nothing started");
+            assert_eq!(
+                answer.stdout,
+                store_listing(&path, false).stdout,
+                "{args:?}"
+            );
+            assert!(answer.stdout.contains("output_preset=Gaming"), "{args:?}");
+            assert!(answer.stderr.is_empty(), "{args:?}: {}", answer.stderr);
+            assert!(!answer.failed, "{args:?}");
+        }
+        let json = without_an_instance(&["--watch", "--list-apps", "--json"], &path)
+            .expect("answered, nothing started");
+        assert_eq!(json.stdout, store_listing(&path, true).stdout);
+    }
+
+    #[test]
+    fn a_question_only_a_running_instance_can_answer_fails_without_one() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("apps.toml");
+        for args in [
+            &["--status"][..],
+            &["--status", "--json"][..],
+            &["--watch"][..],
+            &["--watch", "--meters", "--json"][..],
+            // `--status` wins over `--list-apps` for a running instance as well.
+            &["--list-apps", "--status"][..],
+            &["--quit", "--status"][..],
+            &["--quit", "--watch"][..],
+        ] {
+            let answer = without_an_instance(args, &path).expect("answered, nothing started");
+            assert_eq!(answer.stderr, NOT_RUNNING, "{args:?}");
+            assert!(answer.stdout.is_empty(), "{args:?}");
+            assert!(answer.failed, "{args:?}");
+        }
+        assert!(!path.exists(), "a question creates nothing");
+    }
+
+    #[test]
+    fn quit_without_an_instance_says_so_and_is_not_a_failure() {
+        let path = Path::new("/nonexistent/apps.toml");
+        for args in [&["--quit"][..], &["--power=on", "--quit"][..]] {
+            let answer = without_an_instance(args, path).expect("answered, nothing started");
+            assert_eq!(answer.stderr, NOT_RUNNING, "{args:?}");
+            assert!(answer.stdout.is_empty(), "{args:?}");
+            assert!(!answer.failed, "{args:?}");
+            assert!(answer.window.is_empty(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_that_does_something_starts_fxsound_when_none_runs() {
+        let path = Path::new("/nonexistent/apps.toml");
+        for args in [
+            &[][..],
+            &["--hide"][..],
+            &["--power=on", "--preset=Gaming"][..],
+            &["--app-preset=bf6.exe=Gaming"][..],
+            &["--activated"][..],
+        ] {
+            assert!(without_an_instance(args, path).is_none(), "{args:?}");
+        }
     }
 }

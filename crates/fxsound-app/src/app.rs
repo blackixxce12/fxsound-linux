@@ -45,7 +45,7 @@ use fxsound_ui::dialogs::settings::{DevicePriority, SettingsState};
 
 mod per_app;
 
-pub use per_app::AppRuleRefusal;
+pub use per_app::{AppRuleRefusal, ListedApp, NamedAppRule, apps_named, list_apps};
 
 /// The characters `PresetNameInputFilter` strips from a typed preset name
 /// (`FxPresetNameEditor.cpp:6-33`): the Windows reserved-filename set, kept on Linux so a preset

@@ -14,11 +14,12 @@
 //!            GetPreset() → s, SetOutput(s), SetInput(s), NextOutput(), NextInput(),
 //!            SetNoiseSuppression(s), SetEditDirection(s), GetStatus() → s, Show(), Hide(),
 //!            ToggleWindow(), Quit(), Apply(as argv) → (b ok, s stdout, s stderr),
-//!            ListPresets() → s, ListDevices() → s
+//!            ListPresets() → s, ListDevices() → s,
+//!            SetAppPreset(s app, s direction, s preset), ListApps() → s
 //! properties Version (s, const), Power (b), Preset (s), Output (s), Input (s), Direction (s)
 //! signals    PowerChanged(b), PresetChanged(s direction, s name),
 //!            DeviceChanged(s direction, s node_name, s description), AudioStateChanged(s json),
-//!            Notice(s message)
+//!            Notice(s message), AppRouted(s app, s direction, s preset)
 //! ```
 //!
 //! # One way to carry out a command
@@ -38,11 +39,14 @@
 //! reads its own with, so an option it does not know is `ok = false` with the text `fxsound`
 //! prints for it, not a bus error. `ListPresets` and `ListDevices` answer with the parts of the
 //! `--status --json` document that list the presets and the devices (review items U14 and the
-//! D-Bus additions, the prerequisites of an MCP server). The bus starts FxSound for a call when it
-//! is not running — any call, a property read included, unless the caller sets `NO_AUTO_START`
-//! (`busctl --auto-start=no`), which the manual tells pollers to: `org.fxsound.FxSound.service` in
-//! `/usr/share/dbus-1/services/` hands the start to `fxsound.service`, whose `--activated` exits
-//! quietly when an instance still starting up turns out to hold the lock already.
+//! D-Bus additions, the prerequisites of an MCP server). `SetAppPreset` and `ListApps` are
+//! `--app-preset` / `--app-input-preset` and `--list-apps --json` (per-application presets,
+//! `docs/0.4.0-apps.md`), and `AppRouted` is the `app_routed` event. The bus starts FxSound for
+//! a call when it is not running — any call, a property read included, unless the caller sets
+//! `NO_AUTO_START` (`busctl --auto-start=no`), which the manual tells pollers to:
+//! `org.fxsound.FxSound.service` in `/usr/share/dbus-1/services/` hands the start to
+//! `fxsound.service`, whose `--activated` exits quietly when an instance still starting up turns
+//! out to hold the lock already.
 //!
 //! At most [`ipc::MAX_CONNECTIONS`] calls are in flight at once, the control socket's own limit;
 //! past it a call is refused with [`ipc::TOO_MANY_CALLERS`]. A call whose caller was answered
@@ -94,7 +98,9 @@ use zbus::fdo;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
 
 use crate::App;
-use crate::cli::{self, Cli, Command, DeviceCommand, PowerCommand, PresetCommand, WindowCommand};
+use crate::cli::{
+    self, AppPresetChoice, Cli, Command, DeviceCommand, PowerCommand, PresetCommand, WindowCommand,
+};
 use crate::events::{AppEvent, EventSink};
 use crate::ipc::{self, Control, Response};
 
@@ -146,6 +152,13 @@ pub enum Call {
     Apply(Vec<String>),
     ListPresets,
     ListDevices,
+    /// The application, the direction and the preset, as they came.
+    SetAppPreset {
+        app: String,
+        direction: String,
+        preset: String,
+    },
+    ListApps,
 }
 
 impl Call {
@@ -173,6 +186,8 @@ impl Call {
             Self::Apply(_) => "Apply",
             Self::ListPresets => "ListPresets",
             Self::ListDevices => "ListDevices",
+            Self::SetAppPreset { .. } => "SetAppPreset",
+            Self::ListApps => "ListApps",
         }
     }
 
@@ -228,6 +243,21 @@ impl Call {
                     response.stderr
                 }
             })?,
+            Self::SetAppPreset {
+                app,
+                direction,
+                preset,
+            } => {
+                if app.trim().is_empty() {
+                    return Err("an application name cannot be empty".to_owned());
+                }
+                vec![Command::AppPreset {
+                    direction: cli::parse_direction(direction)?,
+                    app: app.trim().to_owned(),
+                    preset: AppPresetChoice::parse(preset),
+                }]
+            }
+            Self::ListApps => vec![Command::ListApps { json: true }],
         })
     }
 }
@@ -480,6 +510,13 @@ pub enum Signal {
     /// The `audio_state` line `fxsound --watch --json` prints for the same change.
     AudioStateChanged(String),
     Notice(String),
+    /// An application's streams of one lane moved onto the route of a preset of its own, or back
+    /// onto the lane (`preset` empty): the `app_routed` event. `app` is the name the window shows.
+    AppRouted {
+        app: String,
+        direction: DeviceDirection,
+        preset: String,
+    },
 }
 
 impl Signal {
@@ -492,6 +529,7 @@ impl Signal {
             Self::DeviceChanged { .. } => "DeviceChanged",
             Self::AudioStateChanged(_) => "AudioStateChanged",
             Self::Notice(_) => "Notice",
+            Self::AppRouted { .. } => "AppRouted",
         }
     }
 }
@@ -641,15 +679,26 @@ impl Properties {
                 signal: Some(Signal::Notice(message.clone())),
                 changed: Vec::new(),
             },
+            // The controller says it once per move, so every one is news.
+            AppEvent::AppRouted {
+                app,
+                direction,
+                preset,
+            } => Update {
+                signal: Some(Signal::AppRouted {
+                    app: app.display().to_owned(),
+                    direction: *direction,
+                    preset: preset.clone().unwrap_or_default(),
+                }),
+                changed: Vec::new(),
+            },
             // The stream's own business: its first document, the device list, the meters, the
-            // window, an application's route and the stream's end have no signal of their own on
-            // the bus.
+            // window and the stream's end have no signal of their own on the bus.
             AppEvent::Status(_)
             | AppEvent::DevicesChanged { .. }
             | AppEvent::InputMeters(_)
             | AppEvent::EchoCancel { .. }
             | AppEvent::Calibrated(_)
-            | AppEvent::AppRouted { .. }
             | AppEvent::Window { .. }
             | AppEvent::Quit => Update::default(),
         }
@@ -820,6 +869,30 @@ impl Service {
         Ok(listing_of_status::<DeviceListing>(&status).map_err(fdo::Error::Failed)?)
     }
 
+    /// Give an application a preset of its own for `direction` (`output` or `input`), or have it
+    /// follow the lane's again with `default`, `follow` or an empty `preset` — as
+    /// `--app-preset` and `--app-input-preset` do: the application by its Flatpak id, program or
+    /// name, in any case, and one FxSound has not seen kept as the program of that name.
+    async fn set_app_preset(
+        &self,
+        app: &str,
+        direction: &str,
+        preset: &str,
+    ) -> Result<(), MethodError> {
+        self.run_quietly(Call::SetAppPreset {
+            app: app.to_owned(),
+            direction: direction.to_owned(),
+            preset: preset.to_owned(),
+        })
+        .await
+    }
+
+    /// The applications FxSound remembers, as JSON: `schema` and `apps`, the list `GetStatus`
+    /// carries and `fxsound --list-apps --json` prints.
+    async fn list_apps(&self) -> Result<String, MethodError> {
+        self.run(Call::ListApps).await
+    }
+
     /// The version `--status` reports.
     #[zbus(property(emits_changed_signal = "const"))]
     fn version(&self) -> String {
@@ -886,6 +959,17 @@ impl Service {
     /// The notice the window shows in its bubble.
     #[zbus(signal, name = "Notice")]
     async fn notice_signal(emitter: &SignalEmitter<'_>, message: &str) -> zbus::Result<()>;
+
+    /// An application's streams moved onto the route of a preset of its own, or back onto the
+    /// lane: the name the window shows, the lane, and the preset, empty once they are back —
+    /// the `app_routed` event.
+    #[zbus(signal, name = "AppRouted")]
+    async fn app_routed_signal(
+        emitter: &SignalEmitter<'_>,
+        app: &str,
+        direction: &str,
+        preset: &str,
+    ) -> zbus::Result<()>;
 }
 
 /// Calls being answered, so the way out can let them finish.
@@ -950,6 +1034,13 @@ async fn emit(iface: &InterfaceRef<Service>, update: Update) -> zbus::Result<()>
                 Service::audio_state_signal(emitter, &json).await?;
             }
             Signal::Notice(message) => Service::notice_signal(emitter, &message).await?,
+            Signal::AppRouted {
+                app,
+                direction,
+                preset,
+            } => {
+                Service::app_routed_signal(emitter, &app, direction.key(), &preset).await?;
+            }
         }
     }
     if !update.changed.is_empty() {
@@ -1474,6 +1565,51 @@ mod tests {
         assert!(why.contains("expected output or input"), "{why}");
     }
 
+    fn set_app_preset(app: &str, direction: &str, preset: &str) -> Call {
+        Call::SetAppPreset {
+            app: app.to_owned(),
+            direction: direction.to_owned(),
+            preset: preset.to_owned(),
+        }
+    }
+
+    #[test]
+    fn set_app_preset_is_app_preset_or_app_input_preset_by_its_direction() {
+        assert_eq!(
+            commands(set_app_preset("bf6.exe", "output", "Gaming")),
+            cli(&["--app-preset=bf6.exe=Gaming"])
+        );
+        assert_eq!(
+            commands(set_app_preset(" Battlefield 6 ", "INPUT", "Bass=Max")),
+            cli(&["--app-input-preset=Battlefield 6=Bass=Max"]),
+            "the words the options take, the application trimmed and the preset whole"
+        );
+        for follow in ["", "default", "Follow", "  "] {
+            assert_eq!(
+                commands(set_app_preset("brave", "output", follow)),
+                cli(&["--app-preset=brave=default"]),
+                "{follow:?} follows the lane, as an empty preset reads on the bus"
+            );
+        }
+    }
+
+    #[test]
+    fn set_app_preset_refuses_an_empty_application_and_a_direction_it_does_not_know() {
+        let why = set_app_preset("  ", "output", "Gaming")
+            .commands()
+            .unwrap_err();
+        assert!(why.contains("application name cannot be empty"), "{why}");
+        let why = set_app_preset("bf6.exe", "sideways", "Gaming")
+            .commands()
+            .unwrap_err();
+        assert!(why.contains("expected output or input"), "{why}");
+    }
+
+    #[test]
+    fn list_apps_is_list_apps_as_json() {
+        assert_eq!(commands(Call::ListApps), cli(&["--list-apps", "--json"]));
+    }
+
     #[test]
     fn show_hide_and_toggle_window_are_the_window_options() {
         assert_eq!(commands(Call::Show), cli(&["--show"]));
@@ -1509,6 +1645,8 @@ mod tests {
             Call::Apply(vec!["--preset".to_owned(), "Rock".to_owned()]),
             Call::ListPresets,
             Call::ListDevices,
+            set_app_preset("bf6.exe", "output", "Gaming"),
+            Call::ListApps,
         ]
     }
 
@@ -1534,7 +1672,7 @@ mod tests {
         let mut members: Vec<_> = every_call().iter().map(Call::member).collect();
         members.sort_unstable();
         members.dedup();
-        assert_eq!(members.len(), 20);
+        assert_eq!(members.len(), 22);
     }
 
     fn argv(args: &[&str]) -> Vec<String> {
@@ -2185,6 +2323,51 @@ mod tests {
     }
 
     #[test]
+    fn an_application_routed_is_signalled_by_the_name_the_window_shows_and_back_as_empty() {
+        let mut properties = properties();
+        let before = properties.clone();
+        let game = fxsound_core::AppKey {
+            binary: "bf6.exe".to_owned(),
+            name: "Battlefield 6".to_owned(),
+            flatpak: String::new(),
+        };
+        let moved = AppEvent::AppRouted {
+            app: game.clone(),
+            direction: DeviceDirection::Output,
+            preset: Some("Gaming".to_owned()),
+        };
+        assert_eq!(
+            properties.fold(&moved, 0),
+            Update {
+                signal: Some(Signal::AppRouted {
+                    app: "Battlefield 6".to_owned(),
+                    direction: DeviceDirection::Output,
+                    preset: "Gaming".to_owned(),
+                }),
+                changed: Vec::new(),
+            }
+        );
+        let back = AppEvent::AppRouted {
+            app: fxsound_core::AppKey {
+                name: String::new(),
+                ..game
+            },
+            direction: DeviceDirection::Input,
+            preset: None,
+        };
+        assert_eq!(
+            properties.fold(&back, 0).signal,
+            Some(Signal::AppRouted {
+                app: "bf6.exe".to_owned(),
+                direction: DeviceDirection::Input,
+                preset: String::new(),
+            }),
+            "no name: the program, as the window shows it"
+        );
+        assert_eq!(properties, before, "no property holds routes");
+    }
+
+    #[test]
     fn events_the_bus_has_no_signal_for_change_nothing() {
         let mut properties = properties();
         let before = properties.clone();
@@ -2258,7 +2441,7 @@ mod tests {
     #[test]
     fn every_method_is_served_with_its_documented_signature() {
         let xml = introspection();
-        let signatures: [(&str, &[&str]); 20] = [
+        let signatures: [(&str, &[&str]); 22] = [
             ("TogglePower", &[r#"type="b" direction="out""#]),
             ("SetPower", &[r#"type="b" direction="in""#]),
             ("NextPreset", &[]),
@@ -2287,6 +2470,15 @@ mod tests {
             ),
             ("ListPresets", &[r#"type="s" direction="out""#]),
             ("ListDevices", &[r#"type="s" direction="out""#]),
+            (
+                "SetAppPreset",
+                &[
+                    r#"name="app" type="s" direction="in""#,
+                    r#"name="direction" type="s" direction="in""#,
+                    r#"name="preset" type="s" direction="in""#,
+                ],
+            ),
+            ("ListApps", &[r#"type="s" direction="out""#]),
         ];
         for (member, args) in signatures {
             let method = element(&xml, "method", member);
@@ -2299,7 +2491,7 @@ mod tests {
                 assert!(method.contains(arg), "{member} has no {arg}: {method}");
             }
         }
-        assert_eq!(xml.matches("<method ").count(), 20, "{xml}");
+        assert_eq!(xml.matches("<method ").count(), 22, "{xml}");
         for call in every_call() {
             element(&xml, "method", call.member());
         }
@@ -2341,6 +2533,7 @@ mod tests {
             ("DeviceChanged", "sss"),
             ("AudioStateChanged", "s"),
             ("Notice", "s"),
+            ("AppRouted", "sss"),
         ] {
             let signal = element(&xml, "signal", member);
             let served: String = signal
@@ -2367,6 +2560,11 @@ mod tests {
             },
             Signal::AudioStateChanged(String::new()),
             Signal::Notice(String::new()),
+            Signal::AppRouted {
+                app: String::new(),
+                direction: DeviceDirection::Input,
+                preset: String::new(),
+            },
         ] {
             element(&xml, "signal", signal.member());
         }
@@ -2902,6 +3100,138 @@ mod tests {
         let (ok, _, stderr) = apply(&["--quit"]);
         assert!(ok, "{stderr}");
         host.join();
+    }
+
+    #[test]
+    fn over_a_private_bus_an_application_is_given_a_preset_and_listed() {
+        let Some(bus) = PrivateBus::start() else {
+            return;
+        };
+        let host = Host::start(&bus, "apps");
+        assert_eq!(host.state, ServiceState::Serving);
+        let client = bus.client();
+        let proxy = proxy(&client);
+        let list = || -> Value {
+            let listing: String = proxy.call("ListApps", &()).expect("ListApps");
+            serde_json::from_str(&listing).expect("JSON")
+        };
+        assert_eq!(
+            list(),
+            serde_json::json!({"schema": crate::commands::STATUS_SCHEMA, "apps": []})
+        );
+
+        let () = proxy
+            .call("SetAppPreset", &("bf6.exe", "output", "Beta"))
+            .expect("SetAppPreset");
+        let () = proxy
+            .call("SetAppPreset", &("BF6.EXE", "input", "Clean Voice"))
+            .expect("the same application, by its program in another case");
+        let listing = list();
+        assert_eq!(
+            listing["apps"].as_array().map(Vec::len),
+            Some(1),
+            "{listing}"
+        );
+        let game = &listing["apps"][0];
+        assert_eq!(game["binary"], "bf6.exe");
+        assert_eq!(game["output_preset"], "Beta");
+        assert_eq!(game["input_preset"], "Clean Voice");
+        assert_eq!(game["running"], false);
+        let status: String = proxy.call("GetStatus", &()).expect("GetStatus");
+        let status: Value = serde_json::from_str(&status).expect("the status document");
+        assert_eq!(status["apps"], listing["apps"]);
+
+        // The refusal the command line prints; arguments the options would not take either.
+        let (name, detail) =
+            method_error(proxy.call("SetAppPreset", &("bf6.exe", "output", "Nope")));
+        assert_eq!(name, REFUSED);
+        assert_eq!(detail, "no output preset is called \"Nope\"");
+        let (name, _) = method_error(proxy.call("SetAppPreset", &("bf6.exe", "sideways", "Beta")));
+        assert_eq!(name, "org.freedesktop.DBus.Error.InvalidArgs");
+        let (name, _) = method_error(proxy.call("SetAppPreset", &("", "output", "Beta")));
+        assert_eq!(name, "org.freedesktop.DBus.Error.InvalidArgs");
+
+        // An empty preset follows the lane again; the other lane keeps its own.
+        let () = proxy
+            .call("SetAppPreset", &("bf6.exe", "output", ""))
+            .expect("SetAppPreset");
+        let game = &list()["apps"][0];
+        assert_eq!(game["output_preset"], Value::Null);
+        assert_eq!(game["input_preset"], "Clean Voice");
+
+        // The command line through Apply, with its note and its lines.
+        let (ok, stdout, stderr): (bool, String, String) = proxy
+            .call("Apply", &(argv(&["--app-preset=Brave=Alpha"]),))
+            .expect("Apply");
+        assert!(ok);
+        assert!(stdout.is_empty());
+        assert!(stderr.starts_with("note: FxSound has not seen"), "{stderr}");
+        let (ok, stdout, _): (bool, String, String) = proxy
+            .call("Apply", &(argv(&["--list-apps"]),))
+            .expect("Apply");
+        assert!(ok);
+        assert_eq!(stdout.lines().count(), 2, "{stdout}");
+        assert!(stdout.contains("binary=Brave"), "{stdout}");
+        drop(host);
+    }
+
+    #[test]
+    fn over_a_private_bus_an_application_moved_onto_a_route_and_back_is_signalled() {
+        let Some(bus) = PrivateBus::start() else {
+            return;
+        };
+        let client = bus.client();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let Instance::Primary(listener) = Instance::acquire_in(dir.path()).expect("acquire") else {
+            panic!("expected to be primary");
+        };
+        let server = listener
+            .serve_with_status(Arc::new(|| None))
+            .expect("serve");
+        let dbus = DbusHandle::start_on(
+            Bus::Address(bus.address.clone()),
+            server.control(),
+            properties(),
+        );
+        assert_eq!(
+            dbus.wait_until_settled(Duration::from_secs(10)),
+            ServiceState::Serving
+        );
+        let proxy = proxy(&client);
+        let routed = signals(&proxy, "AppRouted");
+        let game = fxsound_core::AppKey {
+            binary: "bf6.exe".to_owned(),
+            name: "Battlefield 6".to_owned(),
+            flatpak: String::new(),
+        };
+        dbus.publish(&AppEvent::AppRouted {
+            app: game.clone(),
+            direction: DeviceDirection::Output,
+            preset: Some("Gaming".to_owned()),
+        });
+        dbus.publish(&AppEvent::AppRouted {
+            app: game,
+            direction: DeviceDirection::Output,
+            preset: None,
+        });
+        for preset in ["Gaming", ""] {
+            let signal = routed
+                .recv_timeout(Duration::from_secs(5))
+                .expect("AppRouted");
+            assert_eq!(
+                signal
+                    .body()
+                    .deserialize::<(String, String, String)>()
+                    .unwrap(),
+                (
+                    "Battlefield 6".to_owned(),
+                    "output".to_owned(),
+                    preset.to_owned()
+                )
+            );
+        }
+        dbus.shutdown();
+        drop(server);
     }
 
     #[test]
