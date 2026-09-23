@@ -58,14 +58,14 @@
 //! It is not only WirePlumber's business, either. Since 0.3.68 the PipeWire server schedules the
 //! members of a link-group together: a node made runnable by a link of its own makes every other
 //! member runnable too (`run_nodes` in `src/pipewire/context.c`). That is what lets the output
-//! lane's playback stream sleep while nothing plays into the sink (see `engine`, "Idle"), and it is
-//! why each lane has a group **of its own** — `fxsound` for the speakers, `fxsound-input` for the
-//! microphone (`docs/spec/12-audio-io.md` §29.2). WirePlumber would be content either way: each
-//! stream still shares a group with its own virtual node, which is all its refusal needs, and no
-//! link either lane needs ever joins two of our own nodes. The server is not. With one group, a
-//! capture stream fed by a microphone — which runs for as long as the input lane is enabled —
-//! made the speakers' pair runnable with it, and the speakers never went idle again while the
-//! microphone lane was on.
+//! lane's playback stream sleep while nothing plays into the sink, and the input lane's capture
+//! stream — and the microphone with it — while nothing records from the source (see `engine`,
+//! "Idle"), and it is why each lane has a group **of its own** — `fxsound` for the speakers,
+//! `fxsound-input` for the microphone (`docs/spec/12-audio-io.md` §29.2). WirePlumber would be
+//! content either way: each stream still shares a group with its own virtual node, which is all
+//! its refusal needs, and no link either lane needs ever joins two of our own nodes. The server is
+//! not. With one group, a capture stream fed by a microphone made the speakers' pair runnable with
+//! it, and the speakers never went idle again while the microphone lane ran.
 //!
 //! With both lanes enabled the system sees *two* FxSound devices: "FxSound (Output)" under its
 //! sinks and "FxSound (Input)" under its sources, each with the word in the system language
@@ -226,6 +226,19 @@ pub const AEC_MONITOR_NODE_NAME: &str = "fxsound_aec_monitor";
 /// input lane's capture stream records from while echo cancellation runs.
 pub const AEC_SOURCE_NODE_NAME: &str = "fxsound_aec_source";
 
+/// `node.name` of the stream FxSound records its own virtual source with while the app holds the
+/// microphone awake ([`UiToAudio::KeepInputAwake`], `docs/0.4.0-upstream.md` U19): the calibration
+/// wizard and the microphone meters.
+///
+/// The input lane's capture stream is passive, so the microphone runs only while something records
+/// from FxSound (Input); this is that something when nobody else is. It is an ordinary recording
+/// stream with no `node.link-group` — the kind WirePlumber 0.5 switches a Bluetooth headset to its
+/// call profile for (`device/autoswitch-bluetooth-profile.lua`) — so it wakes a headset's
+/// microphone exactly as a call would.
+///
+/// [`UiToAudio::KeepInputAwake`]: fxsound_core::messages::UiToAudio::KeepInputAwake
+pub const KEEP_AWAKE_NODE_NAME: &str = "fxsound_mic_check";
+
 /// The four nodes of the two lanes' pairs, in lane order: the output lane's, then the input lane's.
 pub const LANE_NODE_NAMES: [&str; 4] = [
     SINK_NODE_NAME,
@@ -242,11 +255,11 @@ pub const AEC_NODE_NAMES: [&str; 3] = [
 ];
 
 /// Every node this crate ever creates, or has PipeWire create for it: [`LANE_NODE_NAMES`], then
-/// [`AEC_NODE_NAMES`]. None of them is a device FxSound could attach to, so
-/// [`DeviceInfo::from_props`] drops them by name whatever their `media.class` says. The canceller's
-/// source is an `Audio/Source` like any microphone, and offered as one it would let the input lane
-/// capture from its own canceller.
-pub const OUR_NODE_NAMES: [&str; 7] = [
+/// [`AEC_NODE_NAMES`], then [`KEEP_AWAKE_NODE_NAME`]. None of them is a device FxSound could attach
+/// to, so [`DeviceInfo::from_props`] drops them by name whatever their `media.class` says. The
+/// canceller's source is an `Audio/Source` like any microphone, and offered as one it would let the
+/// input lane capture from its own canceller.
+pub const OUR_NODE_NAMES: [&str; 8] = [
     SINK_NODE_NAME,
     OUTPUT_NODE_NAME,
     CAPTURE_NODE_NAME,
@@ -254,6 +267,7 @@ pub const OUR_NODE_NAMES: [&str; 7] = [
     AEC_CAPTURE_NODE_NAME,
     AEC_MONITOR_NODE_NAME,
     AEC_SOURCE_NODE_NAME,
+    KEEP_AWAKE_NODE_NAME,
 ];
 
 /// The `node.link-group` of the output lane's two nodes. **Mandatory**; see the module docs.
@@ -297,6 +311,12 @@ pub const OUTPUT_STREAM_DESCRIPTION: &str = "FxSound output";
 
 /// `node.description` of the capture stream (input direction, NODE 1). Not localised, as above.
 pub const CAPTURE_STREAM_DESCRIPTION: &str = "FxSound capture";
+
+/// `node.description` and `media.name` of the stream that holds the microphone awake
+/// ([`KEEP_AWAKE_NODE_NAME`]). Not localised either, but — unlike the pair's two streams — seen: a
+/// desktop lists it among the applications recording, as "FxSound" with this beside it, for as
+/// long as the calibration wizard or the microphone meters are open.
+pub const KEEP_AWAKE_STREAM_DESCRIPTION: &str = "FxSound microphone check";
 
 /// What the engine tells the user, translated, when one Bluetooth headset is the target of both
 /// lanes ([`AudioToUi::Warning`], `docs/0.4.0-upstream.md` U9): the headset runs its call profile
@@ -656,6 +676,10 @@ impl EngineHandle {
             input_params: input_params_out,
             meters: meters_in,
             events: events_rx,
+            lane_events: PerDirection {
+                output: events_tx.output.clone(),
+                input: events_tx.input.clone(),
+            },
             ready: ready_tx,
             aec_library: aec::WEBRTC_LIBRARY,
             target_volumes: Vec::new(),
@@ -1006,8 +1030,14 @@ mod tests {
         assert_eq!(AEC_LINK_GROUP, "fxsound-aec");
         assert_eq!(
             OUR_NODE_NAMES.to_vec(),
-            [LANE_NODE_NAMES.as_slice(), AEC_NODE_NAMES.as_slice()].concat(),
-            "every node of ours is either a lane's or the canceller's"
+            [
+                LANE_NODE_NAMES.as_slice(),
+                AEC_NODE_NAMES.as_slice(),
+                &[KEEP_AWAKE_NODE_NAME]
+            ]
+            .concat(),
+            "every node of ours is a lane's, the canceller's, or the one that keeps the microphone \
+             awake"
         );
         // Names are matched by string and written into metadata: ASCII, no spaces, all distinct.
         for name in OUR_NODE_NAMES {
@@ -1021,6 +1051,8 @@ mod tests {
         assert_eq!(SINK_DESCRIPTION, "FxSound");
         assert_eq!(OUTPUT_STREAM_DESCRIPTION, "FxSound output");
         assert_eq!(CAPTURE_STREAM_DESCRIPTION, "FxSound capture");
+        assert_eq!(KEEP_AWAKE_NODE_NAME, "fxsound_mic_check");
+        assert_eq!(KEEP_AWAKE_STREAM_DESCRIPTION, "FxSound microphone check");
         assert_eq!(
             node_description(DeviceDirection::Output, Some("ru")),
             "FxSound (Вывод)"

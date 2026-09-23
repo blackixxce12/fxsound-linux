@@ -32,9 +32,12 @@ pub struct DspParams {
     /// still applies, without the balance, while `eq_on` is set (`dfxpProcessReal.cpp:158-169`,
     /// `SosProcess.cpp:500-516`); with the equalizer off as well, audio passes through untouched.
     pub power: bool,
-    /// Hand the device silence, whatever `power` says. Set while the system sleeps (U13), so the
-    /// last buffers before suspend and the first after resume — stale filter state, a limiter
-    /// that last saw a different world — never reach the speakers.
+    /// Hand the device silence, whatever `power` says: the snapshot's mute, the app's to set.
+    ///
+    /// The engine silences a lane the same way on its own while the system sleeps (U13,
+    /// [`UiToAudio::SystemSleeping`]), so the last buffers before suspend and the first after
+    /// resume — stale filter state, a limiter that last saw a different world — never reach the
+    /// speakers; this flag need not be set for that.
     ///
     /// Silence *after* the chain rather than a bypass: the filters, the leveller and the
     /// spectrum keep running on what comes in, so unmuting joins a chain that is already in step
@@ -200,9 +203,9 @@ pub struct InputDspParams {
     /// Master bypass. When `false` the chain passes audio through untouched.
     pub power: bool,
     /// Hand whoever records from FxSound (Input) silence, whatever `power` says. The same flag
-    /// as [`DspParams::mute`], for the same reason — the system is going to sleep — and applied
-    /// the same way, after the chain, so the gate, the denoiser and the calibration counters keep
-    /// following the microphone.
+    /// as [`DspParams::mute`], beside the same silence the engine sets itself while the system
+    /// sleeps, and applied the same way, after the chain, so the gate, the denoiser and the
+    /// calibration counters keep following the microphone.
     pub mute: bool,
 
     /// High-pass corner in Hz, and its order — `0` for off, `2` or `4`.
@@ -707,12 +710,25 @@ pub enum UiToAudio {
     /// pair up already whose volume nothing has moved is then given its target's level.
     SeedTargetVolumes(Vec<TargetVolume>),
     /// logind's `PrepareForSleep`: `true` when the system is about to sleep, `false` when it has
-    /// resumed (U13). The engine defers its device rules across the gap, since Bluetooth devices
-    /// come back under new ids; the mute itself travels in the parameter snapshots.
+    /// resumed (U13).
+    ///
+    /// The engine does the rest itself. On `true` both lanes fall silent after their chains and
+    /// their device rules stop. On `false` both chains' filter history is cleared, both lanes'
+    /// rules run again with a wait of up to 2.5 s for the devices they were on — Bluetooth
+    /// devices reconnect a few seconds after the system does, under new ids — and each lane is
+    /// heard again once it is attached, or after 2 s at the latest. The app need not touch the
+    /// snapshots' `mute` for it. A `true` that is never followed by a `false` is given up on after
+    /// a minute of the system being awake.
     SystemSleeping(bool),
     /// Hold the microphone open while `true`, even with nobody recording from FxSound (Input):
     /// the calibration wizard and the microphone meters need a signal that the passive capture
     /// stream would otherwise not have (U9, U19).
+    ///
+    /// The engine records its own virtual source while it is held, as an application would, which
+    /// runs the input lane and the microphone. That is also what switches a Bluetooth headset to
+    /// its call profile under WirePlumber 0.5, so a headset's microphone delivers audio too —
+    /// about a second after the message, once the profile has switched. Kept until `false`,
+    /// across devices and reconnects.
     KeepInputAwake(bool),
 }
 

@@ -18,8 +18,11 @@
 //!
 //! # Mute
 //!
-//! Both snapshots carry a `mute` (set while the system sleeps, U13). It is honoured here, after
-//! the chain, rather than inside the DSP crate's engines: the chain still runs on every block —
+//! Both snapshots carry a `mute`, and the engine has one of its own for each lane, which it sets
+//! while the system sleeps and until each lane is attached again after the wake (U13,
+//! `crate::engine` "Sleep") — the GUI's snapshot is the GUI's, and the engine does not write it.
+//! The lane is silent while either says so ([`LaneDsp::set_system_mute`]). Both are honoured here,
+//! after the chain, rather than inside the DSP crate's engines: the chain still runs on every block —
 //! its filters, leveller and denoiser keep following what comes in — and only what leaves for the
 //! ring is replaced by silence. So unmuting joins a chain already in step with the programme, and
 //! the engines stay what they were, a pure function of their input and their snapshot. The
@@ -120,6 +123,16 @@ impl LaneDsp {
     #[inline]
     pub(crate) fn set_volume(&mut self, gains: &[f32; CHANNELS]) {
         self.tail_mut().set_targets(gains);
+    }
+
+    /// Whether the engine holds the lane silent, whatever the snapshot's own `mute` says: read by
+    /// NODE 1 from the lane once a block, after [`Self::refresh`] (see the module's "Mute").
+    #[inline]
+    pub(crate) fn set_system_mute(&mut self, muted: bool) {
+        match self {
+            Self::Output(dsp) => dsp.system_muted = muted,
+            Self::Input(dsp) => dsp.system_muted = muted,
+        }
     }
 
     /// A new pair of nodes: start it from silence, and at its volume rather than ramping there from
@@ -277,6 +290,8 @@ pub(crate) struct OutputDsp {
     scratch: Vec<f32>,
     /// The newest snapshot's `mute`, as of the last [`Self::refresh`]. See the module's "Mute".
     muted: bool,
+    /// The engine's own mute for the lane, as of the last [`LaneDsp::set_system_mute`].
+    system_muted: bool,
     /// The node's volume and a new pair's fade in. See the module's "After the chain".
     tail: Tail,
 }
@@ -294,6 +309,7 @@ impl OutputDsp {
             events,
             scratch: worst_case_scratch(),
             muted: false,
+            system_muted: false,
             tail: Tail::new(),
         }
     }
@@ -334,7 +350,7 @@ impl OutputDsp {
     fn process_bytes(&mut self, block: &[u8], channels: usize) -> Option<&[f32]> {
         let scratch = decode(&mut self.scratch, block, channels)?;
         self.engine.process(scratch, channels);
-        silence_if(self.muted, scratch);
+        silence_if(self.muted || self.system_muted, scratch);
         self.tail.apply(scratch, channels);
         Some(scratch)
     }
@@ -367,6 +383,8 @@ pub(crate) struct InputDsp {
     scratch: Vec<f32>,
     /// The newest snapshot's `mute`, as of the last [`Self::refresh`]. See the module's "Mute".
     muted: bool,
+    /// The engine's own mute for the lane, as of the last [`LaneDsp::set_system_mute`].
+    system_muted: bool,
     /// The node's volume and a new pair's fade in. See the module's "After the chain".
     tail: Tail,
 }
@@ -393,6 +411,7 @@ impl InputDsp {
             parked: None,
             scratch: worst_case_scratch(),
             muted: false,
+            system_muted: false,
             tail: Tail::new(),
         }
     }
@@ -486,7 +505,7 @@ impl InputDsp {
     fn process_bytes(&mut self, block: &[u8], channels: usize) -> Option<&[f32]> {
         let scratch = decode(&mut self.scratch, block, channels)?;
         self.engine.process(scratch, channels);
-        silence_if(self.muted, scratch);
+        silence_if(self.muted || self.system_muted, scratch);
         self.tail.apply(scratch, channels);
         Some(scratch)
     }
@@ -1235,6 +1254,107 @@ pub(crate) mod tests {
             unreachable!("the input slot holds the input lane's DSP");
         };
         assert!(!input.muted);
+    }
+
+    /// One block through a lane as NODE 1 runs it while the engine holds the lane `silent` or not:
+    /// refresh, the engine's mute, then process.
+    fn run_block_held(dsp: &mut LaneDsp, block_index: usize, silent: bool) -> Vec<f32> {
+        dsp.refresh();
+        dsp.set_system_mute(silent);
+        dsp.process_bytes(&tone_block(block_index), 2)
+            .expect("a block that fits")
+            .to_vec()
+    }
+
+    #[test]
+    fn the_engines_own_mute_silences_both_lanes_whatever_their_snapshots_say() {
+        // The system is going to sleep: the engine silences both lanes itself, and the GUI's
+        // snapshots — unmuted, and never written by the engine — have no say in it.
+        let mut w = wired();
+        for (direction, dsp) in w.lanes.iter_mut() {
+            assert!(
+                !is_silent(&run_block_held(dsp, 0, false)),
+                "the {} lane plays before the sleep",
+                direction.key()
+            );
+            for index in 1..5 {
+                assert!(
+                    is_silent(&run_block_held(dsp, index, true)),
+                    "the {} lane, block {index}",
+                    direction.key()
+                );
+            }
+            assert!(
+                !is_silent(&run_block_held(dsp, 5, false)),
+                "the {} lane plays on the first block after the engine lets it",
+                direction.key()
+            );
+        }
+    }
+
+    #[test]
+    fn either_mute_is_enough_and_neither_lifts_the_other() {
+        let mut w = wired();
+        // The engine holds the lane silent; the app's own mute coming and going changes nothing.
+        w.params.write(busy_output_params(true));
+        assert!(is_silent(&run_block_held(&mut w.lanes.output, 0, true)));
+        w.params.write(busy_output_params(false));
+        assert!(
+            is_silent(&run_block_held(&mut w.lanes.output, 1, true)),
+            "the app unmuting does not wake a sleeping system's lane"
+        );
+        // And the other way: the engine letting go leaves a lane the app muted muted.
+        w.input_params.write(InputDspParams {
+            mute: true,
+            ..InputDspParams::default()
+        });
+        assert!(is_silent(&run_block_held(&mut w.lanes.input, 0, true)));
+        assert!(
+            is_silent(&run_block_held(&mut w.lanes.input, 1, false)),
+            "the wake does not unmute what the app muted"
+        );
+        w.input_params.write(InputDspParams::default());
+        assert!(!is_silent(&run_block_held(&mut w.lanes.input, 2, false)));
+    }
+
+    #[test]
+    fn the_chain_keeps_running_under_the_engines_mute_so_the_wake_joins_it_in_step() {
+        let mut held = wired();
+        let mut reference = wired();
+        held.params.write(busy_output_params(false));
+        reference.params.write(busy_output_params(false));
+        for index in 0..3 {
+            run_block_held(&mut held.lanes.output, index, false);
+            run_block(&mut reference.lanes.output, index);
+        }
+        for index in 3..40 {
+            assert!(is_silent(&run_block_held(
+                &mut held.lanes.output,
+                index,
+                true
+            )));
+            run_block(&mut reference.lanes.output, index);
+        }
+        for index in 40..43 {
+            assert_eq!(
+                run_block_held(&mut held.lanes.output, index, false),
+                run_block(&mut reference.lanes.output, index),
+                "block {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lane_starts_without_the_engines_mute() {
+        let (lanes, _handover) = lanes_for_tests();
+        let LaneDsp::Output(output) = &lanes.output else {
+            unreachable!("the output slot holds the output lane's DSP");
+        };
+        assert!(!output.system_muted);
+        let LaneDsp::Input(input) = &lanes.input else {
+            unreachable!("the input slot holds the input lane's DSP");
+        };
+        assert!(!input.system_muted);
     }
 
     #[test]

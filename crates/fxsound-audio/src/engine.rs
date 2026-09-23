@@ -80,12 +80,52 @@
 //! merely paused and resumed — 16 ms at the quantum FxSound asks for — which it resumes that much
 //! further on than it stopped.
 //!
-//! The input lane is left running either way: the capture stream is what makes the microphone
-//! produce anything, and a recorder may link to the virtual source at any moment.
+//! The input lane idles the same way with the two nodes' parts swapped (`docs/0.4.0-upstream.md`
+//! U19). Its device-facing stream is NODE 1, the capture stream, and on a server that runs a
+//! link-group together that stream is passive: the microphone's link to it no longer keeps the
+//! microphone running. A recorder's link to NODE 2, the virtual source, makes the source runnable,
+//! the group makes the capture stream runnable with it, and the capture stream's link makes the
+//! microphone run — all in one cycle, as on the output side. Measured on PipeWire 1.6.8 in a
+//! private daemon
+//! (`graph_churn::sleep::a_microphone_runs_only_while_something_records_from_fxsound_input`):
+//! with nothing recording, the capture stream and the microphone stay idle; with a recorder linked,
+//! both run and the recorder gets the processed microphone; unlinked, both are idle again. So the
+//! microphone — its light, a desktop's "recording" indicator, a Bluetooth headset's call profile —
+//! is held only while something records from FxSound (Input). It is how WirePlumber holds its own
+//! Bluetooth microphone, whose capture half is passive in the same way
+//! (`monitors/bluez/create-loopback-node.lua`). The ring is marked stale when the capture stream
+//! pauses, as above, so a recording started later does not open with the end of the last one.
 //!
-//! All of this holds while echo cancellation is off. While it is on, the canceller records the
-//! speakers' monitor on the microphone's clock, and the speakers and the output pair run with it
-//! (`docs/0.4.0-design.md` §7, and `aec`); switched off, they sleep again.
+//! On an older server a passive capture stream would never be woken by a recorder, and it stays an
+//! ordinary stream that holds the microphone for as long as the lane is on, as it did everywhere
+//! before 0.4.0. Pacing it by hand, the output lane's answer there, would keep it inactive until
+//! the source reported `Streaming`, so every recording would start with the blocks the capture
+//! stream missed while it was being woken; and every distribution FxSound is packaged for ships a
+//! server that does not need it.
+//!
+//! What records from the source is usually an application. While the app holds the microphone
+//! awake ([`UiToAudio::KeepInputAwake`]: the calibration wizard, the microphone meters) it is the
+//! engine itself: a recording stream of its own on the source ([`KeepAwake`]), which runs the pair
+//! and the microphone exactly as an application would. It is also the one thing that wakes a
+//! Bluetooth headset's microphone. WirePlumber 0.5 switches a headset to its call profile only for
+//! a recording stream with no `node.link-group` that reaches the headset's loopback microphone
+//! (`device/autoswitch-bluetooth-profile.lua`, `isBluetoothLoopbackSourceNodeLinkedToStream`),
+//! through filters if need be, and the capture stream carries the input lane's group. The stream of
+//! our own carries none, and is found through the source's group to the capture stream and on to
+//! the headset, the way a call recording from FxSound (Input) is. Taking the group off the capture
+//! stream instead would have woken the headset too, but the group is what keeps WirePlumber from
+//! linking the capture stream to our own source (`docs/spec/12-audio-io.md` §28.3), and a pair
+//! would have had to be rebuilt to change it.
+//!
+//! All of this holds while echo cancellation is on, too. The canceller records the speakers'
+//! monitor on the microphone's clock, so while it runs the speakers, the microphone and the output
+//! pair run with it (`docs/0.4.0-design.md` §7, and `aec`). But PipeWire's module makes its own
+//! capture and monitor streams passive, and the capture stream that records the canceller's source
+//! is passive as above, so nothing in that chain runs it by itself: it runs while something records
+//! from FxSound (Input), and sleeps, canceller loaded, when the recording stops
+//! (`graph_churn::echo_cancellation_holds_nothing_awake_while_nothing_records_from_fxsound_input`).
+//! Before U19 the capture stream's link to the canceller ran all of it for as long as the lane was
+//! on.
 //!
 //! # Volume
 //!
@@ -120,6 +160,22 @@
 //! moves at once, as before: on the tick after the node goes, or, when the registry names the node
 //! before its card, on the tick after the card does ([`remove_card`]). So does a lane whose wait
 //! is up.
+//!
+//! # Sleep
+//!
+//! The app tells the engine when logind says the system is about to sleep and when it has woken
+//! ([`UiToAudio::SystemSleeping`], `docs/0.4.0-upstream.md` U13), as upstream's controller mutes
+//! its engine on suspend and unmutes it on resume (`FxController.cpp:2145-2159`). Going to sleep,
+//! both lanes fall silent after their chains — the snapshots' own `mute` path, set from here
+//! rather than by the GUI ([`Lane::system_mute`]) — and no device rules run, so nothing chooses a
+//! device from a graph that is coming apart under the suspend. On waking, both chains' filter
+//! history is cleared, and both lanes' rules run with the wait of "A device that blinks" in front
+//! of them: a lane whose device is not back yet waits up to [`RETURN_WAIT`] for it
+//! ([`Lane::wake_wait`]), card or no card, because a Bluetooth headset reconnects a few seconds
+//! after the system does. A lane is heard again once its rules have attached it, or after
+//! [`WAKE_MUTE`] at the latest. A wake that never comes is given up after [`SLEEP_LIMIT`], so a
+//! lost signal cannot leave FxSound silent. There is no sleep inhibitor, by upstream's decision
+//! (its PR #533).
 
 use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
@@ -154,7 +210,8 @@ use crate::routes::{self, CardRoutes, Route, RouteList};
 use crate::volume::{self, Debounce, LaneVolume, NodeVolume, PropsUpdate};
 use crate::{
     AEC_SOURCE_NODE_NAME, AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION,
-    DEFAULT_QUANTUM_FRAMES, DEFAULT_SAMPLE_RATE, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS,
+    DEFAULT_QUANTUM_FRAMES, DEFAULT_SAMPLE_RATE, KEEP_AWAKE_NODE_NAME,
+    KEEP_AWAKE_STREAM_DESCRIPTION, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS,
     ONE_HEADSET_ON_BOTH_LANES, OUR_NODE_NAMES, OUTPUT_NODE_NAME, OUTPUT_STREAM_DESCRIPTION,
     RING_CAPACITY_FRAMES, SINK_DESCRIPTION, SINK_NODE_NAME, SOURCE_NODE_NAME, link_group, locale,
     our_node_name,
@@ -250,6 +307,28 @@ const NODE_PRIORITY_SESSION: &str = "500";
 /// with no output, an HDMI port whose screen went to sleep — leaves the lane playing into nothing
 /// for no longer than a user would wait before reaching for the volume.
 pub(crate) const RETURN_WAIT: Duration = Duration::from_millis(2500);
+
+/// How long a lane stays silent after the system wakes when its rules have not attached it by then
+/// (module docs, "Sleep"; `docs/0.4.0-upstream.md` U13).
+///
+/// A lane whose device is back at once is heard again the tick its rules have run — the next
+/// supervisor tick, within a fifth of a second of the wake. One still waiting for its device is
+/// heard after this: shorter than [`RETURN_WAIT`], because what it would hold back is a pair
+/// playing into a device that is not there yet, which is silent anyway, and a user who pressed a
+/// key to wake the machine to music should not wait on a headset that may never come back.
+pub(crate) const WAKE_MUTE: Duration = Duration::from_secs(2);
+
+/// How long the system may say it is going to sleep without sleeping, or waking, before the engine
+/// stops believing it (module docs, "Sleep").
+///
+/// Measured on the monotonic clock, which stands still while the system is suspended, so a sleep
+/// of any length costs nothing against it: all it counts is the time the system spends awake
+/// between logind's two signals. logind gives a delay inhibitor five seconds by default
+/// (`InhibitDelayMaxSec`) before it suspends, and the signal that the system has woken follows
+/// the wake at once. So this only runs out when that second signal is lost on its way — a suspend
+/// that failed and a bus or an app that missed saying so — and then it is what keeps FxSound from
+/// staying silent and its device rules from staying frozen until the next sleep.
+pub(crate) const SLEEP_LIMIT: Duration = Duration::from_secs(60);
 
 /// A lane waiting for the node it was attached to (`docs/0.4.0-upstream.md`, U8): the node went,
 /// but the card it belongs to stayed, so it is a card between profiles and the node is expected
@@ -816,6 +895,9 @@ pub(crate) struct SinkData {
     /// Whether this node is its lane's virtual node, whose `Props` are the volume a desktop
     /// sets: the sink, not the input lane's capture stream, whose `Props` are nobody's slider.
     virtual_node: bool,
+    /// The lane's silence while the system sleeps ([`Lane::system_mute`]): one load a block,
+    /// handed to the DSP beside the snapshot's own `mute`.
+    system_mute: Arc<AtomicBool>,
 }
 
 impl SinkData {
@@ -837,6 +919,7 @@ impl SinkData {
             recycle: lane.recycle.0.clone(),
             volume: Arc::clone(&lane.volume),
             virtual_node: dsp.direction() == DeviceDirection::Output,
+            system_mute: Arc::clone(&lane.system_mute),
             dsp: Some(dsp),
         }
     }
@@ -883,6 +966,9 @@ pub(crate) struct Config {
     pub(crate) meters: PerDirection<Input<Meters>>,
     /// Each lane's event queue, read by that lane's chain only.
     pub(crate) events: PerDirection<Receiver<DspEvent>>,
+    /// A second sending end of each lane's event queue, beside the GUI's, for the events the
+    /// engine sends a chain itself ([`Shared::lane_events`]).
+    pub(crate) lane_events: PerDirection<Sender<DspEvent>>,
     pub(crate) ready: Sender<Result<(), AudioError>>,
     /// The canceller library echo cancellation loads: WebRTC's, except in the tests
     /// (`AudioEngine::start_with_canceller`).
@@ -900,6 +986,11 @@ pub(crate) struct Config {
 /// Field order is drop order and drop order matters: a `StreamListener` removes a `spa_hook` from
 /// a list that lives inside the stream, so every listener is declared before the stream it hooks.
 struct Nodes {
+    /// The input pair's recorder of its own, while the app holds the microphone awake
+    /// ([`KeepAwake`]). First, so it goes before the source it records from: a recorder that
+    /// outlived its source for a moment would be one WirePlumber looks for another target for.
+    /// `None` in every output pair, and in an input pair nobody holds awake.
+    keep_awake: Option<KeepAwake>,
     /// A proxy for the pair's virtual node, bound on the session's volume connection once its
     /// registry announces the node ([`adopt_own_node`]): the one way to write the node's `Props` —
     /// the volume it starts at — with `pipewire` 0.10.1, which binds no `pw_stream_set_param`, and
@@ -935,8 +1026,74 @@ struct Nodes {
     format: PairFormat,
     /// NODE 2's schedule, in an output pair whose server does not run a link-group together and
     /// so cannot idle it by itself (module docs, "Idle"). `None` in every other pair: the input
-    /// lane's, which is left running, and an output pair whose NODE 2 is passive.
+    /// lane's, whose capture stream is passive or left running, and an output pair whose NODE 2 is
+    /// passive.
     pace: Option<SecondNodePace>,
+}
+
+/// A recording stream of FxSound's own on the input lane's virtual source, made while the app
+/// holds the microphone awake ([`UiToAudio::KeepInputAwake`], module docs, "Idle").
+///
+/// It stands in for an application recording from FxSound (Input), and is built to look like one
+/// to both halves of the graph. To the server: an ordinary, non-passive capture stream whose link
+/// to the source makes the source runnable, and with it the passive capture stream and the
+/// microphone. To WirePlumber: a `Stream/Input/Audio` with no `node.link-group`, not a monitor —
+/// the one kind of stream `device/autoswitch-bluetooth-profile.lua` switches a Bluetooth headset to
+/// its call profile for, found from the source through the input lane's group to the headset's
+/// loopback microphone. What it records is thrown away.
+///
+/// Part of the pair ([`Nodes::keep_awake`]): a new pair's source is a new node, and the recorder is
+/// made anew with it rather than left for WirePlumber to relink, which it never does for a
+/// `node.dont-reconnect` stream it has linked once. Field order is drop order, as for [`Nodes`].
+struct KeepAwake {
+    _listener: pw::stream::StreamListener<()>,
+    _stream: pw::stream::StreamRc,
+}
+
+impl KeepAwake {
+    /// Make the recorder for an input pair of `format`, asking for the pair's `latency`.
+    ///
+    /// Targeted at the source by name, which is the one the pair was just built with: the old
+    /// pair's source went before this one was made. `node.dont-fallback` and `node.linger` keep it
+    /// waiting, rather than linked to some other source or destroyed, if WirePlumber handles it
+    /// before the source is linkable; `node.dont-reconnect` and `node.dont-move` keep it where it
+    /// was put — nobody else's default and no metadata write may take the recorder elsewhere.
+    fn build(
+        core: &pw::core::CoreRc,
+        format: &PairFormat,
+        latency: &str,
+    ) -> Result<Self, AudioError> {
+        let stream = pw::stream::StreamRc::new(
+            core.clone(),
+            KEEP_AWAKE_NODE_NAME,
+            keep_awake_props(latency),
+        )
+        .map_err(|error| AudioError::PipewireUnavailable(error.to_string()))?;
+        let listener = stream
+            .add_local_listener_with_user_data(())
+            .state_changed(|_stream, _, _old, new| {
+                log::debug!("{KEEP_AWAKE_NODE_NAME}: {new:?}");
+            })
+            .process(on_keep_awake_process)
+            .register()
+            .map_err(|error| AudioError::PipewireUnavailable(error.to_string()))?;
+        let values = format_pod(format.rate, format.channels, &format.positions);
+        let Some(pod) = Pod::from_bytes(&values) else {
+            return Err(AudioError::FormatNegotiation);
+        };
+        stream
+            .connect(
+                libspa::utils::Direction::Input,
+                None,
+                StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
+                &mut [pod],
+            )
+            .map_err(|error| AudioError::PipewireUnavailable(error.to_string()))?;
+        Ok(Self {
+            _listener: listener,
+            _stream: stream,
+        })
+    }
 }
 
 /// The format a lane's pair runs at: decided once per build, declared on both of its nodes, and
@@ -1294,6 +1451,21 @@ struct Lane {
     /// The volume the lane's last pair ended at: what a target never seen before is never
     /// louder than ([`volume::for_new_pair`]).
     last_volume: Option<NodeVolume>,
+    /// Silence after the lane's chain, set by the engine rather than by the GUI's snapshot: while
+    /// the system sleeps, and after it wakes until the lane has been attached again or
+    /// [`WAKE_MUTE`] is up (module docs, "Sleep"). Shared with the lane's NODE 1, whose DSP reads
+    /// it once a block beside the snapshot's own `mute` and silences the same way. Kept across
+    /// pairs, like the ring: a pair built while the system sleeps is born silent.
+    system_mute: Arc<AtomicBool>,
+    /// The system has just woken, and until this instant the lane's rules wait for the device the
+    /// lane was on rather than choose another, if that device is not back yet (module docs,
+    /// "Sleep"). A [`Hold`] for every lane at once, without the card: a Bluetooth headset's card
+    /// goes with the suspend and comes back with its reconnection, and a hold that ended with its
+    /// card would never wait for it.
+    wake_wait: Option<Instant>,
+    /// The system has just woken, and the lane stays silent until its rules have run and left it
+    /// attached, or until this instant at the latest ([`WAKE_MUTE`]).
+    wake_mute_until: Option<Instant>,
 }
 
 impl Lane {
@@ -1325,6 +1497,9 @@ impl Lane {
             volume: Arc::new(LaneVolume::new()),
             volume_debounce: Debounce::default(),
             last_volume: None,
+            system_mute: Arc::new(AtomicBool::new(false)),
+            wake_wait: None,
+            wake_mute_until: None,
         }
     }
 
@@ -1486,6 +1661,18 @@ struct Shared {
     /// start ([`volume::inherited`]): the level a lane with no history at all — no pair yet this
     /// run, nothing remembered for its direction — starts no louder than ([`volume_for_pair`]).
     inherited_volumes: PerDirection<Option<NodeVolume>>,
+    /// The app holds the microphone awake ([`UiToAudio::KeepInputAwake`]): the input pair records
+    /// its own source while it has one ([`KeepAwake`], [`reconcile_keep_awake`]). Kept across
+    /// pairs and reconnects: it is the app's to change, not the server's.
+    keep_input_awake: bool,
+    /// Since when the system has said it is about to sleep ([`UiToAudio::SystemSleeping`]); `None`
+    /// while it is awake. While it is set, both lanes are silent and no device rules run (module
+    /// docs, "Sleep").
+    asleep_since: Option<Instant>,
+    /// A sending end of each lane's event queue — the GUI holds the others — for the one event the
+    /// engine sends a chain itself: clearing its filter history when the system wakes. `None` in
+    /// the tests that build a [`Shared`] without a handle behind it.
+    lane_events: PerDirection<Option<Sender<DspEvent>>>,
 }
 
 impl Shared {
@@ -1536,6 +1723,9 @@ impl Shared {
             headset_warned: None,
             target_volumes: Vec::new(),
             inherited_volumes: PerDirection::default(),
+            keep_input_awake: false,
+            asleep_since: None,
+            lane_events: PerDirection::default(),
         }
     }
 
@@ -1751,6 +1941,7 @@ pub(crate) fn run(config: Config) {
         input_params,
         meters,
         events,
+        lane_events,
         ready,
         aec_library,
         target_volumes,
@@ -1794,6 +1985,10 @@ pub(crate) fn run(config: Config) {
     {
         let mut state = shared.borrow_mut();
         state.aec = EchoCancel::new(aec_library);
+        state.lane_events = PerDirection {
+            output: Some(lane_events.output),
+            input: Some(lane_events.input),
+        };
         // Before the first connection, and so before any pair: neither lane can build on a volume
         // chosen without what the app remembers, or without what WirePlumber kept.
         state.target_volumes = remembered_volumes(target_volumes);
@@ -2066,23 +2261,9 @@ fn control(shared: &mut Shared, message: UiToAudio) {
             set_device_priority(shared, direction, names);
         }
         UiToAudio::SeedTargetVolumes(volumes) => seed_target_volumes(shared, volumes),
-        // The rest of the upstream review's messages (`docs/0.4.0-upstream.md`). The API landed
-        // first, so the app and the engine could be built against it in parallel; each is acted on
-        // by its own item, and until then it is logged and otherwise ignored, which leaves the
-        // engine doing exactly what it did before the message existed.
-        UiToAudio::SystemSleeping(sleeping) => {
-            log::info!(
-                "system {} (not acted on yet, U13)",
-                if sleeping {
-                    "going to sleep"
-                } else {
-                    "resumed"
-                }
-            );
-        }
-        UiToAudio::KeepInputAwake(awake) => {
-            log::info!("keep the microphone awake: {awake} (not acted on yet, U19)");
-        }
+        UiToAudio::SystemSleeping(true) => go_to_sleep(shared, Instant::now()),
+        UiToAudio::SystemSleeping(false) => wake_up(shared, Instant::now()),
+        UiToAudio::KeepInputAwake(awake) => keep_input_awake(shared, awake),
         UiToAudio::Shutdown => unreachable!("handled by handle_control"),
     }
     // A detached microphone lane, another microphone or other speakers: whatever the message
@@ -2090,6 +2271,9 @@ fn control(shared: &mut Shared, message: UiToAudio) {
     // stream recording from it goes back to the microphone with it. Loading one needs the context,
     // which only the supervisor has; it follows within 200 ms.
     reconcile_echo_cancel(shared, None);
+    // And a microphone pair the message built — or rebuilt, for the canceller — is held awake at
+    // once when it is to be, rather than a tick later.
+    reconcile_keep_awake(shared);
 }
 
 /// Switch echo cancellation on or off, and answer with an [`AudioToUi::EchoCancel`] saying where
@@ -2205,8 +2389,10 @@ fn select_device(shared: &mut Shared, direction: DeviceDirection, node_name: Str
     lane.attempts = 0;
     lane.next_attempt = Instant::now();
     lane.last_error = None;
-    // Nor is the lane still waiting for a node that went: the user has said where it goes.
+    // Nor is the lane still waiting for a node that went, or for its device after a wake: the
+    // user has said where it goes.
     lane.hold = None;
+    lane.wake_wait = None;
     if shared.ready() {
         shared.lanes.get_mut(direction).needs_rules = false;
         apply_rules(shared, direction);
@@ -2264,12 +2450,199 @@ fn detach_lane(shared: &mut Shared, direction: DeviceDirection) {
     lane.attempts = 0;
     lane.last_error = None;
     lane.attached = None;
+    // A lane that is off has nothing to be heard or waited for after a wake. While the system
+    // sleeps it stays silent with the other, and the wake finds it off.
+    lane.wake_wait = None;
+    lane.wake_mute_until = None;
+    if shared.asleep_since.is_none() {
+        lane.system_mute.store(false, Ordering::Relaxed);
+    }
     // A pick not yet honoured is not honoured by a lane that is off.
     shared.preference.get_mut(direction).fresh_pick = false;
     shared.notify(AudioToUi::Attached {
         direction,
         node_name: None,
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sleep, and a microphone held awake
+// ---------------------------------------------------------------------------------------------
+
+/// The system is about to sleep (module docs, "Sleep"): silence both lanes and freeze their rules
+/// until it wakes.
+///
+/// Both lanes, enabled or not: a lane the user attaches in the moments before the suspend must not
+/// be heard either, and one that is off hears nothing anyway. A second `true` before a `false`
+/// changes nothing — the sleep began with the first.
+fn go_to_sleep(shared: &mut Shared, now: Instant) {
+    if shared.asleep_since.is_none() {
+        log::info!("the system is going to sleep: both lanes fall silent until it wakes");
+        shared.asleep_since = Some(now);
+    }
+    for (_, lane) in shared.lanes.iter_mut() {
+        lane.system_mute.store(true, Ordering::Relaxed);
+        // A wake that had not finished is overtaken by this sleep, and the next wake starts afresh.
+        lane.wake_wait = None;
+        lane.wake_mute_until = None;
+    }
+}
+
+/// The system has woken (module docs, "Sleep"): clear both chains' history, let both lanes' rules
+/// run with a wait for their devices in front of them, and hear each lane again once it is
+/// attached.
+///
+/// A wake with no sleep before it — the app saying so at start, or saying it twice — changes
+/// nothing. [`SLEEP_LIMIT`] calls this too, when no wake has come.
+fn wake_up(shared: &mut Shared, now: Instant) {
+    if shared.asleep_since.take().is_none() {
+        log::debug!("told the system woke, with no sleep before it");
+        return;
+    }
+    log::info!("the system woke: both lanes look for their devices again");
+    for direction in DeviceDirection::ALL {
+        // The filters, the leveller and the denoiser last saw the world from before the suspend;
+        // the first block after it must not ring with that. Through the lane's own event queue, so
+        // it lands on the block that is next whichever thread the chain is on.
+        if let Some(events) = shared.lane_events.get(direction)
+            && events.try_send(DspEvent::ResetFilterState).is_err()
+        {
+            log::warn!(
+                "could not clear the {} lane's filter history after the wake",
+                direction.key()
+            );
+        }
+        let lane = shared.lanes.get_mut(direction);
+        // What the lane was waiting for before the sleep was timed on a clock that stood still
+        // through it, and against a graph the suspend has since taken apart.
+        lane.hold = None;
+        if lane.enabled {
+            lane.wake_wait = Some(now + RETURN_WAIT);
+            lane.wake_mute_until = Some(now + WAKE_MUTE);
+            // The graph may have changed under the lane in any way while it slept; a backoff it was
+            // serving belongs to the world before.
+            lane.next_attempt = now;
+            lane.needs_rules = true;
+        } else {
+            lane.system_mute.store(false, Ordering::Relaxed);
+        }
+    }
+    // A chain on the main loop has nothing else to apply its events.
+    apply_idle_lane_events(shared);
+}
+
+/// Take the system to have woken without saying so, once it has been going to sleep, awake, for
+/// longer than [`SLEEP_LIMIT`] ([`wake_up`]). Once per supervisor tick.
+fn give_up_on_sleep(shared: &mut Shared, now: Instant) {
+    let Some(since) = shared.asleep_since else {
+        return;
+    };
+    if now.saturating_duration_since(since) < SLEEP_LIMIT {
+        return;
+    }
+    log::warn!(
+        "the system said it was going to sleep {SLEEP_LIMIT:?} ago and never said it woke; \
+         both lanes carry on as if it had"
+    );
+    wake_up(shared, now);
+}
+
+/// Whether a lane's rules wait for the device it was on because the system has just woken: the
+/// wait is not up, the lane is on a device, and that device is not back yet ([`Lane::wake_wait`]).
+/// A wait that is up is let go of here.
+fn waits_after_wake(shared: &mut Shared, direction: DeviceDirection, now: Instant) -> bool {
+    let lane = shared.lanes.get(direction);
+    let Some(until) = lane.wake_wait else {
+        return false;
+    };
+    if now >= until {
+        shared.lanes.get_mut(direction).wake_wait = None;
+        return false;
+    }
+    let on = lane
+        .nodes
+        .as_ref()
+        .map(|nodes| nodes.target.as_str())
+        .or(lane.last_target.as_deref());
+    on.is_some_and(|on| {
+        !shared
+            .devices
+            .iter()
+            .any(|device| device.direction == direction && device.name == on)
+    })
+}
+
+/// Hear a lane again after the wake once it has earned it: it is `attached` — it has a pair, and no
+/// rules are owed, which after a wake means they have run since, because the wake asked for them
+/// ([`wake_up`]) — or [`WAKE_MUTE`] is up. Never while the system is asleep again.
+fn settle_wake_mute(shared: &mut Shared, direction: DeviceDirection, now: Instant, attached: bool) {
+    let sleeping = shared.asleep_since.is_some();
+    let lane = shared.lanes.get_mut(direction);
+    let Some(until) = lane.wake_mute_until else {
+        return;
+    };
+    if sleeping || !(attached || now >= until) {
+        return;
+    }
+    lane.wake_mute_until = None;
+    lane.system_mute.store(false, Ordering::Relaxed);
+    log::info!(
+        "{} lane: heard again after the wake{}",
+        direction.key(),
+        if attached {
+            ""
+        } else {
+            ", before its device was back"
+        }
+    );
+}
+
+/// Hold the microphone awake or let it sleep ([`UiToAudio::KeepInputAwake`]): the input pair
+/// records its own source while it is held ([`KeepAwake`]). Takes effect on the pair up now, if
+/// there is one, and on every pair built while it stays held.
+fn keep_input_awake(shared: &mut Shared, awake: bool) {
+    if shared.keep_input_awake != awake {
+        log::info!(
+            "{}",
+            if awake {
+                "holding the microphone awake"
+            } else {
+                "letting the microphone sleep while nothing records from FxSound (Input)"
+            }
+        );
+    }
+    shared.keep_input_awake = awake;
+    reconcile_keep_awake(shared);
+}
+
+/// Give the input pair its own recorder while the microphone is held awake, and take it away when
+/// it is not ([`KeepAwake`]). From the control message, after every input pair is built, and on
+/// every tick — which is also what retries a recorder that could not be made.
+fn reconcile_keep_awake(shared: &mut Shared) {
+    let want = shared.keep_input_awake;
+    let Some(core) = shared.session.as_ref().map(|session| session.core.clone()) else {
+        return;
+    };
+    let Some(nodes) = shared.lanes.input.nodes.as_mut() else {
+        return;
+    };
+    match (want, nodes.keep_awake.is_some()) {
+        (true, false) => {
+            let latency = pair_latency(nodes.format.rate);
+            match KeepAwake::build(&core, &nodes.format, &latency) {
+                Ok(keep_awake) => {
+                    log::debug!("{KEEP_AWAKE_NODE_NAME} records {SOURCE_NODE_NAME}");
+                    nodes.keep_awake = Some(keep_awake);
+                }
+                Err(error) => log::warn!(
+                    "could not make the stream that holds the microphone awake ({error}); \
+                     trying again on the next tick"
+                ),
+            }
+        }
+        (false, true) => nodes.keep_awake = None,
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2308,12 +2681,14 @@ fn connect(
             // before any pair is built on this connection.
             let scheduled = schedules_link_groups(info.version());
             log::info!(
-                "PipeWire {}: the output lane's playback stream {}",
+                "PipeWire {}: {}",
                 info.version(),
                 if scheduled {
-                    "is passive and sleeps with the sink"
+                    "the playback stream and the capture stream are passive, and sleep with the \
+                     sink and the source"
                 } else {
-                    "is put to sleep by hand while the sink has no clients"
+                    "the playback stream is put to sleep by hand while the sink has no clients, \
+                     and the capture stream holds the microphone while the input lane is on"
                 }
             );
             link_groups_scheduled.set(scheduled);
@@ -2631,12 +3006,16 @@ fn supervise(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) {
             hand_back_disowned_defaults(&mut guard);
         }
 
+        // 3c. A sleep whose wake was never announced is over all the same.
+        let now = Instant::now();
+        give_up_on_sleep(&mut guard, now);
+
         // 4. Each lane on its own: its streams' errors, its format check, its rules, its
         //    published delay.
-        let now = Instant::now();
         for direction in DeviceDirection::ALL {
             supervise_lane(&mut guard, direction, now);
         }
+        reconcile_keep_awake(&mut guard);
 
         // 5. Tell the GUI what changed.
         publish(&mut guard);
@@ -2716,6 +3095,13 @@ fn supervise_lane(shared: &mut Shared, direction: DeviceDirection, now: Instant)
         apply_rules(shared, direction);
     }
 
+    // c2. After a wake, the lane is heard again once its rules have run and left it on a device —
+    //     not waiting, not backing off, not without one — whether they ran just now or on a device
+    //     the user picked in between; or once its time is up.
+    let lane = shared.lanes.get(direction);
+    let attached = lane.nodes.is_some() && !lane.needs_rules;
+    settle_wake_mute(shared, direction, now, attached);
+
     // d. Keep the published delay honest. Switching the denoiser on adds ten milliseconds, and
     //    only the audio thread knows it happened.
     republish_latency(shared, direction);
@@ -2729,9 +3115,16 @@ fn supervise_lane(shared: &mut Shared, direction: DeviceDirection, now: Instant)
     watch_volume(shared, direction);
 }
 
-/// Whether a lane's rules wait for the node its pair was attached to ([`Hold`]). A hold that has
-/// ended — its node is back, or the wait is up — is let go of here, and the log says which.
+/// Whether a lane's rules wait: while the system sleeps, just after it wakes for the device the
+/// lane was on ([`waits_after_wake`]), and for the node its pair was attached to ([`Hold`]). A hold
+/// that has ended — its node is back, or the wait is up — is let go of here, and the log says
+/// which.
 fn held(shared: &mut Shared, direction: DeviceDirection, now: Instant) -> bool {
+    // Nothing chooses a device while the system sleeps, nor, just after it wakes, before the
+    // lane's own device has had its chance to come back (module docs, "Sleep").
+    if shared.asleep_since.is_some() || waits_after_wake(shared, direction, now) {
+        return true;
+    }
     let Some(hold) = shared.lanes.get(direction).hold.as_ref() else {
         return false;
     };
@@ -3976,7 +4369,7 @@ fn build_nodes(
         source_rate,
     } = format;
     let quantum = DEFAULT_QUANTUM_FRAMES.min(MAX_QUANTUM_FRAMES as u32);
-    let latency = format!("{quantum}/{rate}");
+    let latency = pair_latency(rate);
 
     let (passive, pace) = idle_plan(direction, shared.link_groups_scheduled.get());
     let wake = pace.and(shared.wake.clone());
@@ -3987,7 +4380,8 @@ fn build_nodes(
     // there is nothing else to do to make applications able to render into it, and nothing to
     // autoconnect — WirePlumber links clients *to* it.
     //
-    // Input: a capture stream on the chosen microphone, targeted by name and autoconnected.
+    // Input: a capture stream on the chosen microphone, targeted by name and autoconnected, and
+    // passive where the server runs the pair together (U19).
     let (first_name, first_props, first_flags) = match direction {
         DeviceDirection::Output => (
             SINK_NODE_NAME,
@@ -4003,7 +4397,7 @@ fn build_nodes(
         ),
         DeviceDirection::Input => (
             CAPTURE_NODE_NAME,
-            stream_props(direction, via.unwrap_or(&target.name), &latency, false),
+            stream_props(direction, via.unwrap_or(&target.name), &latency, passive),
             StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
         ),
     };
@@ -4067,8 +4461,9 @@ fn build_nodes(
             log::debug!("{first_name}: {new:?}");
             data.status.first_node_moved(&new);
             if passive && matches!(new, StreamState::Paused) {
-                // A passive NODE 2 stopped in the same cycle, and what it had not played yet is
-                // the tail of a sound that has ended (module docs, "Idle").
+                // The pair stopped as one — a passive device-facing stream stops in the same cycle
+                // as the rest of its group — and what NODE 2 had not taken from the ring yet is the
+                // tail of a sound, or of a recording, that has ended (module docs, "Idle").
                 data.ring.mark_stale();
             }
             if let Some(wake) = &wake {
@@ -4185,6 +4580,8 @@ fn build_nodes(
         .map_err(|error| AudioError::PipewireUnavailable(error.to_string()))?;
 
     Ok(Nodes {
+        // Made by [`reconcile_keep_awake`] once the pair is the lane's, when it is to be held.
+        keep_awake: None,
         own: None,
         // A node PipeWire has just made is at unity already; there is nothing to tell it.
         volume_published: pair_volume.gains(channels as usize)
@@ -4202,19 +4599,32 @@ fn build_nodes(
     })
 }
 
-/// How a new pair keeps its NODE 2 from running while nothing plays into its NODE 1 (module docs,
-/// "Idle"): whether NODE 2 is declared passive, and the pace it is kept to by hand when it is not.
+/// The `node.latency` a pair at `rate` asks for: the quantum FxSound runs at, at that rate. Asked of
+/// both nodes and of anything made with the pair ([`KeepAwake`]), so nothing of FxSound's pulls the
+/// graph's quantum below what the pair was built for.
+fn pair_latency(rate: u32) -> String {
+    format!(
+        "{}/{rate}",
+        DEFAULT_QUANTUM_FRAMES.min(MAX_QUANTUM_FRAMES as u32)
+    )
+}
+
+/// How a new pair keeps its device-facing stream from running while nothing uses the lane (module
+/// docs, "Idle"): whether that stream is declared passive, and the pace an output pair's NODE 2 is
+/// kept to by hand when it cannot be.
 ///
-/// The output lane's NODE 2 is passive where the server runs a link-group together and paced by
-/// hand where it does not. The input lane's pair is left running: its NODE 1 is what makes the
-/// microphone produce anything, and a recorder may link to its NODE 2 at any moment.
+/// Where the server runs a link-group together, the device-facing stream is passive in both lanes:
+/// the output lane's playback stream (NODE 2), which then runs only while something plays into the
+/// sink, and the input lane's capture stream (NODE 1), which then runs only while something records
+/// from the source (U19). On an older server the playback stream is paced by hand and the capture
+/// stream is left running, holding the microphone for as long as the lane is on.
 fn idle_plan(
     direction: DeviceDirection,
     link_groups_scheduled: bool,
 ) -> (bool, Option<SecondNodePace>) {
     match direction {
+        _ if link_groups_scheduled => (true, None),
         DeviceDirection::Input => (false, None),
-        DeviceDirection::Output if link_groups_scheduled => (true, None),
         DeviceDirection::Output => (false, Some(SecondNodePace::new())),
     }
 }
@@ -4344,11 +4754,13 @@ fn stream_props(
         "node.linger"                  => "true",
         // Passive, the playback stream's link no longer keeps the speakers running; what runs it
         // is the virtual sink, whenever an application's link makes that run, because the server
-        // runs a link-group together. That is true from PipeWire 0.3.68 on, and only there does
-        // the caller ask for it. On an older server the two nodes are not linked in the graph —
-        // the ring between them is invisible to it — and nothing would ever wake a passive NODE 2
-        // but the speakers running for somebody else: FxSound would play nothing. The capture
-        // stream is never passive. It is what makes the microphone produce anything at all.
+        // runs a link-group together. The capture stream the same way round: its link no longer
+        // keeps the microphone running, and what runs it is the virtual source, whenever a
+        // recorder's link makes that run (U19). That is true from PipeWire 0.3.68 on, and only
+        // there does the caller ask for it. On an older server the two nodes are not linked in
+        // the graph — the ring between them is invisible to it — and nothing would ever wake a
+        // passive stream but its device running for somebody else: FxSound would play, or
+        // record, nothing.
         *pw::keys::NODE_PASSIVE        => if passive { "true" } else { "false" },
         *pw::keys::NODE_LATENCY        => latency,
         // Remixing stays on: it is what lets the pair run stereo on a device that is not. The
@@ -4365,6 +4777,49 @@ fn stream_props(
         props.insert(*pw::keys::STREAM_CAPTURE_SINK, "false");
     }
     props
+}
+
+/// The properties of the recorder that holds the microphone awake ([`KeepAwake`]).
+///
+/// Everything WirePlumber 0.5.17 looks at before it switches a Bluetooth headset to its call
+/// profile (`device/autoswitch-bluetooth-profile.lua`, the `link-added` hook and
+/// `isBluetoothLoopbackSourceNodeLinkedToStream`) is set to what an application's recording stream
+/// has: `media.class = Stream/Input/Audio`, **no** `node.link-group` — the whole point, since the
+/// pair's capture stream has one and is passed over for it — and neither `stream.monitor` nor
+/// `bluez5.loopback`. It is not passive, or it would wake nothing.
+fn keep_awake_props(latency: &str) -> PropertiesBox {
+    properties! {
+        *pw::keys::MEDIA_CLASS         => "Stream/Input/Audio",
+        *pw::keys::MEDIA_TYPE          => "Audio",
+        *pw::keys::MEDIA_CATEGORY      => "Capture",
+        *pw::keys::MEDIA_ROLE          => "Production",
+        *pw::keys::MEDIA_NAME          => KEEP_AWAKE_STREAM_DESCRIPTION,
+        *pw::keys::NODE_NAME           => KEEP_AWAKE_NODE_NAME,
+        *pw::keys::NODE_DESCRIPTION    => KEEP_AWAKE_STREAM_DESCRIPTION,
+        *pw::keys::NODE_AUTOCONNECT    => "true",
+        *pw::keys::NODE_PASSIVE        => "false",
+        *pw::keys::NODE_DONT_RECONNECT => "true",
+        "node.dont-fallback"           => "true",
+        "node.dont-move"               => "true",
+        "node.linger"                  => "true",
+        *pw::keys::NODE_LATENCY        => latency,
+        *pw::keys::TARGET_OBJECT       => SOURCE_NODE_NAME,
+        *pw::keys::STREAM_CAPTURE_SINK => "false",
+        *pw::keys::APP_NAME            => "FxSound",
+        *pw::keys::APP_ID              => crate::APP_ID,
+    }
+}
+
+/// The keep-awake recorder's `process()`: hand every buffer straight back. Being linked and run is
+/// all it is for; what the source played into it has been measured already, by the lane's own
+/// meters on the capture stream.
+///
+/// Same real-time rules as [`on_sink_process`]: dropping a `Buffer` queues it back to the stream,
+/// and there are only ever as many to drop as the stream has buffers.
+fn on_keep_awake_process(stream: &pw::stream::Stream, _: &mut ()) {
+    while let Some(buffer) = stream.dequeue_buffer() {
+        drop(buffer);
+    }
 }
 
 /// Serialise an `SPA_TYPE_OBJECT_Format` / `SPA_PARAM_EnumFormat` pod for interleaved F32.
@@ -4925,9 +5380,11 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
     };
 
     // Parameters are state: take the newest snapshot, discard anything in between. Events are
-    // not: drain them all. The node's volume is state too, and read the same way: nine loads.
+    // not: drain them all. The node's volume is state too, and read the same way: nine loads. So
+    // is the silence the engine holds the lane in while the system sleeps: one more.
     dsp.refresh();
     dsp.set_volume(&data.volume.gains());
+    dsp.set_system_mute(data.system_mute.load(Ordering::Relaxed));
 
     let Some(bytes) = chunk_data.data() else {
         return;
@@ -5754,24 +6211,74 @@ mod tests {
     }
 
     #[test]
-    fn only_the_output_lane_idles_and_only_an_old_server_needs_it_done_by_hand() {
+    fn both_lanes_idle_where_the_server_runs_a_link_group_together_and_only_the_speakers_by_hand_elsewhere()
+     {
         assert_eq!(
             idle_plan(DeviceDirection::Output, true),
             (true, None),
             "a server that runs a link-group together idles a passive NODE 2 by itself"
         );
         assert_eq!(
+            idle_plan(DeviceDirection::Input, true),
+            (true, None),
+            "and a passive capture stream the same way, woken by whatever records from the source"
+        );
+        assert_eq!(
             idle_plan(DeviceDirection::Output, false),
             (false, Some(SecondNodePace::new())),
             "an older one gets an ordinary NODE 2, paced by hand"
         );
-        for scheduled in [true, false] {
-            assert_eq!(
-                idle_plan(DeviceDirection::Input, scheduled),
-                (false, None),
-                "the microphone's pair is left running"
-            );
+        assert_eq!(
+            idle_plan(DeviceDirection::Input, false),
+            (false, None),
+            "and an ordinary capture stream, left running: nothing would wake a passive one there"
+        );
+    }
+
+    #[test]
+    fn the_stream_that_holds_the_microphone_awake_is_one_wireplumber_switches_a_headset_for() {
+        pw::init();
+        let props = keep_awake_props("512/48000");
+        // What `device/autoswitch-bluetooth-profile.lua` (WirePlumber 0.5.17) asks of a stream
+        // before it switches a headset to its call profile for it.
+        assert_eq!(props.get("media.class"), Some("Stream/Input/Audio"));
+        assert_eq!(
+            props.get("node.link-group"),
+            None,
+            "a stream in a link-group is passed over, as the pair's capture stream is"
+        );
+        assert_eq!(props.get("stream.monitor"), None);
+        assert_eq!(props.get("bluez5.loopback"), None);
+        // And what the server asks of a link before it runs what is behind it.
+        assert_eq!(
+            props.get("node.passive"),
+            Some("false"),
+            "a passive recorder would wake nothing"
+        );
+        // Recording FxSound (Input) and nothing else, for good.
+        assert_eq!(props.get("target.object"), Some(SOURCE_NODE_NAME));
+        assert_eq!(props.get("node.autoconnect"), Some("true"));
+        for key in [
+            "node.dont-reconnect",
+            "node.dont-fallback",
+            "node.dont-move",
+            "node.linger",
+        ] {
+            assert_eq!(props.get(key), Some("true"), "{key}");
         }
+        assert_eq!(props.get("stream.capture.sink"), Some("false"));
+        assert_eq!(props.get("node.name"), Some(KEEP_AWAKE_NODE_NAME));
+        assert_eq!(
+            props.get("node.description"),
+            Some(KEEP_AWAKE_STREAM_DESCRIPTION)
+        );
+        assert_eq!(props.get("media.name"), Some(KEEP_AWAKE_STREAM_DESCRIPTION));
+        assert_eq!(props.get("application.name"), Some("FxSound"));
+        assert_eq!(props.get("node.latency"), Some("512/48000"));
+        assert!(
+            is_ours(KEEP_AWAKE_NODE_NAME),
+            "never a device, never a default to remember"
+        );
     }
 
     #[test]
@@ -5882,7 +6389,7 @@ mod tests {
         assert_eq!(output.get("target.object"), Some("alsa_output.x"));
         assert_eq!(output.get("stream.capture.sink"), None);
 
-        let capture = stream_props(DeviceDirection::Input, "alsa_input.mic", "512/48000", false);
+        let capture = stream_props(DeviceDirection::Input, "alsa_input.mic", "512/48000", true);
         assert_eq!(capture.get("media.class"), Some("Stream/Input/Audio"));
         assert_eq!(capture.get("media.category"), Some("Capture"));
         assert_eq!(capture.get("media.role"), Some("Production"));
@@ -5901,7 +6408,17 @@ mod tests {
             output.get("node.link-group"),
             "one group for both lanes runs the speakers for as long as the microphone runs"
         );
-        assert_eq!(capture.get("node.passive"), Some("false"));
+        assert_eq!(
+            capture.get("node.passive"),
+            Some("true"),
+            "the microphone runs only while something records from the source (U19)"
+        );
+        assert_eq!(
+            stream_props(DeviceDirection::Input, "alsa_input.mic", "512/48000", false)
+                .get("node.passive"),
+            Some("false"),
+            "a server that does not run a link-group together gets an ordinary stream"
+        );
         assert_eq!(capture.get("node.autoconnect"), Some("true"));
         assert_eq!(capture.get("target.object"), Some("alsa_input.mic"));
         assert_eq!(
@@ -7601,6 +8118,376 @@ mod tests {
         remove_device(&mut shared, 70);
         detach_lane(&mut shared, DeviceDirection::Output);
         assert_eq!(shared.lanes.output.hold, None);
+    }
+
+    // ---- Sleep (U13) and a microphone held awake (U19) --------------------------------------
+
+    /// The engine's own mute of each lane, `(output, input)`, as its NODE 1 would read it.
+    fn silenced(shared: &Shared) -> (bool, bool) {
+        (
+            shared.lanes.output.system_mute.load(Ordering::Relaxed),
+            shared.lanes.input.system_mute.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Give the engine its sending ends of both lanes' event queues, as the handle does, and hand
+    /// the test the chains' ends.
+    fn with_lane_queues(shared: &mut Shared) -> PerDirection<Receiver<DspEvent>> {
+        let (senders, receivers) =
+            PerDirection::from_fn(|_| crossbeam_channel::bounded(crate::EVENT_QUEUE_LEN)).unzip();
+        shared.lane_events = PerDirection {
+            output: Some(senders.output),
+            input: Some(senders.input),
+        };
+        receivers
+    }
+
+    /// The output lane on the headset, the system gone to sleep, and the headset gone with it,
+    /// card and all — what a suspend does to a Bluetooth device.
+    fn headset_gone_in_the_sleep() -> (Shared, Receiver<AudioToUi>) {
+        let (mut shared, messages) = output_lane_on_the_headset();
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        remove_device(&mut shared, 70);
+        assert!(remove_card(&mut shared, HEADSET_CARD));
+        drained(&messages);
+        (shared, messages)
+    }
+
+    #[test]
+    fn going_to_sleep_silences_both_lanes_whether_or_not_they_are_on() {
+        let mut shared = shared_for_tests();
+        assert_eq!(silenced(&shared), (false, false), "awake, nothing is held");
+        assert!(!shared.lanes.input.enabled);
+
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        assert_eq!(silenced(&shared), (true, true));
+        let since = shared.asleep_since.expect("asleep");
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        assert_eq!(
+            shared.asleep_since,
+            Some(since),
+            "the sleep began with the first word of it"
+        );
+    }
+
+    #[test]
+    fn no_device_is_chosen_while_the_system_sleeps() {
+        // Awake, a headset that goes with its card moves the lane at once. Asleep, nothing moves
+        // it: the rules are asked, and kept asked for the wake.
+        let (mut shared, messages) = headset_gone_in_the_sleep();
+        assert_eq!(shared.lanes.output.hold, None, "no card, so no hold");
+        apply_rules(&mut shared, DeviceDirection::Output);
+        assert!(shared.lanes.output.needs_rules);
+        assert!(
+            shared.lanes.output.previous_names.is_empty(),
+            "the rules did not run"
+        );
+        assert!(drained(&messages).is_empty(), "and nothing was built");
+        assert!(held(
+            &mut shared,
+            DeviceDirection::Output,
+            Instant::now() + RETURN_WAIT * 10
+        ));
+    }
+
+    #[test]
+    fn waking_clears_both_chains_history_through_their_own_queues() {
+        let mut shared = shared_for_tests();
+        let queues = with_lane_queues(&mut shared);
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        assert!(
+            queues.output.is_empty() && queues.input.is_empty(),
+            "nothing is cleared on the way down"
+        );
+        control(&mut shared, UiToAudio::SystemSleeping(false));
+        for (direction, queue) in queues.iter() {
+            assert_eq!(
+                queue.try_iter().collect::<Vec<_>>(),
+                [DspEvent::ResetFilterState],
+                "the {} lane",
+                direction.key()
+            );
+        }
+    }
+
+    #[test]
+    fn a_chain_on_the_main_loop_has_its_history_cleared_by_the_wake_itself() {
+        // Both queues wired as the handle wires them: the engine's senders, the lanes' DSP at the
+        // other end. The output lane's DSP is on the main loop, between pairs; the input lane's is
+        // away with a pair, on an audio thread this test does not run.
+        let (_, params) = triple_buffer::TripleBuffer::new(&DspParams::default()).split();
+        let (_, input_params) =
+            triple_buffer::TripleBuffer::new(&InputDspParams::default()).split();
+        let meters = PerDirection::from_fn(|_| {
+            triple_buffer::TripleBuffer::new(&fxsound_core::messages::Meters::default())
+                .split()
+                .0
+        });
+        let (senders, receivers) =
+            PerDirection::from_fn(|_| crossbeam_channel::bounded(crate::EVENT_QUEUE_LEN)).unzip();
+        let (dsp, handover) = lane_dsp::build(params, input_params, meters, receivers);
+        let (notify, _) = crossbeam_channel::unbounded();
+        let mut shared = Shared::new(
+            notify,
+            None,
+            None,
+            PerDirection {
+                output: Some(dsp.output),
+                input: None,
+            },
+            handover,
+        );
+        let _away_with_its_pair = dsp.input;
+        shared.lane_events = PerDirection {
+            output: Some(senders.output.clone()),
+            input: Some(senders.input.clone()),
+        };
+
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        control(&mut shared, UiToAudio::SystemSleeping(false));
+        assert_eq!(
+            senders.output.len(),
+            0,
+            "applied on the main loop, where the chain is"
+        );
+        assert_eq!(
+            senders.input.len(),
+            1,
+            "sent, and waiting for the block the audio thread runs next"
+        );
+    }
+
+    #[test]
+    fn a_wake_with_no_sleep_before_it_changes_nothing() {
+        let mut shared = shared_for_tests();
+        let queues = with_lane_queues(&mut shared);
+        shared.lanes.output.needs_rules = false;
+        control(&mut shared, UiToAudio::SystemSleeping(false));
+        assert!(queues.output.is_empty() && queues.input.is_empty());
+        assert_eq!(silenced(&shared), (false, false));
+        assert!(!shared.lanes.output.needs_rules);
+        assert_eq!(shared.lanes.output.wake_mute_until, None);
+        assert_eq!(shared.lanes.output.wake_wait, None);
+    }
+
+    #[test]
+    fn waking_asks_every_lane_that_is_on_for_its_rules_at_once_and_forgets_what_it_waited_for_before()
+     {
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        // A node that went with its card still here: a hold, timed before the sleep.
+        remove_device(&mut shared, 70);
+        assert!(shared.lanes.output.hold.is_some());
+        shared.lanes.output.next_attempt = Instant::now() + Duration::from_secs(5);
+        shared.lanes.output.needs_rules = false;
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+
+        let woke = Instant::now();
+        wake_up(&mut shared, woke);
+        let lane = &shared.lanes.output;
+        assert_eq!(
+            lane.hold, None,
+            "timed on a clock that stood still through the sleep"
+        );
+        assert!(lane.needs_rules);
+        assert!(
+            lane.next_attempt <= woke,
+            "a backoff from before the sleep is not served after it"
+        );
+        assert_eq!(lane.wake_wait, Some(woke + RETURN_WAIT));
+        assert_eq!(lane.wake_mute_until, Some(woke + WAKE_MUTE));
+        // The input lane is off: nothing to wait for, and nothing to hold silent.
+        assert_eq!(shared.lanes.input.wake_wait, None);
+        assert_eq!(shared.lanes.input.wake_mute_until, None);
+        assert!(!shared.lanes.input.needs_rules);
+        assert_eq!(silenced(&shared), (true, false));
+    }
+
+    #[test]
+    fn after_a_wake_a_lane_waits_for_its_device_even_with_its_card_gone() {
+        let (mut shared, messages) = headset_gone_in_the_sleep();
+        let woke = Instant::now();
+        wake_up(&mut shared, woke);
+        assert!(
+            held(&mut shared, DeviceDirection::Output, woke),
+            "the headset is given its chance to reconnect"
+        );
+        apply_rules(&mut shared, DeviceDirection::Output);
+        assert!(
+            shared.lanes.output.previous_names.is_empty(),
+            "nothing is chosen meanwhile"
+        );
+        assert!(drained(&messages).is_empty());
+
+        // It reconnects under its name, a new node on a new card: the wait is over the moment it
+        // is back, and the rules run on it.
+        shared.cards.push(headset_card());
+        add_device(&mut shared, headset_sink(81, 81));
+        assert!(!held(
+            &mut shared,
+            DeviceDirection::Output,
+            woke + Duration::from_millis(1500)
+        ));
+    }
+
+    #[test]
+    fn after_a_wake_a_device_that_does_not_come_back_is_given_up_on_once_the_wait_is_up() {
+        let (mut shared, _messages) = headset_gone_in_the_sleep();
+        let woke = Instant::now();
+        wake_up(&mut shared, woke);
+        assert!(held(
+            &mut shared,
+            DeviceDirection::Output,
+            woke + RETURN_WAIT - Duration::from_millis(1)
+        ));
+        assert!(!held(
+            &mut shared,
+            DeviceDirection::Output,
+            woke + RETURN_WAIT
+        ));
+        assert_eq!(
+            shared.lanes.output.wake_wait, None,
+            "a wait that is up is let go of"
+        );
+    }
+
+    #[test]
+    fn after_a_wake_a_lane_whose_device_is_there_is_not_kept_waiting() {
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        let woke = Instant::now();
+        wake_up(&mut shared, woke);
+        assert!(!held(&mut shared, DeviceDirection::Output, woke));
+    }
+
+    #[test]
+    fn a_device_the_user_picks_after_a_wake_ends_the_wait_there_and_then() {
+        let (mut shared, _messages) = headset_gone_in_the_sleep();
+        wake_up(&mut shared, Instant::now());
+        select_device(&mut shared, DeviceDirection::Output, SPEAKERS.to_owned());
+        assert_eq!(shared.lanes.output.wake_wait, None);
+        assert!(!held(&mut shared, DeviceDirection::Output, Instant::now()));
+    }
+
+    #[test]
+    fn a_lane_is_heard_again_the_tick_its_rules_leave_it_attached() {
+        let mut shared = shared_for_tests();
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        let woke = Instant::now();
+        wake_up(&mut shared, woke);
+        let tick = woke + SUPERVISOR_PERIOD;
+        settle_wake_mute(&mut shared, DeviceDirection::Output, tick, false);
+        assert!(
+            silenced(&shared).0,
+            "not attached yet, and the time is not up"
+        );
+        settle_wake_mute(&mut shared, DeviceDirection::Output, tick, true);
+        assert!(!silenced(&shared).0);
+        assert_eq!(shared.lanes.output.wake_mute_until, None);
+    }
+
+    #[test]
+    fn a_lane_still_waiting_for_its_device_is_heard_again_after_two_seconds() {
+        let (mut shared, _messages) = headset_gone_in_the_sleep();
+        let woke = Instant::now();
+        wake_up(&mut shared, woke);
+        settle_wake_mute(
+            &mut shared,
+            DeviceDirection::Output,
+            woke + WAKE_MUTE - Duration::from_millis(1),
+            false,
+        );
+        assert!(silenced(&shared).0);
+        settle_wake_mute(
+            &mut shared,
+            DeviceDirection::Output,
+            woke + WAKE_MUTE,
+            false,
+        );
+        assert!(!silenced(&shared).0);
+        assert!(
+            WAKE_MUTE < RETURN_WAIT,
+            "heard again before the wait for the device is given up, not after"
+        );
+    }
+
+    #[test]
+    fn a_lane_is_never_heard_again_while_the_system_sleeps() {
+        let mut shared = shared_for_tests();
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        let woke = Instant::now();
+        wake_up(&mut shared, woke);
+        // Back to sleep before the lane had settled: the next wake starts afresh, and nothing
+        // unmutes the lane in between, however long it takes.
+        go_to_sleep(&mut shared, woke + SUPERVISOR_PERIOD);
+        assert_eq!(shared.lanes.output.wake_mute_until, None);
+        assert_eq!(shared.lanes.output.wake_wait, None);
+        settle_wake_mute(
+            &mut shared,
+            DeviceDirection::Output,
+            woke + WAKE_MUTE * 10,
+            true,
+        );
+        assert_eq!(silenced(&shared), (true, true));
+    }
+
+    #[test]
+    fn a_lane_detached_after_the_wake_is_not_left_silent_for_when_it_comes_back() {
+        let mut shared = shared_for_tests();
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        wake_up(&mut shared, Instant::now());
+        assert!(silenced(&shared).0);
+        detach_lane(&mut shared, DeviceDirection::Output);
+        assert!(!silenced(&shared).0);
+        assert_eq!(shared.lanes.output.wake_mute_until, None);
+        assert_eq!(shared.lanes.output.wake_wait, None);
+
+        // Detached while the system sleeps, it stays silent with the other lane until the wake,
+        // which finds it off and lets it go.
+        let mut shared = shared_for_tests();
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        detach_lane(&mut shared, DeviceDirection::Output);
+        assert_eq!(silenced(&shared), (true, true));
+        control(&mut shared, UiToAudio::SystemSleeping(false));
+        assert_eq!(silenced(&shared), (false, false));
+    }
+
+    #[test]
+    fn a_sleep_whose_wake_is_never_heard_is_given_up_on_after_the_limit() {
+        let mut shared = shared_for_tests();
+        let queues = with_lane_queues(&mut shared);
+        let slept = Instant::now();
+        go_to_sleep(&mut shared, slept);
+        give_up_on_sleep(&mut shared, slept + SLEEP_LIMIT - Duration::from_millis(1));
+        assert!(shared.asleep_since.is_some());
+        assert!(queues.output.is_empty());
+
+        give_up_on_sleep(&mut shared, slept + SLEEP_LIMIT);
+        assert_eq!(shared.asleep_since, None);
+        assert_eq!(
+            queues.output.try_iter().collect::<Vec<_>>(),
+            [DspEvent::ResetFilterState],
+            "woken as a wake would"
+        );
+        assert!(shared.lanes.output.wake_mute_until.is_some());
+        assert!(
+            SLEEP_LIMIT > Duration::from_secs(5) * 4,
+            "well past logind's own delay before a suspend"
+        );
+    }
+
+    #[test]
+    fn holding_the_microphone_awake_is_kept_for_the_pairs_to_come_and_let_go_of_on_request() {
+        // With no server there is no pair to give a recorder to; the wish is what is kept, for
+        // every pair built while it stands.
+        let mut shared = shared_for_tests();
+        assert!(!shared.keep_input_awake);
+        control(&mut shared, UiToAudio::KeepInputAwake(true));
+        assert!(shared.keep_input_awake);
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        control(&mut shared, UiToAudio::SystemSleeping(false));
+        assert!(shared.keep_input_awake, "a sleep does not let go of it");
+        control(&mut shared, UiToAudio::KeepInputAwake(false));
+        assert!(!shared.keep_input_awake);
     }
 
     #[test]

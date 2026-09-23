@@ -1386,6 +1386,37 @@ Windows stops the render client when the ring empties, "to allow PC to sleep"
 default 5 s). Do **not** fight it. Set `node.always-process = false` (the default) so our sink can
 suspend; set it to `true` only if you observe first-sound truncation on a specific device.
 
+**0.4.0: the microphone sleeps too** (`docs/0.4.0-upstream.md` U19). The input lane's capture
+stream is passive where the server runs a link-group together (28.2), so the microphone, its
+light and a desktop's recording indicator are held only while an application records from
+`fxsound_source`. Measured on PipeWire 1.6.8 in a private daemon
+(`graph_churn::sleep::a_microphone_runs_only_while_something_records_from_fxsound_input`): linked
+to its microphone with nothing recording, neither the capture stream nor the microphone runs; a
+`pw-record` linked to the source runs both and is handed the processed microphone; unlinked, both
+are idle again. While the app holds the microphone awake (`UiToAudio::KeepInputAwake`, the
+calibration wizard and the microphone meters) the engine records its own source with a stream
+called `fxsound_mic_check` — no link-group, not passive, `target.object = fxsound_source`,
+`node.dont-reconnect`/`dont-fallback`/`dont-move`/`linger` — made with each input pair and gone
+with it. Having no link-group is what makes WirePlumber 0.5 switch a Bluetooth headset to its call
+profile for it: `device/autoswitch-bluetooth-profile.lua` only counts a `Stream/Input/Audio` with
+no `node.link-group` that reaches the headset's loopback microphone, and follows it through
+`fxsound_source`'s group to the capture stream and on to the headset, as it does for a call
+recording from FxSound (Input). The capture stream itself, in the input lane's group, never
+switched a headset. Echo cancellation keeps all of this. The canceller's own capture and monitor
+streams are passive, so with it loaded the microphone and the speakers it listens to also run only
+while something records from FxSound (Input) (29.2).
+
+**0.4.0: the system's sleep** (U13). The app forwards logind's `PrepareForSleep` as
+`UiToAudio::SystemSleeping`. Going to sleep, both lanes are silenced after their chains by the
+engine itself — a per-lane flag their NODE 1 reads beside the snapshot's `mute` — and no device
+rules run. On waking, both chains are sent `ResetFilterState`; every enabled lane's rules are
+owed again, whatever backoff it was serving, and a lane whose device is not back waits up to 2.5 s
+for it (`RETURN_WAIT`) whether or not its card is, since a Bluetooth headset's card goes with the
+suspend and comes back with the reconnection. Each lane is heard again on the tick its rules leave
+it attached — within 200 ms (the next supervisor tick) when its device is there — or after 2 s at
+the latest. A sleep that is never followed by a wake is given up after 60 s of the system being
+awake. There is no sleep inhibitor, by upstream's decision (PR #533).
+
 ---
 
 ## 20. Exact node properties
@@ -2014,7 +2045,8 @@ the ring unchanged. Only properties, targets, metadata keys and bookkeeping diff
 | `node.link-group` | `"fxsound-input"` (`"fxsound"` in 0.3.0) | **Mandatory** — see 28.3; the input lane's own group since 0.4.0, 29.2. |
 | `target.object` | the chosen source's `node.name` | |
 | `stream.capture.sink` | `"false"` | Capture the microphone itself, not a sink monitor. |
-| `node.autoconnect` / `node.passive` | `"true"` / `"false"` | As NODE 2 of §20. |
+| `node.autoconnect` | `"true"` | As NODE 2 of §20. |
+| `node.passive` | `"true"` on PipeWire 0.3.68 and later (0.4.0; was `"false"`), `"false"` before | The microphone runs only while something records from NODE 2: the recorder's link runs the source, the server runs the link-group with it, and the capture stream's link runs the microphone (19.8). Older servers do not run a link-group together, and a passive capture stream there would never be woken. |
 | `node.dont-reconnect` | `"true"` (0.4.0; was `"false"`) | As NODE 2 of §20: WirePlumber links the stream to its microphone once and never moves it; a microphone that comes back as a new node gets a new pair. |
 | `node.dont-fallback` | `"true"` (0.4.0) | As NODE 2 of §20. |
 | `node.linger` | `"true"` (0.4.0) | As NODE 2 of §20. |
@@ -2205,16 +2237,24 @@ only thing that reads the group.
 
 **The server runs a group together.** Since 0.3.68, PipeWire's scheduler puts every active member
 of a link-group under one driver (`collect_nodes`) and makes all of them runnable as soon as one
-is (`run_nodes`, `src/pipewire/context.c`). The input lane's capture stream runs for as long as
-the lane is on, because the microphone feeds it. In one group with the output pair, it made
-`fxsound_output` runnable, and `fxsound_output`'s link made the speakers run: the speakers never
-went idle while the microphone lane was on. That undid the idle work of the 0.4.0 design (§1.3,
-§12), which makes the output lane's NODE 2 passive so that it runs only with its sink. Measured
-on PipeWire 1.6.8 in a private daemon: with one group, linking the microphone alone had the output
-lane report `processing`. With a group per lane, `graph_churn::a_microphone_being_captured_does_not_keep_the_speakers_awake`
+is (`run_nodes`, `src/pipewire/context.c`). When this section was written, the input lane's
+capture stream ran for as long as the lane was on, because the microphone fed it. In one group
+with the output pair, it made `fxsound_output` runnable, and `fxsound_output`'s link made the
+speakers run: the speakers never went idle while the microphone lane was on. That undid the idle
+work of the 0.4.0 design (§1.3, §12), which makes the output lane's NODE 2 passive so that it runs
+only with its sink. Measured on PipeWire 1.6.8 in a private daemon: with one group, linking the
+microphone alone had the output lane report `processing`. With a group per lane, `graph_churn::a_microphone_being_captured_does_not_keep_the_speakers_awake`
 holds the speakers' pair and the speakers idle while the microphone is captured, and
 `graph_churn::a_tone_driven_through_each_lane_reaches_that_lane_and_no_other` holds the output
 lane silent until something plays into its sink.
+
+Since the upstream review (U19) the capture stream is passive on such a server (28.2, 19.8), and
+runs only while something records from FxSound (Input): an application, or the engine's own
+`fxsound_mic_check` while the app holds the microphone awake. Echo cancellation does not change
+that, because the canceller in front of the capture stream is passive too (below). The groups
+stay split all the same. A recording is exactly what runs the capture stream now, and in one
+group with the output pair it would run the speakers too, so a voice recorder or a call would
+keep them awake whether or not anything played into FxSound (Output).
 
 **WirePlumber is still satisfied, because each stream shares a group with its own virtual
 node.** WirePlumber consults the group in one place that matters here, `linking-utils.lua`
@@ -2248,4 +2288,13 @@ the same-group check comes before the walk. `fxsound` would pass `canLink`, but 
 run the output pair whenever the canceller's capture stream runs, which is the problem above.
 §7 also records what echo cancellation costs in idle whichever group it is given: the module
 puts its streams in one `node.group` as well, and the monitor stream it records the speakers with
-keeps them and the output pair running.
+keeps them and the output pair running for as long as the canceller runs. Since U19, on a server
+that runs a link-group together, the canceller runs only while something records from FxSound
+(Input). PipeWire's module makes its capture and monitor streams passive, and the capture stream
+that records its source is passive now as well, so nothing in the chain runs it by itself.
+Measured on PipeWire 1.6.8 in a private daemon
+(`graph_churn::echo_cancellation_holds_nothing_awake_while_nothing_records_from_fxsound_input`):
+with the canceller wired in front of the microphone and nothing recording, the microphone, the
+canceller, both pairs and the speakers all stay idle. A recording runs all of them, and when it
+stops they are idle again while the canceller stays loaded. Before U19 the capture stream was an
+ordinary one, and its link to the canceller's source ran all of it for as long as the lane was on.
