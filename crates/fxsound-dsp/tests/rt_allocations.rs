@@ -15,11 +15,11 @@
 //! a state is built, and each test here builds on its own thread and processes on another, as the
 //! main loop and the data thread do, so a first-use cost of any kind shows up as a count.
 
-use fxsound_core::messages::{DspEvent, InputDspParams};
-use fxsound_core::{DenoiseChannelMode, DenoiseLevel, DereverbLevel};
+use fxsound_core::messages::{DspEvent, DspParams, InputDspParams};
+use fxsound_core::{DenoiseChannelMode, DenoiseLevel, DereverbLevel, Effect, EqBand};
 use fxsound_dsp::input::dereverb::Dereverb;
 use fxsound_dsp::input::{Denoiser, InputChain};
-use fxsound_dsp::{ChainSpec, InputEngine};
+use fxsound_dsp::{ChainSpec, Engine, InputEngine};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -267,4 +267,56 @@ fn the_engine_processes_applies_and_handles_events_without_allocating() {
         let _ = std::hint::black_box(engine.latency_frames());
     });
     assert_eq!(n, 0, "the engine allocated {n} times on the audio path");
+}
+
+#[test]
+fn the_music_engine_allocates_nothing_whatever_the_power_and_equalizer_switches_say() {
+    // Each combination takes a different path through `Engine::process` — the whole GraphicEq
+    // block, the effect chain alone, the master gain alone, or nothing — and a band count change
+    // arriving in a snapshot rebuilds the equalizer's ladder on the way in. All of it happens on
+    // the data thread.
+    let mut engine = Engine::new(FS, 1_024, 2);
+    let input = stereo_fixture(1_024 * 4);
+    let mut block = input.clone();
+
+    let mut snapshots = Vec::new();
+    for bands in [10_usize, 31, 5] {
+        let curve: Vec<EqBand> = (0..bands)
+            .map(|band| {
+                let hz = 30.0 * 1.25_f32.powi(band as i32);
+                EqBand::new(hz, if band % 2 == 0 { 6.0 } else { -4.0 })
+            })
+            .collect();
+        for (power, eq_on) in [(true, true), (true, false), (false, true), (false, false)] {
+            let mut params = DspParams {
+                power,
+                eq_on,
+                master_gain_db: -4.0,
+                balance: 6.0,
+                volume_leveling_db: 3.0,
+                ..DspParams::default()
+            };
+            params.set_bands(&curve);
+            params.set_effect(Effect::Ambience, 0.5);
+            params.set_effect(Effect::Bass, 0.7);
+            params.sanitise();
+            snapshots.push(params);
+        }
+    }
+
+    let n = allocations_on_a_fresh_thread(|| {
+        for params in &snapshots {
+            engine.apply(params);
+            block.copy_from_slice(&input);
+            for chunk in block.chunks_mut(1_024 * 2) {
+                engine.process(chunk, 2);
+            }
+        }
+        engine.handle_event(DspEvent::ResetFilterState);
+        let _ = std::hint::black_box(engine.meters());
+    });
+    assert_eq!(
+        n, 0,
+        "the music engine allocated {n} times on the audio path"
+    );
 }

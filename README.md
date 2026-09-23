@@ -218,8 +218,14 @@ sliders appear in:
 
 ```
 in ─► 31-band graphic EQ ─► master gain · balance ─► volume levelling
+      └───────────── skipped whole while the EQ is off ─────────────┘
    ─► Fidelity ─► Ambience ─► Surround ─► Bass ─► Dynamic Boost ─► out
 ```
+
+The first three stages are one block in the original, and the equalizer's switch is that block's
+switch: with the EQ off, the master gain, the balance and the volume levelling go with it, and only
+the effects run. Power off bypasses everything but the master gain, which still applies — without
+the balance, and only while the EQ is on.
 
 | Effect | Algorithm |
 |---|---|
