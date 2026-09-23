@@ -527,6 +527,11 @@ fn a_volume_set_on_fxsounds_sink_is_reported_for_the_device_it_is_attached_to() 
         Some(Some("false".to_owned())),
         "WirePlumber must not restore one volume for every device"
     );
+    assert_eq!(
+        graph.node_prop(crate::OUTPUT_NODE_NAME, "state.restore-props"),
+        Some(Some("false".to_owned())),
+        "nor its one volume for FxSound's streams onto the stream that plays to the device"
+    );
 
     graph
         .set_props(SINK_NODE_NAME, &channel_volumes(0.25))
@@ -631,6 +636,7 @@ fn seeded(target: &str, channels: usize, volume: f32) -> TargetVolume {
     TargetVolume {
         direction: DeviceDirection::Output,
         target: target.to_owned(),
+        port: String::new(),
         channel_volumes: vec![volume; channels],
         mute: false,
     }
@@ -824,6 +830,11 @@ fn the_microphone_lanes_volume_is_reported_from_fxsounds_source() {
         graph.node_prop(SOURCE_NODE_NAME, "state.restore-props"),
         Some(Some("false".to_owned()))
     );
+    assert_eq!(
+        graph.node_prop(crate::CAPTURE_NODE_NAME, "state.restore-props"),
+        Some(Some("false".to_owned())),
+        "a mute left on the capture stream in a mixer must not come back on every pair"
+    );
     graph
         .set_props(SOURCE_NODE_NAME, &channel_volumes(0.5))
         .expect("pw-cli set-param");
@@ -909,6 +920,7 @@ fn the_engine_writing_its_own_nodes_volume_leaves_the_node_answering_every_other
     handle.send(UiToAudio::SeedTargetVolumes(vec![TargetVolume {
         direction: DeviceDirection::Output,
         target: "t_stereo".to_owned(),
+        port: String::new(),
         channel_volumes: vec![0.3, 0.3],
         mute: false,
     }]));

@@ -608,6 +608,17 @@ pub struct TargetVolume {
     pub direction: DeviceDirection,
     /// `node.name` of the real device the lane was attached to.
     pub target: String,
+    /// The port the device was on: the name of its card's active route for the node
+    /// (`SPA_PARAM_Route`), such as `analog-output-headphones`. Empty for a device whose card
+    /// names none — a virtual sink, a card that has not said yet.
+    ///
+    /// One node can be two devices. On most desktops and many laptops (a plain HDA card, not a UCM
+    /// one) the speakers and the headphones are two ports of one sink, and plugging headphones in
+    /// only switches the port, so a volume kept per `node.name` alone was the speakers' level on
+    /// the headphones — upstream's #615 again, under another name. So the entry is one per target
+    /// *and* port, and the settings keep one per port too. Left out of the file when empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub port: String,
     /// `channelVolumes` of FxSound's node, linear amplitude, one per channel in its own order.
     pub channel_volumes: Vec<f32>,
     /// The node's `mute`.
@@ -615,6 +626,20 @@ pub struct TargetVolume {
 }
 
 impl TargetVolume {
+    /// Whether this is the entry for the lane of `direction` on `target`'s port `port` (empty for
+    /// a device with no port).
+    #[must_use]
+    pub fn is_for(&self, direction: DeviceDirection, target: &str, port: &str) -> bool {
+        self.direction == direction && self.target == target && self.port == port
+    }
+
+    /// Whether this and `other` are entries for the same lane, target and port — of which the
+    /// settings keep one.
+    #[must_use]
+    pub fn same_place(&self, other: &Self) -> bool {
+        other.is_for(self.direction, &self.target, &self.port)
+    }
+
     /// The entry as it may be replayed onto a node, or `None` when it cannot be.
     ///
     /// A volume that is not a number, or is below zero, carries no level anyone set, and replaying
@@ -696,9 +721,17 @@ pub enum UiToAudio {
     ///
     /// Empty means "follow the system": no ranking, the session default decides — the app's
     /// `follow_system_default` switch, and upstream's issue #629.
+    ///
+    /// `new_devices_first` says where a device the ranking does not name yet goes: before every
+    /// ranked device when `true`, after every one when `false` — the app's
+    /// `prioritize_new_output`, which puts a newly seen device at the front of its list or at the
+    /// back. The engine needs it because it decides on an arrival before the app's list that
+    /// ranks the newcomer can reach it; send it with every ranking, and again when the setting
+    /// changes.
     SetDevicePriority {
         direction: DeviceDirection,
         names: Vec<String>,
+        new_devices_first: bool,
     },
     /// Every remembered per-target volume, from the settings file (U10), replacing the whole of
     /// the engine's memory. The engine replays the matching one onto its own node when it attaches
@@ -1097,6 +1130,7 @@ mod tests {
         TargetVolume {
             direction: DeviceDirection::Output,
             target: "alsa_output.usb-headphones".to_owned(),
+            port: String::new(),
             channel_volumes: volumes.to_vec(),
             mute: false,
         }
@@ -1161,6 +1195,7 @@ mod tests {
         let entry = TargetVolume {
             direction: DeviceDirection::Input,
             target: "alsa_input.usb-fifine".to_owned(),
+            port: String::new(),
             channel_volumes: vec![0.5, 0.75],
             mute: true,
         };
@@ -1186,6 +1221,7 @@ mod tests {
             TargetVolume {
                 direction: DeviceDirection::Output,
                 target: "alsa_output.pci".to_owned(),
+                port: String::new(),
                 channel_volumes: Vec::new(),
                 mute: false,
             }
@@ -1197,6 +1233,7 @@ mod tests {
         let priority = UiToAudio::SetDevicePriority {
             direction: DeviceDirection::Output,
             names: vec!["alsa_output.usb".to_owned(), "alsa_output.pci".to_owned()],
+            new_devices_first: false,
         };
         assert_eq!(priority.clone(), priority);
         assert_ne!(
@@ -1204,13 +1241,24 @@ mod tests {
             UiToAudio::SetDevicePriority {
                 direction: DeviceDirection::Input,
                 names: vec!["alsa_output.usb".to_owned(), "alsa_output.pci".to_owned()],
+                new_devices_first: false,
             },
             "one ranking per lane"
+        );
+        assert_ne!(
+            priority,
+            UiToAudio::SetDevicePriority {
+                direction: DeviceDirection::Output,
+                names: vec!["alsa_output.usb".to_owned(), "alsa_output.pci".to_owned()],
+                new_devices_first: true,
+            },
+            "where a device not ranked yet goes is part of the ranking"
         );
         // An empty ranking is a message of its own: follow the system.
         let follow = UiToAudio::SetDevicePriority {
             direction: DeviceDirection::Output,
             names: Vec::new(),
+            new_devices_first: false,
         };
         assert_ne!(follow, priority);
 

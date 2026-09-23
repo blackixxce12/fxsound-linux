@@ -439,6 +439,26 @@ pub struct StartOptions {
     /// from before 0.4.0 — and only move once [`UiToAudio::SeedTargetVolumes`] arrived. Sanitised
     /// here as that message's are.
     pub target_volumes: Vec<TargetVolume>,
+    /// The output lane's device ranking (U4), as [`UiToAudio::SetDevicePriority`] would send it:
+    /// the settings' ranked list of outputs, or an empty one while the app follows the system's
+    /// default. Here so that the lane's first choice of device is already made by rank: made
+    /// without it, by the Windows rules, it would be the session default, and a ranking arriving a
+    /// moment later would have to take the lane from there.
+    pub output_priority: DevicePriority,
+    /// The input lane's device ranking, as [`Self::output_priority`] is the output lane's.
+    pub input_priority: DevicePriority,
+}
+
+/// One lane's ranking of its devices, as [`UiToAudio::SetDevicePriority`] carries it after start:
+/// what [`StartOptions`] hands the engine for each lane's first choice.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DevicePriority {
+    /// `node.name`s, most preferred first. Empty is "follow the system": the Windows rules and the
+    /// session default decide.
+    pub names: Vec<String>,
+    /// Whether a device the ranking does not name yet goes before every ranked one, or after
+    /// every one: the app's "prioritize new output devices" ([`Preference::new_devices_first`]).
+    pub new_devices_first: bool,
 }
 
 /// The audio backend. Owns the PipeWire thread and everything on it.
@@ -563,10 +583,16 @@ impl AudioEngine {
         let StartOptions {
             language,
             target_volumes,
+            output_priority,
+            input_priority,
         } = options;
         let (mut handle, mut config, ready) = EngineHandle::wire(remote, language.as_deref());
         config.aec_library = aec_library;
         config.target_volumes = target_volumes;
+        config.device_priority = PerDirection {
+            output: output_priority,
+            input: input_priority,
+        };
         config.wireplumber_state = wireplumber_state;
         let join = std::thread::Builder::new()
             .name("fxsound-audio".to_owned())
@@ -683,6 +709,7 @@ impl EngineHandle {
             ready: ready_tx,
             aec_library: aec::WEBRTC_LIBRARY,
             target_volumes: Vec::new(),
+            device_priority: PerDirection::default(),
             wireplumber_state: None,
         };
         let handle = Self {

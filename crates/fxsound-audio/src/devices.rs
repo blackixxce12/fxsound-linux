@@ -1030,17 +1030,46 @@ pub struct Preference {
     /// the output and leaves the list alone (`FxController::setOutput`), and from then on the pick
     /// is simply the current device, kept until a better-ranked one arrives or it goes.
     pub fresh_pick: bool,
+    /// Where a device the ranking does not name yet stands: before every ranked one when `true`,
+    /// after every one when `false` — the app's "prioritize new output devices"
+    /// (`prioritize_new_output`), sent with the ranking ([`UiToAudio::SetDevicePriority`]).
+    ///
+    /// A device the ranking does not name is one the app has not seen yet: it adds every device it
+    /// is told about to its list — at the front with this set, at the back without — and sends
+    /// the list again. That list comes after the rules have run on the arrival, and by then the
+    /// device is no longer new to them: ranked first, it would never take the lane from the device
+    /// it arrived beside. So the rules place it where the app is about to, the moment it arrives.
+    /// Upstream puts it in the list before it chooses the output (`FxController.cpp:2131-2133`,
+    /// then `:1540-1612`), and the new device wins there too.
+    ///
+    /// [`UiToAudio::SetDevicePriority`]: fxsound_core::messages::UiToAudio::SetDevicePriority
+    pub new_devices_first: bool,
+    /// The ranking has just come into force on a lane whose device the user did not pick — the
+    /// lane was following the system, or the ranking reached the engine only after the rules had
+    /// chosen by the system's default — and the next run of the rules takes the best device by rank
+    /// as if the lane had no current device. Any run spends it, and a pair that fails to be built
+    /// on its choice gives it back for the retry, as it does [`Self::fresh_pick`].
+    ///
+    /// Upstream starts on its preferred output whenever the saved one is absent
+    /// (`FxController.cpp:1516-1532`, `getPreferredOutput`). Without this, a device the Windows
+    /// rules chose before the ranking arrived — the session default, most often — would count as
+    /// the current one and keep the lane for as long as it is there, the ranking's first device
+    /// present beside it or not.
+    pub start_over: bool,
 }
 
 impl Preference {
-    /// Where `name` stands in the ranking: its place when it is ranked, and after every ranked
-    /// device when it is not. Equal places keep the graph's order wherever this is used as a key.
+    /// Where `name` stands in the ranking: its place when it is ranked; and, when it is not, before
+    /// every ranked device or after every one, as [`Self::new_devices_first`] says. Equal places
+    /// keep the graph's order wherever this is used as a key.
     #[must_use]
     pub fn rank(&self, name: &str) -> usize {
-        self.ranking
-            .iter()
-            .position(|ranked| ranked == name)
-            .unwrap_or(self.ranking.len())
+        let first = usize::from(self.new_devices_first);
+        match self.ranking.iter().position(|ranked| ranked == name) {
+            Some(place) => place + first,
+            None if self.new_devices_first => 0,
+            None => self.ranking.len(),
+        }
     }
 }
 
@@ -1176,8 +1205,10 @@ pub fn choose_device(
     // the rules below find it again as what it was, the user's pick or the device we last played
     // to. If its removal had a run of its own — the engine runs the rules from its supervisor tick,
     // which a slow profile switch can straddle, and every run replaces `previous_names` — rule 5
-    // takes it back as new: the same device either way, only with the remembered defaults written
-    // again.
+    // would take it back as new: the same device when the lane was on it, only with the remembered
+    // defaults written again, but a device the lane was *not* on would take the lane from the one
+    // it is on. So the engine keeps a node that went while its card stayed in `previous_names`
+    // until its wait for it is up (`Departure` in `crate::engine`), and it comes back as seen.
     if target.is_none() && !previous_names.is_empty() {
         target = real
             .iter()
@@ -1229,9 +1260,12 @@ pub fn choose_device(
 /// 1. the device the user has just picked, when it is present ([`Preference::fresh_pick`]);
 /// 2. the current device — the one the lane last attached to — while it is present, unless a
 ///    device that was not there at the last enumeration ranks above it (`:1558-1584`): a newcomer
-///    ranked below it never takes the lane from it;
+///    ranked below it never takes the lane from it. Not when the ranking has just come into force
+///    on a device the user did not pick ([`Preference::start_over`]): that device is no choice
+///    to keep;
 /// 3. once the current device has gone, the first present device by rank (`getPreferredOutput`,
-///    `:2677-2698`); unranked devices come after every ranked one, in the graph's order
+///    `:2677-2698`); unranked devices come after every ranked one — or before, while the app puts
+///    new devices first ([`Preference::new_devices_first`]) — in the graph's order
 ///    (`sortByDeviceConfigPriority`, a stable sort, `:1714-1725`).
 ///
 /// Upstream counted devices to tell that one had been added (`:1559`); that misses a device that
@@ -1263,7 +1297,9 @@ fn choose_ranked(
             .filter(|device| !previous_names.iter().any(|name| name == &device.name))
             .min_by_key(rank)
     };
-    if let Some(current) = find(real, &memory.most_recent_playback) {
+    if !preference.start_over
+        && let Some(current) = find(real, &memory.most_recent_playback)
+    {
         return Some(match newcomer {
             Some(newcomer) if rank(&newcomer) < rank(&current) => selection(newcomer, true),
             _ => selection(current, false),
@@ -2536,8 +2572,9 @@ mod tests {
     #[test]
     fn a_headset_whose_removal_had_a_run_of_its_own_comes_back_as_new_to_the_same_target() {
         // The same profile switch, slow enough to straddle two supervisor ticks: one run of the
-        // rules sees the headset gone, the next sees it back. The engine replaces `previous_names`
-        // after every run, so the second one no longer remembers the name.
+        // rules sees the headset gone, the next sees it back, with `previous_names` as the first
+        // run left them without it. (The engine keeps a node that went while its card stayed in
+        // them for the length of its wait; this is the rules' answer when it is not there.)
         let devices = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
         let without_headset: Vec<DeviceInfo> = devices
             .iter()
@@ -3655,7 +3692,7 @@ mod tests {
     fn ranked(names: &[&str]) -> Preference {
         Preference {
             ranking: names.iter().map(|&name| name.to_owned()).collect(),
-            fresh_pick: false,
+            ..Preference::default()
         }
     }
 
@@ -3733,6 +3770,92 @@ mod tests {
         assert_eq!(preference.rank("speakers"), 1);
         assert_eq!(preference.rank("hdmi"), 2);
         assert_eq!(preference.rank("tv"), 2, "every unranked device ties");
+    }
+
+    #[test]
+    fn a_device_not_in_the_ranking_ranks_before_every_one_that_is_while_new_devices_go_first() {
+        let preference = Preference {
+            new_devices_first: true,
+            ..ranked(&["usb-dac", "speakers"])
+        };
+        assert_eq!(preference.rank("hdmi"), 0);
+        assert_eq!(preference.rank("tv"), 0, "every unranked device ties");
+        assert_eq!(preference.rank("usb-dac"), 1);
+        assert_eq!(preference.rank("speakers"), 2);
+    }
+
+    #[test]
+    fn a_device_plugged_in_before_the_app_ranked_it_takes_the_lane_while_new_devices_go_first() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        let first = Preference {
+            new_devices_first: true,
+            ..ranked(&["speakers"])
+        };
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["speakers"],
+            &on("speakers"),
+            &first,
+        );
+        assert_eq!(selection.target, "usb-dac");
+        assert!(selection.write_previous_default, "an arrival");
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &ranked(&["speakers"])
+            ),
+            "speakers",
+            "at the back of the list, it takes nothing"
+        );
+        assert_eq!(
+            output(&devices, &["speakers", "usb-dac"], &on("speakers"), &first),
+            "speakers",
+            "and once it has been seen it is no arrival, first in the list or not"
+        );
+    }
+
+    #[test]
+    fn a_ranking_coming_into_force_chooses_by_rank_past_the_device_the_rules_had() {
+        let devices = [sink("hdmi", 2), sink("usb-dac", 2)];
+        let fresh = Preference {
+            start_over: true,
+            ..ranked(&["usb-dac", "hdmi"])
+        };
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["hdmi", "usb-dac"],
+            &on("hdmi"),
+            &fresh,
+        );
+        assert_eq!(selection.target, "usb-dac");
+        assert!(!selection.write_previous_default, "no arrival");
+        assert_eq!(
+            output(
+                &devices,
+                &["hdmi", "usb-dac"],
+                &on("hdmi"),
+                &ranked(&["usb-dac", "hdmi"])
+            ),
+            "hdmi",
+            "a ranking in force keeps the current device"
+        );
+        let memory = SelectionMemory {
+            user_selected: "hdmi".into(),
+            ..on("usb-dac")
+        };
+        let picked_now = Preference {
+            fresh_pick: true,
+            ..fresh
+        };
+        assert_eq!(
+            output(&devices, &["hdmi", "usb-dac"], &memory, &picked_now),
+            "hdmi",
+            "a fresh pick still comes first"
+        );
     }
 
     #[test]

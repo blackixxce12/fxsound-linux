@@ -19,6 +19,16 @@
 //! target never seen before gets the lower of what a new node has and what the lane was just
 //! playing at — the volume never goes *up* because a device changed.
 //!
+//! A real device is a node *and the port it is on*. On a card that is not UCM — a plain HDA card,
+//! most desktops and many laptops — the speakers and the headphones are two ports of one sink, and
+//! plugging headphones in only moves the sink's active route: no node comes or goes, and the pair
+//! is kept. Keyed by the node's name alone, the headphones got the speakers' level — #615 by
+//! another route. So an entry is kept per node and port ([`TargetVolume::port`], the name of the
+//! card's active route for the node, `crate::routes`), and when the lane's device moves to another
+//! port under a running pair the engine treats it as a change of device for the volume alone:
+//! remembered for the port it leaves, looked up — or never raised — for the one it moves to,
+//! written to the virtual node, and faded in from silence (`follow_port` in `crate::engine`).
+//!
 //! # From before 0.4.0
 //!
 //! Taking WirePlumber out is also what would have made the first 0.4.0 run the loudest one. 0.3.0
@@ -43,10 +53,14 @@
 //! (`channelmix.min-volume = channelmix.max-volume = 1.0`, honoured since PipeWire 0.3.72): the
 //! adapter still stores and publishes whatever a desktop writes — so every slider shows what it
 //! set — but multiplies by one, and the lane's DSP applies the node's volume itself, after the
-//! chain ([`LaneVolume::gains`]). The mute is applied by both, one on each side of the chain: the
-//! adapter's `mute` is not clamped, so a muted sink hands the chain silence, and the lane's gains
-//! are zero while the node is muted ([`NodeVolume::gains`]), so what the chain still makes of the
-//! moment before — a reverb tail, a delay line emptying — is silenced after it too.
+//! chain ([`LaneVolume::gains`]) — up to unity. What a volume above 100 % asks for beyond that is
+//! applied in front of the chain, where the adapter applied it before 0.4.0: after the chain it
+//! would have nothing behind it, and the chain's limiter could not stop it clipping
+//! (`crate::lane_dsp`, "Above unity, in front of the chain"). The mute is applied by both, one on
+//! each side of the chain: the adapter's `mute` is not clamped, so a muted sink hands the chain
+//! silence, and the lane's gains are zero while the node is muted ([`NodeVolume::gains`]), so what
+//! the chain still makes of the moment before — a reverb tail, a delay line emptying — is silenced
+//! after it too.
 //!
 //! An adapter that does not know the two keys — PipeWire before 0.3.72 — would apply the volume
 //! and so would the lane: twice. Its `Props` say which it is, since the adapter lists the keys it
@@ -79,6 +93,8 @@ pub(crate) const CHANNELS: usize = MAX_CHANNELS as usize;
 /// The loudest a channel's volume is applied at: the top of what the app remembers
 /// ([`limits::TARGET_VOLUME`], +12 dB), so a level that is applied is also a level that can be
 /// replayed. PipeWire's own ceiling is +20 dB, which only `pactl` and hand-written `Props` reach.
+/// Whatever of it lies above unity reaches the chain's input rather than its output
+/// (`crate::lane_dsp`), so the limiter at the chain's end has the last word on the peaks.
 const LOUDEST: f32 = *limits::TARGET_VOLUME.end();
 
 /// The adapter keys that clamp its volume range, and the value both are declared at.
@@ -153,6 +169,17 @@ impl NodeVolume {
             .collect()
     }
 
+    /// Whether `other` is the same volume as this one over `channels` channels: the same level on
+    /// every channel, as [`Self::effective`] has it, and the same mute.
+    ///
+    /// The level is compared as it is kept, not as it is heard. Two mutes at different levels
+    /// sound alike — [`Self::gains`] is silence for both — until the mute is lifted, and then they
+    /// do not: a node that was left muted at 0.9 and should be muted at 0.1 plays at 0.9 the
+    /// moment the mute key is pressed.
+    pub(crate) fn same_as(&self, other: &Self, channels: usize) -> bool {
+        self.mute == other.mute && self.effective(channels) == other.effective(channels)
+    }
+
     /// What the lane multiplies each channel by: [`Self::effective`], or silence while muted.
     /// Channels past `channels` are left at unity; the DSP never reaches them.
     pub(crate) fn gains(&self, channels: usize) -> [f32; CHANNELS] {
@@ -163,16 +190,19 @@ impl NodeVolume {
         gains
     }
 
-    /// The entry the app keeps for this volume on `target`.
+    /// The entry the app keeps for this volume on `target`'s port `port` (`None`: a device whose
+    /// card names no port).
     pub(crate) fn to_target(
         &self,
         direction: DeviceDirection,
         target: &str,
+        port: Option<&str>,
         channels: usize,
     ) -> Option<TargetVolume> {
         TargetVolume {
             direction,
             target: target.to_owned(),
+            port: port.unwrap_or_default().to_owned(),
             channel_volumes: self.effective(channels),
             mute: self.mute,
         }
@@ -565,6 +595,9 @@ pub(crate) struct LaneVolume {
     /// How many writes from outside have changed the volume: what the supervisor waits to hold
     /// still before it reports ([`Debounce`]).
     changes: AtomicU64,
+    /// How many times the main loop has asked the DSP to fade the running pair in again: the
+    /// target's port changed under it, and the volume with it (`follow_port` in `crate::engine`).
+    fades: AtomicU64,
 }
 
 impl LaneVolume {
@@ -578,6 +611,7 @@ impl LaneVolume {
             mute: AtomicBool::new(false),
             channels: AtomicUsize::new(crate::MIN_CHANNELS as usize),
             changes: AtomicU64::new(0),
+            fades: AtomicU64::new(0),
         };
         volume.store(&NodeVolume::default());
         volume
@@ -648,6 +682,22 @@ impl LaneVolume {
         self.changes.load(Ordering::Relaxed)
     }
 
+    /// Ask NODE 1's DSP to fade the running pair in again from silence, at the volume as it now
+    /// stands (`crate::lane_dsp`, `LaneDsp::fade_in`). Main loop.
+    ///
+    /// Asked after the volume it fades in to has been stored, and released, so that NODE 1, which
+    /// reads the count before the gains, never starts the fade on the gains from before.
+    pub(crate) fn request_fade(&self) {
+        self.fades.fetch_add(1, Ordering::Release);
+    }
+
+    /// How many fades have been asked for: NODE 1 starts one when this has moved since it last
+    /// looked. One atomic load, acquiring what [`Self::request_fade`] released; real-time safe.
+    #[inline]
+    pub(crate) fn fades(&self) -> u64 {
+        self.fades.load(Ordering::Acquire)
+    }
+
     /// Whether the lane applies the volume after its chain: as long as the node's adapter keeps
     /// its own at unity ([`PropsUpdate::clamped`]).
     pub(crate) fn set_post_dsp(&self, post_dsp: bool) {
@@ -658,9 +708,9 @@ impl LaneVolume {
         self.post_dsp.load(Ordering::Relaxed)
     }
 
-    /// What NODE 1's DSP multiplies each channel by, after its chain: the node's volume, or unity
-    /// when the adapter applies it instead. Real-time safe — nine atomic loads into an array on
-    /// the stack.
+    /// What NODE 1's DSP multiplies each channel by — the part up to unity after its chain, the
+    /// rest in front of it (`crate::lane_dsp`): the node's volume, or unity when the adapter
+    /// applies it instead. Real-time safe — nine atomic loads into an array on the stack.
     #[inline]
     pub(crate) fn gains(&self) -> [f32; CHANNELS] {
         if !self.post_dsp.load(Ordering::Relaxed) {
@@ -741,6 +791,7 @@ mod tests {
         TargetVolume {
             direction,
             target: target.to_owned(),
+            port: String::new(),
             channel_volumes: volumes.to_vec(),
             mute: false,
         }
@@ -755,6 +806,36 @@ mod tests {
     }
 
     // ---- reading Props
+
+    #[test]
+    fn two_mutes_at_different_levels_are_not_the_same_volume() {
+        let quiet = NodeVolume {
+            volume: 1.0,
+            channel_volumes: vec![0.1, 0.1],
+            mute: true,
+        };
+        let loud = NodeVolume {
+            channel_volumes: vec![0.9, 0.9],
+            ..quiet.clone()
+        };
+        assert_eq!(quiet.gains(2), loud.gains(2), "both silent while muted");
+        assert!(!quiet.same_as(&loud, 2), "but not once the mute is lifted");
+        assert!(quiet.same_as(&quiet.clone(), 2));
+        let unmuted = NodeVolume {
+            mute: false,
+            ..quiet.clone()
+        };
+        assert!(!quiet.same_as(&unmuted, 2), "the mute counts too");
+        let scaled = NodeVolume {
+            volume: 0.5,
+            channel_volumes: vec![0.2, 0.2],
+            ..quiet.clone()
+        };
+        assert!(
+            quiet.same_as(&scaled, 2),
+            "the master scalar is folded in, as the lane applies it"
+        );
+    }
 
     #[test]
     fn a_sliders_write_is_read_as_channel_volumes_alone() {

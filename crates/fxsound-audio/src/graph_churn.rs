@@ -3536,6 +3536,145 @@ fn a_headset_between_profiles_keeps_the_output_lane_and_its_sink_is_linked_again
 }
 
 #[test]
+fn a_headset_back_from_a_profile_switch_takes_nothing_from_the_speakers_the_user_picked() {
+    // The headset is ranked above the speakers, but the user picked the speakers: the lane is on
+    // them, not on the headset, and holds no wait for it.
+    let belongs = |card: &CardHolder| format!("device.id = {}", card.id);
+    let Some((graph, card, handle, mut said)) = engine_on_a_headset("notnew", &belongs) else {
+        return;
+    };
+    handle.send(rank(DeviceDirection::Output, &[HEADSET, "t_stereo"]));
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_stereo".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    said.settle(&handle);
+    let from = said.0.len();
+
+    // Something records from its microphone: the headset switches profile, its sink goes while
+    // its card stays, and comes back under the same name after the rules have run without it.
+    assert!(graph.remove_node(HEADSET).is_some(), "the sink never went");
+    std::thread::sleep(3 * crate::engine::SUPERVISOR_PERIOD);
+    assert!(
+        graph.add_card_sink(HEADSET, &belongs(&card)).is_some(),
+        "the headset's sink never came back on its card"
+    );
+    said.settle(&handle);
+    said.settle(&handle);
+    assert_eq!(
+        output_moves_since(&said, from),
+        [],
+        "a sink back from a profile switch is no device just plugged in, ranked first or not"
+    );
+    drop(card);
+    handle.shutdown();
+}
+
+#[test]
+fn a_sink_its_card_brings_back_under_another_name_ends_the_wait_at_once() {
+    let belongs = |card: &CardHolder| format!("device.id = {}", card.id);
+    let Some((graph, card, handle, mut said)) = engine_on_a_headset("rename", &belongs) else {
+        return;
+    };
+    const RENAMED: &str = "t_headset_renamed";
+    // A card switched to another profile whose sink has another name: the old one never returns.
+    assert!(graph.remove_node(HEADSET).is_some(), "the sink never went");
+    assert!(
+        graph.add_card_sink(RENAMED, &belongs(&card)).is_some(),
+        "the renamed sink never appeared on the card"
+    );
+    let renamed_at = Instant::now();
+    assert!(
+        said.attached(&handle, DeviceDirection::Output, Some(RENAMED)),
+        "the output lane never went to the renamed sink"
+    );
+    let waited = renamed_at.elapsed();
+    assert!(
+        waited < crate::engine::RETURN_WAIT,
+        "the lane sat on an unlinked stream for {waited:?}, waiting for a name that never returns"
+    );
+    drop(card);
+    handle.shutdown();
+}
+
+#[test]
+fn a_ranking_handed_over_at_start_makes_the_first_choice_of_output() {
+    let Some(graph) = PrivateGraph::start("rankstart") else {
+        return;
+    };
+    if !installed("pw-cli") {
+        skip("pw-cli is not available, so rankstart cannot run");
+        return;
+    }
+    assert!(
+        graph.add_device("t_low", DeviceDirection::Output).is_some(),
+        "t_low never appeared"
+    );
+    let handle = AudioEngine::start_for_tests(
+        Some(&graph.remote()),
+        StartOptions {
+            output_priority: DevicePriority {
+                names: vec!["t_low".to_owned(), "t_stereo".to_owned()],
+                new_devices_first: false,
+            },
+            ..StartOptions::default()
+        },
+        None,
+    )
+    .expect("the engine should start");
+    let mut said = Transcript::default();
+    assert!(
+        said.attached(&handle, DeviceDirection::Output, Some("t_low")),
+        "the first output is the ranking's first, not the graph's"
+    );
+    said.settle(&handle);
+    assert_eq!(
+        said.attachments(DeviceDirection::Output),
+        [Some("t_low".to_owned())],
+        "and it was the first choice, not a move after one made without the ranking"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn a_device_plugged_in_takes_the_lane_while_the_app_puts_new_devices_first() {
+    let Some(graph) = PrivateGraph::start("newfirst") else {
+        return;
+    };
+    if !installed("pw-cli") {
+        skip("pw-cli is not available, so newfirst cannot run");
+        return;
+    }
+    let handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    // Every output there is, ranked, as the app's list has them: a device the list does not name
+    // is one it has not seen yet, and goes first.
+    handle.send(UiToAudio::SetDevicePriority {
+        direction: DeviceDirection::Output,
+        names: vec!["t_stereo".to_owned(), "t_71".to_owned()],
+        new_devices_first: true,
+    });
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_stereo".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    said.settle(&handle);
+    // Plugged in: the rules run on it before the app has put it at the top of its list.
+    assert!(
+        graph.add_device("t_dac", DeviceDirection::Output).is_some(),
+        "t_dac never appeared"
+    );
+    assert!(
+        said.attached(&handle, DeviceDirection::Output, Some("t_dac")),
+        "a device plugged in goes first, as the app is about to rank it"
+    );
+    handle.shutdown();
+}
+
+#[test]
 fn a_headset_that_goes_for_good_is_given_up_once_the_lane_has_waited_for_it() {
     // Tied to its card by its Bluetooth address alone: the other way the engine asks.
     let Some((graph, card, handle, mut said)) = engine_on_a_headset("gone", &|_| {
@@ -3890,6 +4029,7 @@ fn rank(direction: DeviceDirection, names: &[&str]) -> UiToAudio {
     UiToAudio::SetDevicePriority {
         direction,
         names: names.iter().map(|&name| name.to_owned()).collect(),
+        new_devices_first: false,
     }
 }
 
