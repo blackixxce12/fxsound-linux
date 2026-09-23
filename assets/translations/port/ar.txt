@@ -88,6 +88,7 @@ countries: EG sa
 "Output Presets" = "قوالب الإخراج"
 "Input Presets" = "قوالب الإدخال"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "استخدام ميكروفون سماعة الرأس هذه يحوّلها إلى جودة المكالمات: تُشغَّل الموسيقى بصوت أحادي بتردد 16 kHz"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "يبقى %s على الإعداد المسبق لـ FxSound: لا يمكن تشغيل أكثر من %s إعدادات مسبقة للتطبيقات في آن واحد"
 "No playback devices are present" = "لا توجد أجهزة تشغيل"
 "No microphones are present" = "لا توجد ميكروفونات"
 "The selected device is not present" = "الجهاز المحدد غير موجود"

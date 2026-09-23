@@ -88,6 +88,7 @@ countries: vn
 "Output Presets" = "Preset đầu ra"
 "Input Presets" = "Preset đầu vào"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "Dùng micrô của tai nghe này sẽ chuyển nó sang chất lượng cuộc gọi: nhạc phát đơn âm ở 16 kHz"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s vẫn dùng preset của FxSound: chỉ có thể chạy tối đa %s preset ứng dụng cùng lúc"
 "No playback devices are present" = "Không có thiết bị phát"
 "No microphones are present" = "Không có micrô"
 "The selected device is not present" = "Không tìm thấy thiết bị đã chọn"

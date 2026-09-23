@@ -87,6 +87,7 @@ countries: fi
 "Output Presets" = "Ulostulon esiasetukset"
 "Input Presets" = "Sisääntulon esiasetukset"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "Tämän kuulokemikrofonin mikrofonin käyttö vaihtaa sen puhelulaatuun: musiikki soi monona 16 kHz:n taajuudella"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s pysyy FxSoundin esiasetuksessa: enintään %s sovellusten esiasetusta voi olla käytössä yhtä aikaa"
 "No playback devices are present" = "Toistolaitteita ei ole"
 "No microphones are present" = "Mikrofoneja ei ole"
 "The selected device is not present" = "Valittua laitetta ei ole"

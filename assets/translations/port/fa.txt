@@ -89,6 +89,7 @@ countries: ir
 "Output Presets" = "پیش‌تنظیم‌های خروجی"
 "Input Presets" = "پیش‌تنظیم‌های ورودی"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "استفاده از میکروفون این هدست آن را به کیفیت تماس می‌برد: موسیقی به‌صورت مونو با 16 kHz پخش می‌شود"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s روی پیش‌تنظیم FxSound می‌ماند: حداکثر %s پیش‌تنظیم برنامه می‌توانند هم‌زمان اجرا شوند"
 "No playback devices are present" = "هیچ دستگاه پخشی وجود ندارد"
 "No microphones are present" = "هیچ میکروفونی وجود ندارد"
 "The selected device is not present" = "دستگاه انتخاب‌شده وجود ندارد"

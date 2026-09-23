@@ -88,6 +88,7 @@ countries: ru
 "Output Presets" = "Шаблоны вывода"
 "Input Presets" = "Шаблоны ввода"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "Если использовать микрофон этой гарнитуры, она переходит в режим звонка: музыка звучит в моно с частотой 16 кГц"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s остаётся на пресете FxSound: одновременно может работать не более %s пресетов приложений"
 "No playback devices are present" = "Нет устройств воспроизведения"
 "No microphones are present" = "Нет микрофонов"
 "The selected device is not present" = "Выбранное устройство отсутствует"

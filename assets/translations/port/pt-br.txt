@@ -89,6 +89,7 @@ countries: br
 "Output Presets" = "Predefinições de saída"
 "Input Presets" = "Predefinições de entrada"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "Usar o microfone deste headset o coloca em qualidade de chamada: a música toca em mono a 16 kHz"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s continua no preset do FxSound: no máximo %s presets de aplicativos podem funcionar ao mesmo tempo"
 "No playback devices are present" = "Nenhum dispositivo de reprodução presente"
 "No microphones are present" = "Nenhum microfone presente"
 "The selected device is not present" = "O dispositivo selecionado não está presente"

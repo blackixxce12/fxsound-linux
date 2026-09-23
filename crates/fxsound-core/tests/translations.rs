@@ -29,9 +29,10 @@ use fxsound_core::{
 /// The crates that draw text, relative to this one. Everything else passes strings *to* them.
 const DRAWING_CRATES: [&str; 2] = ["../fxsound-ui/src", "../fxsound-app/src"];
 
-/// Crates that draw nothing but translate text the window shows: the audio engine, whose warning
-/// about one Bluetooth headset on both lanes (`ONE_HEADSET_ON_BOTH_LANES`) is looked up on the
-/// audio thread and arrives translated. Their calls to `tr` and their string constants are read as
+/// Crates that draw nothing but translate text the window shows: the audio engine, whose warnings
+/// about one Bluetooth headset on both lanes (`ONE_HEADSET_ON_BOTH_LANES`) and about an
+/// application left on its lane's preset (`TOO_MANY_APPLICATION_PRESETS`) are looked up on the
+/// audio thread and arrive translated. Their calls to `tr` and their string constants are read as
 /// the drawing crates' are; their string tables are node names, not keys, and are left alone.
 const TRANSLATING_CRATES: [&str; 1] = ["../fxsound-audio/src"];
 
@@ -631,6 +632,24 @@ fn the_audio_engines_warning_about_one_headset_on_both_lanes_is_among_the_keys_a
     assert!(
         !keys.contains("fxsound_sink"),
         "a node name from the audio crate's tables is not a key"
+    );
+}
+
+#[test]
+fn the_audio_engines_warning_about_too_many_application_presets_is_among_the_keys_audited() {
+    // Formatted on the audio thread (`fxsound-audio`, `TOO_MANY_APPLICATION_PRESETS`, through
+    // `tr_args`) when an application's preset cannot get a route of its own, and shown by the
+    // window as it arrives: its key has two placeholders — the application, then the most
+    // presets a lane runs for applications — which every translation has to keep.
+    let keys = scan().keys;
+    let key = "%s stays on FxSound's preset: at most %s application presets can run at once";
+    assert!(
+        keys.contains(key),
+        "the scan does not see the audio crate's call to tr_args"
+    );
+    assert_all_translated(
+        "application preset warnings",
+        &untranslated(&tables(), [key]),
     );
 }
 

@@ -89,6 +89,7 @@ countries: sl
 "Output Presets" = "Prednastavitve izhoda"
 "Input Presets" = "Prednastavitve vhoda"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "Uporaba mikrofona teh slušalk jih preklopi na kakovost klica: glasba se predvaja mono pri 16 kHz"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s ostane na prednastavitvi FxSound: hkrati lahko deluje največ %s prednastavitev aplikacij"
 "No playback devices are present" = "Ni naprav za predvajanje"
 "No microphones are present" = "Ni mikrofonov"
 "The selected device is not present" = "Izbrana naprava ni prisotna"

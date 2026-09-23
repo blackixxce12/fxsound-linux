@@ -92,6 +92,7 @@ countries: no
 "Output Presets" = "Forhåndsinnstillinger for utgang"
 "Input Presets" = "Forhåndsinnstillinger for inngang"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "Bruker du mikrofonen på dette hodesettet, bytter det til samtalekvalitet: musikk spilles i mono ved 16 kHz"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s blir værende på FxSounds forhåndsinnstilling: høyst %s forhåndsinnstillinger for programmer kan kjøre samtidig"
 "No playback devices are present" = "Ingen avspillingsenheter er til stede"
 "No microphones are present" = "Ingen mikrofoner er til stede"
 "The selected device is not present" = "Den valgte enheten er ikke til stede"

@@ -87,6 +87,7 @@ countries: cz
 "Output Presets" = "Předvolby výstupu"
 "Input Presets" = "Předvolby vstupu"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "Použití mikrofonu těchto sluchátek je přepne do kvality hovoru: hudba hraje mono při 16 kHz"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s zůstává na presetu FxSound: současně může běžet nejvýše %s presetů aplikací"
 "No playback devices are present" = "Nejsou k dispozici žádná přehrávací zařízení"
 "No microphones are present" = "Nejsou k dispozici žádné mikrofony"
 "The selected device is not present" = "Vybrané zařízení není k dispozici"

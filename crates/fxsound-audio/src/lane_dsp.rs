@@ -78,10 +78,10 @@
 
 use crossbeam_channel::{Receiver, Sender};
 use fxsound_core::DeviceDirection;
-use fxsound_core::messages::{DspEvent, DspParams, InputDspParams, Meters};
+use fxsound_core::messages::{DspEvent, DspParams, InputDspParams, Meters, RouteParams};
 use fxsound_dsp::Engine as DspEngine;
 use fxsound_dsp::{ChainSpec, InputEngine};
-use triple_buffer::{Input, Output};
+use triple_buffer::{Input, Output, TripleBuffer};
 
 use crate::per_direction::PerDirection;
 use crate::volume::CHANNELS;
@@ -319,6 +319,86 @@ pub(crate) fn build(
         )),
     };
     (dsp, handover)
+}
+
+/// The main loop's end of a per-application route's parameters (`docs/0.4.0-apps.md`): the
+/// writing half of the route's own triple buffer, whose reading half is in the route's
+/// [`LaneDsp`]. The engine keeps it for as long as the route lives, and writes a preset's new
+/// parameters through it when a later [`UiToAudio::SetAppRoutes`] brings them — on the main loop,
+/// wait-free, never on the audio thread.
+///
+/// [`UiToAudio::SetAppRoutes`]: fxsound_core::messages::UiToAudio::SetAppRoutes
+pub(crate) enum RouteParamsWriter {
+    Output(Input<DspParams>),
+    Input(Input<InputDspParams>),
+}
+
+impl RouteParamsWriter {
+    /// Publish `params` to the route's chain. Refused, and `false`, when they are for the other
+    /// lane's chain: a route built for one direction never runs the other's snapshot.
+    pub(crate) fn write(&mut self, params: RouteParams) -> bool {
+        match (self, params) {
+            (Self::Output(input), RouteParams::Output(params)) => {
+                input.write(params);
+                true
+            }
+            (Self::Input(input), RouteParams::Input(params)) => {
+                input.write(params);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// How many events a route's queue holds ([`route`]). A route is only ever sent the wake's
+/// [`DspEvent::ResetFilterState`], which is the same event however many of it wait: one slot, and
+/// a full one means a reset is already waiting for the route's next block.
+pub(crate) const ROUTE_EVENT_QUEUE_LEN: usize = 1;
+
+/// The DSP of a per-application route (`docs/0.4.0-apps.md`), built on the main loop from the
+/// route's preset: the lane's chain for `params`' direction, reading its parameters from a triple
+/// buffer of its own whose writing half comes back with it, and — for an input route — running the
+/// voice chain `spec`, with the main loop's ends of its own hand-over for a later change of chain.
+/// The sending end of its event queue comes back with it too.
+///
+/// A route is not a lane the GUI addresses: nothing reads its meters, so they go into a buffer
+/// nobody reads, and the GUI sends it no events. The engine does: the wake's reset
+/// ([`ROUTE_EVENT_QUEUE_LEN`]), so a routed application's filters, leveller and denoiser forget
+/// the world from before a suspend with its lane's (`crate::engine`, "Sleep"). Every end is real,
+/// so the holder is the lanes' own and the process callback cannot tell a route from a lane. The
+/// parameters are sanitised by the caller ([`crate::app_routes::Rules`]), as the GUI's are by
+/// [`crate::EngineHandle`].
+pub(crate) fn route(
+    params: RouteParams,
+    spec: ChainSpec,
+) -> (
+    LaneDsp,
+    RouteParamsWriter,
+    Option<ChainHandover>,
+    Sender<DspEvent>,
+) {
+    let (meters, _) = TripleBuffer::new(&Meters::default()).split();
+    let (sender, events) = crossbeam_channel::bounded(ROUTE_EVENT_QUEUE_LEN);
+    match params {
+        RouteParams::Output(params) => {
+            let (writer, reader) = TripleBuffer::new(&params).split();
+            let dsp = LaneDsp::Output(OutputDsp::new(reader, meters, events));
+            (dsp, RouteParamsWriter::Output(writer), None, sender)
+        }
+        RouteParams::Input(params) => {
+            let (writer, reader) = TripleBuffer::new(&params).split();
+            let (handover, replacement, retired) = ChainHandover::new();
+            let mut dsp = InputDsp::new(reader, meters, events, replacement, retired);
+            dsp.set_spec(spec);
+            (
+                LaneDsp::Input(dsp),
+                RouteParamsWriter::Input(writer),
+                Some(handover),
+                sender,
+            )
+        }
+    }
 }
 
 /// The output lane's DSP: the music chain and the paths that address it.
@@ -1184,7 +1264,7 @@ pub(crate) mod tests {
     }
 
     /// One block through a lane, as the callback runs it: refresh, then process.
-    fn run_block(dsp: &mut LaneDsp, block_index: usize) -> Vec<f32> {
+    pub(crate) fn run_block(dsp: &mut LaneDsp, block_index: usize) -> Vec<f32> {
         dsp.refresh();
         dsp.process_bytes(&tone_block(block_index), 2)
             .expect("a block that fits")
@@ -1197,7 +1277,7 @@ pub(crate) mod tests {
 
     /// A snapshot of the music chain with state that remembers: a boosted band, the leveller, and
     /// every effect up — so a chain that stopped while muted would come back different.
-    fn busy_output_params(mute: bool) -> DspParams {
+    pub(crate) fn busy_output_params(mute: bool) -> DspParams {
         let mut params = DspParams {
             mute,
             effects: [0.6; fxsound_core::Effect::COUNT],
@@ -1878,5 +1958,192 @@ pub(crate) mod tests {
                 "at the new volume once the fade is over, not ramped from the old"
             );
         }
+    }
+
+    // ---- per-application routes -----------------------------------------------------------
+
+    #[test]
+    fn a_route_runs_its_own_parameters_through_the_lanes_chain() {
+        let (mut dsp, mut writer, handover, _) = route(
+            RouteParams::Output(busy_output_params(false)),
+            ChainSpec::voice(),
+        );
+        assert_eq!(dsp.direction(), DeviceDirection::Output);
+        assert!(
+            handover.is_none(),
+            "an output route has no voice chain to hand over"
+        );
+        dsp.set_format(48_000.0, 2);
+        assert!(!is_silent(&run_block(&mut dsp, 0)));
+
+        // The engine writes a later preset's parameters on the main loop; the next block runs them.
+        assert!(writer.write(RouteParams::Output(busy_output_params(true))));
+        assert!(is_silent(&run_block(&mut dsp, 1)));
+        assert!(
+            !writer.write(RouteParams::Input(InputDspParams::default())),
+            "the other lane's snapshot is refused"
+        );
+        assert!(is_silent(&run_block(&mut dsp, 2)), "and changed nothing");
+        assert!(writer.write(RouteParams::Output(busy_output_params(false))));
+        assert!(!is_silent(&run_block(&mut dsp, 3)));
+    }
+
+    #[test]
+    fn an_input_route_runs_the_chain_its_preset_names_and_takes_a_new_one_over_its_own_handover() {
+        let (mut dsp, mut writer, handover, _) = route(
+            RouteParams::Input(InputDspParams::default()),
+            ChainSpec::podcast(),
+        );
+        assert_eq!(dsp.direction(), DeviceDirection::Input);
+        let handover = handover.expect("an input route hands its chain over");
+        assert_eq!(
+            dsp.as_input_mut().expect("the voice chain").engine().spec(),
+            ChainSpec::podcast()
+        );
+        assert!(!writer.write(RouteParams::Output(DspParams::default())));
+        assert!(writer.write(RouteParams::Input(InputDspParams::default())));
+
+        // Running on the audio thread, the route adopts a chain built on the main loop, and sends
+        // the one it displaces back to be dropped there.
+        dsp.set_format(48_000.0, 2);
+        handover
+            .replacement
+            .try_send(voice_engine(ChainSpec::broadcast()))
+            .expect("room for one replacement");
+        run_block(&mut dsp, 0);
+        assert_eq!(
+            dsp.as_input_mut().expect("the voice chain").engine().spec(),
+            ChainSpec::broadcast()
+        );
+        assert!(
+            handover.retired.try_recv().is_ok(),
+            "the podcast chain came back"
+        );
+    }
+
+    /// The largest difference between two blocks, sample by sample.
+    pub(crate) fn largest_difference(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn a_route_forgets_its_history_through_the_queue_it_hands_back() {
+        // Two routes of one preset fed the same programme for a while, and a third built only
+        // now. The reset reaches the chain of the route it was sent to, on its next block, and
+        // leaves it where the new one starts; the other route remembers.
+        let build = || {
+            route(
+                RouteParams::Output(busy_output_params(false)),
+                ChainSpec::voice(),
+            )
+        };
+        let (mut reset, _, _, events) = build();
+        let (mut kept, _, _, _kept_events) = build();
+        let (mut fresh, _, _, _fresh_events) = build();
+        for dsp in [&mut reset, &mut kept, &mut fresh] {
+            dsp.set_format(48_000.0, 2);
+        }
+        for index in 0..40 {
+            run_block(&mut reset, index);
+            run_block(&mut kept, index);
+        }
+
+        events
+            .try_send(DspEvent::ResetFilterState)
+            .expect("room for the reset");
+        let after_reset = run_block(&mut reset, 40);
+        assert!(events.is_empty(), "taken on the block");
+        let remembered = run_block(&mut kept, 40);
+        let from_fresh = run_block(&mut fresh, 40);
+        assert!(
+            largest_difference(&remembered, &from_fresh) > 1e-3,
+            "the history is there to be cleared: {}",
+            largest_difference(&remembered, &from_fresh)
+        );
+        assert!(
+            largest_difference(&after_reset, &from_fresh) < 1e-6,
+            "{}",
+            largest_difference(&after_reset, &from_fresh)
+        );
+    }
+
+    #[test]
+    fn an_input_routes_voice_chain_forgets_its_history_through_its_queue_too() {
+        let build = || {
+            route(
+                RouteParams::Input(InputDspParams::default()),
+                ChainSpec::voice(),
+            )
+        };
+        let (mut reset, _, _, events) = build();
+        let (mut kept, _, _, _kept_events) = build();
+        let (mut fresh, _, _, _fresh_events) = build();
+        for dsp in [&mut reset, &mut kept, &mut fresh] {
+            dsp.set_format(48_000.0, 2);
+        }
+        for index in 0..40 {
+            run_block(&mut reset, index);
+            run_block(&mut kept, index);
+        }
+        events
+            .try_send(DspEvent::ResetFilterState)
+            .expect("room for the reset");
+        let after_reset = run_block(&mut reset, 40);
+        assert!(events.is_empty(), "taken on the block");
+        let remembered = run_block(&mut kept, 40);
+        let from_fresh = run_block(&mut fresh, 40);
+        assert!(
+            largest_difference(&remembered, &from_fresh) > 1e-3,
+            "the history is there to be cleared: {}",
+            largest_difference(&remembered, &from_fresh)
+        );
+        assert!(
+            largest_difference(&after_reset, &from_fresh) < 1e-6,
+            "{}",
+            largest_difference(&after_reset, &from_fresh)
+        );
+    }
+
+    #[test]
+    fn a_routes_queue_holds_one_reset_and_a_second_changes_nothing() {
+        let (mut dsp, _, _, events) = route(
+            RouteParams::Output(DspParams::default()),
+            ChainSpec::voice(),
+        );
+        assert_eq!(events.capacity(), Some(ROUTE_EVENT_QUEUE_LEN));
+        events
+            .try_send(DspEvent::ResetFilterState)
+            .expect("room for one");
+        assert!(
+            events.try_send(DspEvent::ResetFilterState).is_err(),
+            "full: the one waiting does the same"
+        );
+        dsp.drain_events();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn a_routes_paths_are_its_own_and_touch_no_lanes() {
+        // Two routes of one lane, and the lane itself: a snapshot written to one route reaches
+        // that route alone.
+        let mut w = wired();
+        let (mut first, mut first_writer, _, _) = route(
+            RouteParams::Output(busy_output_params(false)),
+            ChainSpec::voice(),
+        );
+        let (mut second, _, _, _) = route(
+            RouteParams::Output(busy_output_params(false)),
+            ChainSpec::voice(),
+        );
+        first.set_format(48_000.0, 2);
+        second.set_format(48_000.0, 2);
+        first_writer.write(RouteParams::Output(busy_output_params(true)));
+        assert!(is_silent(&run_block(&mut first, 0)));
+        assert!(!is_silent(&run_block(&mut second, 0)));
+        assert!(!is_silent(&run_block(&mut w.lanes.output, 0)));
     }
 }

@@ -89,6 +89,7 @@ countries: ro
 "Output Presets" = "Presetări de ieșire"
 "Input Presets" = "Presetări de intrare"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "Folosirea microfonului acestor căști le trece pe calitate de apel: muzica se aude mono la 16 kHz"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s rămâne pe presetul FxSound: cel mult %s preseturi de aplicații pot rula în același timp"
 "No playback devices are present" = "Nu există dispozitive de redare"
 "No microphones are present" = "Nu există microfoane"
 "The selected device is not present" = "Dispozitivul selectat nu este prezent"

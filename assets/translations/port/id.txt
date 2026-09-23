@@ -88,6 +88,7 @@ countries: id
 "Output Presets" = "Preset keluaran"
 "Input Presets" = "Preset masukan"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "Menggunakan mikrofon headset ini mengalihkannya ke kualitas panggilan: musik diputar mono pada 16 kHz"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s tetap memakai preset FxSound: paling banyak %s preset aplikasi dapat berjalan bersamaan"
 "No playback devices are present" = "Tidak ada perangkat pemutaran"
 "No microphones are present" = "Tidak ada mikrofon"
 "The selected device is not present" = "Perangkat yang dipilih tidak ada"

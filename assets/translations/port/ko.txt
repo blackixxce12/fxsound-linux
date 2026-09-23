@@ -87,6 +87,7 @@ countries: kr
 "Output Presets" = "출력 프리셋"
 "Input Presets" = "입력 프리셋"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "이 헤드셋의 마이크를 사용하면 통화 품질로 전환됩니다: 음악이 16 kHz 모노로 재생됩니다"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s은(는) FxSound 프리셋을 유지합니다: 앱 프리셋은 한 번에 최대 %s개까지 실행할 수 있습니다"
 "No playback devices are present" = "재생 장치가 없습니다"
 "No microphones are present" = "마이크가 없습니다"
 "The selected device is not present" = "선택한 장치가 없습니다"

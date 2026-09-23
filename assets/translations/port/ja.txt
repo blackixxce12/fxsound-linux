@@ -87,6 +87,7 @@ countries: ja
 "Output Presets" = "出力プリセット"
 "Input Presets" = "入力プリセット"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "このヘッドセットのマイクを使うと通話品質に切り替わります：音楽は 16 kHz のモノラルで再生されます"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s は FxSound のプリセットのままです：同時に使えるアプリのプリセットは最大 %s 個です"
 "No playback devices are present" = "再生デバイスがありません"
 "No microphones are present" = "マイクがありません"
 "The selected device is not present" = "選択したデバイスが見つかりません"

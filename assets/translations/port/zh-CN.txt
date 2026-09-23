@@ -87,6 +87,7 @@ countries: cn sg
 "Output Presets" = "输出预设"
 "Input Presets" = "输入预设"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "使用此耳机的麦克风会将其切换到通话音质：音乐将以 16 kHz 单声道播放"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s 继续使用 FxSound 的预设：同时最多只能运行 %s 个应用预设"
 "No playback devices are present" = "没有播放设备"
 "No microphones are present" = "没有麦克风"
 "The selected device is not present" = "所选设备不存在"

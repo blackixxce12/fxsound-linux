@@ -87,6 +87,7 @@ countries: tr
 "Output Presets" = "Çıkış ön ayarları"
 "Input Presets" = "Giriş ön ayarları"
 "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz" = "Bu kulaklığın mikrofonunu kullanmak onu arama kalitesine geçirir: müzik 16 kHz'de mono çalar"
+"%s stays on FxSound's preset: at most %s application presets can run at once" = "%s, FxSound'un ön ayarında kalıyor: aynı anda en fazla %s uygulama ön ayarı çalışabilir"
 "No playback devices are present" = "Çalma aygıtı yok"
 "No microphones are present" = "Mikrofon yok"
 "The selected device is not present" = "Seçilen aygıt mevcut değil"
