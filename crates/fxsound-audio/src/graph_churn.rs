@@ -3405,6 +3405,173 @@ fn speakers_on_no_card_that_go_are_replaced_at_once() {
     handle.shutdown();
 }
 
+/// WirePlumber 0.5's microphone for the test headset: the loopback it puts in front of the
+/// headset's SCO source, named by the address with its colons (`create-loopback-node.lua:45`).
+const LOOPBACK: &str = "bluez_input.00:11:22:33:44:55";
+/// The SCO source behind it, which WirePlumber 0.5 marks `api.bluez5.internal`
+/// (`create-node.lua:31-36`).
+const SCO_SOURCE: &str = "bluez_input.00_11_22_33_44_55.0";
+/// Another headset's microphone as WirePlumber 0.4 lists it: the SCO source itself, on no card
+/// this graph has, so only its info can say it is a headset's.
+const WP04_MICROPHONE: &str = "bluez_input.66_77_88_99_AA_BB.0";
+
+/// The last device list the engine sent, as `(node.name, form factor)`.
+fn last_device_list(said: &Transcript) -> Vec<(String, String)> {
+    said.0
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AudioToUi::Devices(devices) => Some(
+                devices
+                    .iter()
+                    .map(|d| (d.name.clone(), d.form_factor.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// How many warnings the engine has sent so far.
+fn warnings_heard(said: &Transcript) -> usize {
+    said.0
+        .iter()
+        .filter(|message| matches!(message, AudioToUi::Warning { .. }))
+        .count()
+}
+
+#[test]
+fn a_headsets_microphone_from_either_wireplumber_is_offered_as_a_headset_and_warned_about_once() {
+    // The headset's sink as the bluez5 plugin names it in A2DP; its microphone and the SCO source
+    // behind it follow.
+    let belongs = |card: &CardHolder| {
+        format!(
+            "device.id = {} api.bluez5.address = \"{HEADSET_ADDRESS}\" \
+             api.bluez5.profile = a2dp-sink api.bluez5.codec = sbc",
+            card.id
+        )
+    };
+    let Some((graph, card, handle, mut said)) = engine_on_a_headset("u9", &belongs) else {
+        return;
+    };
+    let source = |name: &str, props: &str| {
+        graph.add_adapter(
+            name,
+            &format!(
+                "factory.name = support.null-audio-sink node.name = \"{name}\" \
+                 node.description = \"Test Headset\" media.class = Audio/Source \
+                 priority.driver = 2010 priority.session = 2010 audio.channels = 1 \
+                 audio.position = [ MONO ] {props}"
+            ),
+        )
+    };
+    // As `create-loopback-node.lua:44-55` makes it: `bluez5.loopback`, the card, no address.
+    assert!(
+        source(
+            LOOPBACK,
+            &format!("bluez5.loopback = true device.id = {}", card.id)
+        )
+        .is_some(),
+        "the loopback microphone never appeared"
+    );
+    assert!(
+        source(
+            SCO_SOURCE,
+            &format!(
+                "device.id = {} api.bluez5.address = \"{HEADSET_ADDRESS}\" \
+                 api.bluez5.profile = headset-head-unit api.bluez5.codec = msbc \
+                 api.bluez5.internal = true bluez5.loopback = false",
+                card.id
+            )
+        )
+        .is_some(),
+        "the SCO source never appeared"
+    );
+    assert!(
+        source(
+            WP04_MICROPHONE,
+            "api.bluez5.address = \"66:77:88:99:AA:BB\" \
+             api.bluez5.profile = headset-head-unit api.bluez5.codec = cvsd"
+        )
+        .is_some(),
+        "the other headset's microphone never appeared"
+    );
+
+    // The registry announces none of what makes these headsets' microphones; their info does.
+    let headsets = |list: &[(String, String)]| {
+        [LOOPBACK, WP04_MICROPHONE].iter().all(|name| {
+            list.iter()
+                .any(|(listed, form)| listed == name && form == "headset")
+        })
+    };
+    assert!(
+        said.until(&handle, "both microphones listed as headsets", |m| {
+            matches!(m, AudioToUi::Devices(d) if headsets(
+                &d.iter().map(|d| (d.name.clone(), d.form_factor.clone())).collect::<Vec<_>>()
+            ))
+        }),
+        "the microphones were never offered as headsets: {:?}",
+        last_device_list(&said)
+    );
+    said.settle(&handle);
+    let list = last_device_list(&said);
+    assert!(headsets(&list), "{list:?}");
+    assert!(
+        !list.iter().any(|(name, _)| name == SCO_SOURCE),
+        "WirePlumber's internal SCO source was offered as a microphone: {list:?}"
+    );
+    assert!(
+        list.iter()
+            .any(|(name, form)| name == HEADSET && form == "headphone"),
+        "the headset's sink in A2DP is a pair of headphones: {list:?}"
+    );
+    assert_eq!(warnings_heard(&said), 0, "one lane is not both");
+
+    // The user takes the headset's microphone for the input lane, the music on the headset.
+    handle.send(UiToAudio::SelectDevice {
+        node_name: LOOPBACK.to_owned(),
+        direction: DeviceDirection::Input,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Input, Some(LOOPBACK)));
+    assert_eq!(
+        graph
+            .node_prop(CAPTURE_NODE_NAME, "target.object")
+            .flatten(),
+        Some(LOOPBACK.to_owned()),
+        "the capture stream records from the loopback, not from the SCO source behind it"
+    );
+    assert!(
+        said.heard(&handle, "the one-headset warning", |m| matches!(
+            m,
+            AudioToUi::Warning { direction: None, message } if message.contains("16 kHz")
+        )),
+        "one headset on both lanes was never warned about"
+    );
+    said.settle(&handle);
+    assert_eq!(warnings_heard(&said), 1, "once, not on every tick");
+
+    // The music goes to the speakers and comes back: a new attachment, a new warning.
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_stereo".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    said.settle(&handle);
+    assert_eq!(
+        warnings_heard(&said),
+        1,
+        "the speakers and the headset are two devices"
+    );
+    handle.send(UiToAudio::SelectDevice {
+        node_name: HEADSET.to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some(HEADSET)));
+    said.settle(&handle);
+    assert_eq!(warnings_heard(&said), 2);
+    handle.shutdown();
+}
+
 /// [`CONFIG`] for a daemon that can hold cards ([`PrivateGraph::start_with_cards`]): D-Bus support
 /// on, which the daemon is pointed at a private bus for, the Bluetooth plugin to make a card
 /// from, and the factory that makes it.

@@ -709,6 +709,71 @@ pub(crate) mod tests {
         assert_eq!(dsp.meters().deesser_hz, 5_500.0);
     }
 
+    /// The same, for the microphone WirePlumber 0.5 actually offers: the loopback in front of the
+    /// SCO source, with `bluez5.loopback` and no `api.bluez5.*` key to read a profile or a codec
+    /// from (`create-loopback-node.lua:44-55`). And for WirePlumber 0.4's SCO source on a headset
+    /// that negotiated CVSD, whose 8 kHz leave no sibilance band for the adaptive de-esser to
+    /// split off.
+    #[test]
+    fn wireplumber_05s_loopback_and_a_cvsd_headset_reach_the_de_esser_at_their_own_bandwidth() {
+        let parse = |props: &[(&str, &str)]| {
+            DeviceInfo::from_props(7, &|key: &str| {
+                props.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+            })
+            .expect("a microphone is a device")
+        };
+        let loopback = parse(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", "bluez_input.00:11:22:33:44:55"),
+            ("bluez5.loopback", "true"),
+            ("device.id", "60"),
+        ]);
+        let cvsd = parse(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", "bluez_input.00_11_22_33_44_55.0"),
+            ("api.bluez5.profile", "headset-head-unit"),
+            ("api.bluez5.codec", "cvsd"),
+        ]);
+        let swb = parse(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", "bluez_input.00_11_22_33_44_55.0"),
+            ("api.bluez5.profile", "headset-head-unit"),
+            ("api.bluez5.codec", "lc3_swb"),
+        ]);
+
+        let (lanes, _handover) = lanes_for_tests();
+        let mut dsp = lanes.input;
+        dsp.set_format(DEFAULT_SAMPLE_RATE as f32, 2);
+        let mut params = InputDspParams {
+            deesser_mode: DeEsserMode::Adaptive,
+            ..InputDspParams::default()
+        };
+        params.sanitise();
+        dsp.as_input_mut()
+            .expect("the input lane")
+            .engine
+            .apply(&params);
+
+        dsp.set_source_rate(loopback.native_rate());
+        assert_eq!(
+            dsp.meters().deesser_hz,
+            4_000.0,
+            "the loopback is a headset's, at the wide band"
+        );
+        dsp.set_source_rate(cvsd.native_rate());
+        assert_eq!(
+            dsp.meters().deesser_hz,
+            0.0,
+            "at 8 kHz there is no sibilance band, and the stage stands aside"
+        );
+        dsp.set_source_rate(swb.native_rate());
+        assert_eq!(
+            dsp.meters().deesser_hz,
+            5_500.0,
+            "32 kHz leaves room for the corner the preset asked for"
+        );
+    }
+
     /// The source rate is the voice chain's business; handed to the music chain's lane it goes
     /// nowhere, and the subwoofer layout handed to the voice chain's lane likewise.
     #[test]

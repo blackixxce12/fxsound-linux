@@ -1136,7 +1136,8 @@ icon table ports 1:1):
 | `device.form-factor = "microphone"` | `Microphone` |
 | `device.form-factor = "tv"` or `node.name` contains `.hdmi-` or `device.profile.name` starts `hdmi-` | `Hdmi` |
 | `node.name` contains `.iec958-` / `device.profile.name` contains `iec958` | `Spdif` |
-| `device.bus = "bluetooth"` / `api.bluez5.*` present | `Headphones` (or `Headset` if `api.bluez5.profile` is `headset-head-unit`) |
+| `device.bus = "bluetooth"` / `device.api = "bluez5"` / `api.bluez5.*` present / `bluez5.loopback = true` / the `Device` named by `device.id` says `device.api = "bluez5"` | `Headset` if `api.bluez5.profile` is a headset profile, or — naming no profile — the node is WirePlumber 0.5's loopback microphone or any Bluetooth source; `Headphones` otherwise. Read from the node's info and its card, not from its registry global, which carries none of these keys (U9) |
+| `api.bluez5.internal = true` | not a device at all: WirePlumber 0.5's SCO source behind its loopback microphone (U9) |
 | `media.class = Audio/Sink` on a `Network`/`RAOP`/`roc` module | `NetworkDevice` |
 | anything else | `Unknown` |
 
@@ -1783,9 +1784,17 @@ Because this module can silence a user's machine, the following must all be gree
      (`tests/fixtures/pw-dump-bluez-headset-head-unit.json`) and on a private daemon with a
      one-channel null sink (§26 test 6).
 
-   What is left for the GUI: nothing greys a mono device out any more, and a warning when one
+   What is left for the GUI: nothing greys a mono device out any more. The warning when one
    Bluetooth device is the target of both lanes — music in mono at 16 kHz for the length of the
-   call — belongs to U9.
+   call — is U9's: the engine sends `AudioToUi::Warning { direction: None, .. }` once per
+   attachment, when the two lanes' targets share a Bluetooth card (`device.id`) or address
+   (`DeviceInfo::same_bluetooth_device`), with the text `fxsound_audio::ONE_HEADSET_ON_BOTH_LANES`
+   translated by `fxsound_core::i18n::tr`. WirePlumber 0.5's microphone is the loopback
+   `bluez_input.<addr>` (`bluez5.loopback = true`, `device.id`, no `api.bluez5.*`), recognised as a
+   headset's at 16 kHz; the SCO source behind it (`api.bluez5.internal = true`) is never listed.
+   Tested on the composed fixtures `pw-dump-bluez-a2dp-wireplumber-0.5.json` and
+   `pw-dump-bluez-headset-head-unit-wireplumber-0.4.json` beside the one above, and on a private
+   daemon (`graph_churn`).
 
 7. **The `isUserSelectedPlaybackDevice` bug.** `AudioPassthruPrivate.cpp:215` compares against an
    uninitialised buffer (§15). Nothing in the GUI reads the flag today, so the Linux port should

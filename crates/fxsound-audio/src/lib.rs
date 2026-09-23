@@ -288,6 +288,17 @@ pub const OUTPUT_STREAM_DESCRIPTION: &str = "FxSound output";
 /// `node.description` of the capture stream (input direction, NODE 1). Not localised, as above.
 pub const CAPTURE_STREAM_DESCRIPTION: &str = "FxSound capture";
 
+/// What the engine tells the user, translated, when one Bluetooth headset is the target of both
+/// lanes ([`AudioToUi::Warning`], `docs/0.4.0-upstream.md` U9): the headset runs its call profile
+/// while anything records from it through FxSound, and the music lane's sink goes with it — one
+/// channel, 8 to 32 kHz depending on the codec, 16 kHz on nearly every headset.
+///
+/// The English text is the key [`fxsound_core::i18n::tr`] looks the translation up by. Public so
+/// the app's translation tables and their audit can name it: the audit reads the crates that draw
+/// text, and this string reaches the screen from here.
+pub const ONE_HEADSET_ON_BOTH_LANES: &str =
+    "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz";
+
 /// The `node.name` of FxSound's virtual device for a direction — the value written into that
 /// direction's `default.configured.audio.*` key.
 #[must_use]

@@ -47,12 +47,34 @@ pub const MAX_CHANNELS: u32 = 8;
 /// `SND_DEVICES_MAX_SAMP_FREQ` (`sndDevices.h:189`).
 pub const MAX_SAMPLE_RATE: u32 = 192_000;
 
-/// The most a Bluetooth headset (HFP/HSP) profile carries: 16 kHz with mSBC, and CVSD is
-/// narrower still at 8 kHz. Neither figure is ever published as `audio.rate` — the node
-/// negotiates whatever the graph runs at and resamples inside bluez — so the profile name is the
-/// only place the link's real bandwidth shows. [`DeviceInfo::native_rate`] reports it so that
-/// the adaptive de-esser has something to adapt to (`docs/0.4.0-design.md` §6).
+/// The rate a Bluetooth headset (HFP/HSP) link is taken to carry when nothing names its codec:
+/// mSBC's 16 kHz, the wide band nearly every headset of the last decade negotiates.
+///
+/// No headset figure is ever published as `audio.rate` — the node negotiates whatever the graph
+/// runs at and resamples inside bluez — so the codec, and failing that the profile, is the only
+/// place the link's real bandwidth shows. [`DeviceInfo::native_rate`] reports it so that the
+/// adaptive de-esser has something to adapt to (`docs/0.4.0-design.md` §6). WirePlumber 0.5's
+/// microphone names no codec at all ([`BluezFacts::loopback`]), so this is what it gets.
 pub const BLUEZ_HEADSET_RATE: u32 = 16_000;
+
+/// The rate a Bluetooth headset profile's codec carries, by the name PipeWire's bluez5 plugin
+/// writes into `api.bluez5.codec`; `None` for a codec that is not a headset codec (an A2DP node
+/// names `sbc`, `aac`, `ldac` and the like) or one this build does not know.
+///
+/// The four hands-free codecs PipeWire 1.6 ships
+/// (`/usr/lib/spa-0.2/bluez5/libspa-codec-bluez5-hfp-*`): CVSD, the narrow band every headset
+/// falls back to; mSBC, the wide band; LC3 at 24 kHz (`lc3_a127`, "LC3-24kHz"); and LC3-SWB, the
+/// super-wide band of HFP 1.9 (`hfp-codec-lc3-swb.c`, `lc3_frame_samples(7500, 32000)`).
+#[must_use]
+pub fn bluez_codec_rate(codec: &str) -> Option<u32> {
+    match codec {
+        "cvsd" => Some(8_000),
+        "msbc" => Some(16_000),
+        "lc3_a127" => Some(24_000),
+        "lc3_swb" => Some(32_000),
+        _ => None,
+    }
+}
 
 /// The `media.class` a node must carry to be a playback device we can render into.
 pub const SINK_MEDIA_CLASS: &str = "Audio/Sink";
@@ -183,23 +205,22 @@ impl FormFactor {
             }
         }
 
-        // Bluetooth: the profile says whether the microphone is in play.
-        if get("device.bus") == Some("bluetooth")
-            || get("api.bluez5.profile").is_some()
-            || get("api.bluez5.address").is_some()
-        {
-            return if is_bluez_headset_profile(get) {
+        // Bluetooth: the profile says whether the microphone is in play, and WirePlumber 0.5's
+        // microphone, which names no profile, is a headset's by what it is. A node that is
+        // Bluetooth and says neither is a pair of headphones here; [`DeviceInfo::from_props`]
+        // knows its direction, and makes a microphone of that kind a headset's.
+        let bluez = BluezFacts::from_props(get);
+        if bluez.is_bluetooth() {
+            return if bluez.headset_profile.unwrap_or(bluez.loopback) {
                 Self::Headset
             } else {
                 Self::Headphones
             };
         }
 
-        match get("device.api") {
-            // `raop`/`roc`/`pulse-tunnel` sinks all announce themselves through device.api.
-            Some("raop" | "roc" | "pulse-tunnel") => return Self::NetworkDevice,
-            Some("bluez5") => return Self::Headphones,
-            _ => {}
+        // `raop`/`roc`/`pulse-tunnel` sinks all announce themselves through device.api.
+        if let Some("raop" | "roc" | "pulse-tunnel") = get("device.api") {
+            return Self::NetworkDevice;
         }
         if get("node.network") == Some("true") {
             return Self::NetworkDevice;
@@ -215,13 +236,108 @@ impl FormFactor {
     }
 }
 
-/// Whether a node's `api.bluez5.profile` is a headset profile (`headset-head-unit`,
-/// `headset-audio-gateway`), the one Bluetooth profile with a microphone in play.
+/// What a node's properties say about the Bluetooth link behind it — kept whole on the
+/// [`DeviceInfo`], rather than only the verdicts drawn from it, because the facts arrive in
+/// pieces and the verdicts are drawn again whenever one does.
 ///
-/// Shared by the form factor and by [`DeviceInfo::native_rate`], so the icon and the bandwidth
-/// figure can never disagree about which nodes are headsets.
-fn is_bluez_headset_profile<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> bool {
-    get("api.bluez5.profile").is_some_and(|p| p.starts_with("headset") || p.starts_with("hfp"))
+/// The pieces: the node's registry global carries none of them (it is `node.name`,
+/// `node.description`, `media.class`, `device.id` and a few ids, nothing else); the node's own
+/// info carries the rest of its properties once the engine has bound it
+/// ([`DeviceInfo::learn_bluetooth`]); and whether its card is Bluetooth is a property of another
+/// object, the `Device` it names in `device.id` ([`DeviceInfo::on_bluetooth_card`]).
+///
+/// Two generations of WirePlumber make a headset's microphone differently, and both are read
+/// here. WirePlumber 0.4 lists the SCO source the bluez5 plugin emits, `bluez_input.<addr>.0`,
+/// with `api.bluez5.profile = headset-head-unit` and `api.bluez5.codec`. WirePlumber 0.5 marks
+/// that source `api.bluez5.internal` (`monitors/bluez/create-node.lua:31-36`) and puts a loopback
+/// in front of it for applications to record from: `bluez_input.<addr>`, with
+/// `bluez5.loopback = true`, `device.id` and no `api.bluez5.*` key at all
+/// (`monitors/bluez/create-loopback-node.lua:44-55`) — so it names neither a profile nor a codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluezFacts {
+    /// `api.bluez5.profile`, when the node names one: whether it is a headset profile
+    /// (`headset-head-unit`, `headset-audio-gateway`, or an `hfp-*` spelling) — the
+    /// one kind of Bluetooth profile with a microphone in play. What a node says of its own
+    /// profile outranks everything below: an A2DP sink on a headset's card is headphones.
+    pub headset_profile: Option<bool>,
+    /// `bluez5.loopback = true`: WirePlumber 0.5's Bluetooth microphone. It exists only for a
+    /// device with a headset profile (`create-loopback-node.lua:77-86`), so it is a headset's.
+    pub loopback: bool,
+    /// The node says it is Bluetooth itself: `device.api = bluez5`, `device.bus = bluetooth`, or
+    /// an `api.bluez5.profile`/`address`/`codec` of its own.
+    pub own: bool,
+    /// The card the node names in `device.id` is Bluetooth — its `Device` says
+    /// `device.api = bluez5`. Never read from the node's properties: the engine learns it from the
+    /// card and keeps it through the node's info ([`DeviceInfo::on_bluetooth_card`]).
+    pub card: bool,
+    /// The rate the node's headset codec carries ([`bluez_codec_rate`] of `api.bluez5.codec`),
+    /// when it names one.
+    pub codec_rate: Option<u32>,
+    /// `api.bluez5.internal = true`: one of WirePlumber 0.5's own SCO nodes, behind the loopback
+    /// microphone. Never a device: recording from it directly would bypass the loopback
+    /// WirePlumber switches the headset's profile through.
+    pub internal: bool,
+}
+
+impl BluezFacts {
+    /// Read the facts a node's own properties carry. [`Self::card`] is left `false`: it is a
+    /// property of another object.
+    #[must_use]
+    pub fn from_props<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> Self {
+        let profile = get("api.bluez5.profile");
+        let codec = get("api.bluez5.codec");
+        Self {
+            headset_profile: profile.map(|p| p.starts_with("headset") || p.starts_with("hfp")),
+            loopback: get("bluez5.loopback") == Some("true"),
+            own: get("device.api") == Some("bluez5")
+                || get("device.bus") == Some("bluetooth")
+                || profile.is_some()
+                || codec.is_some()
+                || get("api.bluez5.address").is_some(),
+            card: false,
+            codec_rate: codec.and_then(bluez_codec_rate),
+            internal: get("api.bluez5.internal") == Some("true"),
+        }
+    }
+
+    /// Whether anything says the node is Bluetooth: itself, its being WirePlumber's loopback, or
+    /// its card.
+    #[must_use]
+    pub const fn is_bluetooth(&self) -> bool {
+        self.own || self.loopback || self.card
+    }
+
+    /// Whether the node is a Bluetooth headset's end — a headset profile's sink or source, or a
+    /// headset's microphone.
+    ///
+    /// The profile decides whenever the node names one. A node that names none is a headset's
+    /// when it is WirePlumber 0.5's loopback, and when it is a Bluetooth *microphone*: the headset
+    /// profiles are the only ones that carry a headset's microphone, and every other profile with
+    /// a source in it (A2DP from a phone, LE audio) names itself. A Bluetooth sink that names no
+    /// profile is not assumed to be one — the A2DP sink's registry global names none either, and
+    /// would be taken for a call-quality link until its info arrived.
+    #[must_use]
+    pub const fn is_headset(&self, direction: DeviceDirection) -> bool {
+        match self.headset_profile {
+            Some(headset) => headset,
+            None => {
+                self.loopback
+                    || (matches!(direction, DeviceDirection::Input) && (self.own || self.card))
+            }
+        }
+    }
+}
+
+/// A form factor read from a node's properties, for a node of `direction`: an ALSA source carries
+/// its card's `audio-card` icon, which reads as speakers, and for a capture device the honest
+/// default is a microphone.
+const fn directed(direction: DeviceDirection, form_factor: FormFactor) -> FormFactor {
+    match (direction, form_factor) {
+        (DeviceDirection::Input, FormFactor::Speakers | FormFactor::Unknown) => {
+            FormFactor::Microphone
+        }
+        (_, form_factor) => form_factor,
+    }
 }
 
 /// `api.bluez5.address`, the one key a Bluetooth node and its card both carry, when it says
@@ -250,15 +366,22 @@ pub struct Card {
     /// `api.bluez5.address`, for a Bluetooth card. Not in the registry global; the engine reads it
     /// from the card's own info once it is bound.
     pub bluez_address: Option<String>,
+    /// `device.api = bluez5` (or an address): a Bluetooth device. Unlike the address, the
+    /// registry global carries `device.api`, so this is known the moment the card is announced —
+    /// before the info of any node on it, which is what lets a node that names this card in
+    /// `device.id` count as Bluetooth from its own registry global on ([`BluezFacts::card`]).
+    pub bluetooth: bool,
 }
 
 impl Card {
     /// Build a card from a `Device` object's property dictionary.
     #[must_use]
     pub fn from_props<'a>(object_id: u32, get: &impl Fn(&str) -> Option<&'a str>) -> Self {
+        let bluez_address = bluez_address(get);
         Self {
             object_id,
-            bluez_address: bluez_address(get),
+            bluetooth: get("device.api") == Some("bluez5") || bluez_address.is_some(),
+            bluez_address,
         }
     }
 
@@ -549,10 +672,14 @@ pub struct DeviceInfo {
     pub channels: u32,
     /// `audio.rate` when the node publishes one. ALSA nodes usually do not.
     pub rate: Option<u32>,
-    /// Whether the node runs a Bluetooth headset (HFP/HSP) profile. Such a link carries
-    /// [`BLUEZ_HEADSET_RATE`] at most and never says so in `audio.rate`; see
-    /// [`DeviceInfo::native_rate`].
+    /// Whether the node is a Bluetooth headset's end: a headset (HFP/HSP) profile's sink or source,
+    /// or WirePlumber 0.5's loopback microphone ([`BluezFacts::is_headset`]). Such a link carries
+    /// its codec's rate — [`BLUEZ_HEADSET_RATE`] when it names none — and never says so in
+    /// `audio.rate`; see [`DeviceInfo::native_rate`]. Drawn from [`DeviceInfo::bluez`], again
+    /// whenever that changes.
     pub bluez_headset: bool,
+    /// What the node's properties, and its card, say about the Bluetooth link behind it.
+    pub bluez: BluezFacts,
     /// `audio.position`, or the default layout for [`DeviceInfo::channels`].
     pub positions: ChannelMap,
     /// What the GUI should draw next to it.
@@ -564,7 +691,8 @@ pub struct DeviceInfo {
 impl DeviceInfo {
     /// Build a device from a node's property dictionary, or `None` if the node is neither a sink
     /// nor a source — or is one of FxSound's own four nodes, which must never be listed as a
-    /// device to attach to.
+    /// device to attach to, or one of WirePlumber's internal Bluetooth nodes
+    /// ([`BluezFacts::internal`]).
     ///
     /// Mirrors pass 1 of `sndDevices_GetAll.cpp:141-267`, including its fallbacks: a node with no
     /// `node.description` is labelled with its `node.name` rather than being dropped (the Windows
@@ -597,21 +725,17 @@ impl DeviceInfo {
         let rate = get("audio.rate")
             .and_then(|r| r.parse::<u32>().ok())
             .filter(|&r| r > 0 && r <= MAX_SAMPLE_RATE);
-        let bluez_headset = is_bluez_headset_profile(get);
+        let bluez = BluezFacts::from_props(get);
+        if bluez.internal {
+            return None;
+        }
         let positions = get("audio.position")
             .and_then(ChannelMap::parse)
             .filter(|map| map.len() == channels as usize)
             .unwrap_or_else(|| ChannelMap::default_for(channels));
-        let form_factor = match (direction, FormFactor::from_props(get)) {
-            // An ALSA source carries its card's `audio-card` icon, which reads as speakers; for a
-            // capture device the honest default is a microphone.
-            (DeviceDirection::Input, FormFactor::Speakers | FormFactor::Unknown) => {
-                FormFactor::Microphone
-            }
-            (_, form_factor) => form_factor,
-        };
+        let form_factor = directed(direction, FormFactor::from_props(get));
 
-        Some(Self {
+        let mut device = Self {
             object_id,
             object_serial: get("object.serial").and_then(|s| s.parse::<u64>().ok()),
             card_id: get("device.id").and_then(|s| s.parse::<u32>().ok()),
@@ -621,16 +745,114 @@ impl DeviceInfo {
             nick,
             channels,
             rate,
-            bluez_headset,
+            bluez_headset: false,
+            bluez,
             positions,
             form_factor,
             direction,
-        })
+        };
+        device.classify_bluetooth();
+        Some(device)
+    }
+
+    /// Draw [`Self::bluez_headset`] and the Bluetooth part of [`Self::form_factor`] from
+    /// [`Self::bluez`]: a headset's end is a headset; any other Bluetooth node is a pair of
+    /// headphones, unless its properties said something more particular. The same verdicts
+    /// [`FormFactor::from_props`] draws from a node's own properties, plus what only the
+    /// direction and the card can add — a Bluetooth microphone that names no profile is a
+    /// headset's, and so is a node on a Bluetooth card that says nothing of itself.
+    fn classify_bluetooth(&mut self) {
+        self.bluez_headset = self.bluez.is_headset(self.direction);
+        if self.bluez_headset {
+            self.form_factor = FormFactor::Headset;
+        } else if self.bluez.is_bluetooth()
+            && matches!(
+                self.form_factor,
+                FormFactor::Unknown | FormFactor::Microphone
+            )
+        {
+            self.form_factor = FormFactor::Headphones;
+        }
+    }
+
+    /// Take what a node's own info says about its Bluetooth link — `bluez`, and `form_factor` as
+    /// [`FormFactor::from_props`] reads the same dictionary — and draw the verdicts again. Returns
+    /// whether any of them changed.
+    ///
+    /// Needed because the registry global the device was first built from carries none of it:
+    /// without this, WirePlumber 0.5's microphone was a plain microphone to the engine, and even
+    /// WirePlumber 0.4's SCO source, whose profile is only in its info, fed the de-esser as a
+    /// 48 kHz source (`docs/0.4.0-upstream.md` U9). What the card said ([`BluezFacts::card`]) is
+    /// kept: it is not a property of the node. For a node that is not Bluetooth at all the form
+    /// factor is left as the registry global had it — the icon of an ALSA device is not this
+    /// method's business.
+    ///
+    /// Only for an info that carries the node's properties: one that reports a state change
+    /// carries none, and would read as a node that is Bluetooth no more.
+    pub fn learn_bluetooth(&mut self, bluez: BluezFacts, form_factor: FormFactor) -> bool {
+        let before = (self.bluez, self.bluez_headset, self.form_factor);
+        self.bluez = BluezFacts {
+            card: self.bluez.card,
+            ..bluez
+        };
+        if self.bluez.is_bluetooth() {
+            self.form_factor = directed(self.direction, form_factor);
+        }
+        self.classify_bluetooth();
+        before != (self.bluez, self.bluez_headset, self.form_factor)
+    }
+
+    /// The card this node names in `device.id` is Bluetooth ([`Card::bluetooth`]). Returns whether
+    /// that is news.
+    ///
+    /// What makes WirePlumber 0.5's microphone a headset's from the moment its registry global is
+    /// announced, before its info says `bluez5.loopback`, and a microphone on a Bluetooth card that
+    /// never says anything of itself a headset's at all.
+    pub fn on_bluetooth_card(&mut self) -> bool {
+        if self.bluez.card {
+            return false;
+        }
+        let before = (self.bluez_headset, self.form_factor);
+        self.bluez.card = true;
+        self.classify_bluetooth();
+        before != (self.bluez_headset, self.form_factor)
+    }
+
+    /// Whether this node and `other` are two ends of the same Bluetooth device — its sink and its
+    /// microphone, as the two lanes see them.
+    ///
+    /// Both must be Bluetooth ([`BluezFacts::is_bluetooth`]): an ALSA card's speakers and
+    /// microphone name the same `device.id` too, and share nothing a lane could suffer from. Then
+    /// the same card by `device.id`, which WirePlumber puts on every node it makes for a headset —
+    /// the loopback microphone included, which carries no address (`create-loopback-node.lua:50`)
+    /// — or the same `api.bluez5.address`, a node's own or, for a node that names only its card,
+    /// the card's from `cards`.
+    #[must_use]
+    pub fn same_bluetooth_device(&self, other: &Self, cards: &[Card]) -> bool {
+        if !self.bluez.is_bluetooth() || !other.bluez.is_bluetooth() {
+            return false;
+        }
+        if self.card_id.is_some() && self.card_id == other.card_id {
+            return true;
+        }
+        let address = |device: &Self| {
+            device.bluez_address.clone().or_else(|| {
+                let id = device.card_id?;
+                cards
+                    .iter()
+                    .find(|card| card.object_id == id)?
+                    .bluez_address
+                    .clone()
+            })
+        };
+        address(self).is_some_and(|mine| address(other).as_ref() == Some(&mine))
     }
 
     /// The rate the device really runs at, as far as its properties say: `audio.rate` when the
-    /// node publishes one, [`BLUEZ_HEADSET_RATE`] for a Bluetooth headset profile, and `None`
-    /// when the stream rate is all there is to know.
+    /// node publishes one; for a Bluetooth headset, the rate its codec carries
+    /// ([`bluez_codec_rate`]: CVSD 8 kHz, mSBC 16 kHz, LC3 24 kHz, LC3-SWB 32 kHz), or
+    /// [`BLUEZ_HEADSET_RATE`] when it names none — which WirePlumber 0.5's loopback microphone
+    /// never does; and `None` when the stream rate is all there is to know.
     ///
     /// The capture stream asks for 48 kHz whatever the microphone runs at, so the negotiated
     /// format cannot tell the voice chain how much bandwidth is in the signal — a resampled
@@ -640,11 +862,17 @@ impl DeviceInfo {
     /// de-esser places its corner from it (`docs/0.4.0-design.md` §6).
     #[must_use]
     pub fn native_rate(&self) -> Option<f32> {
-        match self.rate {
-            Some(rate) => Some(rate as f32),
-            None if self.bluez_headset => Some(BLUEZ_HEADSET_RATE as f32),
-            None => None,
-        }
+        self.native_rate_hz().map(|rate| rate as f32)
+    }
+
+    /// [`Self::native_rate`], in whole hertz: what a pair keeps to tell whether it was built for
+    /// the device as it is now.
+    #[must_use]
+    pub fn native_rate_hz(&self) -> Option<u32> {
+        self.rate.or_else(|| {
+            self.bluez_headset
+                .then(|| self.bluez.codec_rate.unwrap_or(BLUEZ_HEADSET_RATE))
+        })
     }
 
     /// Whether the card this node belongs to is among `cards`: the one it names in `device.id`,
@@ -1014,6 +1242,36 @@ mod tests {
     /// The laptop's speakers in that fixture.
     const LAPTOP_SPEAKERS: &str = "alsa_output.pci-0000_00_1f.3.analog-stereo";
 
+    /// The laptop's microphone in the Bluetooth fixtures — on the same ALSA card as its speakers.
+    const LAPTOP_MICROPHONE: &str = "alsa_input.pci-0000_00_1f.3.analog-stereo";
+
+    /// The same headset under WirePlumber 0.5 in A2DP, the profile it idles in: the graph a user
+    /// has in front of them when they pick the headset's microphone for the input lane.
+    ///
+    /// Composed from [`BLUEZ_HEADSET_HEAD_UNIT_DUMP`], as that one was, with what changes between
+    /// the two profiles: the sink runs `a2dp-sink` with `sbc` over two channels
+    /// (`factory.name = api.bluez5.a2dp.sink`), and the SCO source is gone. The loopback microphone
+    /// and its internal capture stream stay: with `bluetooth.autoswitch-to-headset-profile` on —
+    /// WirePlumber's default — the loopback exists for as long as the device has a headset profile
+    /// at all, whichever one it runs (`create-loopback-node.lua:86-98`).
+    const BLUEZ_A2DP_WIREPLUMBER_05_DUMP: &str =
+        include_str!("../tests/fixtures/pw-dump-bluez-a2dp-wireplumber-0.5.json");
+
+    /// The same headset in its call profile under WirePlumber 0.4, which has no loopback: the SCO
+    /// source `bluez_input.<addr>.0` is the microphone itself, with neither `api.bluez5.internal`
+    /// nor `bluez5.loopback` (both are WirePlumber 0.5's, `create-node.lua:31-36`). Composed from
+    /// [`BLUEZ_HEADSET_HEAD_UNIT_DUMP`] with those two keys taken out, the loopback nodes left out,
+    /// and a headset that negotiated CVSD rather than mSBC — the narrow band some still do.
+    const BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP: &str =
+        include_str!("../tests/fixtures/pw-dump-bluez-headset-head-unit-wireplumber-0.4.json");
+
+    /// WirePlumber 0.5's microphone for the headset in these fixtures: the loopback, named by the
+    /// address with its colons (`create-loopback-node.lua:17`, `:45`).
+    const LOOPBACK_MICROPHONE: &str = "bluez_input.00:11:22:33:44:55";
+
+    /// The headset's SCO source: WirePlumber 0.5's internal node, and WirePlumber 0.4's microphone.
+    const SCO_SOURCE: &str = "bluez_input.00_11_22_33_44_55.0";
+
     // ---------------------------------------------------------------------------------------
     // A minimal JSON reader, test-only.
     //
@@ -1319,6 +1577,7 @@ mod tests {
             channels,
             rate: None,
             bluez_headset: false,
+            bluez: BluezFacts::default(),
             positions: ChannelMap::default_for(channels),
             form_factor: FormFactor::Unknown,
             direction,
@@ -2022,6 +2281,7 @@ mod tests {
             [Card {
                 object_id: 60,
                 bluez_address: Some("00:11:22:33:44:55".to_owned()),
+                bluetooth: true,
             }],
             "the fixture's one card is the headset's"
         );
@@ -2034,6 +2294,7 @@ mod tests {
         let headset = Card {
             object_id: 60,
             bluez_address: Some("00:11:22:33:44:55".to_owned()),
+            bluetooth: true,
         };
         assert!(headset.owns(Some(60), None), "by `device.id`");
         assert!(
@@ -2050,6 +2311,7 @@ mod tests {
         let alsa = Card {
             object_id: 45,
             bluez_address: None,
+            bluetooth: false,
         };
         assert!(alsa.owns(Some(45), None));
         assert!(
@@ -2108,6 +2370,7 @@ mod tests {
         let cards_without_addresses = [Card {
             object_id: 0,
             bluez_address: None,
+            bluetooth: false,
         }];
         assert!(!virtual_sink.card_present(&cards_without_addresses));
         assert!(!virtual_sink.card_present(&cards));
@@ -2760,5 +3023,453 @@ mod tests {
             restore_default_candidate(&memory, &unplugged, DeviceDirection::Input).as_deref(),
             Some("internal-mic")
         );
+    }
+
+    // ---- U9: WirePlumber 0.5's Bluetooth microphone, and one headset on both lanes -----------
+
+    /// A property dictionary out of `(key, value)` pairs, the way a test hands one to the parsers.
+    fn props_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<&'a str> + 'a {
+        move |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+    }
+
+    /// One device out of a fixture, by name.
+    fn device_in(dump: &str, name: &str) -> DeviceInfo {
+        devices_in(dump)
+            .into_iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{name} is not a device in the fixture"))
+    }
+
+    /// The devices of one direction in a fixture, by name.
+    fn names_in(dump: &str, direction: DeviceDirection) -> Vec<String> {
+        devices_in(dump)
+            .into_iter()
+            .filter(|d| d.direction == direction)
+            .map(|d| d.name)
+            .collect()
+    }
+
+    #[test]
+    fn each_hands_free_codec_carries_its_own_rate_and_a_music_codec_none() {
+        assert_eq!(bluez_codec_rate("cvsd"), Some(8_000));
+        assert_eq!(bluez_codec_rate("msbc"), Some(16_000));
+        assert_eq!(bluez_codec_rate("lc3_a127"), Some(24_000));
+        assert_eq!(bluez_codec_rate("lc3_swb"), Some(32_000));
+        for music in [
+            "sbc", "sbc_xq", "aac", "ldac", "aptx_hd", "opus_05", "lc3", "",
+        ] {
+            assert_eq!(
+                bluez_codec_rate(music),
+                None,
+                "{music:?} is not a call codec, and says nothing about a call's bandwidth"
+            );
+        }
+        assert_eq!(
+            BLUEZ_HEADSET_RATE,
+            bluez_codec_rate("msbc").expect("mSBC is a call codec"),
+            "a headset that names no codec is taken to run the wide band"
+        );
+    }
+
+    #[test]
+    fn wireplumbers_internal_sco_source_is_never_listed_as_a_microphone() {
+        let inputs = names_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP, DeviceDirection::Input);
+        assert_eq!(
+            inputs,
+            [LAPTOP_MICROPHONE, LOOPBACK_MICROPHONE],
+            "the loopback is the headset's microphone; the SCO source behind it is WirePlumber's"
+        );
+        assert!(
+            DeviceInfo::from_props(
+                71,
+                &props_of(&[
+                    ("media.class", "Audio/Source"),
+                    ("node.name", SCO_SOURCE),
+                    ("api.bluez5.profile", "headset-head-unit"),
+                    ("api.bluez5.internal", "true"),
+                ])
+            )
+            .is_none()
+        );
+        let facts = BluezFacts::from_props(&props_of(&[("api.bluez5.internal", "true")]));
+        assert!(facts.internal);
+        assert!(
+            !BluezFacts::from_props(&props_of(&[("api.bluez5.internal", "false")])).internal,
+            "only `true` hides a node"
+        );
+    }
+
+    #[test]
+    fn wireplumber_05s_loopback_microphone_is_a_bluetooth_headsets_at_the_wide_band() {
+        for dump in [BLUEZ_HEADSET_HEAD_UNIT_DUMP, BLUEZ_A2DP_WIREPLUMBER_05_DUMP] {
+            let microphone = device_in(dump, LOOPBACK_MICROPHONE);
+            assert_eq!(microphone.direction, DeviceDirection::Input);
+            assert!(microphone.bluez.loopback);
+            assert!(
+                !microphone.bluez.own,
+                "it carries no `api.bluez5.*` key at all"
+            );
+            assert_eq!(microphone.bluez.headset_profile, None);
+            assert_eq!(microphone.bluez_address, None);
+            assert_eq!(
+                microphone.card_id,
+                Some(60),
+                "`device.id` names the headset's card"
+            );
+            assert!(microphone.bluez_headset);
+            assert_eq!(microphone.form_factor, FormFactor::Headset);
+            assert_eq!(
+                microphone.native_rate(),
+                Some(16_000.0),
+                "it names no codec, so it runs the wide band nearly every headset negotiates"
+            );
+            assert_eq!(
+                microphone.to_audio_device(None).form_factor,
+                "headset",
+                "the GUI draws it as a headset"
+            );
+        }
+    }
+
+    #[test]
+    fn under_wireplumber_05_the_headset_idles_in_a2dp_as_headphones_beside_its_microphone() {
+        let outputs = names_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, DeviceDirection::Output);
+        assert_eq!(outputs, [LAPTOP_SPEAKERS, HEADSET_SINK]);
+        let inputs = names_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, DeviceDirection::Input);
+        assert_eq!(inputs, [LAPTOP_MICROPHONE, LOOPBACK_MICROPHONE]);
+
+        let sink = device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, HEADSET_SINK);
+        assert_eq!(sink.channels, 2);
+        assert!(!sink.bluez_headset, "A2DP carries no microphone");
+        assert_eq!(sink.bluez.headset_profile, Some(false));
+        assert_eq!(sink.bluez.codec_rate, None, "SBC is a music codec");
+        assert_eq!(sink.form_factor, FormFactor::Headphones);
+        assert_eq!(sink.native_rate(), None);
+    }
+
+    #[test]
+    fn wireplumber_04s_microphone_is_the_sco_source_itself_at_its_codecs_rate() {
+        let inputs = names_in(
+            BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP,
+            DeviceDirection::Input,
+        );
+        assert_eq!(
+            inputs,
+            [LAPTOP_MICROPHONE, SCO_SOURCE],
+            "without `api.bluez5.internal` the SCO source is the microphone"
+        );
+        let microphone = device_in(BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP, SCO_SOURCE);
+        assert!(microphone.bluez_headset);
+        assert!(!microphone.bluez.loopback);
+        assert_eq!(microphone.form_factor, FormFactor::Headset);
+        assert_eq!(
+            microphone.native_rate(),
+            Some(8_000.0),
+            "CVSD: the narrow band, which the de-esser should know to stand aside for"
+        );
+        let sink = device_in(BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP, HEADSET_SINK);
+        assert_eq!(sink.native_rate(), Some(8_000.0), "one SCO link, one codec");
+    }
+
+    #[test]
+    fn a_headsets_codec_sets_its_native_rate_and_a_published_rate_outranks_it() {
+        let parse = |pairs: &[(&str, &str)]| {
+            DeviceInfo::from_props(7, &props_of(pairs)).expect("a named source is a device")
+        };
+        let base = [
+            ("media.class", "Audio/Source"),
+            ("node.name", SCO_SOURCE),
+            ("api.bluez5.profile", "headset-head-unit"),
+        ];
+        for (codec, rate) in [
+            ("cvsd", 8_000.0),
+            ("msbc", 16_000.0),
+            ("lc3_a127", 24_000.0),
+            ("lc3_swb", 32_000.0),
+        ] {
+            let pairs: Vec<(&str, &str)> = base
+                .iter()
+                .copied()
+                .chain([("api.bluez5.codec", codec)])
+                .collect();
+            assert_eq!(parse(&pairs).native_rate(), Some(rate), "{codec}");
+        }
+        assert_eq!(
+            parse(&base).native_rate(),
+            Some(16_000.0),
+            "a headset profile that names no codec"
+        );
+        let published = parse(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", SCO_SOURCE),
+            ("api.bluez5.profile", "headset-head-unit"),
+            ("api.bluez5.codec", "lc3_swb"),
+            ("audio.rate", "16000"),
+        ]);
+        assert_eq!(
+            published.native_rate(),
+            Some(16_000.0),
+            "the node's own word about its rate wins"
+        );
+        // A music codec on an A2DP node is no reason to call it narrow.
+        let a2dp = parse(&[
+            ("media.class", "Audio/Sink"),
+            ("node.name", HEADSET_SINK),
+            ("api.bluez5.profile", "a2dp-sink"),
+            ("api.bluez5.codec", "sbc"),
+        ]);
+        assert_eq!(a2dp.native_rate(), None);
+    }
+
+    #[test]
+    fn a_bluetooth_microphone_that_names_no_profile_is_a_headsets_and_a_sink_is_not() {
+        let microphone = DeviceInfo::from_props(
+            9,
+            &props_of(&[
+                ("media.class", "Audio/Source"),
+                ("node.name", "bluez_input.66_77_88_99_AA_BB"),
+                ("device.api", "bluez5"),
+            ]),
+        )
+        .expect("a source");
+        assert!(microphone.bluez_headset);
+        assert_eq!(microphone.form_factor, FormFactor::Headset);
+        assert_eq!(microphone.native_rate(), Some(16_000.0));
+
+        let sink = DeviceInfo::from_props(
+            10,
+            &props_of(&[
+                ("media.class", "Audio/Sink"),
+                ("node.name", "bluez_output.66_77_88_99_AA_BB.1"),
+                ("device.api", "bluez5"),
+            ]),
+        )
+        .expect("a sink");
+        assert!(
+            !sink.bluez_headset,
+            "a Bluetooth sink that says nothing of its profile is not taken for a call"
+        );
+        assert_eq!(sink.form_factor, FormFactor::Headphones);
+
+        // The profile outranks everything: a phone streaming music into the computer is a
+        // Bluetooth source, and no headset.
+        let phone = DeviceInfo::from_props(
+            11,
+            &props_of(&[
+                ("media.class", "Audio/Source"),
+                ("node.name", "bluez_input.66_77_88_99_AA_BB.2"),
+                ("device.api", "bluez5"),
+                ("api.bluez5.profile", "a2dp-source"),
+            ]),
+        )
+        .expect("a source");
+        assert!(!phone.bluez_headset);
+        assert_eq!(phone.form_factor, FormFactor::Headphones);
+        assert_eq!(phone.native_rate(), None);
+    }
+
+    #[test]
+    fn the_form_factor_reads_the_loopback_microphone_as_a_headset_on_its_properties_alone() {
+        assert_eq!(
+            FormFactor::from_props(&props_of(&[("bluez5.loopback", "true")])),
+            FormFactor::Headset
+        );
+        assert_eq!(
+            FormFactor::from_props(&props_of(&[
+                ("bluez5.loopback", "false"),
+                ("api.bluez5.profile", "headset-head-unit"),
+            ])),
+            FormFactor::Headset,
+            "the SCO source WirePlumber marks `false` is a headset by its profile"
+        );
+        assert_eq!(
+            FormFactor::from_props(&props_of(&[("device.api", "bluez5")])),
+            FormFactor::Headphones,
+            "direction-agnostic, a Bluetooth node that says nothing is headphones"
+        );
+        assert_eq!(
+            FormFactor::from_props(&props_of(&[("bluez5.loopback", "false")])),
+            FormFactor::Unknown,
+            "`false` is not a loopback"
+        );
+    }
+
+    #[test]
+    fn a_microphone_known_only_by_its_registry_global_becomes_a_headset_by_its_card() {
+        // What the registry announces for WirePlumber 0.5's microphone: nothing Bluetooth about it
+        // but the card it names.
+        let mut microphone = DeviceInfo::from_props(
+            73,
+            &props_of(&[
+                ("media.class", "Audio/Source"),
+                ("node.name", LOOPBACK_MICROPHONE),
+                ("node.description", "Test Headset"),
+                ("device.id", "60"),
+                ("object.serial", "73"),
+            ]),
+        )
+        .expect("a source");
+        assert!(!microphone.bluez_headset);
+        assert_eq!(microphone.form_factor, FormFactor::Microphone);
+        assert_eq!(microphone.native_rate(), None);
+
+        assert!(microphone.on_bluetooth_card(), "news the first time");
+        assert!(microphone.bluez_headset);
+        assert_eq!(microphone.form_factor, FormFactor::Headset);
+        assert_eq!(microphone.native_rate(), Some(16_000.0));
+        assert!(!microphone.on_bluetooth_card(), "and no news after");
+
+        // A sink on the same card is Bluetooth, and headphones, until its info names a profile.
+        let mut sink = DeviceInfo::from_props(
+            70,
+            &props_of(&[
+                ("media.class", "Audio/Sink"),
+                ("node.name", HEADSET_SINK),
+                ("device.id", "60"),
+            ]),
+        )
+        .expect("a sink");
+        assert!(sink.on_bluetooth_card());
+        assert!(!sink.bluez_headset);
+        assert_eq!(sink.form_factor, FormFactor::Headphones);
+    }
+
+    #[test]
+    fn a_nodes_info_tells_what_its_registry_global_could_not_and_keeps_what_its_card_said() {
+        let registry_only = |name: &str| {
+            let pairs = [
+                ("media.class", "Audio/Source"),
+                ("node.name", name),
+                ("device.id", "60"),
+            ];
+            DeviceInfo::from_props(1, &props_of(&pairs)).expect("a source")
+        };
+        let info = |dump: &str, id: u32| {
+            let props = objects_in(dump)
+                .into_iter()
+                .find(|(object, _, _)| *object == id)
+                .map(|(_, _, props)| props)
+                .expect("the node is in the fixture");
+            let get = |key: &str| {
+                props
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str())
+            };
+            (BluezFacts::from_props(&get), FormFactor::from_props(&get))
+        };
+
+        // WirePlumber 0.5's microphone, learned from its info alone.
+        let mut loopback = registry_only(LOOPBACK_MICROPHONE);
+        let (facts, form_factor) = info(BLUEZ_HEADSET_HEAD_UNIT_DUMP, 73);
+        assert!(loopback.learn_bluetooth(facts, form_factor));
+        assert!(loopback.bluez_headset);
+        assert_eq!(loopback.form_factor, FormFactor::Headset);
+        assert_eq!(loopback.native_rate(), Some(16_000.0));
+        assert!(
+            !loopback.learn_bluetooth(facts, form_factor),
+            "the same info again is no news"
+        );
+
+        // WirePlumber 0.4's, whose codec is only in its info.
+        let mut sco = registry_only(SCO_SOURCE);
+        let (facts, form_factor) = info(BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP, 71);
+        assert!(sco.learn_bluetooth(facts, form_factor));
+        assert_eq!(sco.native_rate(), Some(8_000.0));
+
+        // What the card said survives an info that could not say it.
+        let mut on_card = registry_only(LOOPBACK_MICROPHONE);
+        assert!(on_card.on_bluetooth_card());
+        let (facts, form_factor) = info(BLUEZ_HEADSET_HEAD_UNIT_DUMP, 73);
+        on_card.learn_bluetooth(facts, form_factor);
+        assert!(on_card.bluez.card);
+        assert!(on_card.bluez.loopback);
+
+        // And an info that names a profile outranks what the card suggested.
+        let mut phone = registry_only("bluez_input.66_77_88_99_AA_BB.2");
+        assert!(phone.on_bluetooth_card());
+        assert!(
+            phone.bluez_headset,
+            "a Bluetooth microphone, as far as anyone knew"
+        );
+        let a2dp_source = [
+            ("device.api", "bluez5"),
+            ("api.bluez5.profile", "a2dp-source"),
+        ];
+        let get = props_of(&a2dp_source);
+        assert!(phone.learn_bluetooth(BluezFacts::from_props(&get), FormFactor::from_props(&get)));
+        assert!(!phone.bluez_headset);
+        assert_eq!(phone.form_factor, FormFactor::Headphones);
+
+        // An ALSA node's info leaves its icon to its registry global.
+        let mut mic = source("alsa_input.usb-fifine", 2);
+        mic.form_factor = FormFactor::Microphone;
+        let alsa = [("device.api", "alsa"), ("device.icon-name", "audio-card")];
+        let get = props_of(&alsa);
+        assert!(!mic.learn_bluetooth(BluezFacts::from_props(&get), FormFactor::from_props(&get)));
+        assert_eq!(mic.form_factor, FormFactor::Microphone);
+    }
+
+    #[test]
+    fn a_headsets_sink_and_its_microphone_are_one_bluetooth_device_under_either_wireplumber() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        for (dump, microphone) in [
+            (BLUEZ_HEADSET_HEAD_UNIT_DUMP, LOOPBACK_MICROPHONE),
+            (BLUEZ_A2DP_WIREPLUMBER_05_DUMP, LOOPBACK_MICROPHONE),
+            (BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP, SCO_SOURCE),
+        ] {
+            let sink = device_in(dump, HEADSET_SINK);
+            let microphone = device_in(dump, microphone);
+            assert!(sink.same_bluetooth_device(&microphone, &cards));
+            assert!(
+                microphone.same_bluetooth_device(&sink, &cards),
+                "either way round"
+            );
+        }
+
+        // By the card's address when the microphone names only its card and the sink only its
+        // address.
+        let sink = DeviceInfo {
+            card_id: None,
+            ..device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, HEADSET_SINK)
+        };
+        let loopback = device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, LOOPBACK_MICROPHONE);
+        assert!(sink.same_bluetooth_device(&loopback, &cards));
+        assert!(
+            !sink.same_bluetooth_device(&loopback, &[]),
+            "without the card, nothing ties an address to a card number"
+        );
+    }
+
+    #[test]
+    fn two_headsets_or_one_sound_card_are_not_one_bluetooth_device() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let sink = device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, HEADSET_SINK);
+        let another = DeviceInfo {
+            card_id: Some(61),
+            ..device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, LOOPBACK_MICROPHONE)
+        };
+        assert!(!sink.same_bluetooth_device(&another, &cards));
+
+        // The laptop's speakers and microphone share a card, and nothing a lane could suffer from.
+        let speakers = device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, LAPTOP_SPEAKERS);
+        let microphone = device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, LAPTOP_MICROPHONE);
+        assert_eq!(speakers.card_id, microphone.card_id);
+        assert!(!speakers.same_bluetooth_device(&microphone, &cards));
+        // Nor is the headset one device with the laptop's microphone.
+        assert!(!sink.same_bluetooth_device(&microphone, &cards));
+    }
+
+    #[test]
+    fn a_card_says_it_is_bluetooth_in_its_registry_global() {
+        let cards = cards_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP);
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].bluetooth);
+        // What the registry announces of a card: its `device.api`, and no address.
+        let announced = Card::from_props(60, &props_of(&[("device.api", "bluez5")]));
+        assert!(announced.bluetooth);
+        assert_eq!(announced.bluez_address, None);
+        let alsa = Card::from_props(45, &props_of(&[("device.api", "alsa")]));
+        assert!(!alsa.bluetooth);
     }
 }
