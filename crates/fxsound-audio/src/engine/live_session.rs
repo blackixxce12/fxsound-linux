@@ -10,7 +10,9 @@
 //! there: nothing here may touch the session's graph.
 
 use super::*;
-use crate::graph_churn::{PATIENCE, PrivateGraph, installed, skip, unless_skipped};
+use crate::graph_churn::{
+    PATIENCE, PrivateGraph, canceller_missing, installed, skip, unless_skipped,
+};
 use crate::lane_dsp::tests::lanes_for_tests;
 
 /// A main loop of the test's own, connected to a private daemon.
@@ -83,6 +85,37 @@ impl Harness {
             self.mainloop
                 .loop_()
                 .iterate(pw::loop_::Timeout::Finite(left));
+        }
+    }
+
+    /// [`Self::until`], with the supervisor's whole tick run on every turn of the loop — for what
+    /// the supervisor does over more than one tick. The hand-back of a claim no lane stands behind
+    /// is one: it waits a tick for the device list to be sent, and another after it has been taken
+    /// ([`Shared::gui_has_had_its_chance`]). Nobody listens to this main loop's notifications, so
+    /// the list counts as taken the moment it is sent.
+    fn supervising_until(&self, what: &str, done: impl Fn(&Shared) -> bool) -> bool {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            supervise(&self.shared, &self.context);
+            if done(&self.shared.borrow()) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                println!("gave up waiting for {what}");
+                return false;
+            }
+            self.mainloop
+                .loop_()
+                .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(10)));
+        }
+    }
+
+    /// Run the supervisor's tick `ticks` times, turning the loop for a while after each, so that
+    /// whatever it was going to write reaches the server and the server's answer comes back.
+    fn supervise_for(&self, ticks: u32) {
+        for _ in 0..ticks {
+            supervise(&self.shared, &self.context);
+            self.pump(Duration::from_millis(50));
         }
     }
 
@@ -653,5 +686,446 @@ fn a_passive_pair_that_stops_does_not_play_its_last_sound_to_the_next_one() {
     assert!(
         ring.underrun_frames.load(Ordering::Relaxed) > underruns,
         "the woken pair started on the last sound's cushion instead of re-priming"
+    );
+}
+
+// ---- The session default: who claims it, and when it goes back ---------------------------------
+
+/// What the input lane's capture stream records from instead of the microphone, if anything.
+fn via_of(shared: &Shared) -> Option<&'static str> {
+    shared
+        .lanes
+        .input
+        .nodes
+        .as_ref()
+        .and_then(|nodes| nodes.via)
+}
+
+/// The configured default of `direction`, as this main loop last heard it from the server.
+fn configured_of(shared: &Shared, direction: DeviceDirection) -> Option<&str> {
+    shared.defaults.get(direction).configured.as_deref()
+}
+
+impl Harness {
+    /// Attach the input lane to `t_mic`, as picking it does, and wait until the server says the
+    /// default source is FxSound's.
+    fn attach_the_microphone(&self) {
+        {
+            let mut shared = self.shared.borrow_mut();
+            shared.lanes.input.enabled = true;
+            shared.memory.input.user_selected = "t_mic".to_owned();
+            run_rules(&mut shared, DeviceDirection::Input);
+            assert_eq!(
+                pair_of(&shared, DeviceDirection::Input),
+                Some(("t_mic".to_owned(), 2))
+            );
+        }
+        assert!(
+            self.until("the input lane's claim on the default source", |shared| {
+                shared.defaults.input.holding
+                    && configured_of(shared, DeviceDirection::Input) == Some(SOURCE_NODE_NAME)
+            }),
+            "the input lane never took the default source"
+        );
+    }
+
+    /// What the user does in their sound settings: make `t_mic` itself the default source.
+    fn user_picks_the_microphone_as_the_default_source(&self) {
+        let written = self.meanwhile(|graph| {
+            graph.write_default(
+                devices::configured_default_key(DeviceDirection::Input),
+                "t_mic",
+            )
+        });
+        assert!(written.is_some(), "pw-metadata would not write the default");
+        assert!(
+            self.until("the user's choice to arrive", |shared| {
+                !shared.defaults.input.holding
+                    && configured_of(shared, DeviceDirection::Input) == Some("t_mic")
+            }),
+            "the user's choice of default source never reached the engine"
+        );
+    }
+
+    /// Whether the server's configured default source settles on `t_mic` and stays there for a
+    /// few turns of the loop — long enough for a claim the engine had issued to arrive.
+    fn default_source_stays_with_the_microphone(&self) -> bool {
+        self.pump(Duration::from_millis(300));
+        self.graph
+            .configured_default(DeviceDirection::Input)
+            .as_deref()
+            == Some("t_mic")
+            && configured_of(&self.shared.borrow(), DeviceDirection::Input) == Some("t_mic")
+    }
+}
+
+/// With echo cancellation on, choosing other speakers reloads the canceller — it listens to the
+/// speakers' monitor — and the input lane's capture stream is moved off its source onto the
+/// microphone, then back onto the new canceller's source a tick or two later. Both moves rebuild
+/// the input lane's pair on the microphone it was already on. Neither is the input lane attaching
+/// to anything, and neither may take back a default source the user had moved away from FxSound —
+/// which is what they did in 0.4.0's first cut, from a click on the *speakers*.
+#[test]
+fn a_capture_stream_the_echo_canceller_moves_leaves_the_users_default_source_alone() {
+    if let Some(missing) = canceller_missing() {
+        skip(&format!(
+            "{missing}, so the echo canceller's rebuilds of the capture stream were not checked"
+        ));
+        return;
+    }
+    if !installed("pw-metadata") {
+        skip("pw-metadata is not available, so the user's default source could not be chosen");
+        return;
+    }
+    let Some(graph) = PrivateGraph::start("aecclaim") else {
+        return;
+    };
+    let harness = Harness::connect(graph);
+    {
+        let mut shared = harness.shared.borrow_mut();
+        shared.aec = EchoCancel::new(aec::NULL_LIBRARY);
+        shared.aec.set_on(true);
+        shared.memory.output.user_selected = "t_stereo".to_owned();
+        run_rules(&mut shared, DeviceDirection::Output);
+    }
+    harness.attach_the_microphone();
+
+    // The supervisor's echo-cancellation step, as its tick runs it.
+    let tick = || {
+        let mut shared = harness.shared.borrow_mut();
+        reconcile_echo_cancel(&mut shared, Some(&harness.context));
+        if shared.aec.route_moved() {
+            run_rules(&mut shared, DeviceDirection::Input);
+        }
+    };
+    let onto_the_canceller = |what: &str| {
+        tick();
+        assert!(
+            harness.until(what, |shared| shared.aec.running()),
+            "the canceller never ran"
+        );
+        tick();
+        assert_eq!(
+            via_of(&harness.shared.borrow()),
+            Some(AEC_SOURCE_NODE_NAME),
+            "the capture stream did not move onto the canceller's source"
+        );
+    };
+    onto_the_canceller("the canceller's source");
+
+    harness.user_picks_the_microphone_as_the_default_source();
+
+    // Other speakers. The canceller that listened to the old ones goes in the same call, and the
+    // capture stream goes back to the microphone with it.
+    control(
+        &mut harness.shared.borrow_mut(),
+        UiToAudio::SelectDevice {
+            node_name: "t_71".to_owned(),
+            direction: DeviceDirection::Output,
+        },
+    );
+    {
+        let shared = harness.shared.borrow();
+        assert_eq!(
+            pair_of(&shared, DeviceDirection::Output).map(|p| p.0),
+            Some("t_71".to_owned())
+        );
+        assert_eq!(
+            pair_of(&shared, DeviceDirection::Input).map(|p| p.0),
+            Some("t_mic".to_owned())
+        );
+        assert_eq!(
+            via_of(&shared),
+            None,
+            "the stream was left on a canceller that has gone"
+        );
+        assert!(
+            !shared.defaults.input.holding,
+            "choosing other speakers took the default source back from the user"
+        );
+    }
+    // A canceller for the new speakers, and the stream back onto its source.
+    onto_the_canceller("the new canceller's source");
+    assert!(!harness.shared.borrow().defaults.input.holding);
+    assert!(
+        harness.default_source_stays_with_the_microphone(),
+        "the server's default source is {:?}, not the microphone the user chose",
+        harness.graph.configured_default(DeviceDirection::Input)
+    );
+}
+
+/// A pair that fails is rebuilt on the same device after its backoff, and that rebuild is a repair
+/// of the pair, not a claim on the default: a default the user moved away from FxSound while the
+/// pair was up stays where they put it.
+#[test]
+fn a_pair_rebuilt_on_its_own_device_after_a_failure_leaves_the_users_default_alone() {
+    if !installed("pw-metadata") {
+        skip("pw-metadata is not available, so the user's default source could not be chosen");
+        return;
+    }
+    let Some(graph) = PrivateGraph::start("repair") else {
+        return;
+    };
+    let harness = Harness::connect(graph);
+    harness.attach_the_microphone();
+    harness.user_picks_the_microphone_as_the_default_source();
+
+    {
+        let mut shared = harness.shared.borrow_mut();
+        shared
+            .lanes
+            .input
+            .status
+            .sink_error
+            .store(true, Ordering::Relaxed);
+        supervise_lane(&mut shared, DeviceDirection::Input, Instant::now());
+        assert_eq!(
+            pair_of(&shared, DeviceDirection::Input),
+            None,
+            "the failed pair went"
+        );
+        let retry = shared.lanes.input.next_attempt;
+        supervise_lane(&mut shared, DeviceDirection::Input, retry);
+        assert_eq!(
+            pair_of(&shared, DeviceDirection::Input),
+            Some(("t_mic".to_owned(), 2)),
+            "the pair came back on its microphone"
+        );
+        assert!(
+            !shared.defaults.input.holding,
+            "rebuilding the pair took the default source back from the user"
+        );
+    }
+    assert!(harness.default_source_stays_with_the_microphone());
+}
+
+/// A lane detached while the connection is down cannot hand its default back then — the
+/// connection is gone, and with it what was known about the defaults — and the key still names
+/// FxSound's source when the connection returns. The reconnect's supervisor hands it back to the
+/// microphone, once the device list has gone to the GUI, rather than adopting a claim no lane
+/// stands behind for the rest of the session.
+#[test]
+fn a_lane_detached_while_the_connection_was_down_hands_back_the_claim_the_reconnect_finds() {
+    let Some(graph) = PrivateGraph::start("detachdown") else {
+        return;
+    };
+    let harness = Harness::connect(graph);
+    harness.attach_the_microphone();
+
+    disconnect(&mut harness.shared.borrow_mut(), "the test pulled the plug");
+    control(
+        &mut harness.shared.borrow_mut(),
+        UiToAudio::DetachLane(DeviceDirection::Input),
+    );
+    connect(&harness.shared, &harness.context).expect("the daemon takes a second connection");
+    assert!(
+        harness.until("the registry and the default source, again", |shared| {
+            settled(shared) && shared.defaults.input.holding
+        }),
+        "the reconnect never read the default source back"
+    );
+
+    assert!(
+        harness.supervising_until(
+            "the default source to go back to the microphone",
+            |shared| { configured_of(shared, DeviceDirection::Input) == Some("t_mic") }
+        ),
+        "the default source still names a node no lane will build: {:?}",
+        configured_of(&harness.shared.borrow(), DeviceDirection::Input)
+    );
+    let shared = harness.shared.borrow();
+    assert!(!shared.lanes.input.enabled);
+    assert_eq!(pair_of(&shared, DeviceDirection::Input), None);
+}
+
+/// [`UiToAudio::SetAsDefault`] with `want: false`, sent while the connection is down: the same
+/// hand-back on the reconnect, and the lane itself comes back without the default.
+#[test]
+fn an_opt_out_sent_while_the_connection_was_down_is_honoured_when_it_returns() {
+    let Some(graph) = PrivateGraph::start("optoutdown") else {
+        return;
+    };
+    let harness = Harness::connect(graph);
+    harness.attach_the_microphone();
+
+    disconnect(&mut harness.shared.borrow_mut(), "the test pulled the plug");
+    control(
+        &mut harness.shared.borrow_mut(),
+        UiToAudio::SetAsDefault {
+            direction: DeviceDirection::Input,
+            want: false,
+        },
+    );
+    connect(&harness.shared, &harness.context).expect("the daemon takes a second connection");
+    assert!(
+        harness.until("the registry and the default source, again", |shared| {
+            settled(shared) && shared.defaults.input.holding
+        }),
+        "the reconnect never read the default source back"
+    );
+
+    assert!(
+        harness.supervising_until(
+            "the default source to go back to the microphone",
+            |shared| { configured_of(shared, DeviceDirection::Input) == Some("t_mic") }
+        ),
+        "the opt-out was ignored for the session: the default source is {:?}",
+        configured_of(&harness.shared.borrow(), DeviceDirection::Input)
+    );
+    let shared = harness.shared.borrow();
+    assert_eq!(
+        pair_of(&shared, DeviceDirection::Input),
+        Some(("t_mic".to_owned(), 2)),
+        "the lane is still attached; it only stopped being the default"
+    );
+    assert!(!shared.defaults.input.holding);
+}
+
+/// The registry's first dump says there is a `default` metadata object; what it holds is sent a
+/// round trip later, in answer to the bind the dump called for. Nothing may choose a device in
+/// between ([`Barrier`]): by the first moment the rules may run after a connect, the default
+/// source the server holds has been read.
+#[test]
+fn the_rules_wait_for_the_session_defaults_after_a_connect() {
+    let Some(graph) = PrivateGraph::start("barrier") else {
+        return;
+    };
+    let harness = Harness::connect(graph);
+    harness.attach_the_microphone();
+
+    disconnect(&mut harness.shared.borrow_mut(), "the test pulled the plug");
+    connect(&harness.shared, &harness.context).expect("the daemon takes a second connection");
+    assert!(
+        harness.until("the rules to be allowed to run", Shared::ready),
+        "the reconnect never let the rules run"
+    );
+    let shared = harness.shared.borrow();
+    assert_eq!(
+        configured_of(&shared, DeviceDirection::Input),
+        Some(SOURCE_NODE_NAME),
+        "the rules were allowed to run before the default source was read"
+    );
+    assert!(shared.defaults.input.holding);
+}
+
+/// [`an_opt_out_sent_while_the_connection_was_down_is_honoured_when_it_returns`], with the
+/// supervisor ticking from the moment the connection returns rather than once the default source
+/// has been read back. A tick between the registry's `done` and the `default` object's keys built
+/// the input lane's pair first; the key then read as the user's own pick of a node that was there,
+/// and the opt-out was ignored for the session.
+#[test]
+fn an_opt_out_sent_while_the_connection_was_down_survives_a_tick_before_the_defaults_are_read() {
+    let Some(graph) = PrivateGraph::start("optouttick") else {
+        return;
+    };
+    let harness = Harness::connect(graph);
+    harness.attach_the_microphone();
+
+    disconnect(&mut harness.shared.borrow_mut(), "the test pulled the plug");
+    control(
+        &mut harness.shared.borrow_mut(),
+        UiToAudio::SetAsDefault {
+            direction: DeviceDirection::Input,
+            want: false,
+        },
+    );
+    connect(&harness.shared, &harness.context).expect("the daemon takes a second connection");
+
+    assert!(
+        harness.supervising_until(
+            "the default source to go back to the microphone",
+            |shared| { configured_of(shared, DeviceDirection::Input) == Some("t_mic") }
+        ),
+        "the opt-out was ignored for the session: the default source is {:?}",
+        configured_of(&harness.shared.borrow(), DeviceDirection::Input)
+    );
+    assert!(
+        harness.supervising_until("the input lane's pair to come back", |shared| {
+            pair_of(shared, DeviceDirection::Input).is_some()
+        }),
+        "the reconnect never rebuilt the input lane"
+    );
+    let shared = harness.shared.borrow();
+    assert_eq!(
+        pair_of(&shared, DeviceDirection::Input),
+        Some(("t_mic".to_owned(), 2)),
+        "the lane is still attached; it only stopped being the default"
+    );
+    assert!(!shared.defaults.input.holding);
+}
+
+/// An attached lane that has opted out of the default, and a user who made FxSound's source the
+/// default in their sound settings all the same. The connection goes and comes back. The reconnect
+/// reads the key before the pair is rebuilt, when there is no node of ours for anyone to have
+/// picked — and it is still the user's pick, and stays theirs however many ticks go by.
+#[test]
+fn a_default_the_user_gave_an_opted_out_lane_by_hand_survives_a_reconnect() {
+    if !installed("pw-metadata") {
+        skip("pw-metadata is not available, so the user's default source could not be chosen");
+        return;
+    }
+    let Some(graph) = PrivateGraph::start("byhand") else {
+        return;
+    };
+    let harness = Harness::connect(graph);
+    harness.attach_the_microphone();
+    control(
+        &mut harness.shared.borrow_mut(),
+        UiToAudio::SetAsDefault {
+            direction: DeviceDirection::Input,
+            want: false,
+        },
+    );
+    assert!(
+        harness.until("the opt-out's hand-back", |shared| {
+            configured_of(shared, DeviceDirection::Input) == Some("t_mic")
+        }),
+        "opting out never handed the default source back"
+    );
+
+    // In their sound settings, the user picks FxSound's source anyway.
+    let written = harness.meanwhile(|graph| {
+        graph.write_default(
+            devices::configured_default_key(DeviceDirection::Input),
+            SOURCE_NODE_NAME,
+        )
+    });
+    assert!(written.is_some(), "pw-metadata would not write the default");
+    assert!(
+        harness.until("the user's choice to arrive", |shared| {
+            shared.defaults.input.holding && !shared.defaults.input.disowned
+        }),
+        "the user's choice of default source never reached the engine"
+    );
+
+    disconnect(&mut harness.shared.borrow_mut(), "the test pulled the plug");
+    connect(&harness.shared, &harness.context).expect("the daemon takes a second connection");
+    assert!(
+        harness.until("the registry and the default source, again", |shared| {
+            settled(shared) && shared.defaults.input.holding
+        }),
+        "the reconnect never read the default source back"
+    );
+    assert!(
+        harness.supervising_until("the input lane's pair to come back", |shared| {
+            pair_of(shared, DeviceDirection::Input).is_some()
+        }),
+        "the reconnect never rebuilt the input lane"
+    );
+    // Well past the ticks a hand-back waits for.
+    harness.supervise_for(5);
+    assert_eq!(
+        harness
+            .graph
+            .configured_default(DeviceDirection::Input)
+            .as_deref(),
+        Some(SOURCE_NODE_NAME),
+        "the reconnect undid the default source the user picked"
+    );
+    let shared = harness.shared.borrow();
+    assert!(shared.defaults.input.holding);
+    assert!(
+        !shared.lanes.input.want_default,
+        "and the lane is still opted out"
     );
 }

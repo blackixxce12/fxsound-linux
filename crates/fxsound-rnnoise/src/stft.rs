@@ -6,9 +6,9 @@
 
 //! Per-channel analysis and synthesis without the network.
 
-use crate::features::{clear_dft, overlap_add, transform_input};
-use crate::{Complex, FRAME_SIZE, FREQ_SIZE, NB_BANDS, WINDOW_SIZE};
-use easyfft::dyn_size::realfft::DynRealDft;
+use crate::features::{overlap_add, transform_input};
+use crate::fft::{Fft, Spectrum};
+use crate::{FRAME_SIZE, FREQ_SIZE, NB_BANDS, WINDOW_SIZE, common};
 
 /// The library's STFT and overlap-add on their own: [`push`](Stft::push) a frame, then
 /// [`synthesise`](Stft::synthesise) it with a set of band gains — typically the ones a
@@ -22,7 +22,9 @@ use easyfft::dyn_size::realfft::DynRealDft;
 /// search of its own; a channel synthesised this way gets the mask's suppression and not the
 /// comb between the harmonics.
 ///
-/// Sized at construction; nothing here allocates afterwards.
+/// Planned and sized at construction — the transforms, their buffers and the library's tables —
+/// so that nothing here allocates or initialises anything afterwards, on its first frame
+/// included.
 #[derive(Clone)]
 pub struct Stft {
     /// The previous frame and the current one, high-pass filtered: the analysis window.
@@ -30,8 +32,9 @@ pub struct Stft {
     mem_hp_x: [f32; 2],
     synthesis_mem: [f32; FRAME_SIZE],
     window_buf: [f32; WINDOW_SIZE],
-    x: DynRealDft<f32>,
+    x: Spectrum,
     ex: [f32; NB_BANDS],
+    fft: Fft,
 }
 
 impl Default for Stft {
@@ -41,15 +44,18 @@ impl Default for Stft {
 }
 
 impl Stft {
-    /// Allocates the transform. Do this before real time starts.
+    /// Plans the transforms and allocates their buffers, and builds the library's window table
+    /// if nothing has yet. Do this before real time starts.
     pub fn new() -> Self {
+        common();
         Self {
             input_mem: [0.0; WINDOW_SIZE],
             mem_hp_x: [0.0; 2],
             synthesis_mem: [0.0; FRAME_SIZE],
             window_buf: [0.0; WINDOW_SIZE],
-            x: DynRealDft::new(0.0, &[Complex::default(); FREQ_SIZE - 1], WINDOW_SIZE),
+            x: Spectrum::new(),
             ex: [0.0; NB_BANDS],
+            fft: Fft::new(),
         }
     }
 
@@ -59,7 +65,7 @@ impl Stft {
         self.mem_hp_x = [0.0; 2];
         self.synthesis_mem.fill(0.0);
         self.window_buf.fill(0.0);
-        clear_dft(&mut self.x);
+        self.x.clear();
         self.ex.fill(0.0);
     }
 
@@ -71,6 +77,7 @@ impl Stft {
         self.input_mem.copy_within(FRAME_SIZE.., 0);
         crate::util::BIQUAD_HP.filter(&mut self.input_mem[new_idx..], &mut self.mem_hp_x, input);
         transform_input(
+            &mut self.fft,
             &self.input_mem,
             0,
             &mut self.window_buf,
@@ -87,6 +94,7 @@ impl Stft {
         crate::interp_band_gain(&mut gf[..], &gains[..]);
         self.x *= &gf[..];
         overlap_add(
+            &mut self.fft,
             &self.x,
             &mut self.window_buf,
             &mut self.synthesis_mem,

@@ -467,7 +467,7 @@ impl PrivateGraph {
 
     /// Write one key of the `default` metadata object. `None` when `pw-metadata` is not there or
     /// refused.
-    fn write_default(&self, key: &str, node_name: &str) -> Option<()> {
+    pub(crate) fn write_default(&self, key: &str, node_name: &str) -> Option<()> {
         let value = devices::default_node_value(node_name);
         self.tool(
             "pw-metadata",
@@ -477,7 +477,7 @@ impl PrivateGraph {
     }
 
     /// What `default.configured.audio.<sink|source>` names right now, if anything.
-    fn configured_default(&self, direction: DeviceDirection) -> Option<String> {
+    pub(crate) fn configured_default(&self, direction: DeviceDirection) -> Option<String> {
         let listing = self.tool("pw-metadata", &["-n", "default"])?;
         let key = format!("key:'{}'", devices::configured_default_key(direction));
         listing
@@ -489,7 +489,7 @@ impl PrivateGraph {
 
     /// Wait until the configured default of `direction` names `want`. `None` when `pw-metadata` is
     /// not there to ask; otherwise what it last named.
-    fn default_settles_on(
+    pub(crate) fn default_settles_on(
         &self,
         direction: DeviceDirection,
         want: &str,
@@ -1257,7 +1257,9 @@ fn the_session_defaults_outrank_the_settings_file_and_are_remembered_per_lane() 
 /// there and adopts the claims without knowing what they displaced. The settings file's copy,
 /// [`UiToAudio::SeedRememberedDefaults`], is what it knows instead: the output lane attaches to
 /// the remembered sink rather than to whichever is listed first, and a clean exit points both keys
-/// at real devices again.
+/// at real devices again. The input lane was on when the run was killed, and its microphone is
+/// plugged in: the default source stays FxSound's from start to finish, rather than going to the
+/// microphone before the app has attached the lane and coming back once it has.
 ///
 /// Sent the way the app sends it, straight after the start. The first rules run on the first
 /// supervisor tick, 200 ms later, so the seed is in place by then.
@@ -1286,16 +1288,59 @@ fn a_claim_left_behind_by_a_killed_run_is_handed_back_to_the_seeded_devices() {
         output: "t_71".to_owned(),
         input: "t_mic".to_owned(),
     });
+
+    // The app switches the input lane back on from the device list — the saved microphone, the
+    // first time it is listed — and a window coming up for the first time can take a while to read
+    // it. Until it has, the claim on the default source is not one to hand back: the microphone
+    // is right there, and handing it back would only have the input lane take it again a moment
+    // later, moving whatever records from the default source twice. So the engine is left unread
+    // while the output lane comes up and for a second after, and the key watched all the while.
+    let Some(output_up) = unless_skipped(
+        graph.nodes_until(|nodes| nodes.iter().any(|(name, _)| *name == SINK_NODE_NAME)),
+        "pw-dump",
+        "the default source before the app has read the device list",
+    ) else {
+        handle.shutdown();
+        return;
+    };
+    assert!(output_up.is_ok(), "the output lane never came up");
+    let unread_until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < unread_until {
+        assert_eq!(
+            graph.configured_default(DeviceDirection::Input).as_deref(),
+            Some(SOURCE_NODE_NAME),
+            "the default source was handed back before the app had seen the microphone listed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     let mut said = Transcript::default();
     assert!(
         said.attached(&handle, DeviceDirection::Output, Some("t_71")),
         "the output lane should go to the seeded sink, not to the first one listed"
     );
+    // What the app does once its loop reads the list, in the same breath.
+    assert!(said.heard(&handle, "the microphone listed", |m| matches!(
+        m,
+        AudioToUi::Devices(devices) if devices.iter().any(|d| d.name == "t_mic")
+    )));
     handle.send(UiToAudio::SelectDevice {
         node_name: "t_mic".to_owned(),
         direction: DeviceDirection::Input,
     });
     assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
+
+    // The input lane stands behind the claim now, and adopts it: the default source stays with
+    // FxSound through the ticks that would have handed it back.
+    let adopted_by = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < adopted_by {
+        assert_eq!(
+            graph.configured_default(DeviceDirection::Input).as_deref(),
+            Some(SOURCE_NODE_NAME),
+            "the default source was handed back from under the input lane that stands behind it"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     said.settle(&handle);
     assert!(
@@ -1316,6 +1361,99 @@ fn a_claim_left_behind_by_a_killed_run_is_handed_back_to_the_seeded_devices() {
         graph.configured_default(DeviceDirection::Input).as_deref(),
         Some("t_mic"),
         "the stale default source should go to the microphone"
+    );
+}
+
+/// The same killed run, and a start with the microphone it had been processing unplugged — so the
+/// app never switches the input lane on, and nothing will build the node the default source still
+/// names. The claim is handed back to that microphone once it is plugged in and the app has seen it
+/// listed, while FxSound runs, rather than left naming nothing for the whole session; and not
+/// before the microphone is there, when handing it
+/// back could only have released it into nothing. The input lane stays detached throughout: the
+/// hand-back is not an attachment. The output lane's claim is its own and is adopted as before.
+#[test]
+fn a_claim_left_behind_for_a_lane_that_stays_detached_is_handed_back_while_the_engine_runs() {
+    let Some(graph) = PrivateGraph::start("orphan") else {
+        return;
+    };
+    for (direction, ours) in [
+        (DeviceDirection::Output, SINK_NODE_NAME),
+        (DeviceDirection::Input, SOURCE_NODE_NAME),
+    ] {
+        let Some(()) = unless_skipped(
+            graph.write_default(devices::configured_default_key(direction), ours),
+            "pw-metadata",
+            "the hand-back of a claim no lane stands behind",
+        ) else {
+            return;
+        };
+        assert_eq!(graph.default_settles_on(direction, ours), Some(Ok(())));
+    }
+
+    let handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    handle.send(UiToAudio::SeedRememberedDefaults {
+        output: "t_71".to_owned(),
+        input: "t_tone".to_owned(),
+    });
+    let mut said = Transcript::default();
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_71")));
+
+    // Unplugged: there is nothing to hand the default source back to yet, so it is left alone.
+    said.settle(&handle);
+    assert_eq!(
+        graph.configured_default(DeviceDirection::Input).as_deref(),
+        Some(SOURCE_NODE_NAME),
+        "the default source was released with nothing to go to"
+    );
+
+    // Plugged in.
+    if graph.add_tone("t_tone").is_none() {
+        skip(
+            "the tone never appeared (is audiotestsrc installed?), so the hand-back was not checked",
+        );
+        handle.shutdown();
+        return;
+    }
+    // The app reads the list with the microphone on it, and — its lane saved as off — leaves the
+    // lane detached. That is its chance gone by; the claim goes back.
+    assert!(said.heard(&handle, "the microphone listed", |m| matches!(
+        m,
+        AudioToUi::Devices(devices) if devices.iter().any(|d| d.name == "t_tone")
+    )));
+    assert_eq!(
+        graph.default_settles_on(DeviceDirection::Input, "t_tone"),
+        Some(Ok(())),
+        "the default source named a node no lane will ever build, with the microphone right there"
+    );
+    assert_eq!(
+        graph.configured_default(DeviceDirection::Output).as_deref(),
+        Some(SINK_NODE_NAME),
+        "the output lane's claim is the output lane's"
+    );
+    said.settle(&handle);
+    assert_eq!(
+        said.attachments(DeviceDirection::Input),
+        Vec::<Option<String>>::new(),
+        "handing the claim back switched the input lane on"
+    );
+    assert!(
+        !said.0.iter().any(|m| matches!(
+            m,
+            AudioToUi::RememberedDefault { node_name, .. } if OUR_NODE_NAMES.contains(&node_name.as_str())
+        )),
+        "a stale claim was remembered as the default from before FxSound"
+    );
+
+    handle.shutdown();
+    assert_eq!(
+        graph.configured_default(DeviceDirection::Output).as_deref(),
+        Some("t_71")
+    );
+    assert_eq!(
+        graph.configured_default(DeviceDirection::Input).as_deref(),
+        Some("t_tone"),
+        "the exit took the default source back from the microphone"
     );
 }
 

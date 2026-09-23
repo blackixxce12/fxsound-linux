@@ -5,11 +5,13 @@
 //! detection, or when the `train` feature is enabled they can be collected and used to train new
 //! neural nets.
 
+// fxsound: `Spectrum` and `Fft` (`crate::fft`) in place of `easyfft`'s `DynRealDft` and its
+// thread-local transforms; `Complex` was only needed to build a `DynRealDft`.
+use crate::fft::{Fft, Spectrum};
 use crate::{
-    CEPS_MEM, Complex, FRAME_SIZE, FREQ_SIZE, NB_BANDS, NB_DELTA_CEPS, NB_FEATURES, PITCH_BUF_SIZE,
+    CEPS_MEM, FRAME_SIZE, FREQ_SIZE, NB_BANDS, NB_DELTA_CEPS, NB_FEATURES, PITCH_BUF_SIZE,
     WINDOW_SIZE, common,
 };
-use easyfft::{dyn_size::realfft::DynRealDft, prelude::*};
 
 /// Contains the necessary state to compute the features of audio input and synthesize the output.
 ///
@@ -30,9 +32,9 @@ pub struct DenoiseFeatures {
 
     // What follows are various buffers. The names are cryptic, but they follow a pattern.
     /// The Fourier transform of the most recent frame of input.
-    pub x: DynRealDft<f32>,
+    pub x: Spectrum,
     /// The Fourier transform of a pitch-period-shifted window of input.
-    pub p: DynRealDft<f32>,
+    pub p: Spectrum,
     /// The band energies of `x` (the signal).
     pub ex: [f32; NB_BANDS],
     /// The band energies of `p` (the signal, lagged by one pitch period).
@@ -43,6 +45,9 @@ pub struct DenoiseFeatures {
     features: [f32; NB_FEATURES],
 
     pitch_finder: crate::pitch::PitchFinder,
+
+    // fxsound: the transforms, planned here rather than on the first frame analysed.
+    fft: Fft,
 }
 
 const fn max(a: usize, b: usize) -> usize {
@@ -59,6 +64,10 @@ impl Default for DenoiseFeatures {
 impl DenoiseFeatures {
     /// Creates a new, empty, `DenoiseFeatures`.
     pub fn new() -> DenoiseFeatures {
+        // fxsound: build the window and DCT tables now, on the thread constructing this, if
+        // nothing has yet. Left to their first use, the first frame would build them in the
+        // middle of an audio callback.
+        common();
         DenoiseFeatures {
             input_mem: [0.0; max(FRAME_SIZE, PITCH_BUF_SIZE)],
             cepstral_mem: [[0.0; NB_BANDS]; CEPS_MEM],
@@ -66,13 +75,14 @@ impl DenoiseFeatures {
             mem_hp_x: [0.0; 2],
             synthesis_mem: [0.0; FRAME_SIZE],
             window_buf: [0.0; WINDOW_SIZE],
-            x: DynRealDft::new(0.0, &[Complex::default(); FREQ_SIZE - 1], WINDOW_SIZE),
-            p: DynRealDft::new(0.0, &[Complex::default(); FREQ_SIZE - 1], WINDOW_SIZE),
+            x: Spectrum::new(),
+            p: Spectrum::new(),
             ex: [0.0; NB_BANDS],
             ep: [0.0; NB_BANDS],
             exp: [0.0; NB_BANDS],
             features: [0.0; NB_FEATURES],
             pitch_finder: crate::pitch::PitchFinder::new(),
+            fft: Fft::new(),
         }
     }
 
@@ -94,8 +104,8 @@ impl DenoiseFeatures {
         self.mem_hp_x = [0.0; 2];
         self.synthesis_mem.fill(0.0);
         self.window_buf.fill(0.0);
-        clear_dft(&mut self.x);
-        clear_dft(&mut self.p);
+        self.x.clear();
+        self.p.clear();
         self.ex.fill(0.0);
         self.ep.fill(0.0);
         self.exp.fill(0.0);
@@ -142,6 +152,7 @@ impl DenoiseFeatures {
         let mut tmp = [0.0; NB_BANDS];
 
         transform_input(
+            &mut self.fft,
             &self.input_mem,
             0,
             &mut self.window_buf,
@@ -151,6 +162,7 @@ impl DenoiseFeatures {
         let pitch_idx = self.find_pitch();
 
         transform_input(
+            &mut self.fft,
             &self.input_mem,
             pitch_idx,
             &mut self.window_buf,
@@ -287,7 +299,13 @@ impl DenoiseFeatures {
 
     pub(crate) fn frame_synthesis(&mut self, out: &mut [f32]) {
         // fxsound: the body moved to `overlap_add` so that `Stft` runs the identical synthesis.
-        overlap_add(&self.x, &mut self.window_buf, &mut self.synthesis_mem, out);
+        overlap_add(
+            &mut self.fft,
+            &self.x,
+            &mut self.window_buf,
+            &mut self.synthesis_mem,
+            out,
+        );
     }
 }
 
@@ -296,12 +314,14 @@ impl DenoiseFeatures {
 /// Inverse-transforms `x`, windows it and overlap-adds it with the previous frame's tail, writing
 /// `FRAME_SIZE` samples to `out`.
 pub(crate) fn overlap_add(
-    x: &DynRealDft<f32>,
+    fft: &mut Fft,
+    x: &Spectrum,
     window_buf: &mut [f32; WINDOW_SIZE],
     synthesis_mem: &mut [f32; FRAME_SIZE],
     out: &mut [f32],
 ) {
-    x.real_ifft_using(window_buf);
+    // fxsound: through the transform planned at construction, not `easyfft`'s thread-local one.
+    fft.inverse(x, window_buf);
     // Not too sure why this scaling factor is introduced
     for x in window_buf.iter_mut() {
         *x /= 2.0;
@@ -320,28 +340,22 @@ pub(crate) fn overlap_add(
     }
 }
 
-// fxsound: zero a transform in place; `DynRealDft` has no method for it.
-pub(crate) fn clear_dft(x: &mut DynRealDft<f32>) {
-    *x.get_offset_mut() = 0.0;
-    for bin in x.get_frequency_bins_mut() {
-        *bin = Complex::default();
-    }
-}
-
 /// Fourier transforms the input.
 ///
 /// The Fourier transform goes in `x` and the band energies go in `ex`.
 // fxsound: `pub(crate)` so that `Stft` analyses a channel exactly as the network's path does.
 pub(crate) fn transform_input(
+    fft: &mut Fft,
     input: &[f32],
     lag: usize,
     window_buf: &mut [f32; WINDOW_SIZE],
-    x: &mut DynRealDft<f32>,
+    x: &mut Spectrum,
     ex: &mut [f32],
 ) {
     let input = &input[input.len().checked_sub(WINDOW_SIZE + lag).unwrap()..];
     crate::apply_window(&mut window_buf[..], input);
-    window_buf.real_fft_using(x);
+    // fxsound: through the transform planned at construction, not `easyfft`'s thread-local one.
+    fft.forward(window_buf, x);
 
     // In the original RNNoise code, the forward transform is normalized and the inverse
     // tranform isn't. `rustfft` doesn't normalize either one, so we do it ourselves.

@@ -115,8 +115,8 @@ use crate::per_direction::PerDirection;
 use crate::{
     AEC_SOURCE_NODE_NAME, AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION,
     DEFAULT_QUANTUM_FRAMES, DEFAULT_SAMPLE_RATE, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS,
-    OUTPUT_NODE_NAME, OUTPUT_STREAM_DESCRIPTION, RING_CAPACITY_FRAMES, SINK_DESCRIPTION,
-    SINK_NODE_NAME, SOURCE_NODE_NAME, link_group, locale, our_node_name,
+    OUR_NODE_NAMES, OUTPUT_NODE_NAME, OUTPUT_STREAM_DESCRIPTION, RING_CAPACITY_FRAMES,
+    SINK_DESCRIPTION, SINK_NODE_NAME, SOURCE_NODE_NAME, link_group, locale, our_node_name,
 };
 
 /// The rate the capture stream asks for, whatever the microphone runs at.
@@ -129,6 +129,12 @@ const CAPTURE_RATE: u32 = DEFAULT_SAMPLE_RATE;
 /// How often the supervisor runs. Also the shortest possible reconnect interval, which is the
 /// "never retry faster than 200 ms" floor of `docs/spec/12-audio-io.md` §22.
 const SUPERVISOR_PERIOD: Duration = Duration::from_millis(200);
+
+/// How many supervisor ticks — five seconds of them — a claim on a default that no lane stands
+/// behind waits for the GUI to take the device list before it is handed back regardless
+/// ([`Shared::gui_has_had_its_chance`]). A GUI takes it within a tick of its loop; this is for an
+/// engine nobody reads from, which has no lane to attach on its behalf and nothing to wait for.
+const GUI_PATIENCE_TICKS: u32 = 25;
 
 /// Retry backoff in milliseconds, then flat at the last value. The socket and each lane keep their
 /// own count against it.
@@ -154,6 +160,12 @@ const RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
 /// and an unanswered registry sync — shutdown right after a reconnect — would otherwise pass for
 /// the confirmation before the metadata write had reached the server.
 const RELEASE_SEQ: i32 = 1;
+
+/// Sequence number of the `sync` put behind the binds the registry's first dump called for
+/// ([`Barrier::Metadata`]), apart from the registry's `0` and [`RELEASE_SEQ`] as those two are
+/// apart from each other. The barrier waits for the number the `sync` returned, which is the one
+/// its `done` carries back.
+const METADATA_SEQ: i32 = 2;
 
 /// How long the output lane's NODE 1 has to have been paused before its NODE 2 is put to sleep,
 /// on a server that does not do that by itself ([`SecondNodePace`]).
@@ -888,6 +900,33 @@ enum State {
     Running,
 }
 
+/// How far a connection has got towards knowing the graph well enough to act on it
+/// ([`Shared::ready`]): two round trips, one behind the other. A `sync`'s `done` comes back only
+/// once the server has answered everything sent before it.
+///
+/// The registry's dump is not enough on its own. It announces the `default` and `settings`
+/// metadata objects, but what they hold is sent only in answer to their bind, which the dump
+/// itself calls for ([`on_global`]) — one round trip after the registry's `done`. And every lane
+/// decision reads it: the current default steers the choice of device, the configured one is what
+/// a claim remembers as displaced, and the graph's clock sets an output pair's rate. A pair built
+/// in that gap is built without them, and rebuilt a moment later on what they say.
+///
+/// Worse, a claim on a default is told apart by whether the lane had a pair when the key was read
+/// ([`on_metadata_property`]). A key that names FxSound's node before this connection has built
+/// it is nobody's pick in this session; one read after may be the user's. A pair built first
+/// would turn the claim a lane that opted out while the connection was down still has to hand
+/// back into the user's own pick, and keep it for the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Barrier {
+    /// The registry's first dump is on its way: [`connect`]'s `sync` has not come back.
+    Registry,
+    /// The dump is in, and every bind it called for has been sent. This `sync` went after them,
+    /// so it comes back after what they were answered with ([`METADATA_SEQ`]).
+    Metadata(AsyncSeq),
+    /// Both are in.
+    Passed,
+}
+
 /// What the `default` metadata object says about one direction (`docs/spec/12-audio-io.md` §21).
 #[derive(Debug, Default)]
 struct DefaultState {
@@ -899,6 +938,54 @@ struct DefaultState {
     /// True while the configured key names our node. Kept in step with the metadata events, so it
     /// is also true when the user picked FxSound by hand in their sound settings.
     holding: bool,
+    /// The configured key names our node, and no lane of ours stands behind that claim: it was
+    /// read while the lane was detached, or while it had opted out of the default and had no node
+    /// for anyone to have picked — and had not been picked by the user before the connection went
+    /// ([`Lane::kept_by_hand`]). So nobody chose it in this session — it is a claim a killed run
+    /// left behind, or one this run could not hand back because the connection was down when the
+    /// lane was detached or opted out. Handed back by [`hand_back_disowned_defaults`], once the
+    /// GUI has had its chance to attach the lane after all ([`ListDelivery`]).
+    disowned: bool,
+}
+
+/// How far the GUI has got with the device lists it is sent: whether it has had its chance to act
+/// on the latest one ([`Shared::gui_has_had_its_chance`]).
+///
+/// What the app does with a device list is attach the lanes it remembers. The saved microphone
+/// switches the input lane on the first time it is listed, and nothing else ever will. So a claim
+/// on a default that no lane stands behind *yet* — a killed run's, found at the start — can be one
+/// the app is about to stand behind. Handed back before the app has seen the list, it moves every
+/// application recording from the default source onto the microphone, and back onto FxSound's
+/// source a moment later, when the lane the app attaches claims it again.
+///
+/// Told apart by the channel itself rather than by a delay: the app reads its notifications once
+/// per turn of its loop, and a window that takes seconds to come up the first time reads nothing
+/// until it has. It acts on a device list as it takes it, and sends the lane's attachment in the
+/// same breath, so once a tick has seen the list taken, the attachment has had a whole tick to
+/// arrive.
+#[derive(Debug, Default)]
+struct ListDelivery {
+    /// Every notification sent over this run, queued or not. Less the channel's length, what the
+    /// GUI has taken off it — and one that could not be queued, with nobody listening, is nothing
+    /// to wait for.
+    sent: Cell<u64>,
+    /// `sent` just after the latest device list was queued: the GUI has that list once it has
+    /// taken this many.
+    list: u64,
+    /// Supervisor ticks spent waiting for the GUI to take it.
+    waited: u32,
+    /// An earlier tick saw the GUI holding the latest list.
+    taken: bool,
+}
+
+impl ListDelivery {
+    /// A device list has just been queued: whatever was known about the last one is not about
+    /// this one.
+    fn list_sent(&mut self) {
+        self.list = self.sent.get();
+        self.waited = 0;
+        self.taken = false;
+    }
 }
 
 /// One direction's worth of engine state (`docs/0.4.0-design.md` §1.1): its pair of nodes, its
@@ -932,6 +1019,22 @@ struct Lane {
     /// Whether to take the session default for this lane's direction once its nodes are up.
     /// `true` unless a caller opted out with [`UiToAudio::SetAsDefault`] with `want: false`.
     want_default: bool,
+    /// The connection went while the default of this lane's direction named its node, and the
+    /// lane had opted out of the default — so it named FxSound because the user picked it in
+    /// their sound settings, not because this lane claimed it ([`disconnect`]). The reconnect
+    /// finds that key before it has rebuilt the pair; this is what tells it the claim is the
+    /// user's to keep rather than one to hand back ([`on_metadata_property`]).
+    ///
+    /// Given up by whatever would have handed the default back had the connection been up: the
+    /// lane opting out again or opting in ([`UiToAudio::SetAsDefault`]), and the pair ending with
+    /// its claim ([`teardown_nodes`]) — a detach, or no device left to attach to.
+    kept_by_hand: bool,
+    /// The device this lane's last pair was built on, kept through the gaps between pairs, so
+    /// that a pair rebuilt on the same device is known for a repair rather than an attachment,
+    /// and leaves the default as it found it ([`apply_rules`]). Forgotten when the pair is torn
+    /// down with its claim ([`teardown_nodes`]), and when the connection goes while the lane held
+    /// the default ([`disconnect`]), so that the next pair claims it again.
+    last_target: Option<String>,
     /// Something this lane's device choice depends on changed. Only ever set on an enabled lane.
     needs_rules: bool,
     /// Consecutive failed tries at this lane's pair, for its own backoff
@@ -942,7 +1045,7 @@ struct Lane {
     /// When this lane's current pair was built; `None` while it has none. What the backoff and the
     /// last error are forgiven against ([`Lane::forgive_if_stable`]): the time a pair has actually
     /// been up, not the time a rebuild was first allowed, which can be much earlier — a rebuild
-    /// waits for the registry's first dump as well as for its backoff.
+    /// waits for the connection's [`Barrier`] as well as for its backoff.
     built_at: Option<Instant>,
     /// Every format mismatch this lane has seen.
     ///
@@ -975,6 +1078,8 @@ impl Lane {
             status: Arc::new(StreamStatus::default()),
             previous_names: Vec::new(),
             want_default: true,
+            kept_by_hand: false,
+            last_target: None,
             needs_rules: false,
             attempts: 0,
             next_attempt: Instant::now(),
@@ -1039,9 +1144,10 @@ impl Lane {
 struct Shared {
     state: State,
     session: Option<Session>,
-    /// The initial registry dump of this session has been delivered, so a device choice made now
-    /// is made against the whole graph rather than whatever part of it has arrived so far.
-    registry_ready: bool,
+    /// How much of the graph this session has been told: once [`Barrier::Passed`], a device choice
+    /// made now is made against the whole graph and the defaults it names, rather than whatever
+    /// part of them has arrived so far.
+    barrier: Barrier,
     /// The output lane and the input lane. Both can run at once.
     lanes: PerDirection<Lane>,
     /// Every sink and source the registry reports, both directions, keyed by registry global id.
@@ -1062,6 +1168,9 @@ struct Shared {
     node_probes: std::collections::HashMap<u32, NodeProbe>,
     /// The session defaults, one per direction.
     defaults: PerDirection<DefaultState>,
+    /// Whether the GUI has had its chance to attach a lane from the device list, before a claim
+    /// no lane stands behind is handed back ([`ListDelivery`]).
+    delivery: ListDelivery,
     /// The graph's clock, as the `settings` metadata object reports it: the rate an output pair is
     /// built at when its sink does not publish one of its own ([`PairFormat::for_target`]).
     clock: GraphClock,
@@ -1130,7 +1239,7 @@ impl Shared {
         Self {
             state: State::Disconnected,
             session: None,
-            registry_ready: false,
+            barrier: Barrier::Registry,
             lanes: PerDirection {
                 output: Lane::new(true, output),
                 input: Lane::new(false, input),
@@ -1138,6 +1247,7 @@ impl Shared {
             devices: Vec::new(),
             node_probes: std::collections::HashMap::new(),
             defaults: PerDirection::default(),
+            delivery: ListDelivery::default(),
             clock: GraphClock::default(),
             memory: PerDirection::default(),
             needs_publish: false,
@@ -1160,6 +1270,7 @@ impl Shared {
     }
 
     fn notify(&self, message: AudioToUi) {
+        self.delivery.sent.set(self.delivery.sent.get() + 1);
         if self.notify.send(message).is_err() {
             log::debug!("no GUI is listening for audio notifications");
         }
@@ -1206,9 +1317,40 @@ impl Shared {
     }
 
     /// Whether a device choice can be made and acted on right now: connected, and the registry's
-    /// first dump is in.
+    /// first dump is in, with what the metadata objects it announced hold ([`Barrier`]).
     fn ready(&self) -> bool {
-        self.session.is_some() && self.registry_ready
+        self.session.is_some() && self.barrier == Barrier::Passed
+    }
+
+    /// Whether the GUI has had its chance to attach a lane from the device list ([`ListDelivery`]):
+    /// no newer list is waiting to be sent, and an earlier tick than this one saw the latest taken
+    /// off the channel — or it has gone untaken for [`GUI_PATIENCE_TICKS`]. Once per supervisor
+    /// tick: the ticks are what it counts.
+    ///
+    /// An earlier tick, and not this one, because the GUI takes the list first and sends the
+    /// attachment after it. A tick that saw the list gone could run between the two, and the
+    /// attachment it would miss is on its way; the next tick is 200 ms later, and finds it made.
+    fn gui_has_had_its_chance(&mut self) -> bool {
+        // Something changed that the GUI has not been sent yet — a device appeared, one the app
+        // may be waiting for. This tick's publish sends it.
+        if self.needs_publish {
+            return false;
+        }
+        if self.delivery.taken {
+            return true;
+        }
+        let taken_off = self
+            .delivery
+            .sent
+            .get()
+            .saturating_sub(self.notify.len() as u64);
+        let delivery = &mut self.delivery;
+        if taken_off >= delivery.list {
+            delivery.taken = true;
+            return false;
+        }
+        delivery.waited = delivery.waited.saturating_add(1);
+        delivery.waited >= GUI_PATIENCE_TICKS
     }
 
     /// Ask for the rules to run for a lane, if it is enabled. A detached lane ignores the registry
@@ -1565,12 +1707,21 @@ fn control(shared: &mut Shared, message: UiToAudio) {
             shared.mark_enabled_lanes_for_rules();
         }
         UiToAudio::SetAsDefault { direction, want } => {
-            shared.lanes.get_mut(direction).want_default = want;
+            let lane = shared.lanes.get_mut(direction);
+            lane.want_default = want;
+            // Either way the lane has spoken for its default since the user's pick. Opted in, it
+            // claims it; opted out, what it holds goes back — here and now, or, with the
+            // connection down, on the reconnect that finds it ([`hand_back_disowned_defaults`]).
+            lane.kept_by_hand = false;
             if want {
                 // With no nodes yet the claim happens when they come up; writing the key now
-                // would point the default at a node that does not exist.
+                // would point the default at a node that does not exist. Those nodes may be a
+                // repair of the pair the lane had — a rebuild after a failure, which on its own
+                // leaves the default as it finds it — so the lane is told its next pair attaches.
                 if shared.lanes.get(direction).nodes.is_some() {
                     claim_default(shared, direction);
+                } else {
+                    shared.lanes.get_mut(direction).last_target = None;
                 }
             } else {
                 release_default(shared, direction);
@@ -1585,13 +1736,19 @@ fn control(shared: &mut Shared, message: UiToAudio) {
             // Only ever fills a gap. If this run has already displaced something, that is the
             // fresher truth and the settings file's copy is stale by a whole session.
             //
-            // This is the whole repair, and it is smaller than it looks. A process that starts and
-            // finds the default naming `fxsound_sink` adopts that claim as its own — which is
-            // harmless *provided it knows what to hand back to*, and that knowledge is exactly
-            // what the killed run took with it. Seeding it from disk is what turns the next clean
-            // exit into the repair. There is deliberately no immediate hand-back here: by the time
-            // the metadata has been read the nodes are up, so the claim is no longer provably
-            // stale, and a guard that cannot fire is worse than no guard.
+            // This is the whole repair for a lane that comes back, and it is smaller than it looks.
+            // A process that starts and finds the default naming `fxsound_sink` adopts that claim
+            // as its own — which is harmless *provided it knows what to hand back to*, and that
+            // knowledge is exactly what the killed run took with it. Seeding it from disk is what
+            // turns the next clean exit into the repair. There is deliberately no immediate
+            // hand-back for such a lane: it is enabled and wants the default, its nodes come up
+            // under the name the key holds, and the claim is no longer provably stale.
+            //
+            // A lane that does *not* come back — the input lane, detached until a microphone is
+            // picked, on a start with that microphone unplugged — has no nodes to stand behind a
+            // claim, and hands it back to what is seeded here as soon as that is present
+            // (`hand_back_disowned_defaults`) — and the app has seen a device list, and so had
+            // its chance to attach the lane after all (`ListDelivery`).
             //
             // What this does not cover, stated plainly: FxSound killed and never started again.
             // Nothing inside the process can repair that.
@@ -1599,7 +1756,10 @@ fn control(shared: &mut Shared, message: UiToAudio) {
                 (DeviceDirection::Output, output),
                 (DeviceDirection::Input, input),
             ] {
-                if name.is_empty() {
+                // One of our own nodes is never the default from before FxSound, whatever a
+                // settings file says: 0.4.0's first cut could remember the echo canceller's
+                // source (`claim_default`), and a file written by it still names that node.
+                if name.is_empty() || is_ours(&name) {
                     continue;
                 }
                 let memory = shared.memory.get_mut(direction);
@@ -1656,6 +1816,10 @@ fn canceller_side(lane: &Lane) -> Side<'_> {
 /// refuses that one (`fxsound_capture` and `fxsound_source` share `fxsound-input`), but not the
 /// best of the rest it tries next, which can be another microphone altogether.
 ///
+/// The rebuild is a repair of the pair, on the microphone it was already on, so it leaves the
+/// default source as it finds it (`Lane::last_target`): a canceller reloaded because the *speakers*
+/// changed must not take back a default source the user had moved away from FxSound.
+///
 /// Rebuilt after the unload rather than before it, and that is the same thing: the module closes
 /// a connection of its own as it goes, so its source's going reaches the server at once, while
 /// the new pair is sent on the engine's connection only when the loop next turns — after the
@@ -1706,10 +1870,9 @@ fn reconcile_echo_cancel(shared: &mut Shared, context: Option<&pw::context::Cont
 ///
 /// The rules run here and now rather than on the next supervisor tick, and the GUI hears what the
 /// lane is attached to as soon as they have: the user is looking at the device list waiting for
-/// the pick to take, and 200 ms is long enough to see. Only when the
-/// registry has not finished its first dump are they left to the barrier that ends it, because a
-/// choice made against half a graph would report "no input devices" for a microphone that is
-/// merely not listed yet.
+/// the pick to take, and 200 ms is long enough to see. Only when the connection has not passed
+/// its [`Barrier`] yet are they left to the tick after it, because a choice made against half a
+/// graph would report "no input devices" for a microphone that is merely not listed yet.
 fn select_device(shared: &mut Shared, direction: DeviceDirection, node_name: String) {
     shared.memory.get_mut(direction).user_selected = node_name;
     let lane = shared.lanes.get_mut(direction);
@@ -1823,12 +1986,11 @@ fn connect(
                 let Ok(mut shared) = shared.try_borrow_mut() else {
                     return;
                 };
-                if confirm_release(&mut shared, seq) {
+                if confirm_release(&mut shared, seq) || !pass_barrier(&mut shared, seq) {
                     return;
                 }
-                // The initial registry dump has been delivered: it is now meaningful to choose a
-                // device, for every lane that wants one.
-                shared.registry_ready = true;
+                // The registry's first dump has been delivered, and what the metadata objects in
+                // it hold: it is now meaningful to choose a device, for every lane that wants one.
                 shared.mark_enabled_lanes_for_rules();
                 shared.needs_publish = true;
             }
@@ -1865,7 +2027,7 @@ fn connect(
     guard.defaults = PerDirection::default();
     guard.clock = GraphClock::default();
     guard.state = State::Connecting;
-    guard.registry_ready = false;
+    guard.barrier = Barrier::Registry;
     guard.session = Some(Session {
         _metadata_listener: None,
         metadata: None,
@@ -1911,8 +2073,47 @@ fn close_session(shared: &mut Shared) {
     }
     shared.node_probes.clear();
     shared.session = None;
-    shared.registry_ready = false;
+    shared.barrier = Barrier::Registry;
     drain_recycled_dsp(shared);
+}
+
+/// One `done` on the way through [`Barrier`]. Returns whether it was the last one: whether the
+/// graph is known well enough, as of now, to choose devices against.
+///
+/// The registry's `done` sends the second `sync`. Every global of the dump has been handled by
+/// the time it arrives, so every bind the dump called for is queued ahead of it, and the server
+/// answers them first. With no session to send it on, or a `sync` that cannot be sent, the
+/// barrier is passed there and then: rules that might run before the defaults are read are
+/// better than rules that never run.
+fn pass_barrier(shared: &mut Shared, seq: AsyncSeq) -> bool {
+    match shared.barrier {
+        Barrier::Registry => {
+            let sync = shared
+                .session
+                .as_ref()
+                .map(|session| session.core.sync(METADATA_SEQ));
+            match sync {
+                Some(Ok(pending)) => {
+                    shared.barrier = Barrier::Metadata(pending);
+                    false
+                }
+                Some(Err(error)) => {
+                    log::warn!("could not wait for the session defaults to be read: {error}");
+                    shared.barrier = Barrier::Passed;
+                    true
+                }
+                None => {
+                    shared.barrier = Barrier::Passed;
+                    true
+                }
+            }
+        }
+        Barrier::Metadata(pending) if pending == seq => {
+            shared.barrier = Barrier::Passed;
+            true
+        }
+        Barrier::Metadata(_) | Barrier::Passed => false,
+    }
 }
 
 /// Tear the connection down and arm the backoff.
@@ -1929,6 +2130,25 @@ fn disconnect(shared: &mut Shared, reason: &str) {
     // our nodes vanish, and the reconnect claims the defaults again (`claim_default` skips the
     // stale value that still names us). What the session knew about the defaults dies with it;
     // `connect` reads them afresh.
+    //
+    // Which lanes held theirs is kept, as the one thing the rebuild needs to know: a lane that
+    // held the default claims it again with its first pair — the server may have lost the key
+    // with everything else — and a lane whose default the user had moved away from FxSound
+    // rebuilds on the same device as a repair and leaves it where the user put it
+    // (`Lane::last_target`). A lane detached or opted out before the reconnect hands back what
+    // the reconnect finds instead ([`hand_back_disowned_defaults`]).
+    //
+    // Except where the claim was never the lane's to give: an opted-out lane whose node the user
+    // made the default in their sound settings. The reconnect reads that key before the pair is
+    // back, and without this would take it for one no lane stands behind (`Lane::kept_by_hand`).
+    for direction in DeviceDirection::ALL {
+        let state = shared.defaults.get(direction);
+        let lane = shared.lanes.get_mut(direction);
+        if state.holding {
+            lane.last_target = None;
+        }
+        lane.kept_by_hand = state.holding && !state.disowned && lane.enabled && !lane.want_default;
+    }
     shared.defaults = PerDirection::default();
     // Both lanes' pairs go with the connection. Each lane stays enabled or detached as it was, so
     // the reconnect rebuilds exactly the lanes that were running.
@@ -1974,6 +2194,13 @@ fn supervise(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) {
         reconcile_echo_cancel(&mut guard, Some(context));
         if guard.aec.route_moved() {
             guard.mark_lane_for_rules(DeviceDirection::Input);
+        }
+
+        // 3b. A claim on a default that no lane stands behind goes back, once the graph is known
+        //     well enough to say where to, and the GUI has had its chance to attach the lane that
+        //     would stand behind it.
+        if guard.ready() && guard.gui_has_had_its_chance() {
+            hand_back_disowned_defaults(&mut guard);
         }
 
         // 4. Each lane on its own: its streams' errors, its format check, its rules, its
@@ -2364,8 +2591,23 @@ fn on_metadata_property(shared: &Rc<RefCell<Shared>>, key: Option<&str>, value: 
         }
         if key == devices::configured_default_key(direction) {
             let configured = value.and_then(devices::parse_default_node_name);
+            let holding = configured.as_deref() == Some(our_node_name(direction));
+            // A key naming a node of ours that does not exist, for a lane that is not going to
+            // claim it. The user cannot have picked a node that is not there, so it is stale.
+            // A lane that will claim it — enabled, and wanting the default — adopts it instead:
+            // its pair is about to come up under that name, and claiming it would change
+            // nothing. And a key that names a node of ours that *is* there was picked by hand,
+            // whatever the lane wants, and is left to the user — as is one the user had picked
+            // before the connection went, read back before the pair is ([`Lane::kept_by_hand`]).
+            //
+            // "Before the pair is" is a promise, not a race: after a connect, no lane builds a
+            // pair until what the `default` object holds has been read ([`Barrier`]).
+            let lane = guard.lanes.get(direction);
+            let stands_behind = lane.enabled && (lane.want_default || lane.kept_by_hand);
+            let disowned = holding && lane.nodes.is_none() && !stands_behind;
             let state = guard.defaults.get_mut(direction);
-            state.holding = configured.as_deref() == Some(our_node_name(direction));
+            state.holding = holding;
+            state.disowned = disowned;
             state.configured = configured;
             return;
         }
@@ -2387,6 +2629,12 @@ fn on_metadata_property(shared: &Rc<RefCell<Shared>>, key: Option<&str>, value: 
 // The session default
 // ---------------------------------------------------------------------------------------------
 
+/// Whether `node_name` is one of the nodes FxSound makes ([`OUR_NODE_NAMES`]): never a default
+/// to remember, nor one to hand back to.
+fn is_ours(node_name: &str) -> bool {
+    OUR_NODE_NAMES.contains(&node_name)
+}
+
 /// Become the session default for a lane's direction, politely: remember what was there first.
 ///
 /// Each lane holds its own claim — `default.configured.audio.sink` for the output lane,
@@ -2403,12 +2651,19 @@ fn claim_default(shared: &mut Shared, direction: DeviceDirection) {
     // killed rather than quit, which WirePlumber's state file preserves — is skipped, so the
     // memory never says "the default before us was us". `original_default` is only ever filled
     // once; `most_recent_default` follows the live value.
+    //
+    // "Us" is every node FxSound makes, not only this lane's virtual device. The echo canceller's
+    // source is an `Audio/Source` with a session priority of its own, and WirePlumber falls back
+    // to it as the current default source whenever the configured one has vanished and nothing
+    // else is left — a microphone unplugged while the input lane held the default. Taken here, it
+    // would go to the settings file as the device to hand the default back to: a node that is gone
+    // the moment echo cancellation is off.
     let previous = {
         let state = shared.defaults.get(direction);
         [state.configured.as_deref(), state.current.as_deref()]
             .into_iter()
             .flatten()
-            .find(|name| *name != ours)
+            .find(|name| !is_ours(name))
             .map(str::to_owned)
     };
     if let Some(previous) = previous {
@@ -2466,6 +2721,52 @@ fn release_default(shared: &mut Shared, direction: DeviceDirection) -> bool {
     };
     shared.defaults.get_mut(direction).holding = false;
     written
+}
+
+/// Hand back every claim on a default that no lane of ours stands behind
+/// ([`DefaultState::disowned`]).
+///
+/// There are two ways to come by one. A run that was killed while a lane held the default leaves
+/// the key naming a node that died with it, and WirePlumber's state file keeps it that way; if the
+/// lane that held it is not attached this time — the microphone is not plugged in, so the input
+/// lane is never switched on — nothing else would ever hand it back, and the default source would
+/// name nothing for the whole session. And a lane detached, or opted out of the default, while the
+/// connection was down could not hand its claim back then (`disconnect` forgets which defaults
+/// were held), and finds it waiting when the connection returns.
+///
+/// Only once there is somewhere to hand it to: with none of the devices the lane remembers
+/// present, the key is left as it is and asked about again on the next tick, rather than released
+/// into nothing and forgotten — the device being plugged back in is exactly what it waits for. A
+/// lane that has since been attached, and wants the default, stands behind the claim again and
+/// adopts it. And the supervisor asks only once the GUI has had its chance to attach that lane
+/// from the device list ([`Shared::gui_has_had_its_chance`]), so that a claim about to be adopted
+/// is not handed back first.
+fn hand_back_disowned_defaults(shared: &mut Shared) {
+    for direction in DeviceDirection::ALL {
+        let state = shared.defaults.get(direction);
+        if !(state.disowned && state.holding) {
+            continue;
+        }
+        let lane = shared.lanes.get(direction);
+        if lane.enabled && lane.want_default {
+            shared.defaults.get_mut(direction).disowned = false;
+            continue;
+        }
+        let somewhere = devices::restore_default_candidate(
+            shared.memory.get(direction),
+            &shared.devices,
+            direction,
+        );
+        if somewhere.is_none() {
+            continue;
+        }
+        log::info!(
+            "the default {} names FxSound, and no lane is claiming it",
+            noun(direction)
+        );
+        release_default(shared, direction);
+        shared.defaults.get_mut(direction).disowned = false;
+    }
 }
 
 /// [`release_default`] for both directions — the exit path, where every default we hold, one per
@@ -2630,6 +2931,11 @@ fn drop_nodes(shared: &mut Shared, direction: DeviceDirection) {
 fn teardown_nodes(shared: &mut Shared, direction: DeviceDirection) {
     release_default(shared, direction);
     drop_nodes(shared, direction);
+    // Whatever pair comes next attaches afresh, and claims afresh. A default the user had given
+    // it by hand went back with this one: a reconnect that still finds it hands it back as well.
+    let lane = shared.lanes.get_mut(direction);
+    lane.last_target = None;
+    lane.kept_by_hand = false;
 }
 
 /// Choose a lane's device and make sure its pair is attached to it (`docs/spec/12-audio-io.md`
@@ -2733,12 +3039,21 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
             let lane = shared.lanes.get_mut(direction);
             lane.nodes = Some(nodes);
             lane.built_at = Some(Instant::now());
+            // A pair rebuilt on the device the lane was already on is a repair — after a stream
+            // error or a format change, or the echo canceller coming or going under the capture
+            // stream, which the *other* lane's device can cause — and leaves the default exactly
+            // as it found it. Still ours if it was: the claim survives the gap under the same
+            // name. The user's if they had moved it away from FxSound meanwhile, which the lane's
+            // own rules respect (the `already` return above) and a repair must not undo. Only a
+            // pair attached to a device claims.
+            let repair = lane.last_target.as_deref() == Some(target.name.as_str());
+            lane.last_target = Some(target.name.clone());
             shared.state = State::Running;
             shared.connect_attempts = 0;
             // Claim before committing: `claim_default` records the default that was there *before*
             // us in `original_default` / `most_recent_default`, and `commit` only fills those slots
             // when they are still empty — so this order keeps them honest on a first run.
-            if shared.lanes.get(direction).want_default {
+            if shared.lanes.get(direction).want_default && !repair {
                 claim_default(shared, direction);
             }
             devices::commit(shared.memory.get_mut(direction), &selection);
@@ -3423,6 +3738,7 @@ fn publish(shared: &mut Shared) {
         if devices != shared.last_devices {
             shared.last_devices.clone_from(&devices);
             shared.notify(AudioToUi::Devices(devices));
+            shared.delivery.list_sent();
         }
     }
 }
@@ -4267,6 +4583,41 @@ mod tests {
             &mut shared,
             AsyncSeq::from_seq(RELEASE_SEQ)
         ));
+    }
+
+    /// Once the registry's `done` has sent the second `sync`, only that `sync`'s `done` lets the
+    /// rules run, and only once: a stray `done` neither lets them run early nor asks every lane
+    /// for its rules again once they have.
+    #[test]
+    fn only_the_sync_behind_the_metadata_binds_lets_the_rules_run() {
+        assert_ne!(METADATA_SEQ, 0, "must not collide with the registry sync");
+        assert_ne!(
+            METADATA_SEQ, RELEASE_SEQ,
+            "must not collide with the release sync"
+        );
+        let mut shared = shared_for_tests();
+        assert_eq!(shared.barrier, Barrier::Registry);
+
+        let behind_the_binds = AsyncSeq::from_seq(METADATA_SEQ);
+        shared.barrier = Barrier::Metadata(behind_the_binds);
+        for stray in [0, RELEASE_SEQ] {
+            assert!(!pass_barrier(&mut shared, AsyncSeq::from_seq(stray)));
+            assert_eq!(shared.barrier, Barrier::Metadata(behind_the_binds));
+        }
+        assert!(pass_barrier(&mut shared, behind_the_binds));
+        assert_eq!(shared.barrier, Barrier::Passed);
+        assert!(!pass_barrier(&mut shared, behind_the_binds));
+        assert!(!pass_barrier(&mut shared, AsyncSeq::from_seq(0)));
+        assert_eq!(shared.barrier, Barrier::Passed);
+    }
+
+    /// With no connection to send the second `sync` on, the registry's `done` is the last one:
+    /// rules that might run before the defaults are read are better than rules that never run.
+    #[test]
+    fn a_barrier_with_no_connection_to_wait_on_does_not_hold_the_rules_for_ever() {
+        let mut shared = shared_for_tests();
+        assert!(pass_barrier(&mut shared, AsyncSeq::from_seq(0)));
+        assert_eq!(shared.barrier, Barrier::Passed);
     }
 
     /// The pump returns as soon as there is nothing pending, and a server that never answers
@@ -5135,6 +5486,27 @@ mod tests {
     }
 
     #[test]
+    fn opting_back_in_between_pairs_makes_the_next_pair_claim_even_on_the_same_device() {
+        let mut shared = shared_for_tests();
+        shared.lanes.input.enabled = true;
+        shared.lanes.input.want_default = false;
+        // The pair was up on this microphone, failed, and is waiting out its backoff: its rebuild
+        // would be a repair, which leaves the default alone.
+        shared.lanes.input.last_target = Some("alsa_input.usb-fifine".to_owned());
+        control(
+            &mut shared,
+            UiToAudio::SetAsDefault {
+                direction: DeviceDirection::Input,
+                want: true,
+            },
+        );
+        assert_eq!(
+            shared.lanes.input.last_target, None,
+            "the opt-in would have waited for a pair that never claims"
+        );
+    }
+
+    #[test]
     fn both_defaults_are_handed_back_on_exit() {
         let mut shared = shared_for_tests();
         shared.lanes.input.enabled = true;
@@ -5146,6 +5518,341 @@ mod tests {
         release_all_defaults(&mut shared);
         assert!(!shared.defaults.output.holding);
         assert!(!shared.defaults.input.holding);
+    }
+
+    /// The configured key of `direction`, as the `default` metadata object would report it.
+    fn configured_key_names(shared: &Rc<RefCell<Shared>>, direction: DeviceDirection, name: &str) {
+        on_metadata_property(
+            shared,
+            Some(devices::configured_default_key(direction)),
+            Some(&devices::default_node_value(name)),
+        );
+    }
+
+    #[test]
+    fn a_claim_found_for_a_detached_lane_is_handed_back_once_there_is_a_device_to_hand_it_to() {
+        // A killed run held the default source; this one starts with that microphone unplugged,
+        // so the input lane stays detached. What the settings file remembered is seeded.
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        control(
+            &mut shared.borrow_mut(),
+            UiToAudio::SeedRememberedDefaults {
+                output: String::new(),
+                input: "alsa_input.usb-fifine".to_owned(),
+            },
+        );
+        configured_key_names(&shared, DeviceDirection::Input, SOURCE_NODE_NAME);
+        configured_key_names(&shared, DeviceDirection::Output, SINK_NODE_NAME);
+        let mut guard = shared.borrow_mut();
+        assert!(guard.defaults.input.holding);
+        assert!(
+            guard.defaults.input.disowned,
+            "nobody picked a node that is not there"
+        );
+        assert!(
+            !guard.defaults.output.disowned,
+            "the output lane stands behind its claim: its pair is about to come up under that name"
+        );
+
+        // Nothing remembered is present yet: the claim is not released into nothing.
+        hand_back_disowned_defaults(&mut guard);
+        assert!(guard.defaults.input.holding, "released with nowhere to go");
+
+        // The microphone is plugged back in: the claim goes back to it, and only that one.
+        add_device(
+            &mut guard,
+            device(40, "alsa_input.usb-fifine", DeviceDirection::Input),
+        );
+        hand_back_disowned_defaults(&mut guard);
+        assert!(!guard.defaults.input.holding, "handed back");
+        assert!(!guard.defaults.input.disowned);
+        assert!(
+            guard.defaults.output.holding,
+            "the default sink is none of the input lane's business"
+        );
+    }
+
+    #[test]
+    fn a_lane_attached_since_adopts_the_claim_instead_of_handing_it_back() {
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        configured_key_names(&shared, DeviceDirection::Input, SOURCE_NODE_NAME);
+        let mut guard = shared.borrow_mut();
+        guard.memory.input.most_recent_default = "alsa_input.usb-fifine".to_owned();
+        add_device(
+            &mut guard,
+            device(40, "alsa_input.usb-fifine", DeviceDirection::Input),
+        );
+        assert!(guard.defaults.input.disowned);
+
+        // The microphone is picked before the supervisor gets to it.
+        control(
+            &mut guard,
+            UiToAudio::SelectDevice {
+                node_name: "alsa_input.usb-fifine".to_owned(),
+                direction: DeviceDirection::Input,
+            },
+        );
+        hand_back_disowned_defaults(&mut guard);
+        assert!(
+            guard.defaults.input.holding,
+            "the lane wants the default and its pair is coming: handing it back would only have \
+             the pair take it again"
+        );
+        assert!(!guard.defaults.input.disowned);
+    }
+
+    #[test]
+    fn an_opt_out_that_arrived_with_the_connection_down_is_honoured_when_it_comes_back() {
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        {
+            let mut guard = shared.borrow_mut();
+            guard.lanes.input.enabled = true;
+            guard.memory.input.user_selected = "alsa_input.usb-fifine".to_owned();
+            add_device(
+                &mut guard,
+                device(40, "alsa_input.usb-fifine", DeviceDirection::Input),
+            );
+            // No connection, so nothing is known to be held and nothing can be handed back now.
+            control(
+                &mut guard,
+                UiToAudio::SetAsDefault {
+                    direction: DeviceDirection::Input,
+                    want: false,
+                },
+            );
+            assert!(!guard.defaults.input.holding);
+        }
+
+        // The connection is back, and the key still names FxSound's source.
+        configured_key_names(&shared, DeviceDirection::Input, SOURCE_NODE_NAME);
+        let mut guard = shared.borrow_mut();
+        assert!(guard.defaults.input.disowned);
+        hand_back_disowned_defaults(&mut guard);
+        assert!(!guard.defaults.input.holding, "the opt-out was ignored");
+    }
+
+    #[test]
+    fn a_claim_no_lane_stands_behind_waits_for_the_gui_to_have_seen_the_device_list() {
+        // The app attaches the input lane from the device list, the first time the saved
+        // microphone is on it. Until it has seen the list, a claim no lane stands behind yet may be
+        // one it is about to stand behind.
+        let (mut shared, messages) = shared_with_messages();
+        add_device(
+            &mut shared,
+            device(40, "alsa_input.usb-fifine", DeviceDirection::Input),
+        );
+        assert!(
+            !shared.gui_has_had_its_chance(),
+            "the microphone has not even been listed to the GUI yet"
+        );
+        publish(&mut shared);
+        assert!(!shared.gui_has_had_its_chance(), "listed, but not read");
+        assert!(
+            drained(&messages)
+                .iter()
+                .any(|message| matches!(message, AudioToUi::Devices(_))),
+            "the GUI reads the list"
+        );
+        assert!(
+            !shared.gui_has_had_its_chance(),
+            "the tick that sees the list taken can come between the GUI taking it and the \
+             attachment it sends straight after"
+        );
+        assert!(shared.gui_has_had_its_chance());
+        assert!(shared.gui_has_had_its_chance(), "and it stays had");
+
+        // Another microphone plugged in: that list is owed to the GUI as well.
+        add_device(
+            &mut shared,
+            device(41, "alsa_input.pci", DeviceDirection::Input),
+        );
+        assert!(!shared.gui_has_had_its_chance(), "not listed yet");
+        publish(&mut shared);
+        assert!(!shared.gui_has_had_its_chance(), "not read yet");
+        drained(&messages);
+        assert!(!shared.gui_has_had_its_chance());
+        assert!(shared.gui_has_had_its_chance());
+    }
+
+    #[test]
+    fn a_device_list_nobody_reads_holds_a_claim_back_for_five_seconds_and_no_longer() {
+        let (mut shared, _unread) = shared_with_messages();
+        add_device(
+            &mut shared,
+            device(40, "alsa_input.usb-fifine", DeviceDirection::Input),
+        );
+        publish(&mut shared);
+        for tick in 1..GUI_PATIENCE_TICKS {
+            assert!(
+                !shared.gui_has_had_its_chance(),
+                "gave up on the GUI after {tick} ticks"
+            );
+        }
+        assert!(
+            shared.gui_has_had_its_chance(),
+            "an engine nobody reads from held the claim for ever"
+        );
+        assert_eq!(
+            SUPERVISOR_PERIOD * GUI_PATIENCE_TICKS,
+            Duration::from_secs(5)
+        );
+
+        // With nobody listening at all, nothing is queued and there is no one to wait for.
+        let mut shared = shared_for_tests();
+        add_device(
+            &mut shared,
+            device(40, "alsa_input.usb-fifine", DeviceDirection::Input),
+        );
+        publish(&mut shared);
+        assert!(!shared.gui_has_had_its_chance());
+        assert!(shared.gui_has_had_its_chance());
+    }
+
+    /// A lane attached to its microphone and opted out of the default, whose source the user made
+    /// the default in their sound settings all the same — then the connection goes, and comes back
+    /// with the microphone listed.
+    fn opted_out_lane_the_user_gave_the_default_by_hand_across_a_disconnect(
+        while_down: Option<UiToAudio>,
+    ) -> Rc<RefCell<Shared>> {
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        {
+            let mut guard = shared.borrow_mut();
+            guard.state = State::Connecting;
+            guard.lanes.input.enabled = true;
+            guard.lanes.input.want_default = false;
+            guard.memory.input.most_recent_default = "alsa_input.usb-fifine".to_owned();
+            guard.defaults.input.holding = true;
+            disconnect(&mut guard, "the server went away");
+            if let Some(message) = while_down {
+                control(&mut guard, message);
+            }
+            // The reconnect lists the microphone again, so a hand-back would have somewhere to go.
+            add_device(
+                &mut guard,
+                device(40, "alsa_input.usb-fifine", DeviceDirection::Input),
+            );
+        }
+        // …and reads the key back before the lane's pair has been rebuilt.
+        configured_key_names(&shared, DeviceDirection::Input, SOURCE_NODE_NAME);
+        shared
+    }
+
+    #[test]
+    fn a_default_the_user_gave_an_opted_out_lane_by_hand_survives_a_reconnect() {
+        let shared = opted_out_lane_the_user_gave_the_default_by_hand_across_a_disconnect(None);
+        let mut guard = shared.borrow_mut();
+        assert!(guard.defaults.input.holding);
+        assert!(
+            !guard.defaults.input.disowned,
+            "the user's own pick was taken for a claim nobody stands behind"
+        );
+        hand_back_disowned_defaults(&mut guard);
+        assert!(
+            guard.defaults.input.holding,
+            "a reconnect undid the default the user picked"
+        );
+    }
+
+    #[test]
+    fn a_default_given_by_hand_still_goes_back_when_the_lane_lets_go_of_it_with_the_connection_down()
+     {
+        for let_go in [
+            UiToAudio::SetAsDefault {
+                direction: DeviceDirection::Input,
+                want: false,
+            },
+            UiToAudio::DetachLane(DeviceDirection::Input),
+        ] {
+            let what = format!("{let_go:?}");
+            let shared =
+                opted_out_lane_the_user_gave_the_default_by_hand_across_a_disconnect(Some(let_go));
+            let mut guard = shared.borrow_mut();
+            assert!(
+                guard.defaults.input.disowned,
+                "{what} with the connection down was forgotten by the reconnect"
+            );
+            hand_back_disowned_defaults(&mut guard);
+            assert!(
+                !guard.defaults.input.holding,
+                "{what} would have handed the default back with the connection up"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_the_user_moved_away_from_fxsound_is_nothing_to_hand_back() {
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        configured_key_names(&shared, DeviceDirection::Input, SOURCE_NODE_NAME);
+        configured_key_names(&shared, DeviceDirection::Input, "alsa_input.usb-fifine");
+        let guard = shared.borrow();
+        assert!(!guard.defaults.input.holding);
+        assert!(!guard.defaults.input.disowned);
+    }
+
+    #[test]
+    fn the_echo_cancellers_source_is_never_remembered_as_the_default_from_before_fxsound() {
+        // The microphone the input lane held the default source on was unplugged: the configured
+        // key still names FxSound's source, and WirePlumber, with nothing else left, fell back to
+        // the echo canceller's. The microphone comes back and its pair claims the default again.
+        let (mut shared, messages) = shared_with_messages();
+        shared.defaults.input.configured = Some(SOURCE_NODE_NAME.to_owned());
+        shared.defaults.input.current = Some(AEC_SOURCE_NODE_NAME.to_owned());
+        claim_default(&mut shared, DeviceDirection::Input);
+        assert_eq!(
+            shared.memory.input,
+            SelectionMemory::default(),
+            "one of our own nodes was remembered as the default from before FxSound"
+        );
+        assert!(
+            !drained(&messages)
+                .iter()
+                .any(|m| matches!(m, AudioToUi::RememberedDefault { .. })),
+            "…and sent to the settings file"
+        );
+
+        // A real device in either key is what is remembered.
+        shared.defaults.input.current = Some("alsa_input.usb-fifine".to_owned());
+        claim_default(&mut shared, DeviceDirection::Input);
+        assert_eq!(
+            shared.memory.input.original_default,
+            "alsa_input.usb-fifine"
+        );
+        assert_eq!(
+            drained(&messages),
+            [AudioToUi::RememberedDefault {
+                direction: DeviceDirection::Input,
+                node_name: "alsa_input.usb-fifine".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn no_node_of_ours_is_ever_seeded_as_a_remembered_default() {
+        let mut shared = shared_for_tests();
+        for name in OUR_NODE_NAMES {
+            control(
+                &mut shared,
+                UiToAudio::SeedRememberedDefaults {
+                    output: name.to_owned(),
+                    input: name.to_owned(),
+                },
+            );
+        }
+        assert_eq!(shared.memory.output, SelectionMemory::default());
+        assert_eq!(shared.memory.input, SelectionMemory::default());
+
+        control(
+            &mut shared,
+            UiToAudio::SeedRememberedDefaults {
+                output: "alsa_output.pci".to_owned(),
+                input: "alsa_input.usb-fifine".to_owned(),
+            },
+        );
+        assert_eq!(shared.memory.output.original_default, "alsa_output.pci");
+        assert_eq!(
+            shared.memory.input.most_recent_default,
+            "alsa_input.usb-fifine"
+        );
     }
 
     #[test]
@@ -5175,6 +5882,33 @@ mod tests {
         shared.lanes.input.enabled = false;
         disconnect(&mut shared, "again");
         assert!(!shared.lanes.input.enabled);
+    }
+
+    #[test]
+    fn after_a_reconnect_only_a_lane_that_held_the_default_claims_it_again() {
+        let mut shared = shared_for_tests();
+        shared.state = State::Connecting;
+        shared.lanes.output.last_target = Some("alsa_output.pci".to_owned());
+        shared.defaults.output.holding = true;
+        shared.lanes.input.enabled = true;
+        shared.lanes.input.last_target = Some("alsa_input.usb-fifine".to_owned());
+        // The user had made the microphone itself the default source.
+        shared.defaults.input.holding = false;
+
+        disconnect(&mut shared, "the server went away");
+        assert_eq!(
+            shared.lanes.output.last_target, None,
+            "the server may have lost the key with everything else: the next pair claims it"
+        );
+        assert_eq!(
+            shared.lanes.input.last_target.as_deref(),
+            Some("alsa_input.usb-fifine"),
+            "the next pair on the microphone is a repair, and the default stays the user's"
+        );
+
+        // Detached, the lane forgets it: whatever it is attached to next, it attaches afresh.
+        detach_lane(&mut shared, DeviceDirection::Input);
+        assert_eq!(shared.lanes.input.last_target, None);
     }
 
     #[test]

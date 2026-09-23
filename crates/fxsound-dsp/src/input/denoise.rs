@@ -33,12 +33,15 @@
 //! one on a downmix whose gains are applied to each channel through that channel's own
 //! transform — a shared mask over a preserved image.
 //!
-//! Real-time safety, honestly stated: the per-channel state is allocated once, at construction,
-//! on the main loop, and every reset is in place. One allocation is *not* avoidable — the
-//! library plans its FFT through a thread-local cache, so the first frame denoised on the audio
-//! thread builds that plan there. It happens once per thread for the life of the process, it is
-//! a few kilobytes, and there is no API to pre-warm it from another thread. Everything after that
-//! frame allocates nothing, and a test with a counting allocator holds it to that.
+//! Real-time safety: the per-channel state is allocated once, at construction, on the main loop —
+//! the network states, the transforms each of them plans, their buffers and the library's tables —
+//! and every reset is in place. So nothing is left to happen on first use, and the first frame
+//! denoised on the data thread costs what every later one does. It used to be otherwise: the
+//! registry library planned its FFT through a per-thread cache, which made switching the denoiser
+//! on for the first time in a session allocate in the middle of an audio callback, once for every
+//! data thread it ever ran on. The vendored copy plans in the constructor instead
+//! (`fxsound-rnnoise/src/fft.rs`), and `tests/rt_allocations.rs` counts from the first frame, on
+//! a thread that has never run one.
 //!
 //! **What a toggle costs, and why that is accepted.** [`Denoiser::set_enabled`],
 //! [`Denoiser::set_level`] and [`Denoiser::set_control`] never restart anything: a snapshot that
