@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod audio_link;
 pub mod cli;
 pub mod commands;
 pub mod dbus;

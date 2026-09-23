@@ -1300,7 +1300,7 @@ fn dim_backdrop(ui: &egui::Ui, window: egui::Rect) {
 // =============================================================================================
 
 /// Row width inside the menu frame. Wide enough for the 200 px name editor at its indent and for
-/// "Overwrite Existing Preset - <name>" with a typical name.
+/// `"Overwrite Existing Preset - <name>"` with a typical name.
 const MENU_WIDTH: f32 = 244.0;
 const MENU_ROW_HEIGHT: f32 = 26.0;
 /// Text starts past a gutter that holds the theme ticks.

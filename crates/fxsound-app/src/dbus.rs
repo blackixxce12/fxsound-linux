@@ -904,7 +904,7 @@ impl DbusHandle {
     }
 
     /// Stop the service: give the names back, let calls in flight be answered — for at most
-    /// [`SHUTDOWN_GRACE`] — and close the connection. The same as dropping the handle, spelled
+    /// `SHUTDOWN_GRACE` — and close the connection. The same as dropping the handle, spelled
     /// out for the way out.
     pub fn shutdown(mut self) {
         self.stop();
