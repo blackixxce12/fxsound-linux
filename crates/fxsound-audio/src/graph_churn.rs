@@ -59,6 +59,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod volume;
+
 /// How long to wait for anything the server has to do.
 pub(crate) const PATIENCE: Duration = Duration::from_secs(10);
 

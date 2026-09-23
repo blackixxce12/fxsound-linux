@@ -127,7 +127,9 @@
 //!   control the volume keys, `wpctl` and every desktop slider target; mirroring would fight
 //!   WirePlumber's own restore and would leave the real device permanently changed after we exit.
 //!   The whole `savedPlaybackVolume` / `b_never_raise_volume` contract therefore disappears — see
-//!   `docs/spec/12-audio-io.md` §19.7.
+//!   `docs/spec/12-audio-io.md` §19.7. What it keeps instead is FxSound's *own* volume per target
+//!   device, written only to its own two virtual nodes, applied after the chain, and never raised
+//!   by a change of device (`volume`, §19.7.1).
 //! * **It never resamples.** The zero-order-hold upsampler at `sndDevicesDoPlayback.cpp:79-89` is
 //!   not ported; PipeWire's sinc resampler handles any rate mismatch — and its channel mixer turns
 //!   a mono microphone into the stereo pair the DSP runs on, and that pair into a mono headset.
@@ -168,13 +170,16 @@ mod lane_dsp;
 pub mod locale;
 mod per_direction;
 mod routes;
+mod volume;
 
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use fxsound_core::DeviceDirection;
-use fxsound_core::messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio};
+use fxsound_core::messages::{
+    AudioToUi, DspEvent, DspParams, InputDspParams, Meters, TargetVolume, UiToAudio,
+};
 use triple_buffer::{Input, Output, TripleBuffer};
 
 use crate::per_direction::PerDirection;
@@ -204,6 +209,10 @@ pub const CAPTURE_NODE_NAME: &str = "fxsound_capture";
 /// Written into `default.configured.audio.source`; stable for the same reason as
 /// [`SINK_NODE_NAME`].
 pub const SOURCE_NODE_NAME: &str = "fxsound_source";
+
+/// `application.id` of every node FxSound makes. Stable too: WirePlumber keyed the volume it kept
+/// for the two virtual nodes by it, and 0.4.0 reads that volume back once (`volume::inherited`).
+pub(crate) const APP_ID: &str = "com.fxsound.FxSound";
 
 /// `node.name` of the echo canceller's capture stream: the one that hears the microphone
 /// (`docs/0.4.0-design.md` §7).
@@ -391,6 +400,27 @@ pub fn quantum_for_ms(ms: u32, rate: u32) -> u32 {
     (frames.next_power_of_two() >> 1).clamp(256, MAX_QUANTUM_FRAMES as u32)
 }
 
+/// What the engine is started with ([`AudioEngine::start_with_options`]): what the settings file
+/// says that has to be in place before the first pair of nodes is built, rather than arrive after
+/// it on the control channel.
+///
+/// The output lane is enabled from the start and builds its pair as soon as the registry has been
+/// read — a round trip after the connection, well before a message sent once
+/// [`AudioEngine::start`] has returned is sure to have been taken in. Anything the first pair
+/// depends on travels here.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StartOptions {
+    /// The UI's language for the virtual nodes' descriptions ([`AudioEngine::start_with_language`]);
+    /// `None` reads the desktop locale.
+    pub language: Option<String>,
+    /// Every remembered per-target volume of FxSound's own nodes: the settings file's
+    /// `device_volumes` (U10). The first pair on a remembered device starts at its level; without
+    /// them it would start at a level chosen without them — unity, or the level WirePlumber kept
+    /// from before 0.4.0 — and only move once [`UiToAudio::SeedTargetVolumes`] arrived. Sanitised
+    /// here as that message's are.
+    pub target_volumes: Vec<TargetVolume>,
+}
+
 /// The audio backend. Owns the PipeWire thread and everything on it.
 ///
 /// There is no public constructor other than [`AudioEngine::start`], which hands back an
@@ -428,7 +458,7 @@ impl AudioEngine {
     /// [`UiToAudio::SelectDevice`]: fxsound_core::messages::UiToAudio::SelectDevice
     /// [`UiToAudio::DetachLane`]: fxsound_core::messages::UiToAudio::DetachLane
     pub fn start() -> Result<EngineHandle, AudioError> {
-        Self::start_with(None, None, aec::WEBRTC_LIBRARY)
+        Self::start_with_options(StartOptions::default())
     }
 
     /// [`AudioEngine::start`], naming the language the virtual nodes are described in.
@@ -436,8 +466,29 @@ impl AudioEngine {
     /// `language` is one of `fxsound_core::i18n::LANGUAGES`' codes — the UI's effective language,
     /// so `FxSound (Вывод)` in the sound settings matches a Russian FxSound window even when the
     /// desktop locale says otherwise. `None` (plain [`AudioEngine::start`]) reads the locale.
+    ///
+    /// A caller with remembered per-device volumes starts with [`Self::start_with_options`]
+    /// instead, so that the first pair already has them.
     pub fn start_with_language(language: &str) -> Result<EngineHandle, AudioError> {
-        Self::start_with(None, Some(language), aec::WEBRTC_LIBRARY)
+        Self::start_with_options(StartOptions {
+            language: Some(language.to_owned()),
+            ..StartOptions::default()
+        })
+    }
+
+    /// [`AudioEngine::start`], with everything the first pair of nodes depends on
+    /// ([`StartOptions`]).
+    ///
+    /// Also reads, once and before connecting, the level WirePlumber kept for FxSound's two nodes
+    /// before 0.4.0 took their volume over: what a lane with nothing remembered for its direction
+    /// starts no louder than (`docs/spec/12-audio-io.md` §19.7.1).
+    pub fn start_with_options(options: StartOptions) -> Result<EngineHandle, AudioError> {
+        Self::start_with(
+            None,
+            options,
+            aec::WEBRTC_LIBRARY,
+            volume::wireplumber_state_file(),
+        )
     }
 
     /// [`AudioEngine::start`], against a named PipeWire socket rather than the session default.
@@ -445,10 +496,22 @@ impl AudioEngine {
     /// Crate-internal because the public surface is fixed, but it is the seam the tests use: a
     /// remote name that does not exist exercises the whole spawn/connect/report path — including
     /// the error mapping and the thread shutdown — without a server and without creating a single
-    /// node in the user's live graph.
+    /// node in the user's live graph. Nor does it read the user's WirePlumber state: a test's
+    /// first pair starts where the test says, not where this machine's FxSound was last left.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start_with_remote(remote: Option<&str>) -> Result<EngineHandle, AudioError> {
-        Self::start_with(remote, None, aec::WEBRTC_LIBRARY)
+        Self::start_with(remote, StartOptions::default(), aec::WEBRTC_LIBRARY, None)
+    }
+
+    /// [`Self::start_with_remote`], with [`StartOptions`], and WirePlumber's state read from
+    /// `wireplumber_state` — a file the test wrote — rather than the user's.
+    #[cfg(test)]
+    pub(crate) fn start_for_tests(
+        remote: Option<&str>,
+        options: StartOptions,
+        wireplumber_state: Option<std::path::PathBuf>,
+    ) -> Result<EngineHandle, AudioError> {
+        Self::start_with(remote, options, aec::WEBRTC_LIBRARY, wireplumber_state)
     }
 
     /// [`Self::start_with_remote`], with the echo canceller running `library` rather than WebRTC.
@@ -461,13 +524,14 @@ impl AudioEngine {
         remote: Option<&str>,
         library: &'static str,
     ) -> Result<EngineHandle, AudioError> {
-        Self::start_with(remote, None, library)
+        Self::start_with(remote, StartOptions::default(), library, None)
     }
 
     fn start_with(
         remote: Option<&str>,
-        language: Option<&str>,
+        options: StartOptions,
         aec_library: &'static str,
+        wireplumber_state: Option<std::path::PathBuf>,
     ) -> Result<EngineHandle, AudioError> {
         // Whether the *socket* exists is left to `pw_context_connect`, which resolves
         // `remote.name` itself and reports the failure precisely. What has to be checked first is
@@ -476,8 +540,14 @@ impl AudioEngine {
         // (`docs/spec/12-audio-io.md` §22).
         engine::preflight(std::env::var_os("XDG_RUNTIME_DIR").as_deref())?;
 
-        let (mut handle, mut config, ready) = EngineHandle::wire(remote, language);
+        let StartOptions {
+            language,
+            target_volumes,
+        } = options;
+        let (mut handle, mut config, ready) = EngineHandle::wire(remote, language.as_deref());
         config.aec_library = aec_library;
+        config.target_volumes = target_volumes;
+        config.wireplumber_state = wireplumber_state;
         let join = std::thread::Builder::new()
             .name("fxsound-audio".to_owned())
             .spawn(move || engine::run(config))
@@ -588,6 +658,8 @@ impl EngineHandle {
             events: events_rx,
             ready: ready_tx,
             aec_library: aec::WEBRTC_LIBRARY,
+            target_volumes: Vec::new(),
+            wireplumber_state: None,
         };
         let handle = Self {
             engine: AudioEngine {

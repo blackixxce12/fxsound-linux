@@ -1268,6 +1268,116 @@ Concretely:
 * `mute(true)` writes zeros into the output rather than stopping NODE 2, so the graph and the
   device stay warm and no xrun storm follows an unmute.
 
+#### 19.7.1 0.4.0: per target, and after the chain (upstream review U10, U11)
+
+> **Scope.** Linux only. Implemented in `crates/fxsound-audio/src/volume.rs`, the volume section of
+> `engine.rs` and the `Tail` stage of `lane_dsp.rs`; the contract is `docs/0.4.0-upstream.md` U10
+> and U11. The bullet above that says "let PipeWire's adapter apply them — preferred" is
+> superseded by the measurement below.
+
+**Where the adapter applies the volume, measured.** A private PipeWire 1.6.8 daemon, the engine's
+output pair on a null sink, pink noise from `pw-play` into `fxsound_sink`, the sink turned down
+20 dB with `pw-cli set-param <fxsound_sink> Props '{ "channelVolumes": [0.1, 0.1] }'`, and the
+level recorded behind NODE 2 from the null sink's monitor with `pw-record`
+(`graph_churn::volume::the_sink_volume_is_measured_behind_node_two_with_the_leveller_bypassed_and_at_four`,
+ignored by default; `--ignored --nocapture` prints the numbers). RMS drops behind NODE 2:
+
+| Chain | Programme | 0.3.0: adapter applies the volume | 0.4.0: the lane applies it after the chain |
+| --- | --- | --- | --- |
+| bypassed (`power = false`) | pink, −20 dBFS RMS | 19.9 dB | 19.9 dB |
+| volume leveller at 4 | pink, −20 dBFS RMS | 19.6 / 19.7 / 19.0 dB at 0–3 / 7–10 / 17–20 s | 19.9 / 20.3 / 19.9 dB |
+| volume leveller at 4 | pink, −12 dBFS RMS | **12.5 / 12.3 / 11.7 dB** | 20.0 / 20.3 / 19.7 dB |
+
+The bypassed row settles where the volume is applied: NODE 2's own volume is untouched and nothing in `process()` applied
+a volume, so the 20 dB were applied by NODE 1's adapter, on the way *into* `process()` — a sink's
+adapter runs its channel mixer before its follower. The quiet programme hides it: the leveller's
+RMS target at 4 (0.5) asks for more than its +12 dB cap at both levels, so it boosts the same
+either way. A programme at a music-like level shows it: at unity the leveller has little to do, at
+−20 dB it boosts by up to its cap, and eight of the twenty decibels the user asked for came back.
+On Windows the DSP sees the programme at full level and the endpoint volume acts after it, so the
+port now does the same:
+
+* **The adapter's volume range is clamped to unity.** Both virtual nodes carry
+  `channelmix.min-volume = channelmix.max-volume = 1.0` (§20, §28.2), which PipeWire's
+  `audioconvert` honours since 0.3.72: it stores and publishes every volume a desktop writes —
+  so every slider shows what it set — and multiplies by `clamp(volume, 1, 1)`. The adapter's
+  `mute` is not clamped: a muted node still hands the chain silence.
+* **The lane applies the published volume after its chain.** NODE 1's `param_changed` (NODE 2's in
+  the input lane, whose virtual node is the source) receives every `Props` write before the adapter
+  does, parses `volume`, `channelVolumes` and `mute`, and stores them in the lane's atomics
+  (`LaneVolume`); NODE 1's `process()` reads the per-channel gains once a block and applies them
+  after the chain and the mute, ramped linearly across the block from the gains the last block
+  ended on. Channel counts that do not match the pair's are spread as their average, as the
+  adapter does; a gain is never above +12 dB (`limits::TARGET_VOLUME`).
+* **An adapter that does not know the keys is detected.** Before 0.3.72 the adapter would apply the
+  volume as well, and the lane would apply it twice. The adapter lists the keys it knows in the
+  `params` of its `Props`; the engine reads them from its own node's whole `Props` and leaves the
+  volume to an adapter that does not clamp. Never from a write: a write's `params` name only what
+  it sets, so `pw-cli set-param fxsound_sink Props '{ params = [ "channelmix.normalize" true ] }'`
+  lists neither bound, and read alone would look like an adapter that does not clamp. Without the
+  second connection (below) nothing reads them, and the lane goes on applying the volume.
+
+**Per target.** Both virtual nodes carry `state.restore-props = false`, which takes WirePlumber's
+`node/state-stream.lua` out of their volume: it keyed one saved volume by `application.id`, so a
+level set for headphones was what the speakers got after an unplug (upstream #615). The engine
+keeps one volume per real device and direction instead (`AudioToUi::TargetVolume`, reported 200–
+400 ms after the volume stops moving, and on every teardown of the pair; the app keeps them as
+`Settings::device_volumes`), and a new pair starts at:
+
+1. the remembered volume of its target, if there is one — upward too, as upstream 1.2.16 (PR #620);
+2. otherwise, per channel, the lower of a new node's unity and the lane's last pair's volume — or,
+   before the lane has had a pair this run, the quietest level remembered for any device of its
+   direction — or, with nothing remembered for its direction either, the level WirePlumber kept for
+   the node before 0.4.0 (below). A mute carries over. **A change of device never raises the
+   volume** (upstream #606/#607);
+3. with nothing remembered at all, the unity the node was made with.
+
+**The memory comes with the engine.** The output lane is enabled from the start and builds its pair
+as soon as the registry has been read, a round trip after the connection — before a message the app
+sends once `AudioEngine::start` has returned is sure to have been taken in. A remembered volume that
+came as a message could therefore arrive after the first pair, which would have played at unity
+until then. So the app hands its memory over in `StartOptions::target_volumes`
+(`AudioEngine::start_with_options`), and the thread has it before it connects.
+`UiToAudio::SeedTargetVolumes` still replaces the whole memory later; a pair whose volume nothing
+has moved since it was built is then given its target's remembered level, and the app is told.
+
+**An entry with no level is not a level.** `TargetVolume::sanitised` keeps an entry without
+`channel_volumes` — only a hand edit writes one — as a remembered mute. Replayed as a level it
+would be the unity of an empty list, and ranked for rule 2 it would be silence, starting every
+device never seen silent. So the engine drops such an entry unless it is muted, and a muted one
+is a target never seen that keeps its mute: rule 2's level, muted. It is never the quietest level.
+
+**From before 0.4.0.** Taking WirePlumber out made one start the loudest: the first 0.4.0 run
+after an upgrade. 0.3.0's level stays in WirePlumber's `$XDG_STATE_HOME/wireplumber/stream-properties`
+(`~/.local/state/…` without the variable), under `Audio/Sink:application.id:com.fxsound.FxSound`
+for the sink and `Audio/Source:application.id:com.fxsound.FxSound` for the source — `formKey` in
+`state-stream.lua` — which WirePlumber may no longer restore, while the app's memory starts empty.
+A sink left at 0.064 (about −24 dB) would have started 24 dB up. So the engine reads that file
+once, before it connects, and takes the node's entry (`volume` × `channelVolumes`, and `mute`) as
+the last pair's level for rule 2: the first pair starts at the lower of it and unity. It is read,
+never written; it goes on standing in only while nothing newer is remembered for the direction.
+Only WirePlumber 0.5's file is read: 0.4's `restore-stream.lua` kept `Stream/*` nodes only, as far
+as is known without a 0.4 to check against, so a virtual sink started at unity there under 0.3.0
+too.
+
+The lane's DSP has that volume before the pair's first block, and the node's `Props` are told
+through a proxy bound on a **second connection** (`Session::_volume_core`): the server stops
+reading a client that sets a param on another client's node until that node's owner answers
+(`node_set_param` in `impl-node.c`, `pw_impl_client_set_busy`), and on the owner's own connection
+that answer is never read — the write never showed and every later write to the node hung.
+`pipewire` 0.10.1 binds no `pw_stream_set_param`, and the one binding that writes a stream's
+controls, `Stream::set_control`, calls a variadic C function without its terminator. The proxy is
+bound by `node.name` until the stream knows its own id, so a pair rebuilt before that registry
+announced the last pair's node binds the dead node first; the volume is written again to the node
+that replaces it, or the new node would show unity while the lane plays the lower level, and the
+next volume key would raise it.
+
+**A new pair fades in.** The first 30 ms a new pair processes rise linearly from silence, in both
+lanes, after the volume (`lane_dsp::FADE_IN_SECONDS`).
+
+The rule that matters most is unchanged: **nothing here writes the real device's `Props`.** Only
+FxSound's own two virtual nodes are written, and only with the volume they had or a lower one.
+
 ### 19.8 Idle/suspend behaviour
 
 Windows stops the render client when the ring empties, "to allow PC to sleep"
@@ -1302,6 +1412,8 @@ suspend; set it to `true` only if you observe first-sound truncation on a specif
 | `priority.session` | `1010` | Slightly above typical ALSA sinks (≈1000) so that, if the user has never chosen a default, policy prefers us. Set to `500` if you would rather never win by default. |
 | `priority.driver` | `0` | We are not a driver. |
 | `monitor.channel-volumes` | `"false"` | |
+| `state.restore-props` | `"false"` (0.4.0) | WirePlumber restores no volume for the node; the engine keeps one per target (§19.7.1). |
+| `channelmix.min-volume` / `channelmix.max-volume` | `"1.0"` / `"1.0"` (0.4.0) | The adapter keeps every volume written and applies none; the lane applies it after its chain (§19.7.1). |
 
 ### NODE 2 — the output stream
 
@@ -1923,6 +2035,7 @@ the ring unchanged. Only properties, targets, metadata keys and bookkeeping diff
 | `node.always-process` | `"false"` | |
 | `audio.channels` / `audio.rate` / `audio.format` / `audio.position` | as §20 NODE 1: `clamp(source.channels, 2, 8)`, graph rate, `F32`, the source's positions | A **mono microphone is accepted**: the stream declares `2` and PipeWire's adapter up-mixes. `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES` was a playback-driver workaround and does not apply to capture. |
 | `device.class`, `priority.session` = `500`, `priority.driver` = `0`, `monitor.channel-volumes`, icons | as §20 NODE 1 | Never wins the default implicitly (§21, open question 2). |
+| `state.restore-props`, `channelmix.min-volume`, `channelmix.max-volume` | as §20 NODE 1 (0.4.0) | One remembered volume per microphone, applied by the lane after the voice chain (§19.7.1). |
 | connect | `Direction::Output`, `MAP_BUFFERS \| RT_PROCESS` — **no** `AUTOCONNECT` | A source does not connect anywhere; recorders connect *to* it. |
 
 The format is decided once per `build_nodes` and declared on both nodes, exactly as §19.3.

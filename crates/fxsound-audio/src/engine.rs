@@ -87,6 +87,15 @@
 //! speakers' monitor on the microphone's clock, and the speakers and the output pair run with it
 //! (`docs/0.4.0-design.md` §7, and `aec`); switched off, they sleep again.
 //!
+//! # Volume
+//!
+//! What a desktop's slider sets on a lane's virtual node is applied by the lane's DSP after its
+//! chain, and remembered per real device (`crate::volume`, `docs/spec/12-audio-io.md` §19.7.1).
+//! The main loop's part is small and lives in one section below: read every `Props` write in the
+//! virtual node's `param_changed` ([`take_props`]), report the volume once it holds still
+//! ([`watch_volume`]), choose the volume a new pair starts at ([`volume_for_pair`]) and write it
+//! to the node through the session's second connection ([`publish_volume`]).
+//!
 //! # A device that blinks
 //!
 //! A Bluetooth headset switches between A2DP and its call profile whenever something starts or
@@ -120,7 +129,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize,
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
-use fxsound_core::messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio};
+use fxsound_core::messages::{
+    AudioToUi, DspEvent, DspParams, InputDspParams, Meters, TargetVolume, UiToAudio,
+};
 use fxsound_core::{AudioDevice, AudioStatus, DeviceDirection};
 use fxsound_dsp::{ChainSpec, InputEngine};
 use libspa::param::audio::{AudioFormat, AudioInfoRaw};
@@ -140,6 +151,7 @@ use crate::devices::{
 use crate::lane_dsp::{self, ChainHandover, LaneDsp};
 use crate::per_direction::PerDirection;
 use crate::routes::{self, CardRoutes, Route, RouteList};
+use crate::volume::{self, Debounce, LaneVolume, NodeVolume, PropsUpdate};
 use crate::{
     AEC_SOURCE_NODE_NAME, AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION,
     DEFAULT_QUANTUM_FRAMES, DEFAULT_SAMPLE_RATE, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS,
@@ -798,6 +810,12 @@ pub(crate) struct SinkData {
     /// The recycle channel of the lane `dsp` belongs to — never the other lane's, so the state
     /// comes back to the slot it was taken from.
     recycle: Sender<LaneDsp>,
+    /// The lane's volume: read once a block for the gains the DSP applies after its chain, and —
+    /// in the output lane, whose NODE 1 is the virtual sink — written from this node's `Props`.
+    volume: Arc<LaneVolume>,
+    /// Whether this node is its lane's virtual node, whose `Props` are the volume a desktop
+    /// sets: the sink, not the input lane's capture stream, whose `Props` are nobody's slider.
+    virtual_node: bool,
 }
 
 impl SinkData {
@@ -811,13 +829,15 @@ impl SinkData {
     fn new(shared: &Shared, dsp: LaneDsp) -> Self {
         let lane = shared.lanes.get(dsp.direction());
         Self {
-            dsp: Some(dsp),
             ring: Arc::clone(&lane.ring),
             counters: Arc::clone(&lane.counters),
             status: Arc::clone(&lane.status),
             format: AudioInfoRaw::new(),
             channels: 0,
             recycle: lane.recycle.0.clone(),
+            volume: Arc::clone(&lane.volume),
+            virtual_node: dsp.direction() == DeviceDirection::Output,
+            dsp: Some(dsp),
         }
     }
 }
@@ -845,6 +865,9 @@ pub(crate) struct OutData {
     format: AudioInfoRaw,
     channels: usize,
     scratch: Vec<f32>,
+    /// The lane's volume, written from this node's `Props` when it is the virtual source; `None`
+    /// on the output lane's playback stream, whose `Props` are nobody's slider.
+    volume: Option<Arc<LaneVolume>>,
 }
 
 /// What [`crate::AudioEngine::start`] hands the thread.
@@ -864,6 +887,12 @@ pub(crate) struct Config {
     /// The canceller library echo cancellation loads: WebRTC's, except in the tests
     /// (`AudioEngine::start_with_canceller`).
     pub(crate) aec_library: &'static str,
+    /// The app's remembered per-target volumes ([`crate::StartOptions::target_volumes`]), in place
+    /// before the thread connects, so the first pair of either lane already has them.
+    pub(crate) target_volumes: Vec<TargetVolume>,
+    /// WirePlumber's `stream-properties` file, to read the level it kept for our nodes before
+    /// 0.4.0 from ([`volume::inherited`]); `None` to read nothing, which is what the tests do.
+    pub(crate) wireplumber_state: Option<std::path::PathBuf>,
 }
 
 /// One lane's two PipeWire nodes and everything that must die with them.
@@ -871,6 +900,20 @@ pub(crate) struct Config {
 /// Field order is drop order and drop order matters: a `StreamListener` removes a `spa_hook` from
 /// a list that lives inside the stream, so every listener is declared before the stream it hooks.
 struct Nodes {
+    /// A proxy for the pair's virtual node, bound on the session's volume connection once its
+    /// registry announces the node ([`adopt_own_node`]): the one way to write the node's `Props` —
+    /// the volume it starts at — with `pipewire` 0.10.1, which binds no `pw_stream_set_param`, and
+    /// the way to read what its adapter makes of the volume ([`PropsUpdate::clamped`]).
+    own: Option<OwnNode>,
+    /// Whether the volume the pair started at has been written to the virtual node's `Props`, so
+    /// that every slider shows it. Until then the lane already applies it — the DSP reads it from
+    /// the lane — but a desktop would show unity. Written to [`Self::own`], and so cleared again
+    /// when another node takes its place ([`still_published`]).
+    volume_published: bool,
+    /// The lane volume's change count once the pair had its starting volume: a remembered volume
+    /// that arrives later ([`UiToAudio::SeedTargetVolumes`]) replaces it only while nothing else
+    /// has changed it since.
+    volume_changes_at_build: u64,
     _first_listener: pw::stream::StreamListener<SinkData>,
     _second_listener: pw::stream::StreamListener<OutData>,
     /// Kept reachable rather than merely alive: the supervisor republishes this node's
@@ -1019,6 +1062,15 @@ struct NodeProbe {
     _node: pw::node::Node,
 }
 
+/// A bound proxy for one of the lane's own virtual nodes ([`Nodes::own`]), in the drop order of a
+/// [`NodeProbe`].
+struct OwnNode {
+    _listener: pw::node::NodeListener,
+    node: pw::node::Node,
+    /// The node's registry id, which its events are matched to the lane's current pair by.
+    id: u32,
+}
+
 /// A bound `Device` object, held only to receive its `info` event ([`Shared::card_probes`]), for
 /// the same reason and in the same drop order as a [`NodeProbe`].
 struct CardProbe {
@@ -1035,6 +1087,16 @@ struct CardProbe {
 ///
 /// Every listener is declared before the proxy it hooks, for the reason [`NodeProbe`] gives.
 struct Session {
+    /// The connection the lanes write their own virtual nodes' volume through
+    /// ([`adopt_own_node`]), and its registry. A second connection because the server stops
+    /// reading a client that sets a param on a node another client owns until that owner answers
+    /// (`node_set_param` in `impl-node.c`, `pw_impl_client_set_busy`): asked on the connection the
+    /// node belongs to, the owner is the client that has just been stopped, the answer is never
+    /// read, and the connection deadlocks — every later write to the node with it. `None` when it
+    /// could not be made; the lanes then play the volume they start at without desktops being told.
+    _volume_registry_listener: Option<pw::registry::Listener>,
+    _volume_registry: Option<pw::registry::RegistryRc>,
+    _volume_core: Option<pw::core::CoreRc>,
     _metadata_listener: Option<pw::metadata::MetadataListener>,
     metadata: Option<pw::metadata::Metadata>,
     /// The `settings` object, only ever read — but held, because what is read from it arrives as
@@ -1225,6 +1287,13 @@ struct Lane {
     last_error: Option<AudioError>,
     /// What the GUI was last told this lane is attached to ([`AudioToUi::Attached`]).
     attached: Option<String>,
+    /// The volume of the lane's virtual node, shared with its DSP (`crate::volume`).
+    volume: Arc<LaneVolume>,
+    /// Holds a volume report back until the volume has stopped moving.
+    volume_debounce: Debounce,
+    /// The volume the lane's last pair ended at: what a target never seen before is never
+    /// louder than ([`volume::for_new_pair`]).
+    last_volume: Option<NodeVolume>,
 }
 
 impl Lane {
@@ -1253,6 +1322,9 @@ impl Lane {
             last_underruns: 0,
             last_error: None,
             attached: None,
+            volume: Arc::new(LaneVolume::new()),
+            volume_debounce: Debounce::default(),
+            last_volume: None,
         }
     }
 
@@ -1405,6 +1477,15 @@ struct Shared {
     /// The output and input targets the user was last warned are one Bluetooth headset
     /// ([`warn_of_one_headset_on_both_lanes`]), for as long as the lanes stay on them.
     headset_warned: Option<(String, String)>,
+    /// The volume of each virtual node per real target, both directions: seeded from the settings
+    /// file ([`UiToAudio::SeedTargetVolumes`]) and kept up to date with every volume reported
+    /// since, so a device the lane comes back to within a run gets the level it had without a
+    /// round trip through the app. Kept across reconnects: it is the user's, not the server's.
+    target_volumes: Vec<TargetVolume>,
+    /// What WirePlumber kept for each virtual node before 0.4.0 took its volume over, read once at
+    /// start ([`volume::inherited`]): the level a lane with no history at all — no pair yet this
+    /// run, nothing remembered for its direction — starts no louder than ([`volume_for_pair`]).
+    inherited_volumes: PerDirection<Option<NodeVolume>>,
 }
 
 impl Shared {
@@ -1453,6 +1534,8 @@ impl Shared {
             wake: None,
             aec: EchoCancel::new(aec::WEBRTC_LIBRARY),
             headset_warned: None,
+            target_volumes: Vec::new(),
+            inherited_volumes: PerDirection::default(),
         }
     }
 
@@ -1670,6 +1753,8 @@ pub(crate) fn run(config: Config) {
         events,
         ready,
         aec_library,
+        target_volumes,
+        wireplumber_state,
     } = config;
 
     pw::init();
@@ -1706,7 +1791,26 @@ pub(crate) fn run(config: Config) {
         },
         handover,
     )));
-    shared.borrow_mut().aec = EchoCancel::new(aec_library);
+    {
+        let mut state = shared.borrow_mut();
+        state.aec = EchoCancel::new(aec_library);
+        // Before the first connection, and so before any pair: neither lane can build on a volume
+        // chosen without what the app remembers, or without what WirePlumber kept.
+        state.target_volumes = remembered_volumes(target_volumes);
+        if let Some(path) = wireplumber_state {
+            state.inherited_volumes = volume::inherited_from(&path);
+            for (direction, inherited) in state.inherited_volumes.iter() {
+                if let Some(inherited) = inherited {
+                    log::info!(
+                        "{} lane: WirePlumber kept {:?}{} for our node before 0.4.0",
+                        direction.key(),
+                        inherited.effective(inherited.channel_volumes.len()),
+                        if inherited.mute { ", muted" } else { "" }
+                    );
+                }
+            }
+        }
+    }
 
     let control_source = control.attach(mainloop.loop_(), {
         let shared = Rc::clone(&shared);
@@ -1961,16 +2065,11 @@ fn control(shared: &mut Shared, message: UiToAudio) {
         UiToAudio::SetDevicePriority { direction, names } => {
             set_device_priority(shared, direction, names);
         }
+        UiToAudio::SeedTargetVolumes(volumes) => seed_target_volumes(shared, volumes),
         // The rest of the upstream review's messages (`docs/0.4.0-upstream.md`). The API landed
         // first, so the app and the engine could be built against it in parallel; each is acted on
         // by its own item, and until then it is logged and otherwise ignored, which leaves the
         // engine doing exactly what it did before the message existed.
-        UiToAudio::SeedTargetVolumes(volumes) => {
-            log::info!(
-                "{} remembered per-device volumes (not acted on yet, U10)",
-                volumes.len()
-            );
-        }
         UiToAudio::SystemSleeping(sleeping) => {
             log::info!(
                 "system {} (not acted on yet, U13)",
@@ -2190,6 +2289,7 @@ fn connect(
     };
     // Whatever the last server was, this one has not said yet.
     link_groups_scheduled.set(false);
+    let remote_for_volume = remote.clone();
     let props = remote.map(|name| {
         properties! {
             *pw::keys::REMOTE_NAME => name,
@@ -2270,6 +2370,18 @@ fn connect(
 
     let _ = core.sync(0);
 
+    let (volume_core, volume_registry, volume_registry_listener) =
+        match volume_connection(shared, context, remote_for_volume) {
+            Ok((core, registry, listener)) => (Some(core), Some(registry), Some(listener)),
+            Err(error) => {
+                log::warn!(
+                    "could not connect a second time to write FxSound's own volume, so desktops \
+                     will not see the volume a device starts at: {error}"
+                );
+                (None, None, None)
+            }
+        };
+
     let mut guard = shared.borrow_mut();
     // Everything learned from a server is learned again from this one. The probes went with the
     // last session ([`close_session`]); emptying them here as well means a probe can only ever
@@ -2286,6 +2398,9 @@ fn connect(
     guard.state = State::Connecting;
     guard.barrier = Barrier::Registry;
     guard.session = Some(Session {
+        _volume_registry_listener: volume_registry_listener,
+        _volume_registry: volume_registry,
+        _volume_core: volume_core,
         _metadata_listener: None,
         metadata: None,
         _settings_listener: None,
@@ -2309,6 +2424,51 @@ fn connect(
     Ok(())
 }
 
+/// The second connection a session makes, to write its own virtual nodes' volume through
+/// ([`Session::_volume_core`]), with a registry that looks out for those nodes and nothing else.
+fn volume_connection(
+    shared: &Rc<RefCell<Shared>>,
+    context: &pw::context::ContextRc,
+    remote: Option<String>,
+) -> Result<
+    (
+        pw::core::CoreRc,
+        pw::registry::RegistryRc,
+        pw::registry::Listener,
+    ),
+    pw::Error,
+> {
+    let props = remote.map(|name| {
+        properties! {
+            *pw::keys::REMOTE_NAME => name,
+        }
+    });
+    let core = context.connect_rc(props)?;
+    let registry = core.get_registry_rc()?;
+    let listener = registry
+        .add_listener_local()
+        .global({
+            let shared = Rc::clone(shared);
+            let registry = registry.clone();
+            move |global| {
+                if global.type_ != pw::types::ObjectType::Node {
+                    return;
+                }
+                let name = global
+                    .props
+                    .and_then(|props| props.get(*pw::keys::NODE_NAME));
+                let Some(direction) = virtual_node_direction(name) else {
+                    return;
+                };
+                if let Ok(mut guard) = shared.try_borrow_mut() {
+                    adopt_own_node(&mut guard, &shared, &registry, global, direction);
+                }
+            }
+        })
+        .register();
+    Ok((core, registry, listener))
+}
+
 /// End the connection and everything made on it, in the only order that is safe.
 ///
 /// Both lanes' pairs first: every stream holds a reference to the core, so a pair left behind
@@ -2324,6 +2484,9 @@ fn close_session(shared: &mut Shared) {
     // next ones once the lanes are back. Its source goes from the registry with the rest.
     shared.aec.unload();
     shared.aec.forget_sources();
+    for direction in DeviceDirection::ALL {
+        retire_volume(shared, direction);
+    }
     for (_, lane) in shared.lanes.iter_mut() {
         lane.nodes = None;
         lane.built_at = None;
@@ -2561,6 +2724,9 @@ fn supervise_lane(shared: &mut Shared, direction: DeviceDirection, now: Instant)
     //    one step of the pacing that waits for time rather than for an event — and catch any wake
     //    the channel could not deliver.
     pace_second_node(shared, direction, now);
+
+    // f. Report the virtual node's volume for its target, once it has stopped moving.
+    watch_volume(shared, direction);
 }
 
 /// Whether a lane's rules wait for the node its pair was attached to ([`Hold`]). A hold that has
@@ -3598,6 +3764,7 @@ fn reconcile_input_chain(shared: &mut Shared) {
 /// the transient rebuilds — a new target, a format mismatch, a stream in error — where the pair is
 /// about to come straight back under the same name. The other lane's pair is not touched.
 fn drop_nodes(shared: &mut Shared, direction: DeviceDirection) {
+    retire_volume(shared, direction);
     let lane = shared.lanes.get_mut(direction);
     lane.nodes = None;
     lane.built_at = None;
@@ -3876,6 +4043,15 @@ fn build_nodes(
     // the previous device's filter history, reverb tail and leveller gain straight into the new
     // one. The engine is recycled deliberately, but its *state* should not be.
     dsp.reset();
+    // The volume this pair starts at (U10): the target's own, or no louder than the lane was just
+    // playing. The lane has it before the DSP is handed over, so the pair's first block is already
+    // at it — faded in from silence — and the node's `Props` are told once its proxy is bound
+    // ([`publish_volume`]).
+    let pair_volume = volume_for_pair(shared, direction, &target.name, channels as usize);
+    let lane_volume = Arc::clone(&shared.lanes.get(direction).volume);
+    lane_volume.begin_pair(channels as usize, &pair_volume);
+    dsp.set_volume(&lane_volume.gains());
+    dsp.begin_pair();
 
     // The one place the ring is reconfigured, because it is the one moment nothing reads it: the
     // lane's previous pair has gone, and this pair's NODE 2 does not exist yet.
@@ -3904,7 +4080,7 @@ fn build_nodes(
                 data.status.sink_error.store(true, Ordering::Relaxed);
             }
         })
-        .param_changed(on_sink_format)
+        .param_changed(on_sink_param)
         .process(on_sink_process)
         .register()
         .map_err(|error| AudioError::PipewireUnavailable(error.to_string()))?;
@@ -3975,6 +4151,7 @@ fn build_nodes(
         format: AudioInfoRaw::new(),
         channels: 0,
         scratch: vec![0.0; MAX_QUANTUM_FRAMES * MAX_CHANNELS as usize],
+        volume: (direction == DeviceDirection::Input).then(|| Arc::clone(&lane.volume)),
     };
     let second_listener = second
         .add_local_listener_with_user_data(second_data)
@@ -3988,7 +4165,7 @@ fn build_nodes(
                 data.status.output_error.store(true, Ordering::Relaxed);
             }
         })
-        .param_changed(on_output_format)
+        .param_changed(on_output_param)
         .process(on_output_process)
         .register()
         .map_err(|error| AudioError::PipewireUnavailable(error.to_string()))?;
@@ -4008,6 +4185,11 @@ fn build_nodes(
         .map_err(|error| AudioError::PipewireUnavailable(error.to_string()))?;
 
     Ok(Nodes {
+        own: None,
+        // A node PipeWire has just made is at unity already; there is nothing to tell it.
+        volume_published: pair_volume.gains(channels as usize)
+            == NodeVolume::default().gains(channels as usize),
+        volume_changes_at_build: lane_volume.changes(),
         _first_listener: first_listener,
         _second_listener: second_listener,
         first,
@@ -4044,6 +4226,16 @@ fn idle_plan(
 /// after the first dot is hyphenated, and `audio.position` has no Rust constant because it has no
 /// `PW_KEY_` either. The description is the localised `"FxSound (<Output|Input>)"`; the name is
 /// the fixed ASCII one the metadata carries.
+///
+/// Three keys are about the node's volume (`crate::volume`). `state.restore-props = false` keeps
+/// WirePlumber from restoring one volume for the node whatever it renders to
+/// (`node/state-stream.lua`, the condition at the top of its restore and store hooks) — the lane
+/// remembers one per target instead, as WirePlumber does for its own loopback nodes
+/// (`monitors/bluez/create-loopback-node.lua`). What WirePlumber had saved for the node until then
+/// stays in its state file, and is read once as the level a lane with no history starts no louder
+/// than ([`volume::inherited`]). And `channelmix.min-volume` and `max-volume` at
+/// unity make the adapter keep every volume a desktop writes and apply none of it, so the lane
+/// can apply it after its chain rather than have the volume leveller undo it.
 fn virtual_node_props(
     direction: DeviceDirection,
     language: Option<&str>,
@@ -4074,12 +4266,15 @@ fn virtual_node_props(
         *pw::keys::AUDIO_RATE         => rate.to_string(),
         *pw::keys::AUDIO_FORMAT       => "F32",
         *pw::keys::APP_NAME           => "FxSound",
-        *pw::keys::APP_ID             => "com.fxsound.FxSound",
+        *pw::keys::APP_ID             => crate::APP_ID,
         "audio.position"              => positions.to_property_value(),
         "device.class"                => "sound",
         "priority.session"            => NODE_PRIORITY_SESSION,
         "priority.driver"             => "0",
         "monitor.channel-volumes"     => "false",
+        volume::MIN_VOLUME_KEY        => volume::UNITY,
+        volume::MAX_VOLUME_KEY        => volume::UNITY,
+        "state.restore-props"         => "false",
         "media.icon-name"             => "fxsound",
         "application.icon-name"       => "fxsound",
     }
@@ -4163,7 +4358,7 @@ fn stream_props(
         *pw::keys::STREAM_DONT_REMIX   => "false",
         *pw::keys::TARGET_OBJECT       => target,
         *pw::keys::APP_NAME            => "FxSound",
-        *pw::keys::APP_ID              => "com.fxsound.FxSound",
+        *pw::keys::APP_ID              => crate::APP_ID,
     };
     if direction == DeviceDirection::Input {
         // Capture the microphone itself, not the monitor of a sink.
@@ -4225,13 +4420,394 @@ fn format_pod(rate: u32, channels: u32, positions: &ChannelMap) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The volume of the virtual nodes (`crate::volume`, U10 and U11)
+// ---------------------------------------------------------------------------------------------
+
+/// The app's remembered per-target volumes as the engine keeps them: entries that cannot be
+/// replayed gone ([`TargetVolume::sanitised`]), and of two for the same direction and target the
+/// later, as the app's own `remember_target_volume` would have it.
+///
+/// An entry with neither a level nor a mute goes too. `sanitised` keeps an entry with no
+/// `channel_volumes` as a remembered mute — which is what [`volume::for_new_pair`] makes of it —
+/// but one that is not muted either says nothing about its device, and is the same as no entry.
+fn remembered_volumes(volumes: Vec<TargetVolume>) -> Vec<TargetVolume> {
+    let mut kept: Vec<TargetVolume> = Vec::with_capacity(volumes.len());
+    for entry in volumes.into_iter().filter_map(TargetVolume::sanitised) {
+        if entry.channel_volumes.is_empty() && !entry.mute {
+            log::info!(
+                "{} lane: a remembered volume for {} has no level, and is left out",
+                entry.direction.key(),
+                entry.target
+            );
+            continue;
+        }
+        kept.retain(|known| (known.direction, &known.target) != (entry.direction, &entry.target));
+        kept.push(entry);
+    }
+    log::info!("{} remembered per-device volumes", kept.len());
+    kept
+}
+
+/// Take the app's remembered per-target volumes ([`UiToAudio::SeedTargetVolumes`]), replacing
+/// whatever the engine held — a later seed is the settings file as it now is
+/// ([`remembered_volumes`]).
+///
+/// The memory normally comes with the engine ([`crate::StartOptions::target_volumes`]), before any
+/// pair. A seed is a replacement for it, and a lane may have built its pair by the time one
+/// arrives — on a volume chosen without it. A pair whose volume nothing has changed since is given
+/// its target's remembered one now, and the app is told so: a pair up for a supervisor tick or two
+/// has reported the volume it started at, and the app's last word for the device must be the one
+/// it now plays at. A pair a desktop has moved meanwhile keeps what the user set.
+fn seed_target_volumes(shared: &mut Shared, volumes: Vec<TargetVolume>) {
+    shared.target_volumes = remembered_volumes(volumes);
+
+    for direction in DeviceDirection::ALL {
+        let lane = shared.lanes.get(direction);
+        let Some(nodes) = lane.nodes.as_ref() else {
+            continue;
+        };
+        if lane.volume.changes() != nodes.volume_changes_at_build {
+            continue;
+        }
+        let Some(entry) = remembered_volume(shared, direction, &nodes.target) else {
+            continue;
+        };
+        let channels = lane.volume.channels();
+        // What the pair is at stands in for the lane's last volume: a remembered mute with no
+        // level mutes it where it is, rather than at the unity of an empty list.
+        let current = lane.volume.snapshot();
+        let volume = volume::for_new_pair(Some(entry), Some(&current), channels);
+        if volume.gains(channels) == current.gains(channels) {
+            continue;
+        }
+        let entry = entry.clone();
+        lane.volume.replace(&volume);
+        let changes = lane.volume.changes();
+        if let Some(nodes) = shared.lanes.get_mut(direction).nodes.as_mut() {
+            nodes.volume_changes_at_build = changes;
+            nodes.volume_published = false;
+        }
+        publish_volume(shared, direction);
+        shared.notify(AudioToUi::TargetVolume(entry));
+    }
+}
+
+/// The remembered volume of the lane of `direction` on `target`, if there is one.
+fn remembered_volume<'a>(
+    shared: &'a Shared,
+    direction: DeviceDirection,
+    target: &str,
+) -> Option<&'a TargetVolume> {
+    shared
+        .target_volumes
+        .iter()
+        .find(|entry| entry.direction == direction && entry.target == target)
+}
+
+/// The volume a new pair of the lane of `direction` starts at on `target`
+/// ([`volume::for_new_pair`]): the target's remembered one, or else no louder than the lane's last
+/// pair — or, before the lane has had one this run, than the quietest level remembered for any
+/// device of its direction — or, with nothing remembered for its direction either, than the level
+/// WirePlumber kept for the lane's node before 0.4.0. Without that last, the first 0.4.0 run after
+/// an upgrade would start at unity, however far down 0.3.0 had been left.
+fn volume_for_pair(
+    shared: &Shared,
+    direction: DeviceDirection,
+    target: &str,
+    channels: usize,
+) -> NodeVolume {
+    let last = shared
+        .lanes
+        .get(direction)
+        .last_volume
+        .clone()
+        .or_else(|| volume::quietest(&shared.target_volumes, direction))
+        .or_else(|| shared.inherited_volumes.get(direction).clone());
+    volume::for_new_pair(
+        remembered_volume(shared, direction, target),
+        last.as_ref(),
+        channels,
+    )
+}
+
+/// Remember `volume` as the lane of `direction`'s on `target`, and tell the app — when it differs
+/// from what is remembered already, so that a volume nobody moved is never reported, and one that
+/// is reported is reported once.
+fn report_target_volume(
+    shared: &mut Shared,
+    direction: DeviceDirection,
+    target: &str,
+    volume: &NodeVolume,
+    channels: usize,
+) {
+    let Some(entry) = volume.to_target(direction, target, channels) else {
+        return;
+    };
+    if remembered_volume(shared, direction, target) == Some(&entry) {
+        return;
+    }
+    log::info!(
+        "{} lane: remembering {:?}{} for {target}",
+        direction.key(),
+        entry.channel_volumes,
+        if entry.mute { ", muted" } else { "" }
+    );
+    shared
+        .target_volumes
+        .retain(|known| (known.direction, known.target.as_str()) != (direction, target));
+    shared.target_volumes.push(entry.clone());
+    shared.notify(AudioToUi::TargetVolume(entry));
+}
+
+/// The supervisor's look at a lane's volume: reported for the pair's target once it has held still
+/// for a tick ([`Debounce`]).
+fn watch_volume(shared: &mut Shared, direction: DeviceDirection) {
+    let lane = shared.lanes.get_mut(direction);
+    let changes = lane.volume.changes();
+    if !lane.volume_debounce.settled(changes) {
+        return;
+    }
+    let Some(target) = lane.nodes.as_ref().map(|nodes| nodes.target.clone()) else {
+        return;
+    };
+    let (volume, channels) = (lane.volume.snapshot(), lane.volume.channels());
+    report_target_volume(shared, direction, &target, &volume, channels);
+}
+
+/// A lane's pair is going: whatever its volume came to is remembered for its target now, without
+/// waiting for the tick — the next pair may be on another device — and becomes the level a device
+/// never seen before is never louder than.
+fn retire_volume(shared: &mut Shared, direction: DeviceDirection) {
+    let lane = shared.lanes.get_mut(direction);
+    let Some(target) = lane.nodes.as_ref().map(|nodes| nodes.target.clone()) else {
+        return;
+    };
+    let (volume, channels) = (lane.volume.snapshot(), lane.volume.channels());
+    lane.volume_debounce.settled(lane.volume.changes());
+    lane.last_volume = Some(volume.clone());
+    report_target_volume(shared, direction, &target, &volume, channels);
+}
+
+/// Write the volume a lane's pair started at to its virtual node's `Props`, once there is a proxy
+/// to write it through ([`adopt_own_node`]) — the node the lane *made*, never the device it
+/// renders to. What is written is the lane's volume as it is now, so a desktop that moved the
+/// slider in the moment before is not overruled. Its echo comes back through `param_changed` as a
+/// write that changes nothing.
+fn publish_volume(shared: &mut Shared, direction: DeviceDirection) {
+    let lane = shared.lanes.get_mut(direction);
+    let (volume, channels) = (lane.volume.snapshot(), lane.volume.channels());
+    let Some(nodes) = lane.nodes.as_mut() else {
+        return;
+    };
+    let Some(own) = nodes.own.as_ref() else {
+        return;
+    };
+    if nodes.volume_published {
+        return;
+    }
+    let bytes = volume::props_pod(&volume, channels);
+    let Some(pod) = Pod::from_bytes(&bytes) else {
+        log::warn!("could not build a Props pod for {volume:?}");
+        return;
+    };
+    own.node.set_param(libspa::param::ParamType::Props, 0, pod);
+    nodes.volume_published = true;
+    log::info!(
+        "{} lane: {} starts at {:?}{}",
+        direction.key(),
+        nodes.target,
+        volume.effective(channels),
+        if volume.mute { ", muted" } else { "" }
+    );
+}
+
+/// The lane a virtual node belongs to, by its `node.name`: `fxsound_sink`'s or `fxsound_source`'s.
+fn virtual_node_direction(node_name: Option<&str>) -> Option<DeviceDirection> {
+    match node_name? {
+        SINK_NODE_NAME => Some(DeviceDirection::Output),
+        SOURCE_NODE_NAME => Some(DeviceDirection::Input),
+        _ => None,
+    }
+}
+
+/// The stream of a pair that is its lane's virtual node: NODE 1 of the output lane, NODE 2 of the
+/// input lane.
+const fn virtual_stream(nodes: &Nodes, direction: DeviceDirection) -> &pw::stream::StreamRc {
+    match direction {
+        DeviceDirection::Output => &nodes.first,
+        DeviceDirection::Input => &nodes.second,
+    }
+}
+
+/// The volume connection's registry announced one of our virtual nodes ([`volume_connection`]):
+/// bind a proxy for it on that connection, if it is the lane's current pair's, to write the pair's
+/// starting volume through ([`publish_volume`]) and to read what the node's adapter makes of a
+/// volume ([`on_own_props`]).
+///
+/// The id is checked against the stream's own when the stream knows it. Before it does, the name
+/// has to do, and the name can be a dead node's: a pair rebuilt before this registry announced the
+/// last pair's node — the second connection reads its socket after the first has torn that pair
+/// down — adopts the node that went, and the volume written to it reaches nothing. So a node
+/// adopted in place of another is written to again ([`still_published`]); the real node is
+/// announced after the dead one, and replaces it.
+fn adopt_own_node(
+    shared: &mut Shared,
+    handle: &Rc<RefCell<Shared>>,
+    registry: &pw::registry::RegistryRc,
+    global: &pw::registry::GlobalObject<&libspa::utils::dict::DictRef>,
+    direction: DeviceDirection,
+) {
+    let id = global.id;
+    let Some(nodes) = shared.lanes.get(direction).nodes.as_ref() else {
+        return;
+    };
+    // `SPA_ID_INVALID` until the server has told the stream which global it is.
+    let known = virtual_stream(nodes, direction).node_id();
+    if known != u32::MAX && known != id {
+        return;
+    }
+    let node = match registry.bind::<pw::node::Node, _>(global) {
+        Ok(node) => node,
+        Err(error) => {
+            log::warn!(
+                "could not bind the {} lane's own node, so desktops will not see the volume it \
+                 starts at: {error}",
+                direction.key()
+            );
+            return;
+        }
+    };
+    let listener = node
+        .add_listener_local()
+        .param({
+            let handle = Rc::clone(handle);
+            move |_seq, param_type, _index, _next, param| {
+                if param_type != libspa::param::ParamType::Props {
+                    return;
+                }
+                if let Some(update) = param.and_then(PropsUpdate::from_pod) {
+                    on_own_props(&handle, direction, id, &update);
+                }
+            }
+        })
+        .register();
+    node.subscribe_params(&[libspa::param::ParamType::Props]);
+    if let Some(nodes) = shared.lanes.get_mut(direction).nodes.as_mut() {
+        let previous = nodes.own.as_ref().map(|own| own.id);
+        nodes.volume_published = still_published(nodes.volume_published, previous, id);
+        nodes.own = Some(OwnNode {
+            _listener: listener,
+            node,
+            id,
+        });
+    }
+    publish_volume(shared, direction);
+}
+
+/// Whether a pair's volume still counts as written to its virtual node once the node `adopted` is
+/// the lane's, in place of the one it had adopted before, `previous`.
+///
+/// Only a node adopted before could have been written to, so the first keeps what the pair was
+/// built with — written already when it starts at the unity a new node has. Another node in its
+/// place is written to again: the one before was a pair's that had gone ([`adopt_own_node`]).
+/// Left unwritten, the new node would show unity while the lane plays the lower level it started
+/// at, and the next volume key would step up from unity — from 0.2 to 1.05, a device change that
+/// raises the volume after all. Writing a node that has the volume already is harmless: its echo
+/// changes nothing.
+const fn still_published(published: bool, previous: Option<u32>, adopted: u32) -> bool {
+    match previous {
+        Some(previous) if previous != adopted => false,
+        _ => published,
+    }
+}
+
+/// The whole of a virtual node's `Props`, as the server lists them: what says whether the node's
+/// adapter keeps its volume at unity ([`PropsUpdate::clamped`]), and so whether the lane's DSP
+/// applies the volume or leaves it to the adapter.
+///
+/// Nothing else decides it: a write lists only what it sets ([`take_props`]). With no second
+/// connection nothing does, and the lane goes on applying the volume, as the adapter of every
+/// PipeWire since 0.3.72 expects.
+///
+/// The volume fields are not taken from here. Every write reaches `param_changed` first, in order
+/// ([`take_props`]); this is the server's echo of the result, a round trip later, and during a
+/// slider drag it can arrive behind the next write and would put an older level back.
+fn on_own_props(
+    handle: &Rc<RefCell<Shared>>,
+    direction: DeviceDirection,
+    id: u32,
+    update: &PropsUpdate,
+) {
+    let Ok(guard) = handle.try_borrow() else {
+        return;
+    };
+    let lane = guard.lanes.get(direction);
+    let ours = lane
+        .nodes
+        .as_ref()
+        .and_then(|nodes| nodes.own.as_ref())
+        .is_some_and(|own| own.id == id);
+    let Some(clamped) = update.clamped.filter(|_| ours) else {
+        return;
+    };
+    if lane.volume.post_dsp() != clamped {
+        if clamped {
+            log::info!(
+                "{} lane: the volume is applied after the chain",
+                direction.key()
+            );
+        } else {
+            log::info!(
+                "{} lane: this PipeWire's adapter applies the volume itself (it is older than \
+                 0.3.72), so the chain hears it turned down",
+                direction.key()
+            );
+        }
+    }
+    lane.volume.set_post_dsp(clamped);
+}
+
+// ---------------------------------------------------------------------------------------------
 // The two process callbacks — RT thread from here down
 // ---------------------------------------------------------------------------------------------
 
 /// NODE 1's `param_changed`. Main loop, never the data thread — which is exactly why the
 /// process callbacks can assume `channels` is constant for the life of a buffer.
-fn on_sink_format(_stream: &pw::stream::Stream, data: &mut SinkData, id: u32, param: Option<&Pod>) {
+///
+/// Two kinds of parameter arrive here: the format the node negotiated, and — on the output lane's
+/// virtual sink — every `Props` write a desktop makes, which is its volume ([`take_props`]).
+fn on_sink_param(_stream: &pw::stream::Stream, data: &mut SinkData, id: u32, param: Option<&Pod>) {
+    if data.virtual_node {
+        take_props(&data.volume, id, param);
+    }
     adopt_sink_format(data, id, param);
+}
+
+/// A `Props` write on a lane's virtual node, as `param_changed` hands it over: the stream's
+/// follower sees every write before the adapter does (`audioadapter.c`, `impl_node_set_param`),
+/// so this is the volume a desktop set, as it set it — a slider's `channelVolumes`, a mute key's
+/// `mute`, never the whole object. Kept in the lane, where the DSP applies it and the supervisor
+/// reports it.
+///
+/// Whether the adapter clamps is not read here, even from a write that carries `params`: a write
+/// names only the settings it changes — `pw-cli set-param fxsound_sink Props '{ params = [
+/// "channelmix.normalize" true ] }'` lists neither volume bound — so it would read as an adapter
+/// that does not clamp, and the lane would stop applying a volume the adapter still keeps at
+/// unity. Only the node's whole `Props` say it ([`on_own_props`]); a write that does move a
+/// bound changes them, and they come back through there.
+///
+/// Main loop. Only the lane's atomics are written, never the DSP's own state: unlike a format
+/// change, a volume change arrives while the data thread is processing.
+fn take_props(volume: &LaneVolume, id: u32, param: Option<&Pod>) {
+    if id != libspa::param::ParamType::Props.as_raw() {
+        return;
+    }
+    let Some(update) = param.and_then(PropsUpdate::from_pod) else {
+        return;
+    };
+    if volume.update(&update) {
+        log::debug!("the virtual node's volume is now {:?}", volume.snapshot());
+    }
 }
 
 /// Latch the format NODE 1 negotiated — without touching the ring.
@@ -4274,12 +4850,12 @@ fn adopt_sink_format(data: &mut SinkData, id: u32, param: Option<&Pod>) {
     log::info!("NODE 1 negotiated {channels} ch @ {rate} Hz");
 }
 
-fn on_output_format(
-    _stream: &pw::stream::Stream,
-    data: &mut OutData,
-    id: u32,
-    param: Option<&Pod>,
-) {
+/// NODE 2's `param_changed`: the format it negotiated, and — on the input lane's virtual source
+/// — its volume ([`take_props`]).
+fn on_output_param(_stream: &pw::stream::Stream, data: &mut OutData, id: u32, param: Option<&Pod>) {
+    if let Some(volume) = &data.volume {
+        take_props(volume, id, param);
+    }
     let Some((rate, channels)) = parse_audio_format(&mut data.format, id, param) else {
         return;
     };
@@ -4349,8 +4925,9 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
     };
 
     // Parameters are state: take the newest snapshot, discard anything in between. Events are
-    // not: drain them all.
+    // not: drain them all. The node's volume is state too, and read the same way: nine loads.
     dsp.refresh();
+    dsp.set_volume(&data.volume.gains());
 
     let Some(bytes) = chunk_data.data() else {
         return;
@@ -5332,6 +5909,533 @@ mod tests {
             Some("false"),
             "capture the microphone, not a sink monitor"
         );
+    }
+
+    #[test]
+    fn both_virtual_nodes_keep_their_volume_from_wireplumber_and_their_adapter_at_unity() {
+        pw::init();
+        let positions = ChannelMap::default_for(2);
+        for direction in DeviceDirection::ALL {
+            let props = virtual_node_props(direction, None, 2, 48_000, &positions, "512/48000");
+            let name = our_node_name(direction);
+            assert_eq!(
+                props.get("state.restore-props"),
+                Some("false"),
+                "WirePlumber would restore one volume for {name} whatever it is attached to"
+            );
+            assert_eq!(props.get("channelmix.min-volume"), Some("1.0"), "{name}");
+            assert_eq!(props.get("channelmix.max-volume"), Some("1.0"), "{name}");
+        }
+        for direction in DeviceDirection::ALL {
+            let props = stream_props(direction, "alsa.x", "512/48000", false);
+            assert_eq!(
+                props.get("channelmix.max-volume"),
+                None,
+                "a device-facing stream's volume is the adapter's, as it always was"
+            );
+            assert_eq!(props.get("state.restore-props"), None);
+        }
+    }
+
+    // ---- the virtual nodes' volume (U10, U11)
+
+    fn remembered(direction: DeviceDirection, target: &str, volumes: &[f32]) -> TargetVolume {
+        TargetVolume {
+            direction,
+            target: target.to_owned(),
+            channel_volumes: volumes.to_vec(),
+            mute: false,
+        }
+    }
+
+    fn at(volumes: &[f32]) -> NodeVolume {
+        NodeVolume {
+            volume: 1.0,
+            channel_volumes: volumes.to_vec(),
+            mute: false,
+        }
+    }
+
+    fn volume_reports(messages: &Receiver<AudioToUi>) -> Vec<TargetVolume> {
+        drained(messages)
+            .into_iter()
+            .filter_map(|message| match message {
+                AudioToUi::TargetVolume(volume) => Some(volume),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_seed_replaces_the_memory_drops_what_cannot_be_replayed_and_keeps_the_later_of_two() {
+        let (mut shared, _) = shared_with_messages();
+        shared.target_volumes = vec![remembered(DeviceDirection::Output, "old", &[0.5])];
+        control(
+            &mut shared,
+            UiToAudio::SeedTargetVolumes(vec![
+                remembered(DeviceDirection::Output, "speakers", &[0.2, 0.2]),
+                remembered(DeviceDirection::Output, "broken", &[f32::NAN, 0.3]),
+                remembered(DeviceDirection::Output, "", &[0.3]),
+                remembered(DeviceDirection::Output, "speakers", &[0.4, 0.4]),
+                remembered(DeviceDirection::Input, "speakers", &[0.9]),
+            ]),
+        );
+        assert_eq!(
+            shared.target_volumes,
+            [
+                remembered(DeviceDirection::Output, "speakers", &[0.4, 0.4]),
+                remembered(DeviceDirection::Input, "speakers", &[0.9]),
+            ],
+            "the same name in the other direction is another device"
+        );
+    }
+
+    #[test]
+    fn a_seed_leaves_out_an_entry_with_no_level_and_keeps_one_that_remembers_a_mute() {
+        let (mut shared, _) = shared_with_messages();
+        let mut bare_mute = remembered(DeviceDirection::Output, "tv", &[]);
+        bare_mute.mute = true;
+        control(
+            &mut shared,
+            UiToAudio::SeedTargetVolumes(vec![
+                remembered(DeviceDirection::Output, "hand-edited", &[]),
+                remembered(DeviceDirection::Output, "headphones", &[0.4, 0.4]),
+                bare_mute.clone(),
+            ]),
+        );
+        assert_eq!(
+            shared.target_volumes,
+            [
+                remembered(DeviceDirection::Output, "headphones", &[0.4, 0.4]),
+                bare_mute
+            ],
+            "an entry with neither a level nor a mute says nothing about its device"
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_entry_with_no_level_neither_raises_its_own_device_nor_silences_a_new_one() {
+        // Put in place past the seed's filter, as a later path to the memory might: what a pair
+        // starts at must not depend on the filter having run.
+        let (mut shared, _) = shared_with_messages();
+        shared.target_volumes = vec![
+            remembered(DeviceDirection::Output, "hand-edited", &[]),
+            remembered(DeviceDirection::Output, "headphones", &[0.4, 0.4]),
+        ];
+        shared.lanes.output.last_volume = Some(at(&[0.3, 0.3]));
+        assert_eq!(
+            volume_for_pair(&shared, DeviceDirection::Output, "hand-edited", 2).effective(2),
+            [0.3, 0.3],
+            "the entry's own device: not the unity of an empty list"
+        );
+        shared.lanes.output.last_volume = None;
+        let new = volume_for_pair(&shared, DeviceDirection::Output, "usb-dac", 2);
+        assert_eq!(
+            new.effective(2),
+            [0.4, 0.4],
+            "a device never seen: the quietest level remembered, not the silence of no level"
+        );
+        assert!(!new.mute);
+    }
+
+    #[test]
+    fn a_first_pair_with_nothing_remembered_is_no_louder_than_what_wireplumber_kept_for_0_3_0() {
+        // 0.3.0 at about −24 dB, in WirePlumber's memory; the app's own memory still empty.
+        let (mut shared, _) = shared_with_messages();
+        shared.inherited_volumes.output = Some(at(&[0.064, 0.064]));
+        assert_eq!(
+            volume_for_pair(&shared, DeviceDirection::Output, "speakers", 2).effective(2),
+            [0.064, 0.064],
+            "not the unity a new node is made with: 24 dB louder than the user left it"
+        );
+        assert_eq!(
+            volume_for_pair(&shared, DeviceDirection::Input, "microphone", 2),
+            NodeVolume::default(),
+            "each lane by what WirePlumber kept for its own node"
+        );
+        shared.inherited_volumes.output = Some(at(&[2.0, 2.0]));
+        assert_eq!(
+            volume_for_pair(&shared, DeviceDirection::Output, "speakers", 2).effective(2),
+            [1.0, 1.0],
+            "and never above unity: it is a ceiling, not a level to replay"
+        );
+    }
+
+    #[test]
+    fn what_wireplumber_kept_gives_way_to_anything_the_lane_or_the_app_knows() {
+        let (mut shared, _) = shared_with_messages();
+        shared.inherited_volumes.output = Some(at(&[0.064, 0.064]));
+        shared.target_volumes = vec![remembered(
+            DeviceDirection::Output,
+            "headphones",
+            &[0.5, 0.5],
+        )];
+        assert_eq!(
+            volume_for_pair(&shared, DeviceDirection::Output, "headphones", 2).effective(2),
+            [0.5, 0.5],
+            "a remembered device: its own level"
+        );
+        assert_eq!(
+            volume_for_pair(&shared, DeviceDirection::Output, "usb-dac", 2).effective(2),
+            [0.5, 0.5],
+            "a device never seen: the quietest the app remembers, which is newer than 0.3.0"
+        );
+        shared.target_volumes.clear();
+        shared.lanes.output.last_volume = Some(at(&[0.7, 0.7]));
+        assert_eq!(
+            volume_for_pair(&shared, DeviceDirection::Output, "usb-dac", 2).effective(2),
+            [0.7, 0.7],
+            "a lane that has had a pair this run: that pair's level"
+        );
+    }
+
+    #[test]
+    fn wireplumbers_key_for_our_nodes_is_made_from_the_properties_they_carry() {
+        // `formKey` in `node/state-stream.lua`: the media class, then `application.id`.
+        pw::init();
+        let positions = ChannelMap::default_for(2);
+        for direction in DeviceDirection::ALL {
+            let props = virtual_node_props(direction, None, 2, 48_000, &positions, "512/48000");
+            let media_class = props.get("media.class").expect("a media class");
+            let app_id = props.get("application.id").expect("an application id");
+            assert_eq!(
+                volume::wireplumber_key(direction),
+                format!("{media_class}:application.id:{app_id}")
+            );
+            assert!(
+                !volume::wireplumber_key(direction).contains([' ', '=', '[', ']', '\\']),
+                "a key WirePlumber would have escaped in its file"
+            );
+        }
+        assert_eq!(
+            volume::wireplumber_key(DeviceDirection::Output),
+            "Audio/Sink:application.id:com.fxsound.FxSound",
+            "the key 0.3.0's sink was saved under"
+        );
+    }
+
+    #[test]
+    fn a_new_pair_on_a_remembered_target_starts_at_that_targets_volume() {
+        let (mut shared, _) = shared_with_messages();
+        shared.target_volumes = vec![remembered(
+            DeviceDirection::Output,
+            "headphones",
+            &[0.3, 0.3],
+        )];
+        shared.lanes.output.last_volume = Some(at(&[0.8, 0.8]));
+        assert_eq!(
+            volume_for_pair(&shared, DeviceDirection::Output, "headphones", 2).effective(2),
+            [0.3, 0.3]
+        );
+    }
+
+    #[test]
+    fn a_new_pair_on_a_target_never_seen_is_no_louder_than_the_lanes_last_pair() {
+        let (mut shared, _) = shared_with_messages();
+        shared.target_volumes = vec![remembered(
+            DeviceDirection::Output,
+            "headphones",
+            &[0.1, 0.1],
+        )];
+        shared.lanes.output.last_volume = Some(at(&[0.4, 0.4]));
+        assert_eq!(
+            volume_for_pair(&shared, DeviceDirection::Output, "usb-dac", 2).effective(2),
+            [0.4, 0.4],
+            "the lane's last pair, not the quietest remembered device, once there has been one"
+        );
+    }
+
+    #[test]
+    fn a_first_pair_on_a_target_never_seen_is_no_louder_than_the_quietest_remembered_device() {
+        let (mut shared, _) = shared_with_messages();
+        shared.target_volumes = vec![
+            remembered(DeviceDirection::Output, "speakers", &[0.9, 0.9]),
+            remembered(DeviceDirection::Output, "headphones", &[0.2, 0.2]),
+            remembered(DeviceDirection::Input, "microphone", &[0.05]),
+        ];
+        assert_eq!(
+            volume_for_pair(&shared, DeviceDirection::Output, "usb-dac", 2).effective(2),
+            [0.2, 0.2]
+        );
+        assert_eq!(
+            volume_for_pair(&shared, DeviceDirection::Input, "webcam", 2).effective(2),
+            [0.05, 0.05],
+            "each lane by its own direction's memory"
+        );
+        let (fresh, _) = shared_with_messages();
+        assert_eq!(
+            volume_for_pair(&fresh, DeviceDirection::Output, "usb-dac", 2),
+            NodeVolume::default(),
+            "nothing remembered anywhere: the unity a new node has"
+        );
+    }
+
+    #[test]
+    fn a_volume_is_reported_once_and_remembered_for_its_target_and_lane() {
+        let (mut shared, messages) = shared_with_messages();
+        report_target_volume(
+            &mut shared,
+            DeviceDirection::Output,
+            "speakers",
+            &at(&[0.5, 0.25]),
+            2,
+        );
+        report_target_volume(
+            &mut shared,
+            DeviceDirection::Output,
+            "speakers",
+            &at(&[0.5, 0.25]),
+            2,
+        );
+        assert_eq!(
+            volume_reports(&messages),
+            [remembered(
+                DeviceDirection::Output,
+                "speakers",
+                &[0.5, 0.25]
+            )],
+            "the same volume again is nothing to report"
+        );
+        report_target_volume(
+            &mut shared,
+            DeviceDirection::Input,
+            "speakers",
+            &at(&[0.5]),
+            1,
+        );
+        let muted = NodeVolume {
+            mute: true,
+            ..at(&[0.5, 0.25])
+        };
+        report_target_volume(&mut shared, DeviceDirection::Output, "speakers", &muted, 2);
+        let mut expected_mute = remembered(DeviceDirection::Output, "speakers", &[0.5, 0.25]);
+        expected_mute.mute = true;
+        assert_eq!(
+            volume_reports(&messages),
+            [
+                remembered(DeviceDirection::Input, "speakers", &[0.5]),
+                expected_mute.clone()
+            ]
+        );
+        assert_eq!(
+            shared.target_volumes,
+            [
+                remembered(DeviceDirection::Input, "speakers", &[0.5]),
+                expected_mute
+            ],
+            "one entry per direction and target, the newest"
+        );
+    }
+
+    #[test]
+    fn the_master_scalar_is_folded_into_the_reported_channel_volumes() {
+        let (mut shared, messages) = shared_with_messages();
+        let volume = NodeVolume {
+            volume: 0.5,
+            ..at(&[0.8, 0.4])
+        };
+        report_target_volume(&mut shared, DeviceDirection::Output, "speakers", &volume, 2);
+        assert_eq!(
+            volume_reports(&messages),
+            [remembered(DeviceDirection::Output, "speakers", &[0.4, 0.2])]
+        );
+    }
+
+    #[test]
+    fn a_lane_without_a_pair_has_no_volume_to_report_or_retire() {
+        let (mut shared, messages) = shared_with_messages();
+        shared.lanes.output.volume.begin_pair(2, &at(&[0.3, 0.3]));
+        for _ in 0..3 {
+            watch_volume(&mut shared, DeviceDirection::Output);
+        }
+        retire_volume(&mut shared, DeviceDirection::Output);
+        assert!(volume_reports(&messages).is_empty());
+        assert_eq!(shared.lanes.output.last_volume, None);
+    }
+
+    #[test]
+    fn a_seed_with_no_pair_up_changes_no_lanes_volume() {
+        let (mut shared, messages) = shared_with_messages();
+        let before = shared.lanes.output.volume.changes();
+        control(
+            &mut shared,
+            UiToAudio::SeedTargetVolumes(vec![remembered(
+                DeviceDirection::Output,
+                "speakers",
+                &[0.2, 0.2],
+            )]),
+        );
+        assert_eq!(shared.lanes.output.volume.changes(), before);
+        assert!(volume_reports(&messages).is_empty(), "a seed is not news");
+    }
+
+    /// A `Props` write as `param_changed` hands it over: `channel_volumes` when it sets them, and
+    /// `params` — key, value, key, value — when it carries any.
+    fn props_write(
+        channel_volumes: Option<&[f32]>,
+        params: Option<Vec<(&str, libspa::pod::Value)>>,
+    ) -> Vec<u8> {
+        use libspa::pod::{Object, Property, PropertyFlags, Value, ValueArray};
+
+        let property = |key: u32, value: Value| Property {
+            key,
+            flags: PropertyFlags::empty(),
+            value,
+        };
+        let mut properties = Vec::new();
+        if let Some(volumes) = channel_volumes {
+            properties.push(property(
+                libspa::sys::SPA_PROP_channelVolumes,
+                Value::ValueArray(ValueArray::Float(volumes.to_vec())),
+            ));
+        }
+        if let Some(params) = params {
+            let fields = params
+                .into_iter()
+                .flat_map(|(key, value)| [Value::String(key.to_owned()), value])
+                .collect();
+            properties.push(property(
+                libspa::sys::SPA_PROP_params,
+                Value::Struct(fields),
+            ));
+        }
+        libspa::pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            &Value::Object(Object {
+                type_: libspa::sys::SPA_TYPE_OBJECT_Props,
+                id: libspa::param::ParamType::Props.as_raw(),
+                properties,
+            }),
+        )
+        .expect("a Props pod")
+        .0
+        .into_inner()
+    }
+
+    /// `take_props` as NODE 1's `param_changed` calls it, with `bytes` as the write.
+    fn written(volume: &LaneVolume, bytes: &[u8]) {
+        take_props(
+            volume,
+            libspa::param::ParamType::Props.as_raw(),
+            Some(Pod::from_bytes(bytes).expect("a pod")),
+        );
+    }
+
+    #[test]
+    fn a_write_of_another_adapter_setting_leaves_the_volume_after_the_chain() {
+        use libspa::pod::Value;
+
+        let volume = LaneVolume::new();
+        volume.begin_pair(2, &at(&[0.2, 0.2]));
+        let before = volume.changes();
+        // `pw-cli set-param fxsound_sink Props '{ params = [ "channelmix.normalize" true ] }'`
+        let normalize = props_write(
+            None,
+            Some(vec![("channelmix.normalize", Value::Bool(true))]),
+        );
+        assert_eq!(
+            Pod::from_bytes(&normalize)
+                .and_then(PropsUpdate::from_pod)
+                .and_then(|update| update.clamped),
+            Some(false),
+            "read on its own, a write that lists neither bound looks like an adapter that does \
+             not clamp"
+        );
+        written(&volume, &normalize);
+        assert!(
+            volume.post_dsp(),
+            "the adapter still keeps the volume at unity, so the lane must go on applying it"
+        );
+        assert_eq!(volume.gains()[..2], [0.2, 0.2]);
+        assert_eq!(volume.changes(), before, "no volume was set");
+    }
+
+    #[test]
+    fn a_slider_write_that_also_carries_params_sets_the_volume_and_nothing_else() {
+        use libspa::pod::Value;
+
+        let volume = LaneVolume::new();
+        volume.begin_pair(2, &at(&[1.0, 1.0]));
+        written(
+            &volume,
+            &props_write(
+                Some(&[0.25, 0.25]),
+                Some(vec![("monitor.channel-volumes", Value::Bool(false))]),
+            ),
+        );
+        assert!(volume.post_dsp());
+        assert_eq!(volume.gains()[..2], [0.25, 0.25]);
+    }
+
+    #[test]
+    fn a_write_that_moves_one_volume_bound_leaves_the_clamp_to_the_nodes_own_props() {
+        use libspa::pod::Value;
+
+        let volume = LaneVolume::new();
+        volume.begin_pair(2, &at(&[0.5, 0.5]));
+        // Moving one bound off unity does make the adapter apply the volume, and the node's whole
+        // `Props` say so a round trip later. The write cannot: it does not say where the other
+        // bound is — and a write of the upper bound alone, at unity, would read the same way.
+        for write in [
+            props_write(
+                None,
+                Some(vec![(volume::MIN_VOLUME_KEY, Value::Float(0.0))]),
+            ),
+            props_write(
+                None,
+                Some(vec![(volume::MAX_VOLUME_KEY, Value::Float(1.0))]),
+            ),
+        ] {
+            written(&volume, &write);
+            assert!(volume.post_dsp());
+            assert_eq!(volume.gains()[..2], [0.5, 0.5]);
+        }
+    }
+
+    #[test]
+    fn the_first_node_a_pair_adopts_keeps_whether_its_volume_needed_writing() {
+        assert!(
+            still_published(true, None, 41),
+            "a pair at unity has nothing to tell a node PipeWire has just made"
+        );
+        assert!(!still_published(false, None, 41));
+    }
+
+    #[test]
+    fn a_node_adopted_in_place_of_a_dead_one_is_written_to_again() {
+        assert!(
+            !still_published(true, Some(40), 41),
+            "the write went to the node of a pair that had gone; the new node would show unity \
+             while the lane plays lower, and a volume key would raise it from there"
+        );
+        assert!(!still_published(false, Some(40), 41));
+    }
+
+    #[test]
+    fn the_same_node_announced_again_is_not_written_to_twice() {
+        assert!(still_published(true, Some(41), 41));
+        assert!(!still_published(false, Some(41), 41));
+    }
+
+    #[test]
+    fn the_virtual_nodes_are_told_apart_from_every_other_node_by_name() {
+        assert_eq!(
+            virtual_node_direction(Some(SINK_NODE_NAME)),
+            Some(DeviceDirection::Output)
+        );
+        assert_eq!(
+            virtual_node_direction(Some(SOURCE_NODE_NAME)),
+            Some(DeviceDirection::Input)
+        );
+        for other in [
+            OUTPUT_NODE_NAME,
+            CAPTURE_NODE_NAME,
+            AEC_SOURCE_NODE_NAME,
+            "alsa_output.pci",
+        ] {
+            assert_eq!(virtual_node_direction(Some(other)), None, "{other}");
+        }
+        assert_eq!(virtual_node_direction(None), None);
     }
 
     #[test]

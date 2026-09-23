@@ -594,8 +594,8 @@ impl Default for Meters {
 /// level the user last chose for that device. The real device's own volume is never touched.
 ///
 /// Travels both ways — reported by the engine as [`AudioToUi::TargetVolume`] when the node's
-/// `Props` change, seeded back with [`UiToAudio::SeedTargetVolumes`] at start-up — and is kept in
-/// the settings file (`Settings::device_volumes`), which is why it is plain data with serde.
+/// `Props` change, handed back when the engine starts (`fxsound_audio::StartOptions`) — and is
+/// kept in the settings file (`Settings::device_volumes`), which is why it is plain data with serde.
 /// Every field defaults, so a hand edit that leaves an entry short costs that field and not the
 /// whole file.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
@@ -697,9 +697,14 @@ pub enum UiToAudio {
         direction: DeviceDirection,
         names: Vec<String>,
     },
-    /// Every remembered per-target volume, from the settings file, sent once at start-up (U10).
-    /// The engine replays the matching one onto its own node when it attaches a lane to that
-    /// target. A later seed replaces the whole memory.
+    /// Every remembered per-target volume, from the settings file (U10), replacing the whole of
+    /// the engine's memory. The engine replays the matching one onto its own node when it attaches
+    /// a lane to that target.
+    ///
+    /// Not how the memory first reaches the engine: the output lane builds its first pair before a
+    /// message sent after start-up is sure to have arrived, so the app hands it over with the
+    /// engine (`fxsound_audio::StartOptions::target_volumes`). This is for a later replacement; a
+    /// pair up already whose volume nothing has moved is then given its target's level.
     SeedTargetVolumes(Vec<TargetVolume>),
     /// logind's `PrepareForSleep`: `true` when the system is about to sleep, `false` when it has
     /// resumed (U13). The engine defers its device rules across the gap, since Bluetooth devices

@@ -26,8 +26,23 @@
 //! meters still describe the chain's output, not the silence; nobody reads them while the system
 //! sleeps. Upstream does the same thing one step later — its mute keeps capturing and processing
 //! and only skips the playback call (`AudioPassthruPrivate.cpp:568`) — and its cut is as hard as
-//! this one: a de-click ramp belongs with the ramp from silence a new pair gets (U10), which is
-//! the same code.
+//! this one: a de-click ramp belongs with the fade in from silence a new pair gets ([`Tail`],
+//! U10), which is where it would go.
+//!
+//! # After the chain
+//!
+//! Two gains follow the chain and the mute, in both lanes, and are one stage ([`Tail`]):
+//!
+//! * **The virtual node's volume** (U11). The adapter in front of a sink applies the node's
+//!   volume before `process()`, where the volume leveller undoes up to eight of the twenty
+//!   decibels a slider asks for (`crate::volume`). So the adapter's range is clamped to unity and
+//!   the node's `channelVolumes` are applied here, after the chain, per channel. A change is
+//!   ramped linearly across one block, from the gain the last block ended on, so a slider being
+//!   dragged moves the level smoothly rather than in steps a block long.
+//! * **A fade in from silence on a new pair** (U10): the first [`FADE_IN_SECONDS`] of whatever a
+//!   new pair processes rise linearly from zero. A pair is new when the device changed, and
+//!   whatever the new device's volume turns out to be, the first sound on it does not arrive as a
+//!   step — nor does the tail of a limiter that last saw another device.
 //!
 //! # Real-time rules
 //!
@@ -45,7 +60,13 @@ use fxsound_dsp::{ChainSpec, InputEngine};
 use triple_buffer::{Input, Output};
 
 use crate::per_direction::PerDirection;
+use crate::volume::CHANNELS;
 use crate::{DEFAULT_SAMPLE_RATE, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS};
+
+/// How long a new pair takes to rise from silence to its volume: inside the 20–50 ms the
+/// upstream review asked for, long enough that a first sound is not a click and short enough to
+/// be over before a listener could call it a fade.
+pub(crate) const FADE_IN_SECONDS: f32 = 0.03;
 
 /// The DSP state of one lane, kept across reconnects and pairs of nodes.
 ///
@@ -83,6 +104,28 @@ impl LaneDsp {
             Self::Output(dsp) => dsp.set_format(sample_rate, channels),
             Self::Input(dsp) => dsp.set_format(sample_rate, channels),
         }
+        self.tail_mut().set_rate(sample_rate);
+    }
+
+    /// This lane's post-chain stage.
+    const fn tail_mut(&mut self) -> &mut Tail {
+        match self {
+            Self::Output(dsp) => &mut dsp.tail,
+            Self::Input(dsp) => &mut dsp.tail,
+        }
+    }
+
+    /// The gains the node's volume asks of each channel, read from the lane's
+    /// `crate::volume::LaneVolume` once a block. The block after this is ramped to them.
+    #[inline]
+    pub(crate) fn set_volume(&mut self, gains: &[f32; CHANNELS]) {
+        self.tail_mut().set_targets(gains);
+    }
+
+    /// A new pair of nodes: start it from silence, and at its volume rather than ramping there from
+    /// the gains the last pair ended on. Main loop, before the DSP is handed to the pair.
+    pub(crate) fn begin_pair(&mut self) {
+        self.tail_mut().begin_pair();
     }
 
     /// Where the subwoofer and the front pair sit in the negotiated layout. The output lane's
@@ -234,6 +277,8 @@ pub(crate) struct OutputDsp {
     scratch: Vec<f32>,
     /// The newest snapshot's `mute`, as of the last [`Self::refresh`]. See the module's "Mute".
     muted: bool,
+    /// The node's volume and a new pair's fade in. See the module's "After the chain".
+    tail: Tail,
 }
 
 impl OutputDsp {
@@ -249,6 +294,7 @@ impl OutputDsp {
             events,
             scratch: worst_case_scratch(),
             muted: false,
+            tail: Tail::new(),
         }
     }
 
@@ -289,6 +335,7 @@ impl OutputDsp {
         let scratch = decode(&mut self.scratch, block, channels)?;
         self.engine.process(scratch, channels);
         silence_if(self.muted, scratch);
+        self.tail.apply(scratch, channels);
         Some(scratch)
     }
 }
@@ -320,6 +367,8 @@ pub(crate) struct InputDsp {
     scratch: Vec<f32>,
     /// The newest snapshot's `mute`, as of the last [`Self::refresh`]. See the module's "Mute".
     muted: bool,
+    /// The node's volume and a new pair's fade in. See the module's "After the chain".
+    tail: Tail,
 }
 
 impl InputDsp {
@@ -344,6 +393,7 @@ impl InputDsp {
             parked: None,
             scratch: worst_case_scratch(),
             muted: false,
+            tail: Tail::new(),
         }
     }
 
@@ -437,6 +487,7 @@ impl InputDsp {
         let scratch = decode(&mut self.scratch, block, channels)?;
         self.engine.process(scratch, channels);
         silence_if(self.muted, scratch);
+        self.tail.apply(scratch, channels);
         Some(scratch)
     }
 }
@@ -479,6 +530,96 @@ impl ChainHandover {
             replacement_rx,
             retired_tx,
         )
+    }
+}
+
+/// The stage after the chain and the mute: the virtual node's volume, per channel, and the fade in
+/// from silence that starts a new pair. See the module's "After the chain".
+///
+/// Real-time safe: fixed-size arrays and counters, a multiply per sample, no branch that can
+/// panic. A channel past [`CHANNELS`] — which the pair's clamp to eight never produces — is left
+/// as it is rather than indexed.
+#[derive(Debug)]
+pub(crate) struct Tail {
+    /// The gain each channel ended the last block on.
+    current: [f32; CHANNELS],
+    /// The gain each channel is ramped to across the next block.
+    target: [f32; CHANNELS],
+    /// Frames of the fade in done so far; the fade is over once this reaches `fade_len`.
+    fade_done: u32,
+    /// The fade's length in frames, at the rate the pair runs.
+    fade_len: u32,
+    sample_rate: f32,
+}
+
+impl Tail {
+    const fn new() -> Self {
+        Self {
+            current: [1.0; CHANNELS],
+            target: [1.0; CHANNELS],
+            fade_done: 0,
+            fade_len: 0,
+            sample_rate: DEFAULT_SAMPLE_RATE as f32,
+        }
+    }
+
+    fn set_rate(&mut self, sample_rate: f32) {
+        if sample_rate.is_finite() && sample_rate > 0.0 {
+            self.sample_rate = sample_rate;
+        }
+    }
+
+    /// Start a new pair: from silence, at the gains it was told last rather than ramping there.
+    fn begin_pair(&mut self) {
+        self.current = self.target;
+        self.fade_len = ((self.sample_rate * FADE_IN_SECONDS) as u32).max(1);
+        self.fade_done = 0;
+    }
+
+    #[inline]
+    fn set_targets(&mut self, gains: &[f32; CHANNELS]) {
+        for (target, &gain) in self.target.iter_mut().zip(gains) {
+            // The lane's volume is sanitised where it is written; a gain that is not a number
+            // could only come from a bug there, and silence is its only safe reading.
+            *target = if gain.is_finite() { gain.max(0.0) } else { 0.0 };
+        }
+    }
+
+    /// Whether the fade in still has frames to go.
+    const fn fading(&self) -> bool {
+        self.fade_done < self.fade_len
+    }
+
+    /// Apply the ramp to the target gains and whatever is left of the fade in to one block of
+    /// interleaved frames.
+    #[inline]
+    fn apply(&mut self, block: &mut [f32], channels: usize) {
+        let Some(frames) = block.len().checked_div(channels) else {
+            return;
+        };
+        if frames == 0 {
+            return;
+        }
+        let ramping = self.current != self.target;
+        if !ramping && !self.fading() && self.current.iter().all(|&gain| gain == 1.0) {
+            return;
+        }
+        let step = 1.0 / frames as f32;
+        for (index, frame) in block.chunks_exact_mut(channels).enumerate() {
+            let fade = if self.fading() {
+                let fade = self.fade_done as f32 / self.fade_len as f32;
+                self.fade_done += 1;
+                fade
+            } else {
+                1.0
+            };
+            // Reaches the target on the block's last frame.
+            let along = (index + 1) as f32 * step;
+            for ((sample, &from), &to) in frame.iter_mut().zip(&self.current).zip(&self.target) {
+                *sample *= fade * (from + (to - from) * along);
+            }
+        }
+        self.current = self.target;
     }
 }
 
@@ -1130,5 +1271,179 @@ pub(crate) mod tests {
             lanes.input.as_input_mut().map(|d| d.engine.spec()),
             Some(ChainSpec::podcast())
         );
+    }
+
+    // ---- after the chain: the node's volume and a new pair's fade in (U10, U11)
+
+    /// `frames` stereo frames of full-scale DC, so what comes out is the gain itself.
+    fn ones(frames: usize) -> Vec<f32> {
+        vec![1.0; frames * 2]
+    }
+
+    fn tail_at(rate: f32) -> Tail {
+        let mut tail = Tail::new();
+        tail.set_rate(rate);
+        tail
+    }
+
+    fn left(block: &[f32]) -> Vec<f32> {
+        block.iter().step_by(2).copied().collect()
+    }
+
+    #[test]
+    fn a_new_pair_rises_linearly_from_silence_to_its_volume_in_thirty_milliseconds() {
+        let mut tail = tail_at(48_000.0);
+        tail.begin_pair();
+        let mut heard = Vec::new();
+        for _ in 0..4 {
+            let mut block = ones(480);
+            tail.apply(&mut block, 2);
+            heard.extend(left(&block));
+        }
+        let len = 1_440;
+        assert_eq!(heard[0], 0.0, "from silence");
+        for (frame, &gain) in heard.iter().enumerate().take(len) {
+            let expected = frame as f32 / len as f32;
+            assert!((gain - expected).abs() < 1e-6, "frame {frame}: {gain}");
+        }
+        assert!(
+            heard[len..].iter().all(|&gain| gain == 1.0),
+            "and at its volume from 30 ms on, across the block boundaries"
+        );
+    }
+
+    #[test]
+    fn the_fade_in_lasts_thirty_milliseconds_at_the_rate_the_pair_runs() {
+        let mut tail = tail_at(44_100.0);
+        tail.begin_pair();
+        let mut block = ones(2_048);
+        tail.apply(&mut block, 2);
+        let heard = left(&block);
+        assert!(heard[1_322] < 1.0);
+        assert_eq!(heard[1_323], 1.0, "1323 frames at 44.1 kHz");
+    }
+
+    #[test]
+    fn a_volume_change_is_ramped_across_one_block_and_held_from_the_next() {
+        let mut tail = tail_at(48_000.0);
+        tail.set_targets(&[0.5; CHANNELS]);
+        let mut block = ones(4);
+        tail.apply(&mut block, 2);
+        assert_eq!(left(&block), [0.875, 0.75, 0.625, 0.5]);
+        let mut block = ones(4);
+        tail.apply(&mut block, 2);
+        assert_eq!(left(&block), [0.5; 4]);
+    }
+
+    #[test]
+    fn each_channel_follows_its_own_volume() {
+        let mut tail = tail_at(48_000.0);
+        let mut gains = [1.0; CHANNELS];
+        gains[1] = 0.25;
+        tail.set_targets(&gains);
+        tail.begin_pair();
+        tail.fade_len = 0;
+        let mut block = ones(3);
+        tail.apply(&mut block, 2);
+        assert_eq!(block, [1.0, 0.25, 1.0, 0.25, 1.0, 0.25]);
+    }
+
+    #[test]
+    fn a_new_pair_starts_at_its_volume_rather_than_ramping_there_from_the_last_pairs() {
+        let mut tail = tail_at(48_000.0);
+        let mut block = ones(4);
+        tail.apply(&mut block, 2);
+        assert_eq!(block, ones(4), "the last pair at unity");
+
+        tail.set_targets(&[0.25; CHANNELS]);
+        tail.begin_pair();
+        let mut block = ones(2_000);
+        tail.apply(&mut block, 2);
+        let heard = left(&block);
+        assert!(
+            (heard[720] - 0.125).abs() < 1e-6,
+            "half way up the fade, at 0.25"
+        );
+        assert_eq!(heard[1_999], 0.25);
+    }
+
+    #[test]
+    fn a_tail_at_unity_with_its_fade_over_leaves_the_block_bit_for_bit_alone() {
+        let mut tail = tail_at(48_000.0);
+        let mut block: Vec<f32> = (0..64).map(|i| (i as f32 * 0.37).sin()).collect();
+        let before = block.clone();
+        tail.apply(&mut block, 2);
+        assert_eq!(block, before);
+    }
+
+    #[test]
+    fn a_gain_that_is_not_a_number_or_below_zero_is_heard_as_silence() {
+        let mut tail = tail_at(48_000.0);
+        let mut gains = [f32::NAN; CHANNELS];
+        gains[1] = -3.0;
+        tail.set_targets(&gains);
+        tail.begin_pair();
+        tail.fade_len = 0;
+        let mut block = ones(2);
+        tail.apply(&mut block, 2);
+        assert_eq!(block, [0.0; 4]);
+    }
+
+    #[test]
+    fn an_empty_block_or_no_channels_is_left_alone_rather_than_divided_by() {
+        let mut tail = tail_at(48_000.0);
+        tail.set_targets(&[0.5; CHANNELS]);
+        tail.begin_pair();
+        let mut empty: [f32; 0] = [];
+        tail.apply(&mut empty, 2);
+        let mut block = ones(4);
+        tail.apply(&mut block, 0);
+        assert_eq!(block, ones(4));
+        assert_eq!(
+            tail.fade_done, 0,
+            "nothing was played, so the fade has not begun"
+        );
+    }
+
+    #[test]
+    fn both_lanes_apply_the_node_volume_after_the_chain_and_fade_a_new_pair_in() {
+        let mut w = wired();
+        w.params.write(DspParams {
+            power: false,
+            ..DspParams::default()
+        });
+        w.input_params.write(InputDspParams {
+            power: false,
+            ..InputDspParams::default()
+        });
+        for (direction, dsp) in w.lanes.iter_mut() {
+            dsp.set_volume(&[0.5; CHANNELS]);
+            dsp.begin_pair();
+            let first = run_block(dsp, 0);
+            assert_eq!(
+                first[..2],
+                [0.0, 0.0],
+                "the {} lane's first frame",
+                direction.key()
+            );
+            // 1440 frames of fade: blocks 0, 1 and 2 of 480.
+            for index in 1..3 {
+                run_block(dsp, index);
+            }
+            let settled = run_block(dsp, 3);
+            let dry: Vec<f32> = tone_block(3)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|raw| f32::from_le_bytes(*raw))
+                .collect();
+            for (wet, dry) in settled.iter().zip(&dry) {
+                assert!(
+                    (wet - 0.5 * dry).abs() < 1e-6,
+                    "the {} lane at half volume: {wet} for {dry}",
+                    direction.key()
+                );
+            }
+        }
     }
 }
