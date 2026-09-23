@@ -65,8 +65,8 @@ use fxsound_core::{ThemeMode, ViewMode, i18n::tr};
 use fxsound_ui::{
     FxColor, Palette, UiAction,
     dialogs::{
-        self, CalibrationAction, CalibrationDialog, CalibrationView, ExportDialog, ExportState,
-        ImportDialog, ImportState, PresetsAction,
+        self, CalibrationDialog, CalibrationView, ExportDialog, ExportState, ImportDialog,
+        ImportState, PresetsAction,
         changelog::{ChangelogAction, ChangelogPane},
         settings::{NavIcons, SettingsAction, SettingsDialog, SettingsState},
     },
@@ -415,6 +415,9 @@ impl Runtime {
                 Ok(Box::new(Shell::new(runtime, palette.mode())))
             }),
         )?;
+        // The wizard is a pane of the window that just went: a run it was in the middle of stops,
+        // and the microphone is let go rather than held for a window that is not there.
+        self.app.cancel_calibration();
         // A quit is announced by `shutdown`, as `quit`.
         if self.exit == WindowExit::Hidden {
             self.announce(&AppEvent::Window { visible: false });
@@ -528,11 +531,13 @@ struct Shell<'a> {
     folder_picker: Option<crossbeam_channel::Receiver<Option<PathBuf>>>,
     /// The changelog pane is open on top of Settings.
     changelog: bool,
-    /// `Some` while the calibration wizard is open on top of Settings ▸ Microphone.
+    /// What the calibration wizard draws this frame, while it is open on top of Settings ▸
+    /// Microphone.
     ///
-    /// A static introduction for now: the state machine that drives it from the input lane's
-    /// meters (0.4.0 design §8) belongs to the controller, which does not have it yet, so Start
-    /// is shown disabled (see [`calibration_intro`]) and only Cancel and the ✕ do anything.
+    /// A copy: the wizard's state machine is the controller's ([`App::calibration_view`]), which
+    /// times the phases from the input lane's meters (0.4.0 design §8). Taken again at the top
+    /// of every frame, after the tick has driven it, so the window is sized for the phase it is
+    /// about to draw.
     calibration: Option<CalibrationView>,
     /// Where the design-size content starts this frame: the viewport's origin, or the centred
     /// offset when the surface is larger than the design (see [`fit_zoom`]).
@@ -655,10 +660,8 @@ impl<'a> Shell<'a> {
     /// selected, and the microphone is asked for again here because the device list can change
     /// between the frame that drew the button and this one.
     fn open_calibration(&mut self) {
-        if self.calibration.is_none()
-            && let Some(device) = self.rt.app.microphone_description()
-        {
-            self.calibration = Some(calibration_intro(device));
+        if self.rt.app.open_calibration() {
+            self.calibration = self.rt.app.calibration_view();
         }
     }
 
@@ -961,7 +964,9 @@ impl<'a> Shell<'a> {
         }
     }
 
-    /// Draw the calibration wizard over Settings, if it is open (0.4.0 design §8).
+    /// Draw the calibration wizard over Settings, if it is open (0.4.0 design §8). What the user
+    /// presses goes to the controller, which runs the wizard; the next frame draws what it made
+    /// of it.
     fn show_calibration(&mut self, ui: &mut egui::Ui, palette: Palette) {
         let window = self.window_rect();
         let Some(view) = self.calibration.take() else {
@@ -971,22 +976,10 @@ impl<'a> Shell<'a> {
         let outer = egui::Rect::from_center_size(window.center(), view.window_size());
         let response =
             CalibrationDialog::new(&view).show(ui, outer, palette, &mut self.rt.app.assets, "main");
-
-        let mut closed = false;
         for action in &response.actions {
-            match action {
-                CalibrationAction::Cancel | CalibrationAction::Close => closed = true,
-                // Measuring, applying and retrying need the controller's calibration state
-                // machine, which is not written yet; until then Start is disabled and the wizard
-                // only introduces itself, so none of these can arrive.
-                CalibrationAction::Start | CalibrationAction::Apply | CalibrationAction::Retry => {
-                    log::debug!("calibration: {action:?} has no state machine to drive yet");
-                }
-            }
+            self.rt.app.handle_calibration(*action);
         }
-        if !closed {
-            self.calibration = Some(view);
-        }
+        self.calibration = self.rt.app.calibration_view();
     }
 
     /// Draw the Import Presets pane, if it is open — the chooser, then the summary
@@ -1115,6 +1108,8 @@ impl eframe::App for Shell<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // The wizard as the tick left it, before anything sizes the window for it.
+        self.calibration = self.rt.app.calibration_view();
         self.sync_theme(&ctx);
         self.sync_view_size(&ctx);
 
@@ -1197,23 +1192,11 @@ impl eframe::App for Shell<'_> {
         self.show_menu(&ctx, palette);
 
         // The visualizer and the meters are live, so keep painting while audio flows — at a
-        // fixed cadence, since there is no vsync to pace the loop.
-        if self.rt.app.state.audio_active {
+        // fixed cadence, since there is no vsync to pace the loop. The calibration wizard's
+        // countdown and live level are too, while it wakes the microphone, measures or analyses.
+        if self.rt.app.state.audio_active || self.rt.app.calibration_is_live() {
             ctx.request_repaint_after(FRAME_INTERVAL);
         }
-    }
-}
-
-/// The calibration wizard's first page for the microphone `device`, as this build can offer it.
-///
-/// Nothing times the phases or reads the input lane's meters yet — that is the controller's
-/// calibration state machine (0.4.0 design §8) — so the host says it cannot measure and Start
-/// stays disabled rather than appearing to begin and then doing nothing. The controller replaces
-/// this with its own view, `can_measure` set from whether its input lane is running.
-fn calibration_intro(device: &str) -> CalibrationView {
-    CalibrationView {
-        can_measure: false,
-        ..CalibrationView::intro(device)
     }
 }
 
@@ -1714,23 +1697,107 @@ fn fit_zoom(surface_px: egui::Vec2, design: egui::Vec2, native_ppp: f32) -> f32 
 #[cfg(test)]
 mod calibration_tests {
     use super::*;
-    use fxsound_ui::dialogs::CalibrationPhase;
+    use fxsound_app::audio_link::FakeEngine;
+    use fxsound_core::messages::AudioToUi;
+    use fxsound_core::{AudioDevice, AudioStatus, DeviceDirection, Settings};
+    use fxsound_preset::{InputPresetStore, PresetStore};
+    use fxsound_ui::dialogs::calibration::wizard;
+    use fxsound_ui::dialogs::{CalibrationAction, CalibrationPhase};
 
-    #[test]
-    fn the_wizard_opens_on_its_introduction_for_the_selected_microphone() {
-        let view = calibration_intro("fifine Microphone Analogue Stereo");
-        assert_eq!(view.phase, CalibrationPhase::Intro);
-        assert_eq!(view.device, "fifine Microphone Analogue Stereo");
-        assert!(view.result.is_none());
+    const MIC: &str = "alsa_input.usb-fifine";
+    const MIC_NAME: &str = "fifine Microphone Analogue Stereo";
+
+    /// A runtime serving the socket in `dir`, around a controller started against a stand-in
+    /// engine whose input lane is attached to the fifine when `with_microphone`.
+    fn runtime(dir: &std::path::Path, with_microphone: bool) -> Runtime {
+        let Instance::Primary(listener) = Instance::acquire_in(dir).expect("acquire") else {
+            panic!("expected to be primary");
+        };
+        let engine = FakeEngine::new();
+        let mut settings = Settings::default();
+        settings.set_lane_enabled(DeviceDirection::Input, true);
+        let presets = PresetStore::with_dirs(Vec::new(), dir.join("presets"));
+        let voices = InputPresetStore::with_dirs(Vec::new(), dir.join("presets").join("Input"));
+        let mut app = App::start_for_tests(settings, presets, voices, &engine);
+        engine.feed(AudioToUi::Devices(vec![AudioDevice {
+            id: 7,
+            name: MIC.to_owned(),
+            description: MIC_NAME.to_owned(),
+            is_default: true,
+            direction: DeviceDirection::Input,
+            form_factor: "microphone".to_owned(),
+        }]));
+        if with_microphone {
+            engine.feed(AudioToUi::Attached {
+                direction: DeviceDirection::Input,
+                node_name: Some(MIC.to_owned()),
+            });
+            engine.feed(AudioToUi::Status {
+                direction: DeviceDirection::Input,
+                status: AudioStatus {
+                    processing: true,
+                    ..AudioStatus::default()
+                },
+            });
+        }
+        app.poll_audio();
+        let (_tray_tx, tray_rx) = crossbeam_channel::unbounded();
+        Runtime {
+            app,
+            dbus: None,
+            server: listener.serve().expect("serve"),
+            tray: None,
+            tray_rx,
+            exit: WindowExit::Hidden,
+            settings_requested: false,
+            terminate: Arc::new(AtomicBool::new(false)),
+            terminating: false,
+        }
     }
 
     #[test]
-    fn start_stays_disabled_until_the_controller_can_drive_the_measurements() {
-        // Part 2's calibration state machine sets this from its input lane; until then a Start
-        // that did nothing would be a button that lies.
-        let view = calibration_intro("fifine Microphone Analogue Stereo");
-        assert!(!view.can_measure);
-        assert!(!view.can_start());
+    fn calibrate_microphone_opens_the_controllers_wizard_over_the_pane_and_grows_the_window() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = runtime(dir.path(), true);
+        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        shell.open_settings();
+        shell.open_calibration();
+
+        let view = shell.calibration.clone().expect("the wizard is open");
+        assert_eq!(view.phase, CalibrationPhase::Intro);
+        assert_eq!(view.device, MIC_NAME);
+        assert!(
+            view.can_start(),
+            "the controller can drive the measurements, so Start is live"
+        );
+        assert!(shell.pane_open(), "the menu stays shut under the wizard");
+        let size = shell.window_size();
+        assert!(size.x >= wizard::WINDOW_SIZE.x && size.y >= wizard::WINDOW_SIZE.y);
+        assert!(shell.rt.app.calibration_open());
+    }
+
+    #[test]
+    fn without_a_microphone_on_the_input_lane_the_wizard_does_not_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = runtime(dir.path(), false);
+        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        shell.open_settings();
+        shell.open_calibration();
+        assert!(shell.calibration.is_none());
+        assert!(!shell.rt.app.calibration_open());
+    }
+
+    #[test]
+    fn cancel_in_the_wizard_closes_it_in_the_controller_too() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = runtime(dir.path(), true);
+        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        shell.open_calibration();
+        shell.rt.app.handle_calibration(CalibrationAction::Start);
+        assert!(shell.rt.app.calibration_is_live(), "Start began a run");
+        shell.rt.app.handle_calibration(CalibrationAction::Cancel);
+        assert!(!shell.rt.app.calibration_open());
+        assert_eq!(shell.rt.app.calibration_view(), None);
     }
 }
 

@@ -118,18 +118,18 @@ fn demo_view(phase: CalibrationPhase, can_measure: bool) -> CalibrationView {
             speech_peak_db: -6.0,
             clipped_percent: 0.0,
             preset: "Headset".to_owned(),
-            lines: [
-                "High-pass 80 Hz",
-                "Gate −40 dB",
-                "Compressor −25 dB, 3:1",
-                "Makeup +3 dB",
-                "Ceiling −3 dB",
-                "Noise suppression Mild",
-            ]
-            .map(str::to_owned)
-            .to_vec(),
+            // The application's own keys (`fxsound-app/src/calibration.rs`), at the widest values
+            // they take, so `--language` shows what a real result looks like.
+            lines: vec![
+                i18n::tr_args("High-pass %s", &["120 Hz"]),
+                i18n::tr_args("Gate %s", &["−90 dB"]),
+                i18n::tr_args("Compressor %s, ratio %s", &["−60 dB", "3:1"]),
+                i18n::tr_args("Makeup gain %s", &["+18 dB"]),
+                i18n::tr_args("Ceiling %s", &["−6 dB"]),
+                i18n::tr_args("Noise suppression: %s", &[&i18n::tr("Medium")]),
+            ],
         }),
-        failure: "The microphone sent nothing but silence. Check that it is not muted.".to_owned(),
+        failure: i18n::tr("No speech was heard. Speak closer to the microphone."),
         can_measure,
         ..CalibrationView::intro(DEVICE)
     }

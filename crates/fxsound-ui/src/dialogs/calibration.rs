@@ -11,11 +11,11 @@
 //! level and, at the end, the result — and returns a [`DialogResponse<CalibrationAction>`]. Timing
 //! the phases, resetting the capture statistics on entry to each, reading them back on exit and
 //! turning them into a recommendation is the application's state machine; nothing here sees a
-//! meter, a clock or a preset store. Whether there is such a state machine and a running input
-//! lane for it to read is the host's to say ([`CalibrationView::can_measure`]); until it does,
-//! Start and Retry are disabled. Every string the result carries (the recommended settings, the
-//! reason a run failed) arrives already translated, because the application is what knows which
-//! numbers they hold.
+//! meter, a clock or a preset store. Whether there is such a state machine and a microphone on
+//! the input lane for it to read is the host's to say ([`CalibrationView::can_measure`]); until it
+//! does, Start and Retry are disabled; the host wakes a lane that is attached but idle itself.
+//! Every string the result carries (the recommended settings, the reason a run failed) arrives
+//! already translated, because the application is what knows which numbers they hold.
 //!
 //! ## What the ✕ means
 //!
@@ -132,10 +132,10 @@ pub struct CalibrationView {
     pub device: String,
     /// Why the run failed, already translated. Shown in the Failed phase only.
     pub failure: String,
-    /// Whether the host can take the measurements: the input lane is running and something times
-    /// the phases and reads its meters. Start and Retry stay disabled without it, so the wizard
-    /// never counts down over a microphone nobody is listening to. [`Self::intro`] leaves it
-    /// `false`; the host says when it can.
+    /// Whether the host can take the measurements: the input lane has a microphone and something
+    /// times the phases and reads its meters — the host wakes the lane itself if it is idle.
+    /// Start and Retry stay disabled without it, so the wizard never counts down over a microphone
+    /// nobody is listening to. [`Self::intro`] leaves it `false`; the host says when it can.
     pub can_measure: bool,
 }
 

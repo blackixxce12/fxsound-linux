@@ -66,6 +66,8 @@ const INDIRECT_CALLS: &[(&str, &[&str])] = &[
     ("channels.label()", &[]),
     ("deesser.label()", &[]),
     ("dereverb.label()", &[]),
+    // The calibration wizard's recommended denoiser level (`fxsound-app/src/calibration.rs`).
+    ("self.denoise.label()", &[]),
     ("effect.label()", &[]),
     ("effect.tooltip()", &[]),
 ];
@@ -795,6 +797,7 @@ const SPELLED_AS_IN_ENGLISH: &[&str] = &[
     "Filter Q",
     "FxSound is %s.",
     "Gate",
+    "Gate %s",
     "General",
     "Help",
     "Import",

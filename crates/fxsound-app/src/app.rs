@@ -22,13 +22,19 @@ use fxsound_core::{
 use fxsound_preset::{InputPresetStore, PresetFile, PresetStore, Store, input::InputPreset};
 use fxsound_ui::{
     AssetCache, Palette, UiAction, UiState,
-    dialogs::{ExportState, ImportState, ImportSummary, OverwriteChoice, PresetsAction},
+    dialogs::{
+        CalibrationAction, CalibrationView, ExportState, ImportState, ImportSummary,
+        OverwriteChoice, PresetsAction,
+    },
     state::PresetEntry,
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::audio_link::{AudioLink, FakeEngine};
+use crate::calibration::{
+    self, Calibration, CalibrationState, Command as CalibrationCommand, Lane,
+};
 use crate::events::{AppEvent, LaneState, Published};
 use crate::notify::{Message, Notifier};
 use fxsound_core::i18n::{self, tr, tr_args};
@@ -414,6 +420,9 @@ pub struct App {
     /// language, the preset list under an unchanged selection, or sound starting or stopping on
     /// the shown lane (see [`App::take_tray_refresh`]).
     tray_stale: bool,
+    /// The calibration wizard, while it is open (0.4.0 design §8): driven from
+    /// [`App::poll_audio`] with the input lane's meters, drawn through [`App::calibration_view`].
+    calibration: Option<CalibrationState>,
 }
 
 impl App {
@@ -495,6 +504,7 @@ impl App {
             events: Vec::new(),
             published: Published::default(),
             tray_stale: false,
+            calibration: None,
         };
 
         // What the settings file asks of the audio thread before it does anything else. See
@@ -564,9 +574,14 @@ impl App {
 
     /// Pull everything the audio thread has published. Call once per frame, before rendering.
     pub fn poll_audio(&mut self) {
+        self.poll_audio_at(Instant::now());
+    }
+
+    /// [`App::poll_audio`] at `now`, which the tests choose so they can step a calibration run
+    /// through its phases without waiting them out.
+    pub(crate) fn poll_audio_at(&mut self, now: Instant) {
         // A notice is up for four seconds (0.4.0 design, §11). The views only draw it; this is
         // the one place that times it, engine or no engine.
-        let now = Instant::now();
         self.state.expire_notification(now);
         // The per-device volumes are written a while after they start moving, not on every step
         // of a mixer drag; the next flush of the settings takes them (see `VOLUME_SAVE_DELAY`).
@@ -576,6 +591,8 @@ impl App {
         }
 
         let Some(engine) = self.engine.as_mut() else {
+            // Nothing will ever flow: a run that was started waits out its wake-up and says so.
+            self.drive_calibration(now, &Meters::default());
             return;
         };
 
@@ -602,6 +619,9 @@ impl App {
         if self.devices_seen && !self.pending_devices.is_empty() {
             self.apply_pending_device();
         }
+
+        // Last, so the wizard sees the lane as this poll left it: attached, processing, listed.
+        self.drive_calibration(now, &microphone);
     }
 
     /// Act on one thing the audio thread said. Crate-visible so the tests of what follows from a
@@ -2035,6 +2055,7 @@ impl App {
             events: Vec::new(),
             published: Published::default(),
             tray_stale: false,
+            calibration: None,
         };
         app.start_the_stream_here();
         app
@@ -2047,6 +2068,8 @@ impl App {
     /// the microphone's as a voice one under `Input/AutoSave/` — so a restart brings them back as a
     /// preset switch would.
     pub fn shutdown(&mut self) {
+        // A wizard left open lets go of the microphone before the engine goes.
+        self.cancel_calibration();
         for lane in DeviceDirection::ALL {
             if let Some(preset) = self.unsaved_lane_preset(lane) {
                 self.autosave_lane_preset(&preset);
@@ -3240,6 +3263,13 @@ impl App {
                 .clone_from(&self.echo_cancel_detail);
         }
         state.has_microphone = self.microphone_description().is_some();
+        // A calibration applied while the pane is open is the pane's last-calibration line.
+        if state.settings.calibration != self.settings.calibration {
+            state
+                .settings
+                .calibration
+                .clone_from(&self.settings.calibration);
+        }
     }
 
     /// The description of the microphone the input lane is attached to, which the calibration
@@ -3255,6 +3285,222 @@ impl App {
             .iter()
             .find(|device| device.direction == DeviceDirection::Input && device.name == attached)
             .map(|device| device.description.as_str())
+    }
+}
+
+// =============================================================================================
+// The calibration wizard (0.4.0 design §8)
+// =============================================================================================
+
+impl App {
+    /// The input lane as the wizard sees it: the microphone the engine says it is attached to, as
+    /// the device list describes it, whether it is processing, its channels, and `meters`.
+    fn calibration_lane<'a>(&'a self, meters: &'a Meters) -> Lane<'a> {
+        let microphone = self
+            .attached(DeviceDirection::Input)
+            .and_then(|attached| {
+                self.state.devices.iter().find(|device| {
+                    device.direction == DeviceDirection::Input && device.name == attached
+                })
+            })
+            .map(|device| (device.name.as_str(), device.description.as_str()));
+        Lane {
+            microphone,
+            processing: self.state.input_active,
+            channels: self.audio_status_for(DeviceDirection::Input).channels,
+            meters,
+        }
+    }
+
+    /// Settings ▸ Microphone ▸ "Calibrate microphone…": open the wizard on its introduction, for
+    /// the microphone the input lane is attached to. Returns whether the wizard is open — not
+    /// without a microphone, which is when the pane's button is disabled.
+    pub fn open_calibration(&mut self) -> bool {
+        if self.calibration.is_none() {
+            let meters = Meters::default();
+            let lane = self.calibration_lane(&meters);
+            if lane.microphone.is_none() {
+                return false;
+            }
+            let wizard = CalibrationState::open(&lane, Instant::now());
+            self.calibration = Some(wizard);
+        }
+        true
+    }
+
+    /// Whether the calibration wizard is open.
+    #[must_use]
+    pub const fn calibration_open(&self) -> bool {
+        self.calibration.is_some()
+    }
+
+    /// Whether the wizard is waking the microphone, measuring or analysing: the window should
+    /// redraw at the meters' pace, for the countdown and the live level.
+    #[must_use]
+    pub fn calibration_is_live(&self) -> bool {
+        self.calibration
+            .as_ref()
+            .is_some_and(CalibrationState::is_live)
+    }
+
+    /// What the wizard draws now, while it is open.
+    #[must_use]
+    pub fn calibration_view(&self) -> Option<CalibrationView> {
+        self.calibration_view_at(Instant::now())
+    }
+
+    pub(crate) fn calibration_view_at(&self, now: Instant) -> Option<CalibrationView> {
+        self.calibration.as_ref().map(|wizard| wizard.view(now))
+    }
+
+    /// What the user pressed in the wizard: Start and Retry begin a run, Apply writes the result
+    /// and closes, Cancel and Close let the microphone go and close.
+    pub fn handle_calibration(&mut self, action: CalibrationAction) {
+        self.calibration_action_at(action, Instant::now());
+    }
+
+    pub(crate) fn calibration_action_at(&mut self, action: CalibrationAction, now: Instant) {
+        match action {
+            CalibrationAction::Start | CalibrationAction::Retry => {
+                if let Some(wizard) = self.calibration.as_mut() {
+                    let commands = wizard.start(now);
+                    self.carry_out_calibration(commands);
+                }
+            }
+            CalibrationAction::Cancel | CalibrationAction::Close => self.cancel_calibration(),
+            CalibrationAction::Apply => {
+                let Some(result) = self
+                    .calibration
+                    .as_ref()
+                    .and_then(CalibrationState::result)
+                    .cloned()
+                else {
+                    return;
+                };
+                // A result that could not be written leaves the wizard on it, with the notice
+                // that says why, so Close is still the user's to press.
+                if self.apply_calibration(&result) {
+                    self.cancel_calibration();
+                }
+            }
+        }
+    }
+
+    /// Close the wizard, letting go of the microphone if it was being held: Cancel at any phase,
+    /// the window going away, the application quitting.
+    pub fn cancel_calibration(&mut self) {
+        if let Some(mut wizard) = self.calibration.take() {
+            let commands = wizard.cancel();
+            self.carry_out_calibration(commands);
+        }
+    }
+
+    /// One look at the input lane for an open wizard, from [`App::poll_audio`].
+    fn drive_calibration(&mut self, now: Instant, meters: &Meters) {
+        let Some(mut wizard) = self.calibration.take() else {
+            return;
+        };
+        let commands = wizard.tick(now, &self.calibration_lane(meters));
+        self.calibration = Some(wizard);
+        self.carry_out_calibration(commands);
+    }
+
+    /// Tell the engine what the wizard asked for.
+    fn carry_out_calibration(&self, commands: Vec<CalibrationCommand>) {
+        let Some(engine) = &self.engine else {
+            return;
+        };
+        for command in commands {
+            match command {
+                CalibrationCommand::KeepInputAwake(awake) => {
+                    engine.send(UiToAudio::KeepInputAwake(awake));
+                }
+                CalibrationCommand::ResetCaptureStats => {
+                    engine.send_event(DeviceDirection::Input, DspEvent::ResetCaptureStats);
+                }
+            }
+        }
+    }
+
+    /// Apply: write `calibration` as the user voice preset `Calibrated — <device>` over the
+    /// shipped preset it recommends, select it on the microphone's lane whichever lane the window
+    /// is editing, and keep the record in the settings file. Returns whether the preset was
+    /// written.
+    ///
+    /// A second calibration of the same microphone overwrites the first, keeping a `.bak`, as a
+    /// save over a user preset does. A new one is refused at the user-preset cap, as Save New
+    /// Preset is.
+    fn apply_calibration(&mut self, calibration: &Calibration) -> bool {
+        use fxsound_preset::PresetSource;
+
+        let name = calibration::calibrated_preset_name(&calibration.microphone.description);
+        let overwrite = self
+            .voice_presets
+            .find(&name)
+            .is_some_and(|entry| entry.source == PresetSource::User);
+        let user_presets = self
+            .voice_presets
+            .entries()
+            .iter()
+            .filter(|entry| entry.source == PresetSource::User)
+            .count();
+        if !overwrite && user_presets >= self.max_user_presets() {
+            let message = Message::preset_limit_reached();
+            self.raise_notice(message.body.clone());
+            self.notify(message);
+            return false;
+        }
+
+        let shipped = calibration.recommendation.preset;
+        let base = self
+            .voice_presets
+            .load_saved(shipped)
+            .unwrap_or_else(|err| {
+                // Clean Voice's numbers under the recommended name: the calibrated preset is still
+                // a whole one, and the numbers the wizard measured are the point of it.
+                log::warn!("calibration: {err}; starting from the built-in voice");
+                InputPreset {
+                    name: shipped.to_owned(),
+                    ..InputPreset::default()
+                }
+            });
+        let preset = calibration
+            .recommendation
+            .preset(base, &name, calibration.description());
+        if let Err(err) = self.voice_presets.save_as(&preset, &name) {
+            log::warn!("could not save the calibrated preset {name}: {err}");
+            self.raise_notice(tr_args("Could not save %s", &[name.as_str()]));
+            return false;
+        }
+
+        self.in_lane(DeviceDirection::Input, |app| {
+            app.refresh_preset_list_keeping_selection();
+            if let Some(index) = app.state.presets.iter().position(|p| p.name == name) {
+                app.select_preset(index);
+            }
+        });
+
+        let measured = &calibration.measurement;
+        self.record_calibration(CalibrationRecord {
+            noise_floor_db: measured.floor_db,
+            speech_rms_db: measured.speech_rms_db,
+            speech_peak_db: measured.speech_peak_db,
+            clipped_ratio: measured.clipped_ratio,
+            unix_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs()),
+            preset: name.clone(),
+            device: calibration.microphone.node_name.clone(),
+        });
+        let message = if overwrite {
+            Message::preset_overwritten(&name)
+        } else {
+            Message::preset_saved(&name)
+        };
+        self.raise_notice(message.body.clone());
+        self.notify(message);
+        self.save_settings_if_dirty();
+        true
     }
 }
 
@@ -7356,5 +7602,531 @@ mod tests {
         app.handle(&[UiAction::SetEditDirection(IN)]);
         assert!(!entry(&app, "Loud").modified);
         assert_eq!(app.state.master_gain_db, 0.0);
+    }
+
+    // ---- the calibration wizard (0.4.0 design §8), through a fake feed -------------------------
+
+    use crate::calibration::{CLEAN_VOICE, Failure};
+    use fxsound_ui::dialogs::{CalibrationAction, CalibrationPhase};
+
+    const FIFINE: &str = "fifine Microphone Analogue Stereo";
+    const CALIBRATED: &str = "Calibrated — fifine Microphone Analogue Stereo";
+
+    /// A voice store in `dir` holding the voice presets the package ships, as the real one does.
+    fn shipped_voices(dir: &tempfile::TempDir) -> InputPresetStore {
+        let shipped = InputPreset::load_dir(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/presets/Input"),
+        )
+        .expect("the shipped voice presets");
+        voice_store_for_tests(
+            &shipped,
+            &dir.path().join("voice-factory"),
+            dir.path().join("user").join("Input"),
+        )
+    }
+
+    /// A start on the shipped voice presets with the window on `edit`, the speakers on the
+    /// headphones, and the microphone lane attached to the fifine and processing — `processing`
+    /// says whether it is. Everything the start-up said is already taken.
+    fn calibrating_with(
+        edit: DeviceDirection,
+        processing: bool,
+    ) -> (App, FakeEngine, tempfile::TempDir, Instant) {
+        let engine = FakeEngine::new();
+        let (store, dir) = music_store();
+        let mut settings = saved_settings(edit);
+        settings.input_preset = CLEAN_VOICE.to_owned();
+        let mut app = App::start_for_tests(settings, store, shipped_voices(&dir), &engine);
+        engine.feed(AudioToUi::Devices(vec![
+            device(SPEAKERS, OUT, true),
+            device(HEADPHONES, OUT, false),
+            AudioDevice {
+                description: FIFINE.to_owned(),
+                form_factor: "microphone".to_owned(),
+                ..device(MIC, IN, true)
+            },
+        ]));
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        engine.feed(attached(IN, Some(MIC)));
+        engine.feed(AudioToUi::Status {
+            direction: IN,
+            status: status(processing),
+        });
+        let t0 = Instant::now();
+        app.poll_audio_at(t0);
+        let _ = engine.take_sent();
+        let _ = engine.take_events();
+        let _ = app.drain_events();
+        (app, engine, dir, t0)
+    }
+
+    fn calibrating(edit: DeviceDirection) -> (App, FakeEngine, tempfile::TempDir, Instant) {
+        calibrating_with(edit, true)
+    }
+
+    /// The input lane's accumulators after `seconds` at `rms_db` RMS with peaks at `peak_db`, at
+    /// 48 kHz, and the floor estimator at `floor_db`.
+    fn capture(seconds: f32, rms_db: f32, peak_db: f32, floor_db: f32) -> Meters {
+        let frames = (seconds * 48_000.0) as u64;
+        Meters {
+            capture_frames: frames,
+            capture_sum_squares: 10_f64.powf(f64::from(rms_db) / 10.0) * frames as f64,
+            capture_peak: 10_f32.powf(peak_db / 20.0),
+            noise_floor_db: floor_db,
+            input_rms_db: rms_db,
+            ..Meters::default()
+        }
+    }
+
+    fn later(t0: Instant, seconds: f32) -> Instant {
+        t0 + std::time::Duration::from_secs_f32(seconds)
+    }
+
+    /// The meter feed of one run, a reading per phase with the time it is handed over: a −55 dBFS
+    /// room (the estimator at −57), speech at −28 RMS peaking at −8, loud speech that never clips.
+    fn script() -> [(f32, Meters); 4] {
+        [
+            (3.0, capture(3.0, -55.0, -40.0, -57.0)),
+            (8.0, capture(5.0, -28.0, -8.0, -56.0)),
+            (10.0, capture(2.0, -16.0, -2.0, -56.0)),
+            (10.5, capture(2.0, -16.0, -2.0, -56.0)),
+        ]
+    }
+
+    /// A second sitting that measures differently at every number the recommendation turns on,
+    /// and still lands on Clean Voice: a −50 dBFS room (the estimator at −52), speech at −22 RMS
+    /// peaking at −2. The gate comes to −44, the compressor to −28 and the makeup to +8, where
+    /// [`script`] gives −49, −34 and +14.
+    fn nearer_script() -> [(f32, Meters); 4] {
+        [
+            (3.0, capture(3.0, -50.0, -38.0, -52.0)),
+            (8.0, capture(5.0, -22.0, -2.0, -51.0)),
+            (10.0, capture(2.0, -12.0, -1.0, -51.0)),
+            (10.5, capture(2.0, -12.0, -1.0, -51.0)),
+        ]
+    }
+
+    /// Press Start at `t0` and feed the script's first `steps` readings.
+    fn run_wizard(app: &mut App, engine: &FakeEngine, t0: Instant, steps: usize) {
+        run_wizard_on(app, engine, t0, script(), steps);
+    }
+
+    /// Press Start at `t0` and feed the first `steps` readings of `feed`.
+    fn run_wizard_on(
+        app: &mut App,
+        engine: &FakeEngine,
+        t0: Instant,
+        feed: [(f32, Meters); 4],
+        steps: usize,
+    ) {
+        app.calibration_action_at(CalibrationAction::Start, t0);
+        // The lane is processing already: the silence starts at the next look.
+        app.poll_audio_at(t0);
+        for (seconds, meters) in feed.into_iter().take(steps) {
+            engine.set_meters(IN, meters);
+            app.poll_audio_at(later(t0, seconds));
+        }
+    }
+
+    /// The numbers of the input chain that a calibration sets: high-pass, gate, compressor
+    /// threshold and ratio, makeup and ceiling.
+    fn calibrated_numbers(params: &InputDspParams) -> (f32, f32, f32, f32, f32, f32) {
+        (
+            params.highpass_hz,
+            params.gate_threshold_db,
+            params.compressor_threshold_db,
+            params.compressor_ratio,
+            params.makeup_db,
+            params.ceiling_db,
+        )
+    }
+
+    /// The `KeepInputAwake` requests among `sent`, in order.
+    fn awake_requests(sent: &[UiToAudio]) -> Vec<bool> {
+        sent.iter()
+            .filter_map(|message| match message {
+                UiToAudio::KeepInputAwake(awake) => Some(*awake),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn phase(app: &App, now: Instant) -> Option<CalibrationPhase> {
+        app.calibration_view_at(now).map(|view| view.phase)
+    }
+
+    #[test]
+    fn a_run_holds_the_microphone_resets_the_input_lane_on_each_phase_and_lets_go_after_the_last() {
+        let (mut app, engine, _dir, t0) = calibrating(OUT);
+        assert!(app.open_calibration());
+        let intro = app.calibration_view_at(t0).expect("open");
+        assert_eq!(intro.phase, CalibrationPhase::Intro);
+        assert_eq!(intro.device, FIFINE);
+        assert!(
+            intro.can_start(),
+            "a microphone is attached, so Start is live"
+        );
+        assert!(
+            engine.take_sent().is_empty(),
+            "opening asks nothing of the engine"
+        );
+
+        app.calibration_action_at(CalibrationAction::Start, t0);
+        assert_eq!(engine.take_sent(), [UiToAudio::KeepInputAwake(true)]);
+        assert!(app.calibration_is_live());
+
+        let mut steps = script().into_iter();
+        app.poll_audio_at(t0);
+        assert_eq!(phase(&app, t0), Some(CalibrationPhase::Silence));
+        for expected in [
+            CalibrationPhase::Speech,
+            CalibrationPhase::Loud,
+            CalibrationPhase::Analysing,
+            CalibrationPhase::Result,
+        ] {
+            let (seconds, meters) = steps.next().expect("a step");
+            engine.set_meters(IN, meters);
+            app.poll_audio_at(later(t0, seconds));
+            assert_eq!(phase(&app, later(t0, seconds)), Some(expected));
+        }
+        assert_eq!(
+            engine.take_events(),
+            [(IN, DspEvent::ResetCaptureStats); 3],
+            "one reset on entry to each timed phase, all on the microphone's lane"
+        );
+        assert_eq!(awake_requests(&engine.take_sent()), [false]);
+        assert!(!app.calibration_is_live());
+
+        let view = app.calibration_view_at(later(t0, 11.0)).expect("open");
+        let result = view.result.as_ref().expect("the result");
+        assert_eq!(result.preset, CLEAN_VOICE);
+        assert!((result.floor_db + 57.0).abs() < 0.01, "{result:?}");
+        assert!((result.speech_rms_db + 28.0).abs() < 0.01, "{result:?}");
+        assert_eq!(
+            result.lines,
+            [
+                "High-pass 80 Hz",
+                "Gate −49 dB",
+                "Compressor −34 dB, ratio 3:1",
+                "Makeup gain +14 dB",
+                "Ceiling −3 dB",
+                "Noise suppression: Mild",
+            ]
+        );
+        assert!(view.can_apply());
+        assert!(
+            app.settings().calibration.is_none(),
+            "nothing is kept until Apply"
+        );
+    }
+
+    #[test]
+    fn apply_writes_the_calibrated_voice_preset_and_selects_it_on_the_microphone_lane() {
+        let (mut app, engine, dir, t0) = calibrating(OUT);
+        app.open_calibration();
+        run_wizard(&mut app, &engine, t0, 4);
+        let _ = engine.take_sent();
+        let _ = app.drain_events();
+
+        app.calibration_action_at(CalibrationAction::Apply, later(t0, 12.0));
+        assert!(!app.calibration_open(), "Apply closes the wizard");
+        assert_eq!(voice_files(&dir, ""), [format!("{CALIBRATED}.toml")]);
+
+        // Selected on the microphone, with the window left on the speakers and their preset.
+        assert_eq!(app.lane_preset(IN), Some((CALIBRATED, false)));
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        assert_eq!(app.state.direction, OUT);
+        assert_eq!(app.settings.input_preset, CALIBRATED);
+
+        // The microphone chain runs it now.
+        let params = engine.input_params().expect("published");
+        assert_eq!(
+            calibrated_numbers(&params),
+            (80.0, -49.0, -34.0, 3.0, 14.0, -3.0)
+        );
+        assert_eq!(params.denoise_level, DenoiseLevel::Light);
+        assert!(params.gate_on && params.compressor_on);
+
+        // The file is Clean Voice with the numbers written over it.
+        let written = app.voice_presets.load_saved(CALIBRATED).expect("on disk");
+        let clean = app.voice_presets.load_saved(CLEAN_VOICE).expect("shipped");
+        assert_eq!(written.eq, clean.eq);
+        assert_eq!(written.deesser, clean.deesser);
+        assert!(
+            written.description.contains(FIFINE),
+            "{}",
+            written.description
+        );
+
+        // The record, the microphone's memory, the stream and the notice.
+        let record = app.settings().calibration.clone().expect("recorded");
+        assert_eq!(
+            (record.preset.as_str(), record.device.as_str()),
+            (CALIBRATED, MIC)
+        );
+        assert!((record.noise_floor_db + 57.0).abs() < 0.01, "{record:?}");
+        assert!((record.speech_peak_db + 8.0).abs() < 0.01, "{record:?}");
+        assert_eq!(record.clipped_ratio, 0.0);
+        assert!(record.unix_time > 1_700_000_000);
+        assert!(
+            app.settings()
+                .device_configs
+                .iter()
+                .any(|config| config.device_id == MIC
+                    && config.direction == IN
+                    && config.preset == CALIBRATED),
+            "the fifine brings its calibrated preset back"
+        );
+        let events = app.drain_events();
+        assert!(
+            events.contains(&AppEvent::PresetChanged {
+                direction: IN,
+                name: Some(CALIBRATED.to_owned()),
+                modified: false,
+            }),
+            "{events:?}"
+        );
+        assert!(events.contains(&AppEvent::Calibrated(record)), "{events:?}");
+        assert!(app.unsaid_changes().is_empty());
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some(format!("New preset {CALIBRATED} is saved.").as_str())
+        );
+        assert!(
+            awake_requests(&engine.take_sent()).is_empty(),
+            "the microphone was already let go"
+        );
+    }
+
+    #[test]
+    fn calibrating_the_same_microphone_again_overwrites_its_preset_and_keeps_a_backup() {
+        let (mut app, engine, dir, t0) = calibrating(IN);
+        app.open_calibration();
+        run_wizard(&mut app, &engine, t0, 4);
+        app.calibration_action_at(CalibrationAction::Apply, later(t0, 12.0));
+        assert_eq!(app.state.master_gain_db, 14.0, "the first sitting's makeup");
+
+        // Nearer the microphone in a noisier room: every number the wizard sets moves.
+        let t1 = later(t0, 20.0);
+        assert!(app.open_calibration());
+        run_wizard_on(&mut app, &engine, t1, nearer_script(), 4);
+        let view = app.calibration_view_at(later(t1, 11.0)).expect("open");
+        assert_eq!(
+            view.result.as_ref().map(|result| result.preset.as_str()),
+            Some(CLEAN_VOICE),
+            "the same shipped preset under it, so only the measured numbers differ"
+        );
+        app.calibration_action_at(CalibrationAction::Apply, later(t1, 12.0));
+
+        // One preset, listed once, still selected, and said to be overwritten.
+        assert_eq!(voice_files(&dir, ""), [format!("{CALIBRATED}.toml")]);
+        assert_eq!(
+            app.state
+                .presets
+                .iter()
+                .filter(|p| p.name == CALIBRATED)
+                .count(),
+            1
+        );
+        assert_eq!(
+            app.state.preset().map(|p| p.name.as_str()),
+            Some(CALIBRATED)
+        );
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some(format!("Changes to preset {CALIBRATED} are saved.").as_str())
+        );
+
+        // The microphone chain runs the second sitting's numbers, and the window, which is on
+        // the microphone, shows its makeup as the output gain.
+        let params = engine.input_params().expect("published");
+        assert_eq!(
+            calibrated_numbers(&params),
+            (80.0, -44.0, -28.0, 3.0, 8.0, -3.0)
+        );
+        assert_eq!(params.denoise_level, DenoiseLevel::Light);
+        assert_eq!(app.state.master_gain_db, 8.0);
+        // Gate, compressor threshold and makeup as a preset file has them.
+        let on_disk = |preset: &InputPreset| {
+            (
+                preset.gate.as_ref().map(|gate| gate.threshold_db),
+                preset.compressor.as_ref().map(|comp| comp.threshold_db),
+                preset.makeup_db,
+            )
+        };
+        let written = saved_voice(&dir, &format!("{CALIBRATED}.toml"));
+        assert_eq!(on_disk(&written), (Some(-44.0), Some(-28.0), 8.0));
+        let record = app.settings().calibration.clone().expect("recorded");
+        assert!((record.noise_floor_db + 52.0).abs() < 0.01, "{record:?}");
+        assert!((record.speech_rms_db + 22.0).abs() < 0.01, "{record:?}");
+
+        // The first sitting's preset is kept beside it, as any overwrite of a user preset is
+        // (design §8).
+        let backup = saved_voice(&dir, &format!("{CALIBRATED}.toml.bak"));
+        assert_eq!(backup.name, CALIBRATED);
+        assert_eq!(on_disk(&backup), (Some(-49.0), Some(-34.0), 14.0));
+    }
+
+    #[test]
+    fn apply_keeps_unsaved_edits_to_the_voice_preset_it_replaces() {
+        let (mut app, engine, dir, t0) = calibrating(IN);
+        app.handle(&[UiAction::SetMasterGain(3.0)]);
+        assert!(app.state.preset().is_some_and(|p| p.modified));
+        app.open_calibration();
+        run_wizard(&mut app, &engine, t0, 4);
+        app.calibration_action_at(CalibrationAction::Apply, later(t0, 12.0));
+        assert_eq!(
+            voice_files(&dir, "AutoSave"),
+            [format!("{CLEAN_VOICE}.toml")],
+            "stashed on the way out, as any preset switch does"
+        );
+    }
+
+    #[test]
+    fn cancel_or_close_at_every_phase_leaves_the_microphone_released() {
+        for steps in 0..=5 {
+            let (mut app, engine, _dir, t0) = calibrating(OUT);
+            app.open_calibration();
+            if steps > 0 {
+                run_wizard(&mut app, &engine, t0, steps - 1);
+            }
+            let shown = phase(&app, later(t0, 11.0)).expect("open");
+            let action = if shown == CalibrationPhase::Result {
+                CalibrationAction::Close
+            } else {
+                CalibrationAction::Cancel
+            };
+            app.calibration_action_at(action, later(t0, 11.0));
+            assert!(!app.calibration_open(), "{shown:?}");
+            let requests = awake_requests(&engine.take_sent());
+            let held = requests.iter().filter(|awake| **awake).count();
+            let released = requests.iter().filter(|awake| !**awake).count();
+            assert_eq!(held, usize::from(steps > 0), "{shown:?}: {requests:?}");
+            assert_eq!(held, released, "{shown:?}: {requests:?}");
+            assert_eq!(
+                requests.last(),
+                (steps > 0).then_some(&false).as_ref().copied()
+            );
+            assert!(app.settings().calibration.is_none());
+        }
+    }
+
+    #[test]
+    fn a_microphone_that_goes_in_the_middle_of_a_run_fails_it_and_lets_it_go() {
+        let (mut app, engine, _dir, t0) = calibrating(OUT);
+        app.open_calibration();
+        run_wizard(&mut app, &engine, t0, 1);
+        assert_eq!(phase(&app, later(t0, 3.0)), Some(CalibrationPhase::Speech));
+        engine.feed(attached(IN, None));
+        app.poll_audio_at(later(t0, 4.0));
+
+        let view = app.calibration_view_at(later(t0, 4.0)).expect("open");
+        assert_eq!(view.phase, CalibrationPhase::Failed);
+        assert_eq!(view.failure, Failure::MicrophoneChanged.text());
+        assert!(!view.can_start(), "no microphone to retry on");
+        assert_eq!(awake_requests(&engine.take_sent()), [true, false]);
+
+        // It comes back: Retry measures it again.
+        engine.feed(attached(IN, Some(MIC)));
+        app.poll_audio_at(later(t0, 5.0));
+        assert!(
+            app.calibration_view_at(later(t0, 5.0))
+                .expect("open")
+                .can_start()
+        );
+        app.calibration_action_at(CalibrationAction::Retry, later(t0, 5.0));
+        assert_eq!(awake_requests(&engine.take_sent()), [true]);
+    }
+
+    #[test]
+    fn a_lane_that_never_starts_fails_after_five_seconds_and_lets_the_microphone_go() {
+        let (mut app, engine, _dir, t0) = calibrating_with(OUT, false);
+        app.open_calibration();
+        app.calibration_action_at(CalibrationAction::Start, t0);
+        app.poll_audio_at(later(t0, 4.9));
+        assert_eq!(
+            phase(&app, later(t0, 4.9)),
+            Some(CalibrationPhase::Silence),
+            "the silence page, waiting for the lane"
+        );
+        assert!(engine.take_events().is_empty(), "nothing is measured yet");
+        app.poll_audio_at(later(t0, 5.0));
+        let view = app.calibration_view_at(later(t0, 5.0)).expect("open");
+        assert_eq!(view.phase, CalibrationPhase::Failed);
+        assert_eq!(
+            view.failure,
+            "The microphone sent no sound within 5 seconds."
+        );
+        assert_eq!(awake_requests(&engine.take_sent()), [true, false]);
+    }
+
+    #[test]
+    fn the_window_going_or_the_application_quitting_mid_run_lets_the_microphone_go() {
+        let (mut app, engine, _dir, t0) = calibrating(OUT);
+        app.open_calibration();
+        run_wizard(&mut app, &engine, t0, 1);
+        app.cancel_calibration();
+        assert_eq!(awake_requests(&engine.take_sent()), [true, false]);
+        assert!(!app.calibration_open());
+
+        let (mut app, engine, _dir, t0) = calibrating(OUT);
+        app.open_calibration();
+        run_wizard(&mut app, &engine, t0, 2);
+        app.shutdown();
+        assert_eq!(awake_requests(&engine.take_sent()), [true, false]);
+        assert!(engine.is_shut_down());
+    }
+
+    #[test]
+    fn without_a_microphone_on_the_input_lane_the_wizard_does_not_open() {
+        let (mut app, engine, _dir, _t0) = calibrating(OUT);
+        engine.feed(attached(IN, None));
+        app.poll_audio();
+        assert!(!app.open_calibration());
+        assert_eq!(app.calibration_view(), None);
+        app.handle_calibration(CalibrationAction::Start);
+        assert!(engine.take_sent().is_empty());
+    }
+
+    #[test]
+    fn the_pane_shows_a_calibration_applied_while_it_is_open() {
+        let (mut app, engine, _dir, t0) = calibrating(OUT);
+        let mut pane = app.settings_state();
+        assert_eq!(pane.calibration_text(), "Not calibrated yet");
+        app.open_calibration();
+        run_wizard(&mut app, &engine, t0, 4);
+        app.calibration_action_at(CalibrationAction::Apply, later(t0, 12.0));
+        app.refresh_settings_state(&mut pane);
+        assert_eq!(pane.settings.calibration, app.settings().calibration);
+        assert!(
+            pane.calibration_text().starts_with("Floor −57 dB"),
+            "{}",
+            pane.calibration_text()
+        );
+    }
+
+    #[test]
+    fn at_the_user_preset_cap_apply_is_refused_and_the_result_stays_up() {
+        let (mut app, engine, dir, t0) = calibrating(OUT);
+        app.settings.max_user_presets = 10;
+        for n in 0..10 {
+            app.voice_presets
+                .save_as(&InputPreset::default(), &format!("Mine {n}"))
+                .expect("saved");
+        }
+        app.open_calibration();
+        run_wizard(&mut app, &engine, t0, 4);
+        app.calibration_action_at(CalibrationAction::Apply, later(t0, 12.0));
+        assert_eq!(
+            phase(&app, later(t0, 12.0)),
+            Some(CalibrationPhase::Result),
+            "Close is still the user's to press"
+        );
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some("Reached the limit on new presets.")
+        );
+        assert!(!voice_files(&dir, "").contains(&format!("{CALIBRATED}.toml")));
+        assert!(app.settings().calibration.is_none());
     }
 }
