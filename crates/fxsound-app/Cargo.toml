@@ -39,10 +39,18 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
 log = { workspace = true }
-# Not called from our code: this is the runtime ksni's tray service and its blocking facade run
-# on. Declaring it makes the flavour explicit and greppable instead of inheriting ksni's own
-# `features = ["rt", "macros"]` (`docs/api/linux-desktop-crates.md` §1).
-tokio = { workspace = true }
+# Two runtimes, never one: ksni's tray service runs on a private current-thread runtime of its own
+# (`docs/api/linux-desktop-crates.md` §1), and the D-Bus service (`src/dbus.rs`) builds another
+# on its `fxsound-dbus` thread. `net` and `time` are that runtime's drivers — zbus's socket is a
+# tokio `UnixStream` there, and a method call waits for the GUI thread under a timeout — and
+# `sync` is the oneshot the answer comes back on. zbus asks for all three itself; naming them
+# here keeps the build from depending on that.
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+# The D-Bus service. Already in the tree through ksni and notify-rust, with `tokio` and `async-io`
+# both on; `tokio` is named so the service does not depend on that unification, and
+# `blocking-api` for `zbus::blocking`, which nothing else enables (the tests call the service
+# through a blocking proxy).
+zbus = { workspace = true, features = ["tokio", "blocking-api"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,8 +1,8 @@
 //! The FxSound binary: parse the command line, be the single instance, run the window.
 //!
 //! Everything interesting lives in the library next door. This file is the shell that wires the
-//! controller to eframe, the tray and the control socket, and it is deliberately the only place
-//! that knows all four exist.
+//! controller to eframe, the tray, the control socket and the D-Bus service, and it is
+//! deliberately the only place that knows all five exist.
 //!
 //! ## Startup, in order
 //!
@@ -20,6 +20,10 @@
 //!    question 6).
 //! 4. Apply the cold-start options, register the tray, then alternate between the two states
 //!    below until something asks to quit.
+//! 5. Just before that loop, start the D-Bus service (`fxsound_app::dbus`) on its own thread. It
+//!    carries its calls to the same control channel the socket uses, so they are answered by the
+//!    pump like a forwarded command line; no session bus, or its name taken, is a log line and
+//!    not a failure.
 //!
 //! ## Two states: a window, or the tray alone
 //!
@@ -51,6 +55,7 @@ use fxsound_app::{
     app::{FORBIDDEN_PRESET_NAME_CHARS, MAX_PRESET_NAME_CHARS, preset_name_available},
     cli::{Cli, Command},
     commands::{self, WindowRequest},
+    dbus::{self, DbusHandle},
     events::{self, AppEvent},
     ipc::{self, Instance},
     selftest,
@@ -232,9 +237,15 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // Step 5: the D-Bus service (0.4.0 design §9), on a thread of its own so that a slow bus
+    // never holds the window up. With no session bus, or with the name owned already, it says so
+    // in the log and the control socket carries on alone.
+    let dbus = DbusHandle::start(server.control(), dbus::Properties::of(&app));
+
     let mut runtime = Runtime {
         events: events::Snapshot::of(&app),
         app,
+        dbus: Some(dbus),
         server,
         tray,
         tray_rx,
@@ -287,12 +298,16 @@ enum HeadlessExit {
     Quit,
 }
 
-/// Everything that outlives a window: the controller, the control socket and the tray.
+/// Everything that outlives a window: the controller, the control socket, the D-Bus service and
+/// the tray.
 ///
 /// A [`Shell`] borrows this for the life of one window run; between runs
 /// [`Runtime::run_headless`] drives the same parts directly.
 struct Runtime {
     app: App,
+    /// The D-Bus service. Declared before `server`, and taken first in [`Runtime::shutdown`]: the
+    /// bus connection goes before the control channel its calls travel on.
+    dbus: Option<DbusHandle>,
     server: ipc::Server,
     /// What the `--watch` stream last said, so each tick publishes only what changed.
     events: events::Snapshot,
@@ -353,13 +368,19 @@ impl Runtime {
         request
     }
 
-    /// Tell the `--watch` subscribers what changed this tick.
+    /// Tell the `--watch` subscribers and the D-Bus service what changed this tick.
     ///
     /// Diffed from a snapshot of the controller for now; the controller queuing events as it
-    /// makes the changes (`App::drain_events`) replaces this, and feeds D-Bus and the tray too.
+    /// makes the changes (`App::drain_events`) replaces this, and feeds the tray too.
     fn publish_events(&mut self) {
         let server = &self.server;
-        self.events.diff(&self.app, |event| server.publish(&event));
+        let dbus = self.dbus.as_ref();
+        self.events.diff(&self.app, |event| {
+            server.publish(&event);
+            if let Some(dbus) = dbus {
+                dbus.publish(&event);
+            }
+        });
         // Gathered only for a subscriber that asked; `publish` holds each to four a second.
         if server.wants_meters() {
             server.publish(&AppEvent::InputMeters(commands::input_meters(
@@ -431,8 +452,17 @@ impl Runtime {
     /// The only way out: stash unsaved edits, restore the system default device and stop the
     /// engine, remove the tray item. Dropping the server unlinks the control socket and ends
     /// every `--watch` stream, right after the `quit` event said why.
+    ///
+    /// The bus goes first. Whatever was forwarded after the quit was decided is refused rather
+    /// than left to wait out its timeout, and then the D-Bus service gives its names back — a
+    /// call answered already, `Quit`'s own, still gets its reply — and closes its connection,
+    /// before the control channel its calls travel on goes away.
     fn shutdown(mut self) {
         self.server.publish(&AppEvent::Quit);
+        self.server.refuse_pending();
+        if let Some(dbus) = self.dbus.take() {
+            dbus.shutdown();
+        }
         self.app.shutdown();
         if let Some(tray) = &self.tray {
             tray.shutdown();

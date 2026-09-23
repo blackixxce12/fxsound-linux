@@ -77,6 +77,12 @@
 //! meanwhile is held and written after it. Every event carries absolute values rather than
 //! deltas, so an event from just before the document was taken repeats what the document already
 //! says, and one from just after it is not lost.
+//!
+//! # The other caller
+//!
+//! The D-Bus service (`crate::dbus`, 0.4.0 design §9) does not go through the socket: it hands
+//! its command lists to the same channel through a [`Control`], and they are drained, carried out
+//! and answered exactly like a forwarded command line, under the same [`HANDLER_TIMEOUT`].
 
 use std::fs::{self, File, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -117,8 +123,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the primary gives the GUI thread to answer a forwarded command before replying with a
 /// bare acknowledgement. Deliberately shorter than [`REPLY_TIMEOUT`] so the client hears *us*
-/// rather than its own timeout.
-const HANDLER_TIMEOUT: Duration = Duration::from_secs(4);
+/// rather than its own timeout. A D-Bus method call waits exactly as long ([`Control::call`]).
+pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// What a caller hears when the GUI thread no longer takes commands.
+const SHUTTING_DOWN: &str = "FxSound is shutting down and cannot take that command";
+
+/// What a caller hears when the GUI thread took a command and did not answer within
+/// [`HANDLER_TIMEOUT`].
+const NO_ANSWER_IN_TIME: &str = "FxSound did not answer in time; the command may still be running";
 
 /// The longest request line the primary reads. An argv is a few hundred bytes; anything near this
 /// is not a command line, and reading it without a bound is how a stray writer eats the heap.
@@ -366,11 +379,13 @@ pub type StatusSource = Arc<dyn Fn() -> Option<serde_json::Value> + Send + Sync>
 fn status_from_application(tx: Sender<Forwarded>) -> StatusSource {
     Arc::new(move || {
         let (reply, answer) = bounded(1);
-        tx.try_send(Forwarded {
-            commands: vec![Command::Status { json: true }],
-            cwd: PathBuf::from("/"),
-            reply: Some(reply),
-        })
+        tx.try_send(Forwarded::new(
+            vec![Command::Status { json: true }],
+            PathBuf::from("/"),
+            move |response| {
+                let _ = reply.send(response);
+            },
+        ))
         .ok()?;
         let response = answer.recv_timeout(HANDLER_TIMEOUT).ok()?;
         if !response.ok {
@@ -412,10 +427,28 @@ impl Server {
         self.rx.try_iter().collect()
     }
 
+    /// Refuse everything forwarded and not yet drained, with the answer a caller gets from an
+    /// instance that is going away — for the way out, so that nobody waits out
+    /// [`HANDLER_TIMEOUT`] on a GUI thread that has stopped answering.
+    pub fn refuse_pending(&self) {
+        for forwarded in self.rx.try_iter() {
+            forwarded.reply(Response::failed(SHUTTING_DOWN));
+        }
+    }
+
     /// Where the socket lives.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// A way into the GUI thread for callers that are not on the socket — the D-Bus service. What
+    /// it sends arrives through [`Server::drain`] like any forwarded command line.
+    #[must_use]
+    pub fn control(&self) -> Control {
+        Control {
+            tx: self.shared.tx.clone(),
+        }
     }
 
     /// Send `event` to every `--watch` subscriber, and drop the ones that are gone or stuck.
@@ -471,13 +504,40 @@ impl Drop for Server {
 /// The reply is sent when this value is dropped, so a handler that forgets to answer still lets
 /// the forwarding process exit; answer explicitly with [`Forwarded::reply`] when there is
 /// output, which in practice means `--status`.
+///
+/// A second process on the control socket is where most of these come from; a D-Bus method call
+/// is the other place (`crate::dbus`), through [`Control`]. Both are answered by the same
+/// `commands::run` on the GUI thread, so there is one way a command is carried out.
 pub struct Forwarded {
     commands: Vec<Command>,
     cwd: PathBuf,
-    reply: Option<Sender<Response>>,
+    reply: Option<Reply>,
 }
 
+/// Where a [`Forwarded`]'s answer goes: a channel back to a connection thread, or a D-Bus call's
+/// oneshot. Called exactly once.
+type Reply = Box<dyn FnOnce(Response) + Send>;
+
 impl Forwarded {
+    /// A command list to hand to the GUI thread, answered through `reply` — once, with whatever
+    /// [`Forwarded::reply`] is given, or with a bare acknowledgement if the value is dropped
+    /// unanswered.
+    ///
+    /// `cwd` is the directory a relative path in an argument is resolved against; a caller that
+    /// has none, like a D-Bus client, passes `/`.
+    #[must_use]
+    pub fn new(
+        commands: Vec<Command>,
+        cwd: PathBuf,
+        reply: impl FnOnce(Response) + Send + 'static,
+    ) -> Self {
+        Self {
+            commands,
+            cwd,
+            reply: Some(Box::new(reply)),
+        }
+    }
+
     /// What the forwarding process asked for, in `applyConfig` order.
     #[must_use]
     pub fn commands(&self) -> &[Command] {
@@ -517,7 +577,7 @@ impl Forwarded {
 
     fn send(&mut self, response: Response) {
         if let Some(reply) = self.reply.take() {
-            let _ = reply.send(response);
+            reply(response);
         }
     }
 }
@@ -534,6 +594,52 @@ impl std::fmt::Debug for Forwarded {
             .field("commands", &self.commands)
             .field("cwd", &self.cwd)
             .finish_non_exhaustive()
+    }
+}
+
+/// The control channel, for a caller that is not a connection on the socket: the D-Bus service
+/// (`crate::dbus`, 0.4.0 design §9). A command list sent here is a [`Forwarded`] like any other,
+/// drained by the GUI thread and carried out by the same `commands::run`, and it is answered
+/// under the same [`HANDLER_TIMEOUT`] and with the same refusals as a forwarded command line.
+#[derive(Clone)]
+pub struct Control {
+    tx: Sender<Forwarded>,
+}
+
+impl Control {
+    /// A control channel whose other end is `tx` — for a test that plays the GUI thread itself.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn from_sender(tx: Sender<Forwarded>) -> Self {
+        Self { tx }
+    }
+
+    /// Hand `commands` to the GUI thread and wait for its answer.
+    ///
+    /// Asynchronous, so a D-Bus method handler awaits it instead of blocking a worker of the
+    /// runtime it is on; that runtime needs its timer enabled for [`HANDLER_TIMEOUT`]. Never
+    /// fails as such: an instance that is going away, or a GUI thread that does not answer in
+    /// time, comes back as a failed [`Response`] that says so, as `fxsound` would print it.
+    pub async fn call(&self, commands: Vec<Command>) -> Response {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let forwarded = Forwarded::new(commands, PathBuf::from("/"), move |response| {
+            let _ = reply.send(response);
+        });
+        if self.tx.try_send(forwarded).is_err() {
+            return Response::failed(SHUTTING_DOWN);
+        }
+        match tokio::time::timeout(HANDLER_TIMEOUT, answer).await {
+            Ok(Ok(response)) => response,
+            // Dropped without its `Drop` running: the process is going away, as in `dispatch`.
+            Ok(Err(_)) => Response::ok(),
+            Err(_) => Response::failed(NO_ANSWER_IN_TIME),
+        }
+    }
+}
+
+impl std::fmt::Debug for Control {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Control").finish_non_exhaustive()
     }
 }
 
@@ -1003,24 +1109,24 @@ fn dispatch(request: Request, tx: &Sender<Forwarded>) -> Response {
     };
 
     let (reply_tx, reply_rx) = bounded(1);
-    let forwarded = Forwarded {
-        commands: cli.commands(),
-        cwd: PathBuf::from(request.cwd),
-        reply: Some(reply_tx),
-    };
+    let forwarded = Forwarded::new(
+        cli.commands(),
+        PathBuf::from(request.cwd),
+        move |response| {
+            let _ = reply_tx.send(response);
+        },
+    );
 
     match tx.try_send(forwarded) {
         Ok(()) => {}
         Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-            return Response::failed("FxSound is shutting down and cannot take that command");
+            return Response::failed(SHUTTING_DOWN);
         }
     }
 
     match reply_rx.recv_timeout(HANDLER_TIMEOUT) {
         Ok(response) => response,
-        Err(RecvTimeoutError::Timeout) => {
-            Response::failed("FxSound did not answer in time; the command may still be running")
-        }
+        Err(RecvTimeoutError::Timeout) => Response::failed(NO_ANSWER_IN_TIME),
         // The handler dropped the `Forwarded` without answering and without the `Drop` impl
         // running, which can only mean the process is going away.
         Err(RecvTimeoutError::Disconnected) => Response::ok(),
@@ -1229,8 +1335,8 @@ fn peer_closed(stream: &UnixStream) -> bool {
     closed || stream.set_nonblocking(false).is_err()
 }
 
-/// Unix time in milliseconds, the events' `ts`.
-fn unix_millis() -> u64 {
+/// Unix time in milliseconds, the events' `ts` — on the socket and in D-Bus's `AudioStateChanged`.
+pub(crate) fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| {
@@ -1780,6 +1886,101 @@ mod tests {
         // And a 0.3.0 frame still parses, as a request that does not watch.
         let parsed: Request = serde_json::from_str(&frame).expect("parse");
         assert!(!parsed.watch && !parsed.meters);
+    }
+
+    // ---- the control channel -----------------------------------------------------------------
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("a runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn a_command_list_from_the_control_channel_is_drained_like_a_forwarded_command_line() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let Instance::Primary(listener) = Instance::acquire_in(dir.path()).expect("acquire") else {
+            panic!("expected to be primary");
+        };
+        let server = listener.serve().expect("serve");
+        let control = server.control();
+        let caller = thread::spawn(move || {
+            block_on(control.call(vec![Command::Power(PowerCommand::Toggle)]))
+        });
+
+        let forwarded = wait_for(&server);
+        assert_eq!(forwarded.commands(), [Command::Power(PowerCommand::Toggle)]);
+        assert_eq!(forwarded.cwd(), Path::new("/"));
+        forwarded.respond_with("on".to_owned(), "a note".to_owned(), false);
+
+        let response = caller.join().expect("the caller");
+        assert!(response.ok);
+        assert_eq!(response.stdout, "on");
+        assert_eq!(response.stderr, "a note");
+    }
+
+    #[test]
+    fn a_refusal_on_the_control_channel_comes_back_failed_with_its_text() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let Instance::Primary(listener) = Instance::acquire_in(dir.path()).expect("acquire") else {
+            panic!("expected to be primary");
+        };
+        let server = listener.serve().expect("serve");
+        let control = server.control();
+        let caller = thread::spawn(move || {
+            block_on(control.call(vec![Command::Preset(PresetCommand::Select(
+                "Nope".to_owned(),
+            ))]))
+        });
+        wait_for(&server).reply(Response::failed("no output preset is called \"Nope\""));
+        let response = caller.join().expect("the caller");
+        assert!(!response.ok);
+        assert_eq!(response.stderr, "no output preset is called \"Nope\"");
+    }
+
+    #[test]
+    fn the_control_channel_of_a_server_that_is_gone_refuses_at_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let Instance::Primary(listener) = Instance::acquire_in(dir.path()).expect("acquire") else {
+            panic!("expected to be primary");
+        };
+        let server = listener.serve().expect("serve");
+        let control = server.control();
+        drop(server);
+        let started = Instant::now();
+        let response = block_on(control.call(vec![Command::Quit]));
+        assert!(!response.ok);
+        assert_eq!(response.stderr, SHUTTING_DOWN);
+        assert!(started.elapsed() < HANDLER_TIMEOUT);
+    }
+
+    #[test]
+    fn a_socket_caller_forwarded_during_the_way_out_is_told_so_rather_than_acknowledged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let Instance::Primary(listener) = Instance::acquire_in(dir.path()).expect("acquire") else {
+            panic!("expected to be primary");
+        };
+        let server = listener.serve().expect("serve");
+        let socket = server.path().to_owned();
+        let caller = thread::spawn(move || {
+            forward_to(
+                &socket,
+                &argv(&["--next-preset"]),
+                Path::new("/"),
+                REPLY_TIMEOUT,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !caller.is_finished() {
+            assert!(Instant::now() < deadline, "the caller was never answered");
+            server.refuse_pending();
+            thread::sleep(Duration::from_millis(5));
+        }
+        let response = caller.join().expect("the caller").expect("an answer");
+        assert!(!response.ok);
+        assert_eq!(response.stderr, SHUTTING_DOWN);
     }
 
     // ---- the event stream --------------------------------------------------------------------

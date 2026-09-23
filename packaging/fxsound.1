@@ -394,9 +394,50 @@ ToggleWindow()             Quit()
 .EE
 .RE
 .PP
+Each method does what the matching option does \(en
+.B TogglePower
+is
+.BR \-\-toggle\-power ,
+.B SetPreset
+is
+.BR \-\-preset ,
+.B SetEditDirection
+is
+.B \-\-edit
+\(en with the same words for its argument:
+.B SetOutput
+and
+.B SetInput
+take a
+.B node.name
+or a description, or
+.B off
+to detach the lane;
+.B SetEditDirection
+takes
+.BR output " or " input .
+Unlike a typed command line, no method raises the window but
+.BR Show " and " ToggleWindow .
+A command the running instance refuses fails with
+.B org.freedesktop.DBus.Error.Failed
+and the message
+.B fxsound
+would print; an argument the option would not take either, with
+.BR org.freedesktop.DBus.Error.InvalidArgs .
+.PP
 Properties:
 .BR Version " (s, constant), " Power " (b), " Preset " (s), "
 .BR Output " (s), " Input " (s) and " Direction " (s)."
+.B Preset
+is the edit direction's preset, without the
+.B *
+for unsaved changes;
+.B Output
+and
+.B Input
+are the lanes' devices by description, empty while a lane is detached;
+.B Direction
+is the edit direction.
 .PP
 Signals:
 .BR PowerChanged (b),
@@ -405,6 +446,16 @@ Signals:
 .BR AudioStateChanged (s\ json)
 and
 .BR Notice (s\ message).
+They follow the
+.B \-\-watch
+events
+.BR power ", " preset_changed ", " device_changed ", " audio_state " and " notice ;
+.B AudioStateChanged
+carries the line
+.B \-\-watch \-\-json
+prints, and a preset that only gains unsaved changes sends no
+.BR PresetChanged .
+A name is empty for a lane that has no preset or no device.
 .PP
 If the name is already taken on the bus, the instance logs that and serves the
 control socket only. With

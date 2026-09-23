@@ -789,8 +789,8 @@ impl Command {
 
 /// `--output`/`--input` and their `--next-*`: a name wins over cycling, as it always has for
 /// `--output`, and an empty name is no command at all, as `applyConfig` treats an empty
-/// `--output`.
-fn device_command(name: Option<&str>, next: bool) -> Option<DeviceCommand> {
+/// `--output`. D-Bus's `SetOutput` and `SetInput` read their argument with it too.
+pub(crate) fn device_command(name: Option<&str>, next: bool) -> Option<DeviceCommand> {
     match name {
         Some(name) if name.trim().eq_ignore_ascii_case("off") => Some(DeviceCommand::Detach),
         Some(name) => (!name.is_empty()).then(|| DeviceCommand::Select(name.to_owned())),
@@ -798,12 +798,14 @@ fn device_command(name: Option<&str>, next: bool) -> Option<DeviceCommand> {
     }
 }
 
-fn parse_direction(value: &str) -> Result<DeviceDirection, String> {
+/// `--edit`'s value; D-Bus's `SetEditDirection` reads its argument with it too (`crate::dbus`).
+pub(crate) fn parse_direction(value: &str) -> Result<DeviceDirection, String> {
     DeviceDirection::from_key(&value.trim().to_ascii_lowercase())
         .ok_or_else(|| format!("expected output or input, got `{value}`"))
 }
 
-fn parse_noise_suppression(value: &str) -> Result<NoiseSuppressionOverride, String> {
+/// `--noise-suppression`'s value; D-Bus's `SetNoiseSuppression` reads its argument with it too.
+pub(crate) fn parse_noise_suppression(value: &str) -> Result<NoiseSuppressionOverride, String> {
     let key = value.trim().to_ascii_lowercase();
     // The window says "Mild"; the key says `light` (see `DenoiseLevel::label`).
     let key = if key == "mild" { "light" } else { key.as_str() };

@@ -41,11 +41,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev libclang-dev pipewire
+            pkg-config libpipewire-0.3-dev libclang-dev pipewire dbus
           # `pipewire` itself is the daemon, and it is here for the graph-churn tests: each one
           # starts a private server with its own socket and synthetic devices. Without the binary
           # those tests print that they are skipping and pass, which is the right behaviour for a
-          # contributor's laptop and the wrong one for CI.
+          # contributor's laptop and the wrong one for CI. `dbus` is there for the same reason:
+          # the D-Bus service's tests start a `dbus-daemon` of their own, never the session's.
 
       # rust-toolchain.toml pins 1.98.1 and asks for rustfmt and clippy, so rustup installs
       # exactly what the developers use rather than whatever the runner image happens to ship.
