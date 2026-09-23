@@ -10,7 +10,7 @@
 //! So each test here starts a **private** PipeWire: its own daemon, its own socket, its own
 //! synthetic devices, nothing shared with the session. Two things make that possible without
 //! touching the process environment, which matters because `std::env::set_var` is unsound with
-//! threads and this crate forbids unsafe code:
+//! threads and this crate denies unsafe code:
 //!
 //! * `remote.name` accepts an absolute socket path, so [`AudioEngine::start_with_remote`] can be
 //!   pointed straight at the private daemon.
@@ -144,6 +144,13 @@ impl PrivateGraph {
         self.dir.join("run/fxsound-test-0")
     }
 
+    /// Kill the daemon under whatever is connected to it: what a user meets as "PipeWire
+    /// restarted". The directory stays until the graph is dropped.
+    pub(crate) fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     pub(crate) fn remote(&self) -> String {
         self.socket().display().to_string()
     }
@@ -275,6 +282,23 @@ impl PrivateGraph {
         direction: &str,
         positions: &[&str],
     ) -> Option<()> {
+        self.port_config(node, direction, positions, false)
+    }
+
+    /// [`Self::configure_ports`] for a sink whose monitor is recorded as well: its input ports, and
+    /// a monitor port per channel beside them, which is what the echo canceller's monitor stream
+    /// is linked to. Waits for the input ports only; the monitor ports come with them.
+    pub(crate) fn configure_monitored_ports(&self, node: &str, positions: &[&str]) -> Option<()> {
+        self.port_config(node, "Input", positions, true)
+    }
+
+    fn port_config(
+        &self,
+        node: &str,
+        direction: &str,
+        positions: &[&str],
+        monitor: bool,
+    ) -> Option<()> {
         let id = self.node_id(node)?.to_string();
         let channels = positions.len();
         let listed = positions
@@ -283,7 +307,7 @@ impl PrivateGraph {
             .collect::<Vec<_>>()
             .join(", ");
         let config = format!(
-            "{{ \"direction\": \"{direction}\", \"mode\": \"dsp\", \
+            "{{ \"direction\": \"{direction}\", \"mode\": \"dsp\", \"monitor\": {monitor}, \
              \"format\": {{ \"mediaType\": \"audio\", \"mediaSubtype\": \"raw\", \
              \"format\": \"F32P\", \"rate\": 48000, \"channels\": {channels}, \
              \"position\": [ {listed} ] }} }}"
@@ -338,6 +362,43 @@ impl PrivateGraph {
             }
         }
         done
+    }
+
+    /// One property of the node called `name`, as the server holds it, written out as the text it
+    /// was set from: `pw-dump` prints a property that reads as a boolean or a number as one, so
+    /// `node.passive = "true"` comes back as `true` and not `"true"`. `None` when `pw-dump` is not
+    /// there to ask; `Some(None)` when the node is not in the graph or does not carry the key.
+    pub(crate) fn node_prop(&self, name: &str, key: &str) -> Option<Option<String>> {
+        let objects = self.dump()?;
+        Some(
+            Self::node_object(&objects, name).and_then(|node| match &node["info"]["props"][key] {
+                serde_json::Value::String(text) => Some(text.clone()),
+                serde_json::Value::Bool(flag) => Some(flag.to_string()),
+                serde_json::Value::Number(number) => Some(number.to_string()),
+                _ => None,
+            }),
+        )
+    }
+
+    /// Wait until the node called `name` carries `key = want`. `None` when `pw-dump` is not there
+    /// to ask; otherwise `Err` with what it last carried when it never came to.
+    pub(crate) fn prop_settles_on(
+        &self,
+        name: &str,
+        key: &str,
+        want: &str,
+    ) -> Option<Result<(), Option<String>>> {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let seen = self.node_prop(name, key)?;
+            if seen.as_deref() == Some(want) {
+                return Some(Ok(()));
+            }
+            if Instant::now() >= deadline {
+                return Some(Err(seen));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// The state the server holds a node in — `"running"`, `"idle"`, `"suspended"`, … — or `None`
@@ -493,6 +554,26 @@ pub(crate) fn installed(program: &str) -> bool {
         .is_ok()
 }
 
+/// Whether a file PipeWire loads into a client at run time is installed: `relative` under any
+/// `/usr/lib*` directory, or under a multiarch directory below one (`/usr/lib/x86_64-linux-gnu`),
+/// which is where Debian and Ubuntu put `spa-0.2` and `pipewire-0.3`.
+pub(crate) fn library_installed(relative: &str) -> bool {
+    let Ok(usr) = std::fs::read_dir("/usr") else {
+        return false;
+    };
+    usr.flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("lib"))
+        .any(|lib| {
+            let lib = lib.path();
+            lib.join(relative).exists()
+                || std::fs::read_dir(&lib).is_ok_and(|below| {
+                    below
+                        .flatten()
+                        .any(|entry| entry.path().join(relative).exists())
+                })
+        })
+}
+
 /// The serial `nodes` lists for `name`, if it lists `name` at all.
 fn serial_of(nodes: &[(&str, u64)], name: &str) -> Option<u64> {
     nodes
@@ -557,6 +638,21 @@ impl Transcript {
         mut pick: impl FnMut(&AudioToUi) -> bool,
     ) -> bool {
         self.0.iter().any(&mut pick) || self.until(handle, what, pick)
+    }
+
+    /// [`Self::heard`], counting only what the engine said from message `from` on — so a message
+    /// of the same kind from before, which is still in the transcript, does not answer for it.
+    fn heard_since(
+        &mut self,
+        handle: &EngineHandle,
+        from: usize,
+        what: &str,
+        mut pick: impl FnMut(&AudioToUi) -> bool,
+    ) -> bool {
+        self.0
+            .get(from..)
+            .is_some_and(|since| since.iter().any(&mut pick))
+            || self.until(handle, what, pick)
     }
 
     /// Give the supervisor three ticks to say whatever it was going to say, and keep all of it.
@@ -716,7 +812,7 @@ fn a_microphone_runs_beside_the_speakers_rather_than_instead_of_them() {
     assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
 
     if let Some(settled) = unless_skipped(
-        graph.settles_on(&OUR_NODE_NAMES),
+        graph.settles_on(&LANE_NODE_NAMES),
         "pw-dump",
         "that all four nodes exist at once",
     ) {
@@ -803,7 +899,7 @@ fn choosing_other_speakers_rebuilds_the_output_pair_and_leaves_the_microphone_pa
     assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
     assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
     let Some(before) = unless_skipped(
-        graph.settles_on(&OUR_NODE_NAMES),
+        graph.settles_on(&LANE_NODE_NAMES),
         "pw-dump",
         "which pair a change of speakers rebuilds",
     ) else {
@@ -829,7 +925,7 @@ fn choosing_other_speakers_rebuilds_the_output_pair_and_leaves_the_microphone_pa
 
     let after = graph
         .nodes_until(|nodes| {
-            nodes.len() == OUR_NODE_NAMES.len()
+            nodes.len() == LANE_NODE_NAMES.len()
                 && [SINK_NODE_NAME, OUTPUT_NODE_NAME]
                     .into_iter()
                     .all(|node| serial_of(nodes, node) != serial_of(&before, node))
@@ -914,7 +1010,7 @@ fn detaching_the_input_lane_takes_only_its_pair_and_its_default_away() {
     // Both pairs first, or the detach below would prove nothing: a capture pair that never
     // existed also leaves only the output pair behind.
     let both = unless_skipped(
-        graph.settles_on(&OUR_NODE_NAMES),
+        graph.settles_on(&LANE_NODE_NAMES),
         "pw-dump",
         "that both pairs exist before the detach",
     )
@@ -1293,7 +1389,7 @@ fn a_restart_rebuilds_every_lane_that_was_running() {
     );
     assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
     if let Some(settled) = unless_skipped(
-        graph.settles_on(&OUR_NODE_NAMES),
+        graph.settles_on(&LANE_NODE_NAMES),
         "pw-dump",
         "that both pairs came back",
     ) {
@@ -1356,7 +1452,7 @@ fn a_tone_driven_through_each_lane_reaches_that_lane_and_no_other() {
     assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
     assert_eq!(
         graph
-            .settles_on(&OUR_NODE_NAMES)
+            .settles_on(&LANE_NODE_NAMES)
             .map(|settled| settled.map(drop)),
         Some(Ok(())),
         "both pairs should be in the graph at once"
@@ -1629,7 +1725,7 @@ fn a_microphone_being_captured_does_not_keep_the_speakers_awake() {
     assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
     assert_eq!(
         graph
-            .settles_on(&OUR_NODE_NAMES)
+            .settles_on(&LANE_NODE_NAMES)
             .map(|settled| settled.map(drop)),
         Some(Ok(())),
         "both pairs should be in the graph at once"
@@ -1672,6 +1768,615 @@ fn a_microphone_being_captured_does_not_keep_the_speakers_awake() {
     handle.shutdown();
 }
 
+/// Why the echo canceller cannot be tested here, if it cannot: `None` when PipeWire's module and
+/// the null canceller — which passes the microphone through, so a test needs no WebRTC — are both
+/// installed.
+pub(crate) fn canceller_missing() -> Option<&'static str> {
+    if !library_installed("pipewire-0.3/libpipewire-module-echo-cancel.so") {
+        return Some("libpipewire-module-echo-cancel is not installed");
+    }
+    if !library_installed("spa-0.2/aec/libspa-aec-null.so") {
+        return Some("libspa-aec-null is not installed");
+    }
+    None
+}
+
+/// Start an engine whose echo canceller runs `library`, and attach its lanes to the private
+/// graph's stereo speakers and to `microphone`.
+fn engine_with_both_lanes(
+    graph: &PrivateGraph,
+    library: &'static str,
+    microphone: &str,
+    said: &mut Transcript,
+) -> EngineHandle {
+    let handle = AudioEngine::start_with_canceller(Some(&graph.remote()), library)
+        .expect("the engine should start");
+    said.until(
+        &handle,
+        "a device list",
+        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == microphone)),
+    );
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_stereo".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    handle.send(UiToAudio::SelectDevice {
+        node_name: microphone.to_owned(),
+        direction: DeviceDirection::Input,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    assert!(said.attached(&handle, DeviceDirection::Input, Some(microphone)));
+    handle
+}
+
+/// Whether the engine has reported echo cancellation as `running`, with a detail `detail` accepts,
+/// from message `from` of the transcript on.
+fn heard_echo_cancel(
+    said: &mut Transcript,
+    handle: &EngineHandle,
+    from: usize,
+    running: bool,
+    detail: impl Fn(&str) -> bool,
+) -> bool {
+    said.heard_since(
+        handle,
+        from,
+        &format!("echo cancellation reported as running: {running}"),
+        |message| {
+            matches!(message, AudioToUi::EchoCancel { running: r, detail: d }
+                if *r == running && detail(d))
+        },
+    )
+}
+
+#[test]
+fn echo_cancellation_puts_the_canceller_in_front_of_the_microphone_and_takes_it_away_again() {
+    if let Some(missing) = canceller_missing() {
+        skip(&format!("{missing}, so echo cancellation was not checked"));
+        return;
+    }
+    let Some(graph) = PrivateGraph::start("aec") else {
+        return;
+    };
+    if !installed("pw-dump") {
+        skip("pw-dump is not available, so echo cancellation was not checked");
+        return;
+    }
+    let mut said = Transcript::default();
+    let handle = engine_with_both_lanes(&graph, aec::NULL_LIBRARY, "t_mic", &mut said);
+    let before = graph
+        .settles_on(&LANE_NODE_NAMES)
+        .expect("pw-dump is installed")
+        .expect("both pairs should be in the graph before echo cancellation is asked for");
+    assert_eq!(
+        graph
+            .node_prop(CAPTURE_NODE_NAME, "target.object")
+            .flatten()
+            .as_deref(),
+        Some("t_mic"),
+        "without echo cancellation the capture stream records the microphone itself"
+    );
+    let heard_before = said.0.len();
+
+    let mark = said.0.len();
+    handle.send(UiToAudio::SetEchoCancel(true));
+    assert!(
+        heard_echo_cancel(&mut said, &handle, mark, true, str::is_empty),
+        "echo cancellation should be reported running once the canceller's source is in the graph"
+    );
+
+    // All seven nodes: both pairs and the canceller's three, with the input lane's capture stream
+    // rebuilt to record from the canceller's source, and the speakers' pair left alone.
+    let during = graph
+        .nodes_until(|nodes| {
+            nodes.len() == OUR_NODE_NAMES.len()
+                && serial_of(nodes, CAPTURE_NODE_NAME) != serial_of(&before, CAPTURE_NODE_NAME)
+        })
+        .expect("pw-dump answered a moment ago")
+        .expect("the canceller's nodes should join both pairs, and the capture stream be rebuilt");
+    assert_eq!(
+        graph.prop_settles_on(CAPTURE_NODE_NAME, "target.object", AEC_SOURCE_NODE_NAME),
+        Some(Ok(())),
+        "while echo cancellation runs, the capture stream records from the canceller's source"
+    );
+    for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME] {
+        assert_eq!(
+            serial_of(&during, node),
+            serial_of(&before, node),
+            "{node} was rebuilt for the microphone's echo cancellation"
+        );
+    }
+    // What the canceller listens to, and the group of its own it listens in.
+    for (node, key, want) in [
+        (AEC_CAPTURE_NODE_NAME, "target.object", "t_mic"),
+        (AEC_MONITOR_NODE_NAME, "target.object", "t_stereo"),
+        (AEC_MONITOR_NODE_NAME, "stream.capture.sink", "true"),
+        (AEC_CAPTURE_NODE_NAME, "node.link-group", AEC_LINK_GROUP),
+        (AEC_MONITOR_NODE_NAME, "node.link-group", AEC_LINK_GROUP),
+        (AEC_SOURCE_NODE_NAME, "node.link-group", AEC_LINK_GROUP),
+        (
+            AEC_SOURCE_NODE_NAME,
+            "node.description",
+            "FxSound echo-cancelled",
+        ),
+        (CAPTURE_NODE_NAME, "node.link-group", INPUT_LINK_GROUP),
+    ] {
+        assert_eq!(
+            graph.node_prop(node, key).flatten().as_deref(),
+            Some(want),
+            "{node}'s {key}"
+        );
+    }
+
+    said.settle(&handle);
+    let since = &said.0[heard_before..];
+    assert!(
+        !since
+            .iter()
+            .any(|m| matches!(m, AudioToUi::Attached { .. } | AudioToUi::Error { .. })),
+        "the canceller is a stage in front of the microphone, not another device: {since:?}"
+    );
+    assert!(
+        said.0.iter().all(|m| match m {
+            AudioToUi::Devices(devices) => devices.iter().all(|d| !d.name.starts_with("fxsound_")),
+            _ => true,
+        }),
+        "the canceller's nodes were offered as devices"
+    );
+
+    // Off: the capture stream goes back to the microphone, and the canceller's nodes go.
+    let mark = said.0.len();
+    handle.send(UiToAudio::SetEchoCancel(false));
+    assert!(
+        heard_echo_cancel(&mut said, &handle, mark, false, str::is_empty),
+        "switching echo cancellation off is answered"
+    );
+    let after = graph
+        .settles_on(&LANE_NODE_NAMES)
+        .expect("pw-dump answered a moment ago")
+        .expect("the canceller's three nodes should be gone, and both pairs still there");
+    assert_eq!(
+        graph
+            .node_prop(CAPTURE_NODE_NAME, "target.object")
+            .flatten()
+            .as_deref(),
+        Some("t_mic"),
+        "with echo cancellation off, the capture stream records the microphone again"
+    );
+    assert_ne!(
+        serial_of(&after, CAPTURE_NODE_NAME),
+        serial_of(&during, CAPTURE_NODE_NAME),
+        "the capture stream was not rebuilt onto the microphone"
+    );
+    for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME] {
+        assert_eq!(serial_of(&after, node), serial_of(&before, node), "{node}");
+    }
+    handle.shutdown();
+}
+
+#[test]
+fn a_canceller_that_cannot_be_loaded_is_reported_and_the_microphone_is_recorded_directly() {
+    let Some(graph) = PrivateGraph::start("aecfail") else {
+        return;
+    };
+    if !installed("pw-dump") {
+        skip("pw-dump is not available, so a failed canceller was not checked");
+        return;
+    }
+    // A library no PipeWire ships: the load fails the way a missing `libspa-aec-webrtc` does,
+    // with ENOENT, whether or not the module itself is installed.
+    const MISSING: &str = "aec/libspa-aec-fxsound-no-such-canceller";
+    let mut said = Transcript::default();
+    let handle = engine_with_both_lanes(&graph, MISSING, "t_mic", &mut said);
+    assert_eq!(
+        graph
+            .settles_on(&LANE_NODE_NAMES)
+            .map(|settled| settled.map(drop)),
+        Some(Ok(())),
+        "both pairs should be in the graph"
+    );
+
+    let mark = said.0.len();
+    handle.send(UiToAudio::SetEchoCancel(true));
+    assert!(
+        heard_echo_cancel(&mut said, &handle, mark, false, |detail| detail
+            .contains(MISSING)),
+        "a canceller that cannot load is reported as not running, and why: {:?}",
+        said.0
+    );
+
+    // And nothing else changes: no canceller nodes, the capture stream still on the microphone,
+    // the lane still attached, and no pretending later on.
+    said.settle(&handle);
+    assert_eq!(
+        graph
+            .node_prop(CAPTURE_NODE_NAME, "target.object")
+            .flatten()
+            .as_deref(),
+        Some("t_mic"),
+        "the input lane keeps recording the microphone itself"
+    );
+    assert_eq!(
+        graph.our_nodes().map(|nodes| nodes.len()),
+        Some(LANE_NODE_NAMES.len()),
+        "a module that failed to load left nodes behind"
+    );
+    assert!(
+        !said
+            .0
+            .iter()
+            .any(|m| matches!(m, AudioToUi::EchoCancel { running: true, .. })),
+        "a canceller that never loaded was reported running"
+    );
+    assert_eq!(
+        said.attachments(DeviceDirection::Input).last(),
+        Some(&Some("t_mic".to_owned()))
+    );
+    let failures = said
+        .0
+        .iter()
+        .filter(
+            |m| matches!(m, AudioToUi::EchoCancel { running: false, detail } if !detail.is_empty()),
+        )
+        .count();
+    assert_eq!(
+        failures, 1,
+        "the failure is reported once, not on every tick"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
+    if let Some(missing) = canceller_missing() {
+        skip(&format!(
+            "{missing}, so the idle after echo cancellation was not checked"
+        ));
+        return;
+    }
+    let Some(graph) = PrivateGraph::start("aecidle") else {
+        return;
+    };
+    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+        .into_iter()
+        .find(|tool| !installed(tool))
+    {
+        skip(&format!(
+            "{missing} is not available, so the idle after echo cancellation was not checked"
+        ));
+        return;
+    }
+    if graph.add_tone("t_tone").is_none() {
+        skip(concat!(
+            "the tone never appeared (is audiotestsrc installed?), ",
+            "so the idle after echo cancellation was not checked"
+        ));
+        return;
+    }
+    let mut said = Transcript::default();
+    let handle = engine_with_both_lanes(&graph, aec::NULL_LIBRARY, "t_tone", &mut said);
+    let mark = said.0.len();
+    handle.send(UiToAudio::SetEchoCancel(true));
+    assert!(heard_echo_cancel(
+        &mut said,
+        &handle,
+        mark,
+        true,
+        str::is_empty
+    ));
+    assert_eq!(
+        graph.prop_settles_on(CAPTURE_NODE_NAME, "target.object", AEC_SOURCE_NODE_NAME),
+        Some(Ok(())),
+        "the capture stream should have moved onto the canceller"
+    );
+
+    // Wire it all as a session manager would: the playback stream to the speakers, the microphone
+    // and the speakers' monitor into the canceller, and the canceller into the capture stream.
+    for (node, direction, positions) in [
+        ("t_tone", "Output", &["MONO"][..]),
+        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+        (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
+        (AEC_CAPTURE_NODE_NAME, "Input", &["FL", "FR"][..]),
+        (AEC_MONITOR_NODE_NAME, "Input", &["FL", "FR"][..]),
+        (AEC_SOURCE_NODE_NAME, "Output", &["FL", "FR"][..]),
+        (CAPTURE_NODE_NAME, "Input", &["FL", "FR"][..]),
+    ] {
+        assert!(
+            graph.configure_ports(node, direction, positions).is_some(),
+            "{node} was not given ports"
+        );
+    }
+    assert!(
+        graph
+            .configure_monitored_ports("t_stereo", &["FL", "FR"])
+            .is_some(),
+        "the speakers were not given ports and a monitor"
+    );
+    assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
+    assert!(graph.link_nodes("t_tone", AEC_CAPTURE_NODE_NAME));
+    assert!(graph.link_nodes("t_stereo", AEC_MONITOR_NODE_NAME));
+    assert!(graph.link_nodes(AEC_SOURCE_NODE_NAME, CAPTURE_NODE_NAME));
+    assert_eq!(
+        graph.runs_until(CAPTURE_NODE_NAME, true).map(drop),
+        Ok(()),
+        "the capture stream should run on the canceller's source"
+    );
+    // What echo cancellation costs (`docs/0.4.0-design.md` §7): the canceller hears the speakers'
+    // monitor on the microphone's clock, so the speakers — and the output pair, linked to them —
+    // run for as long as it does, whatever plays.
+    assert_eq!(
+        graph.runs_until("t_stereo", true).map(drop),
+        Ok(()),
+        "the speakers run while the canceller listens to them"
+    );
+
+    // Off. The canceller goes, the capture stream is rebuilt on the microphone, and once it is
+    // linked there — the session manager's job, done here by hand — the microphone lane runs on
+    // without keeping the speakers awake.
+    let mark = said.0.len();
+    handle.send(UiToAudio::SetEchoCancel(false));
+    assert!(heard_echo_cancel(
+        &mut said,
+        &handle,
+        mark,
+        false,
+        str::is_empty
+    ));
+    assert_eq!(
+        graph
+            .settles_on(&LANE_NODE_NAMES)
+            .map(|settled| settled.map(drop)),
+        Some(Ok(())),
+        "the canceller's nodes should be gone"
+    );
+    assert_eq!(
+        graph.prop_settles_on(CAPTURE_NODE_NAME, "target.object", "t_tone"),
+        Some(Ok(())),
+        "the capture stream should be back on the microphone"
+    );
+    assert!(
+        graph
+            .configure_ports(CAPTURE_NODE_NAME, "Input", &["MONO"])
+            .is_some(),
+        "the rebuilt capture stream was not given ports"
+    );
+    assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
+    assert_eq!(
+        graph.runs_until(CAPTURE_NODE_NAME, true).map(drop),
+        Ok(()),
+        "the microphone lane keeps running"
+    );
+    for node in ["t_stereo", OUTPUT_NODE_NAME, SINK_NODE_NAME] {
+        assert_eq!(
+            graph.runs_until(node, false).map(drop),
+            Ok(()),
+            "{node} should stop once the canceller is gone"
+        );
+    }
+    let quiet_until = Instant::now() + engine::SLEEP_AFTER * 2;
+    while Instant::now() < quiet_until {
+        for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME, "t_stereo"] {
+            assert_ne!(
+                graph.node_state(node).as_deref(),
+                Some("running"),
+                "{node} ran with echo cancellation off and nothing playing"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    handle.shutdown();
+}
+
+/// Wait until the canceller listens to `microphone` and `speakers`, and the capture stream records
+/// from its source in a pair built since `stale` — so not a reading left over from before a reload,
+/// which moves the capture stream onto the microphone and back. `None` when `pw-dump` is not there;
+/// `Some(false)` when it never came to.
+fn canceller_settles_on(
+    graph: &PrivateGraph,
+    microphone: &str,
+    speakers: &str,
+    stale: Option<u64>,
+) -> Option<bool> {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let settled = graph
+            .node_prop(AEC_CAPTURE_NODE_NAME, "target.object")?
+            .as_deref()
+            == Some(microphone)
+            && graph
+                .node_prop(AEC_MONITOR_NODE_NAME, "target.object")?
+                .as_deref()
+                == Some(speakers)
+            && graph
+                .node_prop(CAPTURE_NODE_NAME, "target.object")?
+                .as_deref()
+                == Some(AEC_SOURCE_NODE_NAME)
+            && graph
+                .our_nodes()
+                .is_some_and(|nodes| serial_of(&nodes, CAPTURE_NODE_NAME) != stale);
+        if settled {
+            return Some(true);
+        }
+        if Instant::now() >= deadline {
+            return Some(false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn the_canceller_follows_the_microphone_and_the_speakers_and_goes_with_the_microphone_lane() {
+    if let Some(missing) = canceller_missing() {
+        skip(&format!(
+            "{missing}, so the canceller's reloads were not checked"
+        ));
+        return;
+    }
+    let Some(graph) = PrivateGraph::start("aecfollow") else {
+        return;
+    };
+    if !installed("pw-dump") {
+        skip("pw-dump is not available, so the canceller's reloads were not checked");
+        return;
+    }
+    if graph.add_tone("t_tone").is_none() {
+        skip(concat!(
+            "the tone never appeared (is audiotestsrc installed?), ",
+            "so the canceller's reloads were not checked"
+        ));
+        return;
+    }
+    let mut said = Transcript::default();
+    let handle = engine_with_both_lanes(&graph, aec::NULL_LIBRARY, "t_mic", &mut said);
+    let mark = said.0.len();
+    handle.send(UiToAudio::SetEchoCancel(true));
+    assert!(heard_echo_cancel(
+        &mut said,
+        &handle,
+        mark,
+        true,
+        str::is_empty
+    ));
+    assert_eq!(
+        canceller_settles_on(&graph, "t_mic", "t_stereo", None),
+        Some(true),
+        "the canceller should hear the microphone and the speakers the lanes are attached to"
+    );
+
+    // Other speakers: the canceller is reloaded to hear those, and the capture stream ends up on
+    // the new canceller's source.
+    let capture = |graph: &PrivateGraph| {
+        graph
+            .our_nodes()
+            .and_then(|nodes| serial_of(&nodes, CAPTURE_NODE_NAME))
+    };
+    let before = capture(&graph);
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_71".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    // Asked for again, echo cancellation is answered as the message is handled, and messages are
+    // handled in order: once the answer is in, the change of speakers has been handled in full.
+    let mark = said.0.len();
+    handle.send(UiToAudio::SetEchoCancel(true));
+    assert!(
+        said.heard_since(&handle, mark, "echo cancellation's answer", |m| {
+            matches!(m, AudioToUi::EchoCancel { .. })
+        })
+    );
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_71")));
+    assert_ne!(
+        capture(&graph),
+        before,
+        "the capture stream should leave the unloaded canceller's source with it, not a tick later"
+    );
+    assert_eq!(
+        canceller_settles_on(&graph, "t_mic", "t_71", before),
+        Some(true),
+        "a change of speakers should reload the canceller to hear the new ones"
+    );
+
+    // Another microphone: the same, for the capture side.
+    let before = capture(&graph);
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_tone".to_owned(),
+        direction: DeviceDirection::Input,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
+    assert_eq!(
+        canceller_settles_on(&graph, "t_tone", "t_71", before),
+        Some(true),
+        "a change of microphone should reload the canceller to hear the new one"
+    );
+
+    // The microphone lane detached: the canceller goes with it, the speakers' pair stays.
+    let heard_before = said.0.len();
+    handle.send(UiToAudio::DetachLane(DeviceDirection::Input));
+    assert!(said.attached(&handle, DeviceDirection::Input, None));
+    assert_eq!(
+        graph
+            .settles_on(&[SINK_NODE_NAME, OUTPUT_NODE_NAME])
+            .map(|settled| settled.map(drop)),
+        Some(Ok(())),
+        "detaching the microphone lane should unload the canceller with the lane's pair"
+    );
+    assert!(
+        said.heard_since(
+            &handle,
+            heard_before,
+            "echo cancellation stopping",
+            |m| matches!(
+                m,
+                AudioToUi::EchoCancel { running: false, detail } if detail.is_empty()
+            )
+        ),
+        "the canceller stopping with the lane is reported"
+    );
+
+    // Still on: attaching a microphone again brings it back.
+    let mark = said.0.len();
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_mic".to_owned(),
+        direction: DeviceDirection::Input,
+    });
+    assert!(heard_echo_cancel(
+        &mut said,
+        &handle,
+        mark,
+        true,
+        str::is_empty
+    ));
+    assert_eq!(
+        canceller_settles_on(&graph, "t_mic", "t_71", None),
+        Some(true),
+        "echo cancellation stays on across a detach, and comes back with the microphone lane"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn a_server_that_goes_away_under_a_running_canceller_is_survived() {
+    if let Some(missing) = canceller_missing() {
+        skip(&format!(
+            "{missing}, so losing the server under the canceller was not checked"
+        ));
+        return;
+    }
+    let Some(mut graph) = PrivateGraph::start("aecdisc") else {
+        return;
+    };
+    let mut said = Transcript::default();
+    let handle = engine_with_both_lanes(&graph, aec::NULL_LIBRARY, "t_mic", &mut said);
+    let mark = said.0.len();
+    handle.send(UiToAudio::SetEchoCancel(true));
+    assert!(heard_echo_cancel(
+        &mut said,
+        &handle,
+        mark,
+        true,
+        str::is_empty
+    ));
+
+    // The module's connection and the engine's break together. Whichever of them notices first —
+    // the module destroying itself, or the engine unloading it as the session closes — the module
+    // is destroyed once, and the engine says so.
+    let mark = said.0.len();
+    graph.kill();
+    assert!(
+        said.until(&handle, "a disconnection", |m| matches!(
+            m,
+            AudioToUi::Disconnected { .. }
+        )),
+        "losing the server should be reported"
+    );
+    assert!(
+        heard_echo_cancel(&mut said, &handle, mark, false, |_| true),
+        "a canceller whose server went away is no longer running"
+    );
+    said.settle(&handle);
+    handle.shutdown();
+}
+
 /// Poll a lane's meters until the predicate accepts them, or the patience runs out.
 fn meters_until(
     handle: &mut EngineHandle,
@@ -1702,8 +2407,7 @@ fn a_server_that_goes_away_is_reported_rather_than_hung_on() {
     });
 
     // The case a user meets as "PipeWire restarted": the daemon dies under a running engine.
-    let _ = graph.child.kill();
-    let _ = graph.child.wait();
+    graph.kill();
 
     let reason = wait_for(&handle, "a disconnection", |message| match message {
         AudioToUi::Disconnected { reason } => Some(reason),

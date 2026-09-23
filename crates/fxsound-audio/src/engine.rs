@@ -82,6 +82,10 @@
 //!
 //! The input lane is left running either way: the capture stream is what makes the microphone
 //! produce anything, and a recorder may link to the virtual source at any moment.
+//!
+//! All of this holds while echo cancellation is off. While it is on, the canceller records the
+//! speakers' monitor on the microphone's clock, and the speakers and the output pair run with it
+//! (`docs/0.4.0-design.md` §7, and `aec`); switched off, they sleep again.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
@@ -104,14 +108,15 @@ use pw::properties::{PropertiesBox, properties};
 use pw::stream::{StreamFlags, StreamState};
 use triple_buffer::{Input, Output};
 
+use crate::aec::{self, EchoCancel, Side};
 use crate::devices::{self, ChannelMap, DeviceInfo, SelectionMemory};
 use crate::lane_dsp::{self, ChainHandover, LaneDsp};
 use crate::per_direction::PerDirection;
 use crate::{
-    AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION, DEFAULT_QUANTUM_FRAMES,
-    DEFAULT_SAMPLE_RATE, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS, OUTPUT_NODE_NAME,
-    OUTPUT_STREAM_DESCRIPTION, RING_CAPACITY_FRAMES, SINK_DESCRIPTION, SINK_NODE_NAME,
-    SOURCE_NODE_NAME, link_group, locale, our_node_name,
+    AEC_SOURCE_NODE_NAME, AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION,
+    DEFAULT_QUANTUM_FRAMES, DEFAULT_SAMPLE_RATE, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS,
+    OUTPUT_NODE_NAME, OUTPUT_STREAM_DESCRIPTION, RING_CAPACITY_FRAMES, SINK_DESCRIPTION,
+    SINK_NODE_NAME, SOURCE_NODE_NAME, link_group, locale, our_node_name,
 };
 
 /// The rate the capture stream asks for, whatever the microphone runs at.
@@ -193,8 +198,9 @@ const NODE_PRIORITY_SESSION: &str = "500";
 /// # Why atomics rather than a shared `&mut [f32]`
 ///
 /// A conventional SPSC ring hands the producer and consumer disjoint `&mut` views of one buffer,
-/// which needs `unsafe`. This crate is `#![forbid(unsafe_code)]`, so each slot is an `AtomicU32`
-/// holding `f32::to_bits`. On every target this project supports, a `Relaxed` atomic load or store
+/// which needs `unsafe`. This crate denies `unsafe_code` everywhere but the echo canceller's FFI
+/// seam (`lib.rs`), and certainly in a process callback, so each slot is an `AtomicU32` holding
+/// `f32::to_bits`. On every target this project supports, a `Relaxed` atomic load or store
 /// of a `u32` compiles to the same instruction as a plain one — no fence, no lock — so the cost is
 /// the lost auto-vectorisation on the copy, not the copy itself. Correctness in exchange for a few
 /// nanoseconds per quantum is the right trade in a callback that must never be wrong.
@@ -712,6 +718,9 @@ pub(crate) struct Config {
     /// Each lane's event queue, read by that lane's chain only.
     pub(crate) events: PerDirection<Receiver<DspEvent>>,
     pub(crate) ready: Sender<Result<(), AudioError>>,
+    /// The canceller library echo cancellation loads: WebRTC's, except in the tests
+    /// (`AudioEngine::start_with_canceller`).
+    pub(crate) aec_library: &'static str,
 }
 
 /// One lane's two PipeWire nodes and everything that must die with them.
@@ -728,6 +737,11 @@ struct Nodes {
     second: pw::stream::StreamRc,
     /// `node.name` of the real device NODE 2 renders to, or NODE 1 captures from.
     target: String,
+    /// The node the input lane's NODE 1 records from instead of `target` itself: the echo
+    /// canceller's source, while echo cancellation runs for this microphone ([`aec::route`]).
+    /// `None` in every other pair. What the lane is attached to is still `target` — the canceller
+    /// is a stage in front of the microphone, not another device.
+    via: Option<&'static str>,
     /// What both nodes were declared at.
     format: PairFormat,
     /// NODE 2's schedule, in an output pair whose server does not run a link-group together and
@@ -1095,6 +1109,11 @@ struct Shared {
     /// state, rather than on the next tick. `None` until [`run`] attaches its receiver — so in
     /// tests, which pace by hand — and then the supervisor alone does the pacing.
     wake: Option<pw::channel::Sender<()>>,
+    /// Echo cancellation: whether it is wanted, and the module while one is loaded
+    /// (`docs/0.4.0-design.md` §7). The module is unloaded explicitly wherever the session ends
+    /// ([`close_session`]), so it never outlives the connection it was loaded beside, nor the
+    /// context it was loaded into.
+    aec: EchoCancel,
 }
 
 impl Shared {
@@ -1136,6 +1155,7 @@ impl Shared {
             connection_error: None,
             link_groups_scheduled: Rc::new(Cell::new(false)),
             wake: None,
+            aec: EchoCancel::new(aec::WEBRTC_LIBRARY),
         }
     }
 
@@ -1320,6 +1340,7 @@ pub(crate) fn run(config: Config) {
         meters,
         events,
         ready,
+        aec_library,
     } = config;
 
     pw::init();
@@ -1356,6 +1377,7 @@ pub(crate) fn run(config: Config) {
         },
         handover,
     )));
+    shared.borrow_mut().aec = EchoCancel::new(aec_library);
 
     let control_source = control.attach(mainloop.loop_(), {
         let shared = Rc::clone(&shared);
@@ -1389,6 +1411,9 @@ pub(crate) fn run(config: Config) {
     //
     // Nothing else may run while that happens: a supervisor tick would re-run the rules and take
     // a default straight back, and a late control message could do the same.
+    //
+    // `close_session` also unloads the echo canceller, which is the last thing loaded into the
+    // context and has to go before it does: the context is dropped when this function returns.
     drop(timer);
     drop(control_source);
     drop(wake_source);
@@ -1554,11 +1579,7 @@ fn control(shared: &mut Shared, message: UiToAudio) {
         UiToAudio::Restart => {
             shared.restart_requested = true;
         }
-        // There is no canceller to load yet; until there is, the request is acknowledged and does
-        // nothing, which is what an engine without one can honestly say.
-        UiToAudio::SetEchoCancel(want) => {
-            log::debug!("SetEchoCancel({want}): echo cancellation is not in this engine yet");
-        }
+        UiToAudio::SetEchoCancel(want) => set_echo_cancel(shared, want),
         UiToAudio::SetInputChain(name) => set_input_chain(shared, &name),
         UiToAudio::SeedRememberedDefaults { output, input } => {
             // Only ever fills a gap. If this run has already displaced something, that is the
@@ -1591,6 +1612,88 @@ fn control(shared: &mut Shared, message: UiToAudio) {
             }
         }
         UiToAudio::Shutdown => unreachable!("handled by handle_control"),
+    }
+    // A detached microphone lane, another microphone or other speakers: whatever the message
+    // changed, a canceller that no longer fits goes now rather than on the next tick, and a capture
+    // stream recording from it goes back to the microphone with it. Loading one needs the context,
+    // which only the supervisor has; it follows within 200 ms.
+    reconcile_echo_cancel(shared, None);
+}
+
+/// Switch echo cancellation on or off, and answer with an [`AudioToUi::EchoCancel`] saying where
+/// it stands — even when nothing changed, because whoever asked is waiting to hear.
+///
+/// On, the canceller is loaded by the next supervisor tick, once the input lane has a pair: there
+/// is nothing to cancel for until it does. Off, the module is unloaded now, and the input lane's
+/// capture stream is rebuilt on the microphone in the same call ([`reconcile_echo_cancel`]).
+fn set_echo_cancel(shared: &mut Shared, want: bool) {
+    log::info!("echo cancellation {}", if want { "on" } else { "off" });
+    shared.aec.set_on(want);
+    reconcile_echo_cancel(shared, None);
+    let (running, detail) = shared.aec.answer();
+    shared.notify(AudioToUi::EchoCancel { running, detail });
+}
+
+/// Where a lane is, for the echo canceller: detached, attached to a device, or in between.
+fn canceller_side(lane: &Lane) -> Side<'_> {
+    match (&lane.nodes, lane.enabled) {
+        (_, false) => Side::Off,
+        (Some(nodes), true) => Side::On(&nodes.target),
+        (None, true) => Side::Between,
+    }
+}
+
+/// Load, reload or unload the echo canceller to fit the two lanes ([`EchoCancel::reconcile`]).
+/// `context` is the supervisor's; without it — from a control message — only unloading happens.
+///
+/// A canceller that goes here — switched off, reloaded for other speakers or another microphone,
+/// or let go after going by itself — takes the input lane's capture stream off its source in the
+/// same call: if the lane's pair was recording from it, the lane's rules run now and rebuild the
+/// pair on the microphone. Now, and not on the next tick, because the stream must never be left
+/// aimed at a source that has gone. It carries no `node.dont-fallback`, and under a session
+/// manager a stream whose target vanishes is linked to whatever else it finds: the default source
+/// first, which while the input lane holds the default is FxSound's own. WirePlumber's `canLink`
+/// refuses that one (`fxsound_capture` and `fxsound_source` share `fxsound-input`), but not the
+/// best of the rest it tries next, which can be another microphone altogether.
+///
+/// Rebuilt after the unload rather than before it, and that is the same thing: the module closes
+/// a connection of its own as it goes, so its source's going reaches the server at once, while
+/// the new pair is sent on the engine's connection only when the loop next turns — after the
+/// unload, whichever of the two calls came first. What matters is that no turn of the loop passes
+/// between them.
+fn reconcile_echo_cancel(shared: &mut Shared, context: Option<&pw::context::Context>) {
+    let now = Instant::now();
+    let retry_after = backoff(shared.aec.attempts());
+    let ready = shared.ready();
+    let Shared {
+        aec, lanes, remote, ..
+    } = shared;
+    // Its own connection goes to the server this engine's does, and only once this engine's is up.
+    let connection = context
+        .filter(|_| ready)
+        .map(|context| (context, remote.as_deref()));
+    aec.reconcile(
+        canceller_side(&lanes.input),
+        canceller_side(&lanes.output),
+        connection,
+        retry_after,
+        now,
+    );
+
+    let stranded = shared
+        .lanes
+        .input
+        .nodes
+        .as_ref()
+        .is_some_and(|nodes| nodes.via.is_some() && shared.aec.route(&nodes.target).is_none());
+    if stranded {
+        if ready {
+            apply_rules(shared, DeviceDirection::Input);
+        } else {
+            shared.mark_lane_for_rules(DeviceDirection::Input);
+        }
+        // The rules have followed the canceller's going: the supervisor has nothing to add.
+        shared.aec.route_moved();
     }
 }
 
@@ -1758,6 +1861,7 @@ fn connect(
     // default until this server's `settings` object says otherwise.
     guard.devices.clear();
     guard.node_probes.clear();
+    guard.aec.forget_sources();
     guard.defaults = PerDirection::default();
     guard.clock = GraphClock::default();
     guard.state = State::Connecting;
@@ -1795,6 +1899,11 @@ fn connect(
 /// so whatever comes next — a reconnect, or the end of the thread — finds the lanes as the user
 /// left them.
 fn close_session(shared: &mut Shared) {
+    // The echo canceller first. It is on a connection of its own (`aec`), so nothing here depends
+    // on it, but it was loaded for this server and these devices, and it is loaded again for the
+    // next ones once the lanes are back. Its source goes from the registry with the rest.
+    shared.aec.unload();
+    shared.aec.forget_sources();
     for (_, lane) in shared.lanes.iter_mut() {
         lane.nodes = None;
         lane.built_at = None;
@@ -1857,14 +1966,24 @@ fn supervise(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) {
             disconnect(&mut guard, "restart requested");
         }
 
-        // 3. Each lane on its own: its streams' errors, its format check, its rules, its
+        // 3. The echo canceller: let a module that went by itself go, load the one the lanes call
+        //    for, and when whether it runs has changed, have the input lane's rules move the
+        //    capture stream onto its source or back onto the microphone — before the lanes' step,
+        //    so the move is made in this same tick. A move back because the module went has been
+        //    made already, inside `reconcile_echo_cancel`.
+        reconcile_echo_cancel(&mut guard, Some(context));
+        if guard.aec.route_moved() {
+            guard.mark_lane_for_rules(DeviceDirection::Input);
+        }
+
+        // 4. Each lane on its own: its streams' errors, its format check, its rules, its
         //    published delay.
         let now = Instant::now();
         for direction in DeviceDirection::ALL {
             supervise_lane(&mut guard, direction, now);
         }
 
-        // 4. Tell the GUI what changed.
+        // 5. Tell the GUI what changed.
         publish(&mut guard);
 
         guard.session.is_none() && now >= guard.next_connect
@@ -2008,8 +2127,15 @@ fn on_global(
 
     match global.type_ {
         pw::types::ObjectType::Node => {
-            // Our own four nodes are in the registry too; `from_props` drops them by name so none
-            // of them can ever become a target.
+            // The echo canceller's source: what makes echo cancellation *running*, and the input
+            // lane's cue to record from it (`supervise`). Never a device, like the rest of ours.
+            if props.get(*pw::keys::NODE_NAME) == Some(AEC_SOURCE_NODE_NAME) {
+                log::debug!("the echo canceller's source appeared ({})", global.id);
+                guard.aec.source_appeared(global.id);
+                return;
+            }
+            // Our own nodes are in the registry too; `from_props` drops them by name so none of
+            // them can ever become a target.
             let Some(device) = DeviceInfo::from_props(global.id, &|key: &str| props.get(key))
             else {
                 return;
@@ -2125,6 +2251,10 @@ fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
     let Ok(mut guard) = shared.try_borrow_mut() else {
         return;
     };
+    if guard.aec.source_removed(id) {
+        log::debug!("the echo canceller's source went away ({id})");
+        return;
+    }
     let Some(removed) = remove_device(&mut guard, id) else {
         return;
     };
@@ -2554,12 +2684,21 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
     // and change the format, and in 0.3.0 the name matched, the rules returned here, and the
     // rebuild `on_node_info` asked for never happened.
     let format = PairFormat::for_target(&target, shared.clock.rate());
+    // The microphone itself, or the echo canceller's source in front of it while echo cancellation
+    // runs for this microphone. A pair recording the wrong one of the two is rebuilt like a pair on
+    // the wrong device: the capture stream's target is fixed when it is made.
+    let route = match direction {
+        DeviceDirection::Input => shared.aec.route(&target.name),
+        DeviceDirection::Output => None,
+    };
     let already = shared
         .lanes
         .get(direction)
         .nodes
         .as_ref()
-        .is_some_and(|nodes| nodes.target == target.name && nodes.format == format);
+        .is_some_and(|nodes| {
+            nodes.target == target.name && nodes.format == format && nodes.via == route
+        });
     if already {
         // Nothing to do. An error this lane reported is forgotten once its pair has proved
         // itself (`Lane::forgive_if_stable`), not because the rules ran again in the meantime.
@@ -2571,17 +2710,22 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
     // server never sees two nodes with the same `node.name`. The default is kept: the same node
     // is about to reappear under the same name, and `default.configured.audio.*` survives the gap.
     drop_nodes(shared, direction);
-    match build_nodes(shared, &target, format) {
+    match build_nodes(shared, &target, format, route) {
         Ok(nodes) => {
             log::info!(
-                "{} {} ({} ch @ {} Hz)",
+                "{} {} ({} ch @ {} Hz){}",
                 match direction {
                     DeviceDirection::Output => "rendering to",
                     DeviceDirection::Input => "capturing from",
                 },
                 target.description,
                 nodes.format.channels,
-                nodes.format.rate
+                nodes.format.rate,
+                if nodes.via.is_some() {
+                    ", through the echo canceller"
+                } else {
+                    ""
+                }
             );
             // The lane's error and backoff stay until this pair has proved itself
             // (`Lane::forgive_if_stable`): one that fails again a moment from now is the same
@@ -2616,10 +2760,16 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
 /// driver, no zero-order-hold upsampler. If the real device wants something else, the adapter in
 /// front of it converts — which is also how a mono microphone arrives here as the stereo pair the
 /// DSP runs on.
+///
+/// `via` is the node the input lane's capture stream records from instead of the microphone — the
+/// echo canceller's source ([`aec::route`]) — or `None` to record the microphone itself. The pair's
+/// format is the microphone's either way: the canceller runs at 48 kHz too, and PipeWire converts
+/// its channels to the pair's as it does the microphone's.
 fn build_nodes(
     shared: &mut Shared,
     target: &DeviceInfo,
     format: PairFormat,
+    via: Option<&'static str>,
 ) -> Result<Nodes, AudioError> {
     let Some(session) = shared.session.as_ref() else {
         return Err(AudioError::PipewireDisconnected);
@@ -2663,7 +2813,7 @@ fn build_nodes(
         ),
         DeviceDirection::Input => (
             CAPTURE_NODE_NAME,
-            stream_props(direction, &target.name, &latency, false),
+            stream_props(direction, via.unwrap_or(&target.name), &latency, false),
             StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
         ),
     };
@@ -2840,6 +2990,7 @@ fn build_nodes(
         first,
         second,
         target: target.name.clone(),
+        via,
         format,
         pace,
     })
@@ -3259,6 +3410,11 @@ fn on_output_process(stream: &pw::stream::Stream, data: &mut OutData) {
 fn publish(shared: &mut Shared) {
     for direction in DeviceDirection::ALL {
         publish_lane(shared, direction);
+    }
+
+    // Echo cancellation starting, stopping or failing, once per change.
+    if let Some((running, detail)) = shared.aec.news() {
+        shared.notify(AudioToUi::EchoCancel { running, detail });
     }
 
     if shared.needs_publish {
@@ -4575,6 +4731,88 @@ mod tests {
                 direction: DeviceDirection::Input,
                 node_name: None,
             }]
+        );
+    }
+
+    // ---- §7 of the 0.4.0 design: echo cancellation -----------------------------------------
+
+    #[test]
+    fn switching_echo_cancellation_is_always_answered_even_with_nothing_to_cancel_yet() {
+        let (mut shared, messages) = shared_with_messages();
+        let not_running = AudioToUi::EchoCancel {
+            running: false,
+            detail: String::new(),
+        };
+
+        // On, with no microphone lane: nothing to cancel for, and nothing wrong. The canceller is
+        // loaded once there is a microphone pair, by the supervisor — never from here.
+        control(&mut shared, UiToAudio::SetEchoCancel(true));
+        assert_eq!(drained(&messages), std::slice::from_ref(&not_running));
+        // Asked again, it answers again: whoever sent it is waiting to hear.
+        control(&mut shared, UiToAudio::SetEchoCancel(true));
+        assert_eq!(drained(&messages), std::slice::from_ref(&not_running));
+        publish(&mut shared);
+        assert!(
+            !drained(&messages)
+                .iter()
+                .any(|m| matches!(m, AudioToUi::EchoCancel { .. })),
+            "what was answered is not news on the next tick"
+        );
+
+        control(&mut shared, UiToAudio::SetEchoCancel(false));
+        assert_eq!(drained(&messages), [not_running]);
+    }
+
+    #[test]
+    fn an_engine_never_asked_for_echo_cancellation_never_mentions_it() {
+        let (mut shared, messages) = shared_with_messages();
+        control(
+            &mut shared,
+            UiToAudio::SelectDevice {
+                node_name: "alsa_input.usb-fifine".to_owned(),
+                direction: DeviceDirection::Input,
+            },
+        );
+        publish(&mut shared);
+        assert!(
+            !drained(&messages)
+                .iter()
+                .any(|m| matches!(m, AudioToUi::EchoCancel { .. })),
+            "off is what the GUI assumes until it asks"
+        );
+    }
+
+    #[test]
+    fn the_canceller_sees_each_lane_as_off_between_pairs_or_on_a_device() {
+        let mut shared = shared_for_tests();
+        assert_eq!(canceller_side(&shared.lanes.input), Side::Off);
+        assert_eq!(
+            canceller_side(&shared.lanes.output),
+            Side::Between,
+            "enabled, with no pair yet"
+        );
+        shared.lanes.input.enabled = true;
+        assert_eq!(canceller_side(&shared.lanes.input), Side::Between);
+        shared.lanes.output.enabled = false;
+        assert_eq!(canceller_side(&shared.lanes.output), Side::Off);
+    }
+
+    #[test]
+    fn with_no_canceller_running_the_microphone_is_recorded_directly() {
+        let mut shared = shared_for_tests();
+        shared.aec.set_on(true);
+        // On, but nothing loaded and no source in the graph: the capture stream is aimed at the
+        // microphone, as it is with echo cancellation off.
+        assert_eq!(shared.aec.route("alsa_input.usb-fifine"), None);
+        shared.aec.source_appeared(42);
+        assert_eq!(
+            shared.aec.route("alsa_input.usb-fifine"),
+            None,
+            "a source with no module of ours behind it is not recorded from"
+        );
+        assert!(
+            !shared.aec.route_moved(),
+            "and nothing has moved for the input lane's rules to follow"
         );
     }
 

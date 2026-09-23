@@ -71,6 +71,19 @@
 //! sinks and "FxSound (Input)" under its sources, each with the word in the system language
 //! ([`locale`]). Detaching a lane takes only its own device away.
 //!
+//! # Echo cancellation
+//!
+//! Off by default, and on request the input lane records through PipeWire's own canceller rather
+//! than from the microphone directly (`docs/0.4.0-design.md` §7). The canceller is
+//! `libpipewire-module-echo-cancel`, loaded into this crate's PipeWire context (`aec`): it hears
+//! the microphone and the monitor of the speakers the output lane plays to, and its
+//! `fxsound_aec_source` takes the microphone's place in front of `fxsound_capture`. The three nodes
+//! it makes are FxSound's as much as the lanes' four are — named by us, in a link-group of their
+//! own ([`AEC_LINK_GROUP`]), never offered as devices — and they come and go with the microphone
+//! lane: loaded once it has a pair, reloaded when its microphone or the speakers change, unloaded
+//! when echo cancellation is switched off, when the lane is detached, and before the connection
+//! or the thread ends.
+//!
 //! # Threads
 //!
 //! Nothing in `pipewire` or `libspa` is `Send`, so the whole PipeWire side lives on one thread
@@ -126,7 +139,10 @@
 //!   link-group: each has its own group, its own ring, its own chain, its own counters and its own
 //!   claim on a default, so the music chain cannot reach the microphone's signal or the other way
 //!   round, the microphone running cannot keep the speakers awake, and one lane failing leaves the
-//!   other playing.
+//!   other playing. Echo cancellation is the one bridge, and only while it is on: the canceller
+//!   hears what the speakers play in order to take its echo out of the microphone — nothing of it
+//!   reaches a recording — and it hears that on the microphone's clock, so the speakers and the
+//!   output pair run for as long as it does (`docs/0.4.0-design.md` §7).
 //!
 //! [`DspParams`]: fxsound_core::messages::DspParams
 //! [`InputDspParams`]: fxsound_core::messages::InputDspParams
@@ -136,8 +152,16 @@
 //! [`AudioToUi`]: fxsound_core::messages::AudioToUi
 //! [`UiToAudio::SetAsDefault`]: fxsound_core::messages::UiToAudio::SetAsDefault
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`, for exactly one reason: the echo canceller. PipeWire's canceller is a
+// module (`libpipewire-module-echo-cancel`, `docs/0.4.0-design.md` §7), and `pipewire` 0.10.1 has
+// no binding for loading one — no `pw_context_load_module`, no `pw_impl_module` at all. So `aec`
+// calls the C functions through `pipewire-sys`, and those three functions, and nothing else in
+// the crate, carry an `#[allow(unsafe_code)]` — each `unsafe` block with the reason it is sound
+// beside it. Everything else here, the process callbacks above all, stays as safe as `forbid`
+// made it, and a new `unsafe` anywhere else still fails the build.
+#![deny(unsafe_code)]
 
+mod aec;
 pub mod devices;
 pub mod engine;
 mod lane_dsp;
@@ -180,13 +204,46 @@ pub const CAPTURE_NODE_NAME: &str = "fxsound_capture";
 /// [`SINK_NODE_NAME`].
 pub const SOURCE_NODE_NAME: &str = "fxsound_source";
 
-/// Every node this crate ever creates. None of them is a device FxSound could attach to, so
-/// [`DeviceInfo::from_props`] drops them by name whatever their `media.class` says.
-pub const OUR_NODE_NAMES: [&str; 4] = [
+/// `node.name` of the echo canceller's capture stream: the one that hears the microphone
+/// (`docs/0.4.0-design.md` §7).
+pub const AEC_CAPTURE_NODE_NAME: &str = "fxsound_aec_capture";
+
+/// `node.name` of the echo canceller's monitor stream: the one that hears what the speakers play,
+/// the echo it takes out of the microphone.
+pub const AEC_MONITOR_NODE_NAME: &str = "fxsound_aec_monitor";
+
+/// `node.name` of the echo canceller's source: the microphone with the echo taken out, and what the
+/// input lane's capture stream records from while echo cancellation runs.
+pub const AEC_SOURCE_NODE_NAME: &str = "fxsound_aec_source";
+
+/// The four nodes of the two lanes' pairs, in lane order: the output lane's, then the input lane's.
+pub const LANE_NODE_NAMES: [&str; 4] = [
     SINK_NODE_NAME,
     OUTPUT_NODE_NAME,
     CAPTURE_NODE_NAME,
     SOURCE_NODE_NAME,
+];
+
+/// The three nodes the echo canceller's module makes while echo cancellation runs.
+pub const AEC_NODE_NAMES: [&str; 3] = [
+    AEC_CAPTURE_NODE_NAME,
+    AEC_MONITOR_NODE_NAME,
+    AEC_SOURCE_NODE_NAME,
+];
+
+/// Every node this crate ever creates, or has PipeWire create for it: [`LANE_NODE_NAMES`], then
+/// [`AEC_NODE_NAMES`]. None of them is a device FxSound could attach to, so
+/// [`DeviceInfo::from_props`] drops them by name whatever their `media.class` says. The canceller's
+/// source is an `Audio/Source` like any microphone, and offered as one it would let the input lane
+/// capture from its own canceller.
+pub const OUR_NODE_NAMES: [&str; 7] = [
+    SINK_NODE_NAME,
+    OUTPUT_NODE_NAME,
+    CAPTURE_NODE_NAME,
+    SOURCE_NODE_NAME,
+    AEC_CAPTURE_NODE_NAME,
+    AEC_MONITOR_NODE_NAME,
+    AEC_SOURCE_NODE_NAME,
 ];
 
 /// The `node.link-group` of the output lane's two nodes. **Mandatory**; see the module docs.
@@ -198,6 +255,15 @@ pub const LINK_GROUP: &str = "fxsound";
 /// The `node.link-group` of the input lane's two nodes: a group of their own, not the output
 /// lane's, because the server runs a group's members together (module docs).
 pub const INPUT_LINK_GROUP: &str = "fxsound-input";
+
+/// The `node.link-group` of the echo canceller's three streams: a group of their own, neither
+/// lane's (`docs/0.4.0-design.md` §7, and `aec` for the reasoning).
+///
+/// Not the input lane's, because the input lane's capture stream links to the canceller's source,
+/// and WirePlumber refuses a link between two nodes of one group. Not the output lane's, because
+/// the server runs a group together, and the canceller's capture stream — which runs whenever the
+/// microphone does — would keep the speakers' pair running with it.
+pub const AEC_LINK_GROUP: &str = "fxsound-aec";
 
 /// The `node.link-group` of a lane's pair.
 #[must_use]
@@ -352,7 +418,7 @@ impl AudioEngine {
     /// [`UiToAudio::SelectDevice`]: fxsound_core::messages::UiToAudio::SelectDevice
     /// [`UiToAudio::DetachLane`]: fxsound_core::messages::UiToAudio::DetachLane
     pub fn start() -> Result<EngineHandle, AudioError> {
-        Self::start_with(None, None)
+        Self::start_with(None, None, aec::WEBRTC_LIBRARY)
     }
 
     /// [`AudioEngine::start`], naming the language the virtual nodes are described in.
@@ -361,7 +427,7 @@ impl AudioEngine {
     /// so `FxSound (Вывод)` in the sound settings matches a Russian FxSound window even when the
     /// desktop locale says otherwise. `None` (plain [`AudioEngine::start`]) reads the locale.
     pub fn start_with_language(language: &str) -> Result<EngineHandle, AudioError> {
-        Self::start_with(None, Some(language))
+        Self::start_with(None, Some(language), aec::WEBRTC_LIBRARY)
     }
 
     /// [`AudioEngine::start`], against a named PipeWire socket rather than the session default.
@@ -372,12 +438,26 @@ impl AudioEngine {
     /// node in the user's live graph.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start_with_remote(remote: Option<&str>) -> Result<EngineHandle, AudioError> {
-        Self::start_with(remote, None)
+        Self::start_with(remote, None, aec::WEBRTC_LIBRARY)
+    }
+
+    /// [`Self::start_with_remote`], with the echo canceller running `library` rather than WebRTC.
+    ///
+    /// For the tests: `aec/libspa-aec-null` passes the microphone through untouched, which is all a
+    /// test of where the canceller's nodes go needs, and a library that does not exist is how a
+    /// test makes the load fail the way a missing `libspa-aec-webrtc` would.
+    #[cfg(test)]
+    pub(crate) fn start_with_canceller(
+        remote: Option<&str>,
+        library: &'static str,
+    ) -> Result<EngineHandle, AudioError> {
+        Self::start_with(remote, None, library)
     }
 
     fn start_with(
         remote: Option<&str>,
         language: Option<&str>,
+        aec_library: &'static str,
     ) -> Result<EngineHandle, AudioError> {
         // Whether the *socket* exists is left to `pw_context_connect`, which resolves
         // `remote.name` itself and reports the failure precisely. What has to be checked first is
@@ -386,7 +466,8 @@ impl AudioEngine {
         // (`docs/spec/12-audio-io.md` §22).
         engine::preflight(std::env::var_os("XDG_RUNTIME_DIR").as_deref())?;
 
-        let (mut handle, config, ready) = EngineHandle::wire(remote, language);
+        let (mut handle, mut config, ready) = EngineHandle::wire(remote, language);
+        config.aec_library = aec_library;
         let join = std::thread::Builder::new()
             .name("fxsound-audio".to_owned())
             .spawn(move || engine::run(config))
@@ -496,6 +577,7 @@ impl EngineHandle {
             meters: meters_in,
             events: events_rx,
             ready: ready_tx,
+            aec_library: aec::WEBRTC_LIBRARY,
         };
         let handle = Self {
             engine: AudioEngine {
@@ -835,6 +917,16 @@ mod tests {
         );
         assert_eq!(our_node_name(DeviceDirection::Output), SINK_NODE_NAME);
         assert_eq!(our_node_name(DeviceDirection::Input), SOURCE_NODE_NAME);
+        // The echo canceller's three, which are ours as much as the lanes' four: never a device.
+        assert_eq!(AEC_CAPTURE_NODE_NAME, "fxsound_aec_capture");
+        assert_eq!(AEC_MONITOR_NODE_NAME, "fxsound_aec_monitor");
+        assert_eq!(AEC_SOURCE_NODE_NAME, "fxsound_aec_source");
+        assert_eq!(AEC_LINK_GROUP, "fxsound-aec");
+        assert_eq!(
+            OUR_NODE_NAMES.to_vec(),
+            [LANE_NODE_NAMES.as_slice(), AEC_NODE_NAMES.as_slice()].concat(),
+            "every node of ours is either a lane's or the canceller's"
+        );
         // Names are matched by string and written into metadata: ASCII, no spaces, all distinct.
         for name in OUR_NODE_NAMES {
             assert!(name.is_ascii() && !name.contains(' '), "{name}");

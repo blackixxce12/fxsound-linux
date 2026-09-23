@@ -39,6 +39,9 @@ egui_extras = { version = "=0.36.2", default-features = false }
 
 pipewire = "0.10.1"
 libspa = "0.10.1"
+# The raw bindings `pipewire` is built on, at the version it pins. Only `fxsound-audio`'s `aec`
+# module uses them, for the one call the safe crate does not wrap (`pw_context_load_module`).
+pipewire-sys = "0.10.1"
 
 resvg = "0.48.1"
 usvg = "0.48.1"

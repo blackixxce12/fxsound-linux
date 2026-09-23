@@ -1270,6 +1270,12 @@ mod tests {
             // belt and braces against a future property change.
             (crate::OUTPUT_NODE_NAME, "Audio/Sink"),
             (crate::CAPTURE_NODE_NAME, "Audio/Source"),
+            // The echo canceller's source is an `Audio/Source` like any microphone: only its name
+            // keeps the input lane from being offered its own canceller to record from.
+            (crate::AEC_SOURCE_NODE_NAME, "Audio/Source"),
+            // Its two capture streams, belt and braces as above.
+            (crate::AEC_CAPTURE_NODE_NAME, "Audio/Source"),
+            (crate::AEC_MONITOR_NODE_NAME, "Audio/Source"),
         ] {
             let props = [("media.class", class), ("node.name", name)];
             let parsed = DeviceInfo::from_props(1, &|key: &str| {
