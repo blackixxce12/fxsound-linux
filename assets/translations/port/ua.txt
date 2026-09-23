@@ -101,3 +101,6 @@ countries: ua
 "the echo canceller stopped" = "придушення відлуння зупинилося"
 "waiting for the speakers" = "очікування динаміків"
 "Applications that used %s now follow FxSound's preset" = "Застосунки, що використовували %s, тепер слідують пресету FxSound"
+"Applications" = "Застосунки"
+"FxSound's preset" = "Пресет FxSound"
+"No application has played or recorded through FxSound yet" = "Жоден застосунок ще не відтворював і не записував звук через FxSound"

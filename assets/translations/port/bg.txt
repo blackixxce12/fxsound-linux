@@ -100,3 +100,6 @@ countries: bg
 "the echo canceller stopped" = "потискането на ехото спря"
 "waiting for the speakers" = "изчакват се високоговорителите"
 "Applications that used %s now follow FxSound's preset" = "Приложенията, които използваха %s, вече следват пресета на FxSound"
+"Applications" = "Приложения"
+"FxSound's preset" = "Пресетът на FxSound"
+"No application has played or recorded through FxSound yet" = "Още никое приложение не е възпроизвеждало или записвало звук през FxSound"

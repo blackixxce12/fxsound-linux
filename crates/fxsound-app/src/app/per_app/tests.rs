@@ -924,3 +924,290 @@ fn a_rule_the_engine_has_not_acted_on_is_not_said_to_be_routed() {
     );
     assert!(app.unsaid_changes().is_empty());
 }
+
+// ---- Settings ▸ Applications ----------------------------------------------------------------------
+
+use fxsound_ui::dialogs::settings::SettingsAction;
+use fxsound_ui::state::RoutedApp;
+
+/// OBS Studio: records, and never plays.
+fn obs() -> AppKey {
+    key("obs", "OBS Studio", "")
+}
+
+/// A pane row as `(name, running, [(lane, preset)])`.
+type PaneRow = (String, bool, Vec<(DeviceDirection, Option<String>)>);
+
+/// The pane's rows.
+fn pane_rows(app: &App) -> Vec<PaneRow> {
+    app.app_rows()
+        .into_iter()
+        .map(|row| {
+            (
+                row.name,
+                row.running,
+                row.lanes
+                    .into_iter()
+                    .map(|lane| (lane.direction, lane.preset))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn row(name: &str, running: bool, lanes: &[(DeviceDirection, Option<&str>)]) -> PaneRow {
+    (
+        name.to_owned(),
+        running,
+        lanes
+            .iter()
+            .map(|(lane, preset)| (*lane, preset.map(str::to_owned)))
+            .collect(),
+    )
+}
+
+/// Spotify remembered from last week, Brave from yesterday with a preset of its own.
+fn with_remembered(app: &mut App, dir: &Path) {
+    let file = dir.join("apps.toml");
+    std::fs::write(
+        &file,
+        "[[app]]\nbinary = \"spotify\"\nname = \"Spotify\"\nlast_seen = 100\n\n\
+         [[app]]\nbinary = \"brave\"\nname = \"Brave\"\noutput_preset = \"Volume Boost\"\n\
+         last_seen = 200\n",
+    )
+    .expect("write the store");
+    app.use_app_rules_file_for_tests(file);
+}
+
+#[test]
+fn the_pane_lists_the_running_applications_first_each_with_the_lanes_it_uses() {
+    let (mut app, engine, dir) = started();
+    with_remembered(&mut app, dir.path());
+    app.set_app_preset(&battlefield(), OUT, Some("Gaming"))
+        .expect("set");
+    play(
+        &mut app,
+        &engine,
+        vec![
+            stream(1, IN, &discord()),
+            stream(2, IN, &obs()),
+            stream(3, OUT, &discord()),
+            stream(4, OUT, &battlefield()),
+        ],
+    );
+    assert_eq!(
+        pane_rows(&app),
+        [
+            // Running, by name, each with a combo for the lanes it plays or records on.
+            row("Battlefield 6", true, &[(OUT, Some("Gaming"))]),
+            row("Discord", true, &[(OUT, None), (IN, None)]),
+            row("OBS Studio", true, &[(IN, None)]),
+            // Remembered, the most recently seen first; Spotify's lanes are not known, so both.
+            row("Brave", false, &[(OUT, Some("Volume Boost"))]),
+            row("Spotify", false, &[(OUT, None), (IN, None)]),
+        ]
+    );
+}
+
+#[test]
+fn a_lane_heard_this_session_keeps_its_combo_after_the_application_leaves_it() {
+    let (mut app, engine, _dir) = started();
+    play(
+        &mut app,
+        &engine,
+        vec![stream(1, OUT, &discord()), stream(2, IN, &discord())],
+    );
+    play(&mut app, &engine, vec![stream(1, OUT, &discord())]);
+    assert_eq!(
+        pane_rows(&app),
+        [row("Discord", true, &[(OUT, None), (IN, None)])]
+    );
+    // Quit: remembered, with the lanes it used.
+    play(&mut app, &engine, Vec::new());
+    assert_eq!(
+        pane_rows(&app),
+        [row("Discord", false, &[(OUT, None), (IN, None)])]
+    );
+    // A lane with a preset of its own always has its combo, heard or not.
+    play(&mut app, &engine, vec![stream(5, OUT, &battlefield())]);
+    app.set_app_preset(&battlefield(), IN, Some("Headset"))
+        .expect("set");
+    assert_eq!(
+        pane_rows(&app)[0],
+        row("Battlefield 6", true, &[(OUT, None), (IN, Some("Headset"))])
+    );
+}
+
+#[test]
+fn a_general_rule_is_one_row_running_for_every_program_it_covers() {
+    let (mut app, engine, _dir) = started();
+    let by_name = key("", "Discord", "");
+    app.set_app_preset(&by_name, IN, Some("Headset"))
+        .expect("set");
+    play(&mut app, &engine, vec![stream(1, IN, &discord())]);
+    assert_eq!(
+        pane_rows(&app),
+        [row("Discord", true, &[(IN, Some("Headset"))])]
+    );
+    assert_eq!(app.app_rows()[0].app, by_name, "the rule's own key");
+}
+
+#[test]
+fn choosing_in_the_pane_routes_the_application_at_once_and_the_row_says_so() {
+    let (mut app, engine, _dir) = started();
+    play(&mut app, &engine, vec![stream(1, OUT, &battlefield())]);
+    let _ = routes_sent(&engine);
+    let mut pane = app.settings_state();
+    assert_eq!(pane.apps.len(), 1);
+
+    app.handle_settings(
+        &SettingsAction::SetAppPreset {
+            app: battlefield(),
+            direction: OUT,
+            preset: Some("Gaming".to_owned()),
+        },
+        &mut pane,
+    );
+    let routes = the_routes_sent(&engine);
+    assert_eq!(route_of(&routes, &battlefield(), OUT).preset, "Gaming");
+    assert_eq!(
+        pane.apps[0].lanes,
+        [AppLane {
+            direction: OUT,
+            preset: Some("Gaming".to_owned()),
+        }]
+    );
+
+    // "FxSound's preset": back on the lane.
+    app.handle_settings(
+        &SettingsAction::SetAppPreset {
+            app: battlefield(),
+            direction: OUT,
+            preset: None,
+        },
+        &mut pane,
+    );
+    assert_eq!(the_routes_sent(&engine), Vec::<AppRoute>::new());
+    assert_eq!(pane.apps[0].lanes[0].preset, None);
+    assert_eq!(app.app_rules().preset_for(&battlefield(), OUT), None);
+}
+
+#[test]
+fn a_preset_gone_under_the_open_pane_is_refused_and_changes_nothing() {
+    let (mut app, engine, _dir) = started();
+    play(&mut app, &engine, vec![stream(1, OUT, &battlefield())]);
+    let _ = routes_sent(&engine);
+    let mut pane = app.settings_state();
+    let before = pane.apps.clone();
+    app.handle_settings(
+        &SettingsAction::SetAppPreset {
+            app: battlefield(),
+            direction: OUT,
+            preset: Some("Deleted a moment ago".to_owned()),
+        },
+        &mut pane,
+    );
+    assert!(routes_sent(&engine).is_empty());
+    assert_eq!(pane.apps, before);
+    assert_eq!(app.app_rules().preset_for(&battlefield(), OUT), None);
+}
+
+#[test]
+fn the_cross_forgets_a_remembered_application_and_takes_a_running_ones_presets() {
+    let (mut app, engine, _dir) = started();
+    app.set_app_preset(&brave(), OUT, Some("Volume Boost"))
+        .expect("set");
+    app.set_app_preset(&battlefield(), OUT, Some("Gaming"))
+        .expect("set");
+    play(&mut app, &engine, vec![stream(1, OUT, &battlefield())]);
+    let _ = routes_sent(&engine);
+    let mut pane = app.settings_state();
+    assert_eq!(pane.apps.len(), 2);
+
+    app.handle_settings(&SettingsAction::ForgetApp(brave()), &mut pane);
+    assert_eq!(
+        pane.apps
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Battlefield 6"]
+    );
+    assert!(routes_sent(&engine).is_empty(), "Brave was not running");
+
+    app.handle_settings(&SettingsAction::ForgetApp(battlefield()), &mut pane);
+    assert_eq!(the_routes_sent(&engine), Vec::<AppRoute>::new());
+    assert_eq!(pane.apps.len(), 1, "still running, so still listed");
+    assert!(pane.apps[0].lanes.iter().all(|lane| lane.preset.is_none()));
+    assert!(!pane.apps[0].can_forget(), "nothing left to forget");
+}
+
+#[test]
+fn the_open_pane_follows_the_applications_and_both_lanes_presets() {
+    let (mut app, engine, _dir) = started();
+    let mut pane = app.settings_state();
+    assert!(pane.apps.is_empty());
+    assert_eq!(pane.presets, ["Gaming", "Music", "Volume Boost"]);
+    assert_eq!(pane.input_presets, ["Clean", "Headset"]);
+
+    play(&mut app, &engine, vec![stream(1, OUT, &brave())]);
+    app.refresh_settings_state(&mut pane);
+    assert_eq!(
+        pane.apps
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Brave"]
+    );
+    // A rule chosen from the command line while the pane is open shows too.
+    app.set_app_preset(&brave(), OUT, Some("Volume Boost"))
+        .expect("set");
+    app.refresh_settings_state(&mut pane);
+    assert_eq!(
+        pane.apps[0].lanes[0].preset.as_deref(),
+        Some("Volume Boost")
+    );
+}
+
+#[test]
+fn the_window_knows_which_applications_the_engine_moved_and_the_preset_lists_tip_says_so() {
+    let (mut app, engine, _dir) = started();
+    play(
+        &mut app,
+        &engine,
+        vec![
+            on_route(1, OUT, &battlefield(), "Gaming"),
+            on_route(2, IN, &discord(), "Headset"),
+            stream(3, OUT, &brave()),
+        ],
+    );
+    assert_eq!(
+        app.state.routed_apps,
+        [
+            RoutedApp {
+                direction: OUT,
+                name: "Battlefield 6".to_owned(),
+                preset: "Gaming".to_owned(),
+            },
+            RoutedApp {
+                direction: IN,
+                name: "Discord".to_owned(),
+                preset: "Headset".to_owned(),
+            },
+        ]
+    );
+    app.handle(&[UiAction::SetEditDirection(OUT)]);
+    assert_eq!(
+        fxsound_ui::views::pro::routed_apps_tip(&app.state).as_deref(),
+        Some("Battlefield 6 → Gaming")
+    );
+    app.handle(&[UiAction::SetEditDirection(IN)]);
+    assert_eq!(
+        fxsound_ui::views::pro::routed_apps_tip(&app.state).as_deref(),
+        Some("Discord → Headset")
+    );
+
+    // Moved back onto its lane: the tip has nothing to say.
+    play(&mut app, &engine, vec![stream(1, OUT, &battlefield())]);
+    assert!(app.state.routed_apps.is_empty());
+    assert_eq!(fxsound_ui::views::pro::routed_apps_tip(&app.state), None);
+}

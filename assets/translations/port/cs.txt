@@ -100,3 +100,6 @@ countries: cz
 "the echo canceller stopped" = "potlačení ozvěny se zastavilo"
 "waiting for the speakers" = "čeká se na reproduktory"
 "Applications that used %s now follow FxSound's preset" = "Aplikace, které používaly %s, se nyní řídí presetem FxSound"
+"Applications" = "Aplikace"
+"FxSound's preset" = "Preset FxSound"
+"No application has played or recorded through FxSound yet" = "Přes FxSound zatím žádná aplikace nepřehrávala ani nenahrávala"

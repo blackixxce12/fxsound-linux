@@ -102,3 +102,6 @@ countries: it
 "the echo canceller stopped" = "la cancellazione dell'eco si è interrotta"
 "waiting for the speakers" = "in attesa degli altoparlanti"
 "Applications that used %s now follow FxSound's preset" = "Le applicazioni che usavano %s ora seguono il preset di FxSound"
+"Applications" = "Applicazioni"
+"FxSound's preset" = "Preset di FxSound"
+"No application has played or recorded through FxSound yet" = "Nessuna applicazione ha ancora riprodotto o registrato tramite FxSound"

@@ -102,3 +102,6 @@ countries: sl
 "the echo canceller stopped" = "odpravljanje odmeva se je ustavilo"
 "waiting for the speakers" = "čakanje na zvočnike"
 "Applications that used %s now follow FxSound's preset" = "Aplikacije, ki so uporabljale %s, zdaj sledijo prednastavitvi FxSound"
+"Applications" = "Aplikacije"
+"FxSound's preset" = "Prednastavitev FxSound"
+"No application has played or recorded through FxSound yet" = "Nobena aplikacija še ni predvajala ali snemala prek FxSound"

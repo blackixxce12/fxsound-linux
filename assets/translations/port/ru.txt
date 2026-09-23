@@ -101,3 +101,6 @@ countries: ru
 "the echo canceller stopped" = "эхоподавление остановилось"
 "waiting for the speakers" = "ожидание динамиков"
 "Applications that used %s now follow FxSound's preset" = "Приложения, использовавшие %s, теперь следуют пресету FxSound"
+"Applications" = "Приложения"
+"FxSound's preset" = "Пресет FxSound"
+"No application has played or recorded through FxSound yet" = "Ни одно приложение ещё не воспроизводило и не записывало звук через FxSound"

@@ -101,3 +101,6 @@ countries: vn
 "the echo canceller stopped" = "bộ khử tiếng vọng đã dừng"
 "waiting for the speakers" = "đang chờ loa"
 "Applications that used %s now follow FxSound's preset" = "Các ứng dụng từng dùng %s giờ dùng theo preset của FxSound"
+"Applications" = "Ứng dụng"
+"FxSound's preset" = "Preset của FxSound"
+"No application has played or recorded through FxSound yet" = "Chưa có ứng dụng nào phát hoặc ghi âm qua FxSound"

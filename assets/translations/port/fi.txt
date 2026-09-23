@@ -100,3 +100,6 @@ countries: fi
 "the echo canceller stopped" = "kaiunpoisto pysähtyi"
 "waiting for the speakers" = "odotetaan kaiuttimia"
 "Applications that used %s now follow FxSound's preset" = "Sovellukset, jotka käyttivät esiasetusta %s, seuraavat nyt FxSoundin esiasetusta"
+"Applications" = "Sovellukset"
+"FxSound's preset" = "FxSoundin esiasetus"
+"No application has played or recorded through FxSound yet" = "Mikään sovellus ei ole vielä toistanut tai tallentanut FxSoundin kautta"

@@ -1,13 +1,17 @@
-//! The Settings window: a side nav and four panes.
+//! The Settings window: a side nav and five panes.
 //!
 //! Port of `FxSettingsDialog` (`GUI/FxSettingsDialog.{h,cpp}`) and of the device-priority list it
-//! owns (`GUI/FxOutputPreference.{h,cpp}`). 610 × 597 outside, 600 × 510 of content, four tab
+//! owns (`GUI/FxOutputPreference.{h,cpp}`). 610 × 597 outside, 600 × 510 of content, five tab
 //! buttons down the left and one pane to the right of a vertical rule
-//! (`docs/spec/06-dialogs.md` §1). The original has three; the fourth, **Microphone**, is this
-//! port's (0.4.0 design §1.4, §8): the global overrides over every voice preset, echo
-//! cancellation and the calibration wizard's entry point. It takes the row a fourth button would
-//! have had in the original's own grid, and its pane is built from the same checkbox, stepper and
-//! text button as the other three.
+//! (`docs/spec/06-dialogs.md` §1). The original has three; the other two are this port's, each in
+//! the row the next button would have had in the original's own grid:
+//!
+//! - **Microphone** (0.4.0 design §1.4, §8): the global overrides over every voice preset, echo
+//!   cancellation and the calibration wizard's entry point, built from the same checkbox, stepper
+//!   and text button as the original's three.
+//! - **Applications** (`docs/0.4.0-apps.md`, "Interface"): every application that has played or
+//!   recorded through FxSound, each with a preset of its own per direction or FxSound's, in a list
+//!   built from the device priority list's box, combo, ✕ and rules.
 //!
 //! ## Pure view
 //!
@@ -60,7 +64,8 @@ use egui::{
     StrokeKind, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use fxsound_core::{
-    DeEsserMode, DenoiseChannelsOverride, DereverbLevel, NoiseSuppressionOverride, Settings,
+    AppKey, DeEsserMode, DenoiseChannelsOverride, DereverbLevel, DeviceDirection,
+    NoiseSuppressionOverride, Settings,
 };
 use std::collections::HashMap;
 
@@ -126,9 +131,9 @@ pub fn divider_x(content: Rect) -> f32 {
     pane_rect(content).left() - 1.0
 }
 
-/// One of the four tab buttons: `(20, 50, 150, 40)`, `(20, 110, …)`, `(20, 170, …)`
-/// (`FxSettingsDialog.cpp:121-123`), and the port's Microphone at `(20, 230, …)` — the next row
-/// of the same grid.
+/// One of the five tab buttons: `(20, 50, 150, 40)`, `(20, 110, …)`, `(20, 170, …)`
+/// (`FxSettingsDialog.cpp:121-123`), and the port's Microphone at `(20, 230, …)` and Applications
+/// at `(20, 290, …)` — the next rows of the same grid.
 #[must_use]
 pub fn nav_button_rect(content: Rect, index: usize) -> Rect {
     Rect::from_min_size(
@@ -143,6 +148,10 @@ pub fn nav_button_rect(content: Rect, index: usize) -> Rect {
 /// Where a tab button's caption goes: `(height + 5, 0, width - height + 5, height)` — note the
 /// label is allowed five points more than is left, so it may run one glyph past the button's right
 /// edge (`FxSettingsDialog.cpp:73-75`).
+///
+/// A caption cannot use all of it, though: the Audio and Applications panes' lists start at
+/// content x 173, seven points short of the box's end, and are painted over the nav rows, so the
+/// translations are held to about 104 points, which the tests check in every language.
 #[must_use]
 pub fn nav_label_rect(button: Rect) -> Rect {
     Rect::from_min_size(
@@ -164,9 +173,10 @@ pub fn nav_label_rect(button: Rect) -> Rect {
 /// the rule through such a caption (§1.2); here the rule stops for it instead, the way a group
 /// box's frame stops for its title. The original's three English captions never reach it, but a
 /// translation of one already did (Bosnian `Opšte Opcije` for General, about 103 points), and
-/// the port's `Microphone` does in English and French (about 93): a shorter word would lose what
-/// the tab holds and the name §8 gives it, and running the rule through new text would be a new
-/// control overlapping an old one, so the break is the smaller departure.
+/// the port's `Microphone` and `Applications` do in English (about 93 and 98): a shorter word
+/// would lose what the tab holds and the name §8 and the per-application design give it, and
+/// running the rule through new text would be a new control overlapping an old one, so the break
+/// is the smaller departure.
 #[must_use]
 pub fn divider_segments(span: Rangef, gaps: &[Rangef]) -> Vec<Rangef> {
     let mut gaps: Vec<Rangef> = gaps
@@ -212,11 +222,19 @@ pub enum SettingsTab {
     /// The port's fourth pane: the microphone's global settings and the calibration wizard.
     /// Appended rather than slotted in beside Audio, so the original's three keep their rows.
     Microphone,
+    /// The port's fifth: a preset of its own for each application (`docs/0.4.0-apps.md`).
+    Applications,
 }
 
 impl SettingsTab {
     /// In nav order.
-    pub const ALL: [Self; 4] = [Self::Audio, Self::General, Self::Help, Self::Microphone];
+    pub const ALL: [Self; 5] = [
+        Self::Audio,
+        Self::General,
+        Self::Help,
+        Self::Microphone,
+        Self::Applications,
+    ];
 
     /// The tab button's caption — also the component's name, which is what `TRANS` is given
     /// (`FxSettingsDialog.cpp:92-105`).
@@ -227,6 +245,7 @@ impl SettingsTab {
             Self::General => "General",
             Self::Help => "Help",
             Self::Microphone => "Microphone",
+            Self::Applications => "Applications",
         }
     }
 
@@ -239,6 +258,7 @@ impl SettingsTab {
             Self::General => "General Preferences",
             Self::Help => "Help",
             Self::Microphone => "Microphone",
+            Self::Applications => "Applications",
         }
     }
 
@@ -250,6 +270,7 @@ impl SettingsTab {
             Self::General => NavIcon::Settings,
             Self::Help => NavIcon::Question,
             Self::Microphone => NavIcon::Microphone,
+            Self::Applications => NavIcon::Applications,
         }
     }
 
@@ -260,21 +281,22 @@ impl SettingsTab {
             Self::General => 1,
             Self::Help => 2,
             Self::Microphone => 3,
+            Self::Applications => 4,
         }
     }
 }
 
 // =============================================================================================
-// The four nav icons
+// The five nav icons
 // =============================================================================================
 
 /// The side-nav artwork.
 ///
 /// The original's three are the only images in the app that `FxTheme`'s table does not hold: the
 /// dialog loads them straight from `BinaryData` (`FxSettingsDialog.cpp:92-105`), and they have no
-/// per-theme variant — they are drawn in the same neutral grey in both palettes. The fourth,
-/// `microphone.svg`, is the port's own, drawn to match: a 24-point grid, one `#7E7E7E` fill and
-/// 1.5-point round-capped strokes, like `speaker.svg`.
+/// per-theme variant — they are drawn in the same neutral grey in both palettes. The fourth and
+/// fifth, `microphone.svg` and `applications.svg`, are the port's own, drawn to match: a 24-point
+/// grid, one `#7E7E7E` fill and 1.5-point strokes, like `speaker.svg`.
 /// [`crate::AssetCache`] is keyed by [`FxImage`] and has nowhere to put them, so [`NavIcons`] is
 /// the same rasterise-once-and-keep-the-texture cache with its own key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -287,13 +309,16 @@ pub enum NavIcon {
     Question,
     /// `microphone.svg`.
     Microphone,
+    /// `applications.svg`: a window with its title bar.
+    Applications,
 }
 
-const NAV_SVGS: [&[u8]; 4] = [
+const NAV_SVGS: [&[u8]; 5] = [
     include_bytes!("../../../../assets/images/speaker.svg"),
     include_bytes!("../../../../assets/images/settings.svg"),
     include_bytes!("../../../../assets/images/question.svg"),
     include_bytes!("../../../../assets/images/microphone.svg"),
+    include_bytes!("../../../../assets/images/applications.svg"),
 ];
 
 impl NavIcon {
@@ -304,7 +329,7 @@ impl NavIcon {
     }
 }
 
-/// Textures for the four nav icons, one per physical size.
+/// Textures for the five nav icons, one per physical size.
 ///
 /// Held by the application next to its [`crate::AssetCache`]; `load_texture` must never run per
 /// frame.
@@ -557,6 +582,49 @@ impl DevicePriority {
     }
 }
 
+/// One application of Settings ▸ Applications (`docs/0.4.0-apps.md`, "Interface").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppRow {
+    /// Which application: the store's key for it, handed back in [`SettingsAction::SetAppPreset`]
+    /// and [`SettingsAction::ForgetApp`]. Also the id salt of the row's combos, so that an open
+    /// popup stays with its application when the list reorders under it.
+    pub app: AppKey,
+    /// What the row shows: [`AppKey::display`].
+    pub name: String,
+    /// Whether it plays or records now: drawn with a dot, full colour and first, where a
+    /// remembered one is grey, as a device that is not connected is in the priority lists.
+    pub running: bool,
+    /// A combo per direction the application has used, outputs first — both when that is not
+    /// known — each with the preset chosen for it.
+    pub lanes: Vec<AppLane>,
+}
+
+/// One of an [`AppRow`]'s combos.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppLane {
+    pub direction: DeviceDirection,
+    /// The preset the application runs through in this direction, or `None` for FxSound's own.
+    /// A name the direction's list does not carry — a preset removed behind FxSound's back —
+    /// is shown dimmed: the application follows FxSound's preset until it is back.
+    pub preset: Option<String>,
+}
+
+impl AppRow {
+    /// Whether the ✕ has anything to forget: the row of an application that is not running, or
+    /// a preset of its own. A running application that follows FxSound's preset both ways is
+    /// remembered again the moment it is forgotten, so its ✕ would do nothing, and it has none.
+    #[must_use]
+    pub fn can_forget(&self) -> bool {
+        !self.running || self.lanes.iter().any(|lane| lane.preset.is_some())
+    }
+
+    /// How many lines the row takes: one per combo, and one for a row with none.
+    #[must_use]
+    pub fn lines(&self) -> usize {
+        self.lanes.len().max(1)
+    }
+}
+
 /// Everything the Settings window draws.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SettingsState {
@@ -572,8 +640,14 @@ pub struct SettingsState {
     pub microphones: Vec<DevicePriority>,
     /// The selected row, which is what ▲/▼ and Shift+Up/Shift+Down act on.
     pub selected_device: Option<usize>,
-    /// Every speakers' preset name, for the per-device preset picker.
+    /// Every speakers' preset name, for the per-device preset picker and the Applications pane's
+    /// output combos.
     pub presets: Vec<String>,
+    /// Every voice preset name, for the Applications pane's input combos.
+    pub input_presets: Vec<String>,
+    /// Settings ▸ Applications: the applications playing or recording now, then the ones
+    /// remembered, most recently seen first.
+    pub apps: Vec<AppRow>,
     /// Whether the user has anything to lose: the reset button is enabled iff there is at least
     /// one user preset **or** some preset is modified (`FxSettingsDialog.cpp:210-220`), on either
     /// lane.
@@ -617,6 +691,8 @@ impl SettingsState {
             microphones: Vec::new(),
             selected_device: None,
             presets: Vec::new(),
+            input_presets: Vec::new(),
+            apps: Vec::new(),
             can_reset_presets: false,
             version: String::new(),
             launch_on_startup: false,
@@ -759,6 +835,17 @@ pub enum SettingsAction {
     /// Forget a microphone that is no longer present.
     RemoveMicrophone(usize),
 
+    // ---- applications pane --------------------------------------------------------------------
+    /// Run the application's `direction` through `preset`, or through FxSound's own with `None`
+    /// (`docs/0.4.0-apps.md`). By name, for the reason [`SettingsAction::SetDevicePreset`] is.
+    SetAppPreset {
+        app: AppKey,
+        direction: DeviceDirection,
+        preset: Option<String>,
+    },
+    /// Forget an application: its presets, and its row unless it is running (the ✕).
+    ForgetApp(AppKey),
+
     /// Close the window — the ✕ or Escape (`FxSettingsDialog.cpp:78-88`). The caller then runs
     /// the equivalent of `FxController::refreshOutputList()` (`FxMainWindow.cpp:454`).
     Close,
@@ -862,6 +949,9 @@ impl<'a> SettingsDialog<'a> {
             SettingsTab::Help => help_pane(ui, pane, self.state, palette, id, &mut response),
             SettingsTab::Microphone => {
                 microphone_pane(ui, pane, self.state, palette, assets, id, &mut response);
+            }
+            SettingsTab::Applications => {
+                applications_pane(ui, pane, self.state, palette, assets, id, &mut response);
             }
         }
         response
@@ -2279,6 +2369,366 @@ fn microphone_row(
 }
 
 // =============================================================================================
+// Applications pane (`docs/0.4.0-apps.md`, "Interface")
+// =============================================================================================
+
+/// Applications-pane geometry: the device priority list's box, insets, margins, ✕ and rules, with
+/// a row of one line per combo.
+pub mod applications {
+    /// y of the list: where every pane's first row starts.
+    pub const LIST_Y: f32 = 50.0;
+    /// Kept clear under the list, as under the Microphone pane's.
+    pub const BOTTOM_MARGIN: f32 = 10.0;
+    /// A combo's height: the tallest the combo still sets its text in the small face at
+    /// (`combo::SMALL_FONT_MAX_HEIGHT`), which is what lets a preset name fit beside a caption.
+    pub const COMBO_HEIGHT: f32 = 30.0;
+    /// One line of a row: a combo, and the two points above and below it the device row insets
+    /// its own by.
+    pub const LINE_HEIGHT: f32 = COMBO_HEIGHT + 4.0;
+    /// The preset combo: the device row's 150 and five more, so that its text box holds
+    /// "FxSound's preset" whole in English.
+    pub const PRESET_WIDTH: f32 = 155.0;
+    /// The dot of a running application.
+    pub const DOT_DIAMETER: f32 = 6.0;
+    /// The most a direction caption is given; a longer one is elided. The captions are measured
+    /// each frame in the language in force, so a short language leaves the room to the names.
+    /// Finnish `Sisääntulo`, the longest the tables have, is about 67.
+    pub const CAPTION_MAX_WIDTH: f32 = 72.0;
+    /// The empty list's text is wrapped this far inside the box.
+    pub const EMPTY_TEXT_INSET: f32 = 20.0;
+}
+
+/// The first entry of every combo: follow the lane's own preset.
+pub const FOLLOW_PRESET: &str = "FxSound's preset";
+/// What the empty list says.
+pub const NO_APPLICATIONS: &str = "No application has played or recorded through FxSound yet";
+
+/// The list: at the pane's first row, as wide as the Audio pane's, down to the bottom margin.
+#[must_use]
+pub fn app_list_rect(pane: Rect) -> Rect {
+    Rect::from_min_max(
+        pos2(pane.left() + X_MARGIN, pane.top() + applications::LIST_Y),
+        pos2(
+            pane.left() + X_MARGIN + output_list_rect(pane).width(),
+            pane.bottom() - applications::BOTTOM_MARGIN,
+        ),
+    )
+}
+
+/// Where the rows scroll: the list inset as the device list's is (`reduced(5, 10)`).
+#[must_use]
+pub fn app_rows_rect(list: Rect) -> Rect {
+    list.shrink2(vec2(device_row::LIST_INSET_X, device_row::LIST_INSET_Y))
+}
+
+/// Line `line` of a row that starts at `row`'s top.
+#[must_use]
+pub fn app_line_rect(row: Rect, line: usize) -> Rect {
+    Rect::from_min_size(
+        pos2(
+            row.left(),
+            row.top() + line as f32 * applications::LINE_HEIGHT,
+        ),
+        vec2(row.width(), applications::LINE_HEIGHT),
+    )
+}
+
+/// A line's preset combo: left of where the ✕ goes, on every line, so that the combos of every
+/// row stand in one column.
+#[must_use]
+pub fn app_combo_rect(line: Rect) -> Rect {
+    Rect::from_min_size(
+        pos2(
+            remove_button_rect(line).left() - device_row::MARGIN - applications::PRESET_WIDTH,
+            line.center().y - applications::COMBO_HEIGHT / 2.0,
+        ),
+        vec2(applications::PRESET_WIDTH, applications::COMBO_HEIGHT),
+    )
+}
+
+/// A line's direction caption, `caption_width` wide and right against its combo.
+#[must_use]
+pub fn app_caption_rect(line: Rect, caption_width: f32) -> Rect {
+    let bounds = line.shrink(2.0);
+    let right = app_combo_rect(line).left() - device_row::MARGIN;
+    Rect::from_min_max(
+        pos2(right - caption_width, bounds.top()),
+        pos2(right, bounds.bottom()),
+    )
+}
+
+/// The running dot, a margin in from the row, in the first line's middle.
+#[must_use]
+pub fn app_dot_rect(line: Rect) -> Rect {
+    let bounds = line.shrink(2.0);
+    Rect::from_center_size(
+        pos2(
+            bounds.left() + device_row::MARGIN + applications::DOT_DIAMETER / 2.0,
+            line.center().y,
+        ),
+        Vec2::splat(applications::DOT_DIAMETER),
+    )
+}
+
+/// The application's name: past the dot, to a margin short of the caption.
+#[must_use]
+pub fn app_name_rect(line: Rect, caption_width: f32) -> Rect {
+    let bounds = line.shrink(2.0);
+    Rect::from_min_max(
+        pos2(
+            app_dot_rect(line).right() + device_row::MARGIN,
+            bounds.top(),
+        ),
+        pos2(
+            app_caption_rect(line, caption_width).left() - device_row::MARGIN,
+            bounds.bottom(),
+        ),
+    )
+}
+
+/// How wide the captions are drawn: the wider of the two as measured, up to
+/// [`applications::CAPTION_MAX_WIDTH`].
+#[must_use]
+pub fn app_caption_width(measured: f32) -> f32 {
+    measured
+        .max(0.0)
+        .ceil()
+        .min(applications::CAPTION_MAX_WIDTH)
+}
+
+/// A combo's entries: FxSound's preset, then the direction's presets.
+fn app_preset_items(presets: &[String]) -> Vec<String> {
+    std::iter::once(tr(FOLLOW_PRESET))
+        .chain(presets.iter().cloned())
+        .collect()
+}
+
+/// Which of [`app_preset_items`] a lane shows: FxSound's for `None`, the preset's own entry, or
+/// nothing — the name dimmed as a placeholder — for a preset the list does not carry.
+#[must_use]
+pub fn app_preset_index(presets: &[String], preset: Option<&str>) -> Option<usize> {
+    match preset {
+        None => Some(0),
+        Some(name) => presets.iter().position(|p| p == name).map(|i| i + 1),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn applications_pane(
+    ui: &mut Ui,
+    pane: Rect,
+    state: &SettingsState,
+    palette: Palette,
+    assets: &mut AssetCache,
+    id: Id,
+    response: &mut DialogResponse<SettingsAction>,
+) {
+    let list = app_list_rect(pane);
+    ui.painter().rect_filled(
+        list,
+        CornerRadius::same(device_row::CORNER as u8),
+        palette.color(FxColor::WidgetBackground),
+    );
+    let rows = app_rows_rect(list);
+
+    if state.apps.is_empty() {
+        // Wrapped and centred line by line in the middle of the box, clipped to it.
+        let colour = palette.color(FxColor::HintText);
+        let width = rows.width() - applications::EMPTY_TEXT_INSET * 2.0;
+        let mut job = egui::text::LayoutJob::simple(
+            tr(NO_APPLICATIONS),
+            small_font(),
+            colour,
+            width.max(0.0),
+        );
+        job.halign = egui::Align::Center;
+        let galley = ui.painter().layout_job(job);
+        let at = pos2(rows.center().x, rows.center().y - galley.size().y / 2.0);
+        ui.painter()
+            .with_clip_rect(rows.intersect(ui.painter().clip_rect()))
+            .galley(at, galley, colour);
+        return;
+    }
+
+    let captions = DeviceDirection::ALL.map(|direction| tr(direction.label()));
+    let caption_width = app_caption_width(
+        captions
+            .iter()
+            .map(|caption| {
+                ui.painter()
+                    .layout_no_wrap(caption.clone(), small_font(), Color32::PLACEHOLDER)
+                    .size()
+                    .x
+            })
+            .fold(0.0, f32::max),
+    );
+    let items = [
+        app_preset_items(&state.presets),
+        app_preset_items(&state.input_presets),
+    ];
+    let names = [&state.presets, &state.input_presets];
+
+    ui.scope_builder(UiBuilder::new().max_rect(rows).id_salt(id), |ui| {
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        egui::ScrollArea::vertical()
+            .id_salt(id.with("applications"))
+            .max_height(rows.height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for app in &state.apps {
+                    let (row, _) = ui.allocate_exact_size(
+                        vec2(
+                            ui.available_width(),
+                            app.lines() as f32 * applications::LINE_HEIGHT,
+                        ),
+                        Sense::hover(),
+                    );
+                    // The store keeps up to 500 applications: a row scrolled out of sight takes
+                    // its room and draws nothing.
+                    if !ui.is_rect_visible(row) {
+                        continue;
+                    }
+                    app_row(
+                        ui,
+                        row,
+                        app,
+                        AppRowStyle {
+                            caption_width,
+                            captions: &captions,
+                            items: &items,
+                            names,
+                        },
+                        palette,
+                        assets,
+                        response,
+                    );
+                }
+            });
+    });
+}
+
+/// What every row of the list shares, worked out once a frame.
+struct AppRowStyle<'a> {
+    caption_width: f32,
+    /// `Output` and `Input`, translated, in [`DeviceDirection::ALL`]'s order.
+    captions: &'a [String; 2],
+    /// Each direction's combo entries ([`app_preset_items`]) and its presets' own names.
+    items: &'a [Vec<String>; 2],
+    names: [&'a Vec<String>; 2],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn app_row(
+    ui: &mut Ui,
+    row: Rect,
+    app: &AppRow,
+    style: AppRowStyle<'_>,
+    palette: Palette,
+    assets: &mut AssetCache,
+    response: &mut DialogResponse<SettingsAction>,
+) {
+    let id = Id::new("fx_app_row").with(&app.app);
+    let first = app_line_rect(row, 0);
+
+    if app.running {
+        ui.painter().circle_filled(
+            app_dot_rect(first).center(),
+            applications::DOT_DIAMETER / 2.0,
+            palette.color(FxColor::SelectedRowOutline),
+        );
+    }
+    let name = app_name_rect(first, style.caption_width);
+    let colour = if app.running {
+        palette.color(FxColor::DefaultText)
+    } else {
+        palette.color(FxColor::HintText)
+    };
+    draw_truncated(
+        ui.painter(),
+        &app.name,
+        normal_font(),
+        colour,
+        name,
+        Align2::LEFT_CENTER,
+    );
+
+    for (line, lane) in app.lanes.iter().enumerate() {
+        let line = app_line_rect(row, line);
+        let lane_index = match lane.direction {
+            DeviceDirection::Output => 0,
+            DeviceDirection::Input => 1,
+        };
+        draw_truncated(
+            ui.painter(),
+            &style.captions[lane_index],
+            small_font(),
+            palette.color(FxColor::HintText),
+            app_caption_rect(line, style.caption_width),
+            Align2::RIGHT_CENTER,
+        );
+
+        let names = style.names[lane_index];
+        let selected = app_preset_index(names, lane.preset.as_deref());
+        let combo = app_combo_rect(line);
+        let (_, picked) = FxComboBox::new(&style.items[lane_index], selected)
+            .placeholder(lane.preset.as_deref().unwrap_or_default())
+            .separator_before(Some(1))
+            .show(ui, combo, palette, assets, id.with(lane.direction.key()));
+        if let Some(picked) = picked.filter(|&picked| Some(picked) != selected) {
+            let preset = picked
+                .checked_sub(1)
+                .and_then(|index| names.get(index))
+                .cloned();
+            if picked == 0 || preset.is_some() {
+                response.push(SettingsAction::SetAppPreset {
+                    app: app.app.clone(),
+                    direction: lane.direction,
+                    preset,
+                });
+            }
+        }
+        // The device row's unselected outline, so the two lists' combos look alike
+        // (`FxOutputPreference.cpp:156`).
+        ui.painter().rect_stroke(
+            combo,
+            CornerRadius::same(crate::widgets::combo::corner_radius(combo.height()) as u8),
+            Stroke::new(
+                1.0,
+                palette.color_alpha(FxColor::RowOutline, device_row::UNSELECTED_OUTLINE_ALPHA),
+            ),
+            StrokeKind::Inside,
+        );
+    }
+
+    if app.can_forget()
+        && IconButton::new(FxImage::RemoveButton)
+            .min_hit_size(device_row::BUTTON_WIDTH)
+            .show(
+                ui,
+                remove_button_rect(first),
+                palette,
+                assets,
+                id.with("forget"),
+            )
+            .clicked()
+    {
+        response.push(SettingsAction::ForgetApp(app.app.clone()));
+    }
+
+    // The device rows' half-point rule, under the whole row: a row can be two lines tall, and the
+    // rule is what says where the next application starts.
+    let bounds = row.shrink(2.0);
+    ui.painter().hline(
+        bounds.left() + device_row::MARGIN..=bounds.right() - device_row::MARGIN,
+        row.bottom() - 0.5,
+        Stroke::new(
+            device_row::SEPARATOR_THICKNESS,
+            palette.color(FxColor::RowOutline),
+        ),
+    );
+}
+
+// =============================================================================================
 // Help pane (`docs/spec/06-dialogs.md` §1.9)
 // =============================================================================================
 
@@ -2502,24 +2952,28 @@ mod tests {
     }
 
     #[test]
-    fn the_original_three_tab_buttons_keep_their_rows_and_the_microphone_takes_the_next() {
-        // FxSettingsDialog.cpp:121-123, in content-local coordinates, and the port's fourth on
-        // the same sixty-point pitch.
+    fn the_original_three_tab_buttons_keep_their_rows_and_the_ports_two_take_the_next() {
+        // FxSettingsDialog.cpp:121-123, in content-local coordinates, and the port's fourth and
+        // fifth on the same sixty-point pitch: Applications at (20, 290, 150, 40).
         let content = content();
-        for (index, top) in [(0, 50.0), (1, 110.0), (2, 170.0), (3, 230.0)] {
+        for (index, top) in [(0, 50.0), (1, 110.0), (2, 170.0), (3, 230.0), (4, 290.0)] {
             let button = local(content, nav_button_rect(content, index));
             assert!((button.min - pos2(20.0, top)).length() < 1e-4, "{button:?}");
             assert!((button.size() - vec2(150.0, 40.0)).length() < 1e-4);
         }
         assert_eq!(
             SettingsTab::ALL.map(SettingsTab::index),
-            [0, 1, 2, 3],
+            [0, 1, 2, 3, 4],
             "the nav order is the index order"
         );
         assert_eq!(SettingsTab::ALL[3], SettingsTab::Microphone);
         assert_eq!(SettingsTab::Microphone.icon(), NavIcon::Microphone);
-        // The fourth button ends well above the content's bottom, in the same column.
-        let last = nav_button_rect(content, 3);
+        assert_eq!(SettingsTab::ALL[4], SettingsTab::Applications);
+        assert_eq!(SettingsTab::Applications.icon(), NavIcon::Applications);
+        assert_eq!(SettingsTab::Applications.nav_label(), "Applications");
+        assert_eq!(SettingsTab::Applications.pane_title(), "Applications");
+        // The fifth button ends well above the content's bottom, in the same column.
+        let last = nav_button_rect(content, 4);
         assert!(last.bottom() < content.bottom());
         assert!((last.left() - nav_button_rect(content, 0).left()).abs() < 1e-4);
     }
@@ -2982,12 +3436,12 @@ mod tests {
                 });
             }
         }
-        // The four nav icons were rasterised exactly once each per size.
+        // The five nav icons were rasterised exactly once each per size.
         assert!(!icons.is_empty());
         let cached = icons.len();
         icons.clear();
         assert!(icons.is_empty());
-        assert_eq!(cached, 4);
+        assert_eq!(cached, 5);
     }
 
     #[test]
@@ -3010,12 +3464,13 @@ mod tests {
     }
 
     #[test]
-    fn the_four_nav_icons_rasterise() {
+    fn the_five_nav_icons_rasterise() {
         for icon in [
             NavIcon::Speaker,
             NavIcon::Settings,
             NavIcon::Question,
             NavIcon::Microphone,
+            NavIcon::Applications,
         ] {
             let raster = rasterise(icon.svg_bytes(), 20, 20)
                 .unwrap_or_else(|| panic!("{icon:?} failed to render"));
@@ -3028,28 +3483,50 @@ mod tests {
     }
 
     #[test]
-    fn the_microphone_icon_is_the_same_single_grey_as_the_others() {
-        // Every inked pixel of the port's icon is #7E7E7E, as in `speaker.svg`: no second colour,
+    fn the_ports_two_icons_are_the_same_single_grey_as_the_others() {
+        // Every inked pixel of the port's icons is #7E7E7E, as in `speaker.svg`: no second colour,
         // and nothing themed, because the nav icons have no per-theme variant.
-        let raster = rasterise(NavIcon::Microphone.svg_bytes(), 48, 48).expect("renders");
-        let mut inked = 0;
-        for pixel in &raster.pixels {
-            let [r, g, b, a] = pixel.to_srgba_unmultiplied();
-            if a > 64 {
-                inked += 1;
-                for channel in [r, g, b] {
-                    assert!(
-                        channel.abs_diff(0x7E) <= 2,
-                        "a pixel of {r:02x}{g:02x}{b:02x}"
-                    );
+        for icon in [NavIcon::Microphone, NavIcon::Applications] {
+            let raster = rasterise(icon.svg_bytes(), 48, 48).expect("renders");
+            let mut inked = 0;
+            for pixel in &raster.pixels {
+                let [r, g, b, a] = pixel.to_srgba_unmultiplied();
+                if a > 64 {
+                    inked += 1;
+                    for channel in [r, g, b] {
+                        assert!(
+                            channel.abs_diff(0x7E) <= 2,
+                            "{icon:?}: a pixel of {r:02x}{g:02x}{b:02x}"
+                        );
+                    }
                 }
             }
+            // A capsule, a cradle and a stand; a window and its title bar: a real share of the
+            // square, but far from all of it.
+            let share = inked as f32 / raster.pixels.len() as f32;
+            assert!(
+                (0.1..0.5).contains(&share),
+                "{icon:?}: {share} of the square is inked"
+            );
         }
-        // A capsule, a cradle and a stand: a real share of the square, but far from all of it.
-        let share = inked as f32 / raster.pixels.len() as f32;
+    }
+
+    #[test]
+    fn the_applications_icon_is_a_window_with_its_title_bar_filled() {
+        // Rendered at 24, one pixel per unit of the grid: the bar across the top is solid, the
+        // window's inside is empty, and its frame is there on both sides.
+        let raster = rasterise(NavIcon::Applications.svg_bytes(), 24, 24).expect("renders");
+        let alpha = |x: usize, y: usize| raster.pixels[y * 24 + x].a();
+        assert!(alpha(12, 6) > 200, "the title bar is filled");
+        assert!(alpha(12, 14) == 0, "the window is empty inside");
         assert!(
-            (0.1..0.5).contains(&share),
-            "{share} of the square is inked"
+            alpha(4, 14) > 100 && alpha(19, 14) > 100,
+            "the frame's sides"
+        );
+        assert!(alpha(12, 19) > 100, "the frame's bottom");
+        assert!(
+            alpha(0, 0) == 0 && alpha(23, 23) == 0,
+            "the corners are clear"
         );
     }
 
@@ -3703,8 +4180,8 @@ mod tests {
     }
 
     #[test]
-    fn only_the_microphone_caption_reaches_the_rule_in_english() {
-        // Which is why the rule has to make room for it: the original's three stop short.
+    fn only_the_ports_two_captions_reach_the_rule_in_english() {
+        // Which is why the rule has to make room for them: the original's three stop short.
         let ctx = test_context();
         let content = content();
         frame(&ctx, |ui| {
@@ -3722,12 +4199,901 @@ mod tests {
                 let crosses = label.left() + width > divider_x(content);
                 assert_eq!(
                     crosses,
-                    tab == SettingsTab::Microphone,
+                    matches!(tab, SettingsTab::Microphone | SettingsTab::Applications),
                     "{tab:?} is {width}"
                 );
                 // …and every caption still fits the label box the original allows it.
                 assert!(width <= label.width(), "{tab:?} is elided");
             }
         });
+    }
+
+    // ---- the applications pane ----------------------------------------------------------------
+
+    fn key(binary: &str, name: &str) -> AppKey {
+        AppKey {
+            binary: binary.to_owned(),
+            name: name.to_owned(),
+            flatpak: String::new(),
+        }
+    }
+
+    fn lane(direction: DeviceDirection, preset: Option<&str>) -> AppLane {
+        AppLane {
+            direction,
+            preset: preset.map(str::to_owned),
+        }
+    }
+
+    const OUT: DeviceDirection = DeviceDirection::Output;
+    const IN: DeviceDirection = DeviceDirection::Input;
+
+    /// The feature's example and its neighbours, as the app lists them: the running ones first.
+    ///
+    /// - Battlefield 6 plays through Gaming.
+    /// - Discord records through Headset and plays through FxSound's preset.
+    /// - Firefox plays through FxSound's preset, and so has nothing for its ✕ to forget.
+    /// - Brave is remembered, with Volume Boost.
+    /// - Spotify is remembered from an earlier session, lanes unknown: both combos.
+    /// - Chromium's rule names a preset that is not there any more.
+    fn apps_state() -> SettingsState {
+        SettingsState {
+            tab: SettingsTab::Applications,
+            presets: ["General", "Music", "Gaming", "Volume Boost"]
+                .map(str::to_owned)
+                .to_vec(),
+            input_presets: ["Clean", "Headset"].map(str::to_owned).to_vec(),
+            apps: vec![
+                AppRow {
+                    app: key("bf6.exe", "Battlefield 6"),
+                    name: "Battlefield 6".into(),
+                    running: true,
+                    lanes: vec![lane(OUT, Some("Gaming"))],
+                },
+                AppRow {
+                    app: key("Discord", "Discord"),
+                    name: "Discord".into(),
+                    running: true,
+                    lanes: vec![lane(OUT, None), lane(IN, Some("Headset"))],
+                },
+                AppRow {
+                    app: key("firefox", "Firefox"),
+                    name: "Firefox".into(),
+                    running: true,
+                    lanes: vec![lane(OUT, None)],
+                },
+                AppRow {
+                    app: key("brave", "Brave"),
+                    name: "Brave".into(),
+                    running: false,
+                    lanes: vec![lane(OUT, Some("Volume Boost"))],
+                },
+                AppRow {
+                    app: key("spotify", "Spotify"),
+                    name: "Spotify".into(),
+                    running: false,
+                    lanes: vec![lane(OUT, None), lane(IN, None)],
+                },
+                AppRow {
+                    app: key("chromium", "Chromium"),
+                    name: "Chromium".into(),
+                    running: false,
+                    lanes: vec![lane(OUT, Some("Loudness"))],
+                },
+            ],
+            ..populated()
+        }
+    }
+
+    /// `state`'s applications and forty more, some with names far too long for their room.
+    fn crowded_state() -> SettingsState {
+        let mut state = apps_state();
+        for index in 0..40 {
+            let name = if index % 3 == 0 {
+                format!("An application with a very long name indeed, number {index}")
+            } else {
+                format!("App {index}")
+            };
+            state.apps.push(AppRow {
+                app: key(&format!("app{index}"), &name),
+                name,
+                running: index % 5 == 0,
+                lanes: match index % 3 {
+                    0 => vec![lane(OUT, Some("Music"))],
+                    1 => vec![lane(IN, Some("Clean"))],
+                    _ => vec![lane(OUT, None), lane(IN, None)],
+                },
+            });
+        }
+        state
+    }
+
+    /// Where the pane shown in a window at the origin draws the row at `index`, unscrolled.
+    fn app_row(state: &SettingsState, index: usize) -> Rect {
+        let rows = app_rows_rect(app_list_rect(shown_pane()));
+        let lines: usize = state.apps[..index].iter().map(AppRow::lines).sum();
+        Rect::from_min_size(
+            pos2(
+                rows.left(),
+                rows.top() + lines as f32 * applications::LINE_HEIGHT,
+            ),
+            vec2(
+                rows.width(),
+                state.apps[index].lines() as f32 * applications::LINE_HEIGHT,
+            ),
+        )
+    }
+
+    /// A Settings window kept across frames, so that a combo opened in one can be picked from in
+    /// the next.
+    struct Window {
+        ctx: egui::Context,
+        assets: AssetCache,
+        icons: NavIcons,
+        mode: ThemeMode,
+    }
+
+    impl Window {
+        fn new(mode: ThemeMode) -> Self {
+            let ctx = test_context();
+            // Popups fade in over `animation_time`; at zero a painted menu is whole at once.
+            ctx.all_styles_mut(|style| style.animation_time = 0.0);
+            Self {
+                ctx,
+                assets: AssetCache::new(),
+                icons: NavIcons::new(),
+                mode,
+            }
+        }
+
+        fn frame(
+            &mut self,
+            state: &SettingsState,
+            events: Vec<egui::Event>,
+        ) -> (Vec<SettingsAction>, Vec<egui::epaint::ClippedShape>) {
+            let outer = Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE);
+            let input = egui::RawInput {
+                screen_rect: Some(outer),
+                events,
+                ..Default::default()
+            };
+            let mut actions = Vec::new();
+            let Self {
+                ctx,
+                assets,
+                icons,
+                mode,
+            } = self;
+            let mut output = ctx.run_ui(input, |ui| {
+                actions = SettingsDialog::new(state)
+                    .show(ui, outer, Palette::new(*mode), assets, icons)
+                    .actions;
+            });
+            let shapes = std::mem::take(&mut output.shapes);
+            output.drop_without_applying_deltas();
+            (actions, shapes)
+        }
+
+        fn click(&mut self, state: &SettingsState, at: egui::Pos2) -> Vec<SettingsAction> {
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            let mut actions = Vec::new();
+            for events in [
+                vec![egui::Event::PointerMoved(at)],
+                vec![egui::Event::PointerMoved(at), button(true)],
+                vec![button(false)],
+            ] {
+                actions.extend(self.frame(state, events).0);
+            }
+            actions
+        }
+
+        /// Open the combo at `combo` and pick the entry reading `entry`.
+        fn pick(&mut self, state: &SettingsState, combo: Rect, entry: &str) -> Vec<SettingsAction> {
+            let mut actions = self.click(state, combo.center());
+            let (_, shapes) = self.frame(state, Vec::new());
+            // The last one painted: the list is in the foreground layer, which is painted after
+            // every closed box that might read the same.
+            let at = crate::views::testing::texts(&shapes)
+                .into_iter()
+                .rfind(|(text, rect, _)| text == entry && !combo.contains(rect.center()))
+                .map(|(_, rect, _)| rect.center())
+                .unwrap_or_else(|| panic!("no {entry:?} in the open list"));
+            actions.extend(self.click(state, at));
+            actions
+        }
+    }
+
+    /// Everything the Applications pane paints for `state`, clipped to where it may be.
+    fn applications_shapes(state: &SettingsState, mode: ThemeMode) -> Vec<(egui::Shape, Rect)> {
+        let ctx = test_context();
+        let mut assets = AssetCache::new();
+        let pane = shown_pane();
+        let mut shapes = Vec::new();
+        // Twice: the artwork is uploaded on the first.
+        for _ in 0..2 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE)),
+                ..Default::default()
+            };
+            let mut response = DialogResponse::default();
+            let mut output = ctx.run_ui(input, |ui| {
+                applications_pane(
+                    ui,
+                    pane,
+                    state,
+                    Palette::new(mode),
+                    &mut assets,
+                    Id::new("fx_settings_dialog"),
+                    &mut response,
+                );
+            });
+            assert!(response.is_empty(), "{:?}", response.actions);
+            shapes = std::mem::take(&mut output.shapes)
+                .into_iter()
+                .map(|clipped| {
+                    let bounds = clipped
+                        .shape
+                        .visual_bounding_rect()
+                        .intersect(clipped.clip_rect);
+                    (clipped.shape, bounds)
+                })
+                .filter(|(_, bounds)| bounds.is_positive())
+                .collect();
+            output.drop_without_applying_deltas();
+        }
+        shapes
+    }
+
+    #[test]
+    fn the_applications_list_fills_the_pane_under_its_first_row() {
+        let pane = pane_rect(content());
+        let list = local(pane, app_list_rect(pane));
+        // At the y every pane's first row starts, as wide as the Audio pane's list, and down to
+        // the Microphone pane's bottom margin.
+        assert!((list.min - pos2(20.0, 50.0)).length() < 1e-4, "{list:?}");
+        assert!(
+            (list.width() - output_list_rect(pane).width()).abs() < 1e-4,
+            "{list:?}"
+        );
+        assert!((list.bottom() - (pane.height() - 10.0)).abs() < 1e-4);
+        // The rows are inset inside it as the device list's are.
+        let rows = app_rows_rect(app_list_rect(pane));
+        assert!((rows.left() - app_list_rect(pane).left() - 5.0).abs() < 1e-4);
+        assert!((rows.top() - app_list_rect(pane).top() - 10.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn an_application_line_lays_out_like_a_device_row() {
+        // A 387-point row, as in the Audio pane's list.
+        let line = Rect::from_min_size(pos2(0.0, 0.0), vec2(387.0, applications::LINE_HEIGHT));
+        let device = Rect::from_min_size(pos2(0.0, 0.0), vec2(387.0, device_row::HEIGHT));
+        // The ✕ is the device row's, in the same column.
+        let remove = remove_button_rect(line);
+        assert!(
+            (remove.left() - remove_button_rect(device).left()).abs() < 1e-4,
+            "{remove:?}"
+        );
+        assert!((remove.center().y - line.center().y).abs() < 1e-4);
+        // The combo is a margin left of it, a compact 30 points tall, centred in its line.
+        let combo = app_combo_rect(line);
+        assert!((combo.right() - (remove.left() - 5.0)).abs() < 1e-4);
+        assert!(
+            (combo.size() - vec2(155.0, 30.0)).length() < 1e-4,
+            "{combo:?}"
+        );
+        assert!((combo.top() - 2.0).abs() < 1e-4, "{combo:?}");
+        // The caption is right against it, the name from past the dot to the caption.
+        let caption = app_caption_rect(line, 47.0);
+        assert!((caption.right() - (combo.left() - 5.0)).abs() < 1e-4);
+        assert!((caption.width() - 47.0).abs() < 1e-4);
+        let dot = app_dot_rect(line);
+        assert!((dot.left() - 7.0).abs() < 1e-4, "{dot:?}");
+        assert!((dot.center().y - line.center().y).abs() < 1e-4);
+        let name = app_name_rect(line, 47.0);
+        assert!((name.left() - (dot.right() + 5.0)).abs() < 1e-4, "{name:?}");
+        assert!((name.right() - (caption.left() - 5.0)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn nothing_in_an_application_line_overlaps_anything_else_whatever_the_caption() {
+        let line = Rect::from_min_size(pos2(0.0, 0.0), vec2(387.0, applications::LINE_HEIGHT));
+        for caption_width in [0.0, 33.0, 47.0, 60.0, applications::CAPTION_MAX_WIDTH] {
+            let rects = [
+                ("dot", app_dot_rect(line)),
+                ("name", app_name_rect(line, caption_width)),
+                ("caption", app_caption_rect(line, caption_width)),
+                ("combo", app_combo_rect(line)),
+                ("forget", remove_button_rect(line)),
+            ];
+            for (name, rect) in &rects {
+                assert!(line.contains_rect(*rect), "{name} {rect:?} leaves its line");
+            }
+            for pair in rects.windows(2) {
+                let ((a_name, a), (b_name, b)) = (pair[0], pair[1]);
+                assert!(
+                    a.right() <= b.left() + 1e-4,
+                    "{a_name} {a:?} runs into {b_name} {b:?} with a {caption_width} caption"
+                );
+            }
+        }
+        // The widest caption still leaves the name more room than the caption.
+        let name = app_name_rect(line, applications::CAPTION_MAX_WIDTH);
+        assert!(name.width() > applications::CAPTION_MAX_WIDTH, "{name:?}");
+    }
+
+    #[test]
+    fn a_row_is_a_line_per_combo_and_its_lines_stack_without_a_gap() {
+        let state = apps_state();
+        assert_eq!(
+            state.apps.iter().map(AppRow::lines).collect::<Vec<_>>(),
+            [1, 2, 1, 1, 2, 1]
+        );
+        let row = app_row(&state, 1);
+        let first = app_line_rect(row, 0);
+        let second = app_line_rect(row, 1);
+        assert!((first.bottom() - second.top()).abs() < 1e-4);
+        assert!((second.bottom() - row.bottom()).abs() < 1e-4);
+        assert!(app_combo_rect(first).bottom() < app_combo_rect(second).top());
+        // A row with no lane at all still takes one line.
+        let bare = AppRow {
+            lanes: Vec::new(),
+            ..state.apps[0].clone()
+        };
+        assert_eq!(bare.lines(), 1);
+    }
+
+    #[test]
+    fn only_a_row_with_something_to_forget_offers_its_cross() {
+        let state = apps_state();
+        let can: Vec<bool> = state.apps.iter().map(AppRow::can_forget).collect();
+        // Firefox is running and follows FxSound's preset: forgetting it would change nothing.
+        assert_eq!(can, [true, true, false, true, true, true]);
+    }
+
+    #[test]
+    fn a_combo_shows_fxsounds_preset_its_own_or_a_missing_one_dimmed() {
+        let presets = ["General", "Gaming"].map(str::to_owned);
+        assert_eq!(app_preset_index(&presets, None), Some(0));
+        assert_eq!(app_preset_index(&presets, Some("General")), Some(1));
+        assert_eq!(app_preset_index(&presets, Some("Gaming")), Some(2));
+        assert_eq!(app_preset_index(&presets, Some("Loudness")), None);
+        assert_eq!(
+            app_preset_items(&presets),
+            ["FxSound's preset", "General", "Gaming"].map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn a_caption_is_given_what_it_measures_up_to_the_most_the_pane_allows() {
+        assert!((app_caption_width(46.3) - 47.0).abs() < 1e-4);
+        assert!((app_caption_width(0.0)).abs() < 1e-4);
+        assert!((app_caption_width(400.0) - applications::CAPTION_MAX_WIDTH).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_applications_tab_button_selects_its_pane() {
+        let outer = Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE);
+        let content = super::super::content_rect(outer);
+        let actions = click_settings(&populated(), nav_button_rect(content, 4).center());
+        assert_eq!(
+            actions,
+            [SettingsAction::SelectTab(SettingsTab::Applications)]
+        );
+    }
+
+    #[test]
+    fn picking_a_preset_gives_the_application_its_own_and_the_first_entry_takes_it_back() {
+        let state = apps_state();
+        let mut window = Window::new(ThemeMode::Dark);
+        let battlefield = app_combo_rect(app_line_rect(app_row(&state, 0), 0));
+        assert_eq!(
+            window.pick(&state, battlefield, "Volume Boost"),
+            [SettingsAction::SetAppPreset {
+                app: key("bf6.exe", "Battlefield 6"),
+                direction: OUT,
+                preset: Some("Volume Boost".into()),
+            }]
+        );
+        let mut window = Window::new(ThemeMode::Dark);
+        assert_eq!(
+            window.pick(&state, battlefield, "FxSound's preset"),
+            [SettingsAction::SetAppPreset {
+                app: key("bf6.exe", "Battlefield 6"),
+                direction: OUT,
+                preset: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn each_combo_of_a_row_speaks_for_its_own_direction_and_lists_that_directions_presets() {
+        let state = apps_state();
+        let discord = app_row(&state, 1);
+        let mut window = Window::new(ThemeMode::Light);
+        assert_eq!(
+            window.pick(&state, app_combo_rect(app_line_rect(discord, 1)), "Clean"),
+            [SettingsAction::SetAppPreset {
+                app: key("Discord", "Discord"),
+                direction: IN,
+                preset: Some("Clean".into()),
+            }]
+        );
+        let mut window = Window::new(ThemeMode::Light);
+        assert_eq!(
+            window.pick(&state, app_combo_rect(app_line_rect(discord, 0)), "Gaming"),
+            [SettingsAction::SetAppPreset {
+                app: key("Discord", "Discord"),
+                direction: OUT,
+                preset: Some("Gaming".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn picking_what_a_combo_already_shows_asks_for_nothing() {
+        let state = apps_state();
+        let mut window = Window::new(ThemeMode::Dark);
+        let battlefield = app_combo_rect(app_line_rect(app_row(&state, 0), 0));
+        assert!(window.pick(&state, battlefield, "Gaming").is_empty());
+        let mut window = Window::new(ThemeMode::Dark);
+        let firefox = app_combo_rect(app_line_rect(app_row(&state, 2), 0));
+        assert!(window.pick(&state, firefox, "FxSound's preset").is_empty());
+    }
+
+    #[test]
+    fn a_rule_naming_a_missing_preset_shows_it_dimmed_and_can_be_taken_back() {
+        let state = apps_state();
+        let chromium = app_combo_rect(app_line_rect(app_row(&state, 5), 0));
+        let mut window = Window::new(ThemeMode::Dark);
+        window.frame(&state, Vec::new());
+        let (_, shapes) = window.frame(&state, Vec::new());
+        let shown: Vec<(String, Color32)> = crate::views::testing::texts(&shapes)
+            .into_iter()
+            .filter(|(_, rect, _)| chromium.contains(rect.center()))
+            .map(|(text, _, colour)| (text, colour))
+            .collect();
+        let palette = Palette::new(ThemeMode::Dark);
+        assert_eq!(
+            shown,
+            [(
+                "Loudness".to_owned(),
+                palette.color_alpha(
+                    FxColor::DefaultText,
+                    crate::widgets::combo::PLACEHOLDER_ALPHA
+                )
+            )]
+        );
+        let mut window = Window::new(ThemeMode::Dark);
+        assert_eq!(
+            window.pick(&state, chromium, "FxSound's preset"),
+            [SettingsAction::SetAppPreset {
+                app: key("chromium", "Chromium"),
+                direction: OUT,
+                preset: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn the_cross_forgets_that_application_and_only_where_it_is_drawn() {
+        let state = apps_state();
+        for (index, expected) in [
+            (0, Some(key("bf6.exe", "Battlefield 6"))),
+            (1, Some(key("Discord", "Discord"))),
+            (2, None),
+            (3, Some(key("brave", "Brave"))),
+            (4, Some(key("spotify", "Spotify"))),
+        ] {
+            let cross = remove_button_rect(app_line_rect(app_row(&state, index), 0));
+            assert_eq!(
+                click_settings(&state, cross.center()),
+                expected
+                    .into_iter()
+                    .map(SettingsAction::ForgetApp)
+                    .collect::<Vec<_>>(),
+                "row {index}"
+            );
+        }
+        // The name and the caption are not controls, nor is the second line's end.
+        let discord = app_row(&state, 1);
+        for at in [
+            app_name_rect(app_line_rect(discord, 0), 47.0).center(),
+            app_caption_rect(app_line_rect(discord, 1), 47.0).center(),
+            remove_button_rect(app_line_rect(discord, 1)).center(),
+        ] {
+            assert!(click_settings(&state, at).is_empty(), "{at:?}");
+        }
+    }
+
+    #[test]
+    fn a_running_application_has_a_dot_and_full_colour_and_a_remembered_one_neither() {
+        let state = apps_state();
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let palette = Palette::new(mode);
+            let shapes = applications_shapes(&state, mode);
+            let dots: Vec<Rect> = shapes
+                .iter()
+                .filter_map(|(shape, bounds)| match shape {
+                    egui::Shape::Circle(circle)
+                        if circle.fill == palette.color(FxColor::SelectedRowOutline) =>
+                    {
+                        Some(*bounds)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let expected: Vec<Rect> = (0..3)
+                .map(|index| app_dot_rect(app_line_rect(app_row(&state, index), 0)))
+                .collect();
+            assert_eq!(dots.len(), 3, "{mode:?}: {dots:?}");
+            for (dot, want) in dots.iter().zip(&expected) {
+                assert!((dot.center() - want.center()).length() < 0.5, "{dot:?}");
+            }
+            let colour_of = |name: &str| {
+                shapes.iter().find_map(|(shape, _)| match shape {
+                    egui::Shape::Text(text) if text.galley.text() == name => {
+                        Some(text.fallback_color)
+                    }
+                    _ => None,
+                })
+            };
+            assert_eq!(
+                colour_of("Battlefield 6"),
+                Some(palette.color(FxColor::DefaultText))
+            );
+            assert_eq!(colour_of("Brave"), Some(palette.color(FxColor::HintText)));
+        }
+    }
+
+    #[test]
+    fn nothing_the_applications_pane_paints_escapes_its_list_in_either_palette() {
+        let list = app_list_rect(shown_pane());
+        for state in [
+            apps_state(),
+            crowded_state(),
+            SettingsState {
+                apps: Vec::new(),
+                ..apps_state()
+            },
+        ] {
+            for mode in [ThemeMode::Dark, ThemeMode::Light] {
+                let shapes = applications_shapes(&state, mode);
+                assert!(!shapes.is_empty());
+                for (shape, bounds) in &shapes {
+                    assert!(
+                        list.expand(0.5).contains_rect(*bounds),
+                        "{mode:?}: {bounds:?} leaves the list {list:?}: {shape:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_two_rows_overlap_and_every_text_stays_in_its_own_row() {
+        let state = crowded_state();
+        let rows = app_rows_rect(app_list_rect(shown_pane()));
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let shapes = applications_shapes(&state, mode);
+            let combos: Vec<Rect> = shapes
+                .iter()
+                .filter_map(|(shape, bounds)| match shape {
+                    egui::Shape::Rect(rect)
+                        if (rect.rect.size()
+                            - vec2(applications::PRESET_WIDTH, applications::COMBO_HEIGHT))
+                        .length()
+                            < 1e-3
+                            && rect.fill != Color32::TRANSPARENT =>
+                    {
+                        Some(*bounds)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let texts: Vec<Rect> = shapes
+                .iter()
+                .filter_map(|(shape, bounds)| {
+                    matches!(shape, egui::Shape::Text(_)).then_some(*bounds)
+                })
+                .collect();
+            // Every row the list shows before it scrolls has its combos drawn.
+            let visible_lines = (rows.height() / applications::LINE_HEIGHT).floor() as usize;
+            assert!(combos.len() >= visible_lines, "{} combos", combos.len());
+            for (i, a) in combos.iter().enumerate() {
+                for b in &combos[i + 1..] {
+                    assert!(!a.intersects(*b), "combo {a:?} overlaps combo {b:?}");
+                }
+            }
+            for (i, a) in texts.iter().enumerate() {
+                for b in &texts[i + 1..] {
+                    assert!(
+                        a.intersect(*b).area() < 1.0,
+                        "text {a:?} overlaps text {b:?}"
+                    );
+                }
+                // A text is either a combo's own, inside it, or clear of every combo.
+                let inside = combos.iter().any(|combo| combo.contains_rect(*a));
+                let clear = combos.iter().all(|combo| !combo.intersects(*a));
+                assert!(inside || clear, "text {a:?} straddles a combo");
+            }
+            // And each unscrolled row's name lies in that row's first line.
+            for index in 0..6 {
+                let line = app_line_rect(app_row(&state, index), 0);
+                let name = &state.apps[index].name;
+                let drawn = shapes.iter().find_map(|(shape, bounds)| match shape {
+                    egui::Shape::Text(text) if text.galley.text() == name => Some(*bounds),
+                    _ => None,
+                });
+                let drawn = drawn.unwrap_or_else(|| panic!("{name} not drawn"));
+                assert!(
+                    line.contains_rect(drawn),
+                    "{name} {drawn:?} is not in {line:?}"
+                );
+            }
+        }
+    }
+
+    /// Where each of `names` is painted in `shapes`, clipped or not.
+    fn painted_names(
+        shapes: &[egui::epaint::ClippedShape],
+        names: &[&str],
+    ) -> Vec<(String, Rect, Rect)> {
+        shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if names.contains(&text.galley.text()) => Some((
+                    text.galley.text().to_owned(),
+                    clipped.shape.visual_bounding_rect(),
+                    clipped.clip_rect,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_long_list_scrolls_inside_the_pane_and_draws_only_the_rows_in_sight() {
+        let state = crowded_state();
+        let list = app_list_rect(shown_pane());
+        let rows = app_rows_rect(list);
+        let first = state.apps[0].name.as_str();
+        // The last row whose name is short enough to be painted whole, one row from the end.
+        let last = state.apps[state.apps.len() - 2].name.as_str();
+        assert_eq!(last, "App 38");
+        let mut window = Window::new(ThemeMode::Dark);
+        window.frame(&state, Vec::new());
+        let (_, shapes) = window.frame(&state, Vec::new());
+        let painted = painted_names(&shapes, &[first, last]);
+        assert_eq!(
+            painted
+                .iter()
+                .map(|(name, ..)| name.as_str())
+                .collect::<Vec<_>>(),
+            [first],
+            "the last row is out of sight, so not painted at all"
+        );
+
+        // A long turn of the wheel over the list brings the last row in and takes the first out.
+        let over = rows.center();
+        let wheel = egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, -10_000.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: egui::Modifiers::default(),
+        };
+        window.frame(&state, vec![egui::Event::PointerMoved(over)]);
+        window.frame(&state, vec![egui::Event::PointerMoved(over), wheel]);
+        let mut shapes = Vec::new();
+        for _ in 0..30 {
+            shapes = window.frame(&state, Vec::new()).1;
+        }
+        let painted = painted_names(&shapes, &[first, last]);
+        assert_eq!(
+            painted
+                .iter()
+                .map(|(name, ..)| name.as_str())
+                .collect::<Vec<_>>(),
+            [last],
+            "{painted:?}"
+        );
+        let (_, drawn, clip) = &painted[0];
+        assert!(
+            rows.contains_rect(drawn.intersect(*clip)),
+            "{drawn:?} clipped to {clip:?} leaves {rows:?}"
+        );
+        // The list clips what scrolls to its rows, top and bottom.
+        assert!(
+            clip.top() >= rows.top() - 0.5 && clip.bottom() <= rows.bottom() + 0.5,
+            "{clip:?} lets rows past {rows:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_says_why_it_is_empty_inside_its_box() {
+        let state = SettingsState {
+            apps: Vec::new(),
+            ..apps_state()
+        };
+        let rows = app_rows_rect(app_list_rect(shown_pane()));
+        let shapes = applications_shapes(&state, ThemeMode::Dark);
+        let texts: Vec<(String, Rect)> = shapes
+            .iter()
+            .filter_map(|(shape, bounds)| match shape {
+                egui::Shape::Text(text) => Some((text.galley.text().to_owned(), *bounds)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert_eq!(texts[0].0, NO_APPLICATIONS);
+        assert!(rows.contains_rect(texts[0].1));
+        // Centred, give or take the snap to whole pixels.
+        assert!(
+            (texts[0].1.center() - rows.center()).length() < 1.5,
+            "{:?} in {rows:?}",
+            texts[0].1
+        );
+    }
+
+    #[test]
+    fn the_applications_pane_draws_every_state_without_asking_for_anything() {
+        let ctx = test_context();
+        let mut assets = AssetCache::new();
+        let mut icons = NavIcons::new();
+        let outer = Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE);
+        let no_presets = SettingsState {
+            presets: Vec::new(),
+            input_presets: Vec::new(),
+            ..apps_state()
+        };
+        for state in [
+            apps_state(),
+            crowded_state(),
+            no_presets,
+            SettingsState {
+                apps: Vec::new(),
+                ..apps_state()
+            },
+        ] {
+            for mode in [ThemeMode::Dark, ThemeMode::Light] {
+                frame(&ctx, |ui| {
+                    let response = SettingsDialog::new(&state).show(
+                        ui,
+                        outer,
+                        Palette::new(mode),
+                        &mut assets,
+                        &mut icons,
+                    );
+                    assert!(response.is_empty(), "{:?}", response.actions);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn the_english_follow_entry_the_captions_and_the_examples_names_fit_whole() {
+        // Measured with the real faces. A translation may be elided; the source language must not.
+        let ctx = test_context();
+        let line = app_line_rect(app_row(&apps_state(), 0), 0);
+        frame(&ctx, |ui| {
+            let width = |text: &str, font| {
+                ui.painter()
+                    .layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER)
+                    .size()
+                    .x
+            };
+            let combo = app_combo_rect(line);
+            let font = crate::theme::semibold(crate::widgets::combo::font_size(combo.height()));
+            let room = crate::widgets::combo::text_box(combo).width();
+            for entry in [FOLLOW_PRESET, "Volume Boost", "Headset"] {
+                let used = width(entry, font.clone());
+                assert!(used <= room, "{entry:?} is {used} in {room}");
+            }
+            let caption =
+                app_caption_width(width("Output", small_font()).max(width("Input", small_font())));
+            assert!(caption < applications::CAPTION_MAX_WIDTH);
+            let room = app_name_rect(line, caption).width();
+            for name in ["Battlefield 6", "Discord", "Brave", "Google Chrome"] {
+                let used = width(name, normal_font());
+                assert!(used <= room, "{name:?} is {used} in {room}");
+            }
+        });
+    }
+
+    /// Every translation of `key`, in `font`, that is wider than `room`.
+    fn wider_than(ui: &Ui, key: &str, font: &egui::FontId, room: f32) -> Vec<String> {
+        every_translation(key)
+            .into_iter()
+            .filter_map(|(code, text)| {
+                let used = ui
+                    .painter()
+                    .layout_no_wrap(text.clone(), font.clone(), Color32::PLACEHOLDER)
+                    .size()
+                    .x;
+                (used > room).then(|| format!("{code}: {text:?} is {used:.1} in {room:.1}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_languages_tab_captions_stop_short_of_the_lists_painted_over_the_nav_rows() {
+        // The Applications list runs down past the last tab row and the Audio pane's covers all
+        // but the first, both from x 173 and both painted after the nav, so a caption that
+        // reached one would lose its last glyphs under it with no ellipsis: a caption may not use
+        // all of the label box's 115 points (`nav_label_rect`). German `Anwendungen`, about 114,
+        // did.
+        const CLEARANCE: f32 = 4.0;
+        let ctx = test_context();
+        let content = content();
+        let pane = pane_rect(content);
+        let edge = app_list_rect(pane)
+            .left()
+            .min(output_list_rect(pane).left());
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            for tab in SettingsTab::ALL {
+                let label = nav_label_rect(nav_button_rect(content, tab.index()));
+                let room = edge - label.left() - CLEARANCE;
+                assert!(room < label.width(), "{room} in {}", label.width());
+                problems.extend(wider_than(ui, tab.nav_label(), &normal_font(), room));
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn the_lists_the_captions_stop_short_of_lie_across_the_tab_rows() {
+        let content = content();
+        let pane = pane_rect(content);
+        for tab in SettingsTab::ALL {
+            let row = nav_button_rect(content, tab.index()).center().y;
+            assert!(app_list_rect(pane).y_range().contains(row), "{tab:?}");
+            assert_eq!(
+                output_list_rect(pane).y_range().contains(row),
+                tab != SettingsTab::Audio,
+                "{tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_languages_direction_captions_fit_the_room_the_rows_keep_for_them() {
+        let ctx = test_context();
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            for direction in DeviceDirection::ALL {
+                problems.extend(wider_than(
+                    ui,
+                    direction.label(),
+                    &small_font(),
+                    applications::CAPTION_MAX_WIDTH,
+                ));
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn every_languages_empty_list_text_fits_the_box_it_is_wrapped_into() {
+        let ctx = test_context();
+        let rows = app_rows_rect(app_list_rect(pane_rect(content())));
+        let width = rows.width() - applications::EMPTY_TEXT_INSET * 2.0;
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            for (code, text) in every_translation(NO_APPLICATIONS) {
+                let size = ui
+                    .painter()
+                    .layout(text.clone(), small_font(), Color32::PLACEHOLDER, width)
+                    .size();
+                if size.x > width || size.y > rows.height() {
+                    problems.push(format!("{code}: {text:?} is {size:?}"));
+                }
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 }

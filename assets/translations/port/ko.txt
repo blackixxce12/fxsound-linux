@@ -100,3 +100,6 @@ countries: kr
 "the echo canceller stopped" = "에코 제거기가 멈췄습니다"
 "waiting for the speakers" = "스피커를 기다리는 중"
 "Applications that used %s now follow FxSound's preset" = "%s을(를) 사용하던 앱은 이제 FxSound 프리셋을 따릅니다"
+"Applications" = "앱"
+"FxSound's preset" = "FxSound 프리셋"
+"No application has played or recorded through FxSound yet" = "아직 FxSound를 통해 재생하거나 녹음한 앱이 없습니다"

@@ -4314,6 +4314,25 @@ impl App {
             A::MoveMicrophoneDown(row) => {
                 self.swap_device_config(state, DeviceDirection::Input, *row, row + 1);
             }
+
+            // Settings ▸ Applications (`docs/0.4.0-apps.md`): the rule is written and the routes
+            // sent at once, as from the command line. The pane only offers a preset its lane's
+            // store has; one deleted under the open pane is refused and the row shows the truth
+            // next frame.
+            A::SetAppPreset {
+                app,
+                direction,
+                preset,
+            } => {
+                if let Err(err) = self.set_app_preset(app, *direction, preset.as_deref()) {
+                    log::warn!("could not choose a preset for {}: {err}", app.display());
+                }
+                state.apps = self.app_rows();
+            }
+            A::ForgetApp(app) => {
+                self.forget_app(app);
+                state.apps = self.app_rows();
+            }
             A::SetDevicePreset { device, preset } => {
                 // By the name the row showed, and only one the speakers' store still has: an
                 // index would be counted in the list as it was drawn, not as it is now.
@@ -4458,6 +4477,21 @@ impl App {
         let names = self.device_preset_names();
         if state.presets != names {
             state.presets = names;
+        }
+        // The same for the Applications pane's input combos, and its rows: a preset saved,
+        // renamed or deleted anywhere, an application starting or stopping, show while it is open.
+        let voices: Vec<String> = self
+            .voice_presets
+            .entries()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        if state.input_presets != voices {
+            state.input_presets = voices;
+        }
+        let apps = self.app_rows();
+        if state.apps != apps {
+            state.apps = apps;
         }
         state.can_reset_presets = self.can_reset_presets();
         self.refresh_device_rows(state);

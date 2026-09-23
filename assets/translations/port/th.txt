@@ -100,3 +100,6 @@ countries: th
 "the echo canceller stopped" = "ตัวตัดเสียงสะท้อนหยุดทำงาน"
 "waiting for the speakers" = "กำลังรอลำโพง"
 "Applications that used %s now follow FxSound's preset" = "แอปที่เคยใช้ %s จะใช้พรีเซ็ตของ FxSound แทน"
+"Applications" = "แอป"
+"FxSound's preset" = "พรีเซ็ตของ FxSound"
+"No application has played or recorded through FxSound yet" = "ยังไม่มีแอปที่เล่นหรืออัดเสียงผ่าน FxSound"

@@ -1,0 +1,9 @@
+<svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <g id="24 / basic / applications">
+    <!-- Window frame -->
+    <rect x="3.75" y="4.75" width="16.5" height="14.5" rx="2.5" stroke="#7E7E7E" stroke-width="1.5" fill="none"/>
+
+    <!-- Title bar -->
+    <path d="M3 7.25C3 5.45507 4.45507 4 6.25 4H17.75C19.5449 4 21 5.45507 21 7.25V9H3V7.25Z" fill="#7E7E7E"/>
+  </g>
+</svg>

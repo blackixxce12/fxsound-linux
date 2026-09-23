@@ -207,7 +207,8 @@ pub fn device_sections(devices: &[AudioDevice]) -> DeviceSections {
 ///
 /// It is disabled with the master power (`FxProView.cpp:117-121`, `FxLiteView.cpp:57`) while the
 /// device pickers deliberately are **not** — the one thing a user must still be able to do with
-/// the power off is pick a different device. It lists the edit direction's presets.
+/// the power off is pick a different device. It lists the edit direction's presets. The box's
+/// response is handed back for a tooltip.
 pub(crate) fn preset_combo(
     ui: &mut Ui,
     state: &UiState,
@@ -215,19 +216,20 @@ pub(crate) fn preset_combo(
     assets: &mut AssetCache,
     rect: Rect,
     response: &mut UiResponse,
-) {
+) -> egui::Response {
     let presets: Vec<String> = state
         .presets
         .iter()
         .map(|preset| combo::preset_label(&preset.name, preset.modified))
         .collect();
-    let (_, picked) = FxComboBox::new(&presets, state.selected_preset)
+    let (combo, picked) = FxComboBox::new(&presets, state.selected_preset)
         .enabled(state.controls_enabled())
         .separator_before(first_user_preset(&state.presets))
         .show(ui, rect, palette, assets, "preset_list");
     if let Some(index) = picked {
         response.push(UiAction::SelectPreset(index));
     }
+    combo
 }
 
 /// One row of a device menu **(port addition)**.

@@ -105,3 +105,6 @@ countries: no
 "the echo canceller stopped" = "ekkokanselleringen stoppet"
 "waiting for the speakers" = "venter på høyttalerne"
 "Applications that used %s now follow FxSound's preset" = "Programmer som brukte %s, følger nå FxSounds forhåndsinnstilling"
+"Applications" = "Programmer"
+"FxSound's preset" = "FxSounds forhåndsinnstilling"
+"No application has played or recorded through FxSound yet" = "Ingen programmer har spilt av eller tatt opp gjennom FxSound ennå"

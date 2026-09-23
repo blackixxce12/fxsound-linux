@@ -46,11 +46,17 @@ const INDIRECT_CALLS: &[(&str, &[&str])] = &[
     // `SettingsTab::nav_label` and `pane_title` in `dialogs/settings.rs`.
     (
         "tab.nav_label()",
-        &["Audio", "General", "Help", "Microphone"],
+        &["Audio", "General", "Help", "Microphone", "Applications"],
     ),
     (
         "self.state.tab.pane_title()",
-        &["Audio", "General Preferences", "Help", "Microphone"],
+        &[
+            "Audio",
+            "General Preferences",
+            "Help",
+            "Microphone",
+            "Applications",
+        ],
     ),
     // `HotkeyCommand::label` in `dialogs/settings.rs`.
     (
@@ -848,6 +854,7 @@ fn a_string_that_ends_in_a_space_keeps_the_space_in_every_language() {
 /// nobody translated.
 const SPELLED_AS_IN_ENGLISH: &[&str] = &[
     "Ambience",
+    "Applications",
     "Audio",
     "Balance",
     "Bass Boost",

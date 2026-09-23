@@ -101,3 +101,6 @@ countries: EG sa
 "the echo canceller stopped" = "توقف مُلغي الصدى"
 "waiting for the speakers" = "في انتظار مكبرات الصوت"
 "Applications that used %s now follow FxSound's preset" = "التطبيقات التي كانت تستخدم %s تتبع الآن الإعداد المسبق لـ FxSound"
+"Applications" = "التطبيقات"
+"FxSound's preset" = "الإعداد المسبق لـ FxSound"
+"No application has played or recorded through FxSound yet" = "لم يشغّل أي تطبيق صوتًا أو يسجّله عبر FxSound بعد"

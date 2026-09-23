@@ -103,3 +103,6 @@ countries: HR
 "the echo canceller stopped" = "poništavanje jeke se zaustavilo"
 "waiting for the speakers" = "čeka se na zvučnike"
 "Applications that used %s now follow FxSound's preset" = "Aplikacije koje su koristile %s sada prate FxSound preset"
+"Applications" = "Aplikacije"
+"FxSound's preset" = "FxSound preset"
+"No application has played or recorded through FxSound yet" = "Nijedna aplikacija još nije reproducirala ni snimala zvuk kroz FxSound"

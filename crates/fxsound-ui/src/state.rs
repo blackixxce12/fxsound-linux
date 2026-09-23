@@ -25,6 +25,18 @@ pub struct PresetEntry {
     pub modified: bool,
 }
 
+/// An application the engine runs through a preset of its own (`docs/0.4.0-apps.md`): what the
+/// Pro window's preset list says on hover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedApp {
+    /// The lane whose route the application's streams are on.
+    pub direction: DeviceDirection,
+    /// The application's name as the Applications pane shows it.
+    pub name: String,
+    /// The preset its route runs.
+    pub preset: String,
+}
+
 /// Why echo cancellation, asked for, is not running — as far as the interface says it. The
 /// engine's own words, a module path and an OS error among them, stay in the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +204,11 @@ pub struct UiState {
     pub notice_clock: Option<(String, Instant)>,
     /// Suppresses every tooltip, matching the `hide_help_tooltips` setting.
     pub hide_tooltips: bool,
+
+    // ---- per-application presets -------------------------------------------------------------
+    /// Every application the engine has moved onto a route of its own, both lanes, in the order
+    /// it reported them. The preset list's tooltip lists the edit direction's.
+    pub routed_apps: Vec<RoutedApp>,
 }
 
 impl Default for UiState {
@@ -243,6 +260,7 @@ impl Default for UiState {
             notification: None,
             notice_clock: None,
             hide_tooltips: false,
+            routed_apps: Vec::new(),
         }
     }
 }

@@ -210,7 +210,7 @@ pub fn show(
 
     let mut response = titlebar::show(ui, state, scratch, palette, assets);
 
-    views::preset_combo(
+    let presets = views::preset_combo(
         ui,
         state,
         palette,
@@ -218,6 +218,9 @@ pub fn show(
         at(origin, layout::pro::preset_combo()),
         &mut response,
     );
+    if let Some(tip) = routed_apps_tip(state) {
+        let _ = presets.on_hover_text(tip);
+    }
     views::lane_combos(ui, state, palette, assets, origin, &mut response);
 
     VisualizerWidget::new(state, &mut scratch.visualizer).show(
@@ -260,6 +263,27 @@ pub fn show(
     }
 
     response
+}
+
+/// What the preset list says on hover **(port addition)**: the edit direction's applications that
+/// run a preset of their own, one `Battlefield 6 → Gaming` a line, in the order the engine
+/// reported them (`docs/0.4.0-apps.md`, "Interface").
+///
+/// `None` — no tooltip at all — while the lane has none, and while "Hide help tips" is ticked, as
+/// for every tip in the window. The names are the applications' and the presets', so there is
+/// nothing to translate.
+#[must_use]
+pub fn routed_apps_tip(state: &UiState) -> Option<String> {
+    if state.hide_tooltips {
+        return None;
+    }
+    let lines: Vec<String> = state
+        .routed_apps
+        .iter()
+        .filter(|app| app.direction == state.direction)
+        .map(|app| format!("{} → {}", app.name, app.preset))
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// The notice bubble's geometry and type: `FxNotification` in its in-window, persistent form
@@ -2419,6 +2443,116 @@ mod tests {
         assert!(
             fill > last_underneath,
             "something was painted over the bubble"
+        );
+    }
+
+    // ---- the preset list's tip: applications with a preset of their own ----------------------
+
+    fn routed(direction: DeviceDirection, name: &str, preset: &str) -> crate::state::RoutedApp {
+        crate::state::RoutedApp {
+            direction,
+            name: name.to_owned(),
+            preset: preset.to_owned(),
+        }
+    }
+
+    /// Battlefield 6 and Brave routed on the speakers, Discord on the microphone.
+    fn routed_state() -> UiState {
+        UiState {
+            routed_apps: vec![
+                routed(DeviceDirection::Output, "Battlefield 6", "Gaming"),
+                routed(DeviceDirection::Input, "Discord", "Headset"),
+                routed(DeviceDirection::Output, "Brave", "Volume Boost"),
+            ],
+            ..lanes_state()
+        }
+    }
+
+    #[test]
+    fn the_preset_lists_tip_names_the_edit_directions_routed_applications_only() {
+        let state = routed_state();
+        assert_eq!(
+            routed_apps_tip(&state).as_deref(),
+            Some("Battlefield 6 → Gaming\nBrave → Volume Boost")
+        );
+        let state = UiState {
+            direction: DeviceDirection::Input,
+            ..routed_state()
+        };
+        assert_eq!(
+            routed_apps_tip(&state).as_deref(),
+            Some("Discord → Headset")
+        );
+    }
+
+    #[test]
+    fn there_is_no_tip_without_a_routed_application_or_with_help_tips_hidden() {
+        assert_eq!(routed_apps_tip(&lanes_state()), None);
+        // Routed on the other lane only.
+        let state = UiState {
+            routed_apps: vec![routed(DeviceDirection::Input, "Discord", "Headset")],
+            ..lanes_state()
+        };
+        assert_eq!(routed_apps_tip(&state), None);
+        let state = UiState {
+            hide_tooltips: true,
+            ..routed_state()
+        };
+        assert_eq!(routed_apps_tip(&state), None);
+    }
+
+    /// The tip's lines on screen after the pointer has rested on the preset list for a second.
+    fn tip_shown(state: &UiState) -> Vec<String> {
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let over = layout::pro::preset_combo().center();
+        harness.frame(state, vec![Event::PointerMoved(over)]);
+        // Sixty quiet frames of a sixtieth each: past egui's half-second tooltip delay.
+        let mut shapes = Vec::new();
+        for _ in 0..60 {
+            shapes = harness.frame(state, Vec::new()).1;
+        }
+        texts(&shapes)
+            .into_iter()
+            .map(|(text, _, _)| text)
+            .filter(|text| text.contains('→'))
+            .collect()
+    }
+
+    #[test]
+    fn resting_on_the_preset_list_shows_the_tip_and_only_when_there_is_one() {
+        let shown = tip_shown(&routed_state());
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert!(shown[0].contains("Battlefield 6 → Gaming"), "{shown:?}");
+        assert!(shown[0].contains("Brave → Volume Boost"), "{shown:?}");
+        assert!(!shown[0].contains("Discord"), "{shown:?}");
+        assert!(tip_shown(&lanes_state()).is_empty());
+        assert!(
+            tip_shown(&UiState {
+                hide_tooltips: true,
+                ..routed_state()
+            })
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_lite_window_says_nothing_about_routed_applications() {
+        let state = UiState {
+            view: ViewMode::Lite,
+            ..routed_state()
+        };
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let over = layout::lite::preset_combo().center();
+        harness.frame(&state, vec![Event::PointerMoved(over)]);
+        let mut shapes = Vec::new();
+        for _ in 0..60 {
+            shapes = harness.frame(&state, Vec::new()).1;
+        }
+        assert!(
+            texts(&shapes)
+                .iter()
+                .all(|(text, _, _)| !text.contains('→')),
+            "the design keeps the tip to the Pro window"
         );
     }
 }

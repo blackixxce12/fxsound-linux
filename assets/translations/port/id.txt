@@ -101,3 +101,6 @@ countries: id
 "the echo canceller stopped" = "pembatalan gema berhenti"
 "waiting for the speakers" = "menunggu speaker"
 "Applications that used %s now follow FxSound's preset" = "Aplikasi yang memakai %s kini mengikuti preset FxSound"
+"Applications" = "Aplikasi"
+"FxSound's preset" = "Preset FxSound"
+"No application has played or recorded through FxSound yet" = "Belum ada aplikasi yang memutar atau merekam melalui FxSound"

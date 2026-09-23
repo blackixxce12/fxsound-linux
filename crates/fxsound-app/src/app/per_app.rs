@@ -48,6 +48,8 @@ use fxsound_core::apps::unix_now;
 use fxsound_core::messages::{AppRoute, AppStream, DspParams, InputDspParams, RouteParams};
 use fxsound_core::{AppKey, AppPreset, AppRules, DeviceDirection, Preset, UiToAudio};
 use fxsound_preset::input::InputPreset;
+use fxsound_ui::dialogs::settings::{AppLane, AppRow};
+use fxsound_ui::state::RoutedApp;
 
 use super::{
     App, MusicControls, MusicLevels, PresetVoicing, apply_microphone_settings, ladder, lane_index,
@@ -90,6 +92,10 @@ pub(super) struct AppPresets {
     /// Per lane and application, the route the engine last reported its streams on, in the order
     /// the engine listed them: what `app_routed` has said.
     routed: Vec<(DeviceDirection, AppKey, String)>,
+    /// Every application and lane the engine has reported a stream for since start-up: which
+    /// combos the Applications pane gives a row. The store does not say which lanes an
+    /// application uses, so one not seen this session, with no preset of its own, gets both.
+    used: HashSet<(AppKey, DeviceDirection)>,
 }
 
 impl AppPresets {
@@ -241,6 +247,79 @@ impl App {
         &self.apps.sent
     }
 
+    /// Settings ▸ Applications: a row per remembered application — the ones playing or
+    /// recording now first, by name, then the rest, the most recently seen first.
+    ///
+    /// A row is a rule of the store, and a running one is a rule some stream answers to
+    /// ([`AppRules::rule`]), so a general rule — one for every program called `Discord` — is one
+    /// row however many programs it covers, as it is one choice. Each row has a combo for every
+    /// lane its application has a preset of its own on, or has played or recorded on this
+    /// session; one with neither, remembered from an earlier session, has both.
+    #[must_use]
+    pub fn app_rows(&self) -> Vec<AppRow> {
+        let rules = &self.apps.rules;
+        let keys = || rules.apps.iter().map(|rule| &rule.key);
+        // Which lanes each rule's applications were heard on: now, and this session.
+        let mut running = vec![[false; 2]; rules.apps.len()];
+        let mut used = vec![[false; 2]; rules.apps.len()];
+        for stream in &self.apps.streams {
+            if let Some(index) = stream.app.best_match(keys()) {
+                running[index][lane_index(stream.direction)] = true;
+            }
+        }
+        for (app, direction) in &self.apps.used {
+            if let Some(index) = app.best_match(keys()) {
+                used[index][lane_index(*direction)] = true;
+            }
+        }
+
+        let mut rows: Vec<(u64, AppRow)> = rules
+            .apps
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| {
+                let heard = |direction: DeviceDirection| {
+                    running[index][lane_index(direction)] || used[index][lane_index(direction)]
+                };
+                let mut lanes: Vec<DeviceDirection> = DeviceDirection::ALL
+                    .into_iter()
+                    .filter(|&direction| rule.has_preset(direction) || heard(direction))
+                    .collect();
+                if lanes.is_empty() {
+                    lanes = DeviceDirection::ALL.to_vec();
+                }
+                let row = AppRow {
+                    app: rule.key.clone(),
+                    name: rule.key.display().to_owned(),
+                    running: running[index].contains(&true),
+                    lanes: lanes
+                        .into_iter()
+                        .map(|direction| AppLane {
+                            direction,
+                            // As written: a name the lane's store does not carry exactly is one
+                            // the application does not run, and the pane shows it dimmed.
+                            preset: rule
+                                .has_preset(direction)
+                                .then(|| rule.preset(direction).to_owned()),
+                        })
+                        .collect(),
+                };
+                (rule.last_seen, row)
+            })
+            .collect();
+        rows.sort_by(|(a_seen, a), (b_seen, b)| {
+            let by_name = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
+            b.running.cmp(&a.running).then_with(|| {
+                if a.running {
+                    by_name()
+                } else {
+                    b_seen.cmp(a_seen).then_with(by_name)
+                }
+            })
+        });
+        rows.into_iter().map(|(_, row)| row).collect()
+    }
+
     /// Choose the preset the application `app` names runs through in `direction` — `None` or a
     /// blank name to follow the lane's preset — and say so to the engine at once when the
     /// application is running. Returns whether the store changed; it is written at once.
@@ -322,6 +401,9 @@ impl App {
         let mut new_application = false;
         let mut seen_again = false;
         for stream in &streams {
+            self.apps
+                .used
+                .insert((stream.app.clone(), stream.direction));
             let known = self.apps.rules.rule(&stream.app).is_some();
             if self.apps.rules.seen(&stream.app, now) {
                 if known {
@@ -577,6 +659,14 @@ impl App {
                 now.push((stream.direction, stream.app.clone(), preset.clone()));
             }
         }
+        self.state.routed_apps = now
+            .iter()
+            .map(|(direction, app, preset)| RoutedApp {
+                direction: *direction,
+                name: app.display().to_owned(),
+                preset: preset.clone(),
+            })
+            .collect();
         let before = std::mem::replace(&mut self.apps.routed, now);
         for (direction, app, preset) in &self.apps.routed {
             let unchanged = before.iter().any(|(was_direction, was_app, was)| {

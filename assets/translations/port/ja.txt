@@ -100,3 +100,6 @@ countries: ja
 "the echo canceller stopped" = "エコーキャンセラーが停止しました"
 "waiting for the speakers" = "スピーカーを待っています"
 "Applications that used %s now follow FxSound's preset" = "%s を使っていたアプリは FxSound のプリセットに従います"
+"Applications" = "アプリ"
+"FxSound's preset" = "FxSound のプリセット"
+"No application has played or recorded through FxSound yet" = "FxSound を通して再生・録音したアプリはまだありません"

@@ -47,8 +47,8 @@ pub use presets::{
     PresetsAction,
 };
 pub use settings::{
-    DevicePriority, HotkeyCommand, NavIcon, NavIcons, SettingsAction, SettingsDialog,
-    SettingsState, SettingsTab,
+    AppLane, AppRow, DevicePriority, HotkeyCommand, NavIcon, NavIcons, SettingsAction,
+    SettingsDialog, SettingsState, SettingsTab,
 };
 
 use crate::assets::{AssetCache, FxImage};

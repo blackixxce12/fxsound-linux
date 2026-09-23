@@ -12,18 +12,27 @@
 //! cargo run -p fxsound-ui --example preview -- --lite
 //! cargo run -p fxsound-ui --example preview -- --input --lang=de
 //! cargo run -p fxsound-ui --example preview -- --levels --eq-off
+//! cargo run -p fxsound-ui --example preview -- --apps --light
 //! ```
 //!
 //! Flags: `--light`, `--input` (edit the microphone lane), `--lite`, `--notice[=TEXT]`,
 //! `--detached` (both lanes off), `--levels` (start with the effect column turned over to the
 //! equalizer's controls), `--eq-off` (the equalizer switched off), `--power-off`, `--lang=CODE`
-//! (one of the translation tables' codes; English otherwise), `--exit-after-paint`. Keys while it
+//! (one of the translation tables' codes; English otherwise), `--apps[=empty]` (Settings ▸
+//! Applications over a made-up list of applications, or none), `--exit-after-paint`. Keys while it
 //! runs: `I` switches the edit direction, `N` puts a notice up, `L` flips Pro/Lite, `T` flips the
 //! palette, `Esc` quits.
+//!
+//! The made-up state has Battlefield 6 on its own preset on the speakers and Discord on the
+//! microphone, so resting the pointer on the Pro window's preset list shows the edit direction's
+//! routed applications.
 
 use eframe::egui;
-use fxsound_core::{AudioDevice, DeviceDirection, ThemeMode, ViewMode};
-use fxsound_ui::state::PresetEntry;
+use fxsound_core::{AppKey, AudioDevice, DeviceDirection, ThemeMode, ViewMode};
+use fxsound_ui::dialogs::{
+    AppLane, AppRow, NavIcons, SettingsAction, SettingsDialog, SettingsState, SettingsTab, settings,
+};
+use fxsound_ui::state::{PresetEntry, RoutedApp};
 use fxsound_ui::{AssetCache, Palette, UiAction, UiState, ViewScratch, theme, views, window_size};
 
 fn main() -> eframe::Result<()> {
@@ -67,8 +76,15 @@ fn main() -> eframe::Result<()> {
     if let Some(text) = notice {
         preview.state.notify(text);
     }
+    if let Some(which) = args.iter().find_map(|a| a.strip_prefix("--apps")) {
+        preview.settings = Some(demo_settings(which == "=empty"));
+    }
 
-    let size = window_size(preview.state.view);
+    let size = if preview.settings.is_some() {
+        settings::WINDOW_SIZE
+    } else {
+        window_size(preview.state.view)
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([size.x, size.y])
@@ -152,7 +168,94 @@ fn demo_state() -> UiState {
         denoise_on: true,
         denoise_running: true,
         deesser_requested_hz: 5_500.0,
+        routed_apps: vec![
+            RoutedApp {
+                direction: DeviceDirection::Output,
+                name: "Battlefield 6".to_owned(),
+                preset: "Gaming".to_owned(),
+            },
+            RoutedApp {
+                direction: DeviceDirection::Input,
+                name: "Discord".to_owned(),
+                preset: "Headset".to_owned(),
+            },
+        ],
         ..UiState::default()
+    }
+}
+
+fn app(binary: &str, name: &str) -> AppKey {
+    AppKey {
+        binary: binary.to_owned(),
+        name: name.to_owned(),
+        flatpak: String::new(),
+    }
+}
+
+fn app_row(
+    binary: &str,
+    name: &str,
+    running: bool,
+    lanes: &[(DeviceDirection, Option<&str>)],
+) -> AppRow {
+    AppRow {
+        app: app(binary, name),
+        name: name.to_owned(),
+        running,
+        lanes: lanes
+            .iter()
+            .map(|&(direction, preset)| AppLane {
+                direction,
+                preset: preset.map(str::to_owned),
+            })
+            .collect(),
+    }
+}
+
+/// Settings ▸ Applications as the app would fill it: three applications running, then four
+/// remembered — one of them with a name too long for its room, one whose preset is gone.
+fn demo_settings(empty: bool) -> SettingsState {
+    use DeviceDirection::{Input, Output};
+    let apps = if empty {
+        Vec::new()
+    } else {
+        vec![
+            app_row(
+                "bf6.exe",
+                "Battlefield 6",
+                true,
+                &[(Output, Some("Gaming"))],
+            ),
+            app_row(
+                "Discord",
+                "Discord",
+                true,
+                &[(Output, None), (Input, Some("Headset"))],
+            ),
+            app_row("firefox", "Firefox", true, &[(Output, None)]),
+            app_row("brave", "Brave", false, &[(Output, Some("Music"))]),
+            app_row(
+                "chrome",
+                "Google Chrome Canary Developer Build",
+                false,
+                &[(Output, Some("Loudness"))],
+            ),
+            app_row("obs", "OBS Studio", false, &[(Input, Some("Podcast"))]),
+            app_row(
+                "spotify",
+                "Spotify",
+                false,
+                &[(Output, None), (Input, None)],
+            ),
+        ]
+    };
+    SettingsState {
+        tab: SettingsTab::Applications,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        presets: output_presets().into_iter().map(|p| p.name).collect(),
+        input_presets: input_presets().into_iter().map(|p| p.name).collect(),
+        apps,
+        ..SettingsState::default()
     }
 }
 
@@ -179,6 +282,9 @@ struct Preview {
     state: UiState,
     scratch: ViewScratch,
     assets: AssetCache,
+    /// Settings, drawn instead of the main window when `--apps` asked for it.
+    settings: Option<SettingsState>,
+    icons: NavIcons,
     /// The preset list and selection of the lane not being edited.
     parked: (Vec<PresetEntry>, Option<usize>),
     exit_after_paint: bool,
@@ -191,6 +297,8 @@ impl Preview {
             state,
             scratch: ViewScratch::new(),
             assets: AssetCache::new(),
+            settings: None,
+            icons: NavIcons::new(),
             parked: (input_presets(), Some(0)),
             exit_after_paint,
             frames: 0,
@@ -300,6 +408,41 @@ impl Preview {
         )));
     }
 
+    /// The stand-in for the application's side of Settings.
+    fn handle_settings(&mut self, ctx: &egui::Context, action: &SettingsAction) {
+        let Some(settings) = &mut self.settings else {
+            return;
+        };
+        match action {
+            SettingsAction::SelectTab(tab) => settings.tab = *tab,
+            SettingsAction::SetAppPreset {
+                app,
+                direction,
+                preset,
+            } => {
+                let lane = settings
+                    .apps
+                    .iter_mut()
+                    .filter(|row| row.app == *app)
+                    .flat_map(|row| row.lanes.iter_mut())
+                    .find(|lane| lane.direction == *direction);
+                if let Some(lane) = lane {
+                    lane.preset.clone_from(preset);
+                }
+            }
+            SettingsAction::ForgetApp(app) => {
+                settings.apps.retain(|row| row.app != *app || row.running);
+                for row in settings.apps.iter_mut().filter(|row| row.app == *app) {
+                    for lane in &mut row.lanes {
+                        lane.preset = None;
+                    }
+                }
+            }
+            SettingsAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            _ => {}
+        }
+    }
+
     fn toggle_theme(&mut self, ctx: &egui::Context) {
         self.state.theme = match self.state.theme {
             ThemeMode::Dark => ThemeMode::Light,
@@ -343,7 +486,7 @@ impl eframe::App for Preview {
         if notice {
             self.state.notify(DEFAULT_NOTICE);
         }
-        if view {
+        if view && self.settings.is_none() {
             self.toggle_view(&ctx);
         }
         if palette {
@@ -355,6 +498,28 @@ impl eframe::App for Preview {
 
         self.animate(time);
         self.state.expire_notification(std::time::Instant::now());
+
+        if let Some(settings) = &self.settings {
+            let outer = egui::Rect::from_min_size(ui.max_rect().min, settings::WINDOW_SIZE);
+            let actions = SettingsDialog::new(settings)
+                .show(
+                    ui,
+                    outer,
+                    Palette::new(self.state.theme),
+                    &mut self.assets,
+                    &mut self.icons,
+                )
+                .actions;
+            for action in &actions {
+                self.handle_settings(&ctx, action);
+            }
+            self.frames += 1;
+            if self.exit_after_paint && self.frames > 120 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            return;
+        }
 
         let response = views::show(
             ui,

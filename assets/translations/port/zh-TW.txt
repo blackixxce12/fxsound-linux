@@ -100,3 +100,6 @@ countries: Taiwan
 "the echo canceller stopped" = "回音消除已停止"
 "waiting for the speakers" = "正在等待喇叭"
 "Applications that used %s now follow FxSound's preset" = "使用 %s 的應用程式現在跟隨 FxSound 的預設"
+"Applications" = "應用程式"
+"FxSound's preset" = "FxSound 的預設"
+"No application has played or recorded through FxSound yet" = "尚無應用程式透過 FxSound 播放或錄音"

@@ -100,3 +100,6 @@ countries: tr
 "the echo canceller stopped" = "yankı engelleme durdu"
 "waiting for the speakers" = "hoparlörler bekleniyor"
 "Applications that used %s now follow FxSound's preset" = "%s kullanan uygulamalar artık FxSound'un ön ayarını izliyor"
+"Applications" = "Uygulamalar"
+"FxSound's preset" = "FxSound'un ön ayarı"
+"No application has played or recorded through FxSound yet" = "Henüz hiçbir uygulama FxSound üzerinden çalmadı veya kaydetmedi"
