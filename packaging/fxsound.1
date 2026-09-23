@@ -283,11 +283,9 @@ Print the
 .BR \-\-status ", " \-\-watch " or " \-\-self\-test
 report as JSON instead of as lines: one object for
 .B \-\-status
-(with
-.BR output " and " input
-objects and an
-.B input_meters
-block) and for
+(schema 2, described under
+.BR "STATUS DOCUMENT" )
+and for
 .B \-\-self\-test
 .RB ( version ", " checks ", " ok ),
 one object per line for
@@ -328,8 +326,9 @@ Check the installation and exit: the version; that the factory
 presets and the voice presets are found under the install prefix and parse;
 that the settings file parses; an offline run of both processing chains with
 RNNoise instantiated; that the desktop entry, the icons (application and
-status), the systemd unit, this manual page and the AppStream metainfo are
-present; that the runtime directory can be created. Run from a source tree,
+status), the systemd unit, the D-Bus activation file, this manual page and the
+AppStream metainfo are present, and that the unit and the activation file
+start this binary; that the runtime directory can be created. Run from a source tree,
 the install-only files are reported as
 .BR skip .
 PipeWire and the session bus are reported as
@@ -380,6 +379,135 @@ found at least one failing check, or FxSound itself could not start.
 .B 2
 The command line could not be parsed \(en an unknown option, or a value outside
 its range.
+.SH STATUS DOCUMENT
+.B \-\-status \-\-json
+prints one JSON object. D-Bus
+.B GetStatus
+answers with the same object and
+.B \-\-watch
+opens with it. It carries every key 0.3.0 printed, with the same meaning,
+and every key the Windows build's
+.B \-\-status
+writes (marked
+.IR upstream ),
+with that build's meaning and JSON type, so a client written for either reads
+it. Keys are only ever added; a key that changed its meaning would change
+.BR schema .
+The effects, the equalizer and
+.BR preset ", " presets " and " selected_preset
+are the edit direction's: the lane the window shows.
+.TP
+.B schema
+2. The 0.3.0 document had no number and is schema 1.
+.TP
+.BR version ", " power
+.RI ( upstream )
+The version, and whether processing is on.
+.TP
+.BR audio ", " preset ", " device ", " direction ", " edit_direction ", " view ", " theme
+The edit direction's lane
+.RB ( processing ", " idle " or " unavailable ),
+its preset with
+.B *
+for unsaved changes, its device by description, the edit direction
+.RB ( output " or " input ,
+under both names), and the window's view and theme.
+.TP
+.B effects
+.BR fidelity ", " ambience ", " surround ", " dynamic_boost " and " bass
+on their 0\(en10 scale, and
+.RI ( upstream )
+.BR clarity " and " dynamicboost ,
+the same values as
+.BR fidelity " and " dynamic_boost .
+Exact: a whole value is written as an integer, as 0.3.0 wrote every one, and
+any other with its fraction.
+.TP
+.BR master_gain_db ", " balance_db ", " volume_leveling ", " filter_q ", " eq
+The gain stage, and
+.BR eq :
+.BR enabled ", " bands " and " max_bands .
+.TP
+.BR format ", " ring
+The negotiated
+.BR sample_rate " and " channels ,
+and the ring between the two audio nodes since its stream was built:
+.BR dropped_frames ", " underrun_frames ", " resyncs " and " format_mismatches .
+.TP
+.BR output ", " input
+One object per lane:
+.BR enabled ", " device ", " node_name ", " preset " (without " * "), " modified
+and
+.BR active ;
+.B input
+adds
+.BR noise_suppression " and " denoise_level .
+A detached lane has
+.B null
+for its device.
+.TP
+.BR input_meters ", " echo_cancel
+The microphone's telemetry
+.RB ( voice_probability ", " noise_floor_db ,
+.B null
+until measured, the
+.B _reduction_db
+of the denoiser, gate, compressor and de-esser, and whether the denoiser and
+the de-esser are running), and the echo canceller's
+.BR on " and " running .
+.TP
+.B presets
+.RI ( upstream )
+.B built_in
+and
+.BR user_defined :
+arrays of
+.BR name " and " modified ,
+in the order the preset list shows them.
+.BR output_presets " and " input_presets
+are the same for each lane, whichever the window shows.
+.TP
+.B selected_preset
+.RI ( upstream )
+The preset by the name
+.B \-\-preset
+takes, or
+.B null
+while the lane has none.
+.TP
+.BR output_devices ", " input_devices
+Arrays of names: the description of each device PipeWire has now, in the
+order of
+.BR output_device_list " and " input_device_list .
+.B output_devices
+is
+.IR upstream .
+.TP
+.BR output_device_list ", " input_device_list
+Arrays of
+.BR node_name ", " description " and " present :
+every device the lane's priority list knows, in its order, then any it has
+not learnt yet;
+.B present
+is whether PipeWire has it now, and a device that is not keeps the
+description it was last seen with.
+.TP
+.BR selected_output ", " selected_input
+Each lane's device by description, or
+.B null
+while the lane is detached.
+.B selected_output
+is
+.IR upstream .
+.TP
+.B equalizer
+.RI ( upstream )
+.BR num_bands ", " master_gain " (dB), " volume_leveling ", " filter_q ,
+.BR balance " (dB) and " bands :
+an array of
+.BR index ", " frequency " (Hz), " gain " (dB), " min_frequency " and " max_frequency ,
+the range the band's frequency can be tuned over, which the Windows build
+leaves out.
 .SH D\-BUS
 A running instance also serves an interface on the session bus, for status
 bars, compositor scripts and anything else that would rather hold a connection
@@ -403,15 +531,17 @@ Methods:
 .PP
 .RS 4
 .EX
-TogglePower() \(-> b        SetPower(b)
+TogglePower() \(-> b          SetPower(b)
 NextPreset()               PrevPreset()
 SetPreset(s)               GetPreset() \(-> s
 SetOutput(s)               SetInput(s)
 NextOutput()               NextInput()
 SetNoiseSuppression(s)     SetEditDirection(s)
-GetStatus() \(-> s          (the \-\-status \-\-json document)
+GetStatus() \(-> s            (the \-\-status \-\-json document)
 Show()                     Hide()
 ToggleWindow()             Quit()
+Apply(as argv) \(-> (b ok, s stdout, s stderr)
+ListPresets() \(-> s          ListDevices() \(-> s
 .EE
 .RE
 .PP
@@ -448,6 +578,32 @@ would print; an argument the option would not take either, with
 a command it did not answer within four seconds, with
 .BR org.freedesktop.DBus.Error.Failed .
 .PP
+.B Apply
+runs a whole command line and answers with what
+.B fxsound
+given it would: whether it succeeded, and what it printed on standard output
+and on standard error.
+.I argv
+holds the options without the program name; a leading
+.B fxsound
+is taken too. A line that does not parse, or that the instance refuses,
+answers
+.B false
+with the reason rather than failing the call, and only no answer within four
+seconds fails it. Like the other methods, it leaves the window alone unless
+the line says
+.BR \-\-show ", " \-\-toggle\-window " or " \-\-hide .
+.B ListPresets
+answers with the
+.BR schema ", " edit_direction ", " selected_preset ", " presets ", "
+.BR output_presets " and " input_presets
+of the status document, and
+.B ListDevices
+with its
+.BR schema ", " selected_output ", " selected_input ", "
+.BR output_device_list " and " input_device_list ,
+each as one JSON object.
+.PP
 Properties:
 .BR Version " (s, constant), " Power " (b), " Preset " (s), "
 .BR Output " (s), " Input " (s) and " Direction " (s)."
@@ -481,13 +637,22 @@ prints, and a preset that only gains unsaved changes sends no
 A name is empty for a lane that has no preset or no device.
 .PP
 If the name is already taken on the bus, the instance logs that and serves the
-control socket only. With
+control socket only. A call made while FxSound is not running starts it
+first, in the tray: the bus reads
+.I /usr/share/dbus\-1/services/org.fxsound.FxSound.service
+and hands the start to the systemd user unit,
+.IR fxsound.service ,
+or runs
+.B fxsound \-\-hide
+itself where the bus has no systemd. With
 .BR busctl (1):
 .PP
 .RS 4
 .EX
 busctl \-\-user call org.fxsound.FxSound /org/fxsound/FxSound \e
     org.fxsound.FxSound SetPreset s Rock
+busctl \-\-user call org.fxsound.FxSound /org/fxsound/FxSound \e
+    org.fxsound.FxSound Apply as 2 \-\- \-\-preset=Rock \-\-set_effect=bass:7.5
 busctl \-\-user get\-property org.fxsound.FxSound /org/fxsound/FxSound \e
     org.fxsound.FxSound Power
 busctl \-\-user monitor org.fxsound.FxSound
@@ -568,6 +733,11 @@ connection stays open and receives one JSON line per event.
 A systemd user unit, installed but not enabled. See
 .B NOTES
 below.
+.TP
+.I /usr/share/dbus\-1/services/org.fxsound.FxSound.service
+Starts FxSound, through that unit, when a D-Bus call arrives for it and it is
+not running. See
+.BR D\-BUS .
 .TP
 .I /usr/share/icons/hicolor/scalable/status/com.fxsound.FxSound\-{off,on,processing}.svg
 The tray icon's three states, looked up by name by the StatusNotifier host.

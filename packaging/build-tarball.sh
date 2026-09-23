@@ -15,6 +15,7 @@
 #
 #   bin/fxsound
 #   lib/systemd/user/fxsound.service
+#   share/dbus-1/services/org.fxsound.FxSound.service
 #   share/applications/com.fxsound.FxSound.desktop
 #   share/icons/hicolor/{256x256,32x32}/apps/fxsound.png
 #   share/icons/hicolor/scalable/status/com.fxsound.FxSound-{off,on,processing}.svg
@@ -48,6 +49,9 @@ install -Dm644 packaging/fxsound.desktop "${pkg}/share/applications/com.fxsound.
 # Installed as written, with ExecStart=/usr/bin/fxsound; install.sh below rewrites that for the
 # prefix it is given, because a unit that points at /usr/bin on a /usr/local install starts nothing.
 install -Dm644 packaging/fxsound.service "${pkg}/lib/systemd/user/fxsound.service"
+# D-Bus activation, with Exec=/usr/bin/fxsound rewritten by install.sh as the unit is.
+install -Dm644 packaging/org.fxsound.FxSound.service \
+  "${pkg}/share/dbus-1/services/org.fxsound.FxSound.service"
 # The two icon sizes the tree actually carries, at the paths packaging/PKGBUILD uses.
 install -Dm644 assets/images/fxsound_large.png \
   "${pkg}/share/icons/hicolor/256x256/apps/fxsound.png"
@@ -98,12 +102,14 @@ mkdir -p "${prefix}"
 cp -a "${here}/bin" "${here}/share" "${prefix}/"
 [ -d "${here}/lib" ] && cp -a "${here}/lib" "${prefix}/"
 
-# The unit ships with the path every package uses. Point it at the binary that was just
-# installed; on a /usr prefix this changes nothing.
-unit="${prefix}/lib/systemd/user/fxsound.service"
-if [ -f "${unit}" ] && [ "${prefix}" != /usr ]; then
-  sed -i "s|/usr/bin/fxsound|${prefix}/bin/fxsound|g" "${unit}"
-fi
+# The unit and the D-Bus activation file ship with the path every package uses. Point them at
+# the binary that was just installed; on a /usr prefix this changes nothing.
+for started in "${prefix}/lib/systemd/user/fxsound.service" \
+  "${prefix}/share/dbus-1/services/org.fxsound.FxSound.service"; do
+  if [ -f "${started}" ] && [ "${prefix}" != /usr ]; then
+    sed -i "s|/usr/bin/fxsound|${prefix}/bin/fxsound|g" "${started}"
+  fi
+done
 
 echo "done. Run 'fxsound', or 'systemctl --user enable --now fxsound' to start it at login."
 echo "FxSound needs a running PipeWire session; it does not replace one."

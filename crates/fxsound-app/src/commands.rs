@@ -415,14 +415,27 @@ fn run_preset(app: &mut App, command: &PresetCommand) -> Outcome {
     Outcome::default()
 }
 
+/// The shape of [`StatusDocument`], as its `schema` key says it. 0.3.0's document had no number
+/// and is schema 1; 2 is 0.4.0's, every key of 1 kept and upstream's `printStatus` keys added.
+pub const STATUS_SCHEMA: u32 = 2;
+
 /// Everything `--status` reports, in the shape `--status --json` prints it.
 ///
 /// Every key 0.3.0 printed is still here and still means what it meant, read for the **edit
 /// direction** where 0.3.0 had a single selection — `preset`, `device` and `direction` are what the
-/// window shows. 0.4.0 adds a block per lane, the microphone's telemetry and the echo canceller.
-/// Public so the event stream's `status` event and D-Bus `GetStatus` send this same document.
+/// window shows. 0.4.0 adds a block per lane, the microphone's telemetry and the echo canceller,
+/// and is a superset of the document upstream's `--status` writes (`FxController::printStatus`,
+/// `FxController.cpp:609-683`; review item U14): `presets`, `selected_preset`,
+/// `output_devices`, `selected_output`, `equalizer` and upstream's names in `effects` mean what
+/// they mean there and have the JSON kinds they have there, so a client written against the
+/// Windows build (`fxmcp`'s `status.go`) reads this one. What upstream's names cannot carry goes
+/// under names of its own: each device's `node_name` and whether it is present, in
+/// `output_device_list` and `input_device_list`. Public so the event stream's `status` event and
+/// D-Bus `GetStatus` send this same document.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatusDocument {
+    /// [`STATUS_SCHEMA`].
+    pub schema: u32,
     pub version: &'static str,
     pub power: bool,
     /// The edit direction's lane: `processing`, `idle`, or `unavailable` without an engine.
@@ -450,16 +463,150 @@ pub struct StatusDocument {
     pub input: InputLaneStatus,
     pub input_meters: InputMeters,
     pub echo_cancel: EchoCancelStatus,
+    /// The edit direction's presets, as upstream lists its one set: factory and bonus presets
+    /// under `built_in`, the user's own under `user_defined`.
+    pub presets: PresetLists,
+    /// The edit direction's preset by the name `--preset` takes; `null` while the lane has none.
+    pub selected_preset: Option<String>,
+    /// The speakers' presets, whichever lane the window is editing.
+    pub output_presets: PresetLists,
+    /// The microphone's voice presets, whichever lane the window is editing.
+    pub input_presets: PresetLists,
+    /// The playback devices PipeWire has now, by description, in `output_device_list`'s order:
+    /// upstream's list, an array of names (`FxController.cpp:638-644`), which `status.go` reads
+    /// as `[]string`.
+    pub output_devices: Vec<String>,
+    /// The same for the microphones.
+    pub input_devices: Vec<String>,
+    /// Every playback device the priority list knows, in its order, present or not, and any it
+    /// does not know yet after them.
+    pub output_device_list: Vec<DeviceStatus>,
+    /// The same for the microphones.
+    pub input_device_list: Vec<DeviceStatus>,
+    /// The output lane's device by description, as upstream names it; `null` while detached.
+    pub selected_output: Option<String>,
+    /// The input lane's microphone by description; `null` while detached.
+    pub selected_input: Option<String>,
+    /// The edit direction's equalizer and gain stage, band by band.
+    pub equalizer: Equalizer,
 }
 
-/// The five effect sliders, on their `0..=10` scale, rounded as 0.3.0 printed them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// A value on a control's own scale, as the document prints it: exactly, and a whole number
+/// without a fraction.
+///
+/// 0.3.0 printed the effect levels rounded to whole numbers, and a reader that decodes them into
+/// an integer — Go's `encoding/json` into an `int`, for one — rejects `7.0`. Upstream prints them
+/// as they are, and `--set_effect=bass:7.5` read back as 8 here (review item U14). So a whole
+/// number goes out as `7`, which both kinds of reader take, and anything else as the shortest
+/// decimal of the `f32` the controller holds rather than the noise of its widening
+/// (`0.93_f32 as f64` is `0.9300000071525574`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Level(pub f32);
+
+impl Level {
+    /// The whole number this is, if it is one.
+    fn whole(self) -> Option<i64> {
+        // Far inside `i64` and exact in `f32`; no control's scale comes near it.
+        const LIMIT: f32 = 16_777_216.0;
+        (self.0.is_finite() && self.0.fract() == 0.0 && self.0.abs() <= LIMIT)
+            .then_some(self.0 as i64)
+    }
+}
+
+impl Serialize for Level {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.whole() {
+            Some(whole) => serializer.serialize_i64(whole),
+            None => serializer.serialize_f64(exact(self.0)),
+        }
+    }
+}
+
+impl std::fmt::Display for Level {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.whole() {
+            Some(whole) => write!(f, "{whole}"),
+            None => write!(f, "{}", exact(self.0)),
+        }
+    }
+}
+
+/// `value` as the `f64` whose shortest decimal is the `f32`'s own, and `0` for what JSON cannot
+/// carry.
+pub(crate) fn exact(value: f32) -> f64 {
+    if value.is_finite() {
+        value.to_string().parse().unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// The five effect sliders, on their `0..=10` scale: 0.3.0's names, then upstream's names for the
+/// two it calls otherwise (`FxController.cpp:666-670`), with the same values.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct EffectLevels {
-    pub fidelity: i64,
-    pub ambience: i64,
-    pub surround: i64,
-    pub dynamic_boost: i64,
-    pub bass: i64,
+    pub fidelity: Level,
+    pub ambience: Level,
+    pub surround: Level,
+    pub dynamic_boost: Level,
+    pub bass: Level,
+    /// `fidelity`, by upstream's name.
+    pub clarity: Level,
+    /// `dynamic_boost`, by upstream's name.
+    pub dynamicboost: Level,
+}
+
+/// One lane's presets, split as upstream splits them (`FxController.cpp:616-634`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PresetLists {
+    pub built_in: Vec<PresetStatus>,
+    pub user_defined: Vec<PresetStatus>,
+}
+
+/// One preset: its name and whether it carries unsaved changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PresetStatus {
+    pub name: String,
+    pub modified: bool,
+}
+
+/// One device a lane can be attached to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceStatus {
+    /// What `--output`/`--input` and the settings file take.
+    pub node_name: String,
+    /// What the window's combo shows; the one last seen for a device that is not present.
+    pub description: String,
+    /// Whether PipeWire has the device now.
+    pub present: bool,
+}
+
+/// Upstream's `equalizer` block (`FxController.cpp:647-663`), for the edit direction.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Equalizer {
+    pub num_bands: usize,
+    /// dB.
+    pub master_gain: Level,
+    pub volume_leveling: f64,
+    pub filter_q: f64,
+    /// dB, negative to the left.
+    pub balance: Level,
+    pub bands: Vec<BandStatus>,
+}
+
+/// One equalizer band, with the range its frequency can be tuned over — what upstream's
+/// frequency slider allows (`GraphicEqGet.cpp:105-168`), which its `printStatus` leaves out.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct BandStatus {
+    pub index: usize,
+    /// Hz.
+    pub frequency: f64,
+    /// dB.
+    pub gain: f64,
+    /// Hz.
+    pub min_frequency: f64,
+    /// Hz.
+    pub max_frequency: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -558,9 +705,13 @@ pub fn status_document(app: &App) -> StatusDocument {
             },
         }
     };
-    let effect = |effect: Effect| state.effect(effect).round() as i64;
+    let effect = |effect: Effect| Level(state.effect(effect));
+    let presets = |lane: DeviceDirection| preset_lists(&app.lane_preset_list(lane));
+    let output_device_list = device_list(app, DeviceDirection::Output);
+    let input_device_list = device_list(app, DeviceDirection::Input);
 
     StatusDocument {
+        schema: STATUS_SCHEMA,
         version: env!("CARGO_PKG_VERSION"),
         power: state.power,
         audio: if !app.has_audio() {
@@ -588,6 +739,8 @@ pub fn status_document(app: &App) -> StatusDocument {
             surround: effect(Effect::Surround),
             dynamic_boost: effect(Effect::DynamicBoost),
             bass: effect(Effect::Bass),
+            clarity: effect(Effect::Fidelity),
+            dynamicboost: effect(Effect::DynamicBoost),
         },
         master_gain_db: state.master_gain_db.round() as i64,
         balance_db: state.balance_db.round() as i64,
@@ -619,6 +772,117 @@ pub fn status_document(app: &App) -> StatusDocument {
             on: state.echo_cancel_on,
             running: state.echo_cancel_running,
         },
+        presets: preset_lists(&state.presets),
+        selected_preset: state.preset().map(|p| p.name.clone()),
+        output_presets: presets(DeviceDirection::Output),
+        input_presets: presets(DeviceDirection::Input),
+        output_devices: device_names(&output_device_list),
+        input_devices: device_names(&input_device_list),
+        output_device_list,
+        input_device_list,
+        selected_output: state
+            .device_for(DeviceDirection::Output)
+            .map(|d| d.description.clone()),
+        selected_input: state
+            .device_for(DeviceDirection::Input)
+            .map(|d| d.description.clone()),
+        equalizer: equalizer(state),
+    }
+}
+
+/// A preset list split into factory and user presets, each keeping the picker's order.
+fn preset_lists(entries: &[fxsound_ui::state::PresetEntry]) -> PresetLists {
+    let (built_in, user_defined): (Vec<_>, Vec<_>) =
+        entries.iter().partition(|entry| entry.factory);
+    let status = |entries: Vec<&fxsound_ui::state::PresetEntry>| {
+        entries
+            .into_iter()
+            .map(|entry| PresetStatus {
+                name: entry.name.clone(),
+                modified: entry.modified,
+            })
+            .collect()
+    };
+    PresetLists {
+        built_in: status(built_in),
+        user_defined: status(user_defined),
+    }
+}
+
+/// `direction`'s devices: the priority list's, most preferred first, present or not, then any
+/// device present that the list has not learnt yet — the order the window's combo offers them in.
+fn device_list(app: &App, direction: DeviceDirection) -> Vec<DeviceStatus> {
+    let live = |name: &str| {
+        app.state
+            .devices
+            .iter()
+            .find(|d| d.direction == direction && d.name == name)
+    };
+    let mut list: Vec<DeviceStatus> = crate::priority::ranked(app.settings(), direction)
+        .map(|config| {
+            let device = live(&config.device_id);
+            DeviceStatus {
+                node_name: config.device_id.clone(),
+                description: device
+                    .map_or_else(|| config.device_name.clone(), |d| d.description.clone()),
+                present: device.is_some(),
+            }
+        })
+        .collect();
+    for device in app
+        .state
+        .devices
+        .iter()
+        .filter(|d| d.direction == direction)
+    {
+        if !list.iter().any(|known| known.node_name == device.name) {
+            list.push(DeviceStatus {
+                node_name: device.name.clone(),
+                description: device.description.clone(),
+                present: true,
+            });
+        }
+    }
+    list
+}
+
+/// Upstream's `output_devices`: of `list`, the devices present, by the name the combo shows,
+/// in its order.
+fn device_names(list: &[DeviceStatus]) -> Vec<String> {
+    list.iter()
+        .filter(|device| device.present)
+        .map(|device| device.description.clone())
+        .collect()
+}
+
+/// Upstream's `equalizer` block, from the edit direction's controls. The bands' ranges are the
+/// equalizer's own (`fxsound_dsp::eq::band_frequency_range` over the band count's table).
+fn equalizer(state: &UiState) -> Equalizer {
+    let count = state.eq_bands.len();
+    let (min_hz, max_hz) = fxsound_dsp::eq::band_table(count)
+        .map_or((20.0, 20_000.0), |(_, min_hz, max_hz)| (min_hz, max_hz));
+    Equalizer {
+        num_bands: count,
+        master_gain: Level(state.master_gain_db),
+        volume_leveling: exact(state.volume_leveling),
+        filter_q: exact(state.filter_q),
+        balance: Level(state.balance_db),
+        bands: state
+            .eq_bands
+            .iter()
+            .enumerate()
+            .map(|(index, band)| {
+                let (low, high) =
+                    fxsound_dsp::eq::band_frequency_range(index, count, min_hz, max_hz);
+                BandStatus {
+                    index,
+                    frequency: exact(band.center_hz),
+                    gain: exact(band.boost_db),
+                    min_frequency: exact(low),
+                    max_frequency: exact(high),
+                }
+            })
+            .collect(),
     }
 }
 
@@ -1023,6 +1287,425 @@ mod tests {
         ] {
             assert_eq!(json["ring"][key].as_u64(), Some(0), "ring.{key}: {json}");
         }
+    }
+
+    /// What `fxmcp`'s `status.go` decodes (upstream `fxmcp/internal/fxsound/status.go:18-72`), by
+    /// JSON kind: every key `FxController::printStatus` writes.
+    fn assert_upstream_shape(json: &Value) {
+        assert!(json["version"].is_string(), "version: {json}");
+        assert!(json["power"].is_boolean(), "power: {json}");
+        for list in ["built_in", "user_defined"] {
+            for preset in json["presets"][list]
+                .as_array()
+                .expect("an array of presets")
+            {
+                assert!(preset["name"].is_string(), "{preset}");
+                assert!(preset["modified"].is_boolean(), "{preset}");
+            }
+        }
+        assert!(
+            json["selected_preset"].is_string() || json["selected_preset"].is_null(),
+            "{json}"
+        );
+        // `OutputDevices []string`: one object in it and the whole document fails to decode.
+        for device in json["output_devices"]
+            .as_array()
+            .expect("an array of devices")
+        {
+            assert!(device.is_string(), "output_devices: {json}");
+        }
+        assert!(
+            json["selected_output"].is_string() || json["selected_output"].is_null(),
+            "{json}"
+        );
+        let equalizer = &json["equalizer"];
+        assert!(equalizer["num_bands"].is_u64(), "{equalizer}");
+        for key in ["master_gain", "volume_leveling", "filter_q", "balance"] {
+            assert!(equalizer[key].is_number(), "equalizer.{key}: {equalizer}");
+        }
+        for band in equalizer["bands"].as_array().expect("an array of bands") {
+            assert!(band["index"].is_u64(), "{band}");
+            assert!(band["frequency"].is_number(), "{band}");
+            assert!(band["gain"].is_number(), "{band}");
+        }
+        for key in ["clarity", "ambience", "surround", "dynamicboost", "bass"] {
+            assert!(json["effects"][key].is_number(), "effects.{key}: {json}");
+        }
+    }
+
+    #[test]
+    fn the_json_is_a_superset_of_what_upstreams_status_writes_and_names_its_schema() {
+        let mut a = app_with_presets("upstream-shape");
+        a.receive(fxsound_core::messages::AudioToUi::Devices(mixed_devices()));
+        let json = status(&mut a);
+        assert_eq!(json["schema"].as_u64(), Some(u64::from(STATUS_SCHEMA)));
+        assert_eq!(STATUS_SCHEMA, 2);
+        assert_upstream_shape(&json);
+        assert_eq!(
+            json["output_devices"].as_array().map(Vec::len),
+            Some(2),
+            "both outputs, so every element was looked at: {json}"
+        );
+        assert_eq!(json["equalizer"]["num_bands"].as_u64(), Some(10));
+        assert_eq!(
+            json["equalizer"]["bands"].as_array().map(Vec::len),
+            Some(10)
+        );
+        assert_eq!(json["selected_preset"], json["output"]["preset"]);
+
+        // And with nothing listed and nothing selected, it still decodes.
+        let mut bare = app();
+        assert_upstream_shape(&status(&mut bare));
+    }
+
+    /// `fxmcp`'s `Status` (upstream `fxmcp/internal/fxsound/status.go:18-72`), field for field,
+    /// in the serde types that take what the Go types take: a key of another JSON kind fails the
+    /// decode, as it fails `json.Unmarshal` of the whole document. Go reads a `null` string as
+    /// the empty one, hence the `Option`s.
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code, reason = "decoding is the test; nothing reads the fields")]
+    struct UpstreamStatus {
+        version: String,
+        power: bool,
+        presets: UpstreamPresets,
+        selected_preset: Option<String>,
+        output_devices: Vec<String>,
+        selected_output: Option<String>,
+        equalizer: UpstreamEqualizer,
+        effects: UpstreamEffects,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code, reason = "decoding is the test; nothing reads the fields")]
+    struct UpstreamPresets {
+        built_in: Vec<UpstreamPreset>,
+        user_defined: Vec<UpstreamPreset>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code, reason = "decoding is the test; nothing reads the fields")]
+    struct UpstreamPreset {
+        name: String,
+        modified: bool,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code, reason = "decoding is the test; nothing reads the fields")]
+    struct UpstreamEqualizer {
+        num_bands: i64,
+        master_gain: f64,
+        volume_leveling: f64,
+        filter_q: f64,
+        balance: f64,
+        bands: Vec<UpstreamBand>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code, reason = "decoding is the test; nothing reads the fields")]
+    struct UpstreamBand {
+        index: i64,
+        frequency: f64,
+        gain: f64,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[allow(dead_code, reason = "decoding is the test; nothing reads the fields")]
+    struct UpstreamEffects {
+        clarity: f64,
+        ambience: f64,
+        surround: f64,
+        dynamicboost: f64,
+        bass: f64,
+    }
+
+    #[test]
+    fn the_json_decodes_into_the_status_type_fxmcp_reads_upstreams_into() {
+        let mut a = app_with_presets("upstream-decode");
+        a.receive(fxsound_core::messages::AudioToUi::Devices(mixed_devices()));
+        run(&mut a, &[Command::Effects(vec![(Effect::Bass, 7.5)])]);
+        let text = run(&mut a, &[Command::Status { json: true }]).stdout;
+        let decoded: UpstreamStatus = serde_json::from_str(&text).expect("status.go's Status");
+        assert_eq!(
+            decoded.output_devices,
+            [
+                "Ryzen HD Audio Controller Analogue Stereo",
+                "fifine Microphone Analogue Stereo"
+            ]
+        );
+
+        let mut bare = app();
+        let text = run(&mut bare, &[Command::Status { json: true }]).stdout;
+        let decoded: UpstreamStatus = serde_json::from_str(&text).expect("status.go's Status");
+        assert!(decoded.output_devices.is_empty());
+        let _ = std::fs::remove_dir_all(user_dir("upstream-decode").parent().expect("the root"));
+    }
+
+    #[test]
+    fn an_effect_set_to_a_fraction_reads_back_as_set_under_both_names() {
+        // `--set_effect=bass:7.5` read back as 8 in 0.3.0 (review item U14).
+        let mut a = app();
+        run(
+            &mut a,
+            &[Command::Effects(vec![
+                (Effect::Bass, 7.5),
+                (Effect::Fidelity, 3.3),
+                (Effect::DynamicBoost, 6.0),
+            ])],
+        );
+        let json = status(&mut a);
+        let effects = &json["effects"];
+        assert_eq!(effects["bass"].as_f64(), Some(7.5));
+        assert_eq!(
+            effects["fidelity"].as_f64(),
+            Some(3.3),
+            "not 3.299999952316284"
+        );
+        assert_eq!(effects["clarity"], effects["fidelity"]);
+        assert_eq!(
+            effects["dynamic_boost"].as_i64(),
+            Some(6),
+            "a whole value stays whole"
+        );
+        assert_eq!(effects["dynamicboost"], effects["dynamic_boost"]);
+        let lines = status_lines(&mut a);
+        assert_eq!(line(&lines, "bass"), "7.5");
+        assert_eq!(line(&lines, "dynamic_boost"), "6");
+    }
+
+    #[test]
+    fn a_level_is_whole_when_it_is_whole_and_exact_when_it_is_not() {
+        let json = |value: f32| serde_json::to_string(&Level(value)).expect("serialises");
+        assert_eq!(json(7.0), "7");
+        assert_eq!(json(-6.0), "-6");
+        assert_eq!(json(-0.0), "0");
+        assert_eq!(json(7.5), "7.5");
+        assert_eq!(json(0.93), "0.93");
+        assert_eq!(json(f32::NAN), "0.0");
+        assert_eq!(Level(-0.5).to_string(), "-0.5");
+        assert_eq!(Level(10.0).to_string(), "10");
+    }
+
+    #[test]
+    fn the_presets_of_each_lane_are_split_into_built_in_and_user_defined() {
+        let tag = "preset-lists";
+        let mut a = app_with_presets(tag);
+        let first = a.state.presets[0].name.clone();
+        run(&mut a, &[preset(PresetCommand::Select(first))]);
+        run(&mut a, &[Command::BandGains(vec![(0, 6.0)])]);
+        let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("Mine".into()))]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        run(&mut a, &[Command::BandGains(vec![(0, -2.0)])]);
+
+        let names = |lists: &Value, list: &str| -> Vec<(String, bool)> {
+            lists[list]
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|p| {
+                    (
+                        p["name"].as_str().expect("a name").to_owned(),
+                        p["modified"].as_bool().expect("a flag"),
+                    )
+                })
+                .collect()
+        };
+        let json = status(&mut a);
+        let output = &json["output_presets"];
+        assert_eq!(
+            names(output, "built_in"),
+            [("Alpha".to_owned(), false), ("Beta".to_owned(), false)]
+        );
+        assert_eq!(names(output, "user_defined"), [("Mine".to_owned(), true)]);
+        assert_eq!(json["presets"], *output, "the edit direction's");
+        assert_eq!(json["selected_preset"], "Mine", "without the `*`");
+        assert_eq!(
+            names(&json["input_presets"], "built_in"),
+            [
+                ("Clean Voice".to_owned(), false),
+                ("Flat Voice".to_owned(), false)
+            ]
+        );
+
+        // The other way round, and the speakers' list keeps its unsaved changes off screen.
+        run(&mut a, &[Command::EditDirection(DeviceDirection::Input)]);
+        let json = status(&mut a);
+        assert_eq!(json["presets"], json["input_presets"]);
+        assert_eq!(
+            names(&json["output_presets"], "user_defined"),
+            [("Mine".to_owned(), true)]
+        );
+        assert_eq!(json["selected_preset"], json["input"]["preset"]);
+        let _ = std::fs::remove_dir_all(user_dir(tag).parent().expect("the root"));
+    }
+
+    #[test]
+    fn the_device_lists_follow_the_priority_list_and_say_which_devices_are_present() {
+        use fxsound_core::messages::AudioToUi;
+        let mut a = app();
+        a.receive(AudioToUi::Devices(mixed_devices()));
+        // The fifine unplugged: the list still knows both halves of it.
+        let without_fifine: Vec<AudioDevice> = mixed_devices()
+            .into_iter()
+            .filter(|d| !d.name.contains("fifine"))
+            .collect();
+        a.receive(AudioToUi::Devices(without_fifine));
+        run(
+            &mut a,
+            &[Command::Output(OutputCommand::Select(
+                "alsa_output.pci".into(),
+            ))],
+        );
+
+        let json = status(&mut a);
+        let devices = |key: &str| -> Vec<(String, String, bool)> {
+            json[key]
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|d| {
+                    (
+                        d["node_name"].as_str().expect("a node name").to_owned(),
+                        d["description"].as_str().expect("a description").to_owned(),
+                        d["present"].as_bool().expect("a flag"),
+                    )
+                })
+                .collect()
+        };
+        let outputs = devices("output_device_list");
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|(name, _, present)| (name.as_str(), *present))
+                .collect::<Vec<_>>(),
+            [("alsa_output.pci", true), ("alsa_output.usb-fifine", false)]
+        );
+        assert_eq!(
+            outputs[1].1, "fifine Microphone Analogue Stereo",
+            "the description last seen"
+        );
+        let inputs = devices("input_device_list");
+        assert_eq!(inputs.len(), 2, "{inputs:?}");
+        assert!(
+            inputs
+                .iter()
+                .all(|(name, ..)| name.starts_with("alsa_input."))
+        );
+        // Upstream's lists: the names of the devices there are, the unplugged one left out.
+        assert_eq!(
+            json["output_devices"],
+            serde_json::json!(["Ryzen HD Audio Controller Analogue Stereo"])
+        );
+        assert_eq!(
+            json["input_devices"],
+            serde_json::json!(["Ryzen HD Audio Controller Analogue Stereo"])
+        );
+        assert_eq!(
+            json["selected_output"],
+            "Ryzen HD Audio Controller Analogue Stereo"
+        );
+        assert_eq!(json["selected_output"], json["output"]["device"]);
+        assert_eq!(json["selected_input"], json["input"]["device"]);
+    }
+
+    #[test]
+    fn a_device_the_priority_list_has_not_learnt_yet_is_listed_after_the_ones_it_has() {
+        use fxsound_core::messages::AudioToUi;
+        let mut a = app();
+        let pci = |d: &AudioDevice| d.name.ends_with(".pci");
+        a.receive(AudioToUi::Devices(
+            mixed_devices().into_iter().filter(pci).collect(),
+        ));
+        // A list the controller has not learnt from yet, the newcomer first.
+        let (mut devices, known): (Vec<AudioDevice>, Vec<AudioDevice>) =
+            mixed_devices().into_iter().partition(|d| !pci(d));
+        devices.extend(known);
+        a.state.devices = devices;
+
+        let json = status(&mut a);
+        for (key, expected) in [
+            (
+                "output_device_list",
+                ["alsa_output.pci", "alsa_output.usb-fifine"],
+            ),
+            (
+                "input_device_list",
+                ["alsa_input.pci", "alsa_input.usb-fifine"],
+            ),
+        ] {
+            let listed: Vec<(&str, bool)> = json[key]
+                .as_array()
+                .expect("an array")
+                .iter()
+                .map(|d| {
+                    (
+                        d["node_name"].as_str().expect("a node name"),
+                        d["present"].as_bool().expect("a flag"),
+                    )
+                })
+                .collect();
+            assert_eq!(listed, [(expected[0], true), (expected[1], true)], "{key}");
+        }
+        assert_eq!(
+            json["output_devices"],
+            serde_json::json!([
+                "Ryzen HD Audio Controller Analogue Stereo",
+                "fifine Microphone Analogue Stereo"
+            ]),
+            "upstream's list, in the same order"
+        );
+    }
+
+    #[test]
+    fn each_band_reports_the_range_the_windows_frequency_slider_allows() {
+        let mut a = app();
+        run(
+            &mut a,
+            &[
+                Command::MasterGain(-3.0),
+                Command::Balance(2.0),
+                Command::VolumeLeveling(1.5),
+                Command::BandGains(vec![(2, 4.5)]),
+            ],
+        );
+        for count in [10_usize, 5, 15, 20, 31] {
+            run(&mut a, &[Command::NumBands(count as u32)]);
+            let json = status(&mut a);
+            let equalizer = &json["equalizer"];
+            assert_eq!(equalizer["num_bands"].as_u64(), Some(count as u64));
+            let bands = equalizer["bands"].as_array().expect("an array");
+            assert_eq!(bands.len(), count);
+            for (index, band) in bands.iter().enumerate() {
+                let (low, high) =
+                    fxsound_ui::widgets::equalizer::band_frequency_range(index, count);
+                assert_eq!(band["index"].as_u64(), Some(index as u64));
+                assert_eq!(band["min_frequency"].as_f64(), Some(exact(low)), "{band}");
+                assert_eq!(band["max_frequency"].as_f64(), Some(exact(high)), "{band}");
+                let frequency = band["frequency"].as_f64().expect("a frequency");
+                assert!(
+                    (exact(low)..=exact(high)).contains(&frequency),
+                    "{count} bands: {band}"
+                );
+                assert_eq!(
+                    band["frequency"].as_f64(),
+                    Some(exact(a.state.eq_bands[index].center_hz))
+                );
+            }
+        }
+        let json = status(&mut a);
+        let equalizer = &json["equalizer"];
+        assert_eq!(
+            equalizer["bands"][30]["max_frequency"].as_f64(),
+            Some(20_000.0)
+        );
+        assert_eq!(equalizer["master_gain"].as_i64(), Some(-3));
+        assert_eq!(equalizer["balance"].as_i64(), Some(2));
+        assert_eq!(equalizer["volume_leveling"].as_f64(), Some(1.5));
+        assert_eq!(equalizer["filter_q"], json["filter_q"]);
+        assert_eq!(
+            json["master_gain_db"].as_i64(),
+            Some(-3),
+            "0.3.0's key as it was"
+        );
     }
 
     #[test]

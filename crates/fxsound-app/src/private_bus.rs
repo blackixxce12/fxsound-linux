@@ -13,15 +13,20 @@ pub(crate) struct PrivateBus {
     pub(crate) address: String,
     /// Kept open: the daemon has nowhere to write otherwise.
     _stdout: BufReader<ChildStdout>,
-    /// The system-like bus's configuration and socket, removed with it.
-    _dir: Option<tempfile::TempDir>,
+    /// The bus's configuration and socket, removed with it.
+    _dir: tempfile::TempDir,
 }
 
 impl PrivateBus {
-    /// A bus with the session bus's rules. `None`, after saying so, where `dbus-daemon` is not
-    /// installed.
+    /// A bus with the session bus's rules and none of its service files. `None`, after saying
+    /// so, where `dbus-daemon` is not installed.
+    ///
+    /// Not `dbus-daemon --session`: that configuration reads `/usr/share/dbus-1/services`, where a
+    /// FxSound package installs `org.fxsound.FxSound.service`, and a call to the name after the
+    /// test's own service let go of it would start the installed FxSound — with this process's
+    /// environment, on the session's PipeWire. Here a call nobody owns the name for just fails.
     pub(crate) fn start() -> Option<Self> {
-        Self::spawn(&["--session"], None)
+        Self::typed("session")
     }
 
     /// A bus of the system's type, as logind speaks on — `<type>system</type>` — listening in a
@@ -29,15 +34,21 @@ impl PrivateBus {
     /// a test own `org.freedesktop.login1`, which the real system bus reserves for root. `None`,
     /// after saying so, where `dbus-daemon` is not installed.
     pub(crate) fn start_system_like() -> Option<Self> {
+        Self::typed("system")
+    }
+
+    /// A bus of type `kind` in a scratch directory, anyone allowed to own any name, and no
+    /// service directory: nothing is ever activated.
+    fn typed(kind: &str) -> Option<Self> {
         let dir = scratch_dir();
-        let config = dir.path().join("system-like.conf");
+        let config = dir.path().join(format!("{kind}-like.conf"));
         std::fs::write(
             &config,
             format!(
                 r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig>
-  <type>system</type>
+  <type>{kind}</type>
   <listen>unix:dir={}</listen>
   <auth>EXTERNAL</auth>
   <policy context="default">
@@ -52,10 +63,10 @@ impl PrivateBus {
         )
         .expect("write the bus configuration");
         let flag = format!("--config-file={}", config.display());
-        Self::spawn(&[flag.as_str()], Some(dir))
+        Self::spawn(&[flag.as_str()], dir)
     }
 
-    fn spawn(config: &[&str], dir: Option<tempfile::TempDir>) -> Option<Self> {
+    fn spawn(config: &[&str], dir: tempfile::TempDir) -> Option<Self> {
         let spawned = std::process::Command::new("dbus-daemon")
             .args(config)
             .args(["--print-address=1", "--nofork"])

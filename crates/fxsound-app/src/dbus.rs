@@ -13,7 +13,8 @@
 //! methods    TogglePower() → b, SetPower(b), NextPreset(), PrevPreset(), SetPreset(s),
 //!            GetPreset() → s, SetOutput(s), SetInput(s), NextOutput(), NextInput(),
 //!            SetNoiseSuppression(s), SetEditDirection(s), GetStatus() → s, Show(), Hide(),
-//!            ToggleWindow(), Quit()
+//!            ToggleWindow(), Quit(), Apply(as argv) → (b ok, s stdout, s stderr),
+//!            ListPresets() → s, ListDevices() → s
 //! properties Version (s, const), Power (b), Preset (s), Output (s), Input (s), Direction (s)
 //! signals    PowerChanged(b), PresetChanged(s direction, s name),
 //!            DeviceChanged(s direction, s node_name, s description), AudioStateChanged(s json),
@@ -31,6 +32,15 @@
 //! answer in time, as `Failed`. What a method does not copy is the original's habit of raising
 //! the window after a command line: a bus call comes from a keybind or a status bar, and only
 //! `Show` and `ToggleWindow` bring the window up.
+//!
+//! `Apply` is the whole command line in one call — what `fxsound ARGV` run beside this instance
+//! prints and exits with, as `(ok, stdout, stderr)`: the argv is read by the parser `fxsound`
+//! reads its own with, so an option it does not know is `ok = false` with the text `fxsound`
+//! prints for it, not a bus error. `ListPresets` and `ListDevices` answer with the parts of the
+//! `--status --json` document that list the presets and the devices (review items U14 and the
+//! D-Bus additions, the prerequisites of an MCP server). The bus starts FxSound for a call when it
+//! is not running: `org.fxsound.FxSound.service` in `/usr/share/dbus-1/services/` hands the start
+//! to `fxsound.service`.
 //!
 //! `Preset`, `GetPreset` and `Direction` are about the edit direction, the lane the window shows,
 //! as `--status`'s `preset:` is. `Output` and `Input` are the lanes' devices by description, as
@@ -71,13 +81,14 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use fxsound_core::DeviceDirection;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
 use zbus::fdo;
 use zbus::object_server::{InterfaceRef, SignalEmitter};
 
 use crate::App;
-use crate::cli::{self, Command, DeviceCommand, PowerCommand, PresetCommand, WindowCommand};
+use crate::cli::{self, Cli, Command, DeviceCommand, PowerCommand, PresetCommand, WindowCommand};
 use crate::events::{AppEvent, EventSink};
 use crate::ipc::{self, Control, Response};
 
@@ -126,6 +137,9 @@ pub enum Call {
     Hide,
     ToggleWindow,
     Quit,
+    Apply(Vec<String>),
+    ListPresets,
+    ListDevices,
 }
 
 impl Call {
@@ -150,6 +164,9 @@ impl Call {
             Self::Hide => "Hide",
             Self::ToggleWindow => "ToggleWindow",
             Self::Quit => "Quit",
+            Self::Apply(_) => "Apply",
+            Self::ListPresets => "ListPresets",
+            Self::ListDevices => "ListDevices",
         }
     }
 
@@ -181,7 +198,9 @@ impl Call {
                 }
                 vec![Command::Preset(PresetCommand::Select(name.clone()))]
             }
-            Self::GetPreset | Self::GetStatus => vec![status()],
+            Self::GetPreset | Self::GetStatus | Self::ListPresets | Self::ListDevices => {
+                vec![status()]
+            }
             Self::SetOutput(device) => vec![Command::Output(device_command(device)?)],
             Self::SetInput(device) => vec![Command::Input(device_command(device)?)],
             Self::NextOutput => vec![Command::Output(DeviceCommand::Next)],
@@ -196,8 +215,92 @@ impl Call {
             Self::Hide => vec![Command::Window(WindowCommand::Hide)],
             Self::ToggleWindow => vec![Command::Window(WindowCommand::Toggle)],
             Self::Quit => vec![Command::Quit],
+            Self::Apply(argv) => apply_commands(argv).map_err(|response| {
+                if response.ok {
+                    response.stdout
+                } else {
+                    response.stderr
+                }
+            })?,
         })
     }
+}
+
+/// `Apply`'s command list: `argv` read by the parser `fxsound` reads its own command line with,
+/// the program name optional, without the window raise a typed line gets for nothing
+/// ([`Cli::commands_without_implicit_raise`]).
+///
+/// # Errors
+///
+/// What `fxsound ARGV` would answer without asking the running instance anything: clap's text
+/// for a line it cannot parse, failed as `fxsound` exits 2 for it; `--help` and `--version`,
+/// which succeed with the text on stdout.
+pub fn apply_commands(argv: &[String]) -> Result<Vec<Command>, Response> {
+    let options = match argv.split_first() {
+        Some((first, rest)) if is_program_name(first) => rest,
+        _ => argv,
+    };
+    let args = std::iter::once("fxsound").chain(options.iter().map(String::as_str));
+    match <Cli as clap::Parser>::try_parse_from(args) {
+        Ok(cli) => Ok(cli.commands_without_implicit_raise()),
+        Err(err) if err.use_stderr() => Err(Response::failed(err.render().to_string())),
+        Err(err) => Err(Response::output(err.render().to_string())),
+    }
+}
+
+/// Whether `arg` is a program name rather than an option: `fxsound`, or a path to it. The line
+/// takes no positional argument, so nothing else is lost by reading it as one.
+fn is_program_name(arg: &str) -> bool {
+    !arg.starts_with('-')
+        && std::path::Path::new(arg)
+            .file_name()
+            .is_some_and(|name| name == "fxsound")
+}
+
+/// `Apply`'s answer: the command line's, whatever it was — only no answer in time is a bus
+/// error, `Failed`, as for every other method: the command may still be running.
+fn applied(response: Response) -> Result<(bool, String, String), MethodError> {
+    if response.is_unanswered() {
+        return Err(fdo::Error::Failed(response.stderr).into());
+    }
+    Ok((response.ok, response.stdout, response.stderr))
+}
+
+/// `ListPresets`'s answer: of the status document, the `schema` it is read by, the edit
+/// direction, its preset and its list, and each lane's list — under the document's own keys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresetListing {
+    pub schema: Value,
+    pub edit_direction: Value,
+    pub selected_preset: Value,
+    pub presets: Value,
+    pub output_presets: Value,
+    pub input_presets: Value,
+}
+
+/// `ListDevices`'s answer: of the status document, the `schema` it is read by, each lane's
+/// device and each lane's list of devices with their node names — under the document's own keys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceListing {
+    pub schema: Value,
+    pub selected_output: Value,
+    pub selected_input: Value,
+    pub output_device_list: Value,
+    pub input_device_list: Value,
+}
+
+/// A listing out of the status document, as one JSON object: `PresetListing` or
+/// `DeviceListing`.
+///
+/// # Errors
+///
+/// A document that is not the status document, or one without one of the keys.
+pub fn listing_of_status<T: Serialize + DeserializeOwned>(
+    document: &str,
+) -> Result<String, String> {
+    let listing: T = serde_json::from_str(document)
+        .map_err(|err| format!("the status document does not have the listing: {err}"))?;
+    serde_json::to_string(&listing).map_err(|err| format!("the listing: {err}"))
 }
 
 /// `--output`'s and `--input`'s reading of a device argument: `off` detaches, anything else is a
@@ -667,6 +770,36 @@ impl Service {
     /// Quit, as `--quit` does. The reply comes before the connection closes.
     async fn quit(&self) -> Result<(), MethodError> {
         self.run_quietly(Call::Quit).await
+    }
+
+    /// Run a command line — `["--preset", "Rock", "--set_effect=bass:7.5"]`, the program name
+    /// optional — and answer with what `fxsound` given it would: whether it succeeded, and what it
+    /// printed on stdout and on stderr. A line it cannot parse or FxSound refuses is `ok = false`, not a
+    /// bus error. The window is left alone unless the line says `--show`, `--toggle-window` or
+    /// `--hide`.
+    #[zbus(out_args("ok", "stdout", "stderr"))]
+    async fn apply(&self, argv: Vec<String>) -> Result<(bool, String, String), MethodError> {
+        let _busy = self.in_flight.enter();
+        let response = match apply_commands(&argv) {
+            Ok(commands) => self.control.call(commands).await,
+            Err(response) => response,
+        };
+        applied(response)
+    }
+
+    /// The presets of both lanes, as JSON: `schema`, `edit_direction`, `selected_preset` and the
+    /// `presets`, `output_presets` and `input_presets` lists of `GetStatus`.
+    async fn list_presets(&self) -> Result<String, MethodError> {
+        let status = self.run(Call::ListPresets).await?;
+        Ok(listing_of_status::<PresetListing>(&status).map_err(fdo::Error::Failed)?)
+    }
+
+    /// The devices of both lanes, as JSON: `schema`, `selected_output`, `selected_input` and the
+    /// `output_device_list` and `input_device_list` of `GetStatus` — each device's `node_name`,
+    /// `description` and `present`.
+    async fn list_devices(&self) -> Result<String, MethodError> {
+        let status = self.run(Call::ListDevices).await?;
+        Ok(listing_of_status::<DeviceListing>(&status).map_err(fdo::Error::Failed)?)
     }
 
     /// The version `--status` reports.
@@ -1350,6 +1483,9 @@ mod tests {
             Call::Hide,
             Call::ToggleWindow,
             Call::Quit,
+            Call::Apply(vec!["--preset".to_owned(), "Rock".to_owned()]),
+            Call::ListPresets,
+            Call::ListDevices,
         ]
     }
 
@@ -1375,7 +1511,236 @@ mod tests {
         let mut members: Vec<_> = every_call().iter().map(Call::member).collect();
         members.sort_unstable();
         members.dedup();
-        assert_eq!(members.len(), 17);
+        assert_eq!(members.len(), 20);
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|&arg| arg.to_owned()).collect()
+    }
+
+    #[test]
+    fn apply_runs_the_line_fxsound_would_run_without_raising_the_window() {
+        let line = [
+            "--preset",
+            "Rock",
+            "--set_effect=bass:7.5",
+            "--num_bands=31",
+        ];
+        assert_eq!(commands(Call::Apply(argv(&line))), cli_without_raise(&line));
+        // `--preset` alone raises a typed line's window; a bus call's is left where it is.
+        assert!(cli(&line).contains(&Command::Window(WindowCommand::Show)));
+        assert_eq!(commands(Call::Apply(Vec::new())), Vec::<Command>::new());
+    }
+
+    #[test]
+    fn apply_keeps_the_window_options_the_line_spells_out() {
+        for (option, window) in [
+            ("--show", WindowCommand::Show),
+            ("--toggle-window", WindowCommand::Toggle),
+            ("--hide", WindowCommand::Hide),
+        ] {
+            assert_eq!(
+                commands(Call::Apply(argv(&["--preset", "Rock", option]))),
+                cli(&["--preset", "Rock", option]),
+                "{option}"
+            );
+            assert!(
+                commands(Call::Apply(argv(&[option]))).contains(&Command::Window(window)),
+                "{option}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_takes_argv_with_or_without_the_program_name() {
+        let bare = commands(Call::Apply(argv(&["--next-preset"])));
+        assert_eq!(
+            commands(Call::Apply(argv(&["fxsound", "--next-preset"]))),
+            bare
+        );
+        assert_eq!(
+            commands(Call::Apply(argv(&["/usr/bin/fxsound", "--next-preset"]))),
+            bare
+        );
+        assert_eq!(bare, cli(&["--next-preset"]));
+    }
+
+    #[test]
+    fn apply_answers_a_line_that_does_not_parse_as_fxsound_does_rather_than_with_a_bus_error() {
+        let refused = apply_commands(&argv(&["--bass-boost", "11"])).unwrap_err();
+        assert!(!refused.ok);
+        assert!(refused.stdout.is_empty());
+        assert!(
+            refused.stderr.contains("--bass-boost"),
+            "{}",
+            refused.stderr
+        );
+        assert_eq!(
+            applied(refused.clone()).unwrap(),
+            (false, String::new(), refused.stderr)
+        );
+
+        let out_of_range = apply_commands(&argv(&["--balance=99"])).unwrap_err();
+        assert!(!out_of_range.ok);
+        assert!(!out_of_range.stderr.is_empty());
+    }
+
+    #[test]
+    fn apply_answers_help_and_version_on_stdout() {
+        let help = apply_commands(&argv(&["--help"])).unwrap_err();
+        assert!(help.ok);
+        assert!(help.stdout.contains("--status"), "{}", help.stdout);
+        let version = apply_commands(&argv(&["--version"])).unwrap_err();
+        assert!(version.ok);
+        assert!(
+            version.stdout.contains(env!("CARGO_PKG_VERSION")),
+            "{}",
+            version.stdout
+        );
+    }
+
+    #[test]
+    fn apply_answers_with_the_command_lines_outcome_and_fails_only_without_an_answer() {
+        assert_eq!(
+            applied(Response::output("power: on")).unwrap(),
+            (true, "power: on".to_owned(), String::new())
+        );
+        let refused = Response::failed("no output preset is called \"Nope\"");
+        assert_eq!(
+            applied(refused).unwrap(),
+            (
+                false,
+                String::new(),
+                "no output preset is called \"Nope\"".to_owned()
+            )
+        );
+        match applied(Response::unanswered()) {
+            Err(MethodError::Standard(fdo::Error::Failed(text))) => {
+                assert!(text.contains("did not answer"), "{text}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_runs_through_the_same_commands_as_the_command_line() {
+        let (mut app, _dir) = app_with_presets("apply", &["Alpha", "Beta"]);
+        let run = |app: &mut App, args: &[&str]| {
+            let commands = apply_commands(&argv(args)).expect("the line parses");
+            crate::commands::run(app, &commands)
+        };
+        let outcome = run(&mut app, &["--preset", "Beta", "--set_effect=bass:7.5"]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert!(outcome.window.is_empty(), "{:?}", outcome.window);
+        assert_eq!(Properties::of(&app).preset(), "Beta");
+
+        let outcome = run(&mut app, &["--status", "--json"]);
+        let status: Value = serde_json::from_str(&outcome.stdout).expect("the status document");
+        assert_eq!(status["effects"]["bass"].as_f64(), Some(7.5));
+
+        let outcome = run(&mut app, &["--preset", "Nope"]);
+        assert!(outcome.failed);
+        assert!(outcome.stderr.contains("Nope"), "{}", outcome.stderr);
+
+        let outcome = run(&mut app, &["--watch"]);
+        assert!(outcome.failed, "a stream is not an answer");
+    }
+
+    #[test]
+    fn a_listing_is_the_schema_and_its_keys_of_the_status_document() {
+        let document = r#"{"schema":2,"version":"0.4.0","presets":{"built_in":[]},
+            "edit_direction":"output","selected_preset":"Rock","output_presets":{},
+            "input_presets":{},"selected_output":null,"selected_input":"Headset",
+            "output_devices":[],"input_devices":["Headset"],"output_device_list":[],
+            "input_device_list":[{"node_name":"alsa_input.usb"}]}"#;
+        let keys = |json: &str| -> Vec<String> {
+            let value: Value = serde_json::from_str(json).expect("JSON");
+            value
+                .as_object()
+                .expect("an object")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let presets = listing_of_status::<PresetListing>(document).unwrap();
+        let mut listed = keys(&presets);
+        listed.sort_unstable();
+        assert_eq!(
+            listed,
+            [
+                "edit_direction",
+                "input_presets",
+                "output_presets",
+                "presets",
+                "schema",
+                "selected_preset"
+            ]
+        );
+        assert!(presets.starts_with(r#"{"schema":2,"#), "{presets}");
+        assert!(presets.contains(r#""selected_preset":"Rock""#), "{presets}");
+
+        let devices = listing_of_status::<DeviceListing>(document).unwrap();
+        let mut listed = keys(&devices);
+        listed.sort_unstable();
+        assert_eq!(
+            listed,
+            [
+                "input_device_list",
+                "output_device_list",
+                "schema",
+                "selected_input",
+                "selected_output"
+            ]
+        );
+        assert!(devices.contains(r#""selected_output":null"#), "{devices}");
+        assert!(devices.contains(r#""input_device_list":[{"node_name":"alsa_input.usb"}]"#));
+
+        assert!(listing_of_status::<PresetListing>("[]").is_err());
+        assert!(listing_of_status::<DeviceListing>(r#"{"schema":2}"#).is_err());
+        assert!(listing_of_status::<PresetListing>("not json").is_err());
+    }
+
+    #[test]
+    fn the_real_status_document_lists_both_lanes_presets_and_devices() {
+        let (mut app, _dir) = app_with_presets("listings", &["Alpha", "Beta"]);
+        app.state.devices = vec![fxsound_core::AudioDevice {
+            id: 7,
+            name: "alsa_input.usb".to_owned(),
+            description: "Headset".to_owned(),
+            is_default: true,
+            direction: DeviceDirection::Input,
+            form_factor: "headset".to_owned(),
+        }];
+        let status = crate::commands::run(&mut app, &commands(Call::ListPresets)).stdout;
+        let presets: Value =
+            serde_json::from_str(&listing_of_status::<PresetListing>(&status).unwrap()).unwrap();
+        assert_eq!(presets["schema"], crate::commands::STATUS_SCHEMA);
+        let names = |list: &Value| -> Vec<String> {
+            list["built_in"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|preset| preset["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        assert_eq!(names(&presets["output_presets"]), ["Alpha", "Beta"]);
+        assert_eq!(names(&presets["input_presets"]), ["Clean Voice"]);
+        assert_eq!(presets["presets"], presets["output_presets"]);
+
+        let status = crate::commands::run(&mut app, &commands(Call::ListDevices)).stdout;
+        let devices: Value =
+            serde_json::from_str(&listing_of_status::<DeviceListing>(&status).unwrap()).unwrap();
+        assert_eq!(
+            devices["input_device_list"][0]["node_name"],
+            "alsa_input.usb"
+        );
+        assert_eq!(devices["input_device_list"][0]["description"], "Headset");
+        assert_eq!(devices["input_device_list"][0]["present"], true);
+        assert_eq!(devices["output_device_list"], serde_json::json!([]));
+        assert!(
+            devices.get("input_devices").is_none(),
+            "upstream's names-only list stays in GetStatus: {devices}"
+        );
     }
 
     // ---- answers --------------------------------------------------------------------------------
@@ -1870,7 +2235,7 @@ mod tests {
     #[test]
     fn every_method_is_served_with_its_documented_signature() {
         let xml = introspection();
-        let signatures: [(&str, &[&str]); 17] = [
+        let signatures: [(&str, &[&str]); 20] = [
             ("TogglePower", &[r#"type="b" direction="out""#]),
             ("SetPower", &[r#"type="b" direction="in""#]),
             ("NextPreset", &[]),
@@ -1888,6 +2253,17 @@ mod tests {
             ("Hide", &[]),
             ("ToggleWindow", &[]),
             ("Quit", &[]),
+            (
+                "Apply",
+                &[
+                    r#"name="argv" type="as" direction="in""#,
+                    r#"name="ok" type="b" direction="out""#,
+                    r#"name="stdout" type="s" direction="out""#,
+                    r#"name="stderr" type="s" direction="out""#,
+                ],
+            ),
+            ("ListPresets", &[r#"type="s" direction="out""#]),
+            ("ListDevices", &[r#"type="s" direction="out""#]),
         ];
         for (member, args) in signatures {
             let method = element(&xml, "method", member);
@@ -1900,7 +2276,7 @@ mod tests {
                 assert!(method.contains(arg), "{member} has no {arg}: {method}");
             }
         }
-        assert_eq!(xml.matches("<method ").count(), 17, "{xml}");
+        assert_eq!(xml.matches("<method ").count(), 20, "{xml}");
         for call in every_call() {
             element(&xml, "method", call.member());
         }
@@ -2402,6 +2778,58 @@ mod tests {
         host.join();
         assert!(!bus.has_owner(&client, BUS_NAME));
         assert!(!bus.has_owner(&client, DESKTOP_BUS_NAME));
+    }
+
+    #[test]
+    fn over_a_private_bus_apply_answers_as_the_command_line_and_the_listings_are_json() {
+        let Some(bus) = PrivateBus::start() else {
+            return;
+        };
+        let host = Host::start(&bus, "apply");
+        assert_eq!(host.state, ServiceState::Serving);
+        let client = bus.client();
+        let proxy = proxy(&client);
+        let apply = |args: &[&str]| -> (bool, String, String) {
+            proxy.call("Apply", &(argv(args),)).expect("Apply answers")
+        };
+
+        let (ok, stdout, stderr) = apply(&["--preset", "Beta", "--set_effect=bass:7.5"]);
+        assert!(ok, "{stderr}");
+        assert!(stdout.is_empty() && stderr.is_empty(), "{stdout}{stderr}");
+        let preset: String = proxy.call("GetPreset", &()).expect("GetPreset");
+        assert_eq!(preset, "Beta");
+
+        let (ok, stdout, _) = apply(&["fxsound", "--status", "--json"]);
+        assert!(ok);
+        let status: Value = serde_json::from_str(&stdout).expect("the status document");
+        assert_eq!(status["effects"]["bass"].as_f64(), Some(7.5));
+        assert_eq!(status["selected_preset"], "Beta");
+
+        let (ok, stdout, stderr) = apply(&["--preset", "Nope"]);
+        assert!(!ok);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("Nope"), "{stderr}");
+        let (ok, _, stderr) = apply(&["--no-such-option"]);
+        assert!(!ok);
+        assert!(stderr.contains("--no-such-option"), "{stderr}");
+
+        let presets: String = proxy.call("ListPresets", &()).expect("ListPresets");
+        let presets: Value = serde_json::from_str(&presets).expect("JSON");
+        assert_eq!(presets["selected_preset"], "Beta");
+        assert_eq!(presets["output_presets"]["built_in"][1]["name"], "Beta");
+        assert_eq!(
+            presets["input_presets"]["built_in"][0]["name"],
+            "Clean Voice"
+        );
+        let devices: String = proxy.call("ListDevices", &()).expect("ListDevices");
+        let devices: Value = serde_json::from_str(&devices).expect("JSON");
+        assert!(devices["output_device_list"].is_array(), "{devices}");
+        assert!(devices["input_device_list"].is_array(), "{devices}");
+        assert_eq!(devices["schema"], crate::commands::STATUS_SCHEMA);
+
+        let (ok, _, stderr) = apply(&["--quit"]);
+        assert!(ok, "{stderr}");
+        host.join();
     }
 
     #[test]

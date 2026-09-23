@@ -596,6 +596,19 @@ impl Cli {
         commands
     }
 
+    /// [`Cli::commands`] as D-Bus `Apply` hands them over: without the window raise a typed
+    /// command line gets for nothing (0.4.0 design §9, and [`Cli::window_command`]). A bus call
+    /// comes from a keybind or a status bar, as every other method's does; `--show`,
+    /// `--toggle-window` and `--hide` on the line still do what they say.
+    #[must_use]
+    pub fn commands_without_implicit_raise(&self) -> Vec<Command> {
+        let mut commands = self.commands();
+        if !self.show && self.window_command() == Some(WindowCommand::Show) {
+            commands.retain(|command| *command != Command::Window(WindowCommand::Show));
+        }
+        commands
+    }
+
     /// The subset of [`Cli::commands`] a *cold start* honours — the C column of
     /// `docs/spec/07-startup-tray.md` §4.2, i.e. what `initConfig` reads (`:225-234`).
     ///

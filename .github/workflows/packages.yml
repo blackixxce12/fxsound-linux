@@ -329,6 +329,8 @@ jobs:
               || echo "::warning::desktop-file-validate failed on $desktop (this image's desktop-file-utils predates SingleMainWindow)"
           fi
           test -f '${{ matrix.unitdir }}/fxsound.service'
+          grep -qx 'BusName=org.fxsound.FxSound' '${{ matrix.unitdir }}/fxsound.service'
+          grep -qx 'Name=org.fxsound.FxSound' "$prefix/share/dbus-1/services/org.fxsound.FxSound.service"
           ls "$prefix"/share/man/man1/fxsound.1*
           test -f "$prefix/share/metainfo/com.fxsound.FxSound.metainfo.xml"
           for state in off on processing; do

@@ -14,9 +14,9 @@
 //!    aside, which is right for the application and wrong for a test;
 //! 5. both processing chains run offline at 48 kHz, the voice chain with RNNoise instantiated and
 //!    running, and every sample that comes out finite;
-//! 6. the desktop entry, the application and status icons, the systemd user unit, the manual page
-//!    and the AppStream metainfo, under the prefix — `skip` from the source tree, where they are
-//!    install-only;
+//! 6. the desktop entry, the application and status icons, the systemd user unit, the D-Bus
+//!    activation file, the manual page and the AppStream metainfo, under the prefix — `skip` from
+//!    the source tree, where they are install-only;
 //! 7. the runtime directory the control socket lives in, resolved and usable;
 //! 8. PipeWire: `skip` unless `$XDG_RUNTIME_DIR/pipewire-0` exists, and then only whether a server
 //!    accepts a connection on it — no protocol is spoken, no node or stream is created, and the
@@ -553,6 +553,7 @@ fn check_input_chain() -> Check {
 const DESKTOP_FILE: &str = "share/applications/com.fxsound.FxSound.desktop";
 const METAINFO: &str = "share/metainfo/com.fxsound.FxSound.metainfo.xml";
 const SYSTEMD_UNIT: &str = "lib/systemd/user/fxsound.service";
+const DBUS_SERVICE: &str = "share/dbus-1/services/org.fxsound.FxSound.service";
 const MAN_DIR: &str = "share/man/man1";
 
 /// The icons the tray asks the theme for by name, as a package installs them: the names are the
@@ -588,6 +589,7 @@ fn check_installed_files(env: &Environment) -> Vec<Check> {
                 "app_icons",
                 "status_icons",
                 "systemd_unit",
+                "dbus_service",
                 "man_page",
                 "metainfo",
             ]
@@ -605,6 +607,7 @@ fn check_installed_files(env: &Environment) -> Vec<Check> {
         check_present("app_icons", prefix, &app_icons()),
         check_present("status_icons", prefix, &status_icons()),
         check_unit(&prefix.join(SYSTEMD_UNIT), &prefix.join("bin/fxsound")),
+        check_dbus_service(&prefix.join(DBUS_SERVICE), &prefix.join("bin/fxsound")),
         check_man_page(&prefix.join(MAN_DIR)),
         check_text_file("metainfo", &prefix.join(METAINFO), "<component"),
     ]
@@ -673,6 +676,59 @@ fn check_unit(path: &Path, binary: &Path) -> Check {
             ),
         ),
         None => Check::fail(NAME, format!("{} has no ExecStart", path.display())),
+    }
+}
+
+/// The D-Bus activation file, which starts FxSound for a call to [`crate::dbus::BUS_NAME`]: for
+/// that name, handing the start to the user unit as the bus does where it is systemd's, and
+/// starting *this* binary by its own `Exec=` where it is not — the file ships naming
+/// `/usr/bin/fxsound`, as the unit does.
+fn check_dbus_service(path: &Path, binary: &Path) -> Check {
+    const NAME: &str = "dbus_service";
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Check::fail(NAME, format!("missing: {}", path.display()));
+        }
+        Err(err) => return Check::fail(NAME, format!("{}: {err}", path.display())),
+    };
+    let value = |key: &str| {
+        text.lines().find_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            (name.trim() == key).then(|| value.trim())
+        })
+    };
+    let at = path.display();
+    let unit = SYSTEMD_UNIT.rsplit('/').next().unwrap_or(SYSTEMD_UNIT);
+    if !text.lines().any(|line| line.trim() == "[D-BUS Service]") {
+        return Check::fail(NAME, format!("{at} has no [D-BUS Service]"));
+    }
+    match (value("Name"), value("Exec"), value("SystemdService")) {
+        (Some(name), _, _) if name != crate::dbus::BUS_NAME => Check::fail(
+            NAME,
+            format!("{at} is for {name}, not {}", crate::dbus::BUS_NAME),
+        ),
+        (None, _, _) => Check::fail(NAME, format!("{at} has no Name")),
+        (_, None, _) => Check::fail(NAME, format!("{at} has no Exec")),
+        (_, Some(exec), _)
+            if exec
+                .split_whitespace()
+                .next()
+                .is_none_or(|exec| Path::new(exec) != binary) =>
+        {
+            Check::fail(
+                NAME,
+                format!("{at} starts {exec}, not this binary ({})", binary.display()),
+            )
+        }
+        (_, _, Some(systemd)) if systemd == unit => Check::ok(NAME, at.to_string()),
+        (_, _, systemd) => Check::fail(
+            NAME,
+            format!(
+                "{at} hands the start to {}, not {unit}",
+                systemd.unwrap_or("no unit")
+            ),
+        ),
     }
 }
 
@@ -871,6 +927,14 @@ pub(crate) mod tests {
                 prefix.display()
             ),
         );
+        write(
+            &prefix.join(DBUS_SERVICE),
+            &format!(
+                "[D-BUS Service]\nName=org.fxsound.FxSound\nExec={}/bin/fxsound --hide\n\
+                 SystemdService=fxsound.service\n",
+                prefix.display()
+            ),
+        );
         write(&prefix.join(MAN_DIR).join("fxsound.1.gz"), "man");
         write(
             &prefix.join(METAINFO),
@@ -927,6 +991,7 @@ pub(crate) mod tests {
                 "app_icons",
                 "status_icons",
                 "systemd_unit",
+                "dbus_service",
                 "man_page",
                 "metainfo",
                 "runtime_dir",
@@ -1084,6 +1149,90 @@ pub(crate) mod tests {
 
         write(&tmp.path().join(SYSTEMD_UNIT), "[Service]\nType=simple\n");
         assert_eq!(check(&run(&env), "systemd_unit").status, Status::Fail);
+    }
+
+    #[test]
+    fn a_missing_dbus_activation_file_fails_that_check_alone() {
+        let (tmp, env) = installed();
+        fs::remove_file(tmp.path().join(DBUS_SERVICE)).expect("remove");
+        let report = run(&env);
+        let service = check(&report, "dbus_service");
+        assert_eq!(service.status, Status::Fail);
+        assert!(
+            service.detail.starts_with("missing: "),
+            "{}",
+            service.detail
+        );
+        let failed: Vec<&str> = report
+            .checks
+            .iter()
+            .filter(|c| c.status == Status::Fail)
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(failed, ["dbus_service"]);
+    }
+
+    #[test]
+    fn a_dbus_activation_file_for_another_name_binary_or_unit_fails() {
+        // The shipped file names /usr/bin/fxsound; the tarball's install.sh rewrites it for its
+        // prefix as it rewrites the unit, and one it missed starts the wrong FxSound, or none.
+        let (tmp, env) = installed();
+        let path = tmp.path().join(DBUS_SERVICE);
+        let binary = format!("{}/bin/fxsound", tmp.path().display());
+        for (file, says) in [
+            (
+                "[D-BUS Service]\nName=org.fxsound.FxSound\nExec=/usr/bin/fxsound --hide\n\
+                 SystemdService=fxsound.service\n"
+                    .to_owned(),
+                "starts /usr/bin/fxsound",
+            ),
+            (
+                format!(
+                    "[D-BUS Service]\nName=com.fxsound.FxSound\nExec={binary} --hide\n\
+                     SystemdService=fxsound.service\n"
+                ),
+                "is for com.fxsound.FxSound",
+            ),
+            (
+                format!("[D-BUS Service]\nName=org.fxsound.FxSound\nExec={binary} --hide\n"),
+                "hands the start to no unit",
+            ),
+            (
+                format!(
+                    "[D-BUS Service]\nName=org.fxsound.FxSound\nExec={binary}\n\
+                     SystemdService=pipewire.service\n"
+                ),
+                "hands the start to pipewire.service",
+            ),
+            (
+                format!("[Desktop Entry]\nName=org.fxsound.FxSound\nExec={binary}\n"),
+                "has no [D-BUS Service]",
+            ),
+        ] {
+            write(&path, &file);
+            let service = check(&run(&env), "dbus_service").clone();
+            assert_eq!(service.status, Status::Fail, "{file}");
+            assert!(service.detail.contains(says), "{says}: {}", service.detail);
+        }
+    }
+
+    #[test]
+    fn the_shipped_dbus_activation_file_passes_where_it_is_installed_as_it_ships() {
+        // packaging/org.fxsound.FxSound.service itself, under /usr as every package puts it.
+        let shipped = include_str!("../../../packaging/org.fxsound.FxSound.service");
+        let (tmp, env) = installed();
+        let rewritten = shipped.replace(
+            "/usr/bin/fxsound",
+            &format!("{}/bin/fxsound", tmp.path().display()),
+        );
+        write(&tmp.path().join(DBUS_SERVICE), &rewritten);
+        assert_eq!(check(&run(&env), "dbus_service").status, Status::Ok);
+        let unit = include_str!("../../../packaging/fxsound.service");
+        assert!(
+            unit.lines()
+                .any(|line| line == "BusName=org.fxsound.FxSound"),
+            "the unit the file activates names the bus name it is activated for"
+        );
     }
 
     #[test]
@@ -1342,6 +1491,7 @@ pub(crate) mod tests {
             "app_icons",
             "status_icons",
             "systemd_unit",
+            "dbus_service",
             "man_page",
             "metainfo",
         ] {

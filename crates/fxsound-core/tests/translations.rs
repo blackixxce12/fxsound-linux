@@ -698,7 +698,7 @@ fn every_label_a_core_enum_hands_to_tr_is_translated_in_every_language() {
 
 #[test]
 fn every_string_a_port_table_carries_is_one_the_interface_asks_for() {
-    // A translation nothing asks for is one that twenty-eight files keep up for nothing, and
+    // A translation nothing asks for is one that twenty-nine files keep up for nothing, and
     // usually the sign of a string renamed in the source and not in the tables: 0.3.0's
     // lower-case `voice` outlived the readout that showed it.
     let asked = interface_keys();
@@ -720,7 +720,7 @@ fn every_string_a_port_table_carries_is_one_the_interface_asks_for() {
 
 #[test]
 fn every_port_table_adds_the_same_strings() {
-    // The strings the Windows build never had are added to all twenty-eight tables at once; only
+    // The strings the Windows build never had are added to all twenty-nine tables at once; only
     // a repair of a Windows string is particular to the table it repairs.
     let windows: BTreeSet<String> = LANGUAGES[1..]
         .iter()
@@ -846,7 +846,7 @@ fn the_level_labels_do_not_borrow_the_theme_switchs_word() {
     // `"Light"` names the light theme in every Windows table, and a key has one translation per
     // language: had the level kept the same key, German would have called a gentle noise floor
     // "Hell" and Russian "Светлая". The level's word is its own, so the two translate apart.
-    let de = Catalogue::for_language(&LANGUAGES[5]);
+    let de = Catalogue::for_language(fxsound_core::i18n::language("de").expect("German"));
     assert_eq!(de.code(), "de");
     let theme = de.get("Light").expect("the theme's word");
     for label in [

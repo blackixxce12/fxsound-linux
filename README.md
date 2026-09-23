@@ -117,13 +117,13 @@ A prebuilt tarball is attached to each [release](https://github.com/blackixxce12
 check it against the release's `SHA256SUMS` before unpacking. It is this same script's output, built
 on Debian 12's glibc so the binary runs on anything newer, and it carries the same `install.sh`. The
 archive is a prefix in miniature: `bin/fxsound`, `lib/systemd/user/fxsound.service`,
-`share/applications/`, `share/icons/hicolor/` (the app icon and the tray's three status icons),
-`share/fxsound/presets/`, `share/man/man1/fxsound.1`, `share/metainfo/` and
-`share/doc/fxsound-linux/` (README, CHANGELOG, LICENSE, the Hyprland rules and the autostart
-entry). `install.sh` copies all of that into the prefix and rewrites the unit's `ExecStart` and
-`ExecStop` to `<prefix>/bin/fxsound`; it warns if the prefix is anything other than `/usr` or
-`/usr/local`, because those are the only two the binary searches for presets. On an older
-distribution than Debian 12, build from source instead.
+`share/dbus-1/services/` (D-Bus activation), `share/applications/`, `share/icons/hicolor/` (the
+app icon and the tray's three status icons), `share/fxsound/presets/`, `share/man/man1/fxsound.1`,
+`share/metainfo/` and `share/doc/fxsound-linux/` (README, CHANGELOG, LICENSE, the Hyprland rules
+and the autostart entry). `install.sh` copies all of that into the prefix and rewrites the unit's
+`ExecStart` and `ExecStop`, and the activation file's `Exec`, to `<prefix>/bin/fxsound`; it warns
+if the prefix is anything other than `/usr` or `/usr/local`, because those are the only two the
+binary searches for presets. On an older distribution than Debian 12, build from source instead.
 
 ### What lands where
 
@@ -134,6 +134,7 @@ distribution than Debian 12, build from source instead.
 | `/usr/share/fxsound/presets/Input/` | the 13 voice presets, in TOML |
 | `/usr/share/applications/com.fxsound.FxSound.desktop` | the launcher entry |
 | `/usr/lib/systemd/user/fxsound.service` | `systemctl --user enable --now fxsound` |
+| `/usr/share/dbus-1/services/org.fxsound.FxSound.service` | starts FxSound, through that unit, for a D-Bus call |
 | `/usr/share/icons/hicolor/*/apps/fxsound.png` | the icon |
 | `/usr/share/doc/fxsound-linux/` | the Hyprland rules and the autostart entry |
 
@@ -351,10 +352,10 @@ Each of these is a considered decision, not an oversight:
   the package, and Settings ▸ Help keeps only the version and a **Changelog** that opens the
   bundled `CHANGELOG.md` in-app instead of the upstream website. "Always On Top" is also absent:
   winit ignores window levels on Wayland, and a control that does nothing is worse than none.
-- **Translated, from the original's own tables.** The 28 JUCE `LocalisedStrings` files embedded in
-  the Windows binary (`assets/translations/`, extracted from its `BinaryData.cpp`; Hungarian was
-  declared but never shipped) are embedded here and looked up by the same English keys the C++
-  passes to `TRANS`. The language follows the desktop session (`LC_ALL`/`LC_MESSAGES`/`LANG`)
+- **Translated, from the original's own tables.** The 29 JUCE `LocalisedStrings` files embedded in
+  the Windows binary (`assets/translations/`, extracted from its `BinaryData.cpp` as of 1.2.16.0,
+  which added Bulgarian; Hungarian was declared but never shipped) are embedded here and looked up
+  by the same English keys the C++ passes to `TRANS`. The language follows the desktop session (`LC_ALL`/`LC_MESSAGES`/`LANG`)
   unless one is picked in Settings ▸ General or with `--language <code>` (`--language system`
   returns to following the desktop). Strings this port added are in
   `assets/translations/port/`. Right-to-left scripts render left-to-right — egui has no bidi.

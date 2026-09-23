@@ -3,7 +3,8 @@
 `fxsound.spec` builds FxSound for Linux on Fedora 43 and newer. It installs exactly what the
 Arch package in `packaging/PKGBUILD` installs: the binary, the `.fac` factory and bonus presets,
 the TOML input presets, the desktop entry, both icon sizes, the tray's status icons, the manual
-page, the AppStream metainfo and the systemd **user** unit.
+page, the AppStream metainfo, the systemd **user** unit and the D-Bus activation file that
+starts it.
 
 The Rust dependencies are vendored — `eframe`/`egui` 0.36, `pipewire`, `ksni`, `nnnoiseless`,
 `rfd` and `resvg` are not packaged as crates in Fedora, so a system-registry build cannot

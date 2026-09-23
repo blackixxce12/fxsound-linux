@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.fxsound.FxSound
+Exec=/usr/bin/fxsound --hide
+SystemdService=fxsound.service

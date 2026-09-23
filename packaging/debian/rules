@@ -109,6 +109,11 @@ override_dh_auto_install:
 	install -D -m 0644 packaging/fxsound.service \
 		debian/tmp/usr/lib/systemd/user/fxsound.service
 
+	# D-Bus activation: a call to org.fxsound.FxSound starts FxSound through
+	# that unit (SystemdService=fxsound.service).
+	install -D -m 0644 packaging/org.fxsound.FxSound.service \
+		debian/tmp/usr/share/dbus-1/services/org.fxsound.FxSound.service
+
 	install -D -m 0644 assets/images/fxsound_large.png \
 		debian/tmp/usr/share/icons/hicolor/256x256/apps/fxsound.png
 	install -D -m 0644 assets/images/fxsound.png \

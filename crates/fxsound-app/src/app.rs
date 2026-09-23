@@ -2356,6 +2356,31 @@ impl App {
         (!saved.is_empty()).then_some((saved, false))
     }
 
+    /// `lane`'s preset list as its picker lists it — factory presets first, each with its
+    /// unsaved-changes marker — whichever lane the window is editing. For `--status`, which lists
+    /// both (upstream's `printStatus` lists the one it has, `FxController.cpp:616-636`).
+    ///
+    /// The edit direction's is the window's own list. The other lane's is read from its store, as
+    /// the window would list it on switching over, with the unsaved changes of the selected
+    /// preset that the lane's stored controls still hold.
+    #[must_use]
+    pub fn lane_preset_list(&self, lane: DeviceDirection) -> Vec<PresetEntry> {
+        if lane == self.state.direction {
+            return self.state.presets.clone();
+        }
+        let selected = self.lane_preset(lane);
+        self.store(lane)
+            .entries()
+            .iter()
+            .map(|entry| PresetEntry {
+                name: entry.name.clone(),
+                factory: entry.source == fxsound_preset::PresetSource::Factory,
+                modified: entry.modified
+                    || selected.is_some_and(|(name, modified)| modified && name == entry.name),
+            })
+            .collect()
+    }
+
     /// Whether `lane`'s preset list has one called `name` — the `.fac` store for the speakers,
     /// the voice store, the user's own voice presets included, for the microphone — whichever
     /// lane the window is showing.
