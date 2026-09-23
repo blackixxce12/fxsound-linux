@@ -285,6 +285,9 @@ impl App {
                         self.settings_dirty = true;
                     }
                 }
+                // Per-device volume (U10) and warnings: the engine sends neither yet, and what the
+                // window does with them is Phase C part 2's.
+                AudioToUi::TargetVolume(_) | AudioToUi::Warning { .. } => {}
             }
         }
 

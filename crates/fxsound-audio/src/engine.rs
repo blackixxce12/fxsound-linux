@@ -1771,6 +1771,36 @@ fn control(shared: &mut Shared, message: UiToAudio) {
                 }
             }
         }
+        // The upstream review's messages (`docs/0.4.0-upstream.md`). The API landed first, so the
+        // app and the engine could be built against it in parallel; each is acted on by its own
+        // item, and until then it is logged and otherwise ignored, which leaves the engine doing
+        // exactly what it did before the message existed.
+        UiToAudio::SetDevicePriority { direction, names } => {
+            log::info!(
+                "{} device priority: {} ranked (not acted on yet, U4)",
+                direction.key(),
+                names.len()
+            );
+        }
+        UiToAudio::SeedTargetVolumes(volumes) => {
+            log::info!(
+                "{} remembered per-device volumes (not acted on yet, U10)",
+                volumes.len()
+            );
+        }
+        UiToAudio::SystemSleeping(sleeping) => {
+            log::info!(
+                "system {} (not acted on yet, U13)",
+                if sleeping {
+                    "going to sleep"
+                } else {
+                    "resumed"
+                }
+            );
+        }
+        UiToAudio::KeepInputAwake(awake) => {
+            log::info!("keep the microphone awake: {awake} (not acted on yet, U19)");
+        }
         UiToAudio::Shutdown => unreachable!("handled by handle_control"),
     }
     // A detached microphone lane, another microphone or other speakers: whatever the message

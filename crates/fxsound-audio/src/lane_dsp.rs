@@ -16,6 +16,19 @@
 //! both directions (`crate::engine`, "One engine, two directions"). Its methods forward to the
 //! variant; the only branch left is the one the enum itself is.
 //!
+//! # Mute
+//!
+//! Both snapshots carry a `mute` (set while the system sleeps, U13). It is honoured here, after
+//! the chain, rather than inside the DSP crate's engines: the chain still runs on every block —
+//! its filters, leveller and denoiser keep following what comes in — and only what leaves for the
+//! ring is replaced by silence. So unmuting joins a chain already in step with the programme, and
+//! the engines stay what they were, a pure function of their input and their snapshot. The
+//! meters still describe the chain's output, not the silence; nobody reads them while the system
+//! sleeps. Upstream does the same thing one step later — its mute keeps capturing and processing
+//! and only skips the playback call (`AudioPassthruPrivate.cpp:568`) — and its cut is as hard as
+//! this one: a de-click ramp belongs with the ramp from silence a new pair gets (U10), which is
+//! the same code.
+//!
 //! # Real-time rules
 //!
 //! Everything reached from [`LaneDsp::refresh`], [`LaneDsp::process_bytes`] and
@@ -219,6 +232,8 @@ pub(crate) struct OutputDsp {
     events: Receiver<DspEvent>,
     /// Interleaved de-serialisation buffer, sized for the worst case and never resized.
     scratch: Vec<f32>,
+    /// The newest snapshot's `mute`, as of the last [`Self::refresh`]. See the module's "Mute".
+    muted: bool,
 }
 
 impl OutputDsp {
@@ -233,6 +248,7 @@ impl OutputDsp {
             meters,
             events,
             scratch: worst_case_scratch(),
+            muted: false,
         }
     }
 
@@ -251,7 +267,9 @@ impl OutputDsp {
 
     #[inline]
     fn refresh(&mut self) {
-        self.engine.apply(self.params.read());
+        let params = self.params.read();
+        self.engine.apply(params);
+        self.muted = params.mute;
         self.drain_events();
     }
 
@@ -270,6 +288,7 @@ impl OutputDsp {
     fn process_bytes(&mut self, block: &[u8], channels: usize) -> Option<&[f32]> {
         let scratch = decode(&mut self.scratch, block, channels)?;
         self.engine.process(scratch, channels);
+        silence_if(self.muted, scratch);
         Some(scratch)
     }
 }
@@ -299,6 +318,8 @@ pub(crate) struct InputDsp {
     parked: Option<Box<InputEngine>>,
     /// Interleaved de-serialisation buffer, sized for the worst case and never resized.
     scratch: Vec<f32>,
+    /// The newest snapshot's `mute`, as of the last [`Self::refresh`]. See the module's "Mute".
+    muted: bool,
 }
 
 impl InputDsp {
@@ -322,6 +343,7 @@ impl InputDsp {
             retired,
             parked: None,
             scratch: worst_case_scratch(),
+            muted: false,
         }
     }
 
@@ -396,7 +418,9 @@ impl InputDsp {
     #[inline]
     fn refresh(&mut self) {
         self.adopt_replacement();
-        self.engine.apply(self.params.read());
+        let params = self.params.read();
+        self.engine.apply(params);
+        self.muted = params.mute;
         self.drain_events();
     }
 
@@ -412,6 +436,7 @@ impl InputDsp {
     fn process_bytes(&mut self, block: &[u8], channels: usize) -> Option<&[f32]> {
         let scratch = decode(&mut self.scratch, block, channels)?;
         self.engine.process(scratch, channels);
+        silence_if(self.muted, scratch);
         Some(scratch)
     }
 }
@@ -461,6 +486,16 @@ impl ChainHandover {
 /// eight channels (`docs/spec/12-audio-io.md` §24). Allocated once, on the main loop.
 fn worst_case_scratch() -> Vec<f32> {
     vec![0.0; MAX_QUANTUM_FRAMES * MAX_CHANNELS as usize]
+}
+
+/// Replace a processed block with silence while the lane is muted. After the chain, so the chain
+/// has already seen the block; a `fill` of memory that exists, so nothing here can allocate or
+/// panic.
+#[inline]
+fn silence_if(muted: bool, processed: &mut [f32]) {
+    if muted {
+        processed.fill(0.0);
+    }
 }
 
 /// Read as many whole frames of little-endian `f32` out of `block` as fit, into the front of
@@ -758,6 +793,256 @@ pub(crate) mod tests {
             ChainSpec::broadcast(),
             "the stale podcast engine was drained, not adopted"
         );
+    }
+
+    // ---- the `mute` both snapshots carry (U13): silence after the chain ----
+
+    /// Both lanes with the GUI's ends of their parameter buffers kept, so a test can publish a
+    /// snapshot the way `EngineHandle::set_params` does.
+    struct Wired {
+        lanes: PerDirection<LaneDsp>,
+        params: Input<DspParams>,
+        input_params: Input<InputDspParams>,
+        _handover: ChainHandover,
+    }
+
+    fn wired() -> Wired {
+        let (params_in, params) = TripleBuffer::new(&DspParams::default()).split();
+        let (input_params_in, input_params) = TripleBuffer::new(&InputDspParams::default()).split();
+        let meters = PerDirection::from_fn(|_| TripleBuffer::new(&Meters::default()).split().0);
+        let events =
+            PerDirection::from_fn(|_| crossbeam_channel::bounded(crate::EVENT_QUEUE_LEN).1);
+        let (mut lanes, handover) = build(params, input_params, meters, events);
+        for (_, dsp) in lanes.iter_mut() {
+            dsp.set_format(48_000.0, 2);
+        }
+        Wired {
+            lanes,
+            params: params_in,
+            input_params: input_params_in,
+            _handover: handover,
+        }
+    }
+
+    /// A 1 kHz tone at −6 dBFS on both channels, one 480-frame block starting at `block_index`,
+    /// as the little-endian bytes NODE 1 is handed.
+    fn tone_block(block_index: usize) -> Vec<u8> {
+        const FRAMES: usize = 480;
+        (0..FRAMES)
+            .flat_map(|frame| {
+                let n = (block_index * FRAMES + frame) as f32;
+                let sample = 0.5 * (std::f32::consts::TAU * 1_000.0 * n / 48_000.0).sin();
+                [sample, sample]
+            })
+            .flat_map(f32::to_le_bytes)
+            .collect()
+    }
+
+    /// One block through a lane, as the callback runs it: refresh, then process.
+    fn run_block(dsp: &mut LaneDsp, block_index: usize) -> Vec<f32> {
+        dsp.refresh();
+        dsp.process_bytes(&tone_block(block_index), 2)
+            .expect("a block that fits")
+            .to_vec()
+    }
+
+    fn is_silent(block: &[f32]) -> bool {
+        block.iter().all(|sample| *sample == 0.0)
+    }
+
+    /// A snapshot of the music chain with state that remembers: a boosted band, the leveller, and
+    /// every effect up — so a chain that stopped while muted would come back different.
+    fn busy_output_params(mute: bool) -> DspParams {
+        let mut params = DspParams {
+            mute,
+            effects: [0.6; fxsound_core::Effect::COUNT],
+            volume_leveling_db: 2.0,
+            ..DspParams::default()
+        };
+        params.band_boost_db[3] = 6.0;
+        params.sanitise();
+        params
+    }
+
+    #[test]
+    fn a_muted_output_lane_hands_the_ring_silence() {
+        let mut w = wired();
+        let playing = run_block(&mut w.lanes.output, 0);
+        assert!(!is_silent(&playing), "the tone gets through unmuted");
+
+        w.params.write(busy_output_params(true));
+        for index in 1..5 {
+            assert!(
+                is_silent(&run_block(&mut w.lanes.output, index)),
+                "block {index}"
+            );
+        }
+
+        w.params.write(busy_output_params(false));
+        assert!(
+            !is_silent(&run_block(&mut w.lanes.output, 5)),
+            "and comes back on the first block after the unmute"
+        );
+    }
+
+    #[test]
+    fn a_muted_input_lane_hands_the_recorder_silence() {
+        let mut w = wired();
+        assert!(!is_silent(&run_block(&mut w.lanes.input, 0)));
+
+        w.input_params.write(InputDspParams {
+            mute: true,
+            ..InputDspParams::default()
+        });
+        for index in 1..5 {
+            assert!(
+                is_silent(&run_block(&mut w.lanes.input, index)),
+                "block {index}"
+            );
+        }
+
+        w.input_params.write(InputDspParams::default());
+        assert!(!is_silent(&run_block(&mut w.lanes.input, 5)));
+    }
+
+    #[test]
+    fn the_mute_silences_a_bypassed_lane_too() {
+        // Power off still passes audio — the master gain survives a bypass — so a mute that lived
+        // inside the chain's power branch would leak exactly the blocks a sleeping system sends.
+        let mut w = wired();
+        w.params.write(DspParams {
+            power: false,
+            mute: true,
+            ..DspParams::default()
+        });
+        assert!(is_silent(&run_block(&mut w.lanes.output, 0)));
+        w.input_params.write(InputDspParams {
+            power: false,
+            mute: true,
+            ..InputDspParams::default()
+        });
+        assert!(is_silent(&run_block(&mut w.lanes.input, 0)));
+    }
+
+    #[test]
+    fn the_output_chain_keeps_running_under_the_mute_so_the_unmute_joins_it_in_step() {
+        // Two lanes fed the same programme, one muted for a while. If the mute had stopped the
+        // chain, the filters, the leveller and the effects would resume from the state they held
+        // when it began; running under it, they are exactly where the never-muted lane's are, and
+        // the first block after the unmute is bit for bit the same.
+        let mut muted = wired();
+        let mut reference = wired();
+        muted.params.write(busy_output_params(false));
+        reference.params.write(busy_output_params(false));
+        for index in 0..3 {
+            run_block(&mut muted.lanes.output, index);
+            run_block(&mut reference.lanes.output, index);
+        }
+
+        muted.params.write(busy_output_params(true));
+        for index in 3..40 {
+            assert!(is_silent(&run_block(&mut muted.lanes.output, index)));
+            run_block(&mut reference.lanes.output, index);
+        }
+
+        muted.params.write(busy_output_params(false));
+        for index in 40..43 {
+            assert_eq!(
+                run_block(&mut muted.lanes.output, index),
+                run_block(&mut reference.lanes.output, index),
+                "block {index}"
+            );
+        }
+        // And the meters followed the chain, not the silence: the processed-time counter is the
+        // same on both.
+        assert_eq!(
+            muted.lanes.output.meters().processed_samples,
+            reference.lanes.output.meters().processed_samples
+        );
+    }
+
+    #[test]
+    fn the_voice_chain_and_the_calibration_counters_keep_running_under_the_mute() {
+        let mut muted = wired();
+        let mut reference = wired();
+        let mute = InputDspParams {
+            mute: true,
+            ..InputDspParams::default()
+        };
+        for index in 0..3 {
+            run_block(&mut muted.lanes.input, index);
+            run_block(&mut reference.lanes.input, index);
+        }
+        muted.input_params.write(mute);
+        for index in 3..40 {
+            assert!(is_silent(&run_block(&mut muted.lanes.input, index)));
+            run_block(&mut reference.lanes.input, index);
+        }
+        let (during, expected) = (muted.lanes.input.meters(), reference.lanes.input.meters());
+        assert_eq!(
+            during.capture_frames, expected.capture_frames,
+            "the wizard's counters follow the microphone, not the mute"
+        );
+        assert!(during.input_peak > 0.4, "{}", during.input_peak);
+
+        muted.input_params.write(InputDspParams::default());
+        for index in 40..43 {
+            assert_eq!(
+                run_block(&mut muted.lanes.input, index),
+                run_block(&mut reference.lanes.input, index),
+                "block {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_lanes_mute_leaves_the_other_lane_playing() {
+        // The two snapshots are separate paths; sleeping is both lanes muting, each through its
+        // own, and a mute of one is never the other's.
+        let mut w = wired();
+        w.params.write(DspParams {
+            mute: true,
+            ..DspParams::default()
+        });
+        assert!(is_silent(&run_block(&mut w.lanes.output, 0)));
+        assert!(!is_silent(&run_block(&mut w.lanes.input, 0)));
+
+        let mut w = wired();
+        w.input_params.write(InputDspParams {
+            mute: true,
+            ..InputDspParams::default()
+        });
+        assert!(is_silent(&run_block(&mut w.lanes.input, 0)));
+        assert!(!is_silent(&run_block(&mut w.lanes.output, 0)));
+    }
+
+    #[test]
+    fn a_lane_starts_unmuted_before_its_first_snapshot() {
+        // The holder is built before any snapshot is read; its first block must not be silence
+        // the user never asked for.
+        let (lanes, _handover) = lanes_for_tests();
+        let LaneDsp::Output(output) = &lanes.output else {
+            unreachable!("the output slot holds the output lane's DSP");
+        };
+        assert!(!output.muted);
+        let LaneDsp::Input(input) = &lanes.input else {
+            unreachable!("the input slot holds the input lane's DSP");
+        };
+        assert!(!input.muted);
+    }
+
+    #[test]
+    fn silencing_touches_only_the_processed_block() {
+        let mut scratch = [0.25_f32; 8];
+        let (block, rest) = scratch.split_at_mut(4);
+        silence_if(true, block);
+        assert_eq!(block, [0.0; 4]);
+        assert_eq!(
+            rest, [0.25; 4],
+            "the scratch past the block is not the ring's"
+        );
+        silence_if(false, rest);
+        assert_eq!(rest, [0.25; 4], "unmuted is a straight wire");
     }
 
     /// The music lane never takes a voice engine, however many are waiting: the hand-over's
