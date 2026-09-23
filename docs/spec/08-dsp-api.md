@@ -630,6 +630,9 @@ Constants at `SosProcess.cpp:688-694` and `:699-708`.
   480-frame buffers / 48 kHz that is ~20 s. The release is instantaneous (α = 1).
 * **No public GUI control exposes this** — `setNormalization` is never called from
   `fxsound/Source/GUI/`. It is dead in the shipping app but present in the API.
+* **Port: not ported** (0.4.0 audit #37). With nothing to set a target the stage never ran on
+  Windows, so `fxsound-dsp` carries no normaliser, and `DspParams.normalization_db` reaches
+  nothing.
 
 ### 8.4 `setVolumeLeveling(float gain_db)` — the parameter is **not** dB
 
@@ -718,6 +721,38 @@ Algorithm sketch (`SosProcess.cpp:139-472`):
 
 `sqrtf`, `log10`, `fabs`, `fmax`, `fmin` are called per buffer; the per-sample loops are
 multiply/add only. This is RT-safe (no allocation, no locks), but expensive.
+
+**Where the port departs from it** (0.4.0 audit of copied Windows defects; each changes the sound
+only while levelling is on; `crates/fxsound-dsp/src/leveller.rs` has the detail):
+
+* **#1** — the peak safety `ceiling / peak` reads the *unfiltered* peak of every channel the gain
+  reaches, not the 120 Hz side chain's, so bass is held under the ceiling instead of boosted past
+  it and hard-clipped. The side-chain peak still feeds the quiet statistics; the clip at step 8 is
+  kept as a last guard.
+* **#2** — the state machine steps every **10 ms of audio** (`round(fs · 0.010)` frames), not
+  once per buffer, carrying a step across calls when the PipeWire quantum is shorter or not a
+  multiple of it. Every "per buffer" constant in the table above is therefore per 10 ms, as it was
+  tuned on WASAPI's 10 ms period, and the 6-entry power ring spans 60 ms. At 480-frame buffers and
+  48 kHz the arithmetic is the original's, sample for sample, wherever #1 and #4 do not apply.
+* **#3** — the subwoofer is levelled with every other channel; it is left out of the statistics
+  only (see §16 item 4).
+* **#4** — the start of a step's ramp is no longer clamped to the peak-safe gain: where the peak
+  safety bites, the gain falls over at most 2 ms, arriving on the first sample that would otherwise
+  cross the ceiling, instead of on the step's first sample. The fade is searched for across the
+  whole call, so a transient just past a step boundary inside a call is faded into from the step
+  before; where the next step completes in the same call, the search assumes the lowest effective
+  ceiling that step's decision can set (the tonality moves at most `0.08` of the way to fully
+  clear in a step). The clamp of the start to `max_gain_cap` (`SosProcess.cpp:367`), a fraction of
+  a decibel as the cap drifts, is kept.
+  **Limit:** a transient in the first 2 ms of a *call* cannot be faded into without 2 ms of
+  look-ahead latency, which the port does not add. One `n` frames into a call is faded over those
+  `n` frames only, and one on a call's first frame still falls the whole way in one sample (12.2 dB
+  from a ×4.5 quiet passage into a ±0.9 burst). At 48 kHz that is the first 96 frames of every
+  call — about one hit in eleven at a 1024-frame quantum, one in five at 480 — and every hit at a
+  quantum of 96 frames or less (at 64 frames, 2.8 dB in one sample 8 frames into a call, 1.5 dB
+  16 frames in).
+* **#5** — the detector's filter state is flushed to zero below `1e-20`, so digital silence does
+  not leave it running on subnormals.
 
 ### 8.5 `setFilterQ(float q_multiplier)`
 
@@ -1573,6 +1608,11 @@ fxsound-dsp/
    `excluded_channel = 3`** (LFE) (`SosProcess.cpp:908` vs `:725`). Confirm the intended
    behaviour for 5.1/7.1 before porting, and decide what to do for PipeWire's arbitrary
    channel maps (which are *not* guaranteed to be Windows WAVE order).
+   *Decided (0.4.0 audit #3):* the original skipped the LFE in the gain as well as in the
+   detector, so a quiet scene lifted by 10–20 dB lost its subwoofer by as much. The port levels
+   every channel and keeps the LFE — found by its position in the PipeWire channel map, not by
+   index 3 — out of the RMS, tonality and post-gain statistics only. It does count towards the
+   peak safety, because the ceiling applies to it like any other channel.
 
 5. **Channel order is assumed to be Windows WAVE order** (FL FR FC LFE BL BR [SL SR],
    `dfxpProcessReal.cpp:218-221`). PipeWire delivers a `SPA_PARAM_EnumFormat` channel

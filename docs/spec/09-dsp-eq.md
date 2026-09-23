@@ -750,10 +750,15 @@ back up at ~0.0005/buffer. The `min(smoothing, 0.5)` on line `:710` is applied *
 assignment, so the release factor is really `0.5`, not `1.0`. Reproduce carefully; the `= 1` looks
 like a debug leftover.
 
+**Port:** not ported (0.4.0 audit #37) — `setNormalization` has no caller in the Windows
+application, so the stage never ran there.
+
 Finally `applyVolumeLeveling(...)` runs (`:725` stereo, `:908` surround, with the LFE channel index
-`3` excluded on the surround path). That detector is a separate subsystem (a sidechain HPF at
-120 Hz, three one-pole tone probes at 180 / 1200 / 4500 Hz, a 6-entry power history and a 30-second
-peak window — `SosProcess.cpp:37-76`, `u_sos.h:80-104`) and is out of scope for this document.
+`3` excluded on the surround path — from the gain as well as the detector; the port levels the LFE
+and excludes it from the statistics only, 0.4.0 audit #3). That detector is a separate subsystem
+(a sidechain HPF at 120 Hz, three one-pole tone probes at 180 / 1200 / 4500 Hz, a 6-entry power
+history and a 30-second peak window — `SosProcess.cpp:37-76`, `u_sos.h:80-104`) and is out of scope
+for this document.
 
 ---
 
@@ -1768,7 +1773,9 @@ factors (`0.0005 + gain_diff*0.001` attack, effectively `0.5` release after the
 `min(smoothing, 0.5)` on `:710`) are **per buffer, not per second**. PipeWire quantum sizes differ
 wildly from WASAPI's, so the normaliser's time constants will change behaviour on Linux unless you
 rescale them by `buffer_frames / sample_rate`. This needs a deliberate retuning decision and
-listening tests.
+listening tests. *Moot for the port:* the normaliser is not ported, because nothing in the Windows
+application ever sets its target (0.4.0 audit #37). The volume leveller had the same per-buffer
+problem and now steps on its own 10 ms clock (audit #2, `08-dsp-api.md` §8.4).
 
 **The `smoothing_factor = 1` on `SosProcess.cpp:706` looks like a debug leftover**, immediately
 neutered by `min(smoothing, 0.5)` on `:710`. The commented-out original was
