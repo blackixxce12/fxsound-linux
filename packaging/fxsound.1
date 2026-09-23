@@ -122,7 +122,7 @@ build's and is kept verbatim.
 .TP
 .BI \-\-noise\-suppression= LEVEL
 Noise suppression for the microphone lane, as a control surface over RNNoise:
-.BR off ", " light ", " medium " or " strong ,
+.BR off ", " light " (also " mild ", as the window calls it), " medium " or " strong ,
 or
 .B preset
 to follow whatever the selected voice preset asks for, which is the default.
@@ -136,7 +136,12 @@ Select a preset by its exact, case-sensitive name, in the edit direction's
 list: a
 .I .fac
 preset for the output lane, a voice preset for the input lane. An unknown name
-is an error, not a silent no-op.
+is an error, not a silent no-op; a name only the other lane has is refused with
+a note saying which
+.B \-\-edit
+reaches it. A device named on the same command line is selected first, so
+.B \-\-input=...\& \-\-preset=...
+finds the preset in the microphone's list.
 .TP
 .BI \-\-save_preset= NAME
 Save the current modified settings as a new user preset.
@@ -171,22 +176,37 @@ name is the PipeWire
 .I node.name
 is accepted too, because that is what the settings file persists.
 .B off
-detaches the lane: the virtual sink stays published and nothing is rendered
-until a device is chosen again. Picking a device also makes that lane the edit
-direction. For compatibility with 0.3.0, naming a microphone here is treated as
+detaches the lane: FxSound hands the session default back and removes that
+lane's nodes until a device is chosen again. Picking a device also makes that
+lane the edit direction. For compatibility with 0.3.0, naming a microphone here is treated as
 .B \-\-input
 with a note on standard error.
+A name that matches no device is an error, except before PipeWire has listed
+the devices, as at login: then the name is held, the lane becomes the edit
+direction at once, and the device is selected when the list arrives, keeping a
+preset picked for it in the meantime.
+A later
+.BR \-\-output ,
+.B off
+or
+.B \-\-next\-output
+replaces a held name.
 .TP
 .BI \-\-input= DEVICE|off
 The same for the microphone lane: select the capture device the voice chain
 reads from, or detach the lane with
 .BR off .
+A playback device named here is an error rather than a guess.
 .TP
 .BI \-\-edit= output|input
 Choose the edit direction: the lane the window shows and the preset, effect
 and power options above act on. The window's device combo and the tray menu
-change it too. Without this option a forwarded command line acts on whichever
-direction the instance is already editing.
+change it too, as does
+.BR \-\-output " or " \-\-input
+on the same command line, which
+.B \-\-edit
+overrides. Without either, a forwarded command line acts on whichever direction
+the instance is already editing.
 .TP
 .BI \-\-view= 1|2
 Switch the window between the Lite (1) and Pro (2) layouts.
@@ -224,7 +244,8 @@ Cycle the output lane to the next usable playback device, wrapping. Playback
 devices only: it never crosses into the microphones.
 .TP
 .B \-\-next\-input
-Cycle the microphone lane to the next usable capture device, wrapping.
+Cycle the microphone lane to the next usable capture device, wrapping. Capture
+devices only.
 .SS Control
 .TP
 .B \-\-status
@@ -232,10 +253,11 @@ Print the running instance's state on standard output and exit, one
 .I key: value
 line per item: the version, whether processing is on, then
 .BR output ", " input ", " output_preset ", " input_preset " and " direction
-(the edit direction), followed by an
-.B input:
-block with the voice chain's telemetry. Every other option on the same
-command line is ignored.
+(the edit direction), the lines 0.3.0 printed, and last
+.BR noise_suppression ", " echo_cancel
+and the voice chain's telemetry as
+.B input_
+lines. Every other option on the same command line is ignored.
 .TP
 .B \-\-json
 Print the
@@ -246,8 +268,12 @@ report as JSON instead of as lines: one object for
 .BR output " and " input
 objects and an
 .B input_meters
-block), one object per line for the other two. Not the default: the line
-format is what existing scripts already grep.
+block) and for
+.B \-\-self\-test
+.RB ( version ", " checks ", " ok ),
+one object per line for
+.BR \-\-watch .
+Not the default: the line format is what existing scripts already grep.
 .TP
 .B \-\-watch
 Subscribe to the running instance and print one event per line until it
@@ -282,11 +308,18 @@ Check the installation and exit: the version; that the factory
 presets and the voice presets are found under the install prefix and parse;
 that the settings file parses; an offline run of both processing chains with
 RNNoise instantiated; that the desktop entry, the icons (application and
-status), the systemd unit and this manual page are present; that the runtime
-directory can be created. PipeWire and the session bus are reported as
+status), the systemd unit, this manual page and the AppStream metainfo are
+present; that the runtime directory can be created. Run from a source tree,
+the install-only files are reported as
+.BR skip .
+PipeWire and the session bus are reported as
 .B skip
 rather than as failures when there is none, so the test is meaningful in a
-container with no session. It runs before the single-instance lock is taken,
+container with no session; when they are there, it only checks that something
+answers on their sockets. It writes nothing, not even a broken settings file
+aside. One
+.I name: ok|skip|fail detail
+line per check. It runs before the single-instance lock is taken,
 so it works beside a running FxSound and never forwards anything to it. The
 exit status is 0 if and only if every check that was not skipped passed.
 .TP
@@ -315,15 +348,17 @@ it, not that the effect is audible yet. For
 every check that ran passed.
 .TP
 .B 1
+The command failed and standard error or the report says why: the running
+instance refused it (an unknown preset or device name, for example) or could
+not be reached, there is no running instance for
+.BR \-\-status " or " \-\-watch
+to ask,
 .B \-\-self\-test
-found at least one failing check; the report says which.
+found at least one failing check, or FxSound itself could not start.
 .TP
 .B 2
 The command line could not be parsed \(en an unknown option, or a value outside
 its range.
-.PP
-Any other non-zero status is a failure to start or a failure to reach a running
-instance.
 .SH D\-BUS
 A running instance also serves an interface on the session bus, for status
 bars, compositor scripts and anything else that would rather hold a connection

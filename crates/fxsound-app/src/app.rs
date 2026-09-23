@@ -189,6 +189,19 @@ pub(crate) fn apply_microphone_settings(
     };
 }
 
+/// A `--output` or `--input` that arrived before the device list did (see
+/// [`App::select_device_when_listed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingDevice {
+    lane: DeviceDirection,
+    /// The name as the command line gave it, resolved once the list exists.
+    name: String,
+    /// A preset picked for `lane` while the name was waiting, which the device keeps when it is
+    /// selected instead of bringing back the one it remembers — as it would had the list been
+    /// there, the device selected first and the preset picked after it.
+    preset: Option<String>,
+}
+
 /// Everything the running application owns.
 pub struct App {
     /// What the views draw.
@@ -219,8 +232,9 @@ pub struct App {
     devices_seen: bool,
     /// The last thing the audio thread said about itself, for `--status`.
     audio_status: fxsound_core::AudioStatus,
-    /// A `--output` that arrived before the list did, waiting for it.
-    pending_device: Option<String>,
+    /// A `--output` or `--input` that arrived before the list did, waiting for it — at most one
+    /// per lane, so `--output X --input Y` at login waits for both.
+    pending_devices: Vec<PendingDevice>,
     /// Persisted settings, saved when they change rather than on a timer.
     settings: Settings,
     /// Factory and user presets.
@@ -289,7 +303,7 @@ impl App {
             input_presets: Vec::new(),
             devices_seen: false,
             audio_status: fxsound_core::AudioStatus::default(),
-            pending_device: None,
+            pending_devices: Vec::new(),
             settings,
             presets,
             loaded_preset: None,
@@ -444,7 +458,7 @@ impl App {
 
         // Outside the loop, where the engine is no longer borrowed: selecting a device calls back
         // into the whole controller.
-        if self.devices_seen && self.pending_device.is_some() {
+        if self.devices_seen && !self.pending_devices.is_empty() {
             self.apply_pending_device();
         }
     }
@@ -484,6 +498,12 @@ impl App {
         for action in actions {
             self.handle_one(action.clone());
         }
+        self.save_settings_if_dirty();
+    }
+
+    /// Write the settings file if anything in it changed — once per batch of actions rather than
+    /// once per action.
+    fn save_settings_if_dirty(&mut self) {
         if self.settings_dirty {
             if self.persist
                 && let Err(err) = self.settings.save()
@@ -531,7 +551,10 @@ impl App {
                 self.assets.clear();
             }
 
-            UiAction::SelectPreset(index) => self.select_preset(index),
+            UiAction::SelectPreset(index) => {
+                self.select_preset(index);
+                self.hold_picked_preset();
+            }
             UiAction::SavePreset => self.save_preset(None),
             UiAction::SavePresetAs(name) => self.save_preset(Some(name)),
             UiAction::UndoPresetChanges => self.undo_preset_changes(),
@@ -638,6 +661,7 @@ impl App {
         };
         if let Some(index) = next {
             self.select_preset(index);
+            self.hold_picked_preset();
         }
     }
 
@@ -764,29 +788,7 @@ impl App {
                 }
                 // `"Preset: "` + name on every change (`FxController.cpp:1101`).
                 self.notify(Message::preset_selected(&name));
-                // Record it against whatever is playing, so plugging the headphones back in
-                // brings this preset with them. `DeviceConfig` and its two accessors were written
-                // and tested for exactly this and then never called by anything.
-                if let Some((node, description, form_factor, direction)) =
-                    self.state.selected_device().and_then(|at| {
-                        self.state.devices.get(at).map(|d| {
-                            (
-                                d.name.clone(),
-                                d.description.clone(),
-                                d.form_factor.clone(),
-                                d.direction,
-                            )
-                        })
-                    })
-                {
-                    self.settings.remember_device_preset(
-                        &node,
-                        &description,
-                        &name,
-                        &form_factor,
-                        direction,
-                    );
-                }
+                self.remember_preset_for_selected_device(&name);
                 self.settings
                     .set_preset_for_direction(DeviceDirection::Output, &name);
                 self.settings_dirty = true;
@@ -800,6 +802,33 @@ impl App {
                 self.state
                     .notify(tr_args("Could not load %s", &[name.as_str()]));
             }
+        }
+    }
+
+    /// Record `preset` against whatever is playing, so plugging the headphones back in brings this
+    /// preset with them. `DeviceConfig` and its two accessors were written and tested for exactly
+    /// this and then never called by anything.
+    fn remember_preset_for_selected_device(&mut self, preset: &str) {
+        if let Some((node, description, form_factor, direction)) =
+            self.state.selected_device().and_then(|at| {
+                self.state.devices.get(at).map(|d| {
+                    (
+                        d.name.clone(),
+                        d.description.clone(),
+                        d.form_factor.clone(),
+                        d.direction,
+                    )
+                })
+            })
+        {
+            self.settings.remember_device_preset(
+                &node,
+                &description,
+                preset,
+                &form_factor,
+                direction,
+            );
+            self.settings_dirty = true;
         }
     }
 
@@ -1019,6 +1048,17 @@ impl App {
     /// went away. Picking a device also makes its lane the edit direction, since that is the chain
     /// the user has just shown an interest in.
     fn select_device(&mut self, index: usize, lane: DeviceDirection) {
+        self.select_device_keeping(index, lane, None);
+    }
+
+    /// [`App::select_device`], with `picked` — a preset chosen for `lane` while the device was
+    /// waiting for the list (see [`PendingDevice`]) — in place of the one the device remembers.
+    fn select_device_keeping(
+        &mut self,
+        index: usize,
+        lane: DeviceDirection,
+        picked: Option<String>,
+    ) {
         // Everything needed from the device is taken before anything borrows `self` mutably,
         // because restoring the remembered preset calls back into `select_preset`.
         let Some((name, description, direction)) = self
@@ -1060,7 +1100,21 @@ impl App {
         // one does: the first time something is plugged in, whatever is selected stays selected,
         // because guessing then would be changing the sound on no evidence at all. (Moving to the
         // other lane already brought back what that lane last had, in `set_edit_direction`.)
-        if let Some(preset) = remembered
+        //
+        // A preset picked while the device waited for the list is the later word and wins. It
+        // was selected when it was picked, before this device was, so what is left to do is what
+        // picking it now would add: an output device remembers the preset it is used with.
+        let picked = picked.and_then(|preset| {
+            let at = self.state.presets.iter().position(|e| e.name == preset)?;
+            Some((at, preset))
+        });
+        if let Some((at, preset)) = picked {
+            if self.state.selected_preset != Some(at) {
+                self.select_preset(at);
+            } else if direction == DeviceDirection::Output {
+                self.remember_preset_for_selected_device(&preset);
+            }
+        } else if let Some(preset) = remembered
             && self
                 .state
                 .preset()
@@ -1245,32 +1299,56 @@ impl App {
         self.input_params.deesser_on = self.state.deesser_on;
     }
 
-    /// Act on a `--output` that arrived before the device list did.
+    /// Act on the `--output` and `--input` that arrived before the device list did.
     ///
     /// Taken rather than retried: a name that is not in the list *now that there is one* is a name
     /// that is not a device, and holding it for the next list would mean a typo at login quietly
-    /// changing the device half a minute later when something unrelated is plugged in.
-    fn apply_pending_device(&mut self) {
-        let Some(wanted) = self.pending_device.take() else {
-            return;
-        };
-        let index = self
-            .state
-            .devices
-            .iter()
-            .position(|d| d.name == wanted)
-            .or_else(|| {
-                self.state
-                    .devices
-                    .iter()
-                    .position(|d| d.description == wanted)
-            });
-        match index {
-            Some(index) => self.handle(&[UiAction::SelectDevice(index)]),
+    /// changing the device half a minute later when something unrelated is plugged in. A name is
+    /// resolved exactly as it would have been had the list been there when it arrived
+    /// ([`crate::commands::resolve_device`]), 0.3.0's `--output` naming a microphone included —
+    /// and a preset picked for the lane in the meantime is kept rather than replaced by the one
+    /// the device remembers, since with the list there it would have been picked after the device.
+    /// The same goes for the edit direction: holding a name made its lane the edit direction, and
+    /// if the window is on the other lane by now, something later — `--edit`, the window, a device
+    /// that was listed — chose that, and it stays chosen.
+    pub(crate) fn apply_pending_device(&mut self) {
+        use crate::commands::{Resolved, resolve_device};
+        let pending = std::mem::take(&mut self.pending_devices);
+        let settled_edit = pending
+            .last()
+            .is_some_and(|last| last.lane != self.state.direction)
+            .then_some(self.state.direction);
+        for PendingDevice {
+            lane,
+            name: wanted,
+            preset,
+        } in pending
+        {
             // The invoking process has long since exited, so there is nobody left to return a
-            // status to. The log is the only place this can be said.
-            None => log::warn!("no audio device is called {wanted:?}; --output did nothing"),
+            // status to. The log is the only place anything here can be said.
+            match resolve_device(&self.state.devices, &wanted, lane) {
+                Resolved::Found(index) => self.select_device_keeping(index, lane, preset),
+                // A preset picked for the output lane means nothing on the microphone this turned
+                // out to be, so the device brings back its own.
+                Resolved::OtherDirection(index) if lane == DeviceDirection::Output => {
+                    log::info!("{wanted:?} is a microphone; --output selected it as --input would");
+                    self.select_device(index, DeviceDirection::Input);
+                }
+                Resolved::OtherDirection(_) => {
+                    log::warn!(
+                        "{wanted:?} is a playback device, not a microphone; --input did nothing"
+                    );
+                }
+                Resolved::NotFound => log::warn!(
+                    "no audio device is called {wanted:?}; --{} did nothing",
+                    lane.key()
+                ),
+            }
         }
+        if let Some(edit) = settled_edit {
+            self.set_edit_direction(edit);
+        }
+        self.save_settings_if_dirty();
     }
 
     /// What the audio thread last said about itself — the negotiated format, and how the ring
@@ -1286,13 +1364,123 @@ impl App {
         self.devices_seen
     }
 
-    /// Select this device as soon as a device list exists.
+    /// Select this device for `lane` as soon as a device list exists.
     ///
-    /// Used by `--output` when it runs before enumeration has finished, which is what anything
-    /// started at login does. One pending name, not a queue: a second `--output` supersedes the
-    /// first exactly as a second one would if both had arrived after the list.
-    pub fn select_device_when_listed(&mut self, name: &str) {
-        self.pending_device = Some(name.to_owned());
+    /// Used by `--output` and `--input` when they run before enumeration has finished, which is
+    /// what anything started at login does. One pending name per lane, not a queue: a second
+    /// `--output` supersedes the first exactly as a second one would if both had arrived after the
+    /// list, and leaves a pending `--input` alone. So does anything else that settles the lane's
+    /// device in the meantime — `off`, a device that is in the list — through
+    /// [`App::cancel_pending_device`].
+    ///
+    /// A preset picked for `lane` while the name waits — the `--preset` on the same line, a later
+    /// one, the window's picker — is held with it, and the device keeps that preset when it is
+    /// selected instead of bringing back the one it remembers.
+    pub fn select_device_when_listed(&mut self, name: &str, lane: DeviceDirection) {
+        self.cancel_pending_device(lane);
+        self.pending_devices.push(PendingDevice {
+            lane,
+            name: name.to_owned(),
+            preset: None,
+        });
+    }
+
+    /// Forget the device `lane` was waiting for, so the list's arrival does not select it after
+    /// something later on the command line — `off`, `--next-*`, a device already listed — has
+    /// settled what the lane should be.
+    pub fn cancel_pending_device(&mut self, lane: DeviceDirection) {
+        self.pending_devices.retain(|pending| pending.lane != lane);
+    }
+
+    /// Whether `lane` is waiting for the device list to select a device, and which name.
+    #[must_use]
+    pub fn pending_device(&self, lane: DeviceDirection) -> Option<&str> {
+        self.pending_devices
+            .iter()
+            .find(|pending| pending.lane == lane)
+            .map(|pending| pending.name.as_str())
+    }
+
+    /// After an explicit preset pick: if the edit direction's device is still waiting for the
+    /// list, the pick goes with it (see [`PendingDevice::preset`]).
+    fn hold_picked_preset(&mut self) {
+        let lane = self.state.direction;
+        let picked = self.state.preset().map(|p| p.name.clone());
+        if let Some(pending) = self
+            .pending_devices
+            .iter_mut()
+            .find(|pending| pending.lane == lane)
+        {
+            pending.preset = picked;
+        }
+    }
+
+    /// The preset a lane has selected — its name and whether it carries unsaved changes —
+    /// whichever lane the window is editing. For `--status`, which reports both.
+    ///
+    /// The edit direction's is what the window shows; the other lane's is the one parked when the
+    /// window last left it, or, for a lane the window has not shown this session, the name the
+    /// settings file remembers for it. The part-2 controller keeps both lanes' controls side by
+    /// side and answers this without the fallback.
+    #[must_use]
+    pub fn lane_preset(&self, lane: DeviceDirection) -> Option<(&str, bool)> {
+        if lane == self.state.direction {
+            return self.state.preset().map(|p| (p.name.as_str(), p.modified));
+        }
+        if let Some((parked, controls)) = &self.parked
+            && *parked == lane
+        {
+            return controls
+                .selected_preset
+                .and_then(|i| controls.presets.get(i))
+                .map(|p| (p.name.as_str(), p.modified));
+        }
+        let saved = self.settings.preset_for_direction(lane);
+        (!saved.is_empty()).then_some((saved, false))
+    }
+
+    /// Whether `lane`'s preset list has one called `name` — the `.fac` store for the speakers,
+    /// the voice presets for the microphone — whichever lane the window is showing.
+    #[must_use]
+    pub fn lane_has_preset(&self, lane: DeviceDirection, name: &str) -> bool {
+        match lane {
+            DeviceDirection::Output => self.presets.entries().iter().any(|e| e.name == name),
+            DeviceDirection::Input => self.input_presets.iter().any(|p| p.name == name),
+        }
+    }
+
+    /// Pin the microphone's noise suppression, or hand it back to the voice preset — the Settings
+    /// pane's choice, from the command line. Saved and published at once, whichever lane the
+    /// window is editing; an open pane picks it up in [`App::refresh_settings_state`].
+    pub fn set_noise_suppression(&mut self, choice: fxsound_core::NoiseSuppressionOverride) {
+        if self.settings.noise_suppression == choice {
+            return;
+        }
+        self.settings.noise_suppression = choice;
+        self.microphone_setting_changed();
+    }
+
+    /// Pretend a device list has arrived, so a name that is not in `state.devices` is refused
+    /// rather than held — the command-line tests' way past the login race.
+    #[doc(hidden)]
+    pub fn mark_devices_seen_for_tests(&mut self) {
+        self.devices_seen = true;
+    }
+
+    /// Point a headless app at these preset directories and these voice presets, and show the
+    /// edit direction's list — the command-line tests' way to a preset list without the user's.
+    #[doc(hidden)]
+    pub fn use_presets_for_tests(
+        &mut self,
+        factory_dirs: Vec<PathBuf>,
+        user_dir: PathBuf,
+        voices: Vec<fxsound_preset::input::InputPreset>,
+    ) {
+        self.presets = PresetStore::with_dirs(factory_dirs, user_dir);
+        self.presets.rescan();
+        self.input_presets = voices;
+        self.refresh_preset_list();
+        self.state.selected_preset = None;
     }
 
     /// The microphone snapshot currently published, for tests and for `--status`.
@@ -1331,7 +1519,7 @@ impl App {
             input_presets: Vec::new(),
             devices_seen: false,
             audio_status: fxsound_core::AudioStatus::default(),
-            pending_device: None,
+            pending_devices: Vec::new(),
             settings: Settings::default(),
             presets: PresetStore::with_dirs(
                 Vec::new(),
@@ -1804,6 +1992,22 @@ fn startup_messages(settings: &Settings) -> Vec<UiToAudio> {
     messages
 }
 
+/// The action that attaches `lane` to device `index`.
+pub(crate) const fn select_on(lane: DeviceDirection, index: usize) -> UiAction {
+    match lane {
+        DeviceDirection::Output => UiAction::SelectOutput(index),
+        DeviceDirection::Input => UiAction::SelectInput(index),
+    }
+}
+
+/// The action that detaches `lane`.
+pub(crate) const fn detach(lane: DeviceDirection) -> UiAction {
+    match lane {
+        DeviceDirection::Output => UiAction::DetachOutput,
+        DeviceDirection::Input => UiAction::DetachInput,
+    }
+}
+
 /// An equalizer as the window holds it, from a snapshot's two parallel arrays.
 fn bands_of(centres: &[f32], boosts: &[f32]) -> Vec<EqBand> {
     centres
@@ -2233,11 +2437,14 @@ impl App {
     }
 
     /// Bring the Settings pane's live fields up to date — what the audio thread has said about the
-    /// echo canceller since the pane opened, and whether there is still a microphone to calibrate.
-    /// The host calls this every frame the pane is open; everything else in the pane's working
-    /// copy changes only through [`App::handle_settings`].
+    /// echo canceller since the pane opened, whether there is still a microphone to calibrate, and
+    /// a noise-suppression level `--noise-suppression` set while it was open. The host calls this
+    /// every frame the pane is open; everything else in the pane's working copy changes only
+    /// through [`App::handle_settings`].
     pub fn refresh_settings_state(&self, state: &mut SettingsState) {
         state.echo_cancel_running = self.state.echo_cancel_running;
+        // The one microphone setting the command line and D-Bus can change under an open pane.
+        state.settings.noise_suppression = self.settings.noise_suppression;
         if state.echo_cancel_detail != self.echo_cancel_detail {
             state
                 .echo_cancel_detail
@@ -2751,7 +2958,7 @@ mod tests {
         // A typo held for the next device list would change the device half a minute later, when
         // something unrelated is plugged in. Once a list has been seen, the pending name is spent.
         let mut app = App::headless_for_tests();
-        app.select_device_when_listed("typo");
+        app.select_device_when_listed("typo", DeviceDirection::Output);
         app.devices_seen = true;
         app.state.devices = vec![device(
             "alsa_output.speakers",

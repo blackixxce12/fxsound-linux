@@ -175,6 +175,14 @@ impl<F: PresetFile> Store<F> {
         &self.user_dir
     }
 
+    /// Where factory presets are looked for, in search order — what `fxsound --self-test` reads
+    /// back, so it checks the directories this store will actually use rather than a copy of the
+    /// list that could drift from it.
+    #[must_use]
+    pub fn factory_dirs(&self) -> &[PathBuf] {
+        &self.factory_dirs
+    }
+
     /// Re-scan every directory. Unreadable directories are skipped, not fatal: a missing factory
     /// directory must not stop the application from starting.
     pub fn rescan(&mut self) {

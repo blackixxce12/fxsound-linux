@@ -6,7 +6,8 @@
 //!
 //! ## Startup, in order
 //!
-//! 1. Parse the command line.
+//! 1. Parse the command line. `--self-test` is answered right here, before anything below can
+//!    take a lock, open a socket, show a window or write a setting (0.4.0 design §13).
 //! 2. Try to become the single instance. If another one is already running, forward the command
 //!    line to it over the control socket, print whatever it says and exit — which is what makes
 //!    `fxsound --next-preset` usable as a compositor keybind. `--quit` with nobody to forward to
@@ -50,6 +51,7 @@ use fxsound_app::{
     cli::Cli,
     commands::{self, WindowRequest},
     ipc::{self, Instance},
+    selftest,
     tray::{self, TrayCommand, TrayDevice, TrayHandle, TrayPreset, TrayState},
 };
 use fxsound_core::{ThemeMode, ViewMode, i18n::tr};
@@ -92,6 +94,14 @@ fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
+
+    // Step 1½: the self-test belongs to this process, not to an instance. It runs beside a
+    // running FxSound and in a container with no session, and it leaves no trace in either.
+    if cli.self_test {
+        let report = selftest::run(&selftest::Environment::detect());
+        println!("{}", report.render(cli.json));
+        std::process::exit(report.exit_code());
+    }
 
     // Step 2: single instance. A second invocation is a remote control, not a second app.
     let listener = match Instance::acquire() {
@@ -137,8 +147,9 @@ fn main() -> eframe::Result<()> {
     }
     // `--status` is a question for a running instance as well (`docs/spec/00-architecture.md`
     // §4.7): with none there is nothing to report, and starting one to answer would be the
-    // opposite of what was asked. Fail, after unlinking the socket `server` owns.
-    if cli.status {
+    // opposite of what was asked. `--watch` subscribes to one, and the same holds. Fail, after
+    // unlinking the socket `server` owns.
+    if cli.status || cli.watch {
         eprintln!("FxSound is not running");
         drop(server);
         std::process::exit(1);

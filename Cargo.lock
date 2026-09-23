@@ -1330,6 +1330,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]

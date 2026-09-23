@@ -10,6 +10,7 @@ pub mod cli;
 pub mod commands;
 pub mod ipc;
 pub mod notify;
+pub mod selftest;
 pub mod tray;
 
 pub use app::{App, WindowVisibility};

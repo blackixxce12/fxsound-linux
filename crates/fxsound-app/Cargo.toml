@@ -34,6 +34,9 @@ ksni = { workspace = true, features = ["blocking"] }
 notify-rust = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `--self-test` parses the settings file itself: `Settings::load` moves a file it cannot parse
+# aside, and a self-test must not write anything.
+toml = { workspace = true }
 dirs = { workspace = true }
 log = { workspace = true }
 # Not called from our code: this is the runtime ksni's tray service and its blocking facade run
