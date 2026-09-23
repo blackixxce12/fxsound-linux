@@ -59,7 +59,16 @@
 //! - **A stream that may not be moved** is listed like any other, and marked ([`Pin`]): one that
 //!   says `node.dont-move = true`, whose metadata target WirePlumber ignores anyway
 //!   (`linking/find-defined-target.lua`), and one whose own properties name a target that is not
-//!   FxSound. That application chose its device itself, and a route would undo the choice.
+//!   FxSound. That application chose its device itself, and a route would undo the choice. And two
+//!   that a move would put at risk, because of what WirePlumber does with them once their route's
+//!   node goes — which it does whenever FxSound exits, a lane moves to another device, a route
+//!   fails, or a rule changes: one that says `node.dont-reconnect = true` (what `pipewire-pulse`
+//!   makes of `PA_STREAM_DONT_MOVE`), which WirePlumber never moves once it is linked and never
+//!   links again once its target has gone (`linking/prepare-link.lua`: "dont-reconnect, not
+//!   moving"), so it would first ignore the move and then, were it ever linked onto a route, fall
+//!   silent with it; and one that says `node.dont-fallback = true`, which WirePlumber destroys
+//!   when the target its metadata names is not there (`find-defined-target.lua`: "destroyed node
+//!   as defined target was not found").
 //!
 //! And a stream that says nothing about who it is — no binary, no name, no Flatpak id, its own or
 //! its client's — is left out too: the list could not name it, and no rule could match it.
@@ -292,6 +301,12 @@ pub(crate) struct StreamNode {
     pub(crate) key: AppKey,
     /// `node.dont-move = true`: it may never be moved ([`Pin::DontMove`]).
     pub(crate) dont_move: bool,
+    /// `node.dont-reconnect = true`: once linked, WirePlumber never moves it
+    /// ([`Pin::DontReconnect`]).
+    pub(crate) dont_reconnect: bool,
+    /// `node.dont-fallback = true`: WirePlumber destroys it when the target it is to go to is not
+    /// there ([`Pin::DontFallback`]).
+    pub(crate) dont_fallback: bool,
     /// `stream.capture.sink = true` on a recorder: it records a sink's monitor, not a microphone.
     /// WirePlumber reads the flag on recorders only (`cutils.getTargetDirection`), and so does this.
     /// A recorder without it can record what FxSound plays all the same, by naming one of the
@@ -322,6 +337,8 @@ impl StreamNode {
             client: None,
             key: AppKey::default(),
             dont_move: false,
+            dont_reconnect: false,
+            dont_fallback: false,
             monitor: false,
             target: None,
             complete: false,
@@ -344,6 +361,8 @@ impl StreamNode {
         self.client = get("client.id").and_then(|id| id.parse().ok());
         self.key = app_key(get);
         self.dont_move = parse_bool(get("node.dont-move"));
+        self.dont_reconnect = parse_bool(get("node.dont-reconnect"));
+        self.dont_fallback = parse_bool(get("node.dont-fallback"));
         self.monitor =
             self.direction == DeviceDirection::Input && parse_bool(get("stream.capture.sink"));
         self.target = ExplicitTarget::from_props(get);
@@ -357,6 +376,16 @@ pub(crate) enum Pin {
     /// `node.dont-move = true`: the application asked never to be moved, and WirePlumber would
     /// not follow a metadata target for it anyway.
     DontMove,
+    /// `node.dont-reconnect = true` — what `pipewire-pulse` makes of a PulseAudio client's
+    /// `PA_STREAM_DONT_MOVE`. Once the stream is linked WirePlumber moves it nowhere, whatever its
+    /// metadata says, and once what it is linked to goes it is linked to nothing again
+    /// (`linking/prepare-link.lua`). A key written for it would move nothing and say it had; and
+    /// were it ever to reach a route, it would fall silent the moment that route's node went.
+    DontReconnect,
+    /// `node.dont-fallback = true`: WirePlumber destroys the stream when the target its metadata
+    /// names is not there (`linking/find-defined-target.lua`) — and a route's node goes whenever
+    /// FxSound exits, a lane moves to another device, a route fails, or a rule changes.
+    DontFallback,
     /// It records what a sink plays, not a microphone ([`AppStreams::records_a_sink`]) — what
     /// FxSound plays, or it would not be listed. Behind the microphone it would record the
     /// microphone.
@@ -372,6 +401,8 @@ impl Pin {
     pub(crate) const fn reason(self) -> &'static str {
         match self {
             Self::DontMove => "it says node.dont-move",
+            Self::DontReconnect => "it says node.dont-reconnect",
+            Self::DontFallback => "it says node.dont-fallback",
             Self::Monitor => "it records what a sink plays",
             Self::Target => "it names a target of its own",
         }
@@ -432,13 +463,16 @@ pub(crate) struct AppStreams {
 }
 
 /// One stream [`AppStreams::report`] lists, as the per-application routes plan with it
-/// (`crate::app_routes`): who it is, its lane, and why it may not be moved, if it may not.
+/// (`crate::app_routes`): who it is, its lane, why it may not be moved, if it may not, and the
+/// target its own properties name, if they name one — which may be a route's node
+/// (`crate::app_routes::route_of_target`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Listed {
     pub(crate) id: u32,
     pub(crate) direction: DeviceDirection,
     pub(crate) app: AppKey,
     pub(crate) pin: Option<Pin>,
+    pub(crate) target: Option<ExplicitTarget>,
 }
 
 impl AppStreams {
@@ -582,11 +616,16 @@ impl AppStreams {
         )
     }
 
-    /// Why a stream may not be moved onto a route, or `None` when it may.
+    /// Why a stream may not be moved onto a route, or `None` when it may. The reasons in order:
+    /// what the stream says of itself first, then what it records, then where it asked to go.
     #[must_use]
     pub(crate) fn pin(&self, stream: &StreamNode) -> Option<Pin> {
         if stream.dont_move {
             Some(Pin::DontMove)
+        } else if stream.dont_reconnect {
+            Some(Pin::DontReconnect)
+        } else if stream.dont_fallback {
+            Some(Pin::DontFallback)
         } else if self.records_a_sink(stream) {
             Some(Pin::Monitor)
         } else if stream
@@ -652,6 +691,7 @@ impl AppStreams {
                     direction: stream.direction,
                     app,
                     pin: self.pin(stream),
+                    target: stream.target.clone(),
                 })
             })
             .collect();
@@ -948,10 +988,28 @@ mod tests {
                 ("media.class", RECORDING_MEDIA_CLASS),
                 ("node.dont-move", "true"),
                 ("stream.capture.sink", "1"),
+                ("node.dont-reconnect", "TRUE"),
+                ("node.dont-fallback", "1"),
             ],
         );
         assert!(pinned.dont_move);
         assert!(pinned.monitor);
+        assert!(pinned.dont_reconnect);
+        assert!(pinned.dont_fallback);
+
+        let loose = stream(
+            4,
+            &[
+                ("media.class", PLAYBACK_MEDIA_CLASS),
+                ("node.dont-reconnect", "yes"),
+                ("node.dont-fallback", "false"),
+            ],
+        );
+        assert!(
+            !loose.dont_reconnect,
+            "not a boolean WirePlumber reads as true"
+        );
+        assert!(!loose.dont_fallback);
     }
 
     #[test]
@@ -1297,6 +1355,108 @@ mod tests {
                 .describe(9)
                 .is_some_and(|line| line.contains("never moved: it says node.dont-move"))
         );
+    }
+
+    /// A PulseAudio client that opened its stream with `PA_STREAM_DONT_MOVE`: `pipewire-pulse`
+    /// says so with `node.dont-reconnect`, not `node.dont-move`. WirePlumber would ignore a key
+    /// written for it, and FxSound would have said it moved it.
+    #[test]
+    fn a_stream_that_says_dont_reconnect_is_listed_but_pinned() {
+        let mut streams = AppStreams::default();
+        let pulse = stream(
+            15,
+            &[
+                ("media.class", PLAYBACK_MEDIA_CLASS),
+                ("application.name", "Old player"),
+                ("node.dont-reconnect", "true"),
+            ],
+        );
+        assert_eq!(streams.pin(&pulse), Some(Pin::DontReconnect));
+        streams.stream_appeared(pulse);
+        let listed = streams.listed();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].pin, Some(Pin::DontReconnect));
+        assert!(
+            streams
+                .describe(15)
+                .is_some_and(|line| line.contains("never moved: it says node.dont-reconnect"))
+        );
+    }
+
+    /// A stream that would rather be destroyed than play anywhere but where its target is: it is
+    /// destroyed the moment the route node its key names goes.
+    #[test]
+    fn a_stream_that_says_dont_fallback_is_listed_but_pinned() {
+        let mut streams = AppStreams::default();
+        for class in [PLAYBACK_MEDIA_CLASS, RECORDING_MEDIA_CLASS] {
+            let strict = stream(
+                16,
+                &[
+                    ("media.class", class),
+                    ("application.name", "Strict"),
+                    ("node.dont-fallback", "true"),
+                ],
+            );
+            assert_eq!(streams.pin(&strict), Some(Pin::DontFallback), "{class}");
+        }
+        let strict = stream(
+            16,
+            &[
+                ("media.class", PLAYBACK_MEDIA_CLASS),
+                ("application.name", "Strict"),
+                ("node.dont-fallback", "true"),
+            ],
+        );
+        streams.stream_appeared(strict);
+        assert!(
+            streams
+                .describe(16)
+                .is_some_and(|line| line.contains("never moved: it says node.dont-fallback"))
+        );
+    }
+
+    #[test]
+    fn what_a_stream_says_of_itself_comes_before_what_it_records_and_where_it_asked_to_go() {
+        let mut streams = AppStreams::default();
+        streams.default_sink_is(Some(SINK_NODE_NAME));
+        let class = ("media.class", RECORDING_MEDIA_CLASS);
+        let reconnect = ("node.dont-reconnect", "true");
+        let fallback = ("node.dont-fallback", "true");
+        let monitor = ("stream.capture.sink", "true");
+        let target = ("target.object", "alsa_output.usb");
+        assert_eq!(
+            streams.pin(&stream(17, &[class, reconnect, fallback, monitor, target])),
+            Some(Pin::DontReconnect)
+        );
+        assert_eq!(
+            streams.pin(&stream(17, &[class, fallback, monitor, target])),
+            Some(Pin::DontFallback)
+        );
+        assert_eq!(
+            streams.pin(&stream(17, &[class, monitor, target])),
+            Some(Pin::Monitor)
+        );
+    }
+
+    #[test]
+    fn a_listed_stream_carries_the_target_its_own_properties_name() {
+        let mut streams = AppStreams::default();
+        streams.stream_appeared(stream(
+            18,
+            &[
+                ("media.class", PLAYBACK_MEDIA_CLASS),
+                ("application.name", "Tester"),
+                ("target.object", "fxsound_route_o1"),
+            ],
+        ));
+        streams.stream_appeared(player(19, "Plain"));
+        let listed = streams.listed();
+        assert_eq!(
+            listed[0].target,
+            Some(ExplicitTarget::Object("fxsound_route_o1".to_owned()))
+        );
+        assert_eq!(listed[0].pin, None, "a route of FxSound's is FxSound");
+        assert_eq!(listed[1].target, None);
     }
 
     #[test]

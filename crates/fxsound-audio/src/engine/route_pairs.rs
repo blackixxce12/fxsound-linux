@@ -41,9 +41,18 @@
 //! `target.object = <the node's object.serial>` in the `default` metadata ([`MetadataOp`]), which
 //! WirePlumber follows. A stream that leaves the route — its rule gone, the route taken down, the
 //! lane switched off, the engine exiting — has the key deleted, and the session puts it back where
-//! it would have gone. Deleting always goes before the nodes do: in one tick, on one connection,
-//! the deletes are queued ahead of the route's destruction, and on the way out the deletes ride on
-//! the confirmed exit hand-back ([`release_defaults_before_exit`]).
+//! it would have gone. A key never outlives the node it names: in one tick, on one connection, the
+//! deletes and the writes onto routes that stay are queued ahead of any route's destruction —
+//! including a key onto a route that is rebuilt this tick, under the same number or on the lane's
+//! new device, which is deleted and written again once the new node is known ([`Want::Pending`]) —
+//! and on the way out the deletes ride on the confirmed exit hand-back
+//! ([`release_defaults_before_exit`]).
+//!
+//! A stream FxSound does not move can still be on a route: its own properties may name the route's
+//! node, WirePlumber may have restored it onto one and will not move it again
+//! (`node.dont-reconnect`, [`Moves::anchor`]), or it may be a recorder the user pointed at a
+//! playback route's monitor, by a key FxSound leaves as it is ([`Moves::monitored`]). Such a
+//! stream keeps its route in use ([`Candidate::on_route`]).
 //!
 //! # What a private graph can show
 //!
@@ -59,8 +68,9 @@ use super::*;
 use crate::TOO_MANY_APPLICATION_PRESETS;
 use crate::app_routes::{
     self, Candidate, LaneState, MetadataOp, Moves, OverflowWarnings, RoutePreset, RouteSlot,
-    RouteTable, Rules,
+    RouteTable, Rules, Want,
 };
+use crate::app_streams::{Listed, Pin};
 use crate::lane_dsp::RouteParamsWriter;
 
 /// Every route of both lanes, and everything needed to run and move onto them.
@@ -76,9 +86,6 @@ pub(super) struct Routes {
     moves: Moves,
     /// Which applications the window has been told could not get a route.
     warnings: OverflowWarnings,
-    /// Every route virtual node in the registry, by id, with its serial: what tells [`Moves`] a
-    /// route node has gone once its route has been dropped already.
-    nodes: std::collections::HashMap<u32, u64>,
     /// How long a route nobody uses is kept ([`app_routes::ROUTE_IDLE`], shorter in the tests).
     idle: Duration,
     /// The missing `default` metadata object has been reported, and need not be again.
@@ -93,7 +100,6 @@ impl Routes {
             table: RouteTable::default(),
             moves: Moves::default(),
             warnings: OverflowWarnings::default(),
-            nodes: std::collections::HashMap::new(),
             idle,
             no_metadata_told: false,
         }
@@ -148,6 +154,32 @@ impl Routes {
             .find(|route| route.slot == slot)
             .expect("a route in that slot");
         route.recycle.0.send(dsp).expect("the route keeps its end");
+    }
+
+    /// Plan the routes for `streams` with the rules the engine keeps, both lanes attached, as a
+    /// tick would: the table only, with no pair built and no key written — for tests with no
+    /// server.
+    #[cfg(test)]
+    pub(super) fn plan_for_tests(
+        &mut self,
+        streams: &[Candidate],
+        now: Instant,
+    ) -> app_routes::Plan {
+        let lanes = PerDirection::from_fn(|_| LaneState::Attached);
+        self.table
+            .plan(&self.rules, streams, &lanes, now, self.idle)
+    }
+
+    /// The parameters the route in `slot` runs, as the main loop last wrote them into its buffer.
+    #[cfg(test)]
+    pub(super) fn params_for_tests(
+        &self,
+        slot: RouteSlot,
+    ) -> Option<fxsound_core::messages::RouteParams> {
+        self.live
+            .iter()
+            .find(|route| route.slot == slot)
+            .map(|route| route.preset.params)
     }
 
     /// How many events wait in each route's queue, by slot, in the order the routes were made.
@@ -341,14 +373,23 @@ pub(super) fn set_rules(shared: &mut Shared, asked: Vec<AppRoute>) {
             ""
         }
     );
-    for preset in &changes.params {
+    // A preset named again while its route was kept for a stream FxSound could not move off it
+    // (`Plan::kept`): the route runs the preset as it is now, parameters and chain.
+    let renamed: Vec<RoutePreset> = changes
+        .added
+        .iter()
+        .filter(|(direction, name)| routes.table.slot_of(*direction, name).is_some())
+        .filter_map(|(direction, name)| rules.preset(*direction, name))
+        .collect();
+    for preset in changes.params.iter().chain(&renamed) {
         if let Some(route) = live_route(routes, preset.direction, &preset.name)
+            && route.preset.params != preset.params
             && route.writer.write(preset.params)
         {
             route.preset.params = preset.params;
         }
     }
-    for preset in &changes.chains {
+    for preset in changes.chains.iter().chain(&renamed) {
         if let Some(route) = live_route(routes, preset.direction, &preset.name) {
             route.preset.chain.clone_from(&preset.chain);
             let spec = chain_spec(&preset.chain);
@@ -433,11 +474,12 @@ fn lane_state(lane: &Lane) -> LaneState {
 /// Bring the routes and the metadata in line with the rules, the streams and the lanes: once a
 /// supervisor tick, and at the end of every control message.
 ///
-/// In the order the plan is made in ([`app_routes::Plan`]): the streams that leave a route are
-/// moved back, the routes that go are taken down, the routes that follow a lane to another device
-/// are rebuilt there, the new ones are built, and the streams that go onto a route whose node is
-/// in the registry are moved onto it. A route built or rebuilt in this call has no node in the
-/// registry yet; its streams are moved on a later tick, once it has.
+/// In this order: the streams that leave a route are moved back, and those that go onto a route
+/// whose node is in the registry and stays are moved onto it; then the routes that go are taken
+/// down, the new ones built, and those that follow a lane to another device rebuilt there. Every
+/// key is where it is to be before any node it could name goes. A route built or rebuilt in this
+/// call has no node in the registry yet; its streams are moved on a later tick, once it has — and
+/// until then have no key naming the node it had, nor another route's ([`Want::Pending`]).
 pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
     for route in &mut shared.routes.live {
         while let Ok(dsp) = route.recycle.1.try_recv() {
@@ -453,12 +495,23 @@ pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
     let lanes = PerDirection::from_fn(|direction| lane_state(shared.lanes.get(direction)));
     let attachments =
         PerDirection::from_fn(|direction| Attachment::of(shared.lanes.get(direction)));
-    let streams: Vec<Candidate> = shared
-        .apps
-        .listed()
+    // Every route node the registry has announced: its route, its registry id, its serial.
+    let nodes: Vec<(RouteSlot, u32, u64)> = shared
+        .routes
+        .live
+        .iter()
+        .filter_map(|route| {
+            let (id, serial) = route.node?;
+            Some((route.slot, id, serial?))
+        })
+        .collect();
+    let listed = shared.apps.listed();
+    let moves = &mut shared.routes.moves;
+    let streams: Vec<Candidate> = listed
         .into_iter()
         .map(|stream| Candidate {
-            movable: stream.pin.is_none() && !shared.routes.moves.moved_by_hand(stream.id),
+            movable: stream.pin.is_none() && !moves.moved_by_hand(stream.id),
+            on_route: resting_on(moves, &stream, &nodes),
             id: stream.id,
             direction: stream.direction,
             app: stream.app,
@@ -469,9 +522,33 @@ pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
     } = &mut shared.routes;
     let plan = table.plan(rules, &streams, &lanes, now, *idle);
 
+    // The node each route keeps through this tick: not one that goes, nor one whose pair is
+    // rebuilt on the lane's new device. A lane between pairs keeps its routes' pairs as they are.
+    let staying: std::collections::HashMap<RouteSlot, u64> = shared
+        .routes
+        .live
+        .iter()
+        .filter(|route| {
+            !plan
+                .teardown
+                .iter()
+                .any(|(gone, _)| gone.slot == route.slot && gone.preset == route.preset.name)
+        })
+        .filter(|route| {
+            route.pair.as_ref().is_some_and(|pair| {
+                attachments
+                    .get(route.slot.direction)
+                    .as_ref()
+                    .is_none_or(|on| *on == pair.on)
+            })
+        })
+        .filter_map(|route| Some((route.slot, route.node?.1?)))
+        .collect();
+
     // Where each stream is to be: its route's serial, or — for a route this call builds or moves
-    // to another device, whose node the registry has not announced yet — as it is.
-    let wanted: Vec<(u32, Option<u64>)> = plan
+    // to another device, whose node the registry has not announced yet, or one kept while its lane
+    // is between pairs — pending, on the node the route keeps if it keeps one.
+    let wanted: Vec<(u32, Want)> = plan
         .assigned
         .iter()
         .map(|&(id, slot)| {
@@ -485,7 +562,13 @@ pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
                     .find(|route| route.slot == slot)
                     .and_then(|route| route.serial_on(attachments.get(slot.direction).as_ref()))
             };
-            (id, serial)
+            let want = serial.map_or(
+                Want::Pending {
+                    still: staying.get(&slot).copied(),
+                },
+                Want::Onto,
+            );
+            (id, want)
         })
         .collect();
     let ops = shared.routes.moves.plan(&wanted);
@@ -493,10 +576,19 @@ pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
         .into_iter()
         .partition(|op| matches!(op, MetadataOp::Delete { .. }));
 
-    // 1. The streams leaving a route go back, ahead of the nodes they were on.
+    // 1. The streams leaving a route go back, and the streams going onto a route whose node is
+    //    known and stays are moved onto it — both ahead of any node a key could name going.
     send(shared, &deletes);
+    send(shared, &writes);
 
-    // 2. The routes that go.
+    // 2. The routes that go; and those kept only for a stream FxSound does not move, said once.
+    for (slot, preset) in &plan.kept {
+        log::info!(
+            "route {} ({preset}) is kept though no rule names its preset any more: an application \
+             FxSound does not move plays or records through it; it goes once that one has left",
+            slot.node_name()
+        );
+    }
     for (gone, why) in &plan.teardown {
         if let Some(index) = shared
             .routes
@@ -533,10 +625,7 @@ pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
     //    the lane has moved.
     build_pairs(shared, &attachments, now);
 
-    // 5. The streams onto the routes whose nodes are known.
-    send(shared, &writes);
-
-    // 6. What the app is told of each stream: the preset of the route it was moved onto.
+    // 5. What the app is told of each stream: the preset of the route it was moved onto.
     let mut routed = std::collections::HashMap::new();
     for &(id, slot) in &plan.assigned {
         let Some(route) = shared.routes.live.iter().find(|route| route.slot == slot) else {
@@ -549,7 +638,7 @@ pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
     }
     shared.apps.set_routes(routed);
 
-    // 7. An application whose preset could not get a route stays on its lane, and the window is
+    // 6. An application whose preset could not get a route stays on its lane, and the window is
     //    told why — once.
     for overflow in shared.routes.warnings.news(&plan.overflow) {
         log::info!(
@@ -571,6 +660,42 @@ pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
     for route in &mut shared.routes.live {
         republish_latency_of(route);
     }
+}
+
+/// The route a stream sits on by something no plan of FxSound's changes ([`Candidate::on_route`]),
+/// among `nodes` — each route's slot, its virtual node's registry id and its serial:
+///
+/// - a stream WirePlumber will not move again once it is linked (`node.dont-reconnect`), on the
+///   route its key put it on ([`Moves::anchor`]) for as long as that route's node is there;
+/// - a recorder whose key names a playback route's sink, on that route, whose monitor it records
+///   ([`Moves::monitored`]) — a key of the user's, which WirePlumber reads ahead of the stream's
+///   own properties; or
+/// - a stream whose own properties name a route's node ([`app_routes::route_of_target`]), unless
+///   the metadata holds a key for it, which WirePlumber reads first — or the stream says
+///   `node.dont-move`, and WirePlumber reads no key for it at all.
+fn resting_on(
+    moves: &mut Moves,
+    stream: &Listed,
+    nodes: &[(RouteSlot, u32, u64)],
+) -> Option<RouteSlot> {
+    let slot_of = |serial: u64| {
+        nodes
+            .iter()
+            .find(|&&(.., node)| node == serial)
+            .map(|&(slot, ..)| slot)
+    };
+    if stream.pin == Some(Pin::DontReconnect)
+        && let Some(slot) = moves.anchor(stream.id).and_then(slot_of)
+    {
+        return Some(slot);
+    }
+    if stream.pin != Some(Pin::DontMove) && moves.has_key(stream.id) {
+        return moves.monitored(stream.id).and_then(slot_of);
+    }
+    stream
+        .target
+        .as_ref()
+        .and_then(|target| app_routes::route_of_target(target, nodes))
 }
 
 /// A route whose pair reported an error, or whose two nodes negotiated different formats, loses
@@ -1017,8 +1142,7 @@ pub(super) fn node_appeared(shared: &mut Shared, id: u32, serial: Option<u64>, n
     };
     let routes = &mut shared.routes;
     if let Some(serial) = serial {
-        routes.nodes.insert(id, serial);
-        routes.moves.route_node(serial);
+        routes.moves.route_node(serial, slot.direction);
     }
     if let Some(route) = routes
         .live
@@ -1037,11 +1161,7 @@ pub(super) fn node_appeared(shared: &mut Shared, id: u32, serial: Option<u64>, n
 /// A node of FxSound's left the registry. A route whose virtual node it was has none until its
 /// next pair's is announced.
 pub(super) fn node_removed(shared: &mut Shared, id: u32) {
-    let routes = &mut shared.routes;
-    if let Some(serial) = routes.nodes.remove(&id) {
-        routes.moves.route_node_gone(serial);
-    }
-    for route in &mut routes.live {
+    for route in &mut shared.routes.live {
         if route.node.is_some_and(|(node, _)| node == id) {
             route.node = None;
         }
@@ -1054,13 +1174,20 @@ pub(super) fn metadata_target(shared: &mut Shared, subject: u32, value: Option<&
     shared.routes.moves.heard(subject, value);
 }
 
+/// An application's stream joined the graph: a player or a recorder. What a recorder's key naming
+/// a playback route's sink means depends on which it is ([`Moves::monitored`]).
+pub(super) fn stream_appeared(shared: &mut Shared, id: u32, direction: DeviceDirection) {
+    shared.routes.moves.stream_appeared(id, direction);
+}
+
 /// An application's stream left the registry, and its keys with it.
 pub(super) fn stream_removed(shared: &mut Shared, id: u32) {
     shared.routes.moves.stream_gone(id);
 }
 
-/// The engine is going: every stream FxSound moved goes back. Returns whether anything was
-/// written, and so whether there is a write for the exit's `sync` to confirm
+/// The engine is going: every stream FxSound moved goes back, and every key that puts a stream
+/// onto one of its routes' nodes is deleted, whoever wrote it ([`Moves::everything_back`]). Returns whether
+/// anything was written, and so whether there is a write for the exit's `sync` to confirm
 /// ([`release_defaults_before_exit`]). The routes' nodes go afterwards, with the session.
 pub(super) fn move_everything_back(shared: &mut Shared) -> bool {
     let ops = shared.routes.moves.everything_back();
@@ -1091,5 +1218,103 @@ pub(super) fn close(shared: &mut Shared) {
     routes.live.clear();
     routes.table.clear();
     routes.moves.forget_session();
-    routes.nodes.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_streams::ExplicitTarget;
+    use fxsound_core::AppKey;
+
+    const OUT: DeviceDirection = DeviceDirection::Output;
+    const IN: DeviceDirection = DeviceDirection::Input;
+
+    /// Route o1's virtual node is node 70 with serial 301; route i1's, node 71 with serial 401.
+    const NODES: [(RouteSlot, u32, u64); 2] = [
+        (RouteSlot::new(OUT, 1), 70, 301),
+        (RouteSlot::new(IN, 1), 71, 401),
+    ];
+
+    fn listed(id: u32, direction: DeviceDirection, pin: Option<Pin>) -> Listed {
+        Listed {
+            id,
+            direction,
+            app: AppKey {
+                name: "OBS".to_owned(),
+                ..AppKey::default()
+            },
+            pin,
+            target: None,
+        }
+    }
+
+    /// A screen recorder of FxSound's sink the user points at o1's monitor records what o1 plays,
+    /// by a key FxSound leaves as it is: it sits on o1, and keeps it in use.
+    #[test]
+    fn a_recorder_whose_key_names_a_playback_routes_sink_rests_on_that_route() {
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.route_node(401, IN);
+        let screen = Listed {
+            target: Some(ExplicitTarget::Object(crate::SINK_NODE_NAME.to_owned())),
+            ..listed(90, IN, Some(Pin::Monitor))
+        };
+        moves.stream_appeared(90, IN);
+        assert_eq!(resting_on(&mut moves, &screen, &NODES), None, "no key yet");
+        moves.heard(90, Some("301"));
+        assert_eq!(
+            resting_on(&mut moves, &screen, &NODES),
+            Some(RouteSlot::new(OUT, 1))
+        );
+
+        // The same whatever keeps FxSound from moving it, or none: one that will not be moved
+        // again, and a microphone's recorder the user has pointed there by hand.
+        for pin in [Some(Pin::DontReconnect), Some(Pin::DontFallback), None] {
+            let recorder = listed(91, IN, pin);
+            moves.stream_appeared(91, IN);
+            moves.heard(91, Some("301"));
+            assert_eq!(
+                resting_on(&mut moves, &recorder, &NODES),
+                Some(RouteSlot::new(OUT, 1)),
+                "{pin:?}"
+            );
+            moves.stream_gone(91);
+        }
+
+        // Not while o1's node is not in the graph: a monitor that is no more is on no route.
+        assert_eq!(resting_on(&mut moves, &screen, &NODES[1..]), None);
+        // Nor with a key naming somebody else's sink: the user moved it off.
+        moves.heard(90, Some("57"));
+        assert_eq!(resting_on(&mut moves, &screen, &NODES), None);
+        // And a recorder that says `node.dont-move` has its key ignored by WirePlumber: it is
+        // wherever its own properties put it.
+        let kiosk = listed(92, IN, Some(Pin::DontMove));
+        moves.stream_appeared(92, IN);
+        moves.heard(92, Some("301"));
+        assert_eq!(resting_on(&mut moves, &kiosk, &NODES), None);
+    }
+
+    /// A key naming a route that puts the stream onto it is FxSound's to delete or rewrite, and
+    /// no reason by itself for the stream to sit there — but for one WirePlumber will not move
+    /// again, which is anchored where it was put.
+    #[test]
+    fn a_key_that_puts_a_stream_onto_a_route_rests_it_there_only_when_it_will_not_be_moved_again() {
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.route_node(401, IN);
+        moves.stream_appeared(40, OUT);
+        moves.stream_appeared(90, IN);
+        moves.heard(40, Some("301"));
+        moves.heard(90, Some("401"));
+        assert_eq!(resting_on(&mut moves, &listed(40, OUT, None), &NODES), None);
+        assert_eq!(resting_on(&mut moves, &listed(90, IN, None), &NODES), None);
+        assert_eq!(
+            resting_on(
+                &mut moves,
+                &listed(90, IN, Some(Pin::DontReconnect)),
+                &NODES
+            ),
+            Some(RouteSlot::new(IN, 1))
+        );
+    }
 }

@@ -3865,6 +3865,7 @@ fn track_stream(
     stream: StreamNode,
 ) {
     let id = stream.id;
+    route_pairs::stream_appeared(guard, id, stream.direction);
     guard.apps.stream_appeared(stream);
     let node = match registry.bind::<pw::node::Node, _>(global) {
         Ok(node) => node,
@@ -9358,6 +9359,80 @@ mod tests {
             1,
             "sent, and waiting for the block the audio thread runs next"
         );
+    }
+
+    /// A route kept for a stream FxSound does not move after its preset's rule went
+    /// (`app_routes::Plan::kept`) runs the preset as it is when a rule names it again — its new
+    /// parameters, not the ones it was left with.
+    #[test]
+    fn a_kept_route_whose_preset_is_named_again_runs_it_as_it_is_now() {
+        use crate::app_routes::{Candidate, RouteSlot, Rules};
+        use fxsound_core::AppKey;
+        use fxsound_core::messages::{AppRoute, DspParams, RouteParams};
+
+        let rule = |gain: f32| AppRoute {
+            direction: DeviceDirection::Output,
+            app: AppKey {
+                name: "Game".to_owned(),
+                ..AppKey::default()
+            },
+            preset: "Gaming".to_owned(),
+            params: RouteParams::Output(DspParams {
+                master_gain_db: gain,
+                ..DspParams::default()
+            }),
+            chain: String::new(),
+        };
+        let preset = |gain: f32| {
+            Rules::new(vec![rule(gain)])
+                .0
+                .preset(DeviceDirection::Output, "Gaming")
+                .expect("named")
+        };
+        let stream = |id: u32, name: &str, on_route: Option<RouteSlot>| Candidate {
+            id,
+            direction: DeviceDirection::Output,
+            app: AppKey {
+                name: name.to_owned(),
+                ..AppKey::default()
+            },
+            movable: true,
+            on_route,
+        };
+        let slot = RouteSlot::new(DeviceDirection::Output, 1);
+        let now = Instant::now();
+        let mut shared = shared_for_tests();
+
+        control(&mut shared, UiToAudio::SetAppRoutes(vec![rule(1.0)]));
+        let plan = shared
+            .routes
+            .plan_for_tests(&[stream(40, "Game", None)], now);
+        assert_eq!(plan.build, vec![(slot, "Gaming".to_owned())]);
+        shared.routes.add_for_tests(slot, preset(1.0));
+
+        // The rule goes while a tester that names the route's node itself plays through it.
+        control(&mut shared, UiToAudio::SetAppRoutes(Vec::new()));
+        let tester = stream(44, "Tester", Some(slot));
+        let plan = shared
+            .routes
+            .plan_for_tests(std::slice::from_ref(&tester), now);
+        assert_eq!(plan.kept, vec![(slot, "Gaming".to_owned())]);
+        assert!(plan.teardown.is_empty());
+
+        // Named again, saved in the meantime with other parameters.
+        control(&mut shared, UiToAudio::SetAppRoutes(vec![rule(-6.0)]));
+        assert_eq!(
+            shared.routes.params_for_tests(slot),
+            Some(preset(-6.0).params)
+        );
+        let plan = shared
+            .routes
+            .plan_for_tests(&[stream(40, "Game", None), tester], now);
+        assert!(
+            plan.build.is_empty(),
+            "the kept route is the preset's route"
+        );
+        assert_eq!(plan.assigned, vec![(40, slot)]);
     }
 
     /// A route's preset: the music chain's busy parameters, or the voice chain's defaults.

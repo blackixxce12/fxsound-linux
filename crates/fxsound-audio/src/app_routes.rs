@@ -21,9 +21,17 @@
 //!
 //! - A stream is matched with the rule of its own lane that names its application most
 //!   specifically ([`AppKey::best_match`], the order the store itself uses), and goes onto that
-//!   preset's route. A stream that may not be moved — `node.dont-move`, a target of its own that is
-//!   not FxSound's, a recorder of what FxSound plays (`crate::app_streams`) — or that someone has
-//!   moved by hand ([`Moves::moved_by_hand`]) stays where it is.
+//!   preset's route. A stream that may not be moved — `node.dont-move`, `node.dont-reconnect`,
+//!   `node.dont-fallback`, a target of its own that is not FxSound's, a recorder of what FxSound
+//!   plays (`crate::app_streams`) — or that someone has moved by hand ([`Moves::moved_by_hand`])
+//!   stays where it is.
+//! - A route is in use while a stream is planned onto it, and also while a stream FxSound leaves
+//!   where it is sits on it ([`Candidate::on_route`]): one whose own properties name the route's
+//!   node, one WirePlumber will not move off it again ([`Moves::anchor`]), or a recorder whose
+//!   key names a playback route's sink and records its monitor ([`Moves::monitored`]). Such a
+//!   route is never idle and never makes room for another; and one whose preset no rule names any
+//!   more is kept for as long as such a stream is on it ([`Plan::kept`]), rather than taken down
+//!   under audio that is playing through it.
 //! - A route keeps its number for as long as it lives; a new one takes the lowest number free in
 //!   its lane. A lane runs at most [`MAX_ROUTES_PER_LANE`] routes. A preset that would need one
 //!   more takes the place of a route nobody uses any more, if there is one; if not, its streams stay
@@ -44,16 +52,48 @@
 //! soon as it changes). Deleting the key moves the stream back. [`Moves`] keeps what this engine
 //! wrote and what the metadata says, and plans the writes and deletes that make the one the other.
 //!
-//! A key someone else wrote — the user moving the stream in a mixer — is theirs: the stream is not
-//! moved again, and its key is never deleted. What FxSound wrote is its own on the way to the
-//! server and for as long as it stays there, and no longer: the server reports each change once,
-//! in the order it applies them, and nothing for a change that changes nothing, so its report
-//! settles the change it reports and every one sent before it ([`Moves::heard`]). A serial FxSound
-//! has since moved the stream off, or deleted, is then the user's pick like any other, when they
-//! move the stream back onto it. A key naming a route node of this process's, from an
-//! earlier connection to the same server, is FxSound's and is taken over. The server forgets a
-//! subject's keys when the subject goes, and refuses keys for a subject that does not exist
-//! (measured on PipeWire 1.6.8 with `pw-metadata`), so a stream that has gone takes its key with it.
+//! A key someone else wrote that names anything but a route of FxSound's — the user moving the
+//! stream to their headphones in a mixer — is theirs: the stream is not moved again, and its key is
+//! never deleted. What FxSound wrote is its own on the way to the server and for as long as it
+//! stays there: the server reports each change once, in the order it applies them, and nothing for
+//! a change that changes nothing, so its report settles the change it reports and every one sent
+//! before it ([`Moves::heard`]).
+//!
+//! A key that puts a stream onto a route node of this process's is FxSound's whoever wrote it, and
+//! the plan puts it right: it is kept where it names the route the stream's rule wants, rewritten
+//! where it names another, and deleted where the stream has no rule. Such a key is rarely
+//! anybody's choice. WirePlumber 0.5 remembers every target written for an application by the
+//! target node's *name* and writes it back each time the application opens a stream
+//! (`node/state-stream.lua`, `node.stream.restore-target`, on by default), and nothing clears what
+//! it remembers once the application has quit while it was routed. A route's name is its number,
+//! and numbers are taken again by other presets — so the key WirePlumber writes back names
+//! whatever preset runs under that number now, the application's own or anybody else's, and
+//! cannot be told from a mixer's. Where a stream goes is what its rule says, and the Applications
+//! list is where that is chosen.
+//!
+//! A recorder's key naming a *playback* route's sink puts it onto no route: WirePlumber links a
+//! recorder to a sink's monitor (`lutils.canLink`, `lib/linking-utils.lua`), so the recorder hears
+//! what the route plays, and nothing goes through the route's chain. It is what `pipewire-pulse`
+//! writes when the user points a screen recorder at `Monitor of FxSound (Output) · <preset>` —
+//! a recorder of what a sink plays, which FxSound never moves (`crate::app_streams`) — and no plan
+//! of FxSound's ever writes it, since a recorder is only ever planned onto its own lane's routes.
+//! So it is the user's, like a key naming any other node: never deleted nor rewritten, not even on
+//! the way out, and the route it names is in use while the recorder is there
+//! ([`Moves::monitored`]). Which subjects record, [`Moves::stream_appeared`] is told.
+//!
+//! A delete someone else sent, or a key they wrote over FxSound's, takes FxSound's word back: what
+//! it wrote no longer stands, and the next plan writes it again where the rule still wants it. A key
+//! naming a route of an earlier connection to the same server is taken over the same way. The
+//! server forgets a subject's keys when the subject goes, and refuses keys for a subject that does
+//! not exist (measured on PipeWire 1.6.8 with `pw-metadata`), so a stream that has gone takes its
+//! key with it. On the way out every key that puts a stream onto a route node of this process's is
+//! deleted, whoever wrote it ([`Moves::everything_back`]): the node goes with the process, and a
+//! key left naming it would make the stream the user's to the next run, and its name what
+//! WirePlumber restores.
+//!
+//! A key never names a route node that is about to go. A stream whose route is rebuilt — on the
+//! lane's new device, after a failure, or under the same number for another preset — has its key
+//! deleted ahead of the old node, and written again once the new one is known ([`Want::Pending`]).
 //!
 //! # What can be tested where
 //!
@@ -72,6 +112,7 @@ use std::time::{Duration, Instant};
 use fxsound_core::messages::{AppRoute, RouteParams};
 use fxsound_core::{AppKey, DeviceDirection, MAX_ROUTES_PER_LANE};
 
+use crate::app_streams::ExplicitTarget;
 use crate::per_direction::PerDirection;
 use crate::{CAPTURE_STREAM_DESCRIPTION, OUTPUT_STREAM_DESCRIPTION, ROUTE_NODE_PREFIX, locale};
 
@@ -424,8 +465,8 @@ pub(crate) enum LaneState {
     Off,
 }
 
-/// One application stream, as the routes see it: its node id, its lane, who it is, and whether it
-/// may be moved.
+/// One application stream, as the routes see it: its node id, its lane, who it is, whether it
+/// may be moved, and the route it sits on where FxSound does not decide that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Candidate {
     pub(crate) id: u32,
@@ -434,6 +475,55 @@ pub(crate) struct Candidate {
     /// Neither pinned where it is (`crate::app_streams::Pin`) nor moved by hand
     /// ([`Moves::moved_by_hand`]).
     pub(crate) movable: bool,
+    /// The route the stream is on by something no plan of FxSound's changes: its own properties
+    /// naming the route's node ([`route_of_target`]), with no key in the metadata to override
+    /// them, a key WirePlumber will not move it off again ([`Moves::anchor`]), or — for a
+    /// recorder, whose slot is then of the other lane — a key naming a playback route's sink,
+    /// whose monitor it records ([`Moves::monitored`]). A route with such a stream on it is in use
+    /// ([`Self::stays_on`]).
+    pub(crate) on_route: Option<RouteSlot>,
+}
+
+impl Candidate {
+    /// Whether the stream is on the route in `slot`, and stays there whatever this plan decides: a
+    /// stream that may move and has a rule of its lane is where the plan puts it instead — onto
+    /// its own route, or back onto its lane by a key that overrides its own properties.
+    fn stays_on(&self, slot: RouteSlot, rules: &Rules) -> bool {
+        self.on_route == Some(slot)
+            && !(self.movable && rules.preset_for(self.direction, &self.app).is_some())
+    }
+}
+
+/// The route whose virtual node a stream's own properties name as its target, if they name one:
+/// by the node's name — whichever node carries that name now or will, since WirePlumber links a
+/// stream to a target named by name whenever one is there — or by number, `target.object` by
+/// `object.serial` and `node.target` by registry id, as WirePlumber looks each up
+/// (`linking/find-defined-target.lua`), among `nodes`: each route's slot, its virtual node's
+/// registry id, and its serial.
+pub(crate) fn route_of_target(
+    target: &ExplicitTarget,
+    nodes: &[(RouteSlot, u32, u64)],
+) -> Option<RouteSlot> {
+    let (value, by_id) = match target {
+        ExplicitTarget::Object(value) => (value.trim(), false),
+        ExplicitTarget::Node(value) => (value.trim(), true),
+    };
+    if let Some(slot) = RouteSlot::of_node(value) {
+        return Some(slot);
+    }
+    if by_id {
+        let id = value.parse::<u32>().ok()?;
+        nodes
+            .iter()
+            .find(|&&(_, node, _)| node == id)
+            .map(|&(slot, ..)| slot)
+    } else {
+        let serial = value.parse::<u64>().ok()?;
+        nodes
+            .iter()
+            .find(|&&(.., node_serial)| node_serial == serial)
+            .map(|&(slot, ..)| slot)
+    }
 }
 
 /// Why a route goes.
@@ -478,6 +568,9 @@ pub(crate) struct Slotted {
     pub(crate) preset: String,
     /// When its last stream left; `None` while it has one.
     pub(crate) idle_since: Option<Instant>,
+    /// No rule names its preset any more, and it is kept only for a stream FxSound cannot move
+    /// off it ([`Plan::kept`]).
+    pub(crate) orphaned: bool,
 }
 
 /// What one run of [`RouteTable::plan`] asks of the engine, in the order it is to be done:
@@ -493,6 +586,10 @@ pub(crate) struct Plan {
     pub(crate) assigned: Vec<(u32, RouteSlot)>,
     /// Every stream whose preset could not get a route.
     pub(crate) overflow: Vec<Overflow>,
+    /// Routes whose preset no rule names any more, kept rather than taken down because a stream
+    /// FxSound does not move is on them ([`Candidate::stays_on`]) — each once, in the plan that
+    /// first keeps it. Such a route goes at once when the last of those streams has left.
+    pub(crate) kept: Vec<(RouteSlot, String)>,
 }
 
 /// Every route of both lanes: which preset each runs, under which number, and since when nothing
@@ -599,12 +696,33 @@ impl RouteTable {
             }
         }
 
-        // A route whose preset no rule of the lane names any more goes at once.
+        // Whether a stream FxSound leaves where it is sits on the route in `slot`: audio that
+        // plays through the route whatever this plan decides.
+        let held = |slot: RouteSlot| streams.iter().any(|stream| stream.stays_on(slot, rules));
+
+        // A route whose preset no rule of the lane names any more goes at once — its streams' keys
+        // deleted first — unless such a stream is on it. That one is kept, and goes once they
+        // have left.
         self.take_down(
-            |route| route.slot.direction == direction && !rules.names(direction, &route.preset),
+            |route| {
+                route.slot.direction == direction
+                    && !rules.names(direction, &route.preset)
+                    && !held(route.slot)
+            },
             Teardown::RuleGone,
             plan,
         );
+        for route in self
+            .routes
+            .iter_mut()
+            .filter(|route| route.slot.direction == direction)
+        {
+            let orphaned = !rules.names(direction, &route.preset);
+            if orphaned && !route.orphaned {
+                plan.kept.push((route.slot, route.preset.clone()));
+            }
+            route.orphaned = orphaned;
+        }
 
         // A route with streams is in use; one without has been idle since its last one left, and
         // goes once that is long enough ago.
@@ -613,7 +731,7 @@ impl RouteTable {
             .iter_mut()
             .filter(|route| route.slot.direction == direction)
         {
-            let used = wanted.iter().any(|(preset, _)| *preset == route.preset);
+            let used = wanted.iter().any(|(preset, _)| *preset == route.preset) || held(route.slot);
             route.idle_since = if used {
                 None
             } else {
@@ -689,6 +807,7 @@ impl RouteTable {
             slot,
             preset: preset.to_owned(),
             idle_since: None,
+            orphaned: false,
         });
         plan.build.push((slot, preset.to_owned()));
         Some(slot)
@@ -726,6 +845,20 @@ impl MetadataOp {
     }
 }
 
+/// Where the plan wants a stream's `target.object` ([`Moves::plan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Want {
+    /// Onto the route node with this serial.
+    Onto(u64),
+    /// Onto a route whose node is not known yet: built or rebuilt in this tick, or kept as it is
+    /// while its lane is between pairs. `still` is the node the route has now and keeps — none
+    /// for a route that is built or rebuilt — and a key naming it is left as it is until the
+    /// route's node is known. A key naming any other route node of FxSound's is deleted: one that
+    /// goes in this tick, which WirePlumber would otherwise have to fall back from — or destroy
+    /// the stream over, when it says `node.dont-fallback` — or another preset's route.
+    Pending { still: Option<u64> },
+}
+
 /// What the `default` metadata says about where each application stream goes, and which of it is
 /// FxSound's (module docs, "The metadata").
 #[derive(Debug, Clone, Default)]
@@ -735,16 +868,20 @@ pub(crate) struct Moves {
     /// Every change this engine has sent for each stream that the server has not reported back
     /// yet, oldest first: `Some(serial)` a write, `None` a delete. What makes the report of a write
     /// still on its way FxSound's after a later write was sent — and only until the server has
-    /// reported a later change of FxSound's ([`Self::settle`]): from then on a serial this engine
-    /// moved the stream off, or deleted, is no more FxSound's than any other.
+    /// reported a later change of FxSound's ([`Self::settle`]).
     unconfirmed: HashMap<u32, VecDeque<Option<u64>>>,
     /// The `target.object` the metadata holds for each subject, as its events report it.
     held: HashMap<u32, Held>,
-    /// The serial of every route node this process has made, on any connection. A serial is never
-    /// handed to another object.
-    ours: HashSet<u64>,
-    /// Those of [`Self::ours`] whose node is in the graph now.
-    live: HashSet<u64>,
+    /// The serial of every route node this process has made, on any connection, with the lane of
+    /// its route. A serial is never handed to another object.
+    ours: HashMap<u64, DeviceDirection>,
+    /// For each stream WirePlumber will not move again once it is linked, the route node its key
+    /// named when FxSound first saw it ([`Self::anchor`]).
+    anchored: HashMap<u32, u64>,
+    /// Every application stream in the graph that records (`Stream/Input/Audio`): the subjects
+    /// whose key naming a playback route's sink records that route's monitor, and is not
+    /// FxSound's ([`Self::monitored`]).
+    recorders: HashSet<u32>,
 }
 
 /// A subject's `target.object`, as the metadata last reported it.
@@ -757,25 +894,32 @@ struct Held {
 }
 
 impl Moves {
-    /// A route node of ours has appeared with this serial.
-    pub(crate) fn route_node(&mut self, serial: u64) {
-        self.ours.insert(serial);
-        self.live.insert(serial);
+    /// A route node of ours has appeared with this serial: the virtual node of a route of the
+    /// `direction` lane — a sink for a playback route, a source for a recording one.
+    pub(crate) fn route_node(&mut self, serial: u64, direction: DeviceDirection) {
+        self.ours.insert(serial, direction);
     }
 
-    /// The route node of ours with this serial has gone.
-    pub(crate) fn route_node_gone(&mut self, serial: u64) {
-        self.live.remove(&serial);
+    /// An application stream appeared under `id`: a player (`Output`) or a recorder (`Input`).
+    /// Only a recorder is remembered, and one under an id the server has handed on is forgotten.
+    pub(crate) fn stream_appeared(&mut self, id: u32, direction: DeviceDirection) {
+        match direction {
+            DeviceDirection::Input => self.recorders.insert(id),
+            DeviceDirection::Output => self.recorders.remove(&id),
+        };
     }
 
     /// The metadata says the stream `subject`'s target is now `value`, or that it has none.
     ///
     /// A report that says what a change of this engine's still unreported says is that change,
-    /// and settles it ([`Self::settle`]). One that no change of FxSound's accounts for is someone
-    /// else's move, and what this engine wrote before it is theirs to undo, not this engine's.
+    /// and settles it ([`Self::settle`]). One that no change of FxSound's accounts for — a mixer's
+    /// move, WirePlumber restoring a target, a delete someone else sent — takes back what this
+    /// engine wrote before it ([`Self::overtaken`]).
     pub(crate) fn heard(&mut self, subject: u32, value: Option<&str>) {
         let Some(value) = value.map(str::trim) else {
-            self.settle(subject, None);
+            if !self.settle(subject, None) {
+                self.overtaken(subject, None);
+            }
             self.held.remove(&subject);
             return;
         };
@@ -798,8 +942,8 @@ impl Moves {
                 // first and was overtaken by this write.
                 self.written.insert(subject, serial);
             }
-        } else if !self.names_ours(subject, value) {
-            self.written.remove(&subject);
+        } else {
+            self.overtaken(subject, serial);
         }
         self.held.insert(
             subject,
@@ -808,6 +952,18 @@ impl Moves {
                 echo,
             },
         );
+    }
+
+    /// Someone else set the stream's key to `now` — a serial, or `None` for a delete or a value
+    /// that is no number. What this engine wrote no longer stands, unless it is what they wrote,
+    /// or a change of this engine's is still on its way: the server applies that one after theirs,
+    /// and ends up holding what this engine last sent. The next plan writes the key again where
+    /// the stream's rule still wants it — rather than go on taking the stream for moved, as
+    /// neither the metadata nor WirePlumber does any more.
+    fn overtaken(&mut self, subject: u32, now: Option<u64>) {
+        if !self.unconfirmed.contains_key(&subject) && self.written.get(&subject).copied() != now {
+            self.written.remove(&subject);
+        }
     }
 
     /// Whether `change` — `Some(serial)` a write, `None` a delete — is the report of one this
@@ -839,19 +995,24 @@ impl Moves {
         self.written.remove(&id);
         self.unconfirmed.remove(&id);
         self.held.remove(&id);
+        self.anchored.remove(&id);
+        self.recorders.remove(&id);
     }
 
-    /// The connection went, and every route node with it. What the server holds is read again
-    /// from the next one; which route nodes were this process's is not forgotten.
+    /// The connection went, and every route node with it. What the server holds, and which
+    /// streams record, is read again from the next one; which route nodes were this process's is
+    /// not forgotten.
     pub(crate) fn forget_session(&mut self) {
         self.written.clear();
         self.unconfirmed.clear();
         self.held.clear();
-        self.live.clear();
+        self.anchored.clear();
+        self.recorders.clear();
     }
 
     /// Whether the stream's target was set by someone else — a mixer moving it, the application
-    /// itself — rather than by FxSound: a move FxSound leaves alone.
+    /// itself — to anything but a route of FxSound's, or to a playback route's monitor: a move
+    /// FxSound leaves alone.
     pub(crate) fn moved_by_hand(&self, id: u32) -> bool {
         self.held
             .get(&id)
@@ -863,6 +1024,66 @@ impl Moves {
         self.written.get(&id).copied()
     }
 
+    /// Whether the metadata holds a target for the stream `id`, or is about to hold one of this
+    /// engine's: one that WirePlumber reads ahead of the target the stream's own properties name.
+    pub(crate) fn has_key(&self, id: u32) -> bool {
+        self.held.contains_key(&id) || self.written.contains_key(&id)
+    }
+
+    /// The serial the stream's key names, or is about to: what this engine last wrote while it
+    /// stands behind it, else what the metadata holds, when that is a number.
+    pub(crate) fn target(&self, id: u32) -> Option<u64> {
+        self.written.get(&id).copied().or_else(|| {
+            self.held
+                .get(&id)
+                .and_then(|held| held.value.parse::<u64>().ok())
+        })
+    }
+
+    /// Where a stream WirePlumber will not move again once it is linked (`node.dont-reconnect`)
+    /// sits: the route node its key names, when that key is FxSound's to take over
+    /// ([`Self::takes_over`]) — most likely WirePlumber's own restore of where the application
+    /// was last — remembered from the first time it is seen for as long as the stream lives.
+    /// FxSound never moves such a stream, and deletes such a key like any other of its routes'
+    /// that no rule accounts for: the key moves nothing any more, and left there it is what
+    /// WirePlumber would restore the application onto the next time, under whatever preset that
+    /// number runs then. The stream stays linked where the key put it, all the same, and its route
+    /// must not go from under it; this is how the planner knows ([`Candidate::on_route`]).
+    pub(crate) fn anchor(&mut self, id: u32) -> Option<u64> {
+        if let Some(serial) = self
+            .target(id)
+            .filter(|&serial| self.takes_over(id, serial))
+        {
+            self.anchored.entry(id).or_insert(serial);
+        }
+        self.anchored.get(&id).copied()
+    }
+
+    /// The playback route node whose monitor the recorder `id` records, by a key of the metadata
+    /// naming the route's sink: where a mixer's "record from" puts a screen recorder the user
+    /// points at `Monitor of FxSound (Output) · <preset>` (module docs, "The metadata"). The key is
+    /// not FxSound's, and the recorder sits on that route for as long as it names it
+    /// ([`Candidate::on_route`]).
+    pub(crate) fn monitored(&self, id: u32) -> Option<u64> {
+        if !self.recorders.contains(&id) {
+            return None;
+        }
+        let serial = self.held.get(&id)?.value.trim().parse::<u64>().ok()?;
+        (self.ours.get(&serial) == Some(&DeviceDirection::Output)).then_some(serial)
+    }
+
+    /// Whether a key naming `serial` for `subject` puts the stream onto a route of this
+    /// process's, there or gone, and so is FxSound's whoever wrote it: any route node of
+    /// FxSound's, except a playback route's sink named for a recorder. WirePlumber links a
+    /// recorder to a sink's monitor (`lutils.canLink`, `lib/linking-utils.lua`), and recording
+    /// what a route plays puts nothing through the route's chain; no plan of FxSound's ever puts
+    /// a recorder there, so such a key is somebody's choice ([`Self::monitored`]).
+    fn takes_over(&self, subject: u32, serial: u64) -> bool {
+        self.ours.get(&serial).is_some_and(|&direction| {
+            direction == DeviceDirection::Input || !self.recorders.contains(&subject)
+        })
+    }
+
     /// Whether `held`, what the metadata holds for `subject`, is FxSound's: the report of a write
     /// of this engine's, or a value [`Self::names_ours`].
     fn holds_ours(&self, subject: u32, held: &Held) -> bool {
@@ -870,16 +1091,14 @@ impl Moves {
     }
 
     /// Whether `value`, held for `subject`, is FxSound's without being the report of a write of
-    /// this engine's: the serial this engine stands behind for it, or one of a route node of this
-    /// process's that is gone — an earlier connection's route, or a route since rebuilt. A route
-    /// node that is still there, named by a key no change of this engine's accounts for, is the
-    /// user's pick: they moved the stream onto it by hand.
+    /// this engine's: the serial this engine stands behind for it, or that of a route node of
+    /// this process's, there or gone, whoever wrote it — unless it is a recorder's key naming a
+    /// playback route's sink ([`Self::takes_over`]; module docs, "The metadata").
     fn names_ours(&self, subject: u32, value: &str) -> bool {
         let Ok(serial) = value.trim().parse::<u64>() else {
             return false;
         };
-        self.written.get(&subject) == Some(&serial)
-            || (self.ours.contains(&serial) && !self.live.contains(&serial))
+        self.written.get(&subject) == Some(&serial) || self.takes_over(subject, serial)
     }
 
     /// Whether the key the metadata holds for `id`, or the one this engine last wrote there, is
@@ -891,17 +1110,50 @@ impl Moves {
         }
     }
 
-    /// The writes and deletes that bring the metadata to `wanted`: each stream there onto the
-    /// route node with that serial — or, where the serial is `None` because the route's node has
-    /// not been announced yet, left as it is — and every other stream FxSound has moved back.
-    /// Deletes first, then writes, each in order of subject.
-    pub(crate) fn plan(&self, wanted: &[(u32, Option<u64>)]) -> Vec<MetadataOp> {
+    /// The writes and deletes that bring the metadata to `wanted` ([`Want`]), and every other
+    /// stream FxSound has moved — or whose key puts it onto a route of FxSound's
+    /// ([`Self::takes_over`]) — back. Deletes first, then writes, each in order of subject.
+    ///
+    /// A key that already names the route node a stream is wanted on is taken for this engine's
+    /// own, with nothing sent: WirePlumber's restore of the application's last target, when it
+    /// names the route its rule wants, is exactly what FxSound would have written — and a write of
+    /// the value the server holds would never be reported back.
+    pub(crate) fn plan(&mut self, wanted: &[(u32, Want)]) -> Vec<MetadataOp> {
+        for &(id, want) in wanted {
+            if let Want::Onto(serial) = want
+                && self.written.get(&id) != Some(&serial)
+                && !self.unconfirmed.contains_key(&id)
+                && self
+                    .held
+                    .get(&id)
+                    .is_some_and(|held| held.value.parse::<u64>() == Ok(serial))
+            {
+                self.written.insert(id, serial);
+            }
+        }
+        self.ops(wanted)
+    }
+
+    fn ops(&self, wanted: &[(u32, Want)]) -> Vec<MetadataOp> {
+        // Whether the key of the stream `id` is where the plan wants it, or on its way there.
+        let stays = |id: u32| {
+            wanted.iter().any(|&(wanted, want)| {
+                wanted == id
+                    && match want {
+                        Want::Onto(_) => true,
+                        Want::Pending { still } => {
+                            let now = self.target(id);
+                            now.is_none() || now == still
+                        }
+                    }
+            })
+        };
         let mut deletes: Vec<u32> = self
             .written
             .keys()
             .chain(self.held.keys())
             .copied()
-            .filter(|id| !wanted.iter().any(|(wanted, _)| wanted == id))
+            .filter(|&id| !stays(id))
             .filter(|&id| self.ours_to_delete(id))
             .collect();
         deletes.sort_unstable();
@@ -912,7 +1164,10 @@ impl Moves {
             .collect();
         let mut writes: Vec<(u32, u64)> = wanted
             .iter()
-            .filter_map(|&(id, serial)| serial.map(|serial| (id, serial)))
+            .filter_map(|&(id, want)| match want {
+                Want::Onto(serial) => Some((id, serial)),
+                Want::Pending { .. } => None,
+            })
             .filter(|&(id, serial)| self.written.get(&id) != Some(&serial))
             .collect();
         writes.sort_unstable();
@@ -924,9 +1179,13 @@ impl Moves {
         ops
     }
 
-    /// Every key FxSound holds, to delete: the engine is going.
+    /// Every key FxSound holds, to delete: the engine is going. That is every key this engine
+    /// wrote, and every key that puts a stream onto a route node of this process's whoever wrote
+    /// it — the node goes with the process, and no choice of anybody's survives it. A recorder's
+    /// key naming a playback route's sink is its user's, and stays like a key naming any other
+    /// node (module docs, "The metadata").
     pub(crate) fn everything_back(&self) -> Vec<MetadataOp> {
-        self.plan(&[])
+        self.ops(&[])
     }
 
     /// `op` has been sent.
@@ -974,6 +1233,7 @@ impl OverflowWarnings {
 
 #[cfg(test)]
 mod tests {
+    use super::Want::{Onto, Pending};
     use super::*;
     use fxsound_core::messages::{DspParams, InputDspParams};
 
@@ -1027,6 +1287,7 @@ mod tests {
             direction,
             app,
             movable: true,
+            on_route: None,
         }
     }
 
@@ -1747,7 +2008,7 @@ mod tests {
     #[test]
     fn a_stream_onto_a_route_is_written_once_and_a_stream_leaving_it_is_deleted() {
         let mut moves = Moves::default();
-        let ops = moves.plan(&[(40, Some(301)), (41, Some(301))]);
+        let ops = moves.plan(&[(40, Onto(301)), (41, Onto(301))]);
         assert_eq!(
             ops,
             vec![
@@ -1768,33 +2029,42 @@ mod tests {
         moves.heard(40, Some("301"));
         moves.heard(41, Some("301"));
         assert!(!moves.moved_by_hand(40));
-        assert!(moves.plan(&[(40, Some(301)), (41, Some(301))]).is_empty());
+        assert!(moves.plan(&[(40, Onto(301)), (41, Onto(301))]).is_empty());
 
         // 41 leaves the route.
-        let ops = moves.plan(&[(40, Some(301))]);
+        let ops = moves.plan(&[(40, Onto(301))]);
         assert_eq!(ops, vec![MetadataOp::Delete { subject: 41 }]);
         moves.sent(ops[0]);
         moves.heard(41, None);
         assert_eq!(moves.written(41), None);
-        assert!(moves.plan(&[(40, Some(301))]).is_empty());
+        assert!(moves.plan(&[(40, Onto(301))]).is_empty());
     }
 
     #[test]
     fn a_route_rebuilt_under_a_new_serial_is_written_again_once_its_node_is_announced() {
         let mut moves = Moves::default();
-        moves.route_node(301);
+        moves.route_node(301, OUT);
         moves.sent(MetadataOp::Write {
             subject: 40,
             serial: 301,
         });
         moves.heard(40, Some("301"));
-        // Rebuilt: the new node is not announced yet, and the key is left alone meanwhile —
-        // neither deleted nor written.
-        assert!(moves.plan(&[(40, None)]).is_empty());
+        // Rebuilt — on the lane's new device, or after a failure: the old node goes in this tick,
+        // and the key naming it goes first, rather than be left naming a node that is not there.
+        // Nothing is written while the new node is not announced.
+        let ops = moves.plan(&[(40, Pending { still: None })]);
+        assert_eq!(ops, vec![MetadataOp::Delete { subject: 40 }]);
+        moves.sent(ops[0]);
+        assert!(
+            moves.plan(&[(40, Pending { still: None })]).is_empty(),
+            "deleted once"
+        );
+        moves.heard(40, None);
+        assert!(moves.plan(&[(40, Pending { still: None })]).is_empty());
         // Announced.
-        moves.route_node(377);
+        moves.route_node(377, OUT);
         assert_eq!(
-            moves.plan(&[(40, Some(377))]),
+            moves.plan(&[(40, Onto(377))]),
             vec![MetadataOp::Write {
                 subject: 40,
                 serial: 377
@@ -1803,9 +2073,59 @@ mod tests {
     }
 
     #[test]
+    fn a_key_on_a_route_kept_while_its_lane_is_between_pairs_is_left_as_it_is() {
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.sent(MetadataOp::Write {
+            subject: 40,
+            serial: 301,
+        });
+        moves.heard(40, Some("301"));
+        // The lane has no pair for a moment; the route keeps its node, and the stream its key.
+        assert!(moves.plan(&[(40, Pending { still: Some(301) })]).is_empty());
+        assert_eq!(moves.written(40), Some(301));
+        // A write still on its way onto that node is left on its way, too.
+        moves.sent(MetadataOp::Write {
+            subject: 41,
+            serial: 301,
+        });
+        assert!(
+            moves
+                .plan(&[
+                    (40, Pending { still: Some(301) }),
+                    (41, Pending { still: Some(301) })
+                ])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_key_naming_another_route_than_the_one_a_stream_waits_for_is_deleted_meanwhile() {
+        // The game's preset runs under o1 now; its own route is being built under o2. The key
+        // WirePlumber restored onto o1 is not left there while o2's node is on its way: the game
+        // would play through somebody else's preset until it is.
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.heard(40, Some("301"));
+        let ops = moves.plan(&[(40, Pending { still: None })]);
+        assert_eq!(ops, vec![MetadataOp::Delete { subject: 40 }]);
+        moves.sent(ops[0]);
+        // And a stream waiting for a route between pairs whose own node is not o1.
+        moves.route_node(302, OUT);
+        moves.heard(41, Some("301"));
+        let ops = moves.plan(&[(41, Pending { still: Some(302) })]);
+        assert_eq!(ops, vec![MetadataOp::Delete { subject: 41 }]);
+        moves.sent(ops[0]);
+        // Nothing to delete for a stream with no key; and a key of somebody else's is theirs.
+        assert!(moves.plan(&[(42, Pending { still: None })]).is_empty());
+        moves.heard(43, Some("57"));
+        assert!(moves.plan(&[(43, Pending { still: None })]).is_empty());
+    }
+
+    #[test]
     fn a_stream_moved_by_hand_is_neither_moved_again_nor_moved_back() {
         let mut moves = Moves::default();
-        moves.route_node(301);
+        moves.route_node(301, OUT);
         moves.sent(MetadataOp::Write {
             subject: 40,
             serial: 301,
@@ -1832,29 +2152,42 @@ mod tests {
         assert!(!moves.moved_by_hand(40));
     }
 
+    /// A key naming a route that is there, which no change of FxSound's accounts for — a mixer's
+    /// move, or WirePlumber restoring the application's last target by the route's name — is
+    /// FxSound's all the same: which preset runs under that number is FxSound's business, and the
+    /// application's rule's, not the name's.
     #[test]
-    fn a_stream_moved_onto_a_route_by_hand_is_the_users_while_that_route_is_there() {
+    fn a_key_naming_a_route_that_is_there_is_fxsounds_whoever_wrote_it() {
         let mut moves = Moves::default();
-        moves.route_node(301);
-        // The user moves a player no rule names onto "FxSound (Output) · Gaming" in a mixer.
+        moves.route_node(301, OUT);
+        // A player no rule names, put onto "FxSound (Output) · Gaming".
         moves.heard(44, Some("301"));
-        assert!(moves.moved_by_hand(44));
-        assert!(moves.plan(&[]).is_empty());
-        // The route goes: the key now names nothing, and is FxSound's to clear.
-        moves.route_node_gone(301);
         assert!(!moves.moved_by_hand(44));
-        assert_eq!(moves.plan(&[]), vec![MetadataOp::Delete { subject: 44 }]);
+        let ops = moves.plan(&[]);
+        assert_eq!(ops, vec![MetadataOp::Delete { subject: 44 }]);
+        moves.sent(ops[0]);
+        // A player whose rule wants another route: moved onto that one.
+        moves.route_node(302, OUT);
+        moves.heard(45, Some("301"));
+        assert!(!moves.moved_by_hand(45));
+        assert_eq!(
+            moves.plan(&[(45, Onto(302))]),
+            vec![MetadataOp::Write {
+                subject: 45,
+                serial: 302
+            }]
+        );
     }
 
     #[test]
     fn the_echo_of_an_earlier_write_is_still_fxsounds_after_a_later_one() {
         let mut moves = Moves::default();
-        moves.route_node(301);
+        moves.route_node(301, OUT);
         moves.sent(MetadataOp::Write {
             subject: 40,
             serial: 301,
         });
-        moves.route_node(377);
+        moves.route_node(377, OUT);
         moves.sent(MetadataOp::Write {
             subject: 40,
             serial: 377,
@@ -1864,7 +2197,7 @@ mod tests {
         assert!(!moves.moved_by_hand(40));
         assert_eq!(moves.written(40), Some(377));
         moves.heard(40, Some("377"));
-        assert!(moves.plan(&[(40, Some(377))]).is_empty());
+        assert!(moves.plan(&[(40, Onto(377))]).is_empty());
         assert!(
             moves.unconfirmed.is_empty(),
             "both writes reported, nothing left to wait for"
@@ -1872,19 +2205,19 @@ mod tests {
     }
 
     /// Two players on one route, the rule of one removed, and the user moving it back onto the
-    /// route in a mixer: the serial is the one FxSound wrote for it before, and is theirs now.
+    /// route in a mixer: the route is FxSound's, and without a rule the player goes back.
     #[test]
-    fn a_serial_fxsound_deleted_is_the_users_when_they_move_the_stream_back_onto_it() {
+    fn a_player_whose_rule_was_removed_is_moved_back_off_a_route_it_is_put_on_again() {
         let mut moves = Moves::default();
-        moves.route_node(301);
+        moves.route_node(301, OUT);
         // Brave (40) and Chrome (41) both run "Volume Boost" on route o1.
-        for op in moves.plan(&[(40, Some(301)), (41, Some(301))]) {
+        for op in moves.plan(&[(40, Onto(301)), (41, Onto(301))]) {
             moves.sent(op);
         }
         moves.heard(40, Some("301"));
         moves.heard(41, Some("301"));
         // Chrome's rule is removed: its key is deleted, and the server says so.
-        let ops = moves.plan(&[(40, Some(301))]);
+        let ops = moves.plan(&[(40, Onto(301))]);
         assert_eq!(ops, vec![MetadataOp::Delete { subject: 41 }]);
         moves.sent(ops[0]);
         moves.heard(41, None);
@@ -1892,26 +2225,29 @@ mod tests {
 
         // The user moves Chrome onto "FxSound (Output) · Volume Boost" in pavucontrol.
         moves.heard(41, Some("301"));
-        assert!(moves.moved_by_hand(41), "a move FxSound leaves alone");
+        assert!(!moves.moved_by_hand(41), "a route of FxSound's");
         assert_eq!(moves.written(41), None);
-        assert!(
-            moves.plan(&[(40, Some(301))]).is_empty(),
-            "their key is not deleted on the next plan"
+        assert_eq!(
+            moves.plan(&[(40, Onto(301))]),
+            vec![MetadataOp::Delete { subject: 41 }],
+            "no rule puts Chrome there"
         );
         assert_eq!(
             moves.everything_back(),
-            vec![MetadataOp::Delete { subject: 40 }],
-            "nor on the way out"
+            vec![
+                MetadataOp::Delete { subject: 40 },
+                MetadataOp::Delete { subject: 41 }
+            ],
         );
     }
 
-    /// FxSound moves a stream from one route to another, and the user moves it back onto the first
-    /// in a mixer: the stream is on the first, by their hand, and FxSound says nothing else.
+    /// FxSound moves a stream from one route to another, and someone moves it back onto the first:
+    /// not an old echo, and not the user's pick either — the stream goes back where its rule is.
     #[test]
-    fn a_stream_moved_back_by_hand_onto_the_route_fxsound_moved_it_off_is_the_users() {
+    fn a_stream_put_back_onto_the_route_fxsound_moved_it_off_is_moved_where_its_rule_is() {
         let mut moves = Moves::default();
-        moves.route_node(301);
-        moves.route_node(302);
+        moves.route_node(301, OUT);
+        moves.route_node(302, OUT);
         for serial in [301, 302] {
             moves.sent(MetadataOp::Write {
                 subject: 40,
@@ -1922,13 +2258,19 @@ mod tests {
         }
 
         moves.heard(40, Some("301"));
-        assert!(moves.moved_by_hand(40), "not taken for an old echo");
+        assert!(!moves.moved_by_hand(40));
         assert_eq!(
             moves.written(40),
             None,
             "FxSound no longer says the stream is on the second route's preset"
         );
-        assert!(moves.plan(&[]).is_empty(), "and leaves the key where it is");
+        assert_eq!(
+            moves.plan(&[(40, Onto(302))]),
+            vec![MetadataOp::Write {
+                subject: 40,
+                serial: 302
+            }]
+        );
     }
 
     #[test]
@@ -1936,8 +2278,8 @@ mod tests {
         // A rule added, removed and added again within one round trip: a write, a delete and a
         // write on their way at once. The two writes name routes that are both still there.
         let mut moves = Moves::default();
-        moves.route_node(301);
-        moves.route_node(302);
+        moves.route_node(301, OUT);
+        moves.route_node(302, OUT);
         moves.sent(MetadataOp::Write {
             subject: 40,
             serial: 301,
@@ -1951,7 +2293,7 @@ mod tests {
         moves.heard(40, Some("301"));
         assert!(!moves.moved_by_hand(40));
         assert!(
-            moves.plan(&[(40, Some(302))]).is_empty(),
+            moves.plan(&[(40, Onto(302))]).is_empty(),
             "nothing to send: everything wanted is on its way"
         );
         moves.heard(40, None);
@@ -1959,14 +2301,14 @@ mod tests {
         moves.heard(40, Some("302"));
         assert!(!moves.moved_by_hand(40));
         assert_eq!(moves.written(40), Some(302));
-        assert!(moves.plan(&[(40, Some(302))]).is_empty());
+        assert!(moves.plan(&[(40, Onto(302))]).is_empty());
         assert!(moves.unconfirmed.is_empty());
     }
 
     #[test]
     fn a_delete_on_its_way_is_not_sent_again_when_the_write_it_undoes_comes_back() {
         let mut moves = Moves::default();
-        moves.route_node(301);
+        moves.route_node(301, OUT);
         moves.sent(MetadataOp::Write {
             subject: 40,
             serial: 301,
@@ -1992,8 +2334,8 @@ mod tests {
         // the user's first, and FxSound's after it. The key the server ends up holding is
         // FxSound's, and FxSound stands behind it.
         let mut moves = Moves::default();
-        moves.route_node(301);
-        moves.route_node(302);
+        moves.route_node(301, OUT);
+        moves.route_node(302, OUT);
         moves.sent(MetadataOp::Write {
             subject: 40,
             serial: 301,
@@ -2013,7 +2355,7 @@ mod tests {
         assert!(!moves.moved_by_hand(40));
         assert_eq!(moves.written(40), Some(302));
         assert!(
-            moves.plan(&[(40, Some(302))]).is_empty(),
+            moves.plan(&[(40, Onto(302))]).is_empty(),
             "not written again for want of standing behind it"
         );
     }
@@ -2024,8 +2366,8 @@ mod tests {
         // nothing of it. The next write's report settles it, and no stale serial of FxSound's is
         // left to be taken for its own later.
         let mut moves = Moves::default();
-        moves.route_node(301);
-        moves.route_node(302);
+        moves.route_node(301, OUT);
+        moves.route_node(302, OUT);
         moves.sent(MetadataOp::Write {
             subject: 40,
             serial: 301,
@@ -2039,15 +2381,24 @@ mod tests {
         moves.heard(40, Some("302"));
         assert!(moves.unconfirmed.is_empty());
 
-        // The user moves it onto 301 by hand: nothing of FxSound's accounts for that any more.
+        // Someone moves it onto 301: nothing FxSound sent accounts for that any more, and its
+        // write onto 302 no longer stands — it is sent again.
         moves.heard(40, Some("301"));
-        assert!(moves.moved_by_hand(40));
+        assert!(moves.unconfirmed.is_empty(), "not taken for an echo");
+        assert_eq!(moves.written(40), None);
+        assert_eq!(
+            moves.plan(&[(40, Onto(302))]),
+            vec![MetadataOp::Write {
+                subject: 40,
+                serial: 302
+            }]
+        );
     }
 
     #[test]
     fn a_key_naming_a_route_of_an_earlier_connection_is_fxsounds_and_is_taken_over() {
         let mut moves = Moves::default();
-        moves.route_node(301);
+        moves.route_node(301, OUT);
         moves.sent(MetadataOp::Write {
             subject: 40,
             serial: 301,
@@ -2062,9 +2413,9 @@ mod tests {
         // No rule for it any more: deleted.
         assert_eq!(moves.plan(&[]), vec![MetadataOp::Delete { subject: 40 }]);
         // Still routed: onto the new route.
-        moves.route_node(410);
+        moves.route_node(410, OUT);
         assert_eq!(
-            moves.plan(&[(40, Some(410))]),
+            moves.plan(&[(40, Onto(410))]),
             vec![MetadataOp::Write {
                 subject: 40,
                 serial: 410
@@ -2090,8 +2441,8 @@ mod tests {
     #[test]
     fn every_key_of_fxsounds_is_deleted_on_the_way_out_and_nothing_else() {
         let mut moves = Moves::default();
-        moves.route_node(301);
-        moves.route_node(302);
+        moves.route_node(301, OUT);
+        moves.route_node(302, OUT);
         for (subject, serial) in [(40, 301), (41, 302)] {
             moves.sent(MetadataOp::Write { subject, serial });
             moves.heard(subject, Some(&serial.to_string()));
@@ -2120,7 +2471,7 @@ mod tests {
             subject: 90,
             serial: 301,
         });
-        let ops = moves.plan(&[(10, Some(302))]);
+        let ops = moves.plan(&[(10, Onto(302))]);
         assert_eq!(
             ops,
             vec![
@@ -2132,6 +2483,729 @@ mod tests {
             ]
         );
         assert_eq!(ops[0].subject(), 90);
+    }
+
+    // ---- keys FxSound did not write ------------------------------------------------------
+
+    /// A stream with `on_route` set: sitting on the route in `slot` by something FxSound does not
+    /// change.
+    fn resting(id: u32, direction: DeviceDirection, app: AppKey, slot: RouteSlot) -> Candidate {
+        Candidate {
+            on_route: Some(slot),
+            ..stream(id, direction, app)
+        }
+    }
+
+    /// The `Want` the engine hands [`Moves::plan`] for each assigned stream, from the serial each
+    /// route's node has: `Onto` where the route is not built in this plan and its node is known,
+    /// `Pending` with no node kept otherwise (`engine::route_pairs::reconcile`, attached lanes).
+    fn wants(plan: &Plan, serials: &[(RouteSlot, u64)]) -> Vec<(u32, Want)> {
+        plan.assigned
+            .iter()
+            .map(|&(id, slot)| {
+                let built = plan.build.iter().any(|(built, _)| *built == slot);
+                let serial = serials
+                    .iter()
+                    .find(|(known, _)| *known == slot)
+                    .map(|&(_, serial)| serial)
+                    .filter(|_| !built);
+                (id, serial.map_or(Pending { still: None }, Onto))
+            })
+            .collect()
+    }
+
+    /// Firefox plays a video through "Movies" on o1, and the video ends. It opens a new stream for
+    /// the next one within the idle period, and WirePlumber — which saved `fxsound_route_o1` as
+    /// Firefox's target when FxSound moved it — writes o1's serial for the new stream the moment
+    /// it appears, before FxSound plans it (`node/state-stream.lua`, `node.stream.restore-target`).
+    #[test]
+    fn a_player_the_session_manager_restores_onto_its_own_route_keeps_it_and_is_reported_on_it() {
+        let rules = rules(vec![output_rule(named("Firefox"), "Movies", 1.0)]);
+        let mut table = RouteTable::default();
+        let mut moves = Moves::default();
+        let start = Instant::now();
+        let first = [stream(40, OUT, named("Firefox"))];
+        let plan = table.plan(&rules, &first, &both(ATTACHED), start, ROUTE_IDLE);
+        assert_eq!(built(&plan), vec![(slot(OUT, 1), "Movies")]);
+        moves.route_node(301, OUT);
+        for op in moves.plan(&[(40, Onto(301))]) {
+            moves.sent(op);
+        }
+        moves.heard(40, Some("301"));
+        moves.stream_gone(40);
+        let ended = start + Duration::from_secs(2);
+        table.plan(&rules, &[], &both(ATTACHED), ended, ROUTE_IDLE);
+
+        // The next video: WirePlumber's restore arrives right after the stream appears.
+        moves.heard(52, Some("301"));
+        assert!(!moves.moved_by_hand(52), "not the user's pick");
+        let next = [Candidate {
+            movable: !moves.moved_by_hand(52),
+            ..stream(52, OUT, named("Firefox"))
+        }];
+        let back = ended + Duration::from_secs(3);
+        let plan = table.plan(&rules, &next, &both(ATTACHED), back, ROUTE_IDLE);
+        assert!(plan.build.is_empty() && plan.teardown.is_empty());
+        assert_eq!(plan.assigned, vec![(52, slot(OUT, 1))]);
+        assert!(
+            moves.plan(&wants(&plan, &[(slot(OUT, 1), 301)])).is_empty(),
+            "the key already says what FxSound would write"
+        );
+        assert_eq!(
+            moves.written(52),
+            Some(301),
+            "FxSound stands behind it, and reports the stream on its route"
+        );
+
+        // The route is in use for as long as the stream plays, however long that is.
+        for seconds in [10, 20, 60] {
+            let plan = table.plan(
+                &rules,
+                &next,
+                &both(ATTACHED),
+                back + Duration::from_secs(seconds),
+                ROUTE_IDLE,
+            );
+            assert!(plan.teardown.is_empty(), "{seconds} s on");
+            assert!(moves.plan(&wants(&plan, &[(slot(OUT, 1), 301)])).is_empty());
+        }
+    }
+
+    /// Game X ran through "Gaming" on o1 and quit; o1 went, and Discord's "Voice" took the number.
+    /// X starts again, and WirePlumber restores it onto whatever node is called `fxsound_route_o1`
+    /// now — Discord's preset. X goes onto a route of its own; and a recorder restored onto an
+    /// OBS preset's input route likewise. Without a rule any more, X is moved back to its lane.
+    #[test]
+    fn a_stream_restored_onto_a_number_another_preset_now_runs_is_moved_onto_its_own_route() {
+        let rules = rules(vec![
+            output_rule(named("Discord"), "Voice", 1.0),
+            output_rule(named("Game X"), "Gaming", 1.0),
+            input_rule(named("OBS"), "Studio", "voice"),
+            input_rule(named("Discord"), "Headset", "voice"),
+        ]);
+        let mut table = RouteTable::default();
+        let mut moves = Moves::default();
+        let now = Instant::now();
+        let running = [
+            stream(60, OUT, named("Discord")),
+            stream(61, IN, named("OBS")),
+        ];
+        let plan = table.plan(&rules, &running, &both(ATTACHED), now, ROUTE_IDLE);
+        assert_eq!(
+            built(&plan),
+            vec![(slot(OUT, 1), "Voice"), (slot(IN, 1), "Studio")]
+        );
+        moves.route_node(301, OUT);
+        moves.route_node(401, IN);
+        for (id, direction) in [(60, OUT), (61, IN), (70, OUT), (71, IN)] {
+            moves.stream_appeared(id, direction);
+        }
+        let routes = [(slot(OUT, 1), 301), (slot(IN, 1), 401)];
+        for op in moves.plan(&[(60, Onto(301)), (61, Onto(401))]) {
+            moves.sent(op);
+        }
+        moves.heard(60, Some("301"));
+        moves.heard(61, Some("401"));
+
+        // X appears, restored onto o1; Discord's capture appears, restored onto OBS's i1.
+        moves.heard(70, Some("301"));
+        moves.heard(71, Some("401"));
+        assert!(!moves.moved_by_hand(70) && !moves.moved_by_hand(71));
+        let all = [
+            running[0].clone(),
+            running[1].clone(),
+            stream(70, OUT, named("Game X")),
+            stream(71, IN, named("Discord")),
+        ];
+        let plan = table.plan(&rules, &all, &both(ATTACHED), now, ROUTE_IDLE);
+        assert_eq!(
+            built(&plan),
+            vec![(slot(OUT, 2), "Gaming"), (slot(IN, 2), "Headset")]
+        );
+        // Off the other preset's route at once, rather than through it until their own is up.
+        let ops = moves.plan(&wants(&plan, &routes));
+        assert_eq!(
+            ops,
+            vec![
+                MetadataOp::Delete { subject: 70 },
+                MetadataOp::Delete { subject: 71 }
+            ]
+        );
+        for op in ops {
+            moves.sent(op);
+        }
+        moves.heard(70, None);
+        moves.heard(71, None);
+        // Their routes' nodes are announced: onto them.
+        moves.route_node(302, OUT);
+        moves.route_node(402, IN);
+        let routes = [
+            (slot(OUT, 1), 301),
+            (slot(IN, 1), 401),
+            (slot(OUT, 2), 302),
+            (slot(IN, 2), 402),
+        ];
+        let plan = table.plan(&rules, &all, &both(ATTACHED), now, ROUTE_IDLE);
+        assert_eq!(
+            moves.plan(&wants(&plan, &routes)),
+            vec![
+                MetadataOp::Write {
+                    subject: 70,
+                    serial: 302
+                },
+                MetadataOp::Write {
+                    subject: 71,
+                    serial: 402
+                },
+            ]
+        );
+
+        // Another day: X has no rule any more, and is restored onto o1 all the same.
+        let rules = rules_without_x();
+        let mut table = RouteTable::default();
+        let mut moves = Moves::default();
+        let discord = [stream(60, OUT, named("Discord"))];
+        table.plan(&rules, &discord, &both(ATTACHED), now, ROUTE_IDLE);
+        moves.route_node(301, OUT);
+        for op in moves.plan(&[(60, Onto(301))]) {
+            moves.sent(op);
+        }
+        moves.heard(60, Some("301"));
+        moves.heard(80, Some("301"));
+        let plan = table.plan(
+            &rules,
+            &[discord[0].clone(), stream(80, OUT, named("Game X"))],
+            &both(ATTACHED),
+            now,
+            ROUTE_IDLE,
+        );
+        assert_eq!(plan.assigned, vec![(60, slot(OUT, 1))]);
+        assert_eq!(
+            moves.plan(&wants(&plan, &[(slot(OUT, 1), 301)])),
+            vec![MetadataOp::Delete { subject: 80 }],
+            "back to its lane, and WirePlumber forgets the route's name for it"
+        );
+    }
+
+    fn rules_without_x() -> Rules {
+        rules(vec![output_rule(named("Discord"), "Voice", 1.0)])
+    }
+
+    #[test]
+    fn a_key_already_naming_the_route_a_stream_is_wanted_on_is_taken_as_written() {
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.heard(52, Some("301"));
+        assert!(moves.plan(&[(52, Onto(301))]).is_empty());
+        assert_eq!(moves.written(52), Some(301));
+        assert!(!moves.moved_by_hand(52));
+        // Not while a write of FxSound's is on its way: the server ends up on that one, and the
+        // stream is written onto the route it is wanted on after it.
+        moves.route_node(302, OUT);
+        moves.sent(MetadataOp::Write {
+            subject: 53,
+            serial: 302,
+        });
+        moves.heard(53, Some("301"));
+        assert_eq!(
+            moves.plan(&[(52, Onto(301)), (53, Onto(301))]),
+            vec![MetadataOp::Write {
+                subject: 53,
+                serial: 301
+            }]
+        );
+    }
+
+    #[test]
+    fn a_route_a_stream_fxsound_does_not_move_sits_on_is_never_idle_and_never_given_away() {
+        let presets = ["Gaming", "Two", "Three", "Four", "Five"];
+        let rules = rules(
+            presets
+                .iter()
+                .map(|preset| output_rule(named(preset), preset, 1.0))
+                .collect(),
+        );
+        let mut table = RouteTable::default();
+        let start = Instant::now();
+        let game = stream(40, OUT, named("Gaming"));
+        table.plan(
+            &rules,
+            std::slice::from_ref(&game),
+            &both(ATTACHED),
+            start,
+            ROUTE_IDLE,
+        );
+        // A tester whose own properties name `fxsound_route_o1`, and no rule names: it plays
+        // through o1 whatever FxSound decides.
+        let tester = resting(44, OUT, named("pw-play"), slot(OUT, 1));
+        // The game quits; the tester goes on.
+        let later = start + ROUTE_IDLE * 3;
+        let plan = table.plan(
+            &rules,
+            std::slice::from_ref(&tester),
+            &both(ATTACHED),
+            later,
+            ROUTE_IDLE,
+        );
+        assert!(plan.teardown.is_empty(), "{:?}", plan.teardown);
+        assert_eq!(table.routes()[0].idle_since, None);
+
+        // Four more presets want a route: three get one, the fourth does not take o1's place.
+        let mut all = vec![tester.clone()];
+        all.extend(
+            presets[1..]
+                .iter()
+                .enumerate()
+                .map(|(index, preset)| stream(50 + index as u32, OUT, named(preset))),
+        );
+        let plan = table.plan(&rules, &all, &both(ATTACHED), later, ROUTE_IDLE);
+        assert!(plan.teardown.is_empty(), "{:?}", plan.teardown);
+        assert_eq!(plan.build.len(), 3);
+        assert_eq!(plan.overflow.len(), 1);
+        assert_eq!(table.preset_of(slot(OUT, 1)), Some("Gaming"));
+
+        // Once the tester has gone, o1 is unused like any other route, and the fifth preset takes
+        // its place.
+        let plan = table.plan(
+            &rules,
+            &all[1..],
+            &both(ATTACHED),
+            later + Duration::from_secs(1),
+            ROUTE_IDLE,
+        );
+        assert_eq!(gone(&plan), vec![(slot(OUT, 1), Teardown::Evicted)]);
+        assert_eq!(built(&plan), vec![(slot(OUT, 1), "Five")]);
+    }
+
+    #[test]
+    fn a_stream_fxsound_moves_off_a_route_does_not_keep_it_in_use() {
+        // Its rule names another preset: the plan moves it — by a key WirePlumber reads ahead of
+        // the stream's own properties — and the route it leaves is idle like any other.
+        let rules = rules(vec![
+            output_rule(named("Game"), "Gaming", 1.0),
+            output_rule(named("Brave"), "Volume Boost", 1.0),
+        ]);
+        let mut table = RouteTable::default();
+        let start = Instant::now();
+        table.plan(
+            &rules,
+            &[stream(40, OUT, named("Game"))],
+            &both(ATTACHED),
+            start,
+            ROUTE_IDLE,
+        );
+        let brave = resting(41, OUT, named("Brave"), slot(OUT, 1));
+        let left = start + Duration::from_secs(1);
+        let plan = table.plan(
+            &rules,
+            std::slice::from_ref(&brave),
+            &both(ATTACHED),
+            left,
+            ROUTE_IDLE,
+        );
+        assert_eq!(plan.assigned, vec![(41, slot(OUT, 2))]);
+        assert_eq!(table.routes()[0].idle_since, Some(left));
+    }
+
+    /// The game's rule is removed while a tester that names o1 in its own properties — or a
+    /// player WirePlumber will not move again — plays through it: the route is not taken down
+    /// under it, the plan says so once, and it goes as soon as that stream has.
+    #[test]
+    fn a_route_whose_rule_goes_is_kept_while_a_stream_fxsound_does_not_move_is_on_it() {
+        let with = rules(vec![output_rule(named("Game"), "Gaming", 1.0)]);
+        let mut table = RouteTable::default();
+        let now = Instant::now();
+        let game = stream(40, OUT, named("Game"));
+        table.plan(
+            &with,
+            std::slice::from_ref(&game),
+            &both(ATTACHED),
+            now,
+            ROUTE_IDLE,
+        );
+        let pinned = Candidate {
+            movable: false,
+            ..resting(44, OUT, named("Old player"), slot(OUT, 1))
+        };
+        let streams = [game.clone(), pinned.clone()];
+        let plan = table.plan(
+            &Rules::default(),
+            &streams,
+            &both(ATTACHED),
+            now,
+            ROUTE_IDLE,
+        );
+        assert!(plan.teardown.is_empty());
+        assert!(plan.assigned.is_empty(), "the game goes back to its lane");
+        assert_eq!(plan.kept, vec![(slot(OUT, 1), "Gaming".to_owned())]);
+        let plan = table.plan(
+            &Rules::default(),
+            &streams,
+            &both(ATTACHED),
+            now,
+            ROUTE_IDLE,
+        );
+        assert!(plan.kept.is_empty(), "said once");
+        assert!(plan.teardown.is_empty());
+
+        // The rule comes back while the route is still there: the game goes back onto it, and
+        // nothing is built.
+        let plan = table.plan(&with, &streams, &both(ATTACHED), now, ROUTE_IDLE);
+        assert!(plan.build.is_empty() && plan.teardown.is_empty());
+        assert_eq!(plan.assigned, vec![(40, slot(OUT, 1))]);
+        assert!(!table.routes()[0].orphaned);
+
+        // Gone again, and then the player leaves: the route goes at once.
+        table.plan(
+            &Rules::default(),
+            &streams,
+            &both(ATTACHED),
+            now,
+            ROUTE_IDLE,
+        );
+        let plan = table.plan(&Rules::default(), &[game], &both(ATTACHED), now, ROUTE_IDLE);
+        assert_eq!(gone(&plan), vec![(slot(OUT, 1), Teardown::RuleGone)]);
+
+        // A lane switched off takes such a route all the same: it has no device to be on.
+        let mut table = RouteTable::default();
+        table.plan(
+            &with,
+            &[stream(40, OUT, named("Game"))],
+            &both(ATTACHED),
+            now,
+            ROUTE_IDLE,
+        );
+        let plan = table.plan(&with, &[pinned], &both(LaneState::Off), now, ROUTE_IDLE);
+        assert_eq!(gone(&plan), vec![(slot(OUT, 1), Teardown::LaneOff)]);
+    }
+
+    #[test]
+    fn a_target_a_stream_names_itself_is_found_among_the_routes_by_name_serial_or_id() {
+        let nodes = [(slot(OUT, 1), 70, 700), (slot(IN, 2), 72, 720)];
+        let object = |value: &str| ExplicitTarget::Object(value.to_owned());
+        let node = |value: &str| ExplicitTarget::Node(value.to_owned());
+        assert_eq!(
+            route_of_target(&object("fxsound_route_o1"), &nodes),
+            Some(slot(OUT, 1))
+        );
+        assert_eq!(
+            route_of_target(&object("fxsound_route_o3"), &nodes),
+            Some(slot(OUT, 3)),
+            "by name, whatever node carries the name now or will"
+        );
+        assert_eq!(route_of_target(&object("700"), &nodes), Some(slot(OUT, 1)));
+        assert_eq!(route_of_target(&node("72"), &nodes), Some(slot(IN, 2)));
+        assert_eq!(
+            route_of_target(&node(" fxsound_route_i2 "), &nodes),
+            Some(slot(IN, 2))
+        );
+        for (target, why) in [
+            (object("70"), "an id is no serial"),
+            (node("700"), "a serial is no id"),
+            (
+                object("fxsound_route_o1_play"),
+                "the route's stream is not its node",
+            ),
+            (object("fxsound_sink"), "the lane's node is no route"),
+            (object("alsa_output.usb"), "somebody else's"),
+            (object("-1"), "nothing"),
+        ] {
+            assert_eq!(route_of_target(&target, &nodes), None, "{why}");
+        }
+    }
+
+    #[test]
+    fn a_stream_that_will_not_be_moved_again_is_anchored_where_its_key_put_it() {
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.route_node(302, OUT);
+        // A `node.dont-reconnect` player WirePlumber restored onto o1.
+        moves.heard(80, Some("301"));
+        assert_eq!(moves.anchor(80), Some(301));
+        // Its key is FxSound's to delete — it moves nothing, and is what WirePlumber would
+        // restore next time — and the stream stays anchored where it was put.
+        let ops = moves.plan(&[]);
+        assert_eq!(ops, vec![MetadataOp::Delete { subject: 80 }]);
+        moves.sent(ops[0]);
+        moves.heard(80, None);
+        assert!(!moves.has_key(80));
+        assert_eq!(moves.anchor(80), Some(301));
+        // A later key moves it nowhere: WirePlumber will not.
+        moves.heard(80, Some("302"));
+        assert_eq!(moves.anchor(80), Some(301));
+        // Gone with the stream, and with the connection.
+        moves.stream_gone(80);
+        assert_eq!(moves.anchor(80), None);
+        moves.heard(81, Some("301"));
+        assert_eq!(moves.anchor(81), Some(301));
+        moves.forget_session();
+        assert_eq!(moves.anchor(81), None);
+        // Somebody else's target anchors nothing of FxSound's.
+        moves.heard(82, Some("57"));
+        assert_eq!(moves.anchor(82), None);
+    }
+
+    #[test]
+    fn a_stream_with_no_key_has_none_and_one_with_a_key_of_any_kind_has_one() {
+        let mut moves = Moves::default();
+        assert!(!moves.has_key(40));
+        moves.heard(40, Some("alsa_output.usb"));
+        assert!(moves.has_key(40));
+        assert_eq!(moves.target(40), None, "a name is no serial");
+        moves.sent(MetadataOp::Write {
+            subject: 41,
+            serial: 301,
+        });
+        assert!(moves.has_key(41), "a write on its way");
+        assert_eq!(moves.target(41), Some(301));
+    }
+
+    /// FxSound quits while a key it did not write names one of its routes — one it has not planned
+    /// yet, WirePlumber's restore. The route goes with FxSound; the key would name a node the next
+    /// run never made, and pin the stream as moved by hand for as long as it plays.
+    #[test]
+    fn every_key_naming_a_route_of_fxsounds_is_deleted_on_the_way_out_whoever_wrote_it() {
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.route_node(290, OUT);
+        moves.heard(44, Some("301"));
+        // One naming a route of an earlier connection's, and one somebody else's.
+        moves.heard(45, Some("290"));
+        moves.heard(46, Some("57"));
+        assert_eq!(
+            moves.everything_back(),
+            vec![
+                MetadataOp::Delete { subject: 44 },
+                MetadataOp::Delete { subject: 45 }
+            ]
+        );
+    }
+
+    /// OBS records the desktop (`stream.capture.sink`, so FxSound never moves it), and the user
+    /// points it at `Monitor of FxSound (Output) · Gaming` in pavucontrol, which `pipewire-pulse`
+    /// writes as the route sink's serial. That records what the game plays through its preset; it
+    /// puts nothing onto the route, and FxSound leaves the key where the user put it — through
+    /// every plan, the route's other streams coming and going, and the way out.
+    #[test]
+    fn a_recorder_pointed_at_a_playback_routes_monitor_keeps_its_key_through_every_plan_and_exit() {
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.stream_appeared(90, IN);
+        moves.heard(90, Some("301"));
+        assert!(moves.moved_by_hand(90), "the user's pick");
+        assert_eq!(moves.monitored(90), Some(301));
+        assert_eq!(moves.written(90), None);
+        assert!(moves.plan(&[]).is_empty(), "not deleted");
+
+        // The game goes onto o1 and leaves it again; the recorder's key is neither deleted nor
+        // rewritten meanwhile.
+        let ops = moves.plan(&[(40, Onto(301))]);
+        assert_eq!(
+            ops,
+            vec![MetadataOp::Write {
+                subject: 40,
+                serial: 301
+            }]
+        );
+        moves.sent(ops[0]);
+        moves.heard(40, Some("301"));
+        assert!(moves.plan(&[(40, Onto(301))]).is_empty());
+        assert_eq!(
+            moves.everything_back(),
+            vec![MetadataOp::Delete { subject: 40 }],
+            "only the game's key goes on the way out"
+        );
+        assert_eq!(
+            moves.plan(&[]),
+            vec![MetadataOp::Delete { subject: 40 }],
+            "the game's key goes with its rule, the recorder's stays"
+        );
+        assert_eq!(moves.anchor(90), None, "nothing of FxSound's to remember");
+
+        // A route since rebuilt, or of an earlier connection: the recorder records a monitor that
+        // is no more, as it would any other sink's that went; still the user's key.
+        moves.forget_session();
+        moves.stream_appeared(90, IN);
+        moves.heard(90, Some("301"));
+        assert!(moves.moved_by_hand(90));
+        assert_eq!(moves.monitored(90), Some(301));
+        assert!(moves.plan(&[]).is_empty());
+        assert!(moves.everything_back().is_empty());
+    }
+
+    /// Discord's microphone capture runs through "Voice" on i1, and the user points it at the
+    /// monitor of o1 instead. FxSound's write no longer stands, nor does it write it again: the
+    /// capture is no longer on its route, and the user's key stays.
+    #[test]
+    fn a_recorder_the_user_moves_from_its_route_onto_a_playback_routes_monitor_is_left_there() {
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.route_node(401, IN);
+        moves.stream_appeared(91, IN);
+        for op in moves.plan(&[(91, Onto(401))]) {
+            moves.sent(op);
+        }
+        moves.heard(91, Some("401"));
+        assert_eq!(moves.written(91), Some(401));
+        assert_eq!(moves.monitored(91), None, "on its own lane's route");
+
+        moves.heard(91, Some("301"));
+        assert!(moves.moved_by_hand(91));
+        assert_eq!(
+            moves.written(91),
+            None,
+            "not reported on its route any more"
+        );
+        assert_eq!(moves.monitored(91), Some(301));
+        // Moved by hand, it is planned onto nothing, and nothing of its is sent.
+        assert!(moves.plan(&[]).is_empty());
+        assert!(moves.everything_back().is_empty());
+    }
+
+    /// The exception is a recorder's key naming a playback route's sink, and nothing wider: a
+    /// recorder's key naming a recording route's source puts it onto that route, a player's key
+    /// naming a playback route puts it onto that one, and both are FxSound's whoever wrote them.
+    /// A subject never announced as a recorder is none.
+    #[test]
+    fn only_a_recorders_key_naming_a_playback_routes_sink_is_left_to_whoever_wrote_it() {
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.route_node(401, IN);
+        moves.stream_appeared(90, IN);
+        moves.stream_appeared(40, OUT);
+        moves.heard(90, Some("401"));
+        moves.heard(40, Some("301"));
+        moves.heard(41, Some("301"));
+        for id in [90, 40, 41] {
+            assert!(!moves.moved_by_hand(id), "{id}");
+            assert_eq!(moves.monitored(id), None, "{id}");
+        }
+        assert_eq!(
+            moves.plan(&[]),
+            vec![
+                MetadataOp::Delete { subject: 40 },
+                MetadataOp::Delete { subject: 41 },
+                MetadataOp::Delete { subject: 90 },
+            ]
+        );
+
+        // A stream is what it was last announced as: a player under an id the server has handed
+        // on from a recorder is a player, and its key naming o1 is FxSound's; and a recorder
+        // announced under an id that went is a recorder again.
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.stream_appeared(92, IN);
+        moves.heard(92, Some("301"));
+        assert_eq!(moves.monitored(92), Some(301));
+        moves.stream_appeared(92, OUT);
+        assert_eq!(moves.monitored(92), None);
+        assert_eq!(moves.plan(&[]), vec![MetadataOp::Delete { subject: 92 }]);
+        moves.stream_gone(92);
+        moves.stream_appeared(92, IN);
+        moves.heard(92, Some("301"));
+        assert_eq!(moves.monitored(92), Some(301));
+        assert!(moves.plan(&[]).is_empty());
+    }
+
+    /// OBS goes on recording the monitor of the game's route after the game has quit, and after
+    /// its rule has gone: the route is in use — never idle, never given away — and kept, said
+    /// once, until OBS stops recording it, when it goes at once.
+    #[test]
+    fn a_recorder_of_a_routes_monitor_keeps_the_playback_route_in_use() {
+        let with = rules(vec![output_rule(named("Game"), "Gaming", 1.0)]);
+        let mut table = RouteTable::default();
+        let start = Instant::now();
+        table.plan(
+            &with,
+            &[stream(40, OUT, named("Game"))],
+            &both(ATTACHED),
+            start,
+            ROUTE_IDLE,
+        );
+        let obs = Candidate {
+            movable: false,
+            ..resting(90, IN, named("OBS"), slot(OUT, 1))
+        };
+        let later = start + ROUTE_IDLE * 3;
+        let plan = table.plan(
+            &with,
+            std::slice::from_ref(&obs),
+            &both(ATTACHED),
+            later,
+            ROUTE_IDLE,
+        );
+        assert!(plan.teardown.is_empty(), "{:?}", plan.teardown);
+        assert!(plan.assigned.is_empty() && plan.build.is_empty());
+        assert_eq!(table.routes()[0].idle_since, None);
+
+        let plan = table.plan(
+            &Rules::default(),
+            std::slice::from_ref(&obs),
+            &both(ATTACHED),
+            later,
+            ROUTE_IDLE,
+        );
+        assert!(plan.teardown.is_empty());
+        assert_eq!(plan.kept, vec![(slot(OUT, 1), "Gaming".to_owned())]);
+
+        let plan = table.plan(&Rules::default(), &[], &both(ATTACHED), later, ROUTE_IDLE);
+        assert_eq!(gone(&plan), vec![(slot(OUT, 1), Teardown::RuleGone)]);
+    }
+
+    /// Someone deletes the key FxSound wrote — `pw-metadata -d`, a tool clearing the stream's keys
+    /// — and WirePlumber moves the stream back to the default. FxSound neither goes on saying it
+    /// is on its route nor leaves it off: the key is written again.
+    #[test]
+    fn a_delete_someone_else_sent_takes_back_what_fxsound_wrote_and_the_key_is_written_again() {
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        for op in moves.plan(&[(40, Onto(301))]) {
+            moves.sent(op);
+        }
+        moves.heard(40, Some("301"));
+        assert_eq!(moves.written(40), Some(301));
+
+        moves.heard(40, None);
+        assert_eq!(moves.written(40), None, "not reported as routed any more");
+        assert!(!moves.moved_by_hand(40));
+        let ops = moves.plan(&[(40, Onto(301))]);
+        assert_eq!(
+            ops,
+            vec![MetadataOp::Write {
+                subject: 40,
+                serial: 301
+            }]
+        );
+        moves.sent(ops[0]);
+        moves.heard(40, Some("301"));
+        assert_eq!(moves.written(40), Some(301));
+        assert!(moves.plan(&[(40, Onto(301))]).is_empty());
+    }
+
+    #[test]
+    fn a_delete_someone_else_sent_before_a_write_of_fxsounds_does_not_take_that_write_back() {
+        // FxSound writes 302 while someone deletes the key; the server applies the delete first,
+        // and the write after it, and ends up holding what FxSound sent.
+        let mut moves = Moves::default();
+        moves.route_node(301, OUT);
+        moves.route_node(302, OUT);
+        for op in moves.plan(&[(40, Onto(301))]) {
+            moves.sent(op);
+        }
+        moves.heard(40, Some("301"));
+        moves.sent(MetadataOp::Write {
+            subject: 40,
+            serial: 302,
+        });
+        moves.heard(40, None);
+        assert_eq!(moves.written(40), Some(302));
+        assert!(
+            moves.plan(&[(40, Onto(302))]).is_empty(),
+            "not written twice"
+        );
+        moves.heard(40, Some("302"));
+        assert_eq!(moves.written(40), Some(302));
+        assert!(moves.unconfirmed.is_empty());
     }
 
     // ---- warnings ------------------------------------------------------------------------

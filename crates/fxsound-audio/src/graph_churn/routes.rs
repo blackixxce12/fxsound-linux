@@ -230,6 +230,38 @@ impl PrivateGraph {
         Some(targets)
     }
 
+    /// Write the stream `subject`'s `target.object` as WirePlumber writes back an application's
+    /// last target when it opens a stream (`node/state-stream.lua`), and `pipewire-pulse` a
+    /// mixer's move: the node's serial, as an id. `None` when `pw-metadata` is not there.
+    fn write_target(&self, subject: u64, serial: u64) -> Option<String> {
+        self.tool(
+            "pw-metadata",
+            &[
+                "-n",
+                "default",
+                &subject.to_string(),
+                app_routes::TARGET_OBJECT_KEY,
+                &serial.to_string(),
+                app_routes::TARGET_OBJECT_TYPE,
+            ],
+        )
+    }
+
+    /// Delete the stream `subject`'s `target.object`, as `pw-metadata -d` does. `None` when
+    /// `pw-metadata` is not there.
+    fn delete_target(&self, subject: u64) -> Option<String> {
+        self.tool(
+            "pw-metadata",
+            &[
+                "-n",
+                "default",
+                "-d",
+                &subject.to_string(),
+                app_routes::TARGET_OBJECT_KEY,
+            ],
+        )
+    }
+
     /// Wait until the `target.object` keys are exactly `want`. `None` when `pw-metadata` is not
     /// there to ask; `Some(Err(..))` with what it last held when they never came to be.
     fn targets_settle_on(
@@ -541,6 +573,10 @@ fn every_stream_is_moved_back_before_the_engine_exits() {
     assert!(graph.node_id("t_game").is_some() && graph.node_id("t_browser").is_some());
 }
 
+/// Streams FxSound never moves, each with a rule: none is moved, and no route is built for them.
+/// And a screen recorder of FxSound's sink the user points at a route's monitor — which
+/// `pipewire-pulse` writes as the route sink's serial — keeps that key, on every tick and on the
+/// way out: it records what the route plays, and is on no route of FxSound's.
 #[test]
 fn a_stream_that_may_not_move_is_left_alone_and_gets_no_route() {
     let Some(graph) = PrivateGraph::start("routepin") else {
@@ -568,41 +604,119 @@ fn a_stream_that_may_not_move_is_left_alone_and_gets_no_route() {
     ) else {
         return;
     };
+    // What `pipewire-pulse` makes of `PA_STREAM_DONT_MOVE`: WirePlumber would ignore a key.
+    let Some(_pulse) = start(
+        &graph,
+        "--playback",
+        "t_pulse",
+        "Pulse",
+        "node.dont-reconnect = true",
+    ) else {
+        return;
+    };
+    // WirePlumber would destroy it the moment the route its key named went.
+    let Some(_strict) = start(
+        &graph,
+        "--playback",
+        "t_strict",
+        "Strict",
+        "node.dont-fallback = true",
+    ) else {
+        return;
+    };
+    // A screen recorder of FxSound's sink's monitor: it records what FxSound plays, and no
+    // microphone.
+    let Some(_screen) = start(
+        &graph,
+        "--record",
+        "t_screen",
+        "Screen Recorder",
+        &format!(
+            "stream.capture.sink = true target.object = {}",
+            crate::SINK_NODE_NAME
+        ),
+    ) else {
+        return;
+    };
     // A marker whose route shows the rules have been acted on.
     let Some(_marker) = start(&graph, "--playback", "t_marker", "Marker", "") else {
         return;
     };
-    let Some(marker_id) = unless_skipped(graph.node_id("t_marker"), "pw-dump", "the marker's id")
-    else {
+    let (Some(marker_id), Some(screen_id), Some(strict_id)) = (
+        graph.node_id("t_marker"),
+        graph.node_id("t_screen"),
+        graph.node_id("t_strict"),
+    ) else {
+        skip("pw-dump could not say the applications' ids, so the pins were not checked");
         return;
     };
     handle.send(UiToAudio::SetAppRoutes(vec![
         output_rule(named("Kiosk"), "Gaming"),
         output_rule(named("Pinned"), "Gaming"),
+        output_rule(named("Pulse"), "Gaming"),
+        output_rule(named("Strict"), "Gaming"),
+        input_rule(named("Screen Recorder"), "Studio", "voice"),
         output_rule(named("Marker"), "Movies"),
     ]));
     assert!(
         reported_with(&mut said, &handle, marker_id, Some("Movies")).is_some(),
         "the marker should be moved onto its route"
     );
-    if let Some(nodes) = unless_skipped(graph.route_nodes(), "pw-dump", "the routes") {
-        let names: Vec<&str> = nodes.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["fxsound_route_o1", "fxsound_route_o1_play"],
-            "no route for Gaming: neither of its applications may be moved"
-        );
-    }
+    let Some(nodes) = unless_skipped(graph.route_nodes(), "pw-dump", "the routes") else {
+        handle.shutdown();
+        return;
+    };
+    let names: Vec<&str> = nodes.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["fxsound_route_o1", "fxsound_route_o1_play"],
+        "no route for Gaming nor Studio: none of their applications may be moved"
+    );
+    let movies = serial(&nodes, "fxsound_route_o1");
+    let marker = moved(marker_id, movies);
     if let Some(targets) = unless_skipped(graph.stream_targets(), "pw-metadata", "the keys") {
-        assert_eq!(
-            targets
-                .iter()
-                .map(|(subject, ..)| *subject)
-                .collect::<Vec<_>>(),
-            vec![marker_id]
-        );
+        assert_eq!(targets, vec![marker.clone()]);
     }
+
+    // The user points the screen recorder at `Monitor of FxSound (Output) · Movies`. Then
+    // WirePlumber restores the strict player onto o1 — a key FxSound deletes, which shows it has
+    // looked at the metadata since the recorder's key was written.
+    let screen = moved(screen_id, movies);
+    let Some(_) = unless_skipped(
+        graph.write_target(screen_id, movies),
+        "pw-metadata",
+        "the recorder's move",
+    ) else {
+        handle.shutdown();
+        return;
+    };
+    let Some(_) = unless_skipped(
+        graph.write_target(strict_id, movies),
+        "pw-metadata",
+        "WirePlumber's restore",
+    ) else {
+        handle.shutdown();
+        return;
+    };
+    let keys = [marker.clone(), screen.clone()];
+    if let Some(targets) = unless_skipped(
+        graph.targets_settle_on(&keys),
+        "pw-metadata",
+        "the restored key deleted and the recorder's kept",
+    ) {
+        targets.unwrap_or_else(|seen| panic!("{keys:?} should be left, not {seen:?}"));
+    }
+    said.settle(&handle);
+    if let Some(targets) = unless_skipped(graph.stream_targets(), "pw-metadata", "the keys") {
+        let mut want = keys.to_vec();
+        want.sort();
+        assert_eq!(targets, want, "several ticks later");
+    }
+    // FxSound's own key goes on the way out; the recorder's stays the user's.
     handle.shutdown();
+    if let Some(targets) = unless_skipped(graph.stream_targets(), "pw-metadata", "the keys") {
+        assert_eq!(targets, vec![screen]);
+    }
 }
 
 #[test]
@@ -1013,5 +1127,353 @@ fn new_parameters_for_a_preset_reach_its_route_without_a_new_pair() {
             "and the game stays on it"
         );
     }
+    handle.shutdown();
+}
+
+/// Game X ran through "Gaming" on o1 and quit; the number went to Discord's "Voice". X starts
+/// again, and WirePlumber writes back the target it remembers for it by name —
+/// `fxsound_route_o1`, which runs Voice now — the moment its stream appears. X gets a route of its
+/// own, and is moved onto it.
+#[test]
+fn a_player_restored_onto_a_route_another_preset_now_runs_is_moved_onto_its_own() {
+    let Some(graph) = PrivateGraph::start("routerestoreother") else {
+        return;
+    };
+    if !can_run_applications() {
+        return;
+    }
+    let (handle, mut said, _) = engine_on(&graph);
+    let Some(_discord) = start(&graph, "--playback", "t_discord", "Discord", "") else {
+        return;
+    };
+    let Some(discord_id) = unless_skipped(graph.node_id("t_discord"), "pw-dump", "Discord's id")
+    else {
+        return;
+    };
+    handle.send(UiToAudio::SetAppRoutes(vec![
+        output_rule(named("Discord"), "Voice"),
+        output_rule(named("Game X"), "Gaming"),
+    ]));
+    let Some(Ok(nodes)) = unless_skipped(
+        graph.routes_settle_on(&["fxsound_route_o1", "fxsound_route_o1_play"]),
+        "pw-dump",
+        "Discord's route",
+    ) else {
+        panic!("Discord's route should be built");
+    };
+    let voice = serial(&nodes, "fxsound_route_o1");
+    if let Some(targets) = unless_skipped(
+        graph.targets_settle_on(&[moved(discord_id, voice)]),
+        "pw-metadata",
+        "Discord's target",
+    ) {
+        targets.unwrap_or_else(|seen| panic!("Discord should be on o1, not {seen:?}"));
+    }
+
+    let Some(_game) = start(&graph, "--playback", "t_game", "Game X", "") else {
+        return;
+    };
+    let Some(game_id) = unless_skipped(graph.node_id("t_game"), "pw-dump", "the game's id") else {
+        return;
+    };
+    let Some(_) = unless_skipped(
+        graph.write_target(game_id, voice),
+        "pw-metadata",
+        "WirePlumber's restore",
+    ) else {
+        return;
+    };
+
+    let Some(Ok(nodes)) = unless_skipped(
+        graph.routes_settle_on(&[
+            "fxsound_route_o1",
+            "fxsound_route_o1_play",
+            "fxsound_route_o2",
+            "fxsound_route_o2_play",
+        ]),
+        "pw-dump",
+        "the game's own route",
+    ) else {
+        panic!("the game should get a route of its own, not stay on Discord's");
+    };
+    assert_eq!(
+        serial(&nodes, "fxsound_route_o1"),
+        voice,
+        "Discord's is left alone"
+    );
+    let keys = [
+        moved(discord_id, voice),
+        moved(game_id, serial(&nodes, "fxsound_route_o2")),
+    ];
+    if let Some(targets) = unless_skipped(
+        graph.targets_settle_on(&keys),
+        "pw-metadata",
+        "the game on its own route",
+    ) {
+        targets.unwrap_or_else(|seen| panic!("{keys:?} should be the keys, not {seen:?}"));
+    }
+    assert!(
+        reported_with(&mut said, &handle, game_id, Some("Gaming")).is_some(),
+        "and the game is reported on Gaming"
+    );
+    handle.shutdown();
+}
+
+/// A game opens a second stream while its first plays — a new level, the next video — and
+/// WirePlumber restores it onto `fxsound_route_o1`, its own route, the moment it appears. The key
+/// is FxSound's: the stream is reported on Gaming, and keeps the route in use once the first
+/// stream has gone, for as long as it plays.
+#[test]
+fn a_player_restored_onto_its_own_route_keeps_the_route_in_use() {
+    let Some(graph) = PrivateGraph::start("routerestoresame") else {
+        return;
+    };
+    if !can_run_applications() {
+        return;
+    }
+    let (handle, mut said, _) = engine_on(&graph);
+    let Some(first) = start(&graph, "--playback", "t_game", "Game", "") else {
+        return;
+    };
+    let Some((route, first_id)) = game_on_its_route(&graph, &handle) else {
+        return;
+    };
+    let Some(_second) = start(&graph, "--playback", "t_game2", "Game", "") else {
+        return;
+    };
+    let Some(second_id) = unless_skipped(graph.node_id("t_game2"), "pw-dump", "the second id")
+    else {
+        return;
+    };
+    let Some(_) = unless_skipped(
+        graph.write_target(second_id, route),
+        "pw-metadata",
+        "WirePlumber's restore",
+    ) else {
+        return;
+    };
+    let keys = [moved(first_id, route), moved(second_id, route)];
+    if let Some(targets) = unless_skipped(
+        graph.targets_settle_on(&keys),
+        "pw-metadata",
+        "both streams on the route",
+    ) {
+        targets.unwrap_or_else(|seen| panic!("{keys:?} should be the keys, not {seen:?}"));
+    }
+    assert!(
+        reported_with(&mut said, &handle, second_id, Some("Gaming")).is_some(),
+        "the restored stream is reported on its route"
+    );
+
+    drop(first);
+    let key = moved(second_id, route);
+    if let Some(targets) = unless_skipped(
+        graph.targets_settle_on(std::slice::from_ref(&key)),
+        "pw-metadata",
+        "the first stream's key going with it",
+    ) {
+        targets.unwrap_or_else(|seen| panic!("{key:?} should be left, not {seen:?}"));
+    }
+    std::thread::sleep(IDLE * 2);
+    if let Some(nodes) = unless_skipped(graph.route_nodes(), "pw-dump", "the route") {
+        assert_eq!(
+            nodes,
+            vec![
+                ("fxsound_route_o1".to_owned(), route),
+                (
+                    "fxsound_route_o1_play".to_owned(),
+                    serial(&nodes, "fxsound_route_o1_play")
+                ),
+            ],
+            "the route is in use, and kept, well past the idle period"
+        );
+    }
+    if let Some(targets) = unless_skipped(graph.stream_targets(), "pw-metadata", "the key") {
+        assert_eq!(targets, vec![key]);
+    }
+    handle.shutdown();
+}
+
+/// A tester no rule names asks for a route's node itself, in its own properties. FxSound leaves it
+/// there, and the route is in use while it plays: not idle once the game has gone, and not taken
+/// down when the game's rule goes — until the tester stops, when it goes at once.
+#[test]
+fn a_route_an_application_names_as_its_own_target_is_kept_while_it_plays_through_it() {
+    let Some(graph) = PrivateGraph::start("routeowntarget") else {
+        return;
+    };
+    if !can_run_applications() {
+        return;
+    }
+    let (handle, mut said, _) = engine_on(&graph);
+    let Some(game) = start(&graph, "--playback", "t_game", "Game", "") else {
+        return;
+    };
+    let Some((route, _)) = game_on_its_route(&graph, &handle) else {
+        return;
+    };
+    let Some(tester) = start(
+        &graph,
+        "--playback",
+        "t_tester",
+        "Tester",
+        "target.object = fxsound_route_o1",
+    ) else {
+        return;
+    };
+    let Some(tester_id) = unless_skipped(graph.node_id("t_tester"), "pw-dump", "the tester's id")
+    else {
+        return;
+    };
+    assert!(
+        reported_with(&mut said, &handle, tester_id, None).is_some(),
+        "the tester is listed, and moved nowhere"
+    );
+
+    drop(game);
+    if let Some(targets) = unless_skipped(
+        graph.targets_settle_on(&[]),
+        "pw-metadata",
+        "the game's key going with it",
+    ) {
+        targets.unwrap_or_else(|seen| panic!("no key should be left, not {seen:?}"));
+    }
+    std::thread::sleep(IDLE * 2);
+    let still = |why: &str| {
+        if let Some(nodes) = unless_skipped(graph.route_nodes(), "pw-dump", "the route") {
+            assert_eq!(nodes.len(), 2, "{why}: {nodes:?}");
+            assert_eq!(serial(&nodes, "fxsound_route_o1"), route, "{why}");
+        }
+    };
+    still("in use by the tester well past the idle period");
+
+    handle.send(UiToAudio::SetAppRoutes(Vec::new()));
+    said.settle(&handle);
+    still("kept for the tester with its rule gone");
+
+    drop(tester);
+    let stopped = Instant::now();
+    if let Some(settled) = unless_skipped(graph.routes_settle_on(&[]), "pw-dump", "the route going")
+    {
+        settled.unwrap_or_else(|seen| panic!("the route should go, not stay as {seen:?}"));
+        assert!(
+            stopped.elapsed() < IDLE,
+            "gone at once, not after the idle period: {:?}",
+            stopped.elapsed()
+        );
+    }
+    handle.shutdown();
+}
+
+/// A player WirePlumber will not move again once it is linked (`node.dont-reconnect`), restored
+/// onto a route by WirePlumber. FxSound deletes the key — it moves nothing, and left there it is
+/// what WirePlumber would restore the player onto next time — but the player stays linked where
+/// the key put it, and the route is kept in use for as long as it plays.
+#[test]
+fn a_stream_that_will_not_be_moved_again_keeps_the_route_it_was_restored_onto() {
+    let Some(graph) = PrivateGraph::start("routeanchor") else {
+        return;
+    };
+    if !can_run_applications() {
+        return;
+    }
+    let (handle, mut said, _) = engine_on(&graph);
+    let Some(game) = start(&graph, "--playback", "t_game", "Game", "") else {
+        return;
+    };
+    let Some((route, game_id)) = game_on_its_route(&graph, &handle) else {
+        return;
+    };
+    let Some(old) = start(
+        &graph,
+        "--playback",
+        "t_old",
+        "Old player",
+        "node.dont-reconnect = true",
+    ) else {
+        return;
+    };
+    let Some(old_id) = unless_skipped(graph.node_id("t_old"), "pw-dump", "the player's id") else {
+        return;
+    };
+    assert!(reported_with(&mut said, &handle, old_id, None).is_some());
+    let Some(_) = unless_skipped(
+        graph.write_target(old_id, route),
+        "pw-metadata",
+        "WirePlumber's restore",
+    ) else {
+        return;
+    };
+    let key = moved(game_id, route);
+    if let Some(targets) = unless_skipped(
+        graph.targets_settle_on(std::slice::from_ref(&key)),
+        "pw-metadata",
+        "the restored key deleted",
+    ) {
+        targets.unwrap_or_else(|seen| panic!("only {key:?} should be left, not {seen:?}"));
+    }
+
+    drop(game);
+    std::thread::sleep(IDLE * 2);
+    if let Some(nodes) = unless_skipped(graph.route_nodes(), "pw-dump", "the route") {
+        assert_eq!(nodes.len(), 2, "kept for the old player: {nodes:?}");
+        assert_eq!(serial(&nodes, "fxsound_route_o1"), route);
+    }
+    drop(old);
+    if let Some(settled) = unless_skipped(graph.routes_settle_on(&[]), "pw-dump", "the route going")
+    {
+        settled.unwrap_or_else(|seen| panic!("the route should go, not stay as {seen:?}"));
+    }
+    handle.shutdown();
+}
+
+/// Someone deletes the key FxSound wrote — `pw-metadata -d`, a tool that clears a stream's keys —
+/// and WirePlumber would move the game back to the default. FxSound neither goes on saying it is
+/// on its route nor leaves it off: the key is written again.
+#[test]
+fn a_key_someone_else_deletes_is_written_again() {
+    let Some(graph) = PrivateGraph::start("routeredo") else {
+        return;
+    };
+    if !can_run_applications() {
+        return;
+    }
+    let (handle, mut said, _) = engine_on(&graph);
+    let Some(_game) = start(&graph, "--playback", "t_game", "Game", "") else {
+        return;
+    };
+    let Some((route, game_id)) = game_on_its_route(&graph, &handle) else {
+        return;
+    };
+    let Some(_) = unless_skipped(graph.delete_target(game_id), "pw-metadata", "the delete") else {
+        return;
+    };
+    let key = moved(game_id, route);
+    if let Some(targets) = unless_skipped(
+        graph.targets_settle_on(std::slice::from_ref(&key)),
+        "pw-metadata",
+        "the key written again",
+    ) {
+        targets.unwrap_or_else(|seen| panic!("{key:?} should be written again, not {seen:?}"));
+    }
+    said.settle(&handle);
+    if let Some(targets) = unless_skipped(graph.stream_targets(), "pw-metadata", "the key") {
+        assert_eq!(targets, vec![key]);
+    }
+    let last = said
+        .0
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AudioToUi::AppStreams(streams) => Some(streams.clone()),
+            _ => None,
+        })
+        .expect("the applications were reported");
+    assert!(
+        last.iter()
+            .any(|stream| u64::from(stream.id) == game_id
+                && stream.route.as_deref() == Some("Gaming")),
+        "and the game is reported on its route: {last:?}"
+    );
     handle.shutdown();
 }
