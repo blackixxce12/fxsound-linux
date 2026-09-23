@@ -435,15 +435,31 @@ fn run_preset(app: &mut App, command: &PresetCommand) -> Outcome {
 ///
 /// A preset `lane`'s list does not have is refused, with a word on where it is when the other
 /// lane's list has it, as `--preset` says it. A name no remembered application answers to is not
-/// an error — FxSound keeps the preset for the program of that name, the game that has not been
-/// started yet — but it is said, on stderr, since a mistyped name is just as new to FxSound.
+/// an error — FxSound keeps the preset for the Flatpak id, program or name the text looks like
+/// ([`crate::app::unseen_key`]), the game that has not been started yet — but it is said, on
+/// stderr, since a mistyped name is just as new to FxSound. So is a choice a cold start holds
+/// until it has heard which applications play and record ([`App::hold_app_presets`]).
 fn run_app_preset(
     app: &mut App,
     lane: DeviceDirection,
     name: &str,
     preset: &AppPresetChoice,
 ) -> Outcome {
+    let runs = match lane {
+        DeviceDirection::Output => "plays",
+        DeviceDirection::Input => "records",
+    };
     match app.set_named_app_preset(name, lane, preset.name()) {
+        Ok(done) if done.held => Outcome {
+            stderr: format!(
+                "note: FxSound remembers no application called {name:?}; it chooses the preset \
+                 once it has heard which applications play and record, for one of them that \
+                 answers to the name or else for {} (--list-apps shows the applications FxSound \
+                 knows)",
+                crate::app::unseen_description(&crate::app::unseen_key(name))
+            ),
+            ..Outcome::default()
+        },
         Ok(done) if done.apps.is_empty() => Outcome {
             stderr: format!(
                 "note: FxSound has not seen an application called {name:?}, so it follows \
@@ -454,12 +470,10 @@ fn run_app_preset(
         Ok(done) if done.unseen => Outcome {
             stderr: format!(
                 "note: FxSound has not seen an application called {name:?}; the preset is kept for \
-                 the program {name:?} and runs once it {} (--list-apps shows the applications \
-                 FxSound knows)",
-                match lane {
-                    DeviceDirection::Output => "plays",
-                    DeviceDirection::Input => "records",
-                }
+                 {} and runs once it {runs} (--list-apps shows the applications FxSound knows)",
+                done.apps
+                    .first()
+                    .map_or_else(|| format!("{name:?}"), crate::app::unseen_description)
             ),
             ..Outcome::default()
         },
@@ -3465,6 +3479,9 @@ mod tests {
             Some(vec![
                 triple(OUT, "Battlefield 6", "Gaming"),
                 triple(OUT, "Brave", "Volume Boost"),
+                // Discord's rule follows the speakers, and it could outrank the two above for a
+                // stream that carried its id and their program or name.
+                triple(OUT, "Discord", ""),
                 triple(IN, "Discord", "Headset"),
             ]),
             "sent at once, the way the Settings pane's choice is"
@@ -3568,10 +3585,25 @@ mod tests {
         assert_eq!(chosen(&a, &sandboxed, OUT), "Gaming");
         assert_eq!(chosen(&a, &sandboxed, IN), "Clean", "carried over");
         assert_eq!(chosen(&a, &native, OUT), "", "the native one is untouched");
-        assert_eq!(
-            routes_sent(&engine),
-            Some(vec![triple(OUT, "Firefox", "Gaming")])
-        );
+        assert!(routes_sent(&engine).is_some(), "sent at once");
+        // The engine runs what the store says for each: the native rule follows the speakers
+        // beside the Flatpak's on Gaming, which matches the native stream by its program too.
+        let lane = |direction: DeviceDirection| -> Vec<&fxsound_core::messages::AppRoute> {
+            a.app_routes()
+                .iter()
+                .filter(|route| route.direction == direction)
+                .collect()
+        };
+        let engine_runs = |direction: DeviceDirection, app: &AppKey| {
+            let lane = lane(direction);
+            app.best_match(lane.iter().map(|route| &route.app))
+                .map(|at| lane[at].preset.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(engine_runs(OUT, &sandboxed), "Gaming");
+        assert_eq!(engine_runs(OUT, &native), "");
+        assert_eq!(engine_runs(IN, &sandboxed), "Clean");
+        assert_eq!(engine_runs(IN, &native), "Clean");
     }
 
     #[test]
@@ -3583,21 +3615,24 @@ mod tests {
             outcome
                 .stderr
                 .starts_with("note: FxSound has not seen an application called \"bf6.exe\"")
-                && outcome.stderr.contains("once it plays"),
+                && outcome
+                    .stderr
+                    .contains("kept for the program \"bf6.exe\" and runs once it plays"),
             "{}",
             outcome.stderr
         );
         assert_eq!(a.app_rules().apps.len(), 1);
         assert_eq!(a.app_rules().apps[0].key, key("bf6.exe", "", ""));
         assert_eq!(a.app_rules().apps[0].output_preset, "Gaming");
-        assert_eq!(routes_sent(&engine), None, "nothing plays yet");
+        assert_eq!(
+            routes_sent(&engine),
+            Some(vec![triple(OUT, "bf6.exe", "Gaming")]),
+            "the engine has the rule before the game plays"
+        );
 
         // The game starts: the rule was waiting for it.
         play(&mut a, &engine, vec![stream(1, OUT, &battlefield())]);
-        assert_eq!(
-            routes_sent(&engine),
-            Some(vec![triple(OUT, "Battlefield 6", "Gaming")])
-        );
+        assert_eq!(routes_sent(&engine), None, "nothing new to say");
         assert_eq!(
             a.app_rules().apps.len(),
             1,
@@ -3610,6 +3645,72 @@ mod tests {
             "{}",
             outcome.stderr
         );
+    }
+
+    #[test]
+    fn a_flatpak_id_or_a_name_not_seen_yet_is_kept_as_what_it_is_and_the_note_says_so() {
+        let (mut a, engine, _dir) = with_apps();
+        // The manual's own example, on a first run.
+        let outcome = run_line(
+            &mut a,
+            &["--app-input-preset=com.discordapp.Discord=Headset"],
+        );
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert!(
+            outcome.stderr.contains(
+                "kept for the Flatpak \"com.discordapp.Discord\" and runs once it records"
+            ),
+            "{}",
+            outcome.stderr
+        );
+        let outcome = run_line(&mut a, &["--app-preset=Battlefield 6=Gaming"]);
+        assert!(
+            outcome
+                .stderr
+                .contains("kept for the application called \"Battlefield 6\""),
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(
+            chosen(&a, &key("", "", "com.discordapp.Discord"), IN),
+            "Headset"
+        );
+        assert_eq!(chosen(&a, &key("", "Battlefield 6", ""), OUT), "Gaming");
+
+        // Both start: each is its rule's application, and no second rule is added for either.
+        play(
+            &mut a,
+            &engine,
+            vec![stream(1, IN, &discord()), stream(2, OUT, &battlefield())],
+        );
+        assert_eq!(a.app_rules().apps.len(), 2, "{:?}", a.app_rules());
+        assert_eq!(chosen(&a, &discord(), IN), "Headset");
+        assert_eq!(chosen(&a, &battlefield(), OUT), "Gaming");
+    }
+
+    #[test]
+    fn a_cold_start_holds_a_name_it_does_not_know_and_says_so() {
+        let (mut a, engine, _dir) = with_apps();
+        a.hold_app_presets();
+        let outcome = run_line(&mut a, &["--app-preset=Firefox=Music"]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert!(
+            outcome
+                .stderr
+                .starts_with("note: FxSound remembers no application called \"Firefox\"")
+                && outcome
+                    .stderr
+                    .contains("or else for the program \"Firefox\""),
+            "{}",
+            outcome.stderr
+        );
+        assert!(a.app_rules().apps.is_empty());
+
+        // Firefox plays under a program of another name: the name reaches it.
+        let firefox = key("firefox-bin", "Firefox", "");
+        play(&mut a, &engine, vec![stream(1, OUT, &firefox)]);
+        assert_eq!(chosen(&a, &firefox, OUT), "Music");
+        assert_eq!(a.app_rules().apps.len(), 1);
     }
 
     #[test]

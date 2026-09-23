@@ -9,8 +9,16 @@
 //! - the **streams** the engine reports, whole, whenever they change
 //!   ([`AudioToUi::AppStreams`](fxsound_core::AudioToUi::AppStreams)):
 //!   which applications play and record now, and which of them it has moved onto a route;
-//! - the **routes** that follow from the two ([`UiToAudio::SetAppRoutes`]): one for every running
-//!   application whose rule names a preset of its own that its lane's preset store has.
+//! - the **routes** that follow from the store ([`UiToAudio::SetAppRoutes`]): one for every rule
+//!   that names a preset of its own its lane's preset store has, whether its application runs or
+//!   not, under the rule's own key; and beside them, as entries with no preset, the rules that
+//!   follow the lane where one could outrank those ([`AppKey::may_outrank`]). The engine picks each
+//!   stream's rule among them the way the store picks among all of its own
+//!   ([`AppKey::best_match`]), so a Flatpak Firefox whose own rule follows the lane stays there
+//!   although the native Firefox's rule, which names a preset, matches it by its program. The set
+//!   is the engine's whatever plays: a route outlives its streams by the engine's idle time, so a
+//!   player that closes its stream between two tracks comes back to the same pair, and a new stream
+//!   finds its rule without waiting for the app to hear of it.
 //!
 //! The app resolves a rule to parameters because it owns the preset stores; the engine only runs
 //! them. A route is built the way its lane's own snapshot is — the same reading of the preset into
@@ -28,13 +36,13 @@
 //! A route runs its preset as last **saved** ([`fxsound_preset::Store::load_saved`]): unsaved
 //! edits in the window are the lane's, not what the name another application asked for says.
 //!
-//! The whole set goes to the engine whenever it changes, and only then: a rule changed, the
-//! streams changed, a preset a rule names was saved, renamed or deleted, or something every chain
-//! shares moved. A preset renamed in the window carries every rule to its new name; one deleted
-//! there returns every rule that named it to following the lane, and the window says so once. A
-//! rule naming a preset the store does not have — a hand edit, a file removed behind FxSound's
-//! back — follows the lane without being rewritten, so the preset coming back brings the route
-//! back; the window says so once a session.
+//! The whole set goes to the engine whenever it changes, and only then: a rule changed, a preset a
+//! rule names was saved, renamed or deleted, or something every chain shares moved — never because
+//! a stream came or went. A preset renamed in the window carries every rule to its new name; one
+//! deleted there returns every rule that named it to following the lane, and the window says so
+//! once. A rule naming a preset the store does not have — a hand edit, a file removed behind
+//! FxSound's back — follows the lane without being rewritten, so the preset coming back brings the
+//! route back; the window says so once a session, when the application plays or records.
 //!
 //! `app_routed` on the event stream is the engine's word, not the rules': it says where the engine
 //! has actually moved an application ([`AppStream::route`]), so a route that could not be made —
@@ -67,6 +75,17 @@ use fxsound_core::i18n::tr_args;
 /// are written at once, and whatever is still unwritten at exit is written then.
 pub(super) const SEEN_SAVE_DELAY: Duration = Duration::from_secs(5 * 60);
 
+/// How long after a write of the store failed it is tried again: a full disk, a quota, a
+/// configuration directory remounted read-only for a moment. Until a write succeeds the store stays
+/// due, so the timer keeps trying and the way out tries once more.
+pub(super) const SAVE_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// How long a cold start waits to hear which applications play and record before it keeps a
+/// preset named for an application FxSound does not remember ([`App::hold_app_presets`]). The
+/// engine reports every stream within a supervisor tick of meeting it, but reports nothing at all
+/// while nothing plays, so the wait cannot be for the report alone.
+pub(super) const STREAMS_PATIENCE: Duration = Duration::from_secs(3);
+
 /// The controller's per-application state.
 #[derive(Debug, Default)]
 pub(super) struct AppPresets {
@@ -76,25 +95,39 @@ pub(super) struct AppPresets {
     /// touch the user's files, as `App::persist` keeps the settings.
     path: Option<PathBuf>,
     /// When the store is due to be written: at once for a change the user made or a new
-    /// application, [`SEEN_SAVE_DELAY`] after one seen again. `None` while nothing is unwritten.
+    /// application, [`SEEN_SAVE_DELAY`] after one seen again, [`SAVE_RETRY_DELAY`] after a write
+    /// that failed. `None` while nothing is unwritten.
     save_due: Option<Instant>,
+    /// Whether the last write failed, so that the next failure is not logged as loudly and a
+    /// success is.
+    save_failing: bool,
     /// Every application stream the engine last reported, both lanes, in its order.
     streams: Vec<AppStream>,
-    /// The running applications that have a preset of their own, with that preset as loaded:
-    /// rebuilt when the streams, the rules or the preset stores change, and made into routes
-    /// with the levels of the moment whenever those move ([`App::refresh_app_routes`]).
+    /// What the engine is to know of the rules, lane by lane, each lane in the store's order: every
+    /// rule that names a preset its lane's store has and that loads, with that preset as loaded,
+    /// and every rule that follows the lane where it could outrank one of those. Rebuilt when the
+    /// rules or the preset stores change, and made into routes with the levels of the moment
+    /// whenever those move ([`App::refresh_app_routes`]).
     resolved: Vec<Resolved>,
-    /// The routes the engine was last given, in [`route_order`].
+    /// The presets, per lane, a rule named that are there but did not load.
+    unloadable: Vec<(DeviceDirection, String)>,
+    /// The routes the engine was last given.
     sent: Vec<AppRoute>,
     /// The presets, per lane, a rule named that could not be run — not there, or not readable —
     /// that the window has already said so about this session.
     said: HashSet<(DeviceDirection, String)>,
+    /// While a cold start waits to hear which applications play and record: until when
+    /// ([`STREAMS_PATIENCE`]).
+    holding: Option<Instant>,
+    /// The presets named in the meantime for applications FxSound does not remember, in the order
+    /// they were named: `(text, lane, preset)`.
+    held: Vec<(String, DeviceDirection, String)>,
     /// Per lane and application, the route the engine last reported its streams on, in the order
     /// the engine listed them: what `app_routed` has said.
     routed: Vec<(DeviceDirection, AppKey, String)>,
     /// Every application and lane the engine has reported a stream for since start-up: which
     /// combos the Applications pane gives a row. The store does not say which lanes an
-    /// application uses, so one not seen this session, with no preset of its own, gets both.
+    /// application uses, so one not heard this session gets both.
     used: HashSet<(AppKey, DeviceDirection)>,
 }
 
@@ -115,13 +148,14 @@ impl AppPresets {
     }
 }
 
-/// A running application with a preset of its own, and that preset as its lane's store has it.
+/// One rule as the engine is to know it: its lane, its key, and the preset it runs there as its
+/// lane's store has it — or `None`, with an empty name, for a rule that follows the lane.
 #[derive(Debug, Clone)]
 struct Resolved {
     direction: DeviceDirection,
     app: AppKey,
     preset: String,
-    source: Source,
+    source: Option<Source>,
 }
 
 /// A preset as its file says, before the levels of the moment are applied.
@@ -171,14 +205,75 @@ pub(super) fn followed_notice(preset: &str) -> String {
 /// What [`App::set_named_app_preset`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamedAppRule {
-    /// The applications the name reached ([`apps_named`]); the program of that name when it
-    /// reached none. Empty when it reached none and there was nothing to choose.
+    /// The applications the name reached ([`apps_named`]); the one [`unseen_key`] makes of it when
+    /// it reached none. Empty when it reached none and there was nothing to choose, or the choice
+    /// is held.
     pub apps: Vec<AppKey>,
-    /// Whether the name reached no application FxSound has seen, so that the preset was kept for
-    /// the program of that name.
+    /// Whether the name reached no application FxSound has seen, so that the preset was kept
+    /// under [`unseen_key`], or is held until FxSound has heard which applications run.
     pub unseen: bool,
+    /// Whether the choice is held until FxSound has heard which applications play and record
+    /// ([`App::hold_app_presets`]): the name reached no application FxSound remembers, and one
+    /// that runs now may still answer to it.
+    pub held: bool,
     /// Whether the store changed.
     pub changed: bool,
+}
+
+/// The key a preset named for `text` is kept under when no application FxSound has seen answers
+/// to it: `text` in the identifier it looks like. Each identifier of a rule is compared with the
+/// same one of a stream only ([`AppKey::matches`]), so a Flatpak id kept as a program would never
+/// reach the Flatpak.
+///
+/// - A path or a Windows program (`/usr/bin/mpv`, `bf6.exe`) is a program.
+/// - A Flatpak id (`com.discordapp.Discord`: three or more parts between dots, each of letters,
+///   digits, `_` and `-`, and starting with a letter or `_`) is a Flatpak id.
+/// - Text with a space in it (`Battlefield 6`) is the name the application gives itself.
+/// - One word (`firefox`, `Discord`) is a program, which is compared without regard to case, as
+///   a name is not.
+#[must_use]
+pub fn unseen_key(text: &str) -> AppKey {
+    let text = text.trim();
+    let program = text.contains(['/', '\\'])
+        || text
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("exe"));
+    let parts: Vec<&str> = text.split('.').collect();
+    let flatpak = parts.len() >= 3
+        && parts.iter().all(|part| {
+            part.chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        });
+    let mut key = AppKey::default();
+    let field = if program {
+        &mut key.binary
+    } else if flatpak {
+        &mut key.flatpak
+    } else if text.contains(char::is_whitespace) {
+        &mut key.name
+    } else {
+        &mut key.binary
+    };
+    text.clone_into(field);
+    key
+}
+
+/// What a key [`unseen_key`] made names, in words for the command line's note and the log: `the
+/// program "bf6.exe"`, `the Flatpak "com.discordapp.Discord"`, `the application called
+/// "Battlefield 6"`.
+#[must_use]
+pub fn unseen_description(key: &AppKey) -> String {
+    if !key.flatpak.trim().is_empty() {
+        format!("the Flatpak {:?}", key.flatpak.trim())
+    } else if !key.binary.trim().is_empty() {
+        format!("the program {:?}", key.binary.trim())
+    } else {
+        format!("the application called {:?}", key.name.trim())
+    }
 }
 
 /// One remembered application as the lists show it: its rule, and what its streams are doing.
@@ -311,21 +406,6 @@ fn same_ignoring_case(a: &str, b: &str) -> bool {
         .eq(b.chars().flat_map(char::to_lowercase))
 }
 
-/// The order the routes are sent in, so that the same set is the same message whatever order the
-/// engine listed the streams in: outputs first, then by preset, then by application.
-fn route_order(a: &AppRoute, b: &AppRoute) -> std::cmp::Ordering {
-    let key = |route: &AppRoute| {
-        (
-            lane_index(route.direction),
-            route.preset.clone(),
-            route.app.name.clone(),
-            route.app.binary.clone(),
-            route.app.flatpak.clone(),
-        )
-    };
-    key(a).cmp(&key(b))
-}
-
 // =============================================================================================
 // What the window, the command line and D-Bus read and change
 // =============================================================================================
@@ -396,9 +476,12 @@ impl App {
     ///
     /// A row is a rule of the store, and a running one is a rule some stream answers to
     /// ([`AppRules::rule`]), so a general rule — one for every program called `Discord` — is one
-    /// row however many programs it covers, as it is one choice. Each row has a combo for every
-    /// lane its application has a preset of its own on, or has played or recorded on this
-    /// session; one with neither, remembered from an earlier session, has both.
+    /// row however many programs it covers, as it is one choice. A row whose application has
+    /// played or recorded this session has a combo for every lane it was heard on and every lane
+    /// it has a preset of its own on. One not heard this session — remembered from an earlier one,
+    /// or named from the command line — has both: the store does not say which lanes it uses, and
+    /// a preset chosen for one lane says nothing about the other, so choosing one neither takes
+    /// the other combo away nor moves the rows below under the pointer.
     #[must_use]
     pub fn app_rows(&self) -> Vec<AppRow> {
         let rules = &self.apps.rules;
@@ -418,13 +501,11 @@ impl App {
                     listed.running[lane_index(direction)]
                         || used[listed.index][lane_index(direction)]
                 };
-                let mut lanes: Vec<DeviceDirection> = DeviceDirection::ALL
+                let known = DeviceDirection::ALL.into_iter().any(heard);
+                let lanes: Vec<DeviceDirection> = DeviceDirection::ALL
                     .into_iter()
-                    .filter(|&direction| rule.has_preset(direction) || heard(direction))
+                    .filter(|&direction| !known || heard(direction) || rule.has_preset(direction))
                     .collect();
-                if lanes.is_empty() {
-                    lanes = DeviceDirection::ALL.to_vec();
-                }
                 AppRow {
                     app: rule.key.clone(),
                     name: rule.key.display().to_owned(),
@@ -459,8 +540,10 @@ impl App {
     /// Each application [`App::apps_named`] finds for `text` gets it as the Settings pane gives it
     /// ([`AppRules::upsert`]): a rule's own key changes that rule, and a running application's
     /// key found only among the streams gets a rule of its own beside the one that covered it.
-    /// When `text` names nothing, a rule is added for the program called `text` — the `binary` of
-    /// its key — except to follow the lane, which an application with no rule does already. The
+    /// When `text` names nothing, a rule is added for `text` as the identifier it looks like
+    /// ([`unseen_key`]) — except to follow the lane, which an application with no rule does
+    /// already. While a cold start waits to hear which applications play and record
+    /// ([`App::hold_app_presets`]), such a choice is held instead, and made once it has. The
     /// store is written at once when it changed.
     ///
     /// # Errors
@@ -488,22 +571,26 @@ impl App {
         let mut apps = self.apps_named(text);
         let unseen = apps.is_empty();
         if unseen {
-            if preset.is_empty() {
+            let kept = unseen_key(text);
+            // `/` names no program: its last component is empty, and no stream could match it.
+            if kept.is_empty() {
+                return Err(AppRuleRefusal::NoApplication);
+            }
+            let held = !preset.is_empty() && self.apps.holding.is_some();
+            if held {
+                self.apps
+                    .held
+                    .push((text.to_owned(), direction, preset.to_owned()));
+            }
+            if preset.is_empty() || held {
                 return Ok(NamedAppRule {
                     apps,
                     unseen,
+                    held,
                     changed: false,
                 });
             }
-            let program = AppKey {
-                binary: text.to_owned(),
-                ..AppKey::default()
-            };
-            // `/` names no program: its last component is empty, and no stream could match it.
-            if program.is_empty() {
-                return Err(AppRuleRefusal::NoApplication);
-            }
-            apps.push(program);
+            apps.push(kept);
         }
         // A rule's key is that rule's own best match, so its upsert changes it in place; the
         // others each add the one rule of their own.
@@ -519,8 +606,55 @@ impl App {
         Ok(NamedAppRule {
             apps,
             unseen,
+            held: false,
             changed,
         })
+    }
+
+    /// Hold every preset [`App::set_named_app_preset`] is given for an application FxSound does
+    /// not remember until the engine has said which applications play and record: what a cold
+    /// start does before it runs the command line's `--app-preset` and `--app-input-preset`,
+    /// since those run before any stream is known. An application that plays now under a name the
+    /// store does not know — a Firefox started before FxSound, whose program is `firefox-bin`,
+    /// named `Firefox` — is then reached through its streams, as a running FxSound reaches it,
+    /// rather than given a rule that guesses at its identifiers ([`unseen_key`]).
+    ///
+    /// The wait ends with the engine's first report of the streams, or [`STREAMS_PATIENCE`] after
+    /// this call, since nothing is reported while nothing plays, or on the way out; what was held
+    /// is chosen then, and the log says what became of it. Nothing is held without an engine,
+    /// which reports nothing.
+    pub fn hold_app_presets(&mut self) {
+        if self.engine.is_some() {
+            self.apps.holding = Some(Instant::now() + STREAMS_PATIENCE);
+        }
+    }
+
+    /// The wait [`App::hold_app_presets`] began is over: choose what was held, in the order it was
+    /// named.
+    fn release_held_app_presets(&mut self) {
+        if self.apps.holding.take().is_none() {
+            return;
+        }
+        for (text, direction, preset) in std::mem::take(&mut self.apps.held) {
+            match self.set_named_app_preset(&text, direction, Some(&preset)) {
+                Ok(done) if done.unseen => log::info!(
+                    "no application FxSound knows or hears is called {text:?}: {preset} is kept \
+                     for {}",
+                    done.apps
+                        .first()
+                        .map_or_else(|| format!("{text:?}"), unseen_description)
+                ),
+                Ok(done) => log::info!(
+                    "{preset} chosen for {}",
+                    done.apps
+                        .iter()
+                        .map(|app| app.display().to_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Err(refusal) => log::warn!("{text}={preset} is not chosen: {refusal}"),
+            }
+        }
     }
 
     /// Choose the preset the application `app` names runs through in `direction` — `None` or a
@@ -594,9 +728,12 @@ impl App {
     /// The engine's list of every application stream, in full ([`AudioToUi::AppStreams`]).
     ///
     /// Every application in it that the store does not know is remembered, following both lanes;
-    /// one it knows is marked seen now, and written a while later ([`SEEN_SAVE_DELAY`]). The
-    /// routes are worked out again for the applications running now, and sent if they changed;
-    /// what the engine says it moved is said on the event stream.
+    /// one it knows is marked seen now, and written a while later ([`SEEN_SAVE_DELAY`]). What the
+    /// engine says it moved is said on the event stream, and a rule of a running application that
+    /// names a preset that cannot run is said once a session. The routes are worked out again only
+    /// when the rules changed — a new application's rule may outrank one that names a preset — and
+    /// never because a stream came or went: the engine has every rule already. The first report
+    /// ends a cold start's wait for the streams ([`App::hold_app_presets`]).
     ///
     /// [`AudioToUi::AppStreams`]: fxsound_core::AudioToUi::AppStreams
     pub(super) fn adopt_app_streams(&mut self, streams: Vec<AppStream>) {
@@ -618,22 +755,26 @@ impl App {
         }
         self.apps.streams = streams;
         self.note_app_routes();
-        self.app_presets_changed();
         if new_application {
             self.save_app_rules();
+            self.resolve_app_routes();
+            self.refresh_app_routes();
         } else if seen_again {
             self.apps
                 .save_due
                 .get_or_insert_with(|| Instant::now() + SEEN_SAVE_DELAY);
         }
+        self.release_held_app_presets();
+        self.say_app_route_trouble();
     }
 
     /// A preset store changed — a preset saved, imported, reset or written by the calibration —
-    /// or the rules did: every running application's preset is read again and the routes that
-    /// follow sent if they changed.
+    /// or the rules did: every rule's preset is read again and the routes that follow sent if they
+    /// changed.
     pub(super) fn app_presets_changed(&mut self) {
         self.resolve_app_routes();
         self.refresh_app_routes();
+        self.say_app_route_trouble();
     }
 
     /// `lane`'s preset `old` is called `new` now: every rule that named it follows it there.
@@ -660,54 +801,95 @@ impl App {
     }
 
     /// Make the routes from what is resolved and the levels of the moment, and send them when
-    /// they differ from what the engine was last given. Cheap when nothing is routed, since it runs
-    /// after every snapshot the window publishes ([`App::sync_params_from_state`]).
+    /// they differ from what the engine was last given. Cheap when nothing changed, since it runs
+    /// after every snapshot the window publishes ([`App::sync_params_from_state`]): what was sent
+    /// is compared entry by entry, and a new set is built only when one differs.
+    ///
+    /// They go in the order they were resolved in — lane by lane, each lane in the store's order —
+    /// since that order breaks a tie between two rules that match a stream as strongly, for the
+    /// engine as for the store. A rule that follows the lane carries an empty preset and a snapshot
+    /// of its lane's kind that nothing runs.
     pub(super) fn refresh_app_routes(&mut self) {
-        let mut routes: Vec<AppRoute> = self
+        let unchanged = self.apps.resolved.len() == self.apps.sent.len()
+            && self
+                .apps
+                .resolved
+                .iter()
+                .zip(&self.apps.sent)
+                .all(|(resolved, sent)| {
+                    let (params, chain) = self.route_payload(resolved);
+                    sent.direction == resolved.direction
+                        && sent.app == resolved.app
+                        && sent.preset == resolved.preset
+                        && sent.params == params
+                        && sent.chain == chain
+                });
+        if unchanged {
+            return;
+        }
+        let routes: Vec<AppRoute> = self
             .apps
             .resolved
             .iter()
             .map(|resolved| {
-                let (params, chain) = match &resolved.source {
-                    Source::Music(preset) => (
-                        RouteParams::Output(self.music_route_params(preset)),
-                        String::new(),
-                    ),
-                    Source::Voice(preset) => (
-                        RouteParams::Input(self.voice_route_params(preset)),
-                        preset.chain.clone(),
-                    ),
-                };
+                let (params, chain) = self.route_payload(resolved);
                 AppRoute {
                     direction: resolved.direction,
                     app: resolved.app.clone(),
                     preset: resolved.preset.clone(),
                     params,
-                    chain,
+                    chain: chain.to_owned(),
                 }
             })
             .collect();
-        routes.sort_by(route_order);
-        if routes != self.apps.sent {
-            self.apps.sent.clone_from(&routes);
-            self.send(UiToAudio::SetAppRoutes(routes));
+        self.apps.sent.clone_from(&routes);
+        self.send(UiToAudio::SetAppRoutes(routes));
+    }
+
+    /// The parameters and the voice chain of one resolved rule, with the levels of the moment.
+    fn route_payload<'a>(&self, resolved: &'a Resolved) -> (RouteParams, &'a str) {
+        match &resolved.source {
+            Some(Source::Music(preset)) => {
+                (RouteParams::Output(self.music_route_params(preset)), "")
+            }
+            Some(Source::Voice(preset)) => (
+                RouteParams::Input(self.voice_route_params(preset)),
+                preset.chain.as_str(),
+            ),
+            None => (
+                match resolved.direction {
+                    DeviceDirection::Output => RouteParams::Output(DspParams::default()),
+                    DeviceDirection::Input => RouteParams::Input(InputDspParams::default()),
+                },
+                "",
+            ),
         }
     }
 
-    /// When the store is next due to be written.
-    pub(super) const fn app_rules_save_due(&self) -> Option<Instant> {
-        self.apps.save_due
+    /// When the store next has something to do: be written, or stop waiting for the streams
+    /// ([`App::hold_app_presets`]).
+    pub(super) fn app_rules_due(&self) -> Option<Instant> {
+        self.apps
+            .save_due
+            .into_iter()
+            .chain(self.apps.holding)
+            .min()
     }
 
-    /// Write the store if it is due by `now`.
-    pub(super) fn save_app_rules_if_due(&mut self, now: Instant) {
+    /// Do what is due by `now`: stop waiting for the streams, and write the store.
+    pub(super) fn app_rules_tick(&mut self, now: Instant) {
+        if self.apps.holding.is_some_and(|until| until <= now) {
+            self.release_held_app_presets();
+        }
         if self.apps.save_due.is_some_and(|due| due <= now) {
             self.save_app_rules();
         }
     }
 
-    /// On the way out: what is running now was seen now, and whatever is unwritten is written.
+    /// On the way out: what was held is chosen, what is running now was seen now, and whatever is
+    /// unwritten is written — a write that failed earlier included.
     pub(super) fn save_app_rules_on_exit(&mut self) {
+        self.release_held_app_presets();
         let now = unix_now();
         let mut unwritten = self.apps.save_due.is_some();
         for stream in &self.apps.streams {
@@ -718,75 +900,127 @@ impl App {
         }
     }
 
-    /// Write the store now. A failure is logged: the choices are still in force for this run, and
-    /// the next change tries again.
+    /// Write the store now. The choices are in force for this run whether or not it is written; a
+    /// write that fails leaves the store due [`SAVE_RETRY_DELAY`] later, so the timer tries again
+    /// and the way out does too, and a choice made while the disk was full is not lost to a
+    /// restart that nothing else wrote before. The first failure is a warning, the ones after it
+    /// are not, and the write that succeeds again says so.
     fn save_app_rules(&mut self) {
         self.apps.save_due = None;
-        if let Some(path) = &self.apps.path
-            && let Err(err) = self.apps.rules.save_to(path)
-        {
-            log::warn!("could not save {}: {err}", path.display());
+        let Some(path) = &self.apps.path else {
+            return;
+        };
+        match self.apps.rules.save_to(path) {
+            Ok(()) => {
+                if std::mem::take(&mut self.apps.save_failing) {
+                    log::info!("saved {} after all", path.display());
+                }
+            }
+            Err(err) => {
+                if std::mem::replace(&mut self.apps.save_failing, true) {
+                    log::debug!("still could not save {}: {err}", path.display());
+                } else {
+                    log::warn!(
+                        "could not save {}: {err}; trying again every {} s",
+                        path.display(),
+                        SAVE_RETRY_DELAY.as_secs()
+                    );
+                }
+                self.apps.save_due = Some(Instant::now() + SAVE_RETRY_DELAY);
+            }
         }
     }
 
-    /// Work out which running applications have a preset of their own, and read each such preset
-    /// once. A rule naming a preset that is not there, or that does not load, leaves its
-    /// application on the lane, and the window says so once a session per preset.
+    /// Work out what the engine is to know of the rules ([`AppPresets::resolved`]), reading each
+    /// preset a rule names once.
+    ///
+    /// Every rule that names a preset its lane's store has and that loads goes, whether its
+    /// application runs or not. A rule that follows the lane — by choice, or because the preset it
+    /// names is not there or does not load — goes too, with no preset, where it could outrank one
+    /// of those ([`AppKey::may_outrank`]): left out, a stream it answers for would be matched by
+    /// the more general rule instead. The rest are left out, so the set stays as small as the
+    /// presets chosen, however many applications the store remembers.
     fn resolve_app_routes(&mut self) {
-        // Once per application and lane, however many streams it has open.
-        let mut wanted: Vec<(DeviceDirection, &AppKey, AppPreset<'_>)> = Vec::new();
-        for stream in &self.apps.streams {
-            let lane = stream.direction;
-            if wanted
-                .iter()
-                .any(|(direction, app, _)| *direction == lane && **app == stream.app)
-            {
-                continue;
-            }
-            let preset = self
-                .apps
-                .rules
-                .resolve(&stream.app, lane, |name| self.lane_has_preset(lane, name));
-            wanted.push((lane, &stream.app, preset));
-        }
-
-        let mut loaded: Vec<(DeviceDirection, &str, Result<Source, String>)> = Vec::new();
+        let mut loaded: Vec<(DeviceDirection, &str, Option<Source>)> = Vec::new();
+        let mut unloadable: Vec<(DeviceDirection, String)> = Vec::new();
         let mut resolved = Vec::new();
-        let mut trouble: Vec<(DeviceDirection, String, String)> = Vec::new();
-        for (lane, app, preset) in wanted {
-            let name = match preset {
-                AppPreset::Follow => continue,
-                AppPreset::Missing(name) => {
-                    trouble.push((lane, name.to_owned(), followed_notice(name)));
-                    continue;
-                }
-                AppPreset::Preset(name) => name,
-            };
-            let source = match loaded
-                .iter()
-                .find(|(direction, preset, _)| *direction == lane && *preset == name)
-            {
-                Some((.., source)) => source.clone(),
-                None => {
-                    let source = self.load_route_preset(lane, name);
+        for lane in DeviceDirection::ALL {
+            // Per rule, in the store's order: the preset it runs on this lane, `None` to follow.
+            let mut runs: Vec<(&AppRule, Option<(&str, Source)>)> = Vec::new();
+            for rule in &self.apps.rules.apps {
+                let name = rule.preset(lane);
+                let source = if !rule.has_preset(lane) || !self.lane_has_preset(lane, name) {
+                    None
+                } else if let Some((.., source)) = loaded
+                    .iter()
+                    .find(|(direction, preset, _)| *direction == lane && *preset == name)
+                {
+                    source.clone()
+                } else {
+                    let source = match self.load_route_preset(lane, name) {
+                        Ok(source) => Some(source),
+                        Err(err) => {
+                            log::warn!("{name} could not be loaded for an application: {err}");
+                            unloadable.push((lane, name.to_owned()));
+                            None
+                        }
+                    };
                     loaded.push((lane, name, source.clone()));
                     source
+                };
+                runs.push((rule, source.map(|source| (name, source))));
+            }
+            let needed: Vec<bool> = runs
+                .iter()
+                .map(|(rule, preset)| {
+                    preset.is_some()
+                        || runs.iter().any(|(other, preset)| {
+                            preset.is_some() && rule.key.may_outrank(&other.key)
+                        })
+                })
+                .collect();
+            for ((rule, preset), needed) in runs.into_iter().zip(needed) {
+                if !needed {
+                    continue;
                 }
-            };
-            match source {
-                Ok(source) => resolved.push(Resolved {
+                let (preset, source) = match preset {
+                    Some((name, source)) => (name.to_owned(), Some(source)),
+                    None => (String::new(), None),
+                };
+                resolved.push(Resolved {
                     direction: lane,
-                    app: app.clone(),
-                    preset: name.to_owned(),
+                    app: rule.key.clone(),
+                    preset,
                     source,
-                }),
-                Err(err) => {
-                    log::warn!("{name} could not be loaded for {}: {err}", app.display());
-                    trouble.push((lane, name.to_owned(), tr_args("Could not load %s", &[name])));
-                }
+                });
             }
         }
         self.apps.resolved = resolved;
+        self.apps.unloadable = unloadable;
+    }
+
+    /// Say, once a session per lane and preset, that an application playing or recording now has
+    /// a rule naming a preset it cannot run — one that is not there, or that does not load — and
+    /// follows the lane instead.
+    fn say_app_route_trouble(&mut self) {
+        let mut trouble: Vec<(DeviceDirection, String, String)> = Vec::new();
+        for stream in &self.apps.streams {
+            let lane = stream.direction;
+            let notice = match self.app_preset(&stream.app, lane) {
+                AppPreset::Missing(name) => (name, followed_notice(name)),
+                AppPreset::Preset(name)
+                    if self
+                        .apps
+                        .unloadable
+                        .iter()
+                        .any(|(direction, preset)| *direction == lane && preset == name) =>
+                {
+                    (name, tr_args("Could not load %s", &[name]))
+                }
+                AppPreset::Preset(_) | AppPreset::Follow => continue,
+            };
+            trouble.push((lane, notice.0.to_owned(), notice.1));
+        }
         for (lane, preset, notice) in trouble {
             if self.apps.said.insert((lane, preset)) {
                 self.raise_notice(notice);

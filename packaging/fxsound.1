@@ -287,9 +287,21 @@ decides, and every application it names gets the preset, so
 .B firefox
 reaches both a native and a Flatpak Firefox. One playing or recording now is
 reached by its own as well, even while a rule written for another install
-covers it. One that FxSound has not seen gets a rule for the program of that
-name, which applies from the first time it plays; a note on standard error
-says so, as a misspelt name would be new too.
+covers it. One that FxSound has not seen gets a rule for what
+.I APP
+looks like, which applies from the first time it plays: a Flatpak id for
+three or more parts between dots, such as
+.BR com.discordapp.Discord ;
+the name an application gives itself for text with a space, such as
+.BR "Battlefield 6" ;
+a program for anything else, such as
+.B bf6.exe
+or
+.BR firefox .
+A note on standard error says which, as a misspelt name would be new too.
+Given as FxSound starts, such a name waits up to three seconds for FxSound to
+hear which applications play and record, so one already playing is reached
+by its own name.
 .I PRESET
 is an output preset's exact name, or
 .BR default " (also " follow ,
@@ -965,7 +977,8 @@ fxsound \-\-input='Jabra Evolve2' \-\-preset='Gaming Headset' \e
 .RE
 .PP
 Give a game and a browser presets of their own, and a voice chat's
-microphone a voice preset, then check what runs where:
+microphone a voice preset \(en by program, by program and by Flatpak id, even
+before any of them has run \(en then check what runs where:
 .PP
 .RS 4
 .EX

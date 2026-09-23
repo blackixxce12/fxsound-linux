@@ -20,5 +20,5 @@ pub use effects::{Chain, Effect};
 pub use engine::Engine;
 pub use eq::GraphicEq;
 pub use input::{AudioProcessor, ChainSpec, InputChain, InputEngine};
-pub use leveller::{Normaliser, VolumeLeveller};
+pub use leveller::VolumeLeveller;
 pub use spectrum::SpectrumAnalyser;

@@ -221,7 +221,11 @@ fn main() -> eframe::Result<()> {
 
     let mut app = App::new(engine, &waker);
 
-    // Step 4: the options a cold start honours, before anything is drawn.
+    // Step 4: the options a cold start honours, before anything is drawn. No application stream
+    // has been reported yet, so a preset named for an application the store does not know is held
+    // until the engine has said which applications play and record: the game that was started
+    // before FxSound is then reached by its own streams, as a running FxSound would reach it.
+    app.hold_app_presets();
     let cold = commands::run(&mut app, &cli.cold_start_commands());
     if !cold.stdout.is_empty() {
         println!("{}", cold.stdout);

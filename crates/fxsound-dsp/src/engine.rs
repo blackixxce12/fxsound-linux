@@ -225,12 +225,13 @@ impl Engine {
             if self.applied.eq_on {
                 self.eq.process(buffer, channels);
                 self.apply_gain_stage(buffer, channels);
-                // The subwoofer is excluded from the detector: it carries a deliberately enormous
-                // amount of the programme's energy, so letting it into the level analysis pulls
-                // the gain down on bass-heavy material for reasons that have nothing to do with
-                // how loud the programme actually is.
+                // The subwoofer is levelled with every other channel but kept out of the level
+                // analysis: it carries a deliberately enormous share of the programme's energy,
+                // so letting it into the statistics would pull the gain down on bass-heavy
+                // material for reasons that have nothing to do with how loud the programme
+                // actually is. The stage keeps its own 10 ms clock, whatever the quantum.
                 self.leveller
-                    .process_excluding(buffer, channels, self.lfe_channel);
+                    .process_with_lfe(buffer, channels, self.lfe_channel);
             }
             self.chain.process(buffer, channels);
         } else if self.applied.eq_on {
@@ -582,9 +583,12 @@ mod tests {
         assert!(buffer.iter().all(|s| (s - expected).abs() < 1e-6));
     }
 
-    /// 10 ms at 48 kHz. The block size is part of the levelling stage's behaviour, not an
-    /// implementation detail: the gain is ramped across whatever block it is handed
-    /// (`SosProcess.cpp:375-379`), and the detector's time constants are counted in blocks.
+    /// 10 ms at 48 kHz: one step of the levelling stage's own clock, so every block is exactly
+    /// one step and the stage does what the original does with a buffer, ramp and all
+    /// (`SosProcess.cpp:375-379`). Other block sizes step on the same 10 ms clock (audit #2); where
+    /// a step is split across calls, the ramp to its new gain starts on the first frame of the part
+    /// of the call that completes the step — at a 256-frame quantum, frame 256 of the 480, 224
+    /// frames before the step completes — rather than on the step's first frame.
     const LEVELLER_BLOCK: usize = 480;
 
     /// A phase-continuous 300 Hz stereo tone.
@@ -1164,6 +1168,15 @@ mod tests {
         // The LFE channel carries a deliberately enormous share of a film's energy. Letting it
         // into the level detector pulls the gain down on everything else for a reason that has
         // nothing to do with how loud the programme is.
+        //
+        // Changed on purpose: audit report #3. The fixture used to be a subwoofer at nine times
+        // the fronts, which only worked because the original never levelled the subwoofer: now it
+        // rides the fronts' gain, and a sub at 0.9 lifted by x4 would cross full scale, so the
+        // peak safety — which has to count every channel the gain reaches — rightly holds the
+        // whole mix down. What the test is about is the *statistics*, so the loud subwoofer here
+        // stays under the ceiling once levelled, and the quiet one is silent: had the sub reached
+        // the RMS, the fronts would come out 9.4 % apart. The fronts sit where the gain is below
+        // its cap, so a leak could not hide behind the cap either.
         let channels = 6;
         let params = DspParams {
             volume_leveling_db: 4.0,
@@ -1180,10 +1193,13 @@ mod tests {
         let mut last_quiet = Vec::new();
         let mut last_loud = Vec::new();
         for _ in 0..30 {
-            let mut a = tone(2048, channels, 0.1);
+            let mut a = tone(2048, channels, 0.25);
             let mut b = a.clone();
+            for frame in a.chunks_exact_mut(channels) {
+                frame[LFE] = 0.0;
+            }
             for frame in b.chunks_exact_mut(channels) {
-                frame[LFE] *= 9.0;
+                frame[LFE] *= 1.05;
             }
             quiet_sub.process(&mut a, channels);
             loud_sub.process(&mut b, channels);
@@ -1194,8 +1210,50 @@ mod tests {
         let front_quiet = channel_peak(&last_quiet, channels, 0);
         let front_loud = channel_peak(&last_loud, channels, 0);
         assert!(
+            front_quiet > 0.25 * 2.5,
+            "the fixture must level the fronts well up, got {front_quiet}"
+        );
+        assert!(
+            channel_peak(&last_loud, channels, LFE) < CEILING,
+            "the fixture must keep the levelled subwoofer under the ceiling"
+        );
+        assert!(
             (front_quiet - front_loud).abs() < front_quiet * 0.02,
             "a loud subwoofer moved the front channels: {front_loud} against {front_quiet}"
+        );
+    }
+
+    #[test]
+    fn a_quiet_surround_scene_keeps_its_subwoofer_level_with_the_fronts() {
+        // Audit report #3. The original left the LFE at x1 while the leveller lifted a quiet scene
+        // (`SosProcess.cpp:382-383`, `:908`): on this fixture the fronts came out 12.5 dB up and
+        // the subwoofer 0.3 dB down, so the bass fell 12.8 dB behind the rest of the mix; now both
+        // come out 12.8 dB up. Nothing after the leveller treats the two differently at the
+        // default snapshot, so whatever the chain does to the fronts it does to the subwoofer.
+        let channels = 6;
+        let mut engine = Engine::new(48_000.0, 4096, channels);
+        engine.set_lfe_channel(Some(LFE));
+        engine.apply(&DspParams {
+            volume_leveling_db: 4.0,
+            ..DspParams::default()
+        });
+
+        let mut last = Vec::new();
+        for _ in 0..100 {
+            let mut block = tone(2048, channels, 0.05);
+            engine.process(&mut block, channels);
+            last = block;
+        }
+
+        let front_db = 20.0 * (channel_peak(&last, channels, 0) / 0.05).log10();
+        let sub_db = 20.0 * (channel_peak(&last, channels, LFE) / 0.05).log10();
+        assert!(
+            front_db > 10.0,
+            "the fixture must lift the scene by more than 10 dB, got {front_db} dB"
+        );
+        assert!(
+            (front_db - sub_db).abs() < 0.1,
+            "the subwoofer came out {sub_db:.2} dB against the fronts' {front_db:.2} dB"
         );
     }
 

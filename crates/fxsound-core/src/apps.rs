@@ -171,22 +171,48 @@ impl AppKey {
         best.map(|(index, ..)| index)
     }
 
+    /// Whether, as a rule, this key could be the one [`AppKey::best_match`] picks for an
+    /// application the rule `other` matches too: whether some application both keys match is
+    /// matched by this one at least as strongly.
+    ///
+    /// The app sends the engine the rules that name a preset and, beside them, only the rules
+    /// that follow the lane for which this holds against one of them (`docs/0.4.0-apps.md`): a
+    /// rule that can never outrank a rule naming a preset decides no stream's route, and the
+    /// engine then picks among what it is given exactly as the store picks among all its rules.
+    /// The answer is exact, not a guess: an application can match both keys only through the
+    /// identifiers they carry, and any other value in one of its fields only makes it match
+    /// neither, so every application worth asking about is made of those identifiers.
+    #[must_use]
+    pub fn may_outrank(&self, other: &Self) -> bool {
+        let (mine, theirs) = (self.parts(), other.parts());
+        let choices = |field: usize| ["", mine[field], theirs[field]];
+        choices(0).into_iter().any(|flatpak| {
+            choices(1).into_iter().any(|binary| {
+                choices(2).into_iter().any(|name| {
+                    let application = [flatpak, binary, name];
+                    match (strength(mine, application), strength(theirs, application)) {
+                        (Some(this), Some(that)) => this >= that,
+                        _ => false,
+                    }
+                })
+            })
+        })
+    }
+
     /// The identifier that decided a match between the two keys, or `None` when they do not
     /// match. A stronger decider is a more specific rule: see [`AppRules::rule`].
     fn match_strength(&self, other: &Self) -> Option<Decider> {
-        let (a, b) = (self.flatpak.trim(), other.flatpak.trim());
-        if !a.is_empty() && !b.is_empty() {
-            return (a == b).then_some(Decider::Flatpak);
-        }
-        let (a, b) = (self.binary_basename(), other.binary_basename());
-        if !a.is_empty() && !b.is_empty() {
-            return eq_ignoring_case(a, b).then_some(Decider::Binary);
-        }
-        let (a, b) = (self.name.trim(), other.name.trim());
-        if !a.is_empty() && !b.is_empty() {
-            return (a == b).then_some(Decider::Name);
-        }
-        None
+        strength(self.parts(), other.parts())
+    }
+
+    /// The Flatpak id, the binary and the name, as matching reads them: trimmed, and the binary
+    /// by its basename.
+    fn parts(&self) -> [&str; 3] {
+        [
+            self.flatpak.trim(),
+            self.binary_basename(),
+            self.name.trim(),
+        ]
     }
 
     /// Whether the two keys carry the same identifiers, as matching reads them: the same Flatpak
@@ -209,6 +235,23 @@ impl AppKey {
             self.name.trim().to_owned(),
         )
     }
+}
+
+/// [`AppKey::match_strength`] over two keys' [`AppKey::parts`]: the first identifier both carry
+/// decides, in the order Flatpak id, binary, name.
+fn strength(a: [&str; 3], b: [&str; 3]) -> Option<Decider> {
+    let [flatpak_a, binary_a, name_a] = a;
+    let [flatpak_b, binary_b, name_b] = b;
+    if !flatpak_a.is_empty() && !flatpak_b.is_empty() {
+        return (flatpak_a == flatpak_b).then_some(Decider::Flatpak);
+    }
+    if !binary_a.is_empty() && !binary_b.is_empty() {
+        return eq_ignoring_case(binary_a, binary_b).then_some(Decider::Binary);
+    }
+    if !name_a.is_empty() && !name_b.is_empty() {
+        return (name_a == name_b).then_some(Decider::Name);
+    }
+    None
 }
 
 /// Case-insensitive comparison without allocating: `to_lowercase` on both sides, one character
@@ -1291,6 +1334,123 @@ last_seen = 40
             rules.preset_for(&key("FIREFOX", "Firefox Nightly", ""), OUT),
             Some("Rock")
         );
+    }
+
+    // ---- which rules can outrank which ---------------------------------------------------------
+
+    #[test]
+    fn rules_for_applications_with_nothing_in_common_never_outrank_each_other() {
+        let mpv = key("mpv", "mpv", "");
+        let game = key("bf6.exe", "Battlefield 6", "");
+        assert!(!mpv.may_outrank(&game));
+        assert!(!game.may_outrank(&mpv));
+        assert!(
+            !AppKey::default().may_outrank(&game),
+            "an empty key matches nothing"
+        );
+    }
+
+    #[test]
+    fn a_flatpaks_rule_and_the_native_rule_of_its_program_may_each_outrank_the_other() {
+        let native = key("firefox", "Firefox", "");
+        let sandboxed = key("firefox", "Firefox", "org.mozilla.firefox");
+        assert!(
+            sandboxed.may_outrank(&native),
+            "the Flatpak's own stream: its id beats the native rule's binary"
+        );
+        assert!(
+            native.may_outrank(&sandboxed),
+            "the native stream: both match it by the binary, and the native rule is exact"
+        );
+    }
+
+    #[test]
+    fn a_rule_by_name_alone_never_outranks_a_rule_by_flatpak_id() {
+        let by_name = key("", "Discord", "");
+        let by_id = key("", "", "com.discordapp.Discord");
+        assert!(!by_name.may_outrank(&by_id));
+        assert!(
+            by_id.may_outrank(&by_name),
+            "Discord's stream carries both, and its id decides"
+        );
+    }
+
+    /// Every key whose identifiers come from a few values that share letters in both cases.
+    fn universe() -> Vec<AppKey> {
+        let mut keys = Vec::new();
+        for flatpak in ["", "org.a.A", "org.b.B"] {
+            for binary in ["", "a", "A", "b", "/opt/a"] {
+                for name in ["", "A", "B", " A "] {
+                    keys.push(key(binary, name, flatpak));
+                }
+            }
+        }
+        keys
+    }
+
+    #[test]
+    fn a_rule_may_outrank_another_exactly_when_some_application_says_so() {
+        let keys = universe();
+        for mine in &keys {
+            for theirs in &keys {
+                let witness = keys.iter().any(|application| {
+                    match (
+                        mine.match_strength(application),
+                        theirs.match_strength(application),
+                    ) {
+                        (Some(this), Some(that)) => this >= that,
+                        _ => false,
+                    }
+                });
+                assert_eq!(
+                    mine.may_outrank(theirs),
+                    witness,
+                    "{mine:?} over {theirs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leaving_out_the_rules_that_cannot_outrank_a_preset_changes_no_applications_preset() {
+        // Every rule of the universe, each in turn naming a preset or following, as the app sends
+        // them: what the engine picks among those must be what the store picks among all.
+        let keys = universe();
+        for (index, with_preset) in keys.iter().enumerate() {
+            for (other, second) in keys.iter().enumerate().skip(index + 1).step_by(11) {
+                let mut store = AppRules::default();
+                for (at, rule_key) in keys.iter().enumerate() {
+                    let preset = if at == index || at == other {
+                        "Gaming"
+                    } else {
+                        ""
+                    };
+                    store.apps.push(rule(rule_key.clone(), preset, "", 1));
+                }
+                store.sanitise();
+                let sent: Vec<&AppRule> = store
+                    .apps
+                    .iter()
+                    .filter(|rule| {
+                        rule.has_preset(OUT)
+                            || store.apps.iter().any(|preset| {
+                                preset.has_preset(OUT) && rule.key.may_outrank(&preset.key)
+                            })
+                    })
+                    .collect();
+                for application in &keys {
+                    let engine = application
+                        .best_match(sent.iter().map(|rule| &rule.key))
+                        .map(|at| sent[at].preset(OUT))
+                        .filter(|preset| !preset.is_empty());
+                    assert_eq!(
+                        engine,
+                        store.preset_for(application, OUT),
+                        "{application:?} with {with_preset:?} and {second:?} on a preset"
+                    );
+                }
+            }
+        }
     }
 
     // ---- changes -----------------------------------------------------------------------------

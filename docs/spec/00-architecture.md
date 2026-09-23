@@ -605,8 +605,8 @@ PipeWire's data-thread naming convention, run for 10 minutes under load (Phase 2
 | `dsp/include/DfxDsp.h`, `DfxDsp.cpp`, `DfxDspPrivate.cpp` | public façade + pimpl | `fxsound-dsp::engine::Engine` | [W] |
 | `dsp/DfxDspEq.cpp`, `DspUtil/GraphicEq/*` | band tables, Q derivation, remap | `fxsound-dsp::eq::GraphicEq` | [W] |
 | `ptutil/Filt/FiltCalcBiqd.cpp`, `SOS/SosProcess.cpp` (sections) | parametric design + TDF-II runner | `fxsound-dsp::biquad::{calc_parametric,Section}` | [W] |
-| `SOS/SosProcess.cpp:139-472` | the 38-constant volume leveller | `fxsound-dsp::leveling::VolumeLeveling` | **P2 — missing** |
-| `SOS/SosProcess.cpp:677-723` | RMS normalisation | `fxsound-dsp::engine` (`normalization_db`; disabled at 0.0) | [W] |
+| `SOS/SosProcess.cpp:139-472` | the 38-constant volume leveller | `fxsound-dsp::leveller::VolumeLeveller` (10 ms steps, unfiltered peak safety, LFE levelled: 0.4.0 audit #1–#5) | [W] |
+| `SOS/SosProcess.cpp:677-723` | RMS normalisation | — **not ported**: `setNormalization` has no caller in the Windows app (0.4.0 audit #37) | — |
 | `ptechDsp/Aural/Aural032/Auralp32.c` | Fidelity exciter | `fxsound-dsp::effects::fidelity::Fidelity` | [W] |
 | `ptechDsp/Lex/Lex32/Lex32.c` | Ambience plate reverb | `fxsound-dsp::effects::ambience::Ambience` | **P2 — stub on disk** |
 | `ptechDsp/wide/Wide32/Wide32.c` | Surround widener | `fxsound-dsp::effects::surround::Surround` | [W] |

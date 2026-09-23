@@ -45,7 +45,9 @@ use fxsound_ui::dialogs::settings::{DevicePriority, SettingsState};
 
 mod per_app;
 
-pub use per_app::{AppRuleRefusal, ListedApp, NamedAppRule, apps_named, list_apps};
+pub use per_app::{
+    AppRuleRefusal, ListedApp, NamedAppRule, apps_named, list_apps, unseen_description, unseen_key,
+};
 
 /// The characters `PresetNameInputFilter` strips from a typed preset name
 /// (`FxPresetNameEditor.cpp:6-33`): the Windows reserved-filename set, kept on Linux so a preset
@@ -717,6 +719,9 @@ impl App {
             DeviceDirection::ALL.map(|lane| Some(device_priority(&app.settings, lane)));
 
         app.adopt_saved_presets();
+        // Every per-application rule the store has, with the presets and levels just adopted: the
+        // engine knows them before any application's stream reaches it.
+        app.app_presets_changed();
         // Each enabled lane shows the device the settings file names until the first device list
         // and the engine's word arrive, rather than `Off`, which it is not.
         app.place_lane_selections();
@@ -788,7 +793,8 @@ impl App {
 
     /// When the controller next has something to do that nothing will wake it for: the notice to
     /// take down after its four seconds, the per-device volumes to write, the store of
-    /// per-application presets to write. `None` while there is nothing of the kind; the pump's
+    /// per-application presets to write, a cold start's wait for the streams to end
+    /// ([`App::hold_app_presets`]). `None` while there is nothing of the kind; the pump's
     /// keepalive covers what is left (0.4.0 design §12).
     ///
     /// A notice written straight into [`UiState::notification`] has no clock until the next poll
@@ -808,7 +814,7 @@ impl App {
         notice
             .into_iter()
             .chain(self.volume_save_due)
-            .chain(self.app_rules_save_due())
+            .chain(self.app_rules_due())
             .min()
     }
 
@@ -836,8 +842,9 @@ impl App {
             self.volume_save_due = None;
             self.settings_dirty = true;
         }
-        // The applications seen playing since the store was last written, likewise a while later.
-        self.save_app_rules_if_due(now);
+        // The applications seen playing since the store was last written, likewise a while later;
+        // a write that failed, again; a cold start's wait for the streams, over.
+        self.app_rules_tick(now);
 
         self.meters_moved = false;
         let Some(engine) = self.engine.as_mut() else {

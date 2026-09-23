@@ -872,7 +872,8 @@ impl Service {
     /// Give an application a preset of its own for `direction` (`output` or `input`), or have it
     /// follow the lane's again with `default`, `follow` or an empty `preset` — as
     /// `--app-preset` and `--app-input-preset` do: the application by its Flatpak id, program or
-    /// name, in any case, and one FxSound has not seen kept as the program of that name.
+    /// name, in any case, and one FxSound has not seen kept as the Flatpak id, name or program
+    /// the text looks like.
     async fn set_app_preset(
         &self,
         app: &str,

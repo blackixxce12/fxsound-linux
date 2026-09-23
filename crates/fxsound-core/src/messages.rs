@@ -745,21 +745,28 @@ impl RouteParams {
     }
 }
 
-/// One application that is to run through a preset of its own (`docs/0.4.0-apps.md`).
+/// One rule of the store as the engine acts on it: which applications of a lane run through
+/// which preset (`docs/0.4.0-apps.md`).
 ///
-/// The app resolves every rule of the store (`crate::apps::AppRules`) to one of these — it owns
-/// the preset stores, so it is the one that can turn a preset's name into parameters — and sends
-/// the whole set in [`UiToAudio::SetAppRoutes`]. Routes are per preset, not per application:
-/// every entry of one lane naming the same preset shares one pair of nodes, up to
+/// The app resolves every rule of the store (`crate::apps::AppRules`) that names a preset of its
+/// lane's to one of these — it owns the preset stores, so it is the one that can turn a preset's
+/// name into parameters — whether its application runs or not, and sends the whole set in
+/// [`UiToAudio::SetAppRoutes`]. A rule that follows the lane is sent too, with an empty `preset`,
+/// where it could outrank one that names a preset ([`crate::AppKey::may_outrank`]): the engine
+/// picks each stream's rule with [`crate::AppKey::best_match`] among these, as the store picks
+/// among all of its own. Routes are per preset, not per application: every entry of one lane
+/// naming the same preset shares one pair of nodes, up to
 /// [`MAX_ROUTES_PER_LANE`](crate::apps::MAX_ROUTES_PER_LANE) presets per lane.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppRoute {
     /// The lane the application's stream belongs to.
     pub direction: DeviceDirection,
-    /// Which application's streams to move onto the route.
+    /// The rule's own key: the streams it is the most specific match for are moved onto the
+    /// route.
     pub app: AppKey,
     /// The preset's name: what the route's node is called in a mixer, and how entries sharing a
-    /// route are grouped.
+    /// route are grouped. Empty for a rule that follows the lane: its streams stay there, whatever
+    /// a more general rule says.
     pub preset: String,
     /// The preset resolved to chain parameters, for `direction`.
     pub params: RouteParams,
@@ -872,13 +879,17 @@ pub enum UiToAudio {
     /// about a second after the message, once the profile has switched. Kept until `false`,
     /// across devices and reconnects.
     KeepInputAwake(bool),
-    /// Every application that is to run through a preset of its own, both lanes at once
-    /// (`docs/0.4.0-apps.md`). The full set each time, never a change: the engine compares it
-    /// with what it runs, builds the routes that are new, moves the streams, and tears down what
-    /// is no longer asked for. Empty means no application has a preset of its own.
+    /// Every rule that gives an application a preset of its own, both lanes at once, running or
+    /// not, and the rules that follow the lane where they outrank one of those
+    /// (`docs/0.4.0-apps.md`, [`AppRoute`]). The full set each time, never a change: the engine
+    /// compares it with what it runs, builds a route when a stream needs one, moves the streams,
+    /// and tears down what is no longer asked for. Empty means no application has a preset of its
+    /// own.
     ///
     /// Resent whenever a rule changes, a preset a rule uses is saved, renamed or deleted, or the
-    /// output levels every chain shares — master gain, balance, levelling, band count — change.
+    /// output levels every chain shares — master gain, balance, levelling, band count — change;
+    /// never because a stream came or went, so a route outlives its application's streams by the
+    /// engine's idle time, and a new stream finds its rule at once.
     SetAppRoutes(Vec<AppRoute>),
 }
 

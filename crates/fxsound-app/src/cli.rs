@@ -236,8 +236,9 @@ pub struct Cli {
     ///
     /// Linux addition (per-application presets, `docs/0.4.0-apps.md`). `APP` is a remembered
     /// application's Flatpak id, program or name, in any case (`--list-apps` shows them); one
-    /// FxSound has not seen gets a rule for the program of that name. `PRESET` is an output
-    /// preset's exact name; `default` and `follow` are the lane's.
+    /// FxSound has not seen gets a rule for the Flatpak id, name or program `APP` looks like
+    /// (`crate::app::unseen_key`). `PRESET` is an output preset's exact name; `default` and
+    /// `follow` are the lane's.
     #[arg(
         long = "app-preset",
         alias = "app_preset",

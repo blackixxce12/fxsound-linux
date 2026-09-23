@@ -11,20 +11,23 @@
 //!
 //! # Rules and routes
 //!
-//! The app sends every rule at once ([`UiToAudio::SetAppRoutes`]): an application, a lane, a
-//! preset and that preset's parameters. [`Rules`] keeps them, and [`diff`] says what changed from
-//! one set to the next, per preset: which are new, which are gone, whose parameters or voice chain
-//! changed. A route is per preset, not per application — every application of one lane with the
-//! same preset shares one pair — and exists only while a stream needs it: a rule for a game that is
-//! not running builds nothing. [`RouteTable::plan`] turns the rules and the streams in the graph
-//! into the routes each lane should run:
+//! The app sends every rule at once ([`UiToAudio::SetAppRoutes`]), whether its application runs or
+//! not: an application, a lane, a preset and that preset's parameters — or no preset, for a rule
+//! that follows the lane where it outranks a more general one that names a preset (a Flatpak
+//! Firefox of its own beside the native Firefox's rule, which would match it by its binary).
+//! [`Rules`] keeps them, and [`diff`] says what changed from one set to the next, per preset: which
+//! are new, which are gone, whose parameters or voice chain changed. A route is per preset, not
+//! per application — every application of one lane with the same preset shares one pair — and
+//! exists only while a stream needs it: a rule for a game that is not running builds nothing.
+//! [`RouteTable::plan`] turns the rules and the streams in the graph into the routes each lane
+//! should run:
 //!
 //! - A stream is matched with the rule of its own lane that names its application most
 //!   specifically ([`AppKey::best_match`], the order the store itself uses), and goes onto that
-//!   preset's route. A stream that may not be moved — `node.dont-move`, `node.dont-reconnect`,
-//!   `node.dont-fallback`, a target of its own that is not FxSound's, a recorder of what FxSound
-//!   plays (`crate::app_streams`) — or that someone has moved by hand ([`Moves::moved_by_hand`])
-//!   stays where it is.
+//!   preset's route; a rule that follows leaves it on the lane. A stream that may not be moved —
+//!   `node.dont-move`, `node.dont-reconnect`, `node.dont-fallback`, a target of its own that is
+//!   not FxSound's, a recorder of what FxSound plays (`crate::app_streams`) — or that someone has
+//!   moved by hand ([`Moves::moved_by_hand`]) stays where it is.
 //! - A route is in use while a stream is planned onto it, and also while a stream FxSound leaves
 //!   where it is sits on it ([`Candidate::on_route`]): one whose own properties name the route's
 //!   node, one WirePlumber will not move off it again ([`Moves::anchor`]), or a recorder whose
@@ -258,15 +261,14 @@ pub(crate) struct RoutePreset {
 pub(crate) enum Refusal {
     /// The parameters are for the other lane's chain ([`AppRoute::is_consistent`]).
     Inconsistent,
-    /// No preset is named: there would be nothing to call the route, and "follow the lane" is
-    /// said by sending no rule at all.
-    NoPreset,
     /// The key names no application, so no stream could match it.
     NoApplication,
 }
 
 /// The rules the app last sent ([`UiToAudio::SetAppRoutes`]), as the engine keeps them: every
-/// rule it can act on, in the order they came, each preset's parameters sanitised.
+/// rule it can act on, in the order they came, each preset's parameters sanitised. A rule with no
+/// preset says its application follows the lane: it takes part in matching, so that a more
+/// general rule naming a preset cannot claim the application, and names no route.
 ///
 /// [`UiToAudio::SetAppRoutes`]: fxsound_core::messages::UiToAudio::SetAppRoutes
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -278,17 +280,16 @@ impl Rules {
     /// The rules of `asked` the engine can act on, and each refused one with why.
     ///
     /// A preset's name is trimmed, since it names a node to the user and groups rules into
-    /// routes, and two spellings that differ only by a space are one preset. Every snapshot is
-    /// sanitised, as [`crate::EngineHandle::set_params`] sanitises the lanes', because this is the
-    /// one gate between the message and a route's chain.
+    /// routes, and two spellings that differ only by a space are one preset; a blank one is a rule
+    /// that follows the lane. Every snapshot is sanitised, as [`crate::EngineHandle::set_params`]
+    /// sanitises the lanes', because this is the one gate between the message and a route's
+    /// chain.
     pub(crate) fn new(asked: Vec<AppRoute>) -> (Self, Vec<(AppRoute, Refusal)>) {
         let mut rules = Vec::with_capacity(asked.len());
         let mut refused = Vec::new();
         for mut rule in asked {
             let refusal = if !rule.is_consistent() {
                 Some(Refusal::Inconsistent)
-            } else if rule.preset.trim().is_empty() {
-                Some(Refusal::NoPreset)
             } else if rule.app.is_empty() {
                 Some(Refusal::NoApplication)
             } else {
@@ -312,7 +313,8 @@ impl Rules {
     }
 
     /// The preset the application `app` runs through in `direction`: the one its most specific
-    /// rule of that lane names, or `None` when no rule of that lane names it.
+    /// rule of that lane names, or `None` when no rule of that lane matches it or that rule
+    /// follows the lane.
     pub(crate) fn preset_for(&self, direction: DeviceDirection, app: &AppKey) -> Option<&str> {
         let lane: Vec<&AppRoute> = self
             .rules
@@ -320,14 +322,20 @@ impl Rules {
             .filter(|rule| rule.direction == direction)
             .collect();
         let best = app.best_match(lane.iter().map(|rule| &rule.app))?;
-        lane.get(best).map(|rule| rule.preset.as_str())
+        lane.get(best)
+            .map(|rule| rule.preset.as_str())
+            .filter(|preset| !preset.is_empty())
+    }
+
+    /// The rules that name a preset: every one but those that follow the lane.
+    fn with_preset(&self) -> impl Iterator<Item = &AppRoute> {
+        self.rules.iter().filter(|rule| !rule.preset.is_empty())
     }
 
     /// The preset `name` of `direction`, as its first rule gives it. The app resolves one preset
     /// to one set of parameters; were two rules to disagree, the first is the one a route runs.
     pub(crate) fn preset(&self, direction: DeviceDirection, name: &str) -> Option<RoutePreset> {
-        self.rules
-            .iter()
+        self.with_preset()
             .find(|rule| rule.direction == direction && rule.preset == name)
             .map(|rule| RoutePreset {
                 direction,
@@ -342,15 +350,14 @@ impl Rules {
 
     /// Whether any rule of `direction` names the preset `name`.
     pub(crate) fn names(&self, direction: DeviceDirection, name: &str) -> bool {
-        self.rules
-            .iter()
+        self.with_preset()
             .any(|rule| rule.direction == direction && rule.preset == name)
     }
 
     /// Every preset the rules name, once, in the order they are first named.
     pub(crate) fn presets(&self) -> Vec<RoutePreset> {
         let mut presets: Vec<RoutePreset> = Vec::new();
-        for rule in &self.rules {
+        for rule in self.with_preset() {
             if presets.iter().all(|known| {
                 (known.direction, known.name.as_str()) != (rule.direction, &rule.preset)
             }) && let Some(preset) = self.preset(rule.direction, &rule.preset)
@@ -362,7 +369,9 @@ impl Rules {
     }
 
     /// Which application runs which preset, in one order whatever order the rules came in: what
-    /// tells a set that moves an application from one that only changes a preset's parameters.
+    /// tells a set that moves an application from one that only changes a preset's parameters. A
+    /// rule that follows the lane is one too, with no preset: it can take an application off a
+    /// route a more general rule would put it on.
     fn assignments(&self) -> Vec<(DeviceDirection, AppKey, String)> {
         let mut assignments: Vec<(DeviceDirection, AppKey, String)> = self
             .rules
@@ -1275,6 +1284,21 @@ mod tests {
         }
     }
 
+    /// A rule that has `app` follow its lane, as the app sends one: no preset, and a snapshot of
+    /// the lane's kind that nothing runs.
+    fn follow_rule(direction: DeviceDirection, app: AppKey) -> AppRoute {
+        AppRoute {
+            direction,
+            app,
+            preset: String::new(),
+            params: match direction {
+                DeviceDirection::Output => RouteParams::Output(DspParams::default()),
+                DeviceDirection::Input => RouteParams::Input(InputDspParams::default()),
+            },
+            chain: String::new(),
+        }
+    }
+
     fn rules(asked: Vec<AppRoute>) -> Rules {
         let (rules, refused) = Rules::new(asked);
         assert!(refused.is_empty(), "{refused:?}");
@@ -1408,17 +1432,12 @@ mod tests {
         crossed.params = RouteParams::Input(InputDspParams::default());
         let (rules, refused) = Rules::new(vec![
             crossed,
-            output_rule(named("Game"), "  ", 1.0),
             output_rule(AppKey::default(), "Gaming", 1.0),
             output_rule(named("Game"), " Gaming ", 1.0),
         ]);
         assert_eq!(
             refused.iter().map(|(_, why)| *why).collect::<Vec<_>>(),
-            vec![
-                Refusal::Inconsistent,
-                Refusal::NoPreset,
-                Refusal::NoApplication
-            ]
+            vec![Refusal::Inconsistent, Refusal::NoApplication]
         );
         assert_eq!(rules.len(), 1);
         assert_eq!(
@@ -1426,6 +1445,100 @@ mod tests {
             Some("Gaming"),
             "a preset's name is trimmed"
         );
+    }
+
+    #[test]
+    fn a_rule_with_a_blank_preset_is_taken_as_one_that_follows_the_lane() {
+        let (rules, refused) = Rules::new(vec![output_rule(named("Game"), "  ", 1.0)]);
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules.preset_for(OUT, &named("Game")), None);
+        assert!(rules.presets().is_empty(), "it names no route");
+        assert!(!rules.names(OUT, ""));
+        assert_eq!(rules.preset(OUT, ""), None);
+    }
+
+    #[test]
+    fn a_rule_that_follows_keeps_its_application_off_a_more_general_rules_preset() {
+        // The native Firefox's rule runs Music; the Flatpak one has a rule of its own that follows
+        // the lane. The native rule matches the Flatpak's stream too, by its binary, but the
+        // Flatpak's own rule matches it by its id.
+        let native = app("firefox", "Firefox", "");
+        let sandboxed = app("firefox", "Firefox", "org.mozilla.firefox");
+        let rules = rules(vec![
+            output_rule(native.clone(), "Music", 1.0),
+            follow_rule(OUT, sandboxed.clone()),
+            follow_rule(IN, native.clone()),
+            input_rule(sandboxed.clone(), "Headset", "voice"),
+        ]);
+        assert_eq!(rules.preset_for(OUT, &native), Some("Music"));
+        assert_eq!(rules.preset_for(OUT, &sandboxed), None);
+        assert_eq!(rules.preset_for(IN, &sandboxed), Some("Headset"));
+        assert_eq!(
+            rules.preset_for(IN, &native),
+            None,
+            "the Flatpak's rule matches the native stream by its binary too; the native rule is \
+             its own"
+        );
+        // A game known by its name alone to one rule and by its program to another.
+        let rules = self::rules(vec![
+            output_rule(named("Game"), "Gaming", 1.0),
+            follow_rule(OUT, app("game.exe", "Game", "")),
+        ]);
+        assert_eq!(rules.preset_for(OUT, &app("game.exe", "Game", "")), None);
+        assert_eq!(
+            rules.preset_for(OUT, &named("Game")),
+            Some("Gaming"),
+            "a stream with no program is the rule for the name's"
+        );
+        assert_eq!(
+            rules
+                .presets()
+                .iter()
+                .map(|preset| preset.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Gaming"]
+        );
+    }
+
+    #[test]
+    fn a_native_application_on_a_preset_and_a_flatpak_one_that_follows_are_planned_apart() {
+        let mut table = RouteTable::default();
+        let native = app("firefox", "Firefox", "");
+        let sandboxed = app("firefox", "Firefox", "org.mozilla.firefox");
+        let rules = rules(vec![
+            output_rule(native.clone(), "Music", 1.0),
+            follow_rule(OUT, sandboxed.clone()),
+        ]);
+        let plan = table.plan(
+            &rules,
+            &[stream(20, OUT, native), stream(21, OUT, sandboxed)],
+            &both(ATTACHED),
+            Instant::now(),
+            ROUTE_IDLE,
+        );
+        assert_eq!(built(&plan), vec![(slot(OUT, 1), "Music")]);
+        assert_eq!(
+            plan.assigned,
+            vec![(20, slot(OUT, 1))],
+            "the Flatpak Firefox stays on the lane"
+        );
+    }
+
+    #[test]
+    fn a_rule_that_starts_or_stops_following_moves_applications_and_no_preset() {
+        let native = app("firefox", "Firefox", "");
+        let sandboxed = app("firefox", "Firefox", "org.mozilla.firefox");
+        let before = rules(vec![output_rule(native.clone(), "Music", 1.0)]);
+        let after = rules(vec![
+            output_rule(native, "Music", 1.0),
+            follow_rule(OUT, sandboxed),
+        ]);
+        let changes = diff(&before, &after);
+        assert!(changes.applications);
+        assert!(changes.added.is_empty() && changes.removed.is_empty());
+        assert!(changes.params.is_empty() && changes.chains.is_empty());
+        assert!(diff(&after, &after.clone()).is_empty());
     }
 
     #[test]
