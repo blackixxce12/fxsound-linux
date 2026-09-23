@@ -725,6 +725,15 @@ impl TrayHandle {
     }
 }
 
+/// The tray is redrawn from the controller's events (`crate::events::fan_out`): the whole mirror
+/// at once, and only when something it draws changed — every update is a D-Bus round trip and a
+/// set of property signals.
+impl crate::events::TraySink for TrayHandle {
+    fn redraw(&self, state: TrayState) {
+        self.update(|mirror| *mirror = state);
+    }
+}
+
 /// Register the tray item and start serving it.
 ///
 /// `assume_sni_available(true)` turns "no watcher yet" into a [`Tray::watcher_offline`] callback

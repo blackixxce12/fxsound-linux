@@ -76,7 +76,7 @@ use zbus::object_server::{InterfaceRef, SignalEmitter};
 
 use crate::App;
 use crate::cli::{self, Command, DeviceCommand, PowerCommand, PresetCommand, WindowCommand};
-use crate::events::AppEvent;
+use crate::events::{AppEvent, EventSink};
 use crate::ipc::{self, Control, Response};
 
 /// The API's well-known name.
@@ -483,6 +483,8 @@ impl Properties {
             AppEvent::Status(_)
             | AppEvent::DevicesChanged { .. }
             | AppEvent::InputMeters(_)
+            | AppEvent::EchoCancel { .. }
+            | AppEvent::Calibrated(_)
             | AppEvent::Window { .. }
             | AppEvent::Quit => Update::default(),
         }
@@ -926,6 +928,13 @@ impl Drop for DbusHandle {
     }
 }
 
+/// The D-Bus signals and properties are one of the consumers of the controller's events.
+impl EventSink for DbusHandle {
+    fn publish(&self, event: &AppEvent) {
+        Self::publish(self, event);
+    }
+}
+
 impl std::fmt::Debug for DbusHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DbusHandle")
@@ -1085,7 +1094,7 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use crate::commands::InputMeters;
-    use crate::events::{LaneState, Snapshot};
+    use crate::events::LaneState;
     use crate::ipc::{Forwarded, Instance};
     use clap::Parser as _;
     use fxsound_core::NoiseSuppressionOverride;
@@ -1727,6 +1736,12 @@ mod tests {
                 denoise_running: false,
                 deesser_running: false,
             }),
+            AppEvent::EchoCancel {
+                on: true,
+                running: false,
+                detail: Some("no WebRTC module".to_owned()),
+            },
+            AppEvent::Calibrated(fxsound_core::settings::CalibrationRecord::default()),
             AppEvent::Window { visible: false },
             AppEvent::Quit,
         ] {
@@ -2015,6 +2030,27 @@ mod tests {
     }
 
     #[test]
+    fn the_controllers_own_events_keep_the_properties_current_through_the_fan_out() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let address = format!("unix:path={}", dir.path().join("no-bus-here").display());
+        let (mut app, _presets) = app_with_presets("fan-out", &["Alpha", "Beta"]);
+        let dbus =
+            DbusHandle::start_on(Bus::Address(address), idle_control(), Properties::of(&app));
+        let _ = dbus.wait_until_settled(Duration::from_secs(5));
+
+        app.handle(&[
+            fxsound_ui::UiAction::TogglePower,
+            fxsound_ui::UiAction::SelectPreset(1),
+        ]);
+        crate::events::fan_out(&mut app, &[&dbus], None);
+        let properties = dbus.properties();
+        assert!(!properties.power);
+        assert_eq!(properties.preset(), "Beta");
+        assert_eq!(properties, Properties::of(&app), "nothing left behind");
+        dbus.shutdown();
+    }
+
+    #[test]
     fn an_address_that_is_not_one_stands_the_service_down_too() {
         let dbus = DbusHandle::start_on(
             Bus::Address("not an address".to_owned()),
@@ -2173,7 +2209,6 @@ mod tests {
                         Properties::of(&app),
                     );
                     let _ = settled.send(dbus.wait_until_settled(Duration::from_secs(10)));
-                    let mut snapshot = Snapshot::of(&app);
                     loop {
                         let mut quit = false;
                         for forwarded in server.drain() {
@@ -2181,7 +2216,8 @@ mod tests {
                             quit |= outcome.window.quit;
                             forwarded.respond_with(outcome.stdout, outcome.stderr, outcome.failed);
                         }
-                        snapshot.diff(&app, |event| dbus.publish(&event));
+                        // The runtime's own hand-off, the tray and the watchers left out.
+                        crate::events::fan_out(&mut app, &[&dbus], None);
                         if quit || stop.load(Ordering::SeqCst) {
                             server.refuse_pending();
                             dbus.shutdown();

@@ -412,23 +412,22 @@ fn run_preset(app: &mut App, command: &PresetCommand) -> Outcome {
         PresetCommand::Overwrite => app.handle(&[UiAction::SavePreset]),
         PresetCommand::Undo => app.handle(&[UiAction::UndoPresetChanges]),
         PresetCommand::Rename(name) => {
-            // Rename is save-under-the-new-name followed by deleting the old one, which is what
-            // the original does through its preset list rather than a filesystem rename.
-            let old = app.state.preset().map(|p| p.name.clone());
-            app.handle(&[UiAction::SavePresetAs(name.clone())]);
-            if let Some(old) = old
-                && old != *name
-                && let Some(index) = app.state.presets.iter().position(|p| p.name == old)
+            // The menu's Rename in one step: the saved file moves, everything that named the
+            // preset follows it, and the stream hears the new name once. The original renames
+            // only an unmodified user preset from the command line (`FxController.cpp:428-440`),
+            // as the menu only offers Rename then: what moves is the saved file, so unsaved
+            // edits would be left behind under a name that is gone.
+            if let Some(entry) = app.state.preset()
+                && !entry.factory
+                && entry.modified
             {
-                let previous = app.state.selected_preset;
-                app.state.selected_preset = Some(index);
-                app.handle(&[UiAction::DeletePreset]);
-                if let Some(index) = app.state.presets.iter().position(|p| p.name == *name) {
-                    app.handle(&[UiAction::SelectPreset(index)]);
-                } else {
-                    app.state.selected_preset = previous;
-                }
+                return Outcome::refused(format!(
+                    "{:?} has unsaved changes; save them with --overwrite_preset or drop them \
+                     with --undo_preset before renaming it",
+                    entry.name
+                ));
             }
+            app.rename_preset(name);
         }
         PresetCommand::Delete => app.handle(&[UiAction::DeletePreset]),
         PresetCommand::Next => app.cycle_preset(true),
@@ -675,7 +674,7 @@ pub fn input_meters(state: &UiState) -> InputMeters {
 
 /// `value` to `places` decimals, as an `f64` that prints as short as it reads: an `f32` widened
 /// first would print `0.9300000071525574`.
-fn rounded(value: f32, places: i32) -> f64 {
+pub(crate) fn rounded(value: f32, places: i32) -> f64 {
     let scale = 10_f64.powi(places);
     let value = (f64::from(value) * scale).round() / scale;
     if value.is_finite() { value } else { 0.0 }

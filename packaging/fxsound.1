@@ -153,7 +153,8 @@ Overwrite the selected user preset with its unsaved changes.
 Discard the selected preset's unsaved changes.
 .TP
 .BI \-\-rename_preset= NAME
-Rename the selected user preset.
+Rename the selected user preset. One with unsaved changes is refused: save or
+undo them first.
 .TP
 .B \-\-delete_preset
 Delete the selected user preset.
@@ -283,7 +284,8 @@ quits or standard output is closed. The first event is
 .B \-\-status
 document); after that
 .BR power ", " preset_changed ", " device_changed ", " devices_changed ", "
-.BR audio_state ", " direction ", " notice ", " window " and " quit
+.BR audio_state ", " direction ", " notice ", " echo_cancel ", " calibrated ", "
+.BR window " and " quit
 as they happen. Plain output is
 .I event key=value ...
 per line; with

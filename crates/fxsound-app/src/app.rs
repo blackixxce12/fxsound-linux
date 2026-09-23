@@ -29,8 +29,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::audio_link::{AudioLink, FakeEngine};
+use crate::events::{AppEvent, LaneState, Published};
 use crate::notify::{Message, Notifier};
 use fxsound_core::i18n::{self, tr, tr_args};
+use fxsound_core::settings::CalibrationRecord;
 use fxsound_ui::dialogs::settings::{DevicePriority, SettingsState};
 
 /// The characters `PresetNameInputFilter` strips from a typed preset name
@@ -401,6 +403,17 @@ pub struct App {
     /// controls here; a slot is otherwise empty only for a lane an app has never shown, which
     /// only [`App::headless_for_tests`] builds.
     lane_controls: [Option<LaneControls>; 2],
+    /// What changed since the last [`App::drain_events`], in the order it changed: the one source
+    /// of `--watch`, the D-Bus signals and the tray (0.4.0 design §10). Filled at each mutation,
+    /// never by comparing the whole state on a timer.
+    events: Vec<AppEvent>,
+    /// What those events have said so far, so that a mutation which leaves a thing as the stream
+    /// last described it says nothing (see [`Published`]).
+    published: Published,
+    /// Something the tray draws changed that no event names: the theme, Always On Top, the
+    /// language, the preset list under an unchanged selection, or sound starting or stopping on
+    /// the shown lane (see [`App::take_tray_refresh`]).
+    tray_stale: bool,
 }
 
 impl App {
@@ -479,6 +492,9 @@ impl App {
             notifications_armed: false,
             tray_tip_shown: false,
             lane_controls: [None, None],
+            events: Vec::new(),
+            published: Published::default(),
+            tray_stale: false,
         };
 
         // What the settings file asks of the audio thread before it does anything else. See
@@ -489,6 +505,9 @@ impl App {
 
         app.adopt_saved_presets();
         app.notifications_armed = true;
+        // Start-up is where the stream starts from, not news: a subscriber's first line is the
+        // status document, which already says all of it.
+        app.start_the_stream_here();
         app
     }
 
@@ -564,7 +583,13 @@ impl App {
         // telemetry the input lane's (see [`show_meters`]).
         let shown = engine.meters(self.state.direction);
         let microphone = engine.meters(DeviceDirection::Input);
+        let was_playing = self.state.audio_active;
         show_meters(&mut self.state, &shown, &microphone);
+        // The tray's processing icon is the logo's and the visualizer's "sound is playing", which
+        // no event names: redrawn when it starts or stops, not on every buffer.
+        if self.state.audio_active != was_playing {
+            self.tray_stale = true;
+        }
 
         // Drained first and acted on after, in arrival order, once the engine is no longer
         // borrowed: a device list and a pick call back into the whole controller.
@@ -598,6 +623,7 @@ impl App {
                 let processing = status.processing && self.settings.lane_enabled(direction);
                 set_lane_active(&mut self.state, direction, processing);
                 self.audio_status[lane_index(direction)] = status;
+                self.note_audio(direction);
             }
             // What a lane is really attached to, and the engine's answer to whatever the lane was
             // asked to do: the request ends here, and the combo shows the attachment (see
@@ -610,6 +636,7 @@ impl App {
             } => {
                 if node_name.is_none() {
                     set_lane_active(&mut self.state, direction, false);
+                    self.note_audio(direction);
                 }
                 self.attached[lane_index(direction)] = node_name;
                 self.requested_device[lane_index(direction)] = None;
@@ -620,9 +647,9 @@ impl App {
                 // after the reconnect says when it is again.
                 for direction in DeviceDirection::ALL {
                     set_lane_active(&mut self.state, direction, false);
+                    self.note_audio(direction);
                 }
-                self.state
-                    .notify(format!("{} {reason}", tr("Audio disconnected:")));
+                self.raise_notice(format!("{} {reason}", tr("Audio disconnected:")));
                 // `"Output Disconnected"` (`FxController.cpp:1170`).
                 self.notify(Message::output_disconnected());
             }
@@ -636,16 +663,17 @@ impl App {
                 {
                     self.show_lane_selections();
                 }
-                self.state.notify(message);
+                self.raise_notice(message);
             }
             // Something that works but that the user should know — one Bluetooth headset on both
             // lanes, which drops its music to call quality (U9). Already translated.
             AudioToUi::Warning { message, .. } => {
-                self.state.notify(message);
+                self.raise_notice(message);
             }
             AudioToUi::EchoCancel { running, detail } => {
                 self.state.echo_cancel_running = running;
                 self.echo_cancel_detail = detail;
+                self.note_echo_cancel();
             }
             AudioToUi::RememberedDefault {
                 direction,
@@ -688,6 +716,7 @@ impl App {
     fn adopt_device_list(&mut self, devices: Vec<AudioDevice>) -> Vec<UiToAudio> {
         self.devices_seen = true;
         self.state.devices = devices;
+        self.note_device_list();
         self.show_lane_selections();
         self.saved_devices_for_engine()
     }
@@ -704,6 +733,7 @@ impl App {
             );
             self.state.set_selection(direction, selection);
         }
+        self.note_lane_devices();
     }
 
     /// Record that `lane` has been asked to attach to `node_name`, so its combo can show the
@@ -782,6 +812,7 @@ impl App {
                 self.state.power = !self.state.power;
                 self.settings.power = self.state.power;
                 self.settings_dirty = true;
+                self.note_power();
                 self.sync_params_from_state();
                 // Coming back from a bypass, the filters still hold whatever was in them when the
                 // power went off, and `Chain::set_power` clears only the five effects — never the
@@ -814,6 +845,8 @@ impl App {
                 self.settings_dirty = true;
                 // The artwork differs per theme, so the old textures will never be used again.
                 self.assets.clear();
+                // The tray's Theme items tick the one in force.
+                self.tray_stale = true;
             }
 
             UiAction::SelectPreset(index) => {
@@ -953,6 +986,9 @@ impl App {
                 modified: entry.modified,
             })
             .collect();
+        // The tray lists them. A list that grew under the same selection — an import — is not
+        // an event, and the selection is noted by whoever moves it.
+        self.tray_stale = true;
     }
 
     /// `lane`'s preset store: the `.fac` set for the speakers, the voice set for the microphone.
@@ -1069,10 +1105,10 @@ impl App {
             }
             Err(err) => {
                 log::warn!("could not load preset {name}: {err}");
-                self.state
-                    .notify(tr_args("Could not load %s", &[name.as_str()]));
+                self.raise_notice(tr_args("Could not load %s", &[name.as_str()]));
             }
         }
+        self.note_presets();
     }
 
     /// Record `preset` against whatever is playing, so plugging the headphones back in brings this
@@ -1261,6 +1297,7 @@ impl App {
         {
             entry.modified = true;
         }
+        self.note_presets();
     }
 
     /// Save the edit direction's controls: over the selected preset (`None`), or as a new user
@@ -1288,13 +1325,13 @@ impl App {
                 } else {
                     Message::preset_overwritten(&name)
                 };
-                self.state.notify(message.body.clone());
+                self.note_presets();
+                self.raise_notice(message.body.clone());
                 self.notify(message);
             }
             Err(err) => {
                 log::warn!("could not save preset {name}: {err}");
-                self.state
-                    .notify(tr_args("Could not save %s", &[name.as_str()]));
+                self.raise_notice(tr_args("Could not save %s", &[name.as_str()]));
             }
         }
     }
@@ -1321,7 +1358,7 @@ impl App {
             return;
         };
         if entry.factory {
-            self.state.notify(tr("Factory presets cannot be deleted"));
+            self.raise_notice(tr("Factory presets cannot be deleted"));
             return;
         }
         let name = entry.name.clone();
@@ -1334,14 +1371,14 @@ impl App {
                 } else {
                     self.select_preset(next);
                 }
+                self.note_presets();
                 let message = Message::preset_deleted(&name);
-                self.state.notify(message.body.clone());
+                self.raise_notice(message.body.clone());
                 self.notify(message);
             }
             Err(err) => {
                 log::warn!("could not delete preset {name}: {err}");
-                self.state
-                    .notify(tr_args("Could not delete %s", &[name.as_str()]));
+                self.raise_notice(tr_args("Could not delete %s", &[name.as_str()]));
             }
         }
     }
@@ -1445,6 +1482,7 @@ impl App {
         self.state.dereverb_on = self.input_params.dereverb != fxsound_core::DereverbLevel::Off;
         self.state.deesser_requested_hz = self.input_params.deesser_hz;
         self.state.echo_cancel_on = self.settings.echo_cancel;
+        self.note_echo_cancel();
     }
 
     /// Attach `lane` to device `index` — the one path the window, the tray and the command line
@@ -1486,6 +1524,7 @@ impl App {
             .map(ToOwned::to_owned);
 
         self.state.set_selection(direction, Some(index));
+        self.note_lane_devices();
         self.settings.set_device_name(direction, &name);
         // Picking a device switches its lane on, and says nothing about the other lane: the
         // engine runs both, and choosing speakers leaves the microphone as it was. Recorded so
@@ -1551,6 +1590,8 @@ impl App {
         self.state.set_selection(direction, None);
         self.requested_device[lane_index(direction)] = None;
         set_lane_active(&mut self.state, direction, false);
+        self.note_lane_devices();
+        self.note_audio(direction);
         self.settings.set_lane_enabled(direction, false);
         self.settings_dirty = true;
         if let Some(engine) = &self.engine {
@@ -1579,6 +1620,7 @@ impl App {
         self.settings.set_edit_direction(direction);
         self.settings_dirty = true;
         self.show_lane(direction);
+        self.note_direction();
         true
     }
 
@@ -1614,6 +1656,7 @@ impl App {
                     self.state.presets[at].modified |= modified;
                 }
                 self.sync_params_from_state();
+                self.note_presets();
             }
             None => self.enter_lane_for_the_first_time(direction),
         }
@@ -1688,6 +1731,7 @@ impl App {
         // Published whether or not a preset was loaded: with none to load, or one that failed to,
         // the lane runs what it was seeded with above rather than what its snapshot last held.
         self.sync_params_from_state();
+        self.note_presets();
     }
 
     /// The same controls, mapped onto the microphone chain.
@@ -1925,6 +1969,7 @@ impl App {
         );
         self.refresh_preset_list();
         self.state.selected_preset = None;
+        self.note_presets();
     }
 
     /// The microphone snapshot currently published, for tests and for `--status`.
@@ -1953,7 +1998,7 @@ impl App {
     #[doc(hidden)]
     #[must_use]
     pub fn headless_for_tests() -> Self {
-        Self {
+        let mut app = Self {
             state: UiState::default(),
             params: DspParams::default(),
             input_params: unvoiced_input_params(),
@@ -1987,7 +2032,12 @@ impl App {
             notifications_armed: true,
             tray_tip_shown: false,
             lane_controls: [None, None],
-        }
+            events: Vec::new(),
+            published: Published::default(),
+            tray_stale: false,
+        };
+        app.start_the_stream_here();
+        app
     }
 
     /// Persist settings and stash unsaved preset edits. Called on the way out.
@@ -2010,6 +2060,156 @@ impl App {
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
+    }
+}
+
+// =============================================================================================
+// Events: what changed, said where it changed (0.4.0 design §10)
+// =============================================================================================
+
+impl App {
+    /// Everything that changed since the last call, in the order it changed. The runtime drains
+    /// this once a tick and hands the same events to the `--watch` streams, the D-Bus service and
+    /// the tray ([`crate::events::fan_out`]).
+    pub fn drain_events(&mut self) -> Vec<AppEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    /// Whether the tray has to be redrawn for something no event names — the theme, Always On
+    /// Top, the language, a preset list that changed under its selection, sound starting or
+    /// stopping on the shown lane — and forget it. An event that touches the tray
+    /// ([`AppEvent::touches_tray`]) is the other reason.
+    pub fn take_tray_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.tray_stale)
+    }
+
+    /// Put up a notice in the window and tell the stream: the one way the application raises
+    /// one. The same text raised twice is two notices, each with its own four seconds.
+    pub fn raise_notice(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.state.notify(text.clone());
+        self.events.push(AppEvent::Notice { message: text });
+    }
+
+    /// Keep what the calibration wizard applied — the voice preset it wrote, the microphone and
+    /// what it measured there — in the settings file, and say so (0.4.0 design §8). A record
+    /// with a measurement that is not a number is not one, and changes nothing.
+    pub fn record_calibration(&mut self, record: CalibrationRecord) {
+        let measured = [
+            record.noise_floor_db,
+            record.speech_rms_db,
+            record.speech_peak_db,
+            record.clipped_ratio,
+        ];
+        if !measured.iter().all(|value| value.is_finite()) {
+            log::warn!("a calibration that measured something other than a number was dropped");
+            return;
+        }
+        let record = CalibrationRecord {
+            clipped_ratio: record.clipped_ratio.clamp(0.0, 1.0),
+            ..record
+        };
+        self.settings.calibration = Some(record.clone());
+        self.persist_settings();
+        self.events.push(AppEvent::Calibrated(record));
+    }
+
+    /// What a lane's audio is doing, as `audio_state` reports it: nothing at all without an
+    /// engine, processing while its last status said so, idle otherwise.
+    #[must_use]
+    pub const fn lane_state(&self, direction: DeviceDirection) -> LaneState {
+        if !self.has_audio() {
+            return LaneState::Unavailable;
+        }
+        let active = match direction {
+            DeviceDirection::Output => self.state.output_active,
+            DeviceDirection::Input => self.state.input_active,
+        };
+        if active {
+            LaneState::Processing
+        } else {
+            LaneState::Idle
+        }
+    }
+
+    /// The audio thread's reason the echo canceller is not running, or empty.
+    #[must_use]
+    pub fn echo_cancel_detail(&self) -> &str {
+        &self.echo_cancel_detail
+    }
+
+    /// Changes the stream has not been told about — empty whenever every mutation said what it
+    /// changed. For the tests, which run it after every step as their oracle.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn unsaid_changes(&self) -> Vec<AppEvent> {
+        self.published.unsaid(self)
+    }
+
+    /// Make the controller as it is now what the stream starts from, with nothing queued.
+    fn start_the_stream_here(&mut self) {
+        self.published = Published::of(self);
+        self.events.clear();
+        self.tray_stale = false;
+    }
+
+    /// Hold the thing `check` reads against what the stream last said about it, and queue the
+    /// event that says it changed, if it did.
+    fn note(&mut self, check: impl FnOnce(&mut Published, &Self) -> Option<AppEvent>) {
+        // Out of `self` for the call, so that the check can read the whole controller.
+        let mut published = std::mem::take(&mut self.published);
+        let event = check(&mut published, self);
+        self.published = published;
+        self.events.extend(event);
+    }
+
+    fn note_power(&mut self) {
+        self.note(|published, app| published.power(app.state.power));
+    }
+
+    fn note_direction(&mut self) {
+        self.note(|published, app| published.direction(app.state.direction));
+    }
+
+    /// Both lanes' presets: wherever a list, a selection or an unsaved-changes marker moves.
+    /// Both, because acting on the lane off screen (Reset Presets) goes through the same paths.
+    fn note_presets(&mut self) {
+        for direction in DeviceDirection::ALL {
+            self.note(|published, app| published.preset(direction, app.lane_preset(direction)));
+        }
+    }
+
+    /// Both lanes' devices: wherever a selection is set or the list under it changes.
+    fn note_lane_devices(&mut self) {
+        for direction in DeviceDirection::ALL {
+            self.note(|published, app| {
+                published.device(direction, app.state.device_for(direction))
+            });
+        }
+    }
+
+    fn note_device_list(&mut self) {
+        self.note(|published, app| published.devices(&app.state.devices));
+    }
+
+    fn note_audio(&mut self, direction: DeviceDirection) {
+        self.note(|published, app| {
+            published.audio(
+                direction,
+                app.lane_state(direction),
+                app.audio_status_for(direction),
+            )
+        });
+    }
+
+    fn note_echo_cancel(&mut self) {
+        self.note(|published, app| {
+            published.echo_cancel(
+                app.state.echo_cancel_on,
+                app.state.echo_cancel_running,
+                &app.echo_cancel_detail,
+            )
+        });
     }
 }
 
@@ -2038,6 +2238,10 @@ impl App {
     pub fn tray_state(&self) -> crate::tray::TrayState {
         crate::tray::TrayState {
             power: self.state.power,
+            // The shown lane's non-silent buffers, as the window's logo, the visualizer and
+            // `--status`'s `audio` read them: the original's one `audio_process_on_` drives all
+            // of them (`docs/spec/05-controller-model.md`). Not the lane's `audio_state`, which
+            // stays `processing` while a paused stream keeps the device running on silence.
             processing: self.state.audio_active,
             power_enabled: true,
             theme: self.state.theme,
@@ -2093,6 +2297,8 @@ impl App {
             TrayCommand::SetAlwaysOnTop(on) => {
                 self.settings.always_on_top = on;
                 self.settings_dirty = true;
+                // The item does not tick itself: it waits for the application's answer.
+                self.tray_stale = true;
                 self.handle(&[]);
             }
             TrayCommand::OpenSettings => self.handle(&[UiAction::OpenSettings]),
@@ -2145,7 +2351,7 @@ impl App {
             return;
         };
         if entry.factory {
-            self.state.notify(tr("Factory presets cannot be renamed"));
+            self.raise_notice(tr("Factory presets cannot be renamed"));
             return;
         }
         let old = entry.name.clone();
@@ -2153,16 +2359,14 @@ impl App {
             return;
         }
         if !self.is_preset_name_available(new_name) {
-            self.state
-                .notify(tr_args("A preset named %s already exists", &[new_name]));
+            self.raise_notice(tr_args("A preset named %s already exists", &[new_name]));
             return;
         }
 
         let lane = self.state.direction;
         if let Err(err) = self.store_mut(lane).rename(&old, new_name) {
             log::warn!("could not rename preset {old} to {new_name}: {err}");
-            self.state
-                .notify(tr_args("Could not rename %s", &[old.as_str()]));
+            self.raise_notice(tr_args("Could not rename %s", &[old.as_str()]));
             return;
         }
 
@@ -2187,8 +2391,8 @@ impl App {
             }
         }
         self.settings_dirty = true;
-        self.state
-            .notify(tr_args("Renamed %s to %s", &[old.as_str(), new_name]));
+        self.note_presets();
+        self.raise_notice(tr_args("Renamed %s to %s", &[old.as_str(), new_name]));
         // Direct callers (the menu) do not go through `handle`, so flush here.
         self.handle(&[]);
     }
@@ -2349,7 +2553,7 @@ impl App {
             PresetsAction::RevealExportFolder => {
                 if let Err(err) = reveal_folder(&self.export_dir) {
                     log::warn!("could not open {}: {err}", self.export_dir.display());
-                    self.state.notify(tr_args(
+                    self.raise_notice(tr_args(
                         "Presets exported to %s",
                         &[&self.export_dir.display().to_string()],
                     ));
@@ -2386,7 +2590,7 @@ impl App {
     fn export_presets(&mut self, names: &[String]) -> usize {
         if let Err(err) = std::fs::create_dir_all(&self.export_dir) {
             log::warn!("could not create {}: {err}", self.export_dir.display());
-            self.state.notify(tr("Could not create the export folder"));
+            self.raise_notice(tr("Could not create the export folder"));
             return 0;
         }
         let mut written = 0;
@@ -2396,8 +2600,7 @@ impl App {
                 Ok(_) => written += 1,
                 Err(err) => {
                     log::warn!("could not export {name}: {err}");
-                    self.state
-                        .notify(tr_args("Could not export %s", &[name.as_str()]));
+                    self.raise_notice(tr_args("Could not export %s", &[name.as_str()]));
                 }
             }
         }
@@ -2420,6 +2623,7 @@ impl App {
         {
             entry.modified = true;
         }
+        self.note_presets();
     }
 }
 
@@ -2820,6 +3024,8 @@ impl App {
         };
         self.settings.choose_language(choice);
         i18n::set_language(self.settings.effective_language());
+        // The tray's labels are built in the language in force.
+        self.tray_stale = true;
         self.persist_settings();
     }
 
@@ -2881,6 +3087,7 @@ impl App {
                 // in — rebuilding both nodes for a caption would drop the audio for a moment.
                 self.settings.choose_language(choice.as_deref());
                 i18n::set_language(self.settings.effective_language());
+                self.tray_stale = true;
                 state.settings.language.clone_from(&self.settings.language);
                 state.settings.language_follows_system = self.settings.language_follows_system;
                 self.persist_settings();
@@ -2904,8 +3111,7 @@ impl App {
                     Ok(()) => state.launch_on_startup = *on,
                     Err(err) => {
                         log::warn!("could not change the autostart entry: {err}");
-                        self.state
-                            .notify(tr("Could not change the startup setting"));
+                        self.raise_notice(tr("Could not change the startup setting"));
                     }
                 }
             }
@@ -2936,14 +3142,14 @@ impl App {
             A::ResetPresets => {
                 self.reset_presets();
                 let message = Message::presets_restored();
-                self.state.notify(message.body.clone());
+                self.raise_notice(message.body.clone());
                 self.notify(message);
             }
 
             A::OpenUrl(url) => {
                 if let Err(err) = open_url(url) {
                     log::warn!("could not open {url}: {err}");
-                    self.state.notify(tr("Could not open the link"));
+                    self.raise_notice(tr("Could not open the link"));
                 }
             }
 
@@ -4183,6 +4389,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_notice_the_application_raises_reaches_the_event_stream() {
+        // `App::raise_notice` is the one caller of `UiState::notify` outside the tests: a notice
+        // raised around it is drawn but never reaches `--watch` or the D-Bus `Notice` signal.
+        let direct = concat!(".state", ".notify(");
+        let mut callers = Vec::new();
+        for (file, source) in [
+            ("app.rs", include_str!("app.rs")),
+            ("main.rs", include_str!("main.rs")),
+            ("commands.rs", include_str!("commands.rs")),
+            ("dbus.rs", include_str!("dbus.rs")),
+            ("ipc.rs", include_str!("ipc.rs")),
+            ("tray.rs", include_str!("tray.rs")),
+        ] {
+            // rustfmt breaks a long call over lines; the guard reads it whole.
+            let joined: String = source.split_whitespace().collect();
+            callers.extend(std::iter::repeat_n(file, joined.matches(direct).count()));
+        }
+        assert_eq!(
+            callers,
+            ["app.rs"],
+            "only App::raise_notice calls UiState::notify; raise a notice through it"
+        );
     }
 
     /// A restart: a music store holding a flat `Alpha` and a bass-heavy `Beta`, the two voice

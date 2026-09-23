@@ -56,10 +56,10 @@ use fxsound_app::{
     cli::{Cli, Command},
     commands::{self, WindowRequest},
     dbus::{self, DbusHandle},
-    events::{self, AppEvent},
+    events::{self, AppEvent, EventSink, TraySink},
     ipc::{self, Instance},
     selftest,
-    tray::{self, TrayCommand, TrayDevice, TrayHandle, TrayPreset, TrayState},
+    tray::{self, TrayCommand, TrayHandle},
 };
 use fxsound_core::{ThemeMode, ViewMode, i18n::tr};
 use fxsound_ui::{
@@ -202,10 +202,14 @@ fn main() -> eframe::Result<()> {
         WindowVisibility::Shown
     };
 
+    // What start-up and the cold-start options changed is where every consumer starts from, not
+    // news: the tray is built from the state as it is now, the D-Bus properties below read it,
+    // and a `--watch` subscriber's first line is the status document.
+    let _ = app.drain_events();
+    let _ = app.take_tray_refresh();
+
     let (tray_tx, tray_rx) = crossbeam_channel::unbounded();
-    let tray_state = app.tray_state();
-    let tray_fingerprint = TrayFingerprint::of(&tray_state);
-    let tray = match tray::spawn(tray_state, tray_tx) {
+    let tray = match tray::spawn(app.tray_state(), tray_tx) {
         Ok(handle) => Some(handle),
         Err(err) => {
             log::warn!("no system tray: {err}");
@@ -243,13 +247,11 @@ fn main() -> eframe::Result<()> {
     let dbus = DbusHandle::start(server.control(), dbus::Properties::of(&app));
 
     let mut runtime = Runtime {
-        events: events::Snapshot::of(&app),
         app,
         dbus: Some(dbus),
         server,
         tray,
         tray_rx,
-        tray_fingerprint,
         exit: WindowExit::Hidden,
         settings_requested: false,
         terminate,
@@ -309,12 +311,8 @@ struct Runtime {
     /// bus connection goes before the control channel its calls travel on.
     dbus: Option<DbusHandle>,
     server: ipc::Server,
-    /// What the `--watch` stream last said, so each tick publishes only what changed.
-    events: events::Snapshot,
     tray: Option<TrayHandle>,
     tray_rx: crossbeam_channel::Receiver<TrayCommand>,
-    /// What the tray was last told, so it is only updated on a real change.
-    tray_fingerprint: TrayFingerprint,
     /// Set by the shell before it closes the window; read once `run_native` has returned.
     exit: WindowExit,
     /// The tray's Settings item was chosen and no window has acted on it yet. Set from
@@ -363,29 +361,35 @@ impl Runtime {
         }
         // Flush settings a tray or IPC path may have dirtied without going through `handle`.
         self.app.handle(&[]);
-        self.sync_tray();
         self.publish_events();
         request
     }
 
-    /// Tell the `--watch` subscribers and the D-Bus service what changed this tick.
-    ///
-    /// Diffed from a snapshot of the controller for now; the controller queuing events as it
-    /// makes the changes (`App::drain_events`) replaces this, and feeds the tray too.
+    /// Hand what the controller did since the last tick to the `--watch` subscribers, the D-Bus
+    /// service and the tray: its own queue, drained once, the same events to each
+    /// ([`events::fan_out`]). A tick in which nothing changed publishes nothing and leaves the
+    /// tray alone.
     fn publish_events(&mut self) {
-        let server = &self.server;
-        let dbus = self.dbus.as_ref();
-        self.events.diff(&self.app, |event| {
-            server.publish(&event);
-            if let Some(dbus) = dbus {
-                dbus.publish(&event);
+        // On the stack: this runs on every tick, and an idle tick should cost nothing.
+        let server: &dyn EventSink = &self.server;
+        let both: [&dyn EventSink; 2];
+        let sinks = match &self.dbus {
+            Some(dbus) => {
+                both = [server, dbus];
+                &both[..]
             }
-        });
-        // Gathered only for a subscriber that asked; `publish` holds each to four a second.
-        if server.wants_meters() {
-            server.publish(&AppEvent::InputMeters(commands::input_meters(
-                &self.app.state,
-            )));
+            None => std::slice::from_ref(&server),
+        };
+        let tray = self.tray.as_ref().map(|tray| tray as &dyn TraySink);
+        events::fan_out(&mut self.app, sinks, tray);
+    }
+
+    /// Say something the window layer did, rather than the controller, to the same consumers:
+    /// the window coming and going, and the quit.
+    fn announce(&self, event: &AppEvent) {
+        self.server.publish(event);
+        if let Some(dbus) = &self.dbus {
+            dbus.publish(event);
         }
     }
 
@@ -397,7 +401,7 @@ impl Runtime {
         self.app.assets.clear();
         let options = native_options(self.app.state.view);
 
-        self.server.publish(&AppEvent::Window { visible: true });
+        self.announce(&AppEvent::Window { visible: true });
         let runtime = &mut *self;
         eframe::run_native(
             "FxSound",
@@ -413,7 +417,7 @@ impl Runtime {
         )?;
         // A quit is announced by `shutdown`, as `quit`.
         if self.exit == WindowExit::Hidden {
-            self.server.publish(&AppEvent::Window { visible: false });
+            self.announce(&AppEvent::Window { visible: false });
         }
         Ok(self.exit)
     }
@@ -434,21 +438,6 @@ impl Runtime {
         }
     }
 
-    /// Push the model into the tray.
-    ///
-    /// Only when something it draws actually changed: every call is a D-Bus round trip and a set
-    /// of property signals, and this runs on every tick.
-    fn sync_tray(&mut self) {
-        let Some(tray) = &self.tray else { return };
-        let state = self.app.tray_state();
-        let fingerprint = TrayFingerprint::of(&state);
-        if fingerprint == self.tray_fingerprint {
-            return;
-        }
-        tray.update(|mirror| *mirror = state);
-        self.tray_fingerprint = fingerprint;
-    }
-
     /// The only way out: stash unsaved edits, restore the system default device and stop the
     /// engine, remove the tray item. Dropping the server unlinks the control socket and ends
     /// every `--watch` stream, right after the `quit` event said why.
@@ -458,7 +447,9 @@ impl Runtime {
     /// call answered already, `Quit`'s own, still gets its reply — and closes its connection,
     /// before the control channel its calls travel on goes away.
     fn shutdown(mut self) {
-        self.server.publish(&AppEvent::Quit);
+        // Whatever the last tick left unsaid goes out before the stream ends.
+        self.publish_events();
+        self.announce(&AppEvent::Quit);
         self.server.refuse_pending();
         if let Some(dbus) = self.dbus.take() {
             dbus.shutdown();
@@ -500,59 +491,6 @@ fn native_options(view: ViewMode) -> eframe::NativeOptions {
             ..Default::default()
         },
         ..Default::default()
-    }
-}
-
-/// Everything in a [`TrayState`] the tray draws — all of it but the pixmaps, which
-/// [`App::tray_state`] never fills and `ksni::Icon` could not be compared anyway.
-///
-/// A count and an index are not enough: the Always On Top tick, a preset's trailing ` *`, a
-/// renamed preset and a device's description all change without either moving, and the tray
-/// relies on the application answering with [`TrayHandle::update`] (its Always On Top item
-/// deliberately does not flip itself).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TrayFingerprint {
-    power: bool,
-    processing: bool,
-    power_enabled: bool,
-    theme: ThemeMode,
-    always_on_top: bool,
-    presets: Vec<TrayPreset>,
-    selected_preset: Option<usize>,
-    devices: Vec<TrayDevice>,
-    selected_device: Option<usize>,
-    language: String,
-}
-
-impl TrayFingerprint {
-    fn of(state: &TrayState) -> Self {
-        // Destructured in full, so that a new field on `TrayState` has to decide here whether
-        // the tray draws it.
-        let TrayState {
-            power,
-            processing,
-            power_enabled,
-            theme,
-            always_on_top,
-            presets,
-            selected_preset,
-            devices,
-            selected_device,
-            language,
-            pixmaps: _,
-        } = state;
-        Self {
-            power: *power,
-            processing: *processing,
-            power_enabled: *power_enabled,
-            theme: *theme,
-            always_on_top: *always_on_top,
-            presets: presets.clone(),
-            selected_preset: *selected_preset,
-            devices: devices.clone(),
-            selected_device: *selected_device,
-            language: language.clone(),
-        }
     }
 }
 
@@ -1128,8 +1066,7 @@ impl<'a> Shell<'a> {
                 log::warn!("could not start the folder picker: {err}");
                 self.rt
                     .app
-                    .state
-                    .notify(tr("Could not open the folder picker"));
+                    .raise_notice(tr("Could not open the folder picker"));
             }
         }
     }
@@ -1566,94 +1503,195 @@ fn name_editor(
     None
 }
 
+/// The runtime's glue, over a real control socket in a scratch directory and a headless
+/// controller: never the session's socket, bus or PipeWire.
 #[cfg(test)]
-mod tests {
+mod runtime_tests {
     use super::*;
-    use fxsound_core::DeviceDirection;
+    use crossbeam_channel::{Receiver, Sender};
+    use std::io::Write;
+    use std::path::Path;
+    use std::time::Instant;
 
-    fn state() -> TrayState {
-        TrayState {
-            presets: vec![
-                TrayPreset {
-                    name: "General".to_owned(),
-                    factory: true,
-                    modified: false,
-                },
-                TrayPreset {
-                    name: "Mine".to_owned(),
-                    factory: false,
-                    modified: false,
-                },
-            ],
-            selected_preset: Some(1),
-            devices: vec![TrayDevice {
-                name: "Built-in Audio Analogue Stereo".to_owned(),
-                channels: 2,
-                direction: DeviceDirection::Output,
-            }],
-            selected_device: Some(0),
-            ..TrayState::default()
+    /// A runtime with no engine, no tray and no bus, serving the socket in `dir`.
+    fn runtime(dir: &Path) -> Runtime {
+        let Instance::Primary(listener) = Instance::acquire_in(dir).expect("acquire") else {
+            panic!("expected to be primary");
+        };
+        let (_tray_tx, tray_rx) = crossbeam_channel::unbounded();
+        Runtime {
+            app: App::headless_for_tests(),
+            dbus: None,
+            server: listener.serve().expect("serve"),
+            tray: None,
+            tray_rx,
+            exit: WindowExit::Hidden,
+            settings_requested: false,
+            terminate: Arc::new(AtomicBool::new(false)),
+            terminating: false,
         }
     }
 
-    /// Every change the tray renders has to move the fingerprint, or `Runtime::sync_tray` skips
-    /// the `TrayHandle::update` and the menu keeps showing what it showed before.
+    /// Hands each whole line `ipc::watch_to` writes to a channel.
+    struct Lines {
+        partial: Vec<u8>,
+        tx: Sender<String>,
+    }
+
+    impl Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.partial.extend_from_slice(bytes);
+            while let Some(end) = self.partial.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = self.partial.drain(..=end).collect();
+                let line = String::from_utf8_lossy(&line).trim_end().to_owned();
+                let _ = self.tx.send(line);
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `fxsound --watch` with `args`, on a thread: its lines, and its exit code once the stream
+    /// ends.
+    fn watch(socket: &Path, args: &[&str]) -> (Receiver<String>, std::thread::JoinHandle<i32>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let socket = socket.to_path_buf();
+        let argv: Vec<String> = std::iter::once("fxsound")
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        let meters = args.contains(&"--meters");
+        let thread = std::thread::spawn(move || {
+            let mut out = Lines {
+                partial: Vec::new(),
+                tx,
+            };
+            ipc::watch_to(
+                &socket,
+                &argv,
+                Path::new("/"),
+                meters,
+                &mut out,
+                &mut std::io::sink(),
+            )
+        });
+        (rx, thread)
+    }
+
+    /// Tick until `lines` has one, as the window's loop would.
+    fn next_line(runtime: &mut Runtime, lines: &Receiver<String>) -> String {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            runtime.tick();
+            if let Ok(line) = lines.recv_timeout(Duration::from_millis(10)) {
+                return line;
+            }
+            assert!(Instant::now() < deadline, "nothing arrived on the stream");
+        }
+    }
+
+    /// Tick `ticks` times, and say what arrived meanwhile.
+    fn quiet_ticks(runtime: &mut Runtime, lines: &Receiver<String>, ticks: usize) -> Vec<String> {
+        for _ in 0..ticks {
+            runtime.tick();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        lines.try_iter().collect()
+    }
+
     #[test]
-    fn fingerprint_moves_with_everything_the_tray_draws() {
-        let base = TrayFingerprint::of(&state());
+    fn a_tick_hands_each_change_to_a_watcher_once_and_a_quiet_tick_hands_it_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let (lines, watcher) = watch(runtime.server.path(), &["--watch"]);
+        assert!(next_line(&mut runtime, &lines).starts_with("status "));
 
-        let mut on_top = state();
-        on_top.always_on_top = true;
-        assert_ne!(TrayFingerprint::of(&on_top), base, "the Always On Top tick");
-
-        let mut edited = state();
-        edited.presets[1].modified = true;
-        assert_ne!(
-            TrayFingerprint::of(&edited),
-            base,
-            "a preset's trailing ` *`"
+        runtime.app.handle(&[UiAction::TogglePower]);
+        assert_eq!(next_line(&mut runtime, &lines), "power on=false");
+        assert_eq!(
+            quiet_ticks(&mut runtime, &lines, 5),
+            Vec::<String>::new(),
+            "nothing changed, so nothing is said"
         );
 
-        let mut renamed = state();
-        renamed.presets[1].name = "Renamed".to_owned();
-        assert_ne!(TrayFingerprint::of(&renamed), base, "a renamed preset");
+        runtime.shutdown();
+        assert_eq!(lines.recv().expect("the last line"), "quit");
+        assert_eq!(watcher.join().expect("watcher"), 0, "the stream ended");
+    }
 
-        let mut relabelled = state();
-        relabelled.devices[0].name = "fifine Microphone Analogue Stereo".to_owned();
-        assert_ne!(
-            TrayFingerprint::of(&relabelled),
-            base,
-            "a device's description"
+    #[test]
+    fn a_command_line_forwarded_to_the_instance_shows_up_on_the_stream() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let (lines, _watcher) = watch(runtime.server.path(), &["--watch", "--json"]);
+        next_line(&mut runtime, &lines);
+
+        let socket = runtime.server.path().to_path_buf();
+        let forwarded = std::thread::spawn(move || {
+            ipc::forward_to(
+                &socket,
+                &["fxsound".to_owned(), "--power=off".to_owned()],
+                Path::new("/"),
+                Duration::from_secs(5),
+            )
+        });
+        let line = next_line(&mut runtime, &lines);
+        let event: serde_json::Value = serde_json::from_str(&line).expect("json");
+        assert_eq!(event["event"], "power", "{line}");
+        assert_eq!(event["on"], false, "{line}");
+        assert!(forwarded.join().expect("client").expect("answered").ok);
+    }
+
+    #[test]
+    fn meters_reach_only_the_watcher_that_asked_for_them() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let (plain, _plain_watcher) = watch(runtime.server.path(), &["--watch"]);
+        next_line(&mut runtime, &plain);
+        assert!(!runtime.server.wants_meters());
+        assert!(
+            quiet_ticks(&mut runtime, &plain, 3).is_empty(),
+            "no meters are gathered for a stream that did not ask"
         );
 
-        let mut turned = state();
-        turned.devices[0].direction = DeviceDirection::Input;
-        assert_ne!(TrayFingerprint::of(&turned), base, "a device's direction");
-
-        let mut off = state();
-        off.power = false;
-        assert_ne!(
-            TrayFingerprint::of(&off),
-            base,
-            "the Turn On/Turn Off label"
+        let (metered, _metered_watcher) = watch(runtime.server.path(), &["--watch", "--meters"]);
+        assert!(next_line(&mut runtime, &metered).starts_with("status "));
+        assert!(runtime.server.wants_meters());
+        assert!(next_line(&mut runtime, &metered).starts_with("input_meters "));
+        assert!(
+            quiet_ticks(&mut runtime, &plain, 3).is_empty(),
+            "the plain stream still hears none of them"
         );
     }
 
-    /// The pixmaps are the one thing left out: `App::tray_state` never fills them, and they must
-    /// not make every tick look like a change.
     #[test]
-    fn fingerprint_ignores_the_pixmaps() {
-        assert_eq!(TrayFingerprint::of(&state()), TrayFingerprint::of(&state()));
+    fn the_window_coming_and_going_reaches_the_watchers_through_the_same_consumers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let (lines, _watcher) = watch(runtime.server.path(), &["--watch"]);
+        next_line(&mut runtime, &lines);
 
-        let mut with_pixmaps = state();
-        with_pixmaps.pixmaps.on.push(ksni::Icon {
-            width: 1,
-            height: 1,
-            data: vec![0; 4],
-        });
+        runtime.announce(&AppEvent::Window { visible: false });
+        assert_eq!(next_line(&mut runtime, &lines), "window visible=false");
+    }
+
+    #[test]
+    fn what_the_last_tick_left_unsaid_goes_out_before_the_quit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let (lines, watcher) = watch(runtime.server.path(), &["--watch"]);
+        next_line(&mut runtime, &lines);
+
+        // Changed after the last tick, the way a tray Exit follows a tray pick in one tick.
+        runtime.app.handle(&[UiAction::TogglePower]);
+        runtime.shutdown();
+        assert_eq!(watcher.join().expect("watcher"), 0);
         assert_eq!(
-            TrayFingerprint::of(&with_pixmaps),
-            TrayFingerprint::of(&state())
+            lines.try_iter().collect::<Vec<_>>(),
+            ["power on=false", "quit"]
         );
     }
 }

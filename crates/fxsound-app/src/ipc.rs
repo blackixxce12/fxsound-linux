@@ -100,7 +100,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounde
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{Cli, Command};
-use crate::events::AppEvent;
+use crate::events::{AppEvent, EventSink};
 
 /// Frame version. Bump when the shape of [`Request`] or [`Response`] changes incompatibly; a
 /// primary rejects anything it does not recognise rather than guessing.
@@ -477,6 +477,18 @@ impl Server {
             .list
             .iter()
             .any(|subscriber| subscriber.meters)
+    }
+}
+
+/// The `--watch` streams are one of the consumers of the controller's events; the broadcaster
+/// holds each subscriber that asked for meters to four a second.
+impl EventSink for Server {
+    fn publish(&self, event: &AppEvent) {
+        Self::publish(self, event);
+    }
+
+    fn wants_meters(&self) -> bool {
+        Self::wants_meters(self)
     }
 }
 
