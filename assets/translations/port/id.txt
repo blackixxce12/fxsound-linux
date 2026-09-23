@@ -84,3 +84,4 @@ countries: id
 "The microphone changed during the measurement." = "Mikrofon berubah selama pengukuran."
 "Follow the system's default device" = "Ikuti perangkat bawaan sistem"
 "Input Device Preference" = "Preferensi perangkat masukan"
+"Makeup Gain" = "Penguatan kompensasi"

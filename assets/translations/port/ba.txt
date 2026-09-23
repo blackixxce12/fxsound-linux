@@ -83,3 +83,4 @@ countries: ba
 "The microphone changed during the measurement." = "Mikrofon se promijenio tokom mjerenja."
 "Follow the system's default device" = "Prati zadani uređaj sistema"
 "Input Device Preference" = "Postavke ulaznog uređaja"
+"Makeup Gain" = "Kompenzacijsko pojačanje"

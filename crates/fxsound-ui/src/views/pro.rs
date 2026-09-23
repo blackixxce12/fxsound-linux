@@ -24,12 +24,12 @@
 //!
 //! ## The effect column
 //!
-//! `FxAudioControls` is a two-faced panel: face A is the five effect sliders (`FxEffects`), face B
-//! the equalizer's own controls — band count, filter width, restore defaults — reached through a
-//! flip button (`docs/spec/03-controls.md` §5.1, §5.7). This view draws **face A only**. The
-//! equalizer widget can draw face B itself, at the original's offsets, through
-//! `EqualizerWidget::with_controls`; wiring the flip that swaps the two is a separate piece of work
-//! and is deliberately not started here rather than half-done.
+//! `FxAudioControls` is a two-faced card (`docs/spec/03-controls.md` §1): face A is the five effect
+//! sliders (`FxEffects`, drawn here), face B the equalizer's own controls — band count, master
+//! gain, volume leveling, filter width, balance, Restore Defaults
+//! ([`crate::views::equalizer_controls`]). The card's `ControlBackground` fill and the flip button
+//! at its top-right corner belong to neither face and are drawn here for both
+//! (`FxAudioControls.cpp:80-90`, §5.7, §5.8); which face is up is [`ViewScratch::column_face`].
 //!
 //! ## What `paint()` does that this does not
 //!
@@ -38,13 +38,15 @@
 //! falls out for free: [`UiState::controls_enabled`] is read each frame, and the two device
 //! combos are the controls deliberately left live with the power off.
 
-use crate::assets::AssetCache;
+use crate::assets::{AssetCache, FxImage};
 use crate::layout;
 use crate::state::{UiAction, UiResponse, UiState};
 use crate::theme::{self, FxColor, Palette};
-use crate::views::{self, ViewScratch, at, titlebar, window_origin, window_rect};
+use crate::views::{
+    self, ColumnFace, ViewScratch, at, equalizer_controls, titlebar, window_origin, window_rect,
+};
 use crate::widgets::icon_button;
-use crate::widgets::{EqualizerWidget, FxSlider, VisualizerWidget};
+use crate::widgets::{EqualizerWidget, FxSlider, IconButton, VisualizerWidget};
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
     Align, Align2, Color32, CornerRadius, CursorIcon, Id, Rect, Sense, Ui, Vec2, pos2, vec2,
@@ -224,9 +226,10 @@ pub fn show(
         palette,
     );
 
-    effect_column(
+    audio_controls(
         ui,
         state,
+        &mut scratch.column_face,
         palette,
         assets,
         at(origin, layout::pro::audio_controls()),
@@ -668,6 +671,58 @@ fn input_meters(ui: &Ui, state: &UiState, palette: Palette, strip: Rect) {
                         .color(label_colour),
                 );
         }
+    }
+}
+
+/// The effect column: the card, whichever face is up, and the flip button over both
+/// (`FxAudioControls`, `FxAudioControls.cpp:26-90`).
+fn audio_controls(
+    ui: &mut Ui,
+    state: &UiState,
+    face: &mut ColumnFace,
+    palette: Palette,
+    assets: &mut AssetCache,
+    column: Rect,
+    response: &mut UiResponse,
+) {
+    // `FxAudioControls::paint`: the whole card in `ControlBackground`, radius 8 (§5.8) — the same
+    // card the equalizer beside it sits on.
+    ui.painter().rect_filled(
+        column,
+        CornerRadius::same(layout::PANEL_CORNER_RADIUS as u8),
+        palette.color(FxColor::ControlBackground),
+    );
+
+    match *face {
+        ColumnFace::Effects => effect_column(ui, state, palette, assets, column, response),
+        ColumnFace::EqualizerControls => {
+            equalizer_controls::show(ui, state, palette, assets, column, response);
+        }
+    }
+
+    // Last, so it is on top of either face. A child of the card, so the power switch disables it
+    // with everything else (`FxProView.cpp:112-122`); it has no tooltip in the original.
+    let enabled = state.controls_enabled();
+    let flip = IconButton::new(FxImage::FlipButton)
+        .hover(FxImage::FlipButtonHover)
+        .enabled(enabled)
+        .opacity(if enabled {
+            1.0
+        } else {
+            equalizer_controls::DISABLED_BUTTON_OPACITY
+        })
+        .show(
+            ui,
+            equalizer_controls::flip_button(column),
+            palette,
+            assets,
+            "fx_column_flip",
+        );
+    if flip.clicked() {
+        *face = face.flipped();
+        // The face this frame painted is the old one; the next shows the new one at once rather
+        // than whenever something else next asks for a frame.
+        ui.ctx().request_repaint();
     }
 }
 

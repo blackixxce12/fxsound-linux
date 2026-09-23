@@ -21,6 +21,7 @@
 //! which leaves as [`UiAction::DragWindow`] for the application layer to turn into
 //! `egui::ViewportCommand::StartDrag`.
 
+pub mod equalizer_controls;
 pub mod lite;
 pub mod pro;
 pub mod titlebar;
@@ -34,6 +35,32 @@ use crate::widgets::{EqInteraction, FxComboBox, VisualizerAnimation, combo};
 use egui::{Pos2, Rect, Ui, Vec2};
 use fxsound_core::i18n::tr;
 use fxsound_core::{AudioDevice, DeviceDirection, ViewMode};
+
+/// Which face of the Pro window's effect column is showing.
+///
+/// `FxAudioControls::effects_shown_` (`FxAudioControls.cpp:28`, `:41-46`): the five effect
+/// sliders first, turned over by the flip button to the equalizer's own controls
+/// ([`equalizer_controls`]). Like the original's flag it is the window's and nobody else's — it
+/// is not a setting and is not saved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ColumnFace {
+    /// Face A, `FxEffects`.
+    #[default]
+    Effects,
+    /// Face B, `FxEqualizerControl`.
+    EqualizerControls,
+}
+
+impl ColumnFace {
+    /// The other face.
+    #[must_use]
+    pub const fn flipped(self) -> Self {
+        match self {
+            Self::Effects => Self::EqualizerControls,
+            Self::EqualizerControls => Self::Effects,
+        }
+    }
+}
 
 /// The widget state that has to survive between frames.
 ///
@@ -57,6 +84,8 @@ pub struct ViewScratch {
     /// How far the wordmark has crossed from the plain logo to the highlighted one, `0.0..=1.0`
     /// (`FxWindow.cpp:193-208`).
     pub logo_fade: f32,
+    /// Which face of the effect column the flip button last turned up.
+    pub column_face: ColumnFace,
 }
 
 impl ViewScratch {

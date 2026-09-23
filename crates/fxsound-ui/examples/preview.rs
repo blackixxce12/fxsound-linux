@@ -11,12 +11,15 @@
 //! cargo run -p fxsound-ui --example preview -- --light --input --notice
 //! cargo run -p fxsound-ui --example preview -- --lite
 //! cargo run -p fxsound-ui --example preview -- --input --lang=de
+//! cargo run -p fxsound-ui --example preview -- --levels --eq-off
 //! ```
 //!
 //! Flags: `--light`, `--input` (edit the microphone lane), `--lite`, `--notice[=TEXT]`,
-//! `--detached` (both lanes off), `--lang=CODE` (one of the translation tables' codes; English
-//! otherwise), `--exit-after-paint`. Keys while it runs: `I` switches the edit direction, `N` puts
-//! a notice up, `L` flips Pro/Lite, `T` flips the palette, `Esc` quits.
+//! `--detached` (both lanes off), `--levels` (start with the effect column turned over to the
+//! equalizer's controls), `--eq-off` (the equalizer switched off), `--power-off`, `--lang=CODE`
+//! (one of the translation tables' codes; English otherwise), `--exit-after-paint`. Keys while it
+//! runs: `I` switches the edit direction, `N` puts a notice up, `L` flips Pro/Lite, `T` flips the
+//! palette, `Esc` quits.
 
 use eframe::egui;
 use fxsound_core::{AudioDevice, DeviceDirection, ThemeMode, ViewMode};
@@ -48,7 +51,16 @@ fn main() -> eframe::Result<()> {
         state.selected_output = None;
         state.selected_input = None;
     }
+    if flag("--eq-off") {
+        state.eq_on = false;
+    }
+    if flag("--power-off") {
+        state.power = false;
+    }
     let mut preview = Preview::new(state, flag("--exit-after-paint"));
+    if flag("--levels") {
+        preview.scratch.column_face = views::ColumnFace::EqualizerControls;
+    }
     if flag("--input") {
         preview.set_edit_direction(DeviceDirection::Input);
     }
@@ -126,6 +138,10 @@ fn demo_state() -> UiState {
         selected_output: Some(0),
         selected_input: Some(2),
         effects: [3.0, 5.0, 7.0, 4.0, 8.0],
+        master_gain_db: -4.0,
+        volume_leveling: 1.5,
+        filter_q: 2.0,
+        balance_db: 6.0,
         audio_active: true,
         output_active: true,
         input_active: true,
@@ -232,6 +248,18 @@ impl Preview {
                     slot.boost_db = *gain;
                 }
             }
+            UiAction::SetBandCount(count) => self.set_band_count(*count),
+            UiAction::SetMasterGain(db) => self.state.master_gain_db = *db,
+            UiAction::SetVolumeLeveling(amount) => self.state.volume_leveling = *amount,
+            UiAction::SetFilterQ(q) => self.state.filter_q = *q,
+            UiAction::SetBalance(db) => self.state.balance_db = *db,
+            UiAction::RestoreDefaults => {
+                self.set_band_count(fxsound_core::eq::DEFAULT_BANDS);
+                self.state.master_gain_db = 0.0;
+                self.state.volume_leveling = 0.0;
+                self.state.filter_q = 1.0;
+                self.state.balance_db = 0.0;
+            }
             UiAction::TogglePower => self.state.power = !self.state.power,
             UiAction::ToggleView => self.toggle_view(ctx),
             UiAction::ToggleTheme => self.toggle_theme(ctx),
@@ -241,6 +269,25 @@ impl Preview {
             UiAction::DragWindow => ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag),
             _ => {}
         }
+    }
+
+    /// A new ladder for `count` bands, each taking the gain of the old band nearest it — enough of
+    /// the controller's remap to see a curve survive the change.
+    fn set_band_count(&mut self, count: usize) {
+        let old = std::mem::take(&mut self.state.eq_bands);
+        self.state.eq_bands = (0..count)
+            .map(|band| {
+                let nearest = if count > 1 && !old.is_empty() {
+                    (band * (old.len() - 1) + (count - 1) / 2) / (count - 1)
+                } else {
+                    0
+                };
+                fxsound_core::EqBand::new(
+                    fxsound_ui::widgets::equalizer::default_band_frequency(band, count),
+                    old.get(nearest).map_or(0.0, |b| b.boost_db),
+                )
+            })
+            .collect();
     }
 
     fn toggle_view(&mut self, ctx: &egui::Context) {

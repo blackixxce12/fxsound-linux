@@ -84,3 +84,4 @@ countries: EG sa
 "The microphone changed during the measurement." = "تغيّر الميكروفون أثناء القياس."
 "Follow the system's default device" = "اتباع الجهاز الافتراضي للنظام"
 "Input Device Preference" = "تفضيلات جهاز الإدخال"
+"Makeup Gain" = "كسب التعويض"

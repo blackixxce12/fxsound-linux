@@ -83,3 +83,4 @@ countries: fi
 "The microphone changed during the measurement." = "Mikrofoni vaihtui mittauksen aikana."
 "Follow the system's default device" = "Seuraa järjestelmän oletuslaitetta"
 "Input Device Preference" = "Sisääntulolaitepreferenssi"
+"Makeup Gain" = "Tasausvahvistus"

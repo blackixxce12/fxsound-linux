@@ -4592,6 +4592,20 @@ mod tests {
     }
 
     #[test]
+    fn a_voices_makeup_gain_keeps_the_odd_decibel_the_window_sets() {
+        // On a microphone the column's second face steps the gain in whole decibels (U18), since
+        // voice presets are voiced at 3, 5, 7 and 9: the controller keeps 7 as 7 rather than
+        // putting it on the speakers' two-decibel grid, and it is an edit to the voice preset.
+        let (mut app, _engine, _dir) = restoring_on_the_microphone("Loud");
+        let before = speakers_settings(&app);
+        app.handle(&[UiAction::SetMasterGain(7.0)]);
+        assert_eq!(app.state.master_gain_db, 7.0);
+        assert_eq!(app.input_params().makeup_db, 7.0);
+        assert_eq!(app.lane_preset(IN), Some(("Loud", true)));
+        assert_eq!(speakers_settings(&app), before);
+    }
+
+    #[test]
     fn restoring_defaults_on_a_voice_with_only_its_width_moved_is_no_edit_to_it() {
         // `Quiet` has no makeup and ten bands; the filter width is not written into a voice
         // preset, so putting it back changes nothing a save would keep.

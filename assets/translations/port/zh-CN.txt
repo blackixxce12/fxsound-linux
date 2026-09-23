@@ -83,3 +83,4 @@ countries: cn sg
 "The microphone changed during the measurement." = "测量期间麦克风发生了变化。"
 "Follow the system's default device" = "跟随系统默认设备"
 "Input Device Preference" = "输入设备设置"
+"Makeup Gain" = "补偿增益"

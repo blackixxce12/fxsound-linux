@@ -256,7 +256,7 @@ mic ─► RNNoise ─► high-pass ─► gate ─► 10-band EQ ─► de-esse
 | RNNoise | Recurrent-network denoiser. Off unless the preset asks. ~44 dB off a desk microphone's hum-under-hiss; on undifferentiated white noise, ~1 dB — it separates speech from noise, and white noise gives it nothing to separate |
 | High-pass | Butterworth, 2nd or 4th order. Desk rumble and plosives sit ten to twenty dB above the voice below 150 Hz; left in, they hold the gate open through every pause |
 | Gate | Downward expander with a threshold, a ratio, a floor, hold, and peak or RMS detection — it turns the room down rather than switching it off |
-| Equalizer | Ten bands, the same graphic EQ the output chain uses |
+| Equalizer | The same graphic EQ the output chain uses, ten bands unless you pick five to 31 |
 | De-esser | Split-band, fourth-order Linkwitz–Riley crossover, acting only on the high band |
 | Compressor | Threshold, ratio, soft knee, attack, release, peak or RMS detection |
 | Makeup | Applied after everything that measures, so a preset's thresholds mean what they say |
@@ -300,7 +300,8 @@ does not follow you back to your speakers. The reasoning behind every number in 
 While a microphone is selected the window says so rather than pretending: the five effect sliders are
 drawn disabled with the reason underneath, the chain's stages read out along the bottom of the panel,
 and an equalizer band the device's sample rate cannot carry is struck through instead of left looking
-live.
+live. Turned over, the effect column shows only what the voice chain has: the band count, the filter
+width, and the preset's makeup gain in the master gain's place.
 
 ## Presets
 
@@ -316,9 +317,15 @@ directions between this port and the Windows build.
 | Unsaved edits | `~/.local/share/fxsound/presets/AutoSave/` |
 | Settings | `~/.config/fxsound/settings.toml` |
 
+The flip button at the top of the effect column turns it over to the equalizer's own controls, as in
+the original since 1.2.12: the band count, the master gain, the volume leveling, the filter width,
+the balance and Restore Defaults. Each slider has the original's range and step, and a right-click
+puts it back to its default.
+
 A preset lands on your band count, as in the original since 1.2.11: pick a ten-band preset while on
 31 bands and its curve is fitted onto the 31, and changing the band count carries the curve over
-instead of flattening it. Export writes a preset as last saved, never its unsaved edits.
+instead of flattening it. Restore Defaults puts back ten bands and the neutral levels, and keeps the
+curve. Export writes a preset as last saved, never its unsaved edits.
 
 The settings file keeps the original's key names so it can be diffed against the Windows
 `FxSound.settings`. Settings and presets are written durably — temporary file, fsync, rename — so an

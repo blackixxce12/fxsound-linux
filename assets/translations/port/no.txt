@@ -88,3 +88,4 @@ countries: no
 "The microphone changed during the measurement." = "Mikrofonen endret seg under målingen."
 "Follow the system's default device" = "Følg systemets standardenhet"
 "Input Device Preference" = "Innstilling for inndataenhet"
+"Makeup Gain" = "Utjevningsforsterkning"

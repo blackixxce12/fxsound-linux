@@ -83,3 +83,4 @@ countries: bg
 "The microphone changed during the measurement." = "Микрофонът беше сменен по време на измерването."
 "Follow the system's default device" = "Устройство по подразбиране от системата"
 "Input Device Preference" = "Предпочитания за входно устройство"
+"Makeup Gain" = "Компенсиращо усилване"

@@ -85,3 +85,4 @@ countries: ir
 "The microphone changed during the measurement." = "میکروفون در حین اندازه‌گیری تغییر کرد."
 "Follow the system's default device" = "پیروی از دستگاه پیش‌فرض سیستم"
 "Input Device Preference" = "ترجیح دستگاه ورودی"
+"Makeup Gain" = "بهره جبرانی"

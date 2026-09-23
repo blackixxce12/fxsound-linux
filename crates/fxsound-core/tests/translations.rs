@@ -781,11 +781,13 @@ fn a_string_that_ends_in_a_space_keeps_the_space_in_every_language() {
 
 /// Strings some language writes exactly as English does: audio terms its engineers borrow
 /// (`Gate`, `De-esser`, `Mono`), words the two languages share (Dutch `Help`, Spanish `No`,
-/// Romanian `General`), and the effect names the Polish original keeps as FxSound's own. Any
-/// other string a table translates as itself is a string nobody translated.
+/// Romanian `General`, the German, French and Spanish `Balance`), and the effect names the Polish
+/// original keeps as FxSound's own. Any other string a table translates as itself is a string
+/// nobody translated.
 const SPELLED_AS_IN_ENGLISH: &[&str] = &[
     "Ambience",
     "Audio",
+    "Balance",
     "Bass Boost",
     "Clarity",
     "Clipping",

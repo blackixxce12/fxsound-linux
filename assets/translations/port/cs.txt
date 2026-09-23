@@ -83,3 +83,4 @@ countries: cz
 "The microphone changed during the measurement." = "Mikrofon se během měření změnil."
 "Follow the system's default device" = "Řídit se výchozím zařízením systému"
 "Input Device Preference" = "Předvolba vstupního zařízení"
+"Makeup Gain" = "Vyrovnávací zisk"

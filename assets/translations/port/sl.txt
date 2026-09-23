@@ -85,3 +85,4 @@ countries: sl
 "The microphone changed during the measurement." = "Mikrofon se je med merjenjem zamenjal."
 "Follow the system's default device" = "Sledi privzeti napravi sistema"
 "Input Device Preference" = "Prednostna vhodna naprava"
+"Makeup Gain" = "Izravnalno ojačanje"

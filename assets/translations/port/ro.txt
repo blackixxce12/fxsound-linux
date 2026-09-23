@@ -85,3 +85,4 @@ countries: ro
 "The microphone changed during the measurement." = "Microfonul s-a schimbat în timpul măsurării."
 "Follow the system's default device" = "Urmează dispozitivul implicit al sistemului"
 "Input Device Preference" = "Preferință dispozitiv de intrare"
+"Makeup Gain" = "Câștig de compensare"

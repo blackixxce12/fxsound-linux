@@ -84,3 +84,4 @@ countries: pl
 "The microphone changed during the measurement." = "Mikrofon zmienił się podczas pomiaru."
 "Follow the system's default device" = "Używaj domyślnego urządzenia systemu"
 "Input Device Preference" = "Preferencje urządzenia wejściowego"
+"Makeup Gain" = "Wzmocnienie wyrównawcze"

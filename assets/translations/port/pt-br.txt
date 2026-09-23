@@ -85,3 +85,4 @@ countries: br
 "The microphone changed during the measurement." = "O microfone mudou durante a medição."
 "Follow the system's default device" = "Seguir o dispositivo padrão do sistema"
 "Input Device Preference" = "Preferência do dispositivo de entrada"
+"Makeup Gain" = "Ganho de compensação"

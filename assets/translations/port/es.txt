@@ -83,3 +83,4 @@ countries: ar co es mx
 "The microphone changed during the measurement." = "El micrófono cambió durante la medición."
 "Follow the system's default device" = "Usar el dispositivo por defecto del sistema"
 "Input Device Preference" = "Preferencia de dispositivo de entrada"
+"Makeup Gain" = "Ganancia de compensación"
