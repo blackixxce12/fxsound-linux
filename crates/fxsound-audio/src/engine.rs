@@ -86,6 +86,31 @@
 //! All of this holds while echo cancellation is off. While it is on, the canceller records the
 //! speakers' monitor on the microphone's clock, and the speakers and the output pair run with it
 //! (`docs/0.4.0-design.md` §7, and `aec`); switched off, they sleep again.
+//!
+//! # A device that blinks
+//!
+//! A Bluetooth headset switches between A2DP and its call profile whenever something starts or
+//! stops recording from it (WirePlumber 0.5.17, `device/autoswitch-bluetooth-profile.lua`), and
+//! every switch removes its sink and adds it back under the same `node.name` about half a second
+//! later; an ALSA card switched to another profile does the same to its nodes. In 0.3.0 both halves
+//! of the graph reacted to the gap. WirePlumber moved the playback stream onto the fallback device
+//! by itself, and the next supervisor tick found the target gone and rebuilt the pair on whatever
+//! else there was — the laptop's speakers, for the length of the switch (`docs/0.4.0-upstream.md`,
+//! U8). Now neither does:
+//!
+//! * Each lane's device-facing stream is `node.dont-reconnect`, `node.dont-fallback` and
+//!   `node.linger` ([`stream_props`]): WirePlumber links it to its target once, never moves it,
+//!   and leaves it unlinked and waiting while the target is gone.
+//! * When a lane's target goes while the card it belongs to — PipeWire's `Device` object — stays,
+//!   the lane's rules wait up to [`RETURN_WAIT`] for it to come back ([`Hold`]).
+//! * A pair is attached only to the very node it was built on, `object.serial` and all
+//!   ([`is_same_node`]). WirePlumber never links a stream it has linked once, so a node back under
+//!   its old name gets a new pair, and the new pair's stream is linked to it.
+//!
+//! A node that goes with its card, or that has no card — a virtual sink — is gone, and the lane
+//! moves at once, as before: on the tick after the node goes, or, when the registry names the node
+//! before its card, on the tick after the card does ([`remove_card`]). So does a lane whose wait
+//! is up.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
@@ -109,14 +134,15 @@ use pw::stream::{StreamFlags, StreamState};
 use triple_buffer::{Input, Output};
 
 use crate::aec::{self, EchoCancel, Side};
-use crate::devices::{self, ChannelMap, DeviceInfo, SelectionMemory};
+use crate::devices::{self, BluezFacts, Card, ChannelMap, DeviceInfo, FormFactor, SelectionMemory};
 use crate::lane_dsp::{self, ChainHandover, LaneDsp};
 use crate::per_direction::PerDirection;
 use crate::{
     AEC_SOURCE_NODE_NAME, AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION,
     DEFAULT_QUANTUM_FRAMES, DEFAULT_SAMPLE_RATE, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS,
-    OUR_NODE_NAMES, OUTPUT_NODE_NAME, OUTPUT_STREAM_DESCRIPTION, RING_CAPACITY_FRAMES,
-    SINK_DESCRIPTION, SINK_NODE_NAME, SOURCE_NODE_NAME, link_group, locale, our_node_name,
+    ONE_HEADSET_ON_BOTH_LANES, OUR_NODE_NAMES, OUTPUT_NODE_NAME, OUTPUT_STREAM_DESCRIPTION,
+    RING_CAPACITY_FRAMES, SINK_DESCRIPTION, SINK_NODE_NAME, SOURCE_NODE_NAME, link_group, locale,
+    our_node_name,
 };
 
 /// The rate the capture stream asks for, whatever the microphone runs at.
@@ -128,7 +154,7 @@ const CAPTURE_RATE: u32 = DEFAULT_SAMPLE_RATE;
 
 /// How often the supervisor runs. Also the shortest possible reconnect interval, which is the
 /// "never retry faster than 200 ms" floor of `docs/spec/12-audio-io.md` §22.
-const SUPERVISOR_PERIOD: Duration = Duration::from_millis(200);
+pub(crate) const SUPERVISOR_PERIOD: Duration = Duration::from_millis(200);
 
 /// How many supervisor ticks — five seconds of them — a claim on a default that no lane stands
 /// behind waits for the GUI to take the device list before it is handed back regardless
@@ -198,6 +224,108 @@ const TARGET_FILL_HALF_QUANTA: usize = 3;
 /// have, `500` is the right value: FxSound becomes the default only through the explicit,
 /// reversible metadata write in [`claim_default`], never through WirePlumber's own ranking.
 const NODE_PRIORITY_SESSION: &str = "500";
+
+/// How long a lane waits for the node it is attached to, when that node goes and its card stays
+/// ([`Hold`]).
+///
+/// Long enough for what a Bluetooth headset does under WirePlumber 0.5.17 every time something
+/// starts or stops recording from it: its sink is removed and comes back under the same name once
+/// the new profile's link is up, about half a second later (`docs/0.4.0-upstream.md`, U8). Short
+/// enough that a node that really has gone for good — a card switched by the user to a profile
+/// with no output, an HDMI port whose screen went to sleep — leaves the lane playing into nothing
+/// for no longer than a user would wait before reaching for the volume.
+pub(crate) const RETURN_WAIT: Duration = Duration::from_millis(2500);
+
+/// A lane waiting for the node it was attached to (`docs/0.4.0-upstream.md`, U8): the node went,
+/// but the card it belongs to stayed, so it is a card between profiles and the node is expected
+/// back under its name. Until it is, until [`RETURN_WAIT`] is up, or until the card goes after all
+/// ([`remove_card`]), the lane's rules do not run, and nothing chooses another device for it.
+///
+/// Without this, the next supervisor tick found the target gone and moved the lane to whatever
+/// else there was — for a Bluetooth headset switching to its call profile, the laptop's speakers,
+/// for the half second the switch takes and then back. With it the lane's pair stays as it is:
+/// its device-facing stream is left unlinked and waiting by WirePlumber, which neither moves it
+/// nor destroys it ([`stream_props`]), and when the node comes back the rules find it under a
+/// serial the pair was not built on and rebuild on it ([`is_same_node`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Hold {
+    /// `node.name` of the node the lane waits for.
+    target: String,
+    /// When the lane stops waiting and chooses another device.
+    until: Instant,
+    /// The node's `device.id` and `api.bluez5.address`, kept from the node that went: what ties
+    /// the wait to its card ([`Self::card_present`]).
+    card_id: Option<u32>,
+    bluez_address: Option<String>,
+}
+
+impl Hold {
+    /// What a lane whose pair is attached to `attached_to` does when `removed` goes, with `cards`
+    /// still in the graph: wait for it, or `None` to choose another device at once.
+    ///
+    /// Only the lane's own target is waited for — any other node going is news for the rules as
+    /// usual — and only when its card stayed ([`DeviceInfo::card_present`]). A hold already running
+    /// for the same node keeps its deadline, so a node that comes and goes faster than the rules
+    /// run cannot keep the lane waiting for ever.
+    fn after_removal(
+        removed: &DeviceInfo,
+        attached_to: Option<&str>,
+        cards: &[Card],
+        running: Option<&Self>,
+        now: Instant,
+    ) -> Option<Self> {
+        if attached_to != Some(removed.name.as_str()) || !removed.card_present(cards) {
+            return None;
+        }
+        if let Some(running) = running
+            && running.target == removed.name
+            && now < running.until
+        {
+            return Some(running.clone());
+        }
+        Some(Self {
+            target: removed.name.clone(),
+            until: now + RETURN_WAIT,
+            card_id: removed.card_id,
+            bluez_address: removed.bluez_address.clone(),
+        })
+    }
+
+    /// Whether the lane still waits: its node is not back, and the wait is not up.
+    fn waits(&self, now: Instant, back: bool) -> bool {
+        !back && now < self.until
+    }
+
+    /// Whether the card the node belonged to is still among `cards`, asked as the node was
+    /// ([`DeviceInfo::card_present`]).
+    ///
+    /// A hold begins only with its card there, so this turns false only when the card goes — and a
+    /// card that goes after its node is no card between profiles. It is a headset switched off, a
+    /// USB card pulled out, and the node is not coming back. The two go in one batch of registry
+    /// events, and the batch can name the node first: a Bluetooth device's nodes go as its
+    /// transports are released, before the device itself. Then the node's going finds the card
+    /// still listed and begins a hold that only the card's going can show to be wrong. (Named the
+    /// other way round, the node finds no card and no hold begins.)
+    fn card_present(&self, cards: &[Card]) -> bool {
+        cards
+            .iter()
+            .any(|card| card.owns(self.card_id, self.bluez_address.as_deref()))
+    }
+}
+
+/// Whether a device is the very node a pair was built on: its `node.name` **and** its
+/// `object.serial`.
+///
+/// The name alone cannot tell. A Bluetooth headset switching profile — or any node removed and
+/// added back — comes back under the same name as a new node, and a device-facing stream that is
+/// `node.dont-reconnect` is never linked again by WirePlumber once it has been linked
+/// (`linking/prepare-link.lua:71-76`): the stream was *handled*, the link went with the old node,
+/// and a pair kept because the name matched would play into nothing. A new serial makes the rules
+/// rebuild it, and the new pair's stream is a new one WirePlumber links. When the server says no
+/// serial the name decides, as it did before.
+fn is_same_node(built_name: &str, built_serial: Option<u64>, device: &DeviceInfo) -> bool {
+    built_name == device.name && built_serial == device.object_serial
+}
 
 /// Where the process callbacks meet: a wait-free single-producer single-consumer ring of samples.
 ///
@@ -749,6 +877,9 @@ struct Nodes {
     second: pw::stream::StreamRc,
     /// `node.name` of the real device NODE 2 renders to, or NODE 1 captures from.
     target: String,
+    /// `object.serial` of that device's node when the pair was built: what tells it from a node
+    /// that comes back under the same name ([`is_same_node`]).
+    target_serial: Option<u64>,
     /// The node the input lane's NODE 1 records from instead of `target` itself: the echo
     /// canceller's source, while echo cancellation runs for this microphone ([`aec::route`]).
     /// `None` in every other pair. What the lane is attached to is still `target` — the canceller
@@ -775,16 +906,27 @@ struct PairFormat {
     /// The target's channel count, clamped to `2..=8` (`sndDevices.h:190-191`).
     channels: u32,
     rate: u32,
-    /// The target's own layout at that count.
+    /// The target's own channel positions when the clamp keeps its count, and PipeWire's default
+    /// layout for the clamped count otherwise — a mono device's pair runs `FL,FR`
+    /// ([`ChannelMap::resized`]).
     positions: ChannelMap,
+    /// What the voice chain is told the microphone really carries
+    /// ([`DeviceInfo::native_rate`]) — the input lane's alone; `None` in an output pair, whose
+    /// chain has no use for it. Part of the format so that a pair built before its microphone's
+    /// info said it was a Bluetooth headset — the registry global does not say — is rebuilt for
+    /// it, the way one built before its channel count arrived is. Once that info is in it stays:
+    /// a microphone names its codec, or never does, from its first info on.
+    source_rate: Option<u32>,
 }
 
 impl PairFormat {
     /// The format a pair attached to `target` runs at, with the graph's clock at `graph_rate`.
     ///
-    /// The target's channel count clamped to `2..=8`, its own channel positions, and — for the
-    /// output lane — the device's rate when it publishes one and the graph's clock rate when it
-    /// does not, which is most ALSA sinks. The input lane asks for [`CAPTURE_RATE`] whatever the
+    /// The target's channel count clamped to `2..=8`; its own channel positions when the clamp
+    /// keeps its count, PipeWire's default layout for the clamped count otherwise (a mono device
+    /// runs `FL,FR`, and the adapter converts between that and the device's `MONO`); and — for
+    /// the output lane — the device's rate when it publishes one and the graph's clock rate when
+    /// it does not, which is most ALSA sinks. The input lane asks for [`CAPTURE_RATE`] whatever the
     /// microphone runs at, and lets PipeWire resample. RNNoise exists at 48 kHz and nowhere else,
     /// and a voice preset has to mean one thing on every device — a preset whose denoiser
     /// silently drops out on a 44.1 kHz microphone is a preset describing half its own sound. The
@@ -800,6 +942,10 @@ impl PairFormat {
             channels,
             rate,
             positions: target.positions.resized(channels),
+            source_rate: match target.direction {
+                DeviceDirection::Input => target.native_rate_hz(),
+                DeviceDirection::Output => None,
+            },
         }
     }
 }
@@ -868,6 +1014,13 @@ impl GraphClock {
 struct NodeProbe {
     _listener: pw::node::NodeListener,
     _node: pw::node::Node,
+}
+
+/// A bound `Device` object, held only to receive its `info` event ([`Shared::card_probes`]), for
+/// the same reason and in the same drop order as a [`NodeProbe`].
+struct CardProbe {
+    _listener: pw::device::DeviceListener,
+    _device: pw::device::Device,
 }
 
 /// One PipeWire connection. Replaced wholesale on a reconnect.
@@ -1037,6 +1190,11 @@ struct Lane {
     last_target: Option<String>,
     /// Something this lane's device choice depends on changed. Only ever set on an enabled lane.
     needs_rules: bool,
+    /// The node this lane's pair is attached to went while its card stayed, and the lane waits for
+    /// it rather than choosing another device ([`Hold`]). Ends when the node comes back, when the
+    /// wait is up, and whenever the pair is not coming back as it was anyway: a device the user
+    /// picks, a detach, a connection that goes.
+    hold: Option<Hold>,
     /// Consecutive failed tries at this lane's pair, for its own backoff
     /// (`docs/spec/12-audio-io.md` §22). The socket keeps a separate count.
     attempts: u32,
@@ -1081,6 +1239,7 @@ impl Lane {
             kept_by_hand: false,
             last_target: None,
             needs_rules: false,
+            hold: None,
             attempts: 0,
             next_attempt: Instant::now(),
             built_at: None,
@@ -1166,6 +1325,14 @@ struct Shared {
     /// ([`close_session`]) and again as the next one is made ([`connect`]), so a probe on a dead
     /// core is never kept, let alone kept beside a new one for the same device.
     node_probes: std::collections::HashMap<u32, NodeProbe>,
+    /// Every card the registry reports — PipeWire's `Device` objects — keyed by registry global
+    /// id: what a lane asks, when its target node goes, to tell a card between profiles from a
+    /// device that has gone ([`Hold`]).
+    cards: Vec<Card>,
+    /// One bound proxy per card, kept alive only to receive its `info` event. A Bluetooth card's
+    /// address is not in its registry global, only in its info. Belongs to the session like
+    /// [`Self::node_probes`], and emptied with them.
+    card_probes: std::collections::HashMap<u32, CardProbe>,
     /// The session defaults, one per direction.
     defaults: PerDirection<DefaultState>,
     /// Whether the GUI has had its chance to attach a lane from the device list, before a claim
@@ -1223,6 +1390,9 @@ struct Shared {
     /// ([`close_session`]), so it never outlives the connection it was loaded beside, nor the
     /// context it was loaded into.
     aec: EchoCancel,
+    /// The output and input targets the user was last warned are one Bluetooth headset
+    /// ([`warn_of_one_headset_on_both_lanes`]), for as long as the lanes stay on them.
+    headset_warned: Option<(String, String)>,
 }
 
 impl Shared {
@@ -1246,6 +1416,8 @@ impl Shared {
             },
             devices: Vec::new(),
             node_probes: std::collections::HashMap::new(),
+            cards: Vec::new(),
+            card_probes: std::collections::HashMap::new(),
             defaults: PerDirection::default(),
             delivery: ListDelivery::default(),
             clock: GraphClock::default(),
@@ -1266,6 +1438,7 @@ impl Shared {
             link_groups_scheduled: Rc::new(Cell::new(false)),
             wake: None,
             aec: EchoCancel::new(aec::WEBRTC_LIBRARY),
+            headset_warned: None,
         }
     }
 
@@ -1839,12 +2012,15 @@ fn canceller_side(lane: &Lane) -> Side<'_> {
 /// A canceller that goes here — switched off, reloaded for other speakers or another microphone,
 /// or let go after going by itself — takes the input lane's capture stream off its source in the
 /// same call: if the lane's pair was recording from it, the lane's rules run now and rebuild the
-/// pair on the microphone. Now, and not on the next tick, because the stream must never be left
-/// aimed at a source that has gone. It carries no `node.dont-fallback`, and under a session
-/// manager a stream whose target vanishes is linked to whatever else it finds: the default source
-/// first, which while the input lane holds the default is FxSound's own. WirePlumber's `canLink`
-/// refuses that one (`fxsound_capture` and `fxsound_source` share `fxsound-input`), but not the
-/// best of the rest it tries next, which can be another microphone altogether.
+/// pair on the microphone. Now, and not on the next tick, because until a new pair is built the
+/// lane records nothing, and nothing else will change that. The capture stream is
+/// `node.dont-reconnect`, `node.dont-fallback` and `node.linger` ([`stream_props`]): WirePlumber
+/// linked it once, to the canceller's source, and with that source gone it leaves the stream
+/// unlinked and waiting for good — it never links a stream it has handled again, not to the
+/// microphone and not to a reloaded canceller's source, which is a new node under the old name.
+/// (Without those keys it would be worse: WirePlumber would link it to whatever else it found —
+/// past FxSound's own default source, which `canLink` refuses because the two share
+/// `fxsound-input`, to the best of the rest, which can be another microphone altogether.)
 ///
 /// The rebuild is a repair of the pair, on the microphone it was already on, so it leaves the
 /// default source as it finds it (`Lane::last_target`): a canceller reloaded because the *speakers*
@@ -1918,6 +2094,8 @@ fn select_device(shared: &mut Shared, direction: DeviceDirection, node_name: Str
     lane.attempts = 0;
     lane.next_attempt = Instant::now();
     lane.last_error = None;
+    // Nor is the lane still waiting for a node that went: the user has said where it goes.
+    lane.hold = None;
     if shared.ready() {
         shared.lanes.get_mut(direction).needs_rules = false;
         apply_rules(shared, direction);
@@ -2053,6 +2231,8 @@ fn connect(
     // default until this server's `settings` object says otherwise.
     guard.devices.clear();
     guard.node_probes.clear();
+    guard.cards.clear();
+    guard.card_probes.clear();
     guard.aec.forget_sources();
     guard.defaults = PerDirection::default();
     guard.clock = GraphClock::default();
@@ -2077,6 +2257,7 @@ fn connect(
         lane.attempts = 0;
         lane.next_attempt = now;
         lane.last_error = None;
+        lane.hold = None;
     }
     Ok(())
 }
@@ -2085,11 +2266,11 @@ fn connect(
 ///
 /// Both lanes' pairs first: every stream holds a reference to the core, so a pair left behind
 /// would keep the dead connection open under the next one — and dropping a pair is also what
-/// hands its DSP back through the lane's recycle channel. Then the node probes, each listener
-/// before its proxy ([`NodeProbe`]), while the core they were bound on is still there to destroy
-/// them. Then the session itself. Each lane keeps whether it is enabled, its memory and its DSP,
-/// so whatever comes next — a reconnect, or the end of the thread — finds the lanes as the user
-/// left them.
+/// hands its DSP back through the lane's recycle channel. Then the node and card probes, each
+/// listener before its proxy ([`NodeProbe`]), while the core they were bound on is still there to
+/// destroy them. Then the session itself. Each lane keeps whether it is enabled, its memory and
+/// its DSP, so whatever comes next — a reconnect, or the end of the thread — finds the lanes as
+/// the user left them.
 fn close_session(shared: &mut Shared) {
     // The echo canceller first. It is on a connection of its own (`aec`), so nothing here depends
     // on it, but it was loaded for this server and these devices, and it is loaded again for the
@@ -2100,8 +2281,12 @@ fn close_session(shared: &mut Shared) {
         lane.nodes = None;
         lane.built_at = None;
         lane.status.clear();
+        // A node the lane was waiting for is waited for on this server only: the next one lists
+        // its devices afresh, and the rules choose among them.
+        lane.hold = None;
     }
     shared.node_probes.clear();
+    shared.card_probes.clear();
     shared.session = None;
     shared.barrier = Barrier::Registry;
     drain_recycled_dsp(shared);
@@ -2185,6 +2370,7 @@ fn disconnect(shared: &mut Shared, reason: &str) {
     close_session(shared);
     shared.state = State::Disconnected;
     shared.devices.clear();
+    shared.cards.clear();
     for (_, lane) in shared.lanes.iter_mut() {
         lane.previous_names.clear();
     }
@@ -2303,10 +2489,17 @@ fn supervise_lane(shared: &mut Shared, direction: DeviceDirection, now: Instant)
         shared.lanes.get_mut(direction).retry_later(now);
     }
 
-    // c. Rules and node creation, once the lane's backoff allows.
+    // c. Rules and node creation, once the lane's backoff allows — and not while the lane waits
+    //    for the node it was attached to, which went with its card still here ([`Hold`]). What
+    //    asked for the rules meanwhile stays asked, and they run the tick the node is back or the
+    //    wait is up.
     let lane = shared.lanes.get_mut(direction);
     lane.forgive_if_stable(now);
-    if lane.needs_rules && now >= lane.next_attempt && shared.ready() {
+    if lane.needs_rules
+        && now >= lane.next_attempt
+        && shared.ready()
+        && !held(shared, direction, now)
+    {
         shared.lanes.get_mut(direction).needs_rules = false;
         apply_rules(shared, direction);
     }
@@ -2319,6 +2512,36 @@ fn supervise_lane(shared: &mut Shared, direction: DeviceDirection, now: Instant)
     //    one step of the pacing that waits for time rather than for an event — and catch any wake
     //    the channel could not deliver.
     pace_second_node(shared, direction, now);
+}
+
+/// Whether a lane's rules wait for the node its pair was attached to ([`Hold`]). A hold that has
+/// ended — its node is back, or the wait is up — is let go of here, and the log says which.
+fn held(shared: &mut Shared, direction: DeviceDirection, now: Instant) -> bool {
+    let Some(hold) = shared.lanes.get(direction).hold.as_ref() else {
+        return false;
+    };
+    let back = shared
+        .devices
+        .iter()
+        .any(|device| device.direction == direction && device.name == hold.target);
+    if hold.waits(now, back) {
+        return true;
+    }
+    if back {
+        log::info!(
+            "{} is back; the {} lane attaches to it again",
+            hold.target,
+            direction.key()
+        );
+    } else {
+        log::info!(
+            "{} did not come back within {RETURN_WAIT:?}; the {} lane chooses another device",
+            hold.target,
+            direction.key()
+        );
+    }
+    shared.lanes.get_mut(direction).hold = None;
+    false
 }
 
 /// Tell a lane's NODE 2 to sleep or wake, if its pair is paced by hand and NODE 1 has asked for it
@@ -2429,6 +2652,20 @@ fn on_global(
                                     .get("audio.position")
                                     .and_then(ChannelMap::parse)
                                     .filter(|map| map.len() == channels as usize);
+                                let get = |key: &str| props.get(key);
+                                let address = devices::bluez_address(&get);
+                                on_node_address(&shared, object_id, address);
+                                // Only an info that carries the properties says anything about the
+                                // Bluetooth link; one for a state change carries none, and would
+                                // read as a node that is not Bluetooth.
+                                if info.change_mask().contains(pw::node::NodeChangeMask::PROPS) {
+                                    on_node_bluetooth(
+                                        &shared,
+                                        object_id,
+                                        BluezFacts::from_props(&get),
+                                        FormFactor::from_props(&get),
+                                    );
+                                }
                                 on_node_info(&shared, object_id, channels, positions);
                             }
                         })
@@ -2444,6 +2681,42 @@ fn on_global(
                 Err(err) => {
                     log::debug!("could not bind node {object_id} to read its format: {err}")
                 }
+            }
+        }
+        pw::types::ObjectType::Device => {
+            // A card: nothing to attach to, only something a node can belong to ([`Hold`]).
+            let card = Card::from_props(global.id, &|key: &str| props.get(key));
+            let id = card.object_id;
+            let bluetooth = card.bluetooth;
+            guard.cards.retain(|known| known.object_id != id);
+            guard.cards.push(card);
+            if bluetooth {
+                adopt_bluetooth_card(&mut guard, id);
+            }
+            // A Bluetooth card's address is in its info, not in the registry global.
+            match registry.bind::<pw::device::Device, _>(global) {
+                Ok(device) => {
+                    let listener = device
+                        .add_listener_local()
+                        .info({
+                            let shared = Rc::clone(shared);
+                            move |info| {
+                                if let Some(props) = info.props() {
+                                    let card = Card::from_props(id, &|key: &str| props.get(key));
+                                    on_card_info(&shared, card);
+                                }
+                            }
+                        })
+                        .register();
+                    guard.card_probes.insert(
+                        id,
+                        CardProbe {
+                            _listener: listener,
+                            _device: device,
+                        },
+                    );
+                }
+                Err(err) => log::debug!("could not bind card {id} to read its address: {err}"),
             }
         }
         pw::types::ObjectType::Metadata => {
@@ -2494,7 +2767,17 @@ fn on_global(
 /// Only the lane of the device's direction can care, and only while it is enabled: a new sink
 /// has nothing to say to the microphone's lane, and a microphone plugged in while the input lane
 /// is detached must not attach it.
-fn add_device(shared: &mut Shared, device: DeviceInfo) {
+fn add_device(shared: &mut Shared, mut device: DeviceInfo) {
+    // A node on a Bluetooth card is Bluetooth from its registry global on, which says nothing
+    // else about it: WirePlumber 0.5's microphone is a headset's before its info arrives.
+    if device.card_id.is_some_and(|id| {
+        shared
+            .cards
+            .iter()
+            .any(|card| card.object_id == id && card.bluetooth)
+    }) {
+        device.on_bluetooth_card();
+    }
     let direction = device.direction;
     shared
         .devices
@@ -2512,6 +2795,13 @@ fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
         log::debug!("the echo canceller's source went away ({id})");
         return;
     }
+    if remove_card(&mut guard, id) {
+        return;
+    }
+    // Every bound node's probe goes with its node, a device or not: one of WirePlumber's internal
+    // Bluetooth nodes is bound like any other before its info says what it is, and is no device
+    // by the time it goes ([`forget_internal_node`]).
+    guard.node_probes.remove(&id);
     let Some(removed) = remove_device(&mut guard, id) else {
         return;
     };
@@ -2534,7 +2824,214 @@ fn remove_device(shared: &mut Shared, id: u32) -> Option<DeviceInfo> {
     shared.node_probes.remove(&id);
     shared.needs_publish = true;
     shared.mark_lane_for_rules(removed.direction);
+    hold_for_return(shared, &removed, Instant::now());
     Some(removed)
+}
+
+/// A registry global went away. Returns whether it was a card.
+///
+/// A lane waiting for a node of the card waits no more, and its rules run on the next tick: the
+/// node went because its card did, not because the card is changing profile
+/// ([`Hold::card_present`]). Without this, a headset switched off — its sink reported gone before
+/// its card, in the same batch — left the lane playing into nothing for the whole of
+/// [`RETURN_WAIT`].
+fn remove_card(shared: &mut Shared, id: u32) -> bool {
+    let Some(index) = shared.cards.iter().position(|card| card.object_id == id) else {
+        return false;
+    };
+    shared.cards.remove(index);
+    shared.card_probes.remove(&id);
+    log::debug!("card {id} went away");
+    for direction in DeviceDirection::ALL {
+        let lane = shared.lanes.get_mut(direction);
+        let Some(hold) = lane.hold.take_if(|hold| !hold.card_present(&shared.cards)) else {
+            continue;
+        };
+        log::info!(
+            "{} went with its card: the {} lane stops waiting for it and chooses another device",
+            hold.target,
+            direction.key()
+        );
+        shared.mark_lane_for_rules(direction);
+    }
+    true
+}
+
+/// A node went. When it is the one its lane is on, and the card it belongs to is still here, the
+/// lane waits for it to come back rather than have the rules move it elsewhere on the next tick
+/// ([`Hold`]).
+///
+/// "The one its lane is on" is the pair's target, or — between pairs, while a pair that failed
+/// waits out its backoff — the device the last pair was built on. A node the lane is not on
+/// changes nothing about a hold the lane already has: it is news for the rules, which run once
+/// the hold ends.
+fn hold_for_return(shared: &mut Shared, removed: &DeviceInfo, now: Instant) {
+    let direction = removed.direction;
+    let lane = shared.lanes.get(direction);
+    let on = lane
+        .nodes
+        .as_ref()
+        .map(|nodes| nodes.target.as_str())
+        .or(lane.last_target.as_deref());
+    if !lane.enabled || on != Some(removed.name.as_str()) {
+        return;
+    }
+    let hold = Hold::after_removal(removed, on, &shared.cards, lane.hold.as_ref(), now);
+    match &hold {
+        Some(hold) if lane.hold.as_ref() != Some(hold) => log::info!(
+            "{} went, but its card is still here: the {} lane waits up to {RETURN_WAIT:?} for it \
+             to come back",
+            removed.name,
+            direction.key()
+        ),
+        Some(_) => {}
+        None => log::info!(
+            "{} went, and nothing it belonged to is left: the {} lane chooses another device",
+            removed.name,
+            direction.key()
+        ),
+    }
+    shared.lanes.get_mut(direction).hold = hold;
+}
+
+/// A bound card reported its info: keep its Bluetooth address, which its registry global does not
+/// carry, and whether it is Bluetooth at all. An info that does not say leaves what is known as it
+/// is — a card's info is sent again on every change to its profiles and routes, and says what
+/// changed.
+fn on_card_info(shared: &Rc<RefCell<Shared>>, reported: Card) {
+    if reported.bluez_address.is_none() && !reported.bluetooth {
+        return;
+    }
+    let Ok(mut guard) = shared.try_borrow_mut() else {
+        return;
+    };
+    let Some(card) = guard
+        .cards
+        .iter_mut()
+        .find(|card| card.object_id == reported.object_id)
+    else {
+        return;
+    };
+    if reported.bluez_address.is_some() {
+        card.bluez_address = reported.bluez_address;
+    }
+    // The registry global says `device.api` already, so this is news only for a card announced
+    // without it; kept once known, like the address.
+    let newly_bluetooth = reported.bluetooth && !card.bluetooth;
+    card.bluetooth |= reported.bluetooth;
+    if newly_bluetooth {
+        adopt_bluetooth_card(&mut guard, reported.object_id);
+    }
+}
+
+/// A card turned out to be Bluetooth: every node that names it in `device.id` is a Bluetooth
+/// node, whatever its own properties have had time to say ([`DeviceInfo::on_bluetooth_card`]).
+fn adopt_bluetooth_card(shared: &mut Shared, card_id: u32) {
+    let changed: Vec<u32> = shared
+        .devices
+        .iter_mut()
+        .filter(|device| device.card_id == Some(card_id))
+        .filter_map(|device| device.on_bluetooth_card().then_some(device.object_id))
+        .collect();
+    for object_id in changed {
+        device_reclassified(shared, object_id);
+    }
+}
+
+/// A bound node reported its properties. What they say about the Bluetooth link behind it — which
+/// its registry global does not carry — is taken ([`DeviceInfo::learn_bluetooth`]), and one of
+/// WirePlumber's internal Bluetooth nodes stops being a device ([`forget_internal_node`]).
+fn on_node_bluetooth(
+    shared: &Rc<RefCell<Shared>>,
+    object_id: u32,
+    reported: BluezFacts,
+    form_factor: FormFactor,
+) {
+    let Ok(mut guard) = shared.try_borrow_mut() else {
+        return;
+    };
+    if reported.internal {
+        forget_internal_node(&mut guard, object_id);
+        return;
+    }
+    let Some(device) = guard.devices.iter_mut().find(|d| d.object_id == object_id) else {
+        return;
+    };
+    if device.learn_bluetooth(reported, form_factor) {
+        device_reclassified(&mut guard, object_id);
+    }
+}
+
+/// What a device is has changed — a headset's now, a plain microphone no more — while its format
+/// has not: the GUI's list says so, and a pair attached to it that was built for what it was
+/// before is rebuilt for what it is ([`PairFormat::source_rate`]).
+fn device_reclassified(shared: &mut Shared, object_id: u32) {
+    let Some(device) = shared.devices.iter().find(|d| d.object_id == object_id) else {
+        return;
+    };
+    log::debug!(
+        "{}: {}{}",
+        device.name,
+        device.form_factor.key(),
+        match device.native_rate_hz() {
+            Some(rate) if device.bluez_headset => format!(", a Bluetooth headset at {rate} Hz"),
+            _ => String::new(),
+        }
+    );
+    let wanted = PairFormat::for_target(device, shared.clock.rate());
+    let stale = shared
+        .lanes
+        .get(device.direction)
+        .nodes
+        .as_ref()
+        .is_some_and(|nodes| nodes.target == device.name && nodes.format != wanted);
+    let (name, direction) = (device.name.clone(), device.direction);
+    shared.needs_publish = true;
+    if stale {
+        log::info!(
+            "{name} carries {}, not what the {} lane's pair was built for; rebuilding it",
+            wanted.source_rate.map_or_else(
+                || "the stream's rate".to_owned(),
+                |rate| format!("{rate} Hz")
+            ),
+            direction.key()
+        );
+        shared.mark_lane_for_rules(direction);
+    }
+}
+
+/// A node the registry listed as a device turned out, from its info, to be one of WirePlumber's
+/// internal Bluetooth nodes ([`BluezFacts::internal`]): the SCO source behind WirePlumber 0.5's
+/// loopback microphone, which carries the same `bluez_input.<addr>.0` name WirePlumber 0.4 gave the
+/// microphone itself. It leaves the list without a trace — no wait for it to come back, as a
+/// device that went would get — and its lane's rules run again, in case they took it in the moment
+/// before its info arrived. The node's probe stays until the node goes: this runs inside the
+/// probe's own callback.
+fn forget_internal_node(shared: &mut Shared, object_id: u32) {
+    let Some(index) = shared.devices.iter().position(|d| d.object_id == object_id) else {
+        return;
+    };
+    let node = shared.devices.remove(index);
+    log::debug!(
+        "{} is one of WirePlumber's internal Bluetooth nodes, not a device",
+        node.name
+    );
+    shared.needs_publish = true;
+    shared.mark_lane_for_rules(node.direction);
+}
+
+/// A bound node reported its Bluetooth address, which its registry global does not carry either:
+/// the second way to tell which card it belongs to ([`DeviceInfo::card_present`]).
+fn on_node_address(shared: &Rc<RefCell<Shared>>, object_id: u32, address: Option<String>) {
+    let Some(address) = address else {
+        return;
+    };
+    let Ok(mut guard) = shared.try_borrow_mut() else {
+        return;
+    };
+    if let Some(device) = guard.devices.iter_mut().find(|d| d.object_id == object_id) {
+        device.bluez_address = Some(address);
+    }
 }
 
 /// A bound node reported its format. Fill in what the registry could not tell us — and whatever
@@ -2966,6 +3463,8 @@ fn teardown_nodes(shared: &mut Shared, direction: DeviceDirection) {
     let lane = shared.lanes.get_mut(direction);
     lane.last_target = None;
     lane.kept_by_hand = false;
+    // And it waits for nothing: there is no pair left to keep for a node that went.
+    lane.hold = None;
 }
 
 /// Choose a lane's device and make sure its pair is attached to it (`docs/spec/12-audio-io.md`
@@ -2974,6 +3473,13 @@ fn teardown_nodes(shared: &mut Shared, direction: DeviceDirection) {
 /// A disabled lane is left alone, whatever asked: it has no pair and must not grow one.
 fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
     if !shared.lanes.get(direction).enabled {
+        return;
+    }
+    // A lane waiting for the node it was on chooses nothing until the node is back or the wait is
+    // up ([`Hold`]), whoever asked — the supervisor does not ask meanwhile, but the echo canceller
+    // going does. The ask is kept for when it ends.
+    if held(shared, direction, Instant::now()) {
+        shared.lanes.get_mut(direction).needs_rules = true;
         return;
     }
     let ours = our_node_name(direction);
@@ -3027,13 +3533,18 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
         DeviceDirection::Input => shared.aec.route(&target.name),
         DeviceDirection::Output => None,
     };
+    // And attached to this very node, not only to one of its name: a node that went and came back
+    // — a Bluetooth headset between profiles — is a new node, and WirePlumber never links a pair's
+    // old stream to it ([`is_same_node`]).
     let already = shared
         .lanes
         .get(direction)
         .nodes
         .as_ref()
         .is_some_and(|nodes| {
-            nodes.target == target.name && nodes.format == format && nodes.via == route
+            is_same_node(&nodes.target, nodes.target_serial, &target)
+                && nodes.format == format
+                && nodes.via == route
         });
     if already {
         // Nothing to do. An error this lane reported is forgotten once its pair has proved
@@ -3104,7 +3615,10 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
 /// Windows design wholesale — no `IPolicyConfigVista::SetDeviceFormat`, no rate pushed onto a
 /// driver, no zero-order-hold upsampler. If the real device wants something else, the adapter in
 /// front of it converts — which is also how a mono microphone arrives here as the stereo pair the
-/// DSP runs on.
+/// DSP runs on, and how the output lane's stereo pair reaches a mono headset: NODE 1 stays stereo
+/// ([`DeviceInfo::clamped_channels`]) and the playback stream, which leaves `stream.dont-remix`
+/// off, is down-mixed by its adapter. Nothing is refused for being mono: the Windows rules refused
+/// a mono sink only to dodge a bug in their own driver (`sndDevices.h:32-39`).
 ///
 /// `via` is the node the input lane's capture stream records from instead of the microphone — the
 /// echo canceller's source ([`aec::route`]) — or `None` to record the microphone itself. The pair's
@@ -3121,14 +3635,12 @@ fn build_nodes(
     };
     let core = session.core.clone();
 
-    if target.is_refused_mono() {
-        return Err(AudioError::NoValidOutput);
-    }
     let direction = target.direction;
     let PairFormat {
         channels,
         rate,
         positions,
+        source_rate,
     } = format;
     let quantum = DEFAULT_QUANTUM_FRAMES.min(MAX_QUANTUM_FRAMES as u32);
     let latency = format!("{quantum}/{rate}");
@@ -3186,7 +3698,7 @@ fn build_nodes(
     // cannot tell the voice chain how much bandwidth is in the signal; the device's properties
     // can, and the adaptive de-esser places its corner from them (`docs/0.4.0-design.md` §6).
     // The music chain has no use for it and its lane ignores it.
-    dsp.set_source_rate(target.native_rate());
+    dsp.set_source_rate(source_rate.map(|rate| rate as f32));
     // The subwoofer and the front pair: the music chain's business, ignored by the voice chain's
     // lane, which has no stage that mixes one channel into another.
     dsp.set_layout(positions.lfe_index(), positions.front_pair());
@@ -3335,6 +3847,7 @@ fn build_nodes(
         first,
         second,
         target: target.name.clone(),
+        target_serial: target.object_serial,
         via,
         format,
         pace,
@@ -3409,7 +3922,8 @@ fn virtual_node_props(
 /// The properties of the stream that touches the real device — the playback stream of the output
 /// lane, the capture stream of the input lane (`docs/spec/12-audio-io.md` §20 NODE 2, §28.2
 /// NODE 1). `target` is the real device's `node.name`; `passive` says whether the stream's link
-/// to it may keep it awake (module docs, "Idle").
+/// to it may keep it awake (module docs, "Idle"). WirePlumber links it to `target` once and never
+/// moves it (module docs, "A device that blinks").
 fn stream_props(
     direction: DeviceDirection,
     target: &str,
@@ -3445,7 +3959,28 @@ fn stream_props(
         // and the graph feeds back.
         *pw::keys::NODE_LINK_GROUP     => link_group(direction),
         *pw::keys::NODE_AUTOCONNECT    => "true",
-        *pw::keys::NODE_DONT_RECONNECT => "false",
+        // Where this stream plays is the rules' choice and nobody else's, and these three say so
+        // to WirePlumber (module docs, "A device that blinks"). As 0.5.17 reads them:
+        //
+        // `node.dont-reconnect`: once linked, the stream is never moved. Not onto a new default
+        // while its link stands (`linking/prepare-link.lua:63-67`: "dont-reconnect, not
+        // moving"). Not onto the fallback device when its target goes — the link goes with the
+        // target, and a stream that has been linked once is not linked again (`:71-76`) — and,
+        // by the same check, not back onto its target when that comes back. A node that comes
+        // back is a new node, and the rules rebuild the pair on it ([`is_same_node`]). 0.3.0 left
+        // this `false`, and WirePlumber moved the stream onto the laptop's speakers by itself the
+        // moment a Bluetooth headset switched profile.
+        //
+        // `node.dont-fallback`: a target that is not there when the stream is first linked is
+        // waited for, not replaced by the default device (`find-defined-target.lua:116-128`).
+        //
+        // `node.linger`: and the stream is kept while it waits. Without it, both of those places
+        // send the stream an error and destroy it instead (`find-defined-target.lua:117-123`,
+        // `prepare-link.lua:106-119`), and a pair built a moment before its target went would
+        // lose its device-facing stream under it.
+        *pw::keys::NODE_DONT_RECONNECT => "true",
+        "node.dont-fallback"           => "true",
+        "node.linger"                  => "true",
         // Passive, the playback stream's link no longer keeps the speakers running; what runs it
         // is the virtual sink, whenever an application's link makes that run, because the server
         // runs a link-group together. That is true from PipeWire 0.3.68 on, and only there does
@@ -3455,6 +3990,10 @@ fn stream_props(
         // stream is never passive. It is what makes the microphone produce anything at all.
         *pw::keys::NODE_PASSIVE        => if passive { "true" } else { "false" },
         *pw::keys::NODE_LATENCY        => latency,
+        // Remixing stays on: it is what lets the pair run stereo on a device that is not. The
+        // adapter down-mixes the playback stream into a mono headset and up-mixes a mono
+        // microphone into the capture stream, and the session manager sets the stream's ports up
+        // at the device's own layout only while this is off.
         *pw::keys::STREAM_DONT_REMIX   => "false",
         *pw::keys::TARGET_OBJECT       => target,
         *pw::keys::APP_NAME            => "FxSound",
@@ -3756,6 +4295,7 @@ fn publish(shared: &mut Shared) {
     for direction in DeviceDirection::ALL {
         publish_lane(shared, direction);
     }
+    warn_of_one_headset_on_both_lanes(shared);
 
     // Echo cancellation starting, stopping or failing, once per change.
     if let Some((running, detail)) = shared.aec.news() {
@@ -3844,10 +4384,74 @@ fn publish_attachment(shared: &mut Shared, direction: DeviceDirection) {
     }
 }
 
+/// Warn the user, once per attachment, when both lanes are on one Bluetooth headset — its sink
+/// and its microphone ([`DeviceInfo::same_bluetooth_device`]) — with [`ONE_HEADSET_ON_BOTH_LANES`]
+/// in the language in effect.
+///
+/// Nothing is wrong, so it is not an error, and nothing is refused: it may be exactly what the
+/// user wants for a call. But the moment anything records from FxSound (Input), WirePlumber
+/// switches the headset to its call profile, and the music lane's sink comes back as one channel
+/// at the call codec's rate — no stereo, and every EQ band above half of it dead
+/// (`docs/0.4.0-upstream.md` U9, the review's risk chain, step 7). Nobody would guess why.
+///
+/// "Once per attachment" is judged by what the lanes told the GUI they are attached to
+/// ([`Lane::attached`]), so it follows the user's choices rather than the pairs' comings and
+/// goings: a lane that is merely between pairs — a repair, a profile switch it waits out, a
+/// reconnect — changes nothing, while a lane that detaches or moves to another device ends the
+/// warning, and coming back to the headset is a new attachment that warns again. A target not in
+/// the device list — a sink between profiles — is judged when it is back.
+fn warn_of_one_headset_on_both_lanes(shared: &mut Shared) {
+    let (output, input) = (&shared.lanes.output, &shared.lanes.input);
+    if !output.enabled || !input.enabled {
+        shared.headset_warned = None;
+        return;
+    }
+    let (Some(output), Some(input)) = (output.attached.as_deref(), input.attached.as_deref())
+    else {
+        return;
+    };
+    if shared
+        .headset_warned
+        .as_ref()
+        .is_some_and(|(o, i)| o == output && i == input)
+    {
+        return;
+    }
+    let find = |direction: DeviceDirection, name: &str| {
+        shared
+            .devices
+            .iter()
+            .find(|device| device.direction == direction && device.name == name)
+    };
+    let one_headset = match (
+        find(DeviceDirection::Output, output),
+        find(DeviceDirection::Input, input),
+    ) {
+        (Some(sink), Some(microphone)) => sink.same_bluetooth_device(microphone, &shared.cards),
+        _ => false,
+    };
+    let told = one_headset.then(|| (output.to_owned(), input.to_owned()));
+    shared.headset_warned = None;
+    let Some(told) = told else {
+        return;
+    };
+    log::info!(
+        "{} and {} are one Bluetooth headset: its music drops to call quality while anything \
+         records from FxSound (Input)",
+        told.0,
+        told.1
+    );
+    shared.notify(AudioToUi::Warning {
+        direction: None,
+        message: fxsound_core::i18n::tr(ONE_HEADSET_ON_BOTH_LANES),
+    });
+    shared.headset_warned = Some(told);
+}
+
 /// The device list as the GUI wants it: every output sorted by description, then every input
 /// sorted by description. The GUI draws its section headers off that grouping, so the order is
-/// part of the contract. Mono *outputs* are left out (they could never be chosen); mono inputs
-/// stay in.
+/// part of the contract. Every device is listed, mono ones included: a Bluetooth headset in its
+/// call profile is an output like any other, and one the user may well want to pick.
 fn published_devices(shared: &Shared) -> Vec<AudioDevice> {
     let mut published = Vec::with_capacity(shared.devices.len());
     for (direction, default) in shared.defaults.iter() {
@@ -3855,7 +4459,7 @@ fn published_devices(shared: &Shared) -> Vec<AudioDevice> {
         let mut group: Vec<AudioDevice> = shared
             .devices
             .iter()
-            .filter(|d| d.direction == direction && !d.is_refused_mono())
+            .filter(|d| d.direction == direction)
             .map(|d| d.to_audio_device(default))
             .collect();
         group.sort_by(|a, b| a.description.cmp(&b.description));
@@ -4565,6 +5169,50 @@ mod tests {
     }
 
     #[test]
+    fn both_device_facing_streams_are_linked_once_never_moved_and_kept_while_away() {
+        pw::init();
+        for (direction, target) in [
+            (DeviceDirection::Output, "bluez_output.00_11_22_33_44_55.1"),
+            (DeviceDirection::Input, "bluez_input.00_11_22_33_44_55.0"),
+        ] {
+            for passive in [true, false] {
+                let props = stream_props(direction, target, "512/48000", passive);
+                let key = direction.key();
+                assert_eq!(
+                    props.get("node.dont-reconnect"),
+                    Some("true"),
+                    "{key}: WirePlumber must not move the stream onto the fallback device"
+                );
+                assert_eq!(
+                    props.get("node.dont-fallback"),
+                    Some("true"),
+                    "{key}: a target that is away is waited for, not replaced by the default"
+                );
+                assert_eq!(
+                    props.get("node.linger"),
+                    Some("true"),
+                    "{key}: a stream waiting for its target is kept, not destroyed"
+                );
+                assert_eq!(
+                    props.get("target.object"),
+                    Some(target),
+                    "{key}: the stream still names its target"
+                );
+                assert_eq!(props.get("node.autoconnect"), Some("true"));
+            }
+        }
+        // The virtual nodes are linked *to* by applications and carry none of it.
+        let positions = ChannelMap::default_for(2);
+        for direction in DeviceDirection::ALL {
+            let virtual_node =
+                virtual_node_props(direction, None, 2, 48_000, &positions, "512/48000");
+            for key in ["node.dont-reconnect", "node.dont-fallback", "node.linger"] {
+                assert_eq!(virtual_node.get(key), None, "{}: {key}", direction.key());
+            }
+        }
+    }
+
+    #[test]
     fn a_missing_runtime_directory_is_rejected_before_any_thread_is_spawned() {
         assert!(preflight(None).is_err());
         assert!(preflight(Some(OsStr::new("/tmp"))).is_ok());
@@ -5246,6 +5894,864 @@ mod tests {
         assert!(!shared.lanes.input.needs_rules, "…and not the detached one");
     }
 
+    /// The headset's card, as the registry reports it once its info has arrived.
+    const HEADSET_CARD: u32 = 60;
+    const HEADSET_ADDRESS: &str = "00:11:22:33:44:55";
+    const HEADSET_SINK: &str = "bluez_output.00_11_22_33_44_55.1";
+    const SPEAKERS: &str = "alsa_output.pci-0000_00_1f.3.analog-stereo";
+
+    fn headset_card() -> Card {
+        Card {
+            object_id: HEADSET_CARD,
+            bluez_address: Some(HEADSET_ADDRESS.to_owned()),
+            bluetooth: true,
+        }
+    }
+
+    /// The headset's sink under registry id `object_id` and serial `serial`, on the headset's card.
+    fn headset_sink(object_id: u32, serial: u64) -> DeviceInfo {
+        DeviceInfo {
+            object_serial: Some(serial),
+            card_id: Some(HEADSET_CARD),
+            bluez_address: Some(HEADSET_ADDRESS.to_owned()),
+            ..device(object_id, HEADSET_SINK, DeviceDirection::Output)
+        }
+    }
+
+    /// An output lane on the headset — as the rules left it between pairs, which is all a test
+    /// without a server can build — beside the laptop's speakers, with the headset's card listed.
+    fn output_lane_on_the_headset() -> (Shared, Receiver<AudioToUi>) {
+        let (mut shared, messages) = shared_with_messages();
+        shared.cards.push(headset_card());
+        add_device(&mut shared, headset_sink(70, 70));
+        add_device(&mut shared, device(57, SPEAKERS, DeviceDirection::Output));
+        shared.lanes.output.last_target = Some(HEADSET_SINK.to_owned());
+        shared.lanes.output.needs_rules = false;
+        (shared, messages)
+    }
+
+    #[test]
+    fn a_node_back_under_its_name_with_a_new_serial_is_not_the_node_a_pair_was_built_on() {
+        let back = headset_sink(74, 74);
+        assert!(is_same_node(HEADSET_SINK, Some(74), &back));
+        assert!(
+            !is_same_node(HEADSET_SINK, Some(70), &back),
+            "the same name on a new node: WirePlumber will not link the old stream to it"
+        );
+        assert!(!is_same_node(SPEAKERS, Some(74), &back), "another device");
+        assert!(
+            !is_same_node(HEADSET_SINK, None, &back),
+            "a pair built without a serial on a device that has one now is not known to be on it"
+        );
+        let unnumbered = DeviceInfo {
+            object_serial: None,
+            ..back
+        };
+        assert!(
+            is_same_node(HEADSET_SINK, None, &unnumbered),
+            "with no serial on either side the name decides, as it did before"
+        );
+    }
+
+    #[test]
+    fn a_target_that_goes_while_its_card_stays_is_waited_for() {
+        let now = Instant::now();
+        let hold = Hold::after_removal(
+            &headset_sink(70, 70),
+            Some(HEADSET_SINK),
+            &[headset_card()],
+            None,
+            now,
+        );
+        assert_eq!(
+            hold,
+            Some(Hold {
+                target: HEADSET_SINK.to_owned(),
+                until: now + RETURN_WAIT,
+                card_id: Some(HEADSET_CARD),
+                bluez_address: Some(HEADSET_ADDRESS.to_owned()),
+            }),
+            "the wait keeps what tied the node to its card, for when the card goes too"
+        );
+        assert!(
+            RETURN_WAIT >= Duration::from_secs(2) && RETURN_WAIT <= Duration::from_secs(3),
+            "long enough for a profile switch, short enough not to be mistaken for a hang"
+        );
+    }
+
+    #[test]
+    fn a_target_that_goes_with_its_card_or_has_no_card_is_not_waited_for() {
+        let now = Instant::now();
+        assert_eq!(
+            Hold::after_removal(&headset_sink(70, 70), Some(HEADSET_SINK), &[], None, now),
+            None,
+            "the headset went with its sink: it has gone, not changed profile"
+        );
+        let virtual_sink = device(90, "easyeffects_sink", DeviceDirection::Output);
+        assert_eq!(
+            Hold::after_removal(
+                &virtual_sink,
+                Some("easyeffects_sink"),
+                &[headset_card()],
+                None,
+                now
+            ),
+            None,
+            "a node on no card has nothing to come back with"
+        );
+    }
+
+    #[test]
+    fn a_bluetooth_target_is_waited_for_when_only_its_address_ties_it_to_its_card() {
+        let now = Instant::now();
+        let unnumbered = DeviceInfo {
+            card_id: None,
+            ..headset_sink(70, 70)
+        };
+        assert!(
+            Hold::after_removal(
+                &unnumbered,
+                Some(HEADSET_SINK),
+                &[headset_card()],
+                None,
+                now
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn only_the_node_a_lane_is_on_is_waited_for() {
+        let now = Instant::now();
+        let cards = [headset_card()];
+        assert_eq!(
+            Hold::after_removal(&headset_sink(70, 70), Some(SPEAKERS), &cards, None, now),
+            None,
+            "the headset going is news for the rules of a lane on the speakers"
+        );
+        assert_eq!(
+            Hold::after_removal(&headset_sink(70, 70), None, &cards, None, now),
+            None,
+            "a lane on nothing waits for nothing"
+        );
+    }
+
+    #[test]
+    fn a_node_that_goes_again_before_the_rules_saw_it_back_keeps_the_first_deadline() {
+        let first = Instant::now();
+        let cards = [headset_card()];
+        let running = Hold::after_removal(
+            &headset_sink(70, 70),
+            Some(HEADSET_SINK),
+            &cards,
+            None,
+            first,
+        )
+        .expect("waited for");
+        let again = Hold::after_removal(
+            &headset_sink(74, 74),
+            Some(HEADSET_SINK),
+            &cards,
+            Some(&running),
+            first + Duration::from_secs(1),
+        );
+        assert_eq!(
+            again.as_ref(),
+            Some(&running),
+            "a node that blinks faster than the rules run cannot keep the lane waiting for ever"
+        );
+
+        let later = first + RETURN_WAIT + Duration::from_millis(1);
+        let afresh = Hold::after_removal(
+            &headset_sink(74, 74),
+            Some(HEADSET_SINK),
+            &cards,
+            Some(&running),
+            later,
+        );
+        assert_eq!(
+            afresh.map(|hold| hold.until),
+            Some(later + RETURN_WAIT),
+            "a hold whose time was up is no deadline to keep: the next departure waits afresh"
+        );
+    }
+
+    #[test]
+    fn a_hold_ends_when_its_node_is_back_or_its_time_is_up() {
+        let now = Instant::now();
+        let hold = Hold {
+            target: HEADSET_SINK.to_owned(),
+            until: now + RETURN_WAIT,
+            card_id: Some(HEADSET_CARD),
+            bluez_address: None,
+        };
+        assert!(hold.waits(now, false));
+        assert!(hold.waits(now + RETURN_WAIT - Duration::from_millis(1), false));
+        assert!(
+            !hold.waits(now, true),
+            "back: the rules attach to it at once"
+        );
+        assert!(!hold.waits(now + RETURN_WAIT, false), "time is up");
+    }
+
+    #[test]
+    fn a_target_that_goes_with_its_card_still_listed_holds_its_own_lane_and_no_other() {
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        shared.lanes.input.enabled = true;
+        shared.lanes.input.last_target = Some("alsa_input.mic".to_owned());
+        add_device(
+            &mut shared,
+            device(58, "alsa_input.mic", DeviceDirection::Input),
+        );
+
+        let removed = remove_device(&mut shared, 70).expect("the headset's sink");
+        assert_eq!(removed.name, HEADSET_SINK);
+        let hold = shared.lanes.output.hold.clone().expect("the lane waits");
+        assert_eq!(hold.target, HEADSET_SINK);
+        assert!(
+            shared.lanes.output.needs_rules,
+            "the rules are still asked for, for when the wait ends"
+        );
+        assert_eq!(
+            shared.lanes.input.hold, None,
+            "the microphone's lane is not on it"
+        );
+
+        let now = Instant::now();
+        assert!(held(&mut shared, DeviceDirection::Output, now));
+        assert!(!held(&mut shared, DeviceDirection::Input, now));
+        assert!(
+            shared.lanes.output.hold.is_some(),
+            "a hold that still holds is kept"
+        );
+        assert!(!held(&mut shared, DeviceDirection::Output, hold.until));
+        assert_eq!(
+            shared.lanes.output.hold, None,
+            "a hold whose time is up is let go of"
+        );
+    }
+
+    #[test]
+    fn a_target_back_under_its_name_ends_the_wait_at_once() {
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        remove_device(&mut shared, 70);
+        assert!(held(&mut shared, DeviceDirection::Output, Instant::now()));
+
+        // Back half a second later, as a new node: a new id and a new serial.
+        add_device(&mut shared, headset_sink(74, 74));
+        assert!(!held(&mut shared, DeviceDirection::Output, Instant::now()));
+        assert_eq!(shared.lanes.output.hold, None);
+        assert!(shared.lanes.output.needs_rules);
+    }
+
+    #[test]
+    fn a_target_that_goes_with_its_card_moves_its_lane_on_the_next_tick() {
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        shared.cards.clear();
+        remove_device(&mut shared, 70);
+        assert_eq!(shared.lanes.output.hold, None);
+        assert!(!held(&mut shared, DeviceDirection::Output, Instant::now()));
+        assert!(shared.lanes.output.needs_rules);
+    }
+
+    #[test]
+    fn a_card_that_goes_after_its_node_ends_the_wait_for_it() {
+        // A headset switched off: its sink is reported gone first, while its card is still
+        // listed, and the card a moment later in the same batch.
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        remove_device(&mut shared, 70);
+        assert!(shared.lanes.output.hold.is_some(), "the sink alone went");
+        shared.lanes.output.needs_rules = false;
+
+        assert!(remove_card(&mut shared, HEADSET_CARD));
+        assert_eq!(
+            shared.lanes.output.hold, None,
+            "with its card gone the headset is gone, not between profiles"
+        );
+        assert!(shared.cards.is_empty());
+        assert!(
+            shared.lanes.output.needs_rules,
+            "the rules are asked for again, so the next tick moves the lane"
+        );
+        assert!(!held(&mut shared, DeviceDirection::Output, Instant::now()));
+    }
+
+    #[test]
+    fn a_card_that_goes_after_a_node_tied_to_it_by_address_alone_ends_the_wait_too() {
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        // The same sink reported again, without a `device.id`: it replaces the one listed.
+        add_device(
+            &mut shared,
+            DeviceInfo {
+                card_id: None,
+                ..headset_sink(70, 70)
+            },
+        );
+        remove_device(&mut shared, 70);
+        assert!(shared.lanes.output.hold.is_some());
+
+        assert!(remove_card(&mut shared, HEADSET_CARD));
+        assert_eq!(shared.lanes.output.hold, None);
+    }
+
+    #[test]
+    fn a_card_the_waited_for_node_does_not_belong_to_leaves_the_wait_as_it_was() {
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        shared.cards.push(Card {
+            object_id: 45,
+            bluez_address: None,
+            bluetooth: false,
+        });
+        remove_device(&mut shared, 70);
+        let hold = shared.lanes.output.hold.clone();
+        assert!(hold.is_some());
+        shared.lanes.output.needs_rules = false;
+
+        assert!(remove_card(&mut shared, 45), "the speakers' card went");
+        assert_eq!(
+            shared.lanes.output.hold, hold,
+            "the headset's card is still here"
+        );
+        assert!(!shared.lanes.output.needs_rules);
+        assert_eq!(shared.cards, [headset_card()]);
+    }
+
+    #[test]
+    fn a_card_going_ends_only_the_wait_of_the_lane_on_one_of_its_nodes() {
+        // Both lanes wait: the output lane for the headset's sink, the input lane for a USB
+        // microphone whose card is changing profile.
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        shared.cards.push(Card {
+            object_id: 80,
+            bluez_address: None,
+            bluetooth: false,
+        });
+        shared.lanes.input.enabled = true;
+        shared.lanes.input.last_target = Some("alsa_input.usb-fifine".to_owned());
+        add_device(
+            &mut shared,
+            DeviceInfo {
+                card_id: Some(80),
+                ..device(81, "alsa_input.usb-fifine", DeviceDirection::Input)
+            },
+        );
+        remove_device(&mut shared, 70);
+        remove_device(&mut shared, 81);
+        let microphones_wait = shared.lanes.input.hold.clone();
+        assert!(shared.lanes.output.hold.is_some());
+        assert!(microphones_wait.is_some());
+
+        assert!(remove_card(&mut shared, HEADSET_CARD));
+        assert_eq!(shared.lanes.output.hold, None);
+        assert_eq!(
+            shared.lanes.input.hold, microphones_wait,
+            "the microphone's card did not go"
+        );
+    }
+
+    #[test]
+    fn a_global_that_is_no_card_is_left_to_the_rest_of_the_registry_handling() {
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        assert!(
+            !remove_card(&mut shared, 70),
+            "the headset's sink is a node"
+        );
+        assert_eq!(shared.cards, [headset_card()]);
+        assert_eq!(shared.devices.len(), 2, "and it is still listed");
+    }
+
+    #[test]
+    fn a_card_that_goes_before_its_node_leaves_nothing_to_wait_for() {
+        // The same batch named the other way round.
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        assert!(remove_card(&mut shared, HEADSET_CARD));
+        remove_device(&mut shared, 70);
+        assert_eq!(shared.lanes.output.hold, None);
+        assert!(shared.lanes.output.needs_rules);
+    }
+
+    #[test]
+    fn another_node_going_leaves_a_lanes_wait_as_it_was() {
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        remove_device(&mut shared, 70);
+        let hold = shared.lanes.output.hold.clone();
+        assert!(hold.is_some());
+        remove_device(&mut shared, 57);
+        assert_eq!(shared.lanes.output.hold, hold);
+    }
+
+    #[test]
+    fn a_detached_lane_waits_for_nothing() {
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        shared.lanes.output.enabled = false;
+        remove_device(&mut shared, 70);
+        assert_eq!(shared.lanes.output.hold, None);
+    }
+
+    #[test]
+    fn the_rules_of_a_lane_that_waits_choose_nothing_and_stay_asked_for() {
+        let (mut shared, messages) = output_lane_on_the_headset();
+        remove_device(&mut shared, 70);
+        shared.lanes.output.needs_rules = false;
+
+        apply_rules(&mut shared, DeviceDirection::Output);
+        assert!(shared.lanes.output.needs_rules);
+        assert!(
+            shared.lanes.output.previous_names.is_empty(),
+            "the rules did not run"
+        );
+        assert!(
+            drained(&messages).is_empty(),
+            "nothing was chosen, so nothing failed to be built"
+        );
+
+        // Once the wait is over the same call runs them — and, with no server here, fails to
+        // build on what it chose, which is how a test can see that it chose.
+        shared.lanes.output.hold = None;
+        apply_rules(&mut shared, DeviceDirection::Output);
+        assert_eq!(shared.lanes.output.previous_names, [SPEAKERS]);
+        assert!(drained(&messages).iter().any(|message| matches!(
+            message,
+            AudioToUi::Error {
+                direction: Some(DeviceDirection::Output),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_device_the_user_picks_or_a_detach_ends_the_wait_for_the_one_that_went() {
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        remove_device(&mut shared, 70);
+        assert!(shared.lanes.output.hold.is_some());
+        select_device(&mut shared, DeviceDirection::Output, SPEAKERS.to_owned());
+        assert_eq!(shared.lanes.output.hold, None);
+
+        let (mut shared, _messages) = output_lane_on_the_headset();
+        remove_device(&mut shared, 70);
+        detach_lane(&mut shared, DeviceDirection::Output);
+        assert_eq!(shared.lanes.output.hold, None);
+    }
+
+    #[test]
+    fn a_cards_address_and_a_nodes_are_learned_from_their_info_and_kept_through_silence() {
+        let (shared, _messages) = shared_with_messages();
+        let shared = Rc::new(RefCell::new(shared));
+        // As the registry announces it: `device.api` is in the global, the address is not.
+        shared.borrow_mut().cards.push(Card {
+            object_id: HEADSET_CARD,
+            bluez_address: None,
+            bluetooth: true,
+        });
+        add_device(
+            &mut shared.borrow_mut(),
+            DeviceInfo {
+                bluez_address: None,
+                ..headset_sink(70, 70)
+            },
+        );
+
+        on_card_info(&shared, headset_card());
+        on_node_address(&shared, 70, Some(HEADSET_ADDRESS.to_owned()));
+        assert_eq!(shared.borrow().cards, [headset_card()]);
+        assert_eq!(
+            shared.borrow().devices[0].bluez_address.as_deref(),
+            Some(HEADSET_ADDRESS)
+        );
+
+        // A route or profile change sends the info again without the address — without any
+        // properties at all.
+        on_card_info(
+            &shared,
+            Card {
+                object_id: HEADSET_CARD,
+                bluez_address: None,
+                bluetooth: false,
+            },
+        );
+        on_node_address(&shared, 70, None);
+        assert_eq!(shared.borrow().cards, [headset_card()]);
+        assert_eq!(
+            shared.borrow().devices[0].bluez_address.as_deref(),
+            Some(HEADSET_ADDRESS)
+        );
+    }
+
+    // ---- U9: WirePlumber 0.5's Bluetooth microphone, and one headset on both lanes -----------
+
+    /// WirePlumber 0.5's microphone for the headset: the loopback, named by the address.
+    const LOOPBACK: &str = "bluez_input.00:11:22:33:44:55";
+    /// The headset's SCO source: WirePlumber 0.5's internal node, WirePlumber 0.4's microphone.
+    const SCO_SOURCE: &str = "bluez_input.00_11_22_33_44_55.0";
+    const LAPTOP_MICROPHONE: &str = "alsa_input.pci-0000_00_1f.3.analog-stereo";
+
+    /// A source as the registry announces it: a name, a class, the card it names, and nothing
+    /// that says Bluetooth.
+    fn announced_source(object_id: u32, name: &str, card: Option<u32>) -> DeviceInfo {
+        let card = card.map(|id| id.to_string());
+        DeviceInfo::from_props(object_id, &|key: &str| match key {
+            "media.class" => Some(devices::SOURCE_MEDIA_CLASS),
+            "node.name" => Some(name),
+            "device.id" => card.as_deref(),
+            _ => None,
+        })
+        .expect("a source that is not one of ours")
+    }
+
+    /// What a node's info says, read the way the engine's info callback reads it.
+    fn info_of(pairs: &[(&str, &str)]) -> (BluezFacts, FormFactor) {
+        let get = |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+        (BluezFacts::from_props(&get), FormFactor::from_props(&get))
+    }
+
+    /// WirePlumber 0.5's loopback microphone's info (`create-loopback-node.lua:44-55`).
+    fn loopback_info() -> (BluezFacts, FormFactor) {
+        info_of(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", LOOPBACK),
+            ("bluez5.loopback", "true"),
+            ("device.id", "60"),
+        ])
+    }
+
+    /// Both lanes enabled, the headset's card listed, and its sink, its microphone, the laptop's
+    /// speakers and the laptop's microphone announced — the microphone with its info in.
+    fn both_lanes_beside_a_headset() -> (Rc<RefCell<Shared>>, Receiver<AudioToUi>) {
+        let (mut shared, messages) = shared_with_messages();
+        shared.lanes.input.enabled = true;
+        shared.cards.push(headset_card());
+        shared.cards.push(Card {
+            object_id: 45,
+            bluez_address: None,
+            bluetooth: false,
+        });
+        add_device(&mut shared, headset_sink(70, 70));
+        add_device(
+            &mut shared,
+            DeviceInfo {
+                card_id: Some(45),
+                ..device(57, SPEAKERS, DeviceDirection::Output)
+            },
+        );
+        add_device(
+            &mut shared,
+            announced_source(73, LOOPBACK, Some(HEADSET_CARD)),
+        );
+        add_device(
+            &mut shared,
+            announced_source(58, LAPTOP_MICROPHONE, Some(45)),
+        );
+        let shared = Rc::new(RefCell::new(shared));
+        let (facts, form_factor) = loopback_info();
+        on_node_bluetooth(&shared, 73, facts, form_factor);
+        (shared, messages)
+    }
+
+    /// Put each lane on a device, as `publish_attachment` records it once the lane's pair is up.
+    fn attach(shared: &Rc<RefCell<Shared>>, output: Option<&str>, input: Option<&str>) {
+        let mut guard = shared.borrow_mut();
+        guard.lanes.output.attached = output.map(str::to_owned);
+        guard.lanes.input.attached = input.map(str::to_owned);
+    }
+
+    /// The warnings the engine has sent since the last look.
+    fn warnings(messages: &Receiver<AudioToUi>) -> Vec<(Option<DeviceDirection>, String)> {
+        drained(messages)
+            .into_iter()
+            .filter_map(|message| match message {
+                AudioToUi::Warning { direction, message } => Some((direction, message)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn wireplumber_05s_microphone_is_a_headsets_from_its_registry_global_on_a_bluetooth_card() {
+        let (mut shared, _messages) = shared_with_messages();
+        shared.cards.push(headset_card());
+        add_device(
+            &mut shared,
+            announced_source(73, LOOPBACK, Some(HEADSET_CARD)),
+        );
+        let microphone = &shared.devices[0];
+        assert!(microphone.bluez.card);
+        assert!(microphone.bluez_headset);
+        assert_eq!(microphone.form_factor, devices::FormFactor::Headset);
+        assert_eq!(microphone.native_rate(), Some(16_000.0));
+
+        // A microphone on a card that is not Bluetooth is only a microphone.
+        shared.cards.push(Card {
+            object_id: 45,
+            bluez_address: None,
+            bluetooth: false,
+        });
+        add_device(
+            &mut shared,
+            announced_source(58, LAPTOP_MICROPHONE, Some(45)),
+        );
+        let laptop = &shared.devices[1];
+        assert!(!laptop.bluez_headset);
+        assert_eq!(laptop.form_factor, devices::FormFactor::Microphone);
+    }
+
+    #[test]
+    fn a_card_that_turns_out_to_be_bluetooth_makes_its_microphone_a_headsets() {
+        let (mut shared, _messages) = shared_with_messages();
+        // A card announced without `device.api`, and its microphone.
+        shared.cards.push(Card {
+            object_id: HEADSET_CARD,
+            bluez_address: None,
+            bluetooth: false,
+        });
+        add_device(
+            &mut shared,
+            announced_source(73, LOOPBACK, Some(HEADSET_CARD)),
+        );
+        shared.needs_publish = false;
+        assert!(!shared.devices[0].bluez_headset);
+
+        let shared = Rc::new(RefCell::new(shared));
+        on_card_info(&shared, headset_card());
+        let guard = shared.borrow();
+        assert!(guard.cards[0].bluetooth);
+        assert!(guard.devices[0].bluez_headset);
+        assert!(guard.needs_publish, "the GUI's list shows it as a headset");
+    }
+
+    #[test]
+    fn a_microphones_info_tells_the_engine_it_is_wireplumber_05s_loopback() {
+        let (shared, _messages) = shared_with_messages();
+        let shared = Rc::new(RefCell::new(shared));
+        // On no card the engine knows of: only the info can say.
+        add_device(
+            &mut shared.borrow_mut(),
+            announced_source(73, LOOPBACK, None),
+        );
+        shared.borrow_mut().needs_publish = false;
+        assert!(!shared.borrow().devices[0].bluez_headset);
+
+        let (facts, form_factor) = loopback_info();
+        on_node_bluetooth(&shared, 73, facts, form_factor);
+        let guard = shared.borrow();
+        assert!(guard.devices[0].bluez_headset);
+        assert_eq!(guard.devices[0].form_factor, devices::FormFactor::Headset);
+        assert!(guard.needs_publish);
+        assert_eq!(
+            published_devices(&guard)[0].form_factor,
+            "headset",
+            "and the GUI is shown a headset"
+        );
+    }
+
+    #[test]
+    fn an_internal_sco_source_leaves_the_list_once_its_info_says_so_and_is_not_waited_for() {
+        let (mut shared, _messages) = shared_with_messages();
+        shared.cards.push(headset_card());
+        shared.lanes.input.enabled = true;
+        add_device(
+            &mut shared,
+            announced_source(71, SCO_SOURCE, Some(HEADSET_CARD)),
+        );
+        add_device(
+            &mut shared,
+            announced_source(73, LOOPBACK, Some(HEADSET_CARD)),
+        );
+        shared.lanes.input.needs_rules = false;
+        shared.lanes.output.needs_rules = false;
+        shared.needs_publish = false;
+        let shared = Rc::new(RefCell::new(shared));
+
+        on_node_bluetooth(
+            &shared,
+            71,
+            info_of(&[
+                ("media.class", "Audio/Source"),
+                ("node.name", SCO_SOURCE),
+                ("api.bluez5.profile", "headset-head-unit"),
+                ("api.bluez5.codec", "msbc"),
+                ("api.bluez5.internal", "true"),
+                ("bluez5.loopback", "false"),
+            ])
+            .0,
+            devices::FormFactor::Headset,
+        );
+        {
+            let guard = shared.borrow();
+            let names: Vec<&str> = guard.devices.iter().map(|d| d.name.as_str()).collect();
+            assert_eq!(names, [LOOPBACK], "WirePlumber's own node is no microphone");
+            assert!(guard.needs_publish);
+            assert!(
+                guard.lanes.input.needs_rules,
+                "in case the rules took it before its info arrived"
+            );
+            assert!(
+                !guard.lanes.output.needs_rules,
+                "nothing the output lane cares about"
+            );
+            assert_eq!(
+                guard.lanes.input.hold, None,
+                "and it is not a device that went"
+            );
+        }
+
+        // When it goes for good — the headset back on A2DP — there is nothing left to take.
+        on_global_remove(&shared, 71);
+        assert_eq!(shared.borrow().devices.len(), 1);
+    }
+
+    #[test]
+    fn a_microphone_that_turns_out_to_be_a_headset_asks_for_a_pair_of_its_own() {
+        let plain = announced_source(73, LOOPBACK, None);
+        let mut headset = plain.clone();
+        let (facts, form_factor) = loopback_info();
+        headset.learn_bluetooth(facts, form_factor);
+        let before = PairFormat::for_target(&plain, DEFAULT_SAMPLE_RATE);
+        let after = PairFormat::for_target(&headset, DEFAULT_SAMPLE_RATE);
+        assert_eq!(before.source_rate, None);
+        assert_eq!(after.source_rate, Some(16_000));
+        assert_ne!(
+            before, after,
+            "a pair built before the info arrived was told the wrong bandwidth, and is rebuilt"
+        );
+        assert_eq!(
+            (before.channels, before.rate, before.positions),
+            (after.channels, after.rate, after.positions),
+            "nothing else about the pair changes"
+        );
+
+        // The music lane's pair has no voice chain to tell: a headset's sink changes nothing.
+        let sink = headset_sink(70, 70);
+        let call = DeviceInfo {
+            bluez_headset: true,
+            ..sink.clone()
+        };
+        assert_eq!(
+            PairFormat::for_target(&sink, DEFAULT_SAMPLE_RATE),
+            PairFormat::for_target(&call, DEFAULT_SAMPLE_RATE)
+        );
+    }
+
+    #[test]
+    fn one_headset_on_both_lanes_is_warned_about_once_per_attachment() {
+        let (shared, messages) = both_lanes_beside_a_headset();
+        drained(&messages);
+
+        attach(&shared, Some(HEADSET_SINK), Some(LOOPBACK));
+        warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        let told = warnings(&messages);
+        assert_eq!(
+            told,
+            [(None, fxsound_core::i18n::tr(ONE_HEADSET_ON_BOTH_LANES))],
+            "one warning, about both lanes, in the language in effect"
+        );
+        assert!(told[0].1.contains("16 kHz"));
+
+        // Every tick after says nothing new.
+        for _ in 0..3 {
+            warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        }
+        assert_eq!(warnings(&messages), []);
+
+        // A lane between pairs — a repair, a profile switch it waits out, a reconnect — is no new
+        // attachment.
+        attach(&shared, None, Some(LOOPBACK));
+        warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        attach(&shared, Some(HEADSET_SINK), Some(LOOPBACK));
+        warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        assert_eq!(warnings(&messages), []);
+
+        // The music moved to the speakers and back: a new attachment, and a new warning.
+        attach(&shared, Some(SPEAKERS), Some(LOOPBACK));
+        warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        assert_eq!(warnings(&messages), []);
+        attach(&shared, Some(HEADSET_SINK), Some(LOOPBACK));
+        warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        assert_eq!(warnings(&messages).len(), 1);
+
+        // The microphone lane detached and attached again: the same.
+        shared.borrow_mut().lanes.input.enabled = false;
+        attach(&shared, Some(HEADSET_SINK), None);
+        warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        shared.borrow_mut().lanes.input.enabled = true;
+        attach(&shared, Some(HEADSET_SINK), Some(LOOPBACK));
+        warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        assert_eq!(warnings(&messages).len(), 1);
+    }
+
+    #[test]
+    fn a_headsets_sink_beside_another_microphone_is_nothing_to_warn_about() {
+        let (shared, messages) = both_lanes_beside_a_headset();
+        drained(&messages);
+        for (output, input) in [
+            (HEADSET_SINK, LAPTOP_MICROPHONE),
+            (SPEAKERS, LOOPBACK),
+            // One sound card, and not a Bluetooth one.
+            (SPEAKERS, LAPTOP_MICROPHONE),
+        ] {
+            attach(&shared, Some(output), Some(input));
+            warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+            assert_eq!(warnings(&messages), [], "{output} and {input}");
+        }
+        // Nor while only one lane runs.
+        attach(&shared, Some(HEADSET_SINK), None);
+        warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        assert_eq!(warnings(&messages), []);
+    }
+
+    #[test]
+    fn a_headsets_sink_between_profiles_is_judged_once_it_is_back() {
+        let (shared, messages) = both_lanes_beside_a_headset();
+        drained(&messages);
+        remove_device(&mut shared.borrow_mut(), 70);
+        attach(&shared, Some(HEADSET_SINK), Some(LOOPBACK));
+        warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        assert_eq!(
+            warnings(&messages),
+            [],
+            "the sink is not in the list to judge"
+        );
+
+        add_device(&mut shared.borrow_mut(), headset_sink(74, 74));
+        warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        assert_eq!(warnings(&messages).len(), 1);
+    }
+
+    #[test]
+    fn wireplumber_04s_microphone_and_its_headsets_sink_are_warned_about_too() {
+        let (mut shared, messages) = shared_with_messages();
+        shared.lanes.input.enabled = true;
+        add_device(
+            &mut shared,
+            DeviceInfo {
+                card_id: None,
+                ..headset_sink(70, 70)
+            },
+        );
+        // WirePlumber 0.4 names the SCO source by address, profile and codec, and no card here.
+        add_device(&mut shared, announced_source(71, SCO_SOURCE, None));
+        let shared = Rc::new(RefCell::new(shared));
+        // Both ends of the SCO link say so in their info, and nowhere else.
+        let (facts, form_factor) = info_of(&[
+            ("api.bluez5.address", HEADSET_ADDRESS),
+            ("api.bluez5.profile", "headset-head-unit"),
+            ("api.bluez5.codec", "cvsd"),
+        ]);
+        for id in [70, 71] {
+            on_node_address(&shared, id, Some(HEADSET_ADDRESS.to_owned()));
+            on_node_bluetooth(&shared, id, facts, form_factor);
+        }
+        assert_eq!(
+            shared.borrow().devices[1].native_rate(),
+            Some(8_000.0),
+            "its codec's rate"
+        );
+        drained(&messages);
+
+        attach(&shared, Some(HEADSET_SINK), Some(SCO_SOURCE));
+        warn_of_one_headset_on_both_lanes(&mut shared.borrow_mut());
+        assert_eq!(warnings(&messages).len(), 1, "one address, one headset");
+    }
+
     #[test]
     fn a_default_that_moves_is_news_for_its_own_lane_only() {
         let shared = Rc::new(RefCell::new(shared_for_tests()));
@@ -5659,6 +7165,69 @@ mod tests {
         assert!(guard.defaults.input.disowned);
         hand_back_disowned_defaults(&mut guard);
         assert!(!guard.defaults.input.holding, "the opt-out was ignored");
+    }
+
+    #[test]
+    fn a_mono_headset_is_listed_among_the_outputs_the_gui_may_pick() {
+        // The list used to leave a mono output out altogether, because the rules would have
+        // refused it: a headset in its call profile simply vanished from the picker.
+        let (mut shared, messages) = shared_with_messages();
+        let headset = DeviceInfo::from_props(50, &|key: &str| match key {
+            "media.class" => Some(devices::SINK_MEDIA_CLASS),
+            "node.name" => Some("bluez_output.00_11_22_33_44_55.1"),
+            "node.description" => Some("Headset"),
+            "api.bluez5.profile" => Some("headset-head-unit"),
+            "audio.channels" => Some("1"),
+            _ => None,
+        })
+        .expect("a sink that is not one of ours");
+        assert!(headset.is_mono());
+        add_device(&mut shared, headset);
+        add_device(&mut shared, device(51, "speakers", DeviceDirection::Output));
+        add_device(
+            &mut shared,
+            device(52, "alsa_input.pci", DeviceDirection::Input),
+        );
+
+        let listed: Vec<(String, DeviceDirection, String)> = published_devices(&shared)
+            .into_iter()
+            .map(|d| (d.name, d.direction, d.form_factor))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (
+                    "bluez_output.00_11_22_33_44_55.1".to_owned(),
+                    DeviceDirection::Output,
+                    "headset".to_owned()
+                ),
+                (
+                    "speakers".to_owned(),
+                    DeviceDirection::Output,
+                    "unknown".to_owned()
+                ),
+                (
+                    "alsa_input.pci".to_owned(),
+                    DeviceDirection::Input,
+                    "microphone".to_owned()
+                ),
+            ],
+            "every output by description, the mono one included, then every input"
+        );
+
+        publish(&mut shared);
+        let sent = drained(&messages)
+            .into_iter()
+            .find_map(|message| match message {
+                AudioToUi::Devices(devices) => Some(devices),
+                _ => None,
+            });
+        assert!(
+            sent.is_some_and(|devices| devices
+                .iter()
+                .any(|d| d.name == "bluez_output.00_11_22_33_44_55.1")),
+            "the GUI is told about it"
+        );
     }
 
     #[test]

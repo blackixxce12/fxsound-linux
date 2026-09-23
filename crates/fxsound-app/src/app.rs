@@ -35,6 +35,7 @@ use crate::audio_link::{AudioLink, FakeEngine};
 use crate::calibration::{
     self, Calibration, CalibrationState, Command as CalibrationCommand, Lane,
 };
+use crate::cli::PresetCommand;
 use crate::events::{AppEvent, LaneState, Published};
 use crate::notify::{Message, Notifier};
 use fxsound_core::i18n::{self, tr, tr_args};
@@ -65,6 +66,143 @@ pub fn preset_name_available(existing: &[PresetEntry], name: &str) -> bool {
     }
     let wanted = wanted.to_lowercase();
     !existing.iter().any(|p| p.name.to_lowercase() == wanted)
+}
+
+/// Why a preset command is refused: the reasons the hamburger menu greys an item out
+/// (`FxMainWindow.cpp:536-543`), which the command line, the control socket and D-Bus answer with
+/// rather than doing what the menu would never offer (upstream `FxController.cpp:377-448`). One
+/// rule, [`App::preset_command_allowed`], for all of them.
+///
+/// The text ([`std::fmt::Display`]) is what `fxsound` prints on stderr and what a D-Bus caller
+/// gets with `org.fxsound.FxSound.Error.Refused`: English, and naming the options that get round
+/// it, like every other refusal of the command path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// `--preset` with a name the edit direction's list does not have; whether the other lane's
+    /// list has it, which is what the message then says how to reach.
+    UnknownPreset {
+        lane: DeviceDirection,
+        name: String,
+        other_lane_has_it: bool,
+    },
+    /// Nothing is selected to save, overwrite, undo, rename or delete.
+    NoPresetSelected,
+    /// Save New Preset or Overwrite with no unsaved changes: there is nothing to save.
+    NothingToSave {
+        preset: String,
+    },
+    /// Undo with no unsaved changes.
+    NothingToUndo {
+        preset: String,
+    },
+    /// Overwrite of a preset that ships with FxSound, which would leave a user copy shadowing it.
+    FactoryOverwrite {
+        preset: String,
+    },
+    FactoryRename {
+        preset: String,
+    },
+    FactoryDelete {
+        preset: String,
+    },
+    /// Rename of a preset with unsaved changes: what moves is the saved file, and the edits would
+    /// be left behind under a name that is gone.
+    UnsavedChanges {
+        preset: String,
+    },
+    /// Save New Preset or Rename to a name a preset already has, compared case-insensitively.
+    NameTaken {
+        name: String,
+    },
+    /// Save New Preset or Rename to a blank name.
+    EmptyName,
+    /// Save New Preset at the user-preset cap ([`App::max_user_presets`]).
+    LimitReached {
+        max: usize,
+    },
+}
+
+impl Refusal {
+    /// Whether the name is all that is wrong: Save New Preset and Rename Preset open an editor
+    /// under their row that asks for the name and checks it as it is typed, so the row itself is
+    /// offered whatever the name.
+    #[must_use]
+    pub const fn is_about_the_name(&self) -> bool {
+        matches!(self, Self::NameTaken { .. } | Self::EmptyName)
+    }
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPreset {
+                lane,
+                name,
+                other_lane_has_it,
+            } => {
+                write!(f, "no {} preset is called {name:?}", lane.key())?;
+                if *other_lane_has_it {
+                    let other = lane.other();
+                    write!(
+                        f,
+                        "; it is {} preset, so add --edit={} to select it",
+                        lane_noun(other),
+                        other.key()
+                    )?;
+                }
+                Ok(())
+            }
+            Self::NoPresetSelected => f.write_str("no preset is selected"),
+            Self::NothingToSave { preset } => {
+                write!(f, "{preset:?} has no unsaved changes to save")
+            }
+            Self::NothingToUndo { preset } => {
+                write!(f, "{preset:?} has no unsaved changes to undo")
+            }
+            Self::FactoryOverwrite { preset } => write!(
+                f,
+                "{preset:?} is a factory preset and cannot be overwritten; save the changes as a \
+                 new preset with --save_preset"
+            ),
+            Self::FactoryRename { preset } => {
+                write!(f, "{preset:?} is a factory preset and cannot be renamed")
+            }
+            Self::FactoryDelete { preset } => {
+                write!(f, "{preset:?} is a factory preset and cannot be deleted")
+            }
+            Self::UnsavedChanges { preset } => write!(
+                f,
+                "{preset:?} has unsaved changes; save them with --overwrite_preset or drop them \
+                 with --undo_preset before renaming it"
+            ),
+            Self::NameTaken { name } => write!(f, "a preset called {name:?} already exists"),
+            Self::EmptyName => f.write_str("a preset name cannot be empty"),
+            Self::LimitReached { max } => write!(
+                f,
+                "the limit of {max} user presets is reached; delete one before saving another"
+            ),
+        }
+    }
+}
+
+/// "an output" / "an input", for a message about a lane's preset.
+const fn lane_noun(lane: DeviceDirection) -> &'static str {
+    match lane {
+        DeviceDirection::Output => "an output",
+        DeviceDirection::Input => "an input",
+    }
+}
+
+/// Which of the hamburger menu's preset items are offered: each is
+/// [`App::preset_command_allowed`] for its command, while the power is on
+/// (`FxMainWindow.cpp:536-543`). Export and Import are not preset commands and stay the menu's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PresetMenu {
+    pub save_new: bool,
+    pub overwrite: bool,
+    pub undo: bool,
+    pub rename: bool,
+    pub delete: bool,
 }
 
 /// What the window shows for one lane: the design's `ChainControls` (0.4.0 design §1.4), of which
@@ -358,6 +496,13 @@ pub struct App {
     /// meantime does not take the pick back. The lane's next [`AudioToUi::Attached`] or error is
     /// the engine's answer and ends it, so it never outlives that answer.
     requested_device: [Option<String>; 2],
+    /// The device each lane's preset goes with, outputs first: the saved device at start-up, then
+    /// every device the lane attaches to. Unlike `attached` it outlives a detach, a reconnect and
+    /// the wait for a lane's first attachment, so a lane that attaches to the device it was
+    /// already on has not moved (see [`AudioToUi::Attached`]), and a preset picked in the meantime
+    /// — `--preset` at a cold start among them — stays. `None` only for a lane with no saved
+    /// device that has not attached yet.
+    preset_device: [Option<String>; 2],
     /// When the per-device volumes the engine reported last are due to be written to the settings
     /// file (see [`VOLUME_SAVE_DELAY`]).
     volume_save_due: Option<Instant>,
@@ -416,9 +561,9 @@ pub struct App {
     /// What those events have said so far, so that a mutation which leaves a thing as the stream
     /// last described it says nothing (see [`Published`]).
     published: Published,
-    /// Something the tray draws changed that no event names: the theme, Always On Top, the
-    /// language, the preset list under an unchanged selection, or sound starting or stopping on
-    /// the shown lane (see [`App::take_tray_refresh`]).
+    /// Something the tray draws changed that no event names: the theme, the language, the preset
+    /// list under an unchanged selection, or sound starting or stopping on the shown lane (see
+    /// [`App::take_tray_refresh`]).
     tray_stale: bool,
     /// The calibration wizard, while it is open (0.4.0 design §8): driven from
     /// [`App::poll_audio`] with the input lane's meters, drawn through [`App::calibration_view`].
@@ -481,6 +626,11 @@ impl App {
             audio_status: [fxsound_core::AudioStatus::default(); 2],
             attached: [None, None],
             requested_device: [None, None],
+            preset_device: DeviceDirection::ALL.map(|lane| {
+                Some(settings.device_name(lane))
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+            }),
             volume_save_due: None,
             pending_devices: Vec::new(),
             settings,
@@ -650,6 +800,19 @@ impl App {
             // [`lane_selection`]).
             // A lane with no nodes processes nothing, whatever its last status said; the status
             // that says so follows on the engine's next tick.
+            //
+            // A move to another device that nobody here asked for — the engine's own rules after
+            // a hotplug, a device gone, a priority — brings that device's preset with it, as a
+            // pick in the window does, and quietly, as the original's device-change handler does
+            // (`FxController.cpp:1645-1658`, `setPreset(…, false)`). A move the window, the tray,
+            // the command line or the announcement of the saved device asked for brought it
+            // already, when it was asked for.
+            //
+            // "Another device" is one other than the device the lane's preset goes with
+            // ([`App::preset_device`]), as upstream moves the preset only for a device other than
+            // the one it already shows: a lane attaching for the first time to its saved device,
+            // or coming back after a reconnect to the one it was on, has not moved, and a preset
+            // picked while it waited — `--preset` at a cold start — stays.
             AudioToUi::Attached {
                 direction,
                 node_name,
@@ -658,9 +821,19 @@ impl App {
                     set_lane_active(&mut self.state, direction, false);
                     self.note_audio(direction);
                 }
-                self.attached[lane_index(direction)] = node_name;
-                self.requested_device[lane_index(direction)] = None;
+                let slot = lane_index(direction);
+                let requested = self.requested_device[slot].take();
+                let moved_on_its_own = node_name.is_some()
+                    && node_name != self.preset_device[slot]
+                    && node_name != requested;
+                self.attached[slot].clone_from(&node_name);
+                if node_name.is_some() {
+                    self.preset_device[slot].clone_from(&node_name);
+                }
                 self.show_lane_selections();
+                if moved_on_its_own && let Some(node_name) = node_name {
+                    self.quietly(|app| app.bring_back_device_preset(direction, &node_name));
+                }
             }
             AudioToUi::Disconnected { reason } => {
                 // Nothing is processed while the connection is down. Each lane's next status
@@ -802,7 +975,35 @@ impl App {
         if requested {
             self.show_lane_selections();
         }
+        // The saved device comes back with the preset it remembers, as a device the engine moves
+        // to does (see `AudioToUi::Attached`), when the lane really was on another device: the
+        // headphones' own preset when they are plugged back in, or when the engine's rules
+        // attached the lane to the speakers before the list came. A lane still on, or still
+        // waiting for, the device its preset goes with ([`App::preset_device`]) keeps its preset:
+        // at an ordinary start that is the saved one, or whatever was picked before the list came
+        // — `--preset` at a cold start among them — which the saved device must not overwrite.
+        for message in &messages {
+            if let UiToAudio::SelectDevice {
+                node_name,
+                direction,
+            } = message
+                && self.preset_device[lane_index(*direction)]
+                    .as_ref()
+                    .is_some_and(|was| was != node_name)
+            {
+                self.quietly(|app| app.bring_back_device_preset(*direction, node_name));
+            }
+        }
         messages
+    }
+
+    /// Do `act` with the desktop notifications held back: for a preset the controller moves on
+    /// the engine's word rather than the user's, which the original moves with
+    /// `setPreset(…, false)` (`FxController.cpp:1645-1658`).
+    fn quietly(&mut self, act: impl FnOnce(&mut Self)) {
+        let armed = std::mem::replace(&mut self.notifications_armed, false);
+        act(self);
+        self.notifications_armed = armed;
     }
 
     /// Act on everything the views reported this frame.
@@ -1158,14 +1359,76 @@ impl App {
         }
     }
 
+    /// Load the preset `node_name` remembers into `lane`, whichever lane the window edits — for a
+    /// device the lane has moved to without a pick in the window, and for the Output Device
+    /// Preference row of the device playing now. Nothing happens when the device remembers
+    /// nothing, when what it remembers is no longer a preset, or when that preset is already the
+    /// lane's.
+    fn bring_back_device_preset(&mut self, lane: DeviceDirection, node_name: &str) {
+        let Some(preset) = self
+            .settings
+            .preset_for_device(node_name, lane)
+            .map(ToOwned::to_owned)
+        else {
+            return;
+        };
+        self.in_lane(lane, |app| {
+            if app.state.preset().is_some_and(|p| p.name == preset) {
+                return;
+            }
+            if let Some(at) = app.state.presets.iter().position(|p| p.name == preset) {
+                app.select_preset(at);
+            }
+        });
+    }
+
+    /// Where the preset the device of the lane on screen remembers sits in the window's list;
+    /// `None` when the lane has no device, the device remembers nothing, or what it remembers is
+    /// no longer a preset. What Delete Preset and Reset Presets fall back to (upstream 7f160b6).
+    fn device_preset_index(&self) -> Option<usize> {
+        let lane = self.state.direction;
+        let device = self.state.device_for(lane)?;
+        let preset = self.settings.preset_for_device(&device.name, lane)?;
+        self.state.presets.iter().position(|p| p.name == preset)
+    }
+
+    /// Put a music preset in the window and publish it — its curve on the user's band count, not
+    /// its own (upstream `DfxDspEq.cpp:127-247`).
+    ///
+    /// A user on thirty-one bands who picks a ten-band factory preset stays on thirty-one bands:
+    /// the live ladder is kept and the preset's gains are fitted onto it by position
+    /// ([`fxsound_dsp::eq::fit_preset_gains`]). Only a preset of the live count brings its own
+    /// centre frequencies. A preset with no equalizer at all is the original's "old preset": the
+    /// equalizer on and flat.
     fn apply_preset(&mut self, preset: &Preset) {
         for effect in Effect::ALL {
             self.state.effects[effect as usize] =
                 scale::value_to_slider_for(effect, preset.effect(effect));
         }
-        self.state.eq_bands = preset.eq_bands.clone();
-        self.state.eq_on = preset.eq_on;
+        let ladder = self.music_ladder();
+        (self.state.eq_on, self.state.eq_bands) = if preset.eq_bands.is_empty() {
+            (true, bands_of(&ladder, &vec![0.0; ladder.len()]))
+        } else if preset.eq_bands.len() == ladder.len() {
+            (preset.eq_on, preset.eq_bands.clone())
+        } else {
+            let centres: Vec<f32> = preset.eq_bands.iter().map(|b| b.center_hz).collect();
+            let gains: Vec<f32> = preset.eq_bands.iter().map(|b| b.boost_db).collect();
+            let fitted = fxsound_dsp::eq::fit_preset_gains(&centres, &gains, &ladder);
+            (preset.eq_on, bands_of(&ladder, &fitted))
+        };
         self.sync_params_from_state();
+    }
+
+    /// The music lane's live band ladder: the user's band count (`settings.num_bands`), at the
+    /// centres the window holds when it holds that many bands, else at the engine's own ladder
+    /// for the count. Asked while the window shows the music lane.
+    fn music_ladder(&self) -> Vec<f32> {
+        let count = (self.settings.num_bands as usize).clamp(1, fxsound_core::eq::MAX_BANDS);
+        if self.state.eq_bands.len() == count {
+            self.state.eq_bands.iter().map(|b| b.center_hz).collect()
+        } else {
+            ladder(count)
+        }
     }
 
     /// The edit direction's controls as that lane's kind of preset, under the selected preset's
@@ -1385,7 +1648,11 @@ impl App {
         match self.store_mut(self.state.direction).delete(&name) {
             Ok(()) => {
                 self.refresh_preset_list();
-                let next = index.min(self.state.presets.len().saturating_sub(1));
+                // The device's own preset, as the original does (upstream 7f160b6); else the
+                // neighbour, so the list does not jump back to its top.
+                let next = self
+                    .device_preset_index()
+                    .unwrap_or_else(|| index.min(self.state.presets.len().saturating_sub(1)));
                 if self.state.presets.is_empty() {
                     self.state.selected_preset = None;
                 } else {
@@ -1403,24 +1670,26 @@ impl App {
         }
     }
 
+    /// Change the edit direction's band count, carrying the curve over by position rather than
+    /// wiping it flat (upstream 182a329, `GraphicEqSet.cpp:200-245`): the window, `--num_bands`
+    /// and Restore Defaults all come through here.
+    ///
+    /// The new ladder is the engine's own for the count. On the speakers the count is the user's
+    /// setting, which every music preset is then fitted onto ([`App::apply_preset`]); on a
+    /// microphone it is the voice preset's own, as its ladder is, and the setting is left alone,
+    /// as the four level settings are.
     fn set_band_count(&mut self, count: usize) {
         let count = count.clamp(1, fxsound_core::eq::MAX_BANDS);
         if count == self.state.eq_bands.len() {
             return;
         }
-        // Take the engine's own ladder for the new count so the frequencies stay sensible; the
-        // gains start flat, as they do in the original when the band count changes.
-        let centers = fxsound_dsp::eq::band_table(count).map_or_else(
-            || {
-                let mut eq = fxsound_dsp::GraphicEq::new();
-                eq.set_num_bands(count);
-                eq.center_frequencies().to_vec()
-            },
-            |(table, _, _)| table.to_vec(),
-        );
-        self.state.eq_bands = centers.into_iter().map(|hz| EqBand::new(hz, 0.0)).collect();
-        self.settings.num_bands = count as u32;
-        self.settings_dirty = true;
+        let gains: Vec<f32> = self.state.eq_bands.iter().map(|b| b.boost_db).collect();
+        let gains = fxsound_dsp::eq::remap_band_gains(&gains, count);
+        self.state.eq_bands = bands_of(&ladder(count), &gains);
+        if self.state.direction == DeviceDirection::Output {
+            self.settings.num_bands = count as u32;
+            self.settings_dirty = true;
+        }
         self.mark_preset_modified();
         self.sync_params_from_state();
         // The new ladder is the edited chain's; the other lane keeps its own curve until it is
@@ -1430,22 +1699,32 @@ impl App {
         }
     }
 
+    /// Restore Defaults under the equalizer (`FxEqualizerControl::restoreDefaults`,
+    /// `FxAudioControls.cpp:529-544`): ten bands, no volume leveling, centred balance, the
+    /// narrowest filter width and no master gain. The curve is kept — carried onto ten bands
+    /// ([`App::set_band_count`]) — since it is the preset's, not a default.
+    ///
+    /// Each value goes where its own control sends it: on the speakers the levels are settings
+    /// over every preset; on a microphone the gain is the voice preset's makeup, so moving it is
+    /// an edit to the preset.
     fn restore_defaults(&mut self) {
-        for band in &mut self.state.eq_bands {
-            band.boost_db = 0.0;
-        }
+        self.set_band_count(fxsound_core::eq::DEFAULT_BANDS);
+        let makeup_moved = self.state.master_gain_db != 0.0;
         self.state.filter_q = 1.0;
         self.state.master_gain_db = 0.0;
         self.state.balance_db = 0.0;
         self.state.volume_leveling = 0.0;
-        if self.state.direction == DeviceDirection::Output {
-            self.settings.filter_q = 1.0;
-            self.settings.master_gain = 0.0;
-            self.settings.balance = 0.0;
-            self.settings.volume_leveling = 0.0;
-            self.settings_dirty = true;
+        match self.state.direction {
+            DeviceDirection::Output => {
+                self.settings.filter_q = 1.0;
+                self.settings.master_gain = 0.0;
+                self.settings.balance = 0.0;
+                self.settings.volume_leveling = 0.0;
+                self.settings_dirty = true;
+            }
+            DeviceDirection::Input if makeup_moved => self.mark_preset_modified(),
+            DeviceDirection::Input => {}
         }
-        self.mark_preset_modified();
         self.sync_params_from_state();
     }
 
@@ -1717,6 +1996,13 @@ impl App {
                 self.state.eq_on = self.params.eq_on;
                 let (centres, boosts) = self.params.bands();
                 self.state.eq_bands = bands_of(centres, boosts);
+                // On the user's band count even with no preset to load (U1): the snapshot starts
+                // on ten bands whatever the settings file says.
+                let ladder = self.music_ladder();
+                if ladder.len() != self.state.eq_bands.len() {
+                    let gains = fxsound_dsp::eq::remap_band_gains(boosts, ladder.len());
+                    self.state.eq_bands = bands_of(&ladder, &gains);
+                }
             }
             DeviceDirection::Input => {
                 let params = self.input_params;
@@ -2033,6 +2319,7 @@ impl App {
             audio_status: [fxsound_core::AudioStatus::default(); 2],
             attached: [None, None],
             requested_device: [None, None],
+            preset_device: [None, None],
             volume_save_due: None,
             pending_devices: Vec::new(),
             settings: Settings::default(),
@@ -2268,7 +2555,6 @@ impl App {
             processing: self.state.audio_active,
             power_enabled: true,
             theme: self.state.theme,
-            always_on_top: self.settings.always_on_top,
             presets: self
                 .state
                 .presets
@@ -2317,13 +2603,6 @@ impl App {
                     self.handle(&[UiAction::ToggleTheme]);
                 }
             }
-            TrayCommand::SetAlwaysOnTop(on) => {
-                self.settings.always_on_top = on;
-                self.settings_dirty = true;
-                // The item does not tick itself: it waits for the application's answer.
-                self.tray_stale = true;
-                self.handle(&[]);
-            }
             TrayCommand::OpenSettings => self.handle(&[UiAction::OpenSettings]),
             // Handled by the shell.
             TrayCommand::ToggleWindow | TrayCommand::Open | TrayCommand::Exit => {}
@@ -2341,6 +2620,140 @@ impl App {
             max as usize
         } else {
             120
+        }
+    }
+
+    /// Whether `command` may run on the edit direction's presets now, and if not, why: the one
+    /// rule behind the hamburger menu's items ([`App::preset_menu`]) and the preset options of the
+    /// command line, the control socket and D-Bus (`commands::run`).
+    ///
+    /// The menu's own predicates (`FxMainWindow.cpp:536-543`) and the original's command line
+    /// (`FxController.cpp:377-448`) agree on all of it but the power switch: the menu greys every
+    /// preset item out while the power is off and the original's command line ignores them, but a
+    /// script here gets its preset command carried out either way. A new or renamed preset's name
+    /// is checked last, so a refusal about the name ([`Refusal::is_about_the_name`]) means
+    /// everything else would allow it.
+    ///
+    /// # Errors
+    ///
+    /// The [`Refusal`] that stands in the way.
+    pub fn preset_command_allowed(&self, command: &PresetCommand) -> Result<(), Refusal> {
+        let selected = || self.state.preset().ok_or(Refusal::NoPresetSelected);
+        match command {
+            PresetCommand::Select(name) => {
+                if self.state.presets.iter().any(|p| p.name == *name) {
+                    return Ok(());
+                }
+                let lane = self.state.direction;
+                Err(Refusal::UnknownPreset {
+                    lane,
+                    name: name.clone(),
+                    other_lane_has_it: self.lane_has_preset(lane.other(), name),
+                })
+            }
+            PresetCommand::SaveAs(name) => {
+                let preset = selected()?;
+                if !preset.modified {
+                    return Err(Refusal::NothingToSave {
+                        preset: preset.name.clone(),
+                    });
+                }
+                let max = self.max_user_presets();
+                if self.user_preset_count() >= max {
+                    return Err(Refusal::LimitReached { max });
+                }
+                self.new_name_allowed(name)
+            }
+            PresetCommand::Overwrite => {
+                let preset = selected()?;
+                if preset.factory {
+                    return Err(Refusal::FactoryOverwrite {
+                        preset: preset.name.clone(),
+                    });
+                }
+                if !preset.modified {
+                    return Err(Refusal::NothingToSave {
+                        preset: preset.name.clone(),
+                    });
+                }
+                Ok(())
+            }
+            PresetCommand::Undo => {
+                let preset = selected()?;
+                if preset.modified {
+                    Ok(())
+                } else {
+                    Err(Refusal::NothingToUndo {
+                        preset: preset.name.clone(),
+                    })
+                }
+            }
+            PresetCommand::Rename(name) => {
+                let preset = selected()?;
+                if preset.factory {
+                    return Err(Refusal::FactoryRename {
+                        preset: preset.name.clone(),
+                    });
+                }
+                if preset.modified {
+                    return Err(Refusal::UnsavedChanges {
+                        preset: preset.name.clone(),
+                    });
+                }
+                self.new_name_allowed(name)
+            }
+            PresetCommand::Delete => {
+                let preset = selected()?;
+                if preset.factory {
+                    Err(Refusal::FactoryDelete {
+                        preset: preset.name.clone(),
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            PresetCommand::Next | PresetCommand::Previous => Ok(()),
+        }
+    }
+
+    /// Whether a new or renamed preset may be called `name` ([`preset_name_available`]).
+    fn new_name_allowed(&self, name: &str) -> Result<(), Refusal> {
+        let name = name.trim();
+        if name.is_empty() {
+            Err(Refusal::EmptyName)
+        } else if self.is_preset_name_available(name) {
+            Ok(())
+        } else {
+            Err(Refusal::NameTaken {
+                name: name.to_owned(),
+            })
+        }
+    }
+
+    /// The hamburger menu's preset items: each offered when [`App::preset_command_allowed`]
+    /// allows its command and the power is on — Save New Preset and Rename Preset whatever the
+    /// name, which their editor asks for.
+    #[must_use]
+    pub fn preset_menu(&self) -> PresetMenu {
+        let offered = |command: PresetCommand| {
+            self.state.power
+                && self
+                    .preset_command_allowed(&command)
+                    .or_else(|refusal| {
+                        if refusal.is_about_the_name() {
+                            Ok(())
+                        } else {
+                            Err(refusal)
+                        }
+                    })
+                    .is_ok()
+        };
+        PresetMenu {
+            save_new: offered(PresetCommand::SaveAs(String::new())),
+            overwrite: offered(PresetCommand::Overwrite),
+            undo: offered(PresetCommand::Undo),
+            rename: offered(PresetCommand::Rename(String::new())),
+            delete: offered(PresetCommand::Delete),
         }
     }
 
@@ -2752,6 +3165,19 @@ pub(crate) const fn detach(lane: DeviceDirection) -> UiAction {
 }
 
 /// An equalizer as the window holds it, from a snapshot's two parallel arrays.
+/// The engine's band ladder for `count` bands: the original's hard-coded table where it has
+/// one, else the geometric ladder `GraphicEq` builds.
+fn ladder(count: usize) -> Vec<f32> {
+    fxsound_dsp::eq::band_table(count).map_or_else(
+        || {
+            let mut eq = fxsound_dsp::GraphicEq::new();
+            eq.set_num_bands(count);
+            eq.center_frequencies().to_vec()
+        },
+        |(table, _, _)| table.to_vec(),
+    )
+}
+
 fn bands_of(centres: &[f32], boosts: &[f32]) -> Vec<EqBand> {
     centres
         .iter()
@@ -3011,9 +3437,10 @@ impl App {
     /// Settings ▸ Reset Presets: every preset of **both** lanes back to what shipped or was last
     /// saved, by dropping every autosave in both stores.
     ///
-    /// Each lane's selected preset is then loaded again as saved — the one in the window and the
-    /// one off screen alike, so the engine stops running edits that no longer exist anywhere,
-    /// rather than the lane off screen keeping them until it is next looked at.
+    /// Each lane then loads the preset its device remembers (upstream 7f160b6), or else its
+    /// selected one again as saved — the lane in the window and the one off screen alike, so the
+    /// engine stops running edits that no longer exist anywhere, rather than the lane off screen
+    /// keeping them until it is next looked at.
     fn reset_presets(&mut self) {
         for lane in DeviceDirection::ALL {
             let names: Vec<String> = self
@@ -3031,7 +3458,7 @@ impl App {
         for lane in DeviceDirection::ALL {
             self.in_lane(lane, |app| {
                 app.refresh_preset_list_keeping_selection();
-                if let Some(index) = app.state.selected_preset {
+                if let Some(index) = app.device_preset_index().or(app.state.selected_preset) {
                     app.select_preset(index);
                 }
             });
@@ -3158,6 +3585,17 @@ impl App {
                 let name = self.presets.entries().get(*preset).map(|p| p.name.clone());
                 if let (Some(index), Some(name)) = (self.output_config_index(*device), name) {
                     self.settings.device_configs[index].preset = name;
+                    // The row of the device playing now takes effect at once, rather than the
+                    // next time the device comes back (upstream 83ccf5e,
+                    // `FxOutputPreference.cpp:57-61`).
+                    let node_name = self.settings.device_configs[index].device_id.clone();
+                    if self
+                        .state
+                        .device_for(DeviceDirection::Output)
+                        .is_some_and(|playing| playing.name == node_name)
+                    {
+                        self.bring_back_device_preset(DeviceDirection::Output, &node_name);
+                    }
                     self.device_configs_changed(state);
                 }
             }
@@ -3657,32 +4095,208 @@ mod tests {
         assert_eq!(app.state.filter_q, 1.0);
     }
 
-    #[test]
-    fn restoring_defaults_flattens_the_curve_and_the_levels() {
-        let mut app = with_presets(&["Jazz"]);
-        app.handle(&[
-            UiAction::SetBandGain(2, 9.0),
-            UiAction::SetMasterGain(-6.0),
-            UiAction::SetVolumeLeveling(3.0),
-        ]);
-        app.handle(&[UiAction::RestoreDefaults]);
-        assert!(app.state.eq_bands.iter().all(|b| b.boost_db == 0.0));
-        assert_eq!(app.state.master_gain_db, 0.0);
-        assert_eq!(app.state.volume_leveling, 0.0);
-        assert_eq!(app.state.filter_q, 1.0);
+    fn gains(app: &App) -> Vec<f32> {
+        app.state.eq_bands.iter().map(|b| b.boost_db).collect()
+    }
+
+    fn centres(app: &App) -> Vec<f32> {
+        app.state.eq_bands.iter().map(|b| b.center_hz).collect()
     }
 
     #[test]
-    fn changing_the_band_count_rebuilds_the_curve_flat() {
+    fn restoring_defaults_keeps_the_curve_on_ten_bands_and_resets_the_levels() {
+        // `FxEqualizerControl::restoreDefaults` (`FxAudioControls.cpp:529-544`): ten bands,
+        // leveling, balance, width and gain back to their defaults — and the curve, which is the
+        // preset's, carried onto the ten bands rather than flattened (U1).
         let mut app = with_presets(&["Jazz"]);
-        app.handle(&[UiAction::SetBandGain(0, 8.0)]);
+        app.handle(&[
+            UiAction::SetBandCount(31),
+            UiAction::SetBandGain(0, 9.0),
+            UiAction::SetBandGain(30, -5.0),
+            UiAction::SetMasterGain(-6.0),
+            UiAction::SetVolumeLeveling(3.0),
+            UiAction::SetBalance(4.0),
+            UiAction::SetFilterQ(2.5),
+        ]);
+        let curve = gains(&app);
+        app.handle(&[UiAction::RestoreDefaults]);
+
+        assert_eq!(gains(&app), fxsound_dsp::eq::remap_band_gains(&curve, 10));
+        assert_eq!(gains(&app)[0], 9.0);
+        assert_eq!(gains(&app)[9], -5.0);
+        assert_eq!(centres(&app), ladder(10));
+        assert_eq!(app.settings.num_bands, 10);
+        assert_eq!(app.params().num_bands, 10);
+        assert_eq!(app.state.master_gain_db, 0.0);
+        assert_eq!(app.state.volume_leveling, 0.0);
+        assert_eq!(app.state.balance_db, 0.0);
+        assert_eq!(app.state.filter_q, 1.0);
+        assert_eq!(
+            (
+                app.settings.master_gain,
+                app.settings.volume_leveling,
+                app.settings.balance,
+                app.settings.filter_q
+            ),
+            (0.0, 0.0, 0.0, 1.0),
+            "the speakers' levels are settings over every preset"
+        );
+    }
+
+    #[test]
+    fn restoring_defaults_on_ten_bands_is_no_edit_to_the_speakers_preset() {
+        // The levels are settings, not the preset's, and ten bands stay the curve they are.
+        let mut app = with_presets(&["Jazz"]);
+        app.handle(&[UiAction::SetVolumeLeveling(3.0)]);
+        assert!(!app.state.presets[0].modified);
+        app.handle(&[UiAction::RestoreDefaults]);
+        assert!(!app.state.presets[0].modified);
+        assert_eq!(app.state.volume_leveling, 0.0);
+    }
+
+    #[test]
+    fn changing_the_band_count_carries_the_curve_over_by_position() {
+        // Upstream 182a329 (`GraphicEqSet.cpp:200-245`): 10 → 31 used to wipe the curve flat.
+        let mut app = with_presets(&["Jazz"]);
+        app.handle(&[
+            UiAction::SetBandGain(0, 8.0),
+            UiAction::SetBandGain(4, 6.0),
+            UiAction::SetBandGain(9, -4.0),
+        ]);
+        let ten = gains(&app);
         app.handle(&[UiAction::SetBandCount(31)]);
+
         assert_eq!(app.state.eq_bands.len(), 31);
-        assert!(app.state.eq_bands.iter().all(|b| b.boost_db == 0.0));
+        assert_eq!(gains(&app), fxsound_dsp::eq::remap_band_gains(&ten, 31));
+        assert_eq!(gains(&app)[0], 8.0, "the first band lands on the first");
+        assert_eq!(gains(&app)[30], -4.0, "and the last on the last");
         // The 31-band ISO ladder starts at 20 Hz and ends at 20 kHz.
         assert_eq!(app.state.eq_bands[0].center_hz, 20.0);
         assert_eq!(app.state.eq_bands[30].center_hz, 20000.0);
         assert_eq!(app.params().num_bands, 31);
+        assert_eq!(app.params().bands().1, gains(&app).as_slice());
+        assert_eq!(app.settings.num_bands, 31);
+        assert!(app.state.presets[0].modified);
+
+        // And back: the ends come home exactly, the rest close to where they were.
+        app.handle(&[UiAction::SetBandCount(10)]);
+        assert_eq!(gains(&app)[0], 8.0);
+        assert_eq!(gains(&app)[9], -4.0);
+        assert_eq!(centres(&app), ladder(10));
+    }
+
+    #[test]
+    fn fewer_bands_keep_a_narrow_boost_at_its_height_rather_than_averaging_it() {
+        // Shrinking picks the nearest band, `1 + (int)((i-1)*(old-1)/(new-1) + 0.5)`: from 31 to
+        // 5 that is bands 1, 9, 16, 24 and 31, so a boost on band 16 alone survives whole.
+        let mut app = headless();
+        app.handle(&[UiAction::SetBandCount(31), UiAction::SetBandGain(15, 9.0)]);
+        app.handle(&[UiAction::SetBandCount(5)]);
+        assert_eq!(gains(&app), [0.0, 0.0, 9.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn a_microphone_changes_its_own_band_count_and_leaves_the_speakers_setting_alone() {
+        // The band count Settings keeps is the music chain's, like the four level settings; a
+        // voice preset carries its own ladder.
+        let mut app = headless();
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
+        app.handle(&[UiAction::SetBandCount(5)]);
+        assert_eq!(app.input_params().num_bands, 5);
+        assert_eq!(app.settings.num_bands, 10);
+        assert_eq!(
+            app.params().num_bands,
+            10,
+            "the speakers' chain is untouched"
+        );
+    }
+
+    /// A start from [`saved_settings`] with the speakers on 31 bands and their four levels off
+    /// their defaults, the window then moved to the microphone and its voice preset `voice`.
+    fn restoring_on_the_microphone(voice: &str) -> (App, FakeEngine, tempfile::TempDir) {
+        let mut settings = saved_settings(OUT);
+        settings.input_preset = voice.to_owned();
+        settings.num_bands = 31;
+        settings.filter_q = 2.0;
+        settings.balance = 3.0;
+        settings.volume_leveling = 2.0;
+        let (mut app, engine, dir) = started_with(settings);
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        assert_eq!(app.lane_preset(IN), Some((voice, false)));
+        (app, engine, dir)
+    }
+
+    /// The speakers' side of the settings file: their band count and their four levels.
+    fn speakers_settings(app: &App) -> (u32, f32, f32, f32, f32) {
+        let s = &app.settings;
+        (
+            s.num_bands,
+            s.master_gain,
+            s.filter_q,
+            s.balance,
+            s.volume_leveling,
+        )
+    }
+
+    #[test]
+    fn restoring_defaults_on_a_microphone_carries_its_curve_onto_ten_bands_as_an_edit_to_it() {
+        // On a voice the band count and the gain are the preset's own ([`App::set_band_count`],
+        // `SetMasterGain`), so Restore Defaults edits the voice preset; the speakers' band count
+        // and levels are settings over the music presets, which it does not reach.
+        let (mut app, _engine, _dir) = restoring_on_the_microphone("Loud");
+        let speakers = (speakers_settings(&app), *app.params());
+        app.handle(&[
+            UiAction::SetBandCount(5),
+            UiAction::SetBandGain(0, 6.0),
+            UiAction::SetBandGain(4, -4.0),
+            UiAction::SetMasterGain(12.0),
+            UiAction::SetFilterQ(2.5),
+        ]);
+        let curve = gains(&app);
+        app.handle(&[UiAction::RestoreDefaults]);
+
+        assert_eq!(app.input_params().num_bands, 10);
+        assert_eq!(gains(&app), fxsound_dsp::eq::remap_band_gains(&curve, 10));
+        assert_eq!(gains(&app)[0], 6.0);
+        assert_eq!(gains(&app)[9], -4.0);
+        assert_eq!(centres(&app), ladder(10));
+        assert_eq!(app.input_params().makeup_db, 0.0);
+        assert_eq!(app.input_params().filter_q, 1.0);
+        assert_eq!(app.lane_preset(IN), Some(("Loud", true)));
+        assert_eq!(
+            (speakers_settings(&app), *app.params()),
+            speakers,
+            "the speakers' band count, levels and chain are as they were"
+        );
+    }
+
+    #[test]
+    fn restoring_defaults_takes_a_voice_presets_makeup_to_zero_as_an_edit_to_it() {
+        // `Loud` carries 9 dB of makeup and ten bands: the gain is the only thing that moves, and
+        // it is the preset's.
+        let (mut app, _engine, _dir) = restoring_on_the_microphone("Loud");
+        let before = speakers_settings(&app);
+        app.handle(&[UiAction::RestoreDefaults]);
+        assert_eq!(app.input_params().makeup_db, 0.0);
+        assert_eq!(app.input_params().num_bands, 10);
+        assert_eq!(app.lane_preset(IN), Some(("Loud", true)));
+        assert_eq!(speakers_settings(&app), before);
+    }
+
+    #[test]
+    fn restoring_defaults_on_a_voice_with_only_its_width_moved_is_no_edit_to_it() {
+        // `Quiet` has no makeup and ten bands; the filter width is not written into a voice
+        // preset, so putting it back changes nothing a save would keep.
+        let (mut app, _engine, _dir) = restoring_on_the_microphone("Quiet");
+        let before = speakers_settings(&app);
+        app.handle(&[UiAction::SetFilterQ(2.5)]);
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+        app.handle(&[UiAction::RestoreDefaults]);
+        assert_eq!(app.input_params().filter_q, 1.0);
+        assert_eq!(app.input_params().makeup_db, 0.0);
+        assert_eq!(app.input_params().num_bands, 10);
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+        assert_eq!(speakers_settings(&app), before);
     }
 
     #[test]
@@ -8128,5 +8742,839 @@ mod tests {
         );
         assert!(!voice_files(&dir, "").contains(&format!("{CALIBRATED}.toml")));
         assert!(app.settings().calibration.is_none());
+    }
+
+    // ---- the upstream review's controller items: U2, U6, U15, U16 -----------------------------
+
+    use crate::cli::PresetCommand as P;
+
+    fn preset_with(name: &str, bands: &[(f32, f32)]) -> Preset {
+        Preset {
+            name: name.to_owned(),
+            eq_bands: bands.iter().map(|&(hz, db)| EqBand::new(hz, db)).collect(),
+            ..Preset::default()
+        }
+    }
+
+    /// A start on `num_bands` bands against a fake engine, with `presets` as the speakers' factory
+    /// set and the first of them the output lane's saved preset.
+    fn started_on(num_bands: u32, presets: &[Preset]) -> (App, FakeEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let factory = dir.path().join("factory");
+        std::fs::create_dir_all(&factory).expect("factory directory");
+        for preset in presets {
+            let file = factory.join(format!("{}.fac", preset.name));
+            fxsound_preset::save(preset, &file).expect("write");
+        }
+        let mut music = PresetStore::with_dirs(vec![factory], dir.path().join("user"));
+        music.rescan();
+        let mut settings = Settings::default();
+        settings.num_bands = num_bands;
+        presets[0].name.clone_into(&mut settings.output_preset);
+        let engine = FakeEngine::new();
+        let app = App::start_for_tests(settings, music, voices(&dir), &engine);
+        (app, engine, dir)
+    }
+
+    fn pick(app: &mut App, name: &str) {
+        let at = app
+            .state
+            .presets
+            .iter()
+            .position(|p| p.name == name)
+            .unwrap_or_else(|| panic!("no preset {name}"));
+        app.handle(&[UiAction::SelectPreset(at)]);
+    }
+
+    #[test]
+    fn a_preset_of_another_band_count_lands_on_the_users_band_count() {
+        // Upstream `DfxDspEq.cpp:127-247`: a user on thirty-one bands who picks a ten-band preset
+        // stays on thirty-one bands, the preset's curve fitted onto them by position (U2).
+        let ten: Vec<(f32, f32)> = fxsound_core::eq::DEFAULT_CENTERS_HZ
+            .iter()
+            .zip([6.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, -3.0])
+            .map(|(&hz, db)| (hz, db))
+            .collect();
+        let (app, engine, _dir) = started_on(31, &[preset_with("Ten", &ten)]);
+
+        let preset_centres: Vec<f32> = ten.iter().map(|b| b.0).collect();
+        let preset_gains: Vec<f32> = ten.iter().map(|b| b.1).collect();
+        assert_eq!(app.state.eq_bands.len(), 31);
+        assert_eq!(
+            centres(&app),
+            ladder(31),
+            "the live ladder, not the preset's"
+        );
+        assert_eq!(
+            gains(&app),
+            fxsound_dsp::eq::fit_preset_gains(&preset_centres, &preset_gains, &ladder(31))
+        );
+        assert_eq!(gains(&app)[0], 6.0);
+        assert_eq!(gains(&app)[30], -3.0);
+        assert_eq!(
+            app.settings.num_bands, 31,
+            "the preset does not move the setting"
+        );
+        assert_eq!(engine.params().expect("published").num_bands, 31);
+        assert_eq!(
+            app.lane_preset(OUT),
+            Some(("Ten", false)),
+            "loading is no edit"
+        );
+    }
+
+    #[test]
+    fn a_preset_of_the_users_band_count_brings_its_own_frequencies_and_another_keeps_them() {
+        // Equal counts copy the centres too (`DfxDspEq.cpp:229-241`); a different count keeps the
+        // live ladder, whatever moved it.
+        let moved: Vec<(f32, f32)> = (0..10)
+            .map(|band| (40.0 * 2f32.powi(band), if band == 3 { 5.0 } else { 0.0 }))
+            .collect();
+        let five = [
+            (62.5, 3.0),
+            (250.0, 0.0),
+            (1000.0, 0.0),
+            (4000.0, 0.0),
+            (16000.0, -2.0),
+        ];
+        let (mut app, _engine, _dir) = started_on(
+            10,
+            &[preset_with("Moved", &moved), preset_with("Five", &five)],
+        );
+        let moved_centres: Vec<f32> = moved.iter().map(|b| b.0).collect();
+        assert_eq!(centres(&app), moved_centres);
+        assert_eq!(gains(&app)[3], 5.0);
+
+        pick(&mut app, "Five");
+        assert_eq!(centres(&app), moved_centres, "the ladder the user is on");
+        assert_eq!(
+            gains(&app),
+            fxsound_dsp::eq::remap_band_gains(&[3.0, 0.0, 0.0, 0.0, -2.0], 10)
+        );
+        assert_eq!(app.params().num_bands, 10);
+    }
+
+    #[test]
+    fn a_preset_with_no_equalizer_turns_it_on_and_flat_on_the_users_ladder() {
+        // The original's "old preset" (`DfxDspEq.cpp:144-158`).
+        let (mut app, _engine, _dir) = started_on(15, &[preset_with("Alpha", &[])]);
+        app.handle(&[UiAction::SetEqEnabled(false), UiAction::SetBandGain(2, 7.0)]);
+        let mut old = preset_with("Old", &[]);
+        old.eq_on = false;
+        app.apply_preset(&old);
+        assert!(app.state.eq_on);
+        assert!(app.params().eq_on);
+        assert_eq!(app.state.eq_bands.len(), 15);
+        assert!(gains(&app).iter().all(|&g| g == 0.0), "{:?}", gains(&app));
+        assert_eq!(centres(&app), ladder(15));
+    }
+
+    #[test]
+    fn a_start_with_no_preset_to_load_still_shows_the_saved_band_count() {
+        let engine = FakeEngine::new();
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let music = PresetStore::with_dirs(Vec::new(), dir.path().join("user"));
+        let mut settings = Settings::default();
+        settings.num_bands = 20;
+        let app = App::start_for_tests(settings, music, voices(&dir), &engine);
+        assert_eq!(app.state.eq_bands.len(), 20);
+        assert_eq!(centres(&app), ladder(20));
+        assert_eq!(engine.params().expect("published").num_bands, 20);
+    }
+
+    /// The speakers playing `Alpha` and the headphones last used with `Beta`, both remembered in
+    /// `device_configs` the way a pick remembers them.
+    fn speakers_on_alpha(tag: &str) -> App {
+        let mut app = app_with_two_presets(tag);
+        app.handle(&[UiAction::SelectOutput(0), UiAction::SelectPreset(1)]);
+        app.handle(&[UiAction::SelectOutput(1), UiAction::SelectPreset(0)]);
+        assert_eq!(selected(&app, OUT), Some("alsa_output.speakers"));
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+        assert_eq!(
+            app.settings
+                .preset_for_device("alsa_output.headphones", OUT),
+            Some("Beta")
+        );
+        app
+    }
+
+    fn row_of(pane: &SettingsState, node_name: &str) -> usize {
+        pane.devices
+            .iter()
+            .position(|row| row.id == node_name)
+            .unwrap_or_else(|| panic!("no row for {node_name}"))
+    }
+
+    #[test]
+    fn a_device_preset_set_in_settings_for_the_device_playing_applies_at_once() {
+        // Upstream 83ccf5e (`FxOutputPreference.cpp:57-61`); the row of a device that is not
+        // playing only remembers.
+        let mut app = speakers_on_alpha("settings-row");
+        let mut pane = app.settings_state();
+        let alpha = app.presets.index_of("Alpha").expect("Alpha");
+        let beta = app.presets.index_of("Beta").expect("Beta");
+
+        let headphones = row_of(&pane, "alsa_output.headphones");
+        app.handle_settings(
+            &SettingsAction::SetDevicePreset {
+                device: headphones,
+                preset: alpha,
+            },
+            &mut pane,
+        );
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+        assert_eq!(
+            app.settings
+                .preset_for_device("alsa_output.headphones", OUT),
+            Some("Alpha")
+        );
+
+        let speakers = row_of(&pane, "alsa_output.speakers");
+        app.handle_settings(
+            &SettingsAction::SetDevicePreset {
+                device: speakers,
+                preset: beta,
+            },
+            &mut pane,
+        );
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        assert_eq!(app.settings.output_preset, "Beta");
+        assert_eq!(
+            pane.devices[row_of(&pane, "alsa_output.speakers")].preset,
+            Some(beta)
+        );
+        assert_eq!(pane.settings.device_configs, app.settings.device_configs);
+    }
+
+    #[test]
+    fn a_device_preset_set_in_settings_while_the_microphone_is_edited_reaches_the_speakers() {
+        let mut app = speakers_on_alpha("settings-row-off-screen");
+        let _voices = with_voice_presets(&mut app);
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        let mut pane = app.settings_state();
+        let beta = app.presets.index_of("Beta").expect("Beta");
+        app.handle_settings(
+            &SettingsAction::SetDevicePreset {
+                device: row_of(&pane, "alsa_output.speakers"),
+                preset: beta,
+            },
+            &mut pane,
+        );
+        assert_eq!(app.state.direction, IN, "the window stays where it was");
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        assert_eq!(app.settings.output_preset, "Beta");
+    }
+
+    #[test]
+    fn deleting_a_preset_selects_the_one_the_device_remembers() {
+        // Upstream 7f160b6 (`FxController::deletePreset`): the device's preset, not the
+        // neighbour, which here would be Beta.
+        let mut app = speakers_on_alpha("delete-to-device");
+        app.presets
+            .save_as(&Preset::default(), "Mine")
+            .expect("saved");
+        app.refresh_preset_list();
+        pick(&mut app, "Mine");
+        app.settings.remember_device_preset(
+            "alsa_output.speakers",
+            "alsa_output.speakers",
+            "Alpha",
+            "speaker",
+            OUT,
+        );
+        app.handle(&[UiAction::DeletePreset]);
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+    }
+
+    #[test]
+    fn deleting_the_devices_own_preset_falls_back_to_the_neighbour() {
+        let mut app = speakers_on_alpha("delete-to-neighbour");
+        app.presets
+            .save_as(&Preset::default(), "Mine")
+            .expect("saved");
+        app.refresh_preset_list();
+        pick(&mut app, "Mine");
+        assert_eq!(
+            app.settings.preset_for_device("alsa_output.speakers", OUT),
+            Some("Mine")
+        );
+        app.handle(&[UiAction::DeletePreset]);
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+    }
+
+    #[test]
+    fn resetting_presets_selects_the_one_the_device_remembers() {
+        // Upstream 7f160b6 (`FxController::resetPresets`).
+        let mut app = speakers_on_alpha("reset-to-device");
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 6.0)]);
+        app.settings.remember_device_preset(
+            "alsa_output.speakers",
+            "alsa_output.speakers",
+            "Beta",
+            "speaker",
+            OUT,
+        );
+        let mut pane = app.settings_state();
+        app.handle_settings(&SettingsAction::ResetPresets, &mut pane);
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+    }
+
+    #[test]
+    fn resetting_presets_with_no_device_memory_reloads_the_selected_one_as_saved() {
+        let mut app = with_presets(&[]);
+        let (store, _dir) = music_store();
+        app.presets = store;
+        app.refresh_preset_list();
+        pick(&mut app, "Beta");
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 2.0)]);
+        let mut pane = app.settings_state();
+        app.handle_settings(&SettingsAction::ResetPresets, &mut pane);
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        assert!((app.params().effect(Effect::Bass) - 0.6).abs() < 0.01);
+    }
+
+    /// The saved run of [`saved_settings`] — the headphones on `Beta` — brought up to the moment the
+    /// engine has attached them as asked, with the speakers remembering `Alpha`.
+    fn on_the_headphones() -> (App, FakeEngine, tempfile::TempDir) {
+        let mut settings = saved_settings(OUT);
+        settings.remember_device_preset(SPEAKERS, "Speakers", "Alpha", "speaker", OUT);
+        let (mut app, engine, dir) = started_with(settings);
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+        assert_eq!(selected(&app, OUT), Some(HEADPHONES));
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        let _ = app.drain_events();
+        (app, engine, dir)
+    }
+
+    #[test]
+    fn a_device_the_engine_moves_to_on_its_own_brings_back_the_preset_it_remembers() {
+        // The headphones are unplugged and the engine's rules take the speakers: they come with
+        // the preset they were last used with, as a pick in the window would bring it (U6).
+        let (mut app, engine, _dir) = on_the_headphones();
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
+        assert_eq!(selected(&app, OUT), Some(SPEAKERS));
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+        assert_eq!(app.params().effect(Effect::Bass), 0.0, "Alpha's flat bass");
+        assert!(
+            app.drain_events().contains(&AppEvent::PresetChanged {
+                direction: OUT,
+                name: Some("Alpha".to_owned()),
+                modified: false,
+            }),
+            "the stream hears it"
+        );
+    }
+
+    #[test]
+    fn a_device_the_window_asked_for_or_the_lane_already_had_moves_no_preset() {
+        let (mut app, engine, _dir) = on_the_headphones();
+        // The lane attached again to what it already had: no move.
+        app.settings
+            .remember_device_preset(HEADPHONES, "Headphones", "Alpha", "headphones", OUT);
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+
+        // Asked for from the window, which brought the preset with the pick; the engine's answer
+        // brings nothing more.
+        let speakers = app
+            .state
+            .devices
+            .iter()
+            .position(|d| d.name == SPEAKERS)
+            .expect("listed");
+        app.handle(&[UiAction::SelectOutput(speakers)]);
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+        app.settings
+            .remember_device_preset(SPEAKERS, "Speakers", "Beta", "speaker", OUT);
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+    }
+
+    #[test]
+    fn a_start_the_engine_attached_elsewhere_first_ends_on_the_saved_devices_preset() {
+        // The engine attaches the output by its own rules before the list arrives: the speakers,
+        // which bring Alpha. The saved headphones, announced once they are listed, bring back
+        // their own Beta rather than playing on with the speakers' preset.
+        let mut settings = saved_settings(OUT);
+        settings.remember_device_preset(SPEAKERS, "Speakers", "Alpha", "speaker", OUT);
+        settings.remember_device_preset(HEADPHONES, "Headphones", "Beta", "headphones", OUT);
+        let (mut app, engine, _dir) = started_with(settings);
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        app.poll_audio();
+        assert!(
+            engine.take_sent().contains(&UiToAudio::SelectDevice {
+                node_name: HEADPHONES.to_owned(),
+                direction: OUT,
+            }),
+            "the saved headphones are asked for"
+        );
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+        assert_eq!(selected(&app, OUT), Some(HEADPHONES));
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        assert_eq!(app.settings.output_preset, "Beta");
+    }
+
+    #[test]
+    fn the_saved_device_plugged_back_in_brings_back_its_preset() {
+        let (mut app, engine, _dir) = on_the_headphones();
+        app.settings
+            .remember_device_preset(HEADPHONES, "Headphones", "Beta", "headphones", OUT);
+        // Unplugged: the engine takes the speakers, and their Alpha.
+        engine.feed(AudioToUi::Devices(without_the_headphones()));
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+        // Plugged back in: announced again, and back on Beta.
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+        assert_eq!(selected(&app, OUT), Some(HEADPHONES));
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+    }
+
+    /// [`two_lane_devices`] with the headphones unplugged.
+    fn without_the_headphones() -> Vec<AudioDevice> {
+        two_lane_devices()
+            .into_iter()
+            .filter(|d| d.name != HEADPHONES)
+            .collect()
+    }
+
+    /// The saved run of [`saved_settings`] — the headphones on `Beta`, which they remember — just
+    /// started, with `Alpha` picked before the engine has said anything: from the command line,
+    /// where `fxsound --preset Alpha` at a cold start runs before the device list, or from the
+    /// window.
+    fn alpha_picked_at_a_cold_start(from_the_window: bool) -> (App, FakeEngine, tempfile::TempDir) {
+        let mut settings = saved_settings(OUT);
+        settings.remember_device_preset(HEADPHONES, "Headphones", "Beta", "headphones", OUT);
+        let (mut app, engine, dir) = started_with(settings);
+        if from_the_window {
+            pick(&mut app, "Alpha");
+        } else {
+            let outcome = crate::commands::run(
+                &mut app,
+                &[crate::cli::Command::Preset(PresetCommand::Select(
+                    "Alpha".to_owned(),
+                ))],
+            );
+            assert!(!outcome.failed, "{}", outcome.stderr);
+        }
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+        let _ = engine.take_sent();
+        (app, engine, dir)
+    }
+
+    #[test]
+    fn a_preset_picked_at_a_cold_start_survives_the_saved_device_being_listed() {
+        // The saved headphones are announced and then attached. The preset they remember is the
+        // one the pick replaced: bringing it back would undo the pick, and upstream moves the
+        // preset only for a device other than the one it shows (`FxController.cpp:1645-1658`).
+        for from_the_window in [false, true] {
+            let (mut app, engine, _dir) = alpha_picked_at_a_cold_start(from_the_window);
+            engine.feed(AudioToUi::Devices(two_lane_devices()));
+            app.poll_audio();
+            assert!(
+                engine.take_sent().contains(&UiToAudio::SelectDevice {
+                    node_name: HEADPHONES.to_owned(),
+                    direction: OUT,
+                }),
+                "the saved headphones are still asked for"
+            );
+            assert_eq!(
+                app.lane_preset(OUT),
+                Some(("Alpha", false)),
+                "listed, picked from the window: {from_the_window}"
+            );
+            engine.feed(attached(OUT, Some(HEADPHONES)));
+            app.poll_audio();
+            assert_eq!(selected(&app, OUT), Some(HEADPHONES));
+            assert_eq!(
+                app.lane_preset(OUT),
+                Some(("Alpha", false)),
+                "attached, picked from the window: {from_the_window}"
+            );
+            assert_eq!(app.settings.output_preset, "Alpha");
+        }
+    }
+
+    #[test]
+    fn a_preset_picked_at_a_cold_start_survives_the_saved_device_attaching_before_the_list() {
+        for from_the_window in [false, true] {
+            let (mut app, engine, _dir) = alpha_picked_at_a_cold_start(from_the_window);
+            engine.feed(attached(OUT, Some(HEADPHONES)));
+            app.poll_audio();
+            assert_eq!(
+                app.lane_preset(OUT),
+                Some(("Alpha", false)),
+                "attached, picked from the window: {from_the_window}"
+            );
+            engine.feed(AudioToUi::Devices(two_lane_devices()));
+            app.poll_audio();
+            assert_eq!(selected(&app, OUT), Some(HEADPHONES));
+            assert_eq!(
+                app.lane_preset(OUT),
+                Some(("Alpha", false)),
+                "listed, picked from the window: {from_the_window}"
+            );
+            assert_eq!(app.settings.output_preset, "Alpha");
+        }
+    }
+
+    #[test]
+    fn a_lane_back_on_the_device_it_was_on_after_a_reconnect_has_not_moved() {
+        // The headphones went and the engine took the speakers, with their Alpha. Then the
+        // connection dropped, and Beta was picked while the lane had no nodes: the speakers
+        // coming back are the device the lane was on, not a move, and the pick stays.
+        let (mut app, engine, _dir) = on_the_headphones();
+        engine.feed(AudioToUi::Devices(without_the_headphones()));
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+
+        engine.feed(AudioToUi::Disconnected {
+            reason: "the server went away".to_owned(),
+        });
+        engine.feed(attached(OUT, None));
+        app.poll_audio();
+        pick(&mut app, "Beta");
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
+        assert_eq!(selected(&app, OUT), Some(SPEAKERS));
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+    }
+
+    #[test]
+    fn the_saved_device_listed_again_while_the_lane_has_no_nodes_still_brings_its_preset() {
+        // The lane was last on the speakers, with their Alpha, when the connection dropped; the
+        // headphones are back in the first list after it. That is a move, nodes or no nodes.
+        let (mut app, engine, _dir) = on_the_headphones();
+        app.settings
+            .remember_device_preset(HEADPHONES, "Headphones", "Beta", "headphones", OUT);
+        engine.feed(AudioToUi::Devices(without_the_headphones()));
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+        let _ = engine.take_sent();
+
+        engine.feed(AudioToUi::Disconnected {
+            reason: "the server went away".to_owned(),
+        });
+        engine.feed(attached(OUT, None));
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        app.poll_audio();
+        assert!(
+            engine.take_sent().contains(&UiToAudio::SelectDevice {
+                node_name: HEADPHONES.to_owned(),
+                direction: OUT,
+            }),
+            "the saved headphones are asked for again"
+        );
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+        assert_eq!(selected(&app, OUT), Some(HEADPHONES));
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+    }
+
+    #[test]
+    fn a_microphone_the_engine_moves_to_brings_its_voice_preset_without_moving_the_window() {
+        const USB: &str = "alsa_input.usb";
+        let mut settings = saved_settings(OUT);
+        settings.remember_device_preset(USB, "USB microphone", "Quiet", "microphone", IN);
+        let (mut app, engine, _dir) = started_with(settings);
+        let mut devices = two_lane_devices();
+        devices.push(device(USB, IN, false));
+        engine.feed(AudioToUi::Devices(devices));
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        engine.feed(attached(IN, Some(MIC)));
+        app.poll_audio();
+        assert_eq!(app.lane_preset(IN), Some(("Loud", false)));
+        assert_eq!(app.input_params().makeup_db, 9.0);
+
+        engine.feed(attached(IN, Some(USB)));
+        app.poll_audio();
+        assert_eq!(app.state.direction, OUT, "the window stays on the speakers");
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+        assert_eq!(app.input_params().makeup_db, 0.0);
+        assert_eq!(app.settings.input_preset, "Quiet");
+    }
+
+    fn listed_entry(name: &str, factory: bool, modified: bool) -> PresetEntry {
+        PresetEntry {
+            name: name.to_owned(),
+            factory,
+            modified,
+        }
+    }
+
+    /// A headless app listing the factory `Jazz` and the user's `Mine`, with one of them selected.
+    fn choosing(factory: bool, modified: bool) -> App {
+        let mut app = headless();
+        app.state.presets = vec![
+            listed_entry("Jazz", true, false),
+            listed_entry("Mine", false, false),
+        ];
+        let at = usize::from(!factory);
+        app.state.presets[at].modified = modified;
+        app.state.selected_preset = Some(at);
+        app
+    }
+
+    #[test]
+    fn the_menu_offers_a_preset_item_exactly_when_its_command_would_run() {
+        // One rule for the hamburger and the command path (U15), and it is still the original's
+        // enablement (`FxMainWindow.cpp:536-543`).
+        for factory in [true, false] {
+            for modified in [false, true] {
+                for power in [true, false] {
+                    let mut app = choosing(factory, modified);
+                    app.state.power = power;
+                    let menu = app.preset_menu();
+                    let runs = |command: P| match app.preset_command_allowed(&command) {
+                        Ok(()) => true,
+                        Err(refusal) => refusal.is_about_the_name(),
+                    };
+                    let case = format!("factory {factory}, modified {modified}, power {power}");
+                    assert_eq!(
+                        menu.save_new,
+                        power && runs(P::SaveAs(String::new())),
+                        "{case}"
+                    );
+                    assert_eq!(menu.overwrite, power && runs(P::Overwrite), "{case}");
+                    assert_eq!(menu.undo, power && runs(P::Undo), "{case}");
+                    assert_eq!(
+                        menu.rename,
+                        power && runs(P::Rename(String::new())),
+                        "{case}"
+                    );
+                    assert_eq!(menu.delete, power && runs(P::Delete), "{case}");
+
+                    assert_eq!(menu.save_new, modified && power, "{case}");
+                    assert_eq!(menu.overwrite, modified && !factory && power, "{case}");
+                    assert_eq!(menu.undo, modified && power, "{case}");
+                    assert_eq!(menu.rename, !modified && !factory && power, "{case}");
+                    assert_eq!(menu.delete, !factory && power, "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_refusal_says_what_stands_in_the_way() {
+        let refused = |app: &App, command: P| app.preset_command_allowed(&command).unwrap_err();
+        let jazz = || "Jazz".to_owned();
+        let mine = || "Mine".to_owned();
+
+        let app = choosing(true, true);
+        assert_eq!(
+            refused(&app, P::Overwrite),
+            Refusal::FactoryOverwrite { preset: jazz() }
+        );
+        assert_eq!(
+            refused(&app, P::Rename("New".into())),
+            Refusal::FactoryRename { preset: jazz() }
+        );
+        assert_eq!(
+            refused(&app, P::Delete),
+            Refusal::FactoryDelete { preset: jazz() }
+        );
+        assert_eq!(
+            refused(&app, P::SaveAs("mine".into())),
+            Refusal::NameTaken {
+                name: "mine".into()
+            },
+            "names are compared ignoring case"
+        );
+        assert_eq!(refused(&app, P::SaveAs("  ".into())), Refusal::EmptyName);
+        assert_eq!(app.preset_command_allowed(&P::SaveAs("New".into())), Ok(()));
+        assert_eq!(app.preset_command_allowed(&P::Undo), Ok(()));
+
+        let app = choosing(false, false);
+        assert_eq!(
+            refused(&app, P::Overwrite),
+            Refusal::NothingToSave { preset: mine() }
+        );
+        assert_eq!(
+            refused(&app, P::SaveAs("New".into())),
+            Refusal::NothingToSave { preset: mine() }
+        );
+        assert_eq!(
+            refused(&app, P::Undo),
+            Refusal::NothingToUndo { preset: mine() }
+        );
+        assert_eq!(
+            refused(&app, P::Rename("Mine".into())),
+            Refusal::NameTaken { name: mine() }
+        );
+        assert_eq!(
+            app.preset_command_allowed(&P::Rename("Yours".into())),
+            Ok(())
+        );
+        assert_eq!(app.preset_command_allowed(&P::Delete), Ok(()));
+
+        let app = choosing(false, true);
+        assert_eq!(
+            refused(&app, P::Rename("Yours".into())),
+            Refusal::UnsavedChanges { preset: mine() }
+        );
+        assert_eq!(app.preset_command_allowed(&P::Overwrite), Ok(()));
+
+        let mut app = choosing(false, true);
+        app.state.selected_preset = None;
+        for command in [
+            P::SaveAs("New".into()),
+            P::Overwrite,
+            P::Undo,
+            P::Rename("New".into()),
+            P::Delete,
+        ] {
+            assert_eq!(refused(&app, command), Refusal::NoPresetSelected);
+        }
+        assert_eq!(
+            refused(&app, P::Select("Nope".into())),
+            Refusal::UnknownPreset {
+                lane: OUT,
+                name: "Nope".into(),
+                other_lane_has_it: false,
+            }
+        );
+        assert_eq!(
+            app.preset_command_allowed(&P::Select("Jazz".into())),
+            Ok(())
+        );
+        assert_eq!(app.preset_command_allowed(&P::Next), Ok(()));
+        assert_eq!(app.preset_command_allowed(&P::Previous), Ok(()));
+    }
+
+    #[test]
+    fn a_refusal_reads_as_the_reason_and_the_way_round_it() {
+        let text = |refusal: Refusal| refusal.to_string();
+        assert_eq!(
+            text(Refusal::FactoryOverwrite {
+                preset: "Jazz".into()
+            }),
+            "\"Jazz\" is a factory preset and cannot be overwritten; save the changes as a new \
+             preset with --save_preset"
+        );
+        assert!(
+            text(Refusal::UnsavedChanges {
+                preset: "Mine".into()
+            })
+            .contains("--undo_preset")
+        );
+        assert_eq!(
+            text(Refusal::NameTaken {
+                name: "Rock".into()
+            }),
+            "a preset called \"Rock\" already exists"
+        );
+        assert_eq!(
+            text(Refusal::LimitReached { max: 10 }),
+            "the limit of 10 user presets is reached; delete one before saving another"
+        );
+        assert_eq!(
+            text(Refusal::UnknownPreset {
+                lane: OUT,
+                name: "Loud".into(),
+                other_lane_has_it: true,
+            }),
+            "no output preset is called \"Loud\"; it is an input preset, so add --edit=input to \
+             select it"
+        );
+        assert!(!Refusal::NoPresetSelected.is_about_the_name());
+        assert!(Refusal::EmptyName.is_about_the_name());
+    }
+
+    #[test]
+    fn save_new_is_refused_at_the_user_preset_cap_and_the_menu_greys_it_out() {
+        let mut app = choosing(true, true);
+        app.settings.max_user_presets = 10;
+        for n in 1..9 {
+            app.state
+                .presets
+                .push(listed_entry(&format!("Mine {n}"), false, false));
+        }
+        assert_eq!(app.user_preset_count(), 9);
+        assert_eq!(app.preset_command_allowed(&P::SaveAs("New".into())), Ok(()));
+        assert!(app.preset_menu().save_new);
+
+        app.state.presets.push(listed_entry("Mine 9", false, false));
+        assert_eq!(
+            app.preset_command_allowed(&P::SaveAs("New".into())),
+            Err(Refusal::LimitReached { max: 10 })
+        );
+        assert!(!app.preset_menu().save_new);
+    }
+
+    #[test]
+    fn exporting_from_the_window_writes_the_saved_preset_not_its_unsaved_edits() {
+        // Upstream PR #155 (U16): the edits live in the autosave until they are saved.
+        let (mut app, dir) = with_store();
+        add_user_preset(&mut app, "Music");
+        add_user_preset(&mut app, "Other");
+        pick(&mut app, "Music");
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 8.0)]);
+        // Switching away stashes the edits in the autosave, which the store prefers on load.
+        pick(&mut app, "Other");
+        let (stashed, from_autosave) = app.presets.load("Music").expect("load");
+        assert!(from_autosave);
+        assert!(
+            stashed.effect(Effect::Bass) > 0.5,
+            "the edits are in the autosave"
+        );
+
+        let mut state = ExportState {
+            presets: vec!["Music".into()],
+            selected: [0].into_iter().collect(),
+            ..ExportState::default()
+        };
+        app.handle_export(&PresetsAction::Export, &mut state);
+        assert_eq!(state.finished, Some(true));
+        let exported =
+            fxsound_preset::load(&dir.path().join("export/Music.fac")).expect("the export");
+        assert_eq!(
+            exported.effect(Effect::Bass),
+            0.0,
+            "as saved, not as edited"
+        );
+    }
+
+    #[test]
+    fn exporting_a_voice_preset_writes_it_as_saved_too() {
+        let (mut app, dir) = with_store();
+        let voices_dir = use_voices(
+            &mut app,
+            &[fxsound_preset::input::InputPreset {
+                name: "Loud".to_owned(),
+                makeup_db: 9.0,
+                ..fxsound_preset::input::InputPreset::default()
+            }],
+        );
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        pick(&mut app, "Loud");
+        app.handle(&[UiAction::SetMasterGain(-4.0)]);
+        let edited = app.lane_snapshot(IN).expect("a voice preset").0;
+        app.autosave_lane_preset(&edited);
+
+        let mut state = ExportState {
+            presets: vec!["Loud".into()],
+            selected: [0].into_iter().collect(),
+            ..ExportState::default()
+        };
+        app.handle_export(&PresetsAction::Export, &mut state);
+        assert_eq!(state.finished, Some(true));
+        let exported = InputPreset::load(&dir.path().join("export/Loud.toml")).expect("the export");
+        assert_eq!(exported.makeup_db, 9.0, "as saved, not as edited");
+        drop(voices_dir);
     }
 }

@@ -5,7 +5,18 @@
 //!
 //! ```text
 //! in ─► graphic EQ ─► master gain · balance ─► volume levelling ─► effect chain ─► spectrum tap ─► out
+//!       └─── GraphicEq block: skipped while the EQ is off ────┘
+//!
+//! power off:
+//! in ─► master gain, while the EQ is on (no balance) ─► spectrum tap ─► out
 //! ```
+//!
+//! The equalizer's switch is the whole block's switch, not the filters' alone: master gain,
+//! balance and the levelling stage all live inside the original's `sosProcessBuffer`, which
+//! `dfxpProcessReal.cpp:143-157` does not call while the equalizer is off (upstream aad64c1,
+//! "disable leveling when EQ is off"). Power off calls `GraphicEqProcess_MasterGainOnly` instead
+//! (`:158-169`), one multiply per sample on every channel (`SosProcess.cpp:500-516`) — and that
+//! call sits behind the same EQ test.
 //!
 //! Everything after construction is allocation-free. [`Engine::process`] is the only method the
 //! real-time thread calls per buffer; the others are called from the same thread in response to a
@@ -208,19 +219,25 @@ impl Engine {
         }
 
         if self.applied.power {
-            self.eq.process(buffer, channels);
-            self.apply_gain_stage(buffer, channels);
-            // The subwoofer is excluded from the detector: it carries a deliberately enormous
-            // amount of the programme's energy, so letting it into the level analysis pulls the
-            // gain down on bass-heavy material for reasons that have nothing to do with how loud
-            // the programme actually is.
-            self.leveller
-                .process_excluding(buffer, channels, self.lfe_channel);
+            // The GraphicEq block, whole or not at all (`dfxpProcessReal.cpp:143-157`). While it
+            // is skipped the equalizer's and the leveller's state stand still, as the original's
+            // do, rather than being reset.
+            if self.applied.eq_on {
+                self.eq.process(buffer, channels);
+                self.apply_gain_stage(buffer, channels);
+                // The subwoofer is excluded from the detector: it carries a deliberately enormous
+                // amount of the programme's energy, so letting it into the level analysis pulls
+                // the gain down on bass-heavy material for reasons that have nothing to do with
+                // how loud the programme actually is.
+                self.leveller
+                    .process_excluding(buffer, channels, self.lfe_channel);
+            }
             self.chain.process(buffer, channels);
-        } else {
-            // Bypassed, the master gain is still applied — it is the one stage that survives a
-            // bypass in the original (`SosProcess.cpp:512-514`).
-            self.apply_gain_stage(buffer, channels);
+        } else if self.applied.eq_on {
+            // Bypassed, the master gain is the one stage that survives — without the balance, and
+            // only while the equalizer is on (`dfxpProcessReal.cpp:158-169`,
+            // `SosProcess.cpp:500-516`).
+            self.apply_master_gain_only(buffer);
         }
 
         // A block that went in finite can still come out non-finite if a stage's own state has
@@ -259,6 +276,18 @@ impl Engine {
             for sample in buffer.iter_mut() {
                 *sample *= self.master_gain;
             }
+        }
+    }
+
+    /// The bypass's gain stage: `sosProcessBuffer_MasterGainOnly`, which multiplies every sample
+    /// of every channel — the subwoofer and the rears included — by the master gain and nothing
+    /// else (`SosProcess.cpp:500-516`).
+    fn apply_master_gain_only(&self, buffer: &mut [f32]) {
+        if self.master_gain == 1.0 {
+            return;
+        }
+        for sample in buffer.iter_mut() {
+            *sample *= self.master_gain;
         }
     }
 
@@ -411,10 +440,15 @@ mod tests {
 
     #[test]
     fn master_gain_survives_a_bypass() {
-        // The original keeps the master gain live even when the engine is bypassed.
+        // The original keeps the master gain live when the engine is bypassed — but only while the
+        // equalizer is on, and without the balance: `dfxpProcessReal.cpp:158-169` calls
+        // `GraphicEqProcess_MasterGainOnly` behind an `i_eq_on` test, and it multiplies by the
+        // master gain alone (`SosProcess.cpp:500-516`). The two conditions have tests of their own
+        // below; this one pins the half that has not changed.
         let mut engine = Engine::new(48_000.0, 256, 2);
         let params = DspParams {
             power: false,
+            eq_on: true,
             master_gain_db: 6.0,
             ..DspParams::default()
         };
@@ -440,18 +474,33 @@ mod tests {
 
     #[test]
     fn balance_reaches_the_audio_path() {
-        let mut engine = Engine::new(48_000.0, 256, 2);
+        // Powered on, because a bypass carries the master gain but not the balance
+        // (`SosProcess.cpp:500-516`). That means the whole chain, where Dynamic Boost's look-ahead
+        // delays the output and its ceiling scales both sides alike; the ratio between the sides
+        // is what the balance set.
+        let mut engine = Engine::new(48_000.0, 4096, 2);
         let params = DspParams {
-            power: false,
             balance: 20.0,
             ..DspParams::default()
         };
         engine.apply(&params);
 
-        let mut buffer = vec![1.0_f32, 1.0, 1.0, 1.0];
+        let mut buffer = tone(4096, 2, 0.5);
         engine.process(&mut buffer, 2);
-        assert!(buffer[0] < buffer[1], "left should be attenuated");
-        assert!((buffer[1] - 1.0).abs() < 1e-6, "right should be untouched");
+        let left = channel_peak(&buffer, 2, 0);
+        let right = channel_peak(&buffer, 2, 1);
+        assert!(
+            left < right,
+            "left should be attenuated: {left} against {right}"
+        );
+        assert!(
+            (left / right - 0.1).abs() < 0.005,
+            "20 dB of balance should leave the left at a tenth of the right: {left} against {right}"
+        );
+        assert!(
+            (right - 0.5 * 0.966_051).abs() < 0.01,
+            "the right should only see Dynamic Boost's ceiling: {right}"
+        );
     }
 
     #[test]
@@ -561,8 +610,13 @@ mod tests {
             volume_leveling_db: amount,
             ..DspParams::default()
         };
+        settled_peak(&params, amplitude, blocks)
+    }
+
+    /// [`settled_output_peak`] for any snapshot.
+    fn settled_peak(params: &DspParams, amplitude: f32, blocks: usize) -> f32 {
         let mut engine = Engine::new(48_000.0, LEVELLER_BLOCK, 2);
-        engine.apply(&params);
+        engine.apply(params);
 
         let mut peak = 0.0_f32;
         for block in 0..blocks {
@@ -613,10 +667,11 @@ mod tests {
     fn a_zero_amount_leveller_is_absent_from_the_path_bit_for_bit() {
         // Amount 0 is the shipping default (`fxsound/Source/GUI/FxController.h:48`), and
         // `SosProcess.cpp:146-150` returns before touching a sample. `Engine::process` calls the
-        // stage unconditionally, so what has to be proved here is that having it in the chain and
-        // not having it at all produce the same bits — not merely the same audio. Anything that
-        // rode in from the previous buffer (a stale ramp, a retained gain, a clamp at the ceiling)
-        // would show up as a mismatch somewhere in the block.
+        // stage whenever the equalizer is on, whatever the amount, so what has to be proved here
+        // is that having it in the chain and not having it at all produce the same bits — not
+        // merely the same audio. Anything that rode in from the previous buffer (a stale ramp, a
+        // retained gain, a clamp at the ceiling) would show up as a mismatch somewhere in the
+        // block.
         let mut params = DspParams {
             master_gain_db: -3.0,
             volume_leveling_db: 0.0,
@@ -663,6 +718,215 @@ mod tests {
                 "sample {index}: engine gave {got}, a leveller-free chain gave {want}"
             );
         }
+    }
+
+    // --- The equalizer's switch is the GraphicEq block's switch (U3) ---------------------------
+    //
+    // `dfxpProcessReal.cpp:143-170`: powered, the block — filters, master gain, balance, levelling
+    // — runs only while the equalizer is on; bypassed, `GraphicEqProcess_MasterGainOnly` runs
+    // behind the same test, and it is the master gain alone (`SosProcess.cpp:500-516`).
+
+    /// A snapshot that gives every stage of the GraphicEq block something audible to do.
+    fn busy_graphic_eq_block(eq_on: bool) -> DspParams {
+        let mut params = DspParams {
+            eq_on,
+            master_gain_db: -9.0,
+            balance: 12.0,
+            volume_leveling_db: 4.0,
+            ..DspParams::default()
+        };
+        for band in 0..10 {
+            params.band_boost_db[band] = if band % 2 == 0 { 9.0 } else { -6.0 };
+        }
+        params
+    }
+
+    /// Everything a fresh engine hands back for `blocks` blocks of a continuous stereo tone.
+    fn render_blocks(params: &DspParams, blocks: usize, amplitude: f32) -> Vec<f32> {
+        let mut engine = Engine::new(48_000.0, LEVELLER_BLOCK, 2);
+        engine.apply(params);
+        let mut rendered = Vec::with_capacity(blocks * LEVELLER_BLOCK * 2);
+        for block in 0..blocks {
+            let mut buffer = continuous_tone(block * LEVELLER_BLOCK, LEVELLER_BLOCK, amplitude);
+            engine.process(&mut buffer, 2);
+            rendered.extend_from_slice(&buffer);
+        }
+        rendered
+    }
+
+    fn assert_same_bits(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}: lengths differ");
+        for (index, (got, want)) in got.iter().zip(want).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "{what}: sample {index} is {got}, expected {want}"
+            );
+        }
+    }
+
+    fn largest_difference(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .fold(0.0_f32, |acc, (x, y)| acc.max((x - y).abs()))
+    }
+
+    #[test]
+    fn turning_the_equalizer_off_takes_the_master_gain_the_balance_and_the_leveller_with_it() {
+        // Upstream aad64c1. With the equalizer off, an engine whose block is set to do a great
+        // deal and one whose block is set to do nothing must hand back the same bits.
+        let busy = render_blocks(&busy_graphic_eq_block(false), 60, 0.05);
+        let plain = render_blocks(
+            &DspParams {
+                eq_on: false,
+                ..DspParams::default()
+            },
+            60,
+            0.05,
+        );
+        assert_same_bits(&busy, &plain, "equalizer off");
+
+        // And the fixture really does exercise the block: switched on, the same settings move the
+        // output a long way.
+        let on = render_blocks(&busy_graphic_eq_block(true), 60, 0.05);
+        assert!(
+            largest_difference(&on, &busy) > 0.01,
+            "the fixture's block settings do nothing even with the equalizer on"
+        );
+    }
+
+    #[test]
+    fn with_the_equalizer_off_only_the_effect_chain_touches_the_signal() {
+        // The effects are not part of the block (`dfxpProcessReal.cpp:174` onwards is outside it),
+        // so the engine must equal the effect chain alone, bit for bit, block for block.
+        let mut params = busy_graphic_eq_block(false);
+        params.set_effect(EffectId::Fidelity, 0.4);
+        params.set_effect(EffectId::Bass, 0.6);
+
+        let through_engine = render_blocks(&params, 20, 0.2);
+
+        let mut chain = Chain::new(48_000.0);
+        chain.apply(&DspParams::default());
+        chain.apply(&params);
+        let mut reference = Vec::new();
+        for block in 0..20 {
+            let mut buffer = continuous_tone(block * LEVELLER_BLOCK, LEVELLER_BLOCK, 0.2);
+            chain.process(&mut buffer, 2);
+            reference.extend_from_slice(&buffer);
+        }
+        assert_same_bits(&through_engine, &reference, "equalizer off, effects on");
+
+        // The effects themselves were live: without them the output is different.
+        let without_effects = render_blocks(&busy_graphic_eq_block(false), 20, 0.2);
+        assert!(largest_difference(&through_engine, &without_effects) > 1e-3);
+    }
+
+    #[test]
+    fn a_quiet_passage_is_not_levelled_while_the_equalizer_is_off() {
+        let levelled = |eq_on| {
+            settled_peak(
+                &DspParams {
+                    eq_on,
+                    volume_leveling_db: 4.0,
+                    ..DspParams::default()
+                },
+                0.02,
+                400,
+            )
+        };
+        let unlevelled = settled_output_peak(0.0, 0.02, 400);
+
+        assert!(
+            levelled(true) > unlevelled * 2.5,
+            "the fixture is wrong: levelling did not lift the passage with the equalizer on"
+        );
+        assert_eq!(
+            levelled(false).to_bits(),
+            unlevelled.to_bits(),
+            "the leveller still ran with the equalizer off"
+        );
+    }
+
+    #[test]
+    fn the_bypass_applies_the_master_gain_without_the_balance() {
+        let mut engine = Engine::new(48_000.0, 256, 2);
+        engine.apply(&DspParams {
+            power: false,
+            master_gain_db: -6.0,
+            balance: 20.0,
+            ..DspParams::default()
+        });
+
+        let mut buffer = vec![0.5_f32; 16];
+        engine.process(&mut buffer, 2);
+        let expected = 0.5 * db_to_linear(-6.0);
+        for (index, sample) in buffer.iter().enumerate() {
+            assert_eq!(
+                sample.to_bits(),
+                expected.to_bits(),
+                "sample {index}: {sample}, expected the plain master gain {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bypass_passes_the_audio_untouched_while_the_equalizer_is_off() {
+        let mut params = busy_graphic_eq_block(false);
+        params.power = false;
+        params.master_gain_db = 6.0;
+        let mut engine = Engine::new(48_000.0, LEVELLER_BLOCK, 2);
+        engine.apply(&params);
+
+        for block in 0..10 {
+            let input = continuous_tone(block * LEVELLER_BLOCK, LEVELLER_BLOCK, 0.3);
+            let mut buffer = input.clone();
+            engine.process(&mut buffer, 2);
+            assert_same_bits(&buffer, &input, "bypassed with the equalizer off");
+        }
+    }
+
+    #[test]
+    fn the_bypass_leaves_out_the_equalizer_curve_and_the_leveller() {
+        // Only the master gain survives a bypass; the curve and the levelling stay behind even
+        // while the equalizer is on.
+        for master_gain_db in [0.0, -3.0] {
+            let mut params = busy_graphic_eq_block(true);
+            params.power = false;
+            params.master_gain_db = master_gain_db;
+            let gain = db_to_linear(master_gain_db);
+            let mut engine = Engine::new(48_000.0, LEVELLER_BLOCK, 2);
+            engine.apply(&params);
+
+            for block in 0..10 {
+                let input = continuous_tone(block * LEVELLER_BLOCK, LEVELLER_BLOCK, 0.02);
+                let expected: Vec<f32> = input.iter().map(|s| s * gain).collect();
+                let mut buffer = input;
+                engine.process(&mut buffer, 2);
+                assert_same_bits(&buffer, &expected, "bypassed with the equalizer on");
+            }
+        }
+    }
+
+    #[test]
+    fn the_bypass_applies_the_master_gain_to_every_channel_of_a_surround_layout() {
+        // `sosProcessBuffer_MasterGainOnly` runs over `i_num_sample_sets * i_num_channels`
+        // samples: the subwoofer and the rears take the gain exactly as the front pair does.
+        let channels = 6;
+        let mut engine = Engine::new(48_000.0, 1024, channels);
+        engine.set_lfe_channel(Some(LFE));
+        engine.apply(&DspParams {
+            power: false,
+            master_gain_db: -6.0,
+            balance: -10.0,
+            ..DspParams::default()
+        });
+
+        let input = tone(512, channels, 0.5);
+        let mut buffer = input.clone();
+        engine.process(&mut buffer, channels);
+        let gain = db_to_linear(-6.0);
+        let expected: Vec<f32> = input.iter().map(|s| s * gain).collect();
+        assert_same_bits(&buffer, &expected, "bypassed 5.1");
     }
 
     #[test]

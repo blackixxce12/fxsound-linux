@@ -42,7 +42,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libpipewire-0.3-dev libclang-dev \
-            pipewire pipewire-bin libspa-0.2-modules dbus
+            pipewire pipewire-bin libspa-0.2-modules \
+            libspa-0.2-bluetooth dbus-daemon
           # `pipewire` itself is the daemon, and it is here for the graph-churn tests: each one
           # starts a private server with its own socket and synthetic devices. Without the binary
           # those tests print that they are skipping and pass, which is the right behaviour for a
@@ -53,9 +54,11 @@ jobs:
           # outside the engine and to wire a tone through both lanes; `libspa-0.2-modules` has the
           # `audiotestsrc` plugin that tone comes from. Both already arrive as dependencies of
           # `pipewire`; they are named because the tests now fail without them, and the list here
-          # is where to look first when one does. `dbus` is there for the same reason as
+          # is where to look first when one does. `dbus-daemon` is there for the same reason as
           # `pipewire`: the D-Bus service's tests start a `dbus-daemon` of their own, never the
-          # session's.
+          # session's. `libspa-0.2-bluetooth` and `dbus-daemon` are also for the tests of a headset
+          # between profiles: the only card — PipeWire `Device` — a private daemon can make without
+          # hardware is Bluetooth's enumerator, on a private system bus.
 
       # rust-toolchain.toml pins 1.98.1 and asks for rustfmt and clippy, so rustup installs
       # exactly what the developers use rather than whatever the runner image happens to ship.

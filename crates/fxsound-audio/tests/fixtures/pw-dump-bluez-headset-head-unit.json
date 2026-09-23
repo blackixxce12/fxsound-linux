@@ -1,0 +1,391 @@
+[
+  {
+    "id": 40,
+    "type": "PipeWire:Interface:Metadata",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x"
+    ],
+    "props": {
+      "client.id": 33,
+      "factory.id": 7,
+      "metadata.name": "default",
+      "module.id": 6,
+      "object.serial": 40
+    },
+    "metadata": [
+      {
+        "subject": 0,
+        "key": "default.audio.sink",
+        "type": "Spa:String:JSON",
+        "value": {
+          "name": "bluez_output.00_11_22_33_44_55.1"
+        }
+      },
+      {
+        "subject": 0,
+        "key": "default.audio.source",
+        "type": "Spa:String:JSON",
+        "value": {
+          "name": "bluez_input.00:11:22:33:44:55"
+        }
+      }
+    ]
+  },
+  {
+    "id": 57,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 65,
+      "max-output-ports": 0,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 2,
+      "n-output-ports": 2,
+      "state": "suspended",
+      "error": null,
+      "props": {
+        "api.alsa.path": "front:0",
+        "api.alsa.pcm.card": 0,
+        "api.alsa.pcm.stream": "playback",
+        "audio.channels": 2,
+        "audio.position": "[ FL, FR ]",
+        "card.profile.device": 4,
+        "client.id": 33,
+        "clock.quantum-limit": 8192,
+        "device.api": "alsa",
+        "device.class": "sound",
+        "device.icon-name": "audio-card-analog",
+        "device.id": 45,
+        "device.profile.description": "Analog Stereo",
+        "device.profile.name": "analog-stereo",
+        "device.routes": 1,
+        "factory.id": 19,
+        "factory.name": "api.alsa.pcm.sink",
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Audio/Sink",
+        "node.description": "Built-in Audio Analog Stereo",
+        "node.driver": true,
+        "node.loop.name": "data-loop.0",
+        "node.name": "alsa_output.pci-0000_00_1f.3.analog-stereo",
+        "node.nick": "ALC257 Analog",
+        "node.pause-on-idle": false,
+        "object.id": 57,
+        "object.path": "alsa:acp:PCH:4:playback",
+        "object.serial": 57,
+        "port.group": "playback",
+        "priority.driver": 1009,
+        "priority.session": 1009
+      }
+    }
+  },
+  {
+    "id": 58,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 0,
+      "max-output-ports": 65,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 0,
+      "n-output-ports": 2,
+      "state": "suspended",
+      "error": null,
+      "props": {
+        "api.alsa.path": "front:0",
+        "api.alsa.pcm.card": 0,
+        "api.alsa.pcm.stream": "capture",
+        "audio.channels": 2,
+        "audio.position": "[ FL, FR ]",
+        "card.profile.device": 5,
+        "client.id": 33,
+        "clock.quantum-limit": 8192,
+        "device.api": "alsa",
+        "device.class": "sound",
+        "device.icon-name": "audio-card-analog",
+        "device.id": 45,
+        "device.profile.description": "Analog Stereo",
+        "device.profile.name": "analog-stereo",
+        "device.routes": 1,
+        "factory.id": 19,
+        "factory.name": "api.alsa.pcm.source",
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Audio/Source",
+        "node.description": "Built-in Audio Analog Stereo",
+        "node.driver": true,
+        "node.loop.name": "data-loop.0",
+        "node.name": "alsa_input.pci-0000_00_1f.3.analog-stereo",
+        "node.nick": "ALC257 Analog",
+        "node.pause-on-idle": false,
+        "object.id": 58,
+        "object.path": "alsa:acp:PCH:5:capture",
+        "object.serial": 58,
+        "port.group": "capture",
+        "priority.driver": 2009,
+        "priority.session": 2009
+      }
+    }
+  },
+  {
+    "id": 60,
+    "type": "PipeWire:Interface:Device",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "change-mask": [
+        "props",
+        "params"
+      ],
+      "props": {
+        "api.bluez5.address": "00:11:22:33:44:55",
+        "api.bluez5.class": "0x240404",
+        "api.bluez5.connection": "connected",
+        "api.bluez5.icon": "audio-headset",
+        "api.bluez5.path": "/org/bluez/hci0/dev_00_11_22_33_44_55",
+        "client.id": 34,
+        "device.alias": "Test Headset",
+        "device.api": "bluez5",
+        "device.bus": "bluetooth",
+        "device.description": "Test Headset",
+        "device.form-factor": "headset",
+        "device.icon-name": "audio-headset-bluetooth",
+        "device.name": "bluez_card.00_11_22_33_44_55",
+        "factory.id": 14,
+        "media.class": "Audio/Device",
+        "object.id": 60,
+        "object.serial": 60
+      }
+    }
+  },
+  {
+    "id": 70,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 65,
+      "max-output-ports": 0,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 1,
+      "n-output-ports": 1,
+      "state": "suspended",
+      "error": null,
+      "props": {
+        "api.bluez5.address": "00:11:22:33:44:55",
+        "api.bluez5.codec": "msbc",
+        "api.bluez5.profile": "headset-head-unit",
+        "api.bluez5.transport": "",
+        "audio.channels": 1,
+        "audio.position": "[ MONO ]",
+        "card.profile.device": 1,
+        "client.id": 34,
+        "clock.quantum-limit": 8192,
+        "device.api": "bluez5",
+        "device.id": 60,
+        "device.routes": 1,
+        "factory.id": 10,
+        "factory.name": "api.bluez5.sco.sink",
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Audio/Sink",
+        "node.description": "Test Headset",
+        "node.driver": true,
+        "node.loop.name": "data-loop.0",
+        "node.name": "bluez_output.00_11_22_33_44_55.1",
+        "node.pause-on-idle": false,
+        "object.id": 70,
+        "object.serial": 70,
+        "priority.driver": 1010,
+        "priority.session": 1010,
+        "spa.object.id": 1
+      }
+    }
+  },
+  {
+    "id": 71,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 0,
+      "max-output-ports": 65,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 0,
+      "n-output-ports": 1,
+      "state": "running",
+      "error": null,
+      "props": {
+        "api.bluez5.address": "00:11:22:33:44:55",
+        "api.bluez5.codec": "msbc",
+        "api.bluez5.internal": true,
+        "api.bluez5.profile": "headset-head-unit",
+        "api.bluez5.transport": "",
+        "audio.channels": 1,
+        "audio.position": "[ MONO ]",
+        "bluez5.loopback": false,
+        "card.profile.device": 0,
+        "client.id": 34,
+        "clock.quantum-limit": 8192,
+        "device.api": "bluez5",
+        "device.id": 60,
+        "device.routes": 1,
+        "factory.id": 10,
+        "factory.name": "api.bluez5.sco.source",
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Audio/Source",
+        "node.description": "Test Headset",
+        "node.driver": true,
+        "node.loop.name": "data-loop.0",
+        "node.name": "bluez_input.00_11_22_33_44_55.0",
+        "node.pause-on-idle": false,
+        "object.id": 71,
+        "object.serial": 71,
+        "priority.driver": 2010,
+        "priority.session": 2010,
+        "spa.object.id": 0
+      }
+    }
+  },
+  {
+    "id": 72,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 65,
+      "max-output-ports": 0,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 1,
+      "n-output-ports": 0,
+      "state": "running",
+      "error": null,
+      "props": {
+        "audio.channels": 1,
+        "audio.position": "[MONO]",
+        "bluez5.loopback": true,
+        "client.id": 34,
+        "factory.id": 8,
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Stream/Input/Audio/Internal",
+        "node.description": "Bluetooth internal capture stream for Test Headset",
+        "node.dont-fallback": true,
+        "node.linger": true,
+        "node.loop.name": "data-loop.0",
+        "node.name": "bluez_capture_internal.00:11:22:33:44:55",
+        "node.passive": true,
+        "object.id": 72,
+        "object.serial": 72,
+        "state.restore-props": false,
+        "stream.dont-remix": true,
+        "target.object": "bluez_input.00_11_22_33_44_55.0"
+      }
+    }
+  },
+  {
+    "id": 73,
+    "type": "PipeWire:Interface:Node",
+    "version": 3,
+    "permissions": [
+      "r",
+      "w",
+      "x",
+      "m"
+    ],
+    "info": {
+      "max-input-ports": 0,
+      "max-output-ports": 65,
+      "change-mask": [
+        "input-ports",
+        "output-ports",
+        "state",
+        "props",
+        "params"
+      ],
+      "n-input-ports": 0,
+      "n-output-ports": 1,
+      "state": "running",
+      "error": null,
+      "props": {
+        "audio.position": "[MONO]",
+        "bluez5.loopback": true,
+        "card.profile.device": 0,
+        "client.id": 34,
+        "device.id": 60,
+        "device.routes": 1,
+        "factory.id": 8,
+        "library.name": "audioconvert/libspa-audioconvert",
+        "media.class": "Audio/Source",
+        "node.description": "Test Headset",
+        "node.loop.name": "data-loop.0",
+        "node.name": "bluez_input.00:11:22:33:44:55",
+        "node.virtual": false,
+        "object.id": 73,
+        "object.serial": 73,
+        "priority.session": 2010
+      }
+    }
+  }
+]

@@ -381,67 +381,36 @@ fn next_device(app: &App, lane: DeviceDirection) -> Option<usize> {
     }
 }
 
+/// A preset option: refused, with the reason on stderr, wherever the hamburger menu would grey
+/// its item out ([`App::preset_command_allowed`]) — an unknown name, an overwrite of a factory
+/// preset, a rename with unsaved changes, a new name that is taken, the user-preset cap — and
+/// otherwise carried out as the menu item is.
+///
+/// A name that is not in the edit direction's list is an error for either lane (0.4.0 design
+/// §1.4, §11): 0.3.0 exited zero having done nothing, which a script cannot tell from success. A
+/// name the other lane has is almost certainly that lane's preset, so the message says how to
+/// reach it.
 fn run_preset(app: &mut App, command: &PresetCommand) -> Outcome {
+    if let Err(refusal) = app.preset_command_allowed(command) {
+        return Outcome::refused(refusal.to_string());
+    }
     match command {
         PresetCommand::Select(name) => {
             if let Some(index) = app.state.presets.iter().position(|p| p.name == *name) {
                 app.handle(&[UiAction::SelectPreset(index)]);
-            } else {
-                // Selected in the edit direction's list and nowhere else (0.4.0 design §1.4), and
-                // a name that is not in it is an error for either lane: 0.3.0 exited zero having
-                // done nothing, which a script cannot tell from success. A name the other lane has
-                // is almost certainly that lane's preset, so the message says how to reach it.
-                let lane = app.state.direction;
-                let other = lane.other();
-                let hint = if app.lane_has_preset(other, name) {
-                    format!(
-                        "; it is {} preset, so add --edit={} to select it",
-                        lane_noun(other),
-                        other.key()
-                    )
-                } else {
-                    String::new()
-                };
-                return Outcome::refused(format!(
-                    "no {} preset is called {name:?}{hint}",
-                    lane.key()
-                ));
             }
         }
         PresetCommand::SaveAs(name) => app.handle(&[UiAction::SavePresetAs(name.clone())]),
         PresetCommand::Overwrite => app.handle(&[UiAction::SavePreset]),
         PresetCommand::Undo => app.handle(&[UiAction::UndoPresetChanges]),
-        PresetCommand::Rename(name) => {
-            // The menu's Rename in one step: the saved file moves, everything that named the
-            // preset follows it, and the stream hears the new name once. The original renames
-            // only an unmodified user preset from the command line (`FxController.cpp:428-440`),
-            // as the menu only offers Rename then: what moves is the saved file, so unsaved
-            // edits would be left behind under a name that is gone.
-            if let Some(entry) = app.state.preset()
-                && !entry.factory
-                && entry.modified
-            {
-                return Outcome::refused(format!(
-                    "{:?} has unsaved changes; save them with --overwrite_preset or drop them \
-                     with --undo_preset before renaming it",
-                    entry.name
-                ));
-            }
-            app.rename_preset(name);
-        }
+        // The menu's Rename in one step: the saved file moves, everything that named the preset
+        // follows it, and the stream hears the new name once.
+        PresetCommand::Rename(name) => app.rename_preset(name),
         PresetCommand::Delete => app.handle(&[UiAction::DeletePreset]),
         PresetCommand::Next => app.cycle_preset(true),
         PresetCommand::Previous => app.cycle_preset(false),
     }
     Outcome::default()
-}
-
-/// "an output" / "an input", for a message about a lane's preset.
-const fn lane_noun(lane: DeviceDirection) -> &'static str {
-    match lane {
-        DeviceDirection::Output => "an output",
-        DeviceDirection::Input => "an input",
-    }
 }
 
 /// Everything `--status` reports, in the shape `--status --json` prints it.
@@ -2224,6 +2193,135 @@ mod tests {
             "{}",
             outcome.stderr
         );
+        let _ = std::fs::remove_dir_all(user_dir(tag).parent().expect("the root"));
+    }
+
+    #[test]
+    fn num_bands_on_the_command_line_carries_the_curve_over() {
+        // U1: `--num_bands` goes through the same remap as the window, rather than wiping the
+        // curve flat.
+        let mut a = app();
+        run(
+            &mut a,
+            &[
+                Command::BandGains(vec![(0, 6.0), (9, -3.0)]),
+                Command::NumBands(31),
+            ],
+        );
+        assert_eq!(a.state.eq_bands.len(), 31);
+        assert_eq!(a.state.eq_bands[0].boost_db, 6.0);
+        assert_eq!(a.state.eq_bands[30].boost_db, -3.0);
+        assert_eq!(a.settings().num_bands, 31);
+    }
+
+    #[test]
+    fn a_preset_command_the_menu_would_grey_out_is_refused_and_changes_nothing() {
+        // U15: the same rule as the hamburger menu, with the reason on stderr and a non-zero exit
+        // instead of a user copy shadowing a factory preset or a save nobody asked for.
+        let tag = "refusals";
+        let mut a = app_with_presets(tag);
+        let user = user_dir(tag);
+        run(&mut a, &[preset(PresetCommand::Select("Alpha".into()))]);
+        for (command, words) in [
+            (PresetCommand::Overwrite, "factory"),
+            (PresetCommand::Rename("Mine".into()), "factory"),
+            (PresetCommand::Delete, "factory"),
+            (PresetCommand::SaveAs("Mine".into()), "no unsaved changes"),
+            (PresetCommand::Undo, "no unsaved changes"),
+        ] {
+            let outcome = run(&mut a, &[preset(command.clone())]);
+            assert!(outcome.failed, "{command:?}");
+            assert!(
+                outcome.stderr.contains(words),
+                "{command:?}: {}",
+                outcome.stderr
+            );
+        }
+
+        run(&mut a, &[Command::BandGains(vec![(0, 6.0)])]);
+        let outcome = run(&mut a, &[preset(PresetCommand::Overwrite)]);
+        assert!(outcome.failed);
+        assert!(
+            outcome.stderr.contains("--save_preset"),
+            "{}",
+            outcome.stderr
+        );
+        let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("beta".into()))]);
+        assert!(outcome.failed);
+        assert!(
+            outcome.stderr.contains("already exists"),
+            "{}",
+            outcome.stderr
+        );
+
+        let saved: Vec<_> = std::fs::read_dir(&user)
+            .map(|dir| {
+                dir.filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "fac"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            saved,
+            Vec::<std::path::PathBuf>::new(),
+            "no user preset was written"
+        );
+        assert_eq!(
+            a.lane_preset(DeviceDirection::Output),
+            Some(("Alpha", true)),
+            "the edits are still there to save under a new name"
+        );
+        let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("Mine".into()))]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        let _ = std::fs::remove_dir_all(user.parent().expect("the root"));
+    }
+
+    #[test]
+    fn a_line_stops_at_nothing_and_still_fails_for_the_command_that_was_refused() {
+        // Each command is answered on its own: a refused one fails the line without undoing or
+        // skipping the others, as an unknown device already does.
+        let tag = "refusal-in-a-line";
+        let mut a = app_with_presets(tag);
+        let outcome = run(
+            &mut a,
+            &[
+                preset(PresetCommand::Select("Alpha".into())),
+                preset(PresetCommand::Delete),
+                preset(PresetCommand::Select("Beta".into())),
+            ],
+        );
+        assert!(outcome.failed);
+        assert_eq!(outcome.stderr.lines().count(), 1, "{}", outcome.stderr);
+        assert_eq!(
+            a.lane_preset(DeviceDirection::Output),
+            Some(("Beta", false))
+        );
+        let _ = std::fs::remove_dir_all(user_dir(tag).parent().expect("the root"));
+    }
+
+    #[test]
+    fn preset_commands_run_with_the_power_off_where_the_original_ignored_them() {
+        // A deliberate difference (README): the menu greys its preset items out while the power
+        // is off, and the original's command line ignores them, but a script here is answered.
+        let tag = "power-off";
+        let mut a = app_with_presets(tag);
+        let outcome = run(
+            &mut a,
+            &[
+                Command::Power(PowerCommand::Off),
+                preset(PresetCommand::Select("Beta".into())),
+                Command::BandGains(vec![(0, 6.0)]),
+                preset(PresetCommand::SaveAs("Mine".into())),
+            ],
+        );
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert!(!a.state.power);
+        assert_eq!(
+            a.lane_preset(DeviceDirection::Output),
+            Some(("Mine", false))
+        );
+        assert!(!a.preset_menu().delete, "while the menu offers nothing");
         let _ = std::fs::remove_dir_all(user_dir(tag).parent().expect("the root"));
     }
 }

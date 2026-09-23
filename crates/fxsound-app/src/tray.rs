@@ -14,7 +14,7 @@
 //! menu instead of drawing and positioning a popup by hand the way `showContextMenu` does
 //! (`docs/spec/07-startup-tray.md` §5.8).
 //!
-//! # Three deliberate departures
+//! # Four deliberate departures
 //!
 //! 1. **Three icons, not four.** Windows picks between a red and a blue "processing" icon
 //!    depending on its own theme (`FxSystemTrayView.cpp:90-111`). A panel owns its own background
@@ -32,6 +32,9 @@
 //!    port also lists capture devices (`docs/spec/12-audio-io.md` §28), so the submenu carries two
 //!    radio groups under two disabled header rows — "Output" and "Input" — the nearest thing
 //!    DBusMenu has to a section header.
+//! 4. **No Always On Top.** Windows ticks it off the window (`:275-278`, `:320`); winit's Wayland
+//!    backend ignores window levels, so the item would tick and change nothing. The hamburger
+//!    menu dropped it for the same reason.
 //!
 //! # Threading
 //!
@@ -46,7 +49,7 @@ use crossbeam_channel::Sender;
 use fxsound_core::ThemeMode;
 use fxsound_core::i18n::{tr, tr_args};
 use ksni::blocking::{Handle, TrayMethods as _};
-use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
+use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Category, Icon, MenuItem, Status, ToolTip, Tray};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,9 +166,6 @@ pub struct TrayState {
     /// that concept on Linux, so this defaults to `true` and is kept only as the hook.
     pub power_enabled: bool,
     pub theme: ThemeMode,
-    /// Ticked state of the Always On Top item. Windows reads it off the window rather than the
-    /// controller (`:320`).
-    pub always_on_top: bool,
     pub presets: Vec<TrayPreset>,
     pub selected_preset: Option<usize>,
     pub devices: Vec<TrayDevice>,
@@ -183,7 +183,6 @@ impl Default for TrayState {
             processing: false,
             power_enabled: true,
             theme: ThemeMode::default(),
-            always_on_top: false,
             presets: Vec::new(),
             selected_preset: None,
             devices: Vec::new(),
@@ -276,8 +275,6 @@ pub enum TrayCommand {
     OpenSettings,
     /// Menu ▸ Theme ▸ Dark | Light (`:267-273`).
     SetTheme(ThemeMode),
-    /// Menu ▸ Always On Top, carrying the requested state (`:275-278`).
-    SetAlwaysOnTop(bool),
     /// Menu ▸ Exit. The only way to quit from the UI on Windows (`:285-287`).
     Exit,
 }
@@ -628,20 +625,7 @@ impl Tray for FxTray {
             .into(),
         );
         menu.push(self.theme_menu());
-        menu.push(
-            CheckmarkItem {
-                label: tr("Always On Top"),
-                checked: self.state.always_on_top,
-                // ksni does not flip `checked` for us (`ksni-0.3.6/src/menu.rs:299-306`), and we
-                // deliberately do not flip it here either: the application answers with
-                // `TrayHandle::update` so the tick can never disagree with the window.
-                activate: Box::new(|tray: &mut Self| {
-                    tray.send(TrayCommand::SetAlwaysOnTop(!tray.state.always_on_top));
-                }),
-                ..Default::default()
-            }
-            .into(),
-        );
+        // No Always On Top here: departure 4 in the module docs.
         menu.push(
             StandardItem {
                 label: tr("Exit"),
@@ -896,16 +880,35 @@ mod tests {
                 "---",
                 "Settings",
                 "Theme",
-                "Always On Top",
                 "Exit",
             ]
         );
     }
 
     #[test]
+    fn the_menu_has_no_always_on_top_item_that_would_change_nothing() {
+        // Departure 4: winit's Wayland backend ignores window levels, so the item is gone rather
+        // than ticked for nothing, whether the power is on or off.
+        for power in [true, false] {
+            let (tray, _rx) = with_state(TrayState {
+                power,
+                ..populated()
+            });
+            let labels = labels(&tray.menu());
+            assert!(
+                !labels
+                    .iter()
+                    .any(|label| label == "Always On Top" || *label == tr("Always On Top")),
+                "{labels:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_preset_submenu_is_only_there_while_power_is_on() {
         // `FxSystemTrayView.cpp:313-316`: with power off the menu is Open / Turn On / devices /
-        // Settings / Theme / Always On Top / Donate / Exit.
+        // Settings / Theme / Always On Top / Donate / Exit — here without the two this port
+        // dropped.
         let (tray, _rx) = with_state(TrayState {
             power: false,
             ..populated()
@@ -1161,10 +1164,6 @@ mod tests {
 
         activate(&menu, "Settings", &mut tray);
         assert_eq!(rx.try_recv(), Ok(TrayCommand::OpenSettings));
-
-        activate(&menu, "Always On Top", &mut tray);
-        assert_eq!(rx.try_recv(), Ok(TrayCommand::SetAlwaysOnTop(true)));
-        assert!(!tray.state().always_on_top);
 
         activate(&menu, "Exit", &mut tray);
         assert_eq!(rx.try_recv(), Ok(TrayCommand::Exit));

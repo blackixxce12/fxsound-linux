@@ -28,7 +28,9 @@ use crate::{
 /// callback. Deliberately `Copy` and free of heap-owning fields.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DspParams {
-    /// Master bypass. When `false` the engine passes audio through untouched.
+    /// Master bypass. When `false` the engine skips everything but the master gain, which it
+    /// still applies, without the balance, while `eq_on` is set (`dfxpProcessReal.cpp:158-169`,
+    /// `SosProcess.cpp:500-516`); with the equalizer off as well, audio passes through untouched.
     pub power: bool,
     /// Hand the device silence, whatever `power` says. Set while the system sleeps (U13), so the
     /// last buffers before suspend and the first after resume — stale filter state, a limiter
@@ -40,7 +42,9 @@ pub struct DspParams {
     pub mute: bool,
     /// The five effect knobs on the engine's `0.0..=1.0` scale, indexed by `Effect as usize`.
     pub effects: [f32; Effect::COUNT],
-    /// Whether the graphic equalizer contributes.
+    /// Whether the GraphicEq block runs: the equalizer and, with it, the master gain, the balance
+    /// and the volume levelling, which the original processes as one block and switches as one
+    /// (`dfxpProcessReal.cpp:143-157`, upstream aad64c1). The effects do not depend on it.
     pub eq_on: bool,
     /// How many entries of the band arrays are live.
     pub num_bands: u8,

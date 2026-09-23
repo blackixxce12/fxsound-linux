@@ -90,21 +90,46 @@ pub(crate) fn skip(reason: &str) {
 pub(crate) struct PrivateGraph {
     dir: PathBuf,
     child: Child,
+    /// The private system bus of a graph that can hold cards ([`Self::start_with_cards`]).
+    bus: Option<Child>,
 }
 
 impl PrivateGraph {
     /// `None` when there is no `pipewire` to start, which is not a failure — unless
     /// [`REQUIRE_TOOLS`] says it is.
     pub(crate) fn start(tag: &str) -> Option<Self> {
-        Self::spawn(tag)
+        Self::spawn(tag, false)
             .inspect_err(|why| skip(&format!("{why}, so {tag} cannot run")))
             .ok()
     }
 
-    /// [`Self::start`], saying why when there is no daemon to be had.
-    fn spawn(tag: &str) -> Result<Self, String> {
+    /// [`Self::start`], for a daemon that can also hold cards — PipeWire's `Device` objects, which
+    /// nodes belong to ([`Self::add_card`]).
+    ///
+    /// Every factory that makes a `Device` wants hardware — a sound card, a camera — except
+    /// Bluetooth's enumerator, which wants a system bus and finds no BlueZ on it. So this daemon
+    /// gets a system bus of its own, a `dbus-daemon` with its socket in the graph's directory, and
+    /// its environment names that bus as the system bus and a socket that does not exist as the
+    /// session bus. Nothing it does can reach the machine's own buses, or the BlueZ behind them.
+    pub(crate) fn start_with_cards(tag: &str) -> Option<Self> {
+        Self::spawn(tag, true)
+            .inspect_err(|why| skip(&format!("{why}, so {tag} cannot run")))
+            .ok()
+    }
+
+    /// [`Self::start`] or [`Self::start_with_cards`], saying why when there is no daemon to be
+    /// had.
+    fn spawn(tag: &str, cards: bool) -> Result<Self, String> {
         if !installed("pipewire") {
             return Err("pipewire is not installed".to_owned());
+        }
+        if cards {
+            if !installed("dbus-daemon") {
+                return Err("dbus-daemon is not installed".to_owned());
+            }
+            if !library_installed("spa-0.2/bluez5/libspa-bluez5.so") {
+                return Err("libspa-bluez5 is not installed".to_owned());
+            }
         }
 
         // Directly under /tmp: a Unix socket path may not exceed 108 bytes, and a path beside the
@@ -112,22 +137,59 @@ impl PrivateGraph {
         let dir = PathBuf::from(format!("/tmp/fxsound-t-{}-{tag}", std::process::id()));
         let run = dir.join("run");
         let conf = dir.join("pipewire.conf");
+        let config = if cards {
+            card_config()
+        } else {
+            CONFIG.to_owned()
+        };
         std::fs::create_dir_all(&run)
             .and_then(|()| std::fs::File::create(&conf))
-            .and_then(|mut file| file.write_all(CONFIG.as_bytes()))
+            .and_then(|mut file| file.write_all(config.as_bytes()))
             .map_err(|error| format!("{} could not be prepared: {error}", dir.display()))?;
 
-        let child = Command::new("pipewire")
+        let bus = if cards {
+            match Self::start_bus(&dir) {
+                Ok(bus) => Some(bus),
+                Err(why) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    return Err(why);
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut daemon = Command::new("pipewire");
+        daemon
             .arg("-c")
             .arg(&conf)
             .env("XDG_RUNTIME_DIR", &run)
             .env("PIPEWIRE_DEBUG", "0")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| format!("pipewire could not be started: {error}"))?;
+            .stderr(Stdio::null());
+        if cards {
+            daemon
+                .env(
+                    "DBUS_SYSTEM_BUS_ADDRESS",
+                    format!("unix:path={}", dir.join("bus").display()),
+                )
+                .env(
+                    "DBUS_SESSION_BUS_ADDRESS",
+                    format!("unix:path={}", dir.join("no-session-bus").display()),
+                );
+        }
+        let child = match daemon.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(mut bus) = bus {
+                    let _ = bus.kill();
+                    let _ = bus.wait();
+                }
+                return Err(format!("pipewire could not be started: {error}"));
+            }
+        };
 
-        let graph = Self { dir, child };
+        let graph = Self { dir, child, bus };
         let deadline = Instant::now() + PATIENCE;
         while Instant::now() < deadline {
             if graph.socket().exists() {
@@ -138,6 +200,50 @@ impl PrivateGraph {
             std::thread::sleep(Duration::from_millis(50));
         }
         Err("the private pipewire never came up".to_owned())
+    }
+
+    /// A `dbus-daemon` for [`Self::start_with_cards`], listening in `dir` and nowhere else, and
+    /// waited for until its socket is there.
+    fn start_bus(dir: &std::path::Path) -> Result<Child, String> {
+        let conf = dir.join("bus.conf");
+        let socket = dir.join("bus");
+        let config = format!(
+            r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>system</type>
+  <listen>unix:path={}</listen>
+  <auth>EXTERNAL</auth>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#,
+            socket.display()
+        );
+        std::fs::write(&conf, config)
+            .map_err(|error| format!("{} could not be written: {error}", conf.display()))?;
+        let mut bus = Command::new("dbus-daemon")
+            .arg(format!("--config-file={}", conf.display()))
+            .arg("--nofork")
+            .arg("--nopidfile")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("dbus-daemon could not be started: {error}"))?;
+        let deadline = Instant::now() + PATIENCE;
+        while Instant::now() < deadline {
+            if socket.exists() {
+                return Ok(bus);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = bus.kill();
+        let _ = bus.wait();
+        Err("the private system bus never came up".to_owned())
     }
 
     fn socket(&self) -> PathBuf {
@@ -433,10 +539,161 @@ impl PrivateGraph {
     /// client that then leaves, so it lingers. `None` when the plugin is not installed and the node
     /// never appears.
     pub(crate) fn add_tone(&self, name: &str) -> Option<()> {
-        let props = format!(
-            "{{ factory.name = audiotestsrc node.name = {name} node.description = \"Test Tone\" \
-             media.class = Audio/Source object.linger = true }}"
+        self.add_adapter(
+            name,
+            &format!(
+                "factory.name = audiotestsrc node.name = {name} node.description = \"Test Tone\" \
+                 media.class = Audio/Source"
+            ),
+        )
+    }
+
+    /// Add a one-channel sink while the engine runs: a null sink laid out `MONO`, which is what a
+    /// Bluetooth headset in its call profile or a mono USB headset looks like to the rules. The
+    /// graph's own devices are all stereo or better, so a test that wants a mono one adds it — and
+    /// adding it later is also how it arrives as a *new* device. `None` when it never appears.
+    ///
+    /// It gets the `priority.driver` WirePlumber gives a Bluetooth sink (`name-node.lua`), and not
+    /// only for likeness. Left at 0 it ties with the tone, which is a driver too and was created
+    /// first; with two drivers of equal priority joined through our pair, this daemon was seen to
+    /// stop the whole graph after half a second — a runtime-made stereo null sink the same, the
+    /// graph's own `t_stereo` not. No session builds that graph: every real device carries a
+    /// priority of its own.
+    pub(crate) fn add_mono_sink(&self, name: &str) -> Option<()> {
+        self.add_adapter(
+            name,
+            &format!(
+                "factory.name = support.null-audio-sink node.name = {name} \
+                 node.description = \"Test Mono Out\" media.class = Audio/Sink \
+                 priority.driver = 1010 audio.channels = 1 audio.position = [ MONO ]"
+            ),
+        )
+    }
+
+    /// Add a card — a PipeWire `Device` object — named `name`, with the Bluetooth address
+    /// `address` in its properties, and keep it in the graph for as long as the returned holder
+    /// lives. Only on a graph started with [`Self::start_with_cards`]. `None` when it never
+    /// appears.
+    ///
+    /// It is Bluetooth's enumerator, which on this graph's empty bus enumerates nothing: a card
+    /// with no nodes of its own, which a test's nodes then name in `device.id` or share an address
+    /// with, as WirePlumber's nodes do with a headset's card. It is made by a `pw-cli` that stays
+    /// connected, because a device belongs to the client that made it and goes when that client
+    /// does — which is also how a test takes it away again.
+    pub(crate) fn add_card(&self, name: &str, address: &str) -> Option<CardHolder> {
+        let mut child = Command::new("pw-cli")
+            .arg("-r")
+            .arg(self.socket())
+            .env("XDG_RUNTIME_DIR", self.dir.join("run"))
+            .env("PIPEWIRE_REMOTE", self.socket())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let command = format!(
+            "create-device spa-device-factory {{ factory.name = api.bluez5.enum.dbus \
+             device.name = {name} device.api = bluez5 api.bluez5.address = \"{address}\" }}\n"
         );
+        // Written and left open: `pw-cli` reads its commands from it, and stays for as long as
+        // there may be more.
+        let written = child
+            .stdin
+            .as_mut()
+            .is_some_and(|stdin| stdin.write_all(command.as_bytes()).is_ok());
+        let mut holder = CardHolder { child, id: 0 };
+        if !written {
+            return None;
+        }
+        let deadline = Instant::now() + PATIENCE;
+        while Instant::now() < deadline {
+            let found = self.dump()?.iter().find_map(|object| {
+                (object["type"].as_str() == Some("PipeWire:Interface:Device")
+                    && object["info"]["props"]["device.name"].as_str() == Some(name))
+                .then(|| object["id"].as_u64())
+                .flatten()
+            });
+            if let Some(id) = found {
+                holder.id = id;
+                return Some(holder);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
+    /// One property of the card called `name`, the way [`Self::node_prop`] reads a node's.
+    pub(crate) fn card_prop(&self, name: &str, key: &str) -> Option<Option<String>> {
+        let objects = self.dump()?;
+        Some(
+            objects
+                .iter()
+                .find(|object| {
+                    object["type"].as_str() == Some("PipeWire:Interface:Device")
+                        && object["info"]["props"]["device.name"].as_str() == Some(name)
+                })
+                .and_then(|card| card["info"]["props"][key].as_str().map(str::to_owned)),
+        )
+    }
+
+    /// Add a stereo sink that belongs to a card: `card` is the properties that say which —
+    /// `device.id = <id>`, `api.bluez5.address = "<address>"`, or both. A headset's sink as
+    /// WirePlumber makes one, down to the driver priority (see [`Self::add_mono_sink`] for why that
+    /// matters here). `None` when it never appears.
+    pub(crate) fn add_card_sink(&self, name: &str, card: &str) -> Option<()> {
+        self.add_adapter(
+            name,
+            &format!(
+                "factory.name = support.null-audio-sink node.name = {name} \
+                 node.description = \"Test Headset\" media.class = Audio/Sink \
+                 priority.driver = 1010 audio.channels = 2 audio.position = [ FL FR ] {card}"
+            ),
+        )
+    }
+
+    /// Whether any link runs from the node called `from` to the node called `to`. `None` when
+    /// `pw-dump` is not there to ask; `Some(false)` when either node is not in the graph.
+    pub(crate) fn linked(&self, from: &str, to: &str) -> Option<bool> {
+        let objects = self.dump()?;
+        let id = |name| Self::node_object(&objects, name).and_then(|node| node["id"].as_u64());
+        let (Some(from), Some(to)) = (id(from), id(to)) else {
+            return Some(false);
+        };
+        Some(objects.iter().any(|object| {
+            object["type"].as_str() == Some("PipeWire:Interface:Link")
+                && object["info"]["output-node-id"].as_u64() == Some(from)
+                && object["info"]["input-node-id"].as_u64() == Some(to)
+        }))
+    }
+
+    /// Do to the output lane's playback stream what WirePlumber 0.5.17 does to it, as far as
+    /// linking goes, since there is no WirePlumber here to do it. The stream is
+    /// `node.dont-reconnect`, so: one never linked before is linked to its `target.object`; one
+    /// linked before is left alone, whatever became of its link — even with its target back under
+    /// the same name (`linking/prepare-link.lua:71-76`). `handled` is WirePlumber's `was_handled`:
+    /// the serials of the streams linked so far.
+    ///
+    /// Whether it linked the stream: `Some(false)` for one it had linked before. `None` when a
+    /// tool is missing or refused, the stream is not there, or its target is not.
+    pub(crate) fn link_like_wireplumber(&self, handled: &mut Vec<u64>) -> Option<bool> {
+        let serial = serial_of(&self.our_nodes()?, OUTPUT_NODE_NAME)?;
+        if handled.contains(&serial) {
+            return Some(false);
+        }
+        let target = self.node_prop(OUTPUT_NODE_NAME, "target.object")??;
+        self.configure_ports(OUTPUT_NODE_NAME, "Output", &["FL", "FR"])?;
+        self.configure_ports(&target, "Input", &["FL", "FR"])?;
+        if !self.link_nodes(OUTPUT_NODE_NAME, &target) {
+            return None;
+        }
+        handled.push(serial);
+        Some(true)
+    }
+
+    /// Create an adapter node with `props`, by a client that then leaves, so it lingers — and wait
+    /// until the server lists it under `name`.
+    fn add_adapter(&self, name: &str, props: &str) -> Option<()> {
+        let props = format!("{{ {props} object.linger = true }}");
         // What `pw-cli` exits with says less than whether the node turns up, so only that is asked.
         let _ = self.tool("pw-cli", &["create-node", "adapter", &props]);
         // The same patience as every other wait here: a slow runner that is merely late to show
@@ -444,6 +701,23 @@ impl PrivateGraph {
         let deadline = Instant::now() + PATIENCE;
         while Instant::now() < deadline {
             if self.node_id(name).is_some() {
+                return Some(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
+    /// Take the node called `name` out of the graph, the way a device goes when it is unplugged,
+    /// and wait until the server no longer lists it. `None` when it was not there to take, or
+    /// never went.
+    pub(crate) fn remove_node(&self, name: &str) -> Option<()> {
+        let id = self.node_id(name)?.to_string();
+        // As for creating one: whether it goes is the answer, not what `pw-cli` exits with.
+        let _ = self.tool("pw-cli", &["destroy", &id]);
+        let deadline = Instant::now() + PATIENCE;
+        while Instant::now() < deadline {
+            if self.node_id(name).is_none() {
                 return Some(());
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -542,6 +816,21 @@ impl PrivateGraph {
     }
 }
 
+/// A card [`PrivateGraph::add_card`] made, and the `pw-cli` that holds it in the graph. Dropped,
+/// the client goes and its card with it.
+pub(crate) struct CardHolder {
+    child: Child,
+    /// The card's registry id: what its nodes name in `device.id`.
+    pub(crate) id: u64,
+}
+
+impl Drop for CardHolder {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Whether a program can be started at all. Asked up front by a test that cannot do without a
 /// tool, because [`PrivateGraph::tool`]'s `None` also means "ran and refused", which for such a
 /// test is a failure and not a reason to skip.
@@ -598,6 +887,10 @@ impl Drop for PrivateGraph {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(bus) = self.bus.as_mut() {
+            let _ = bus.kill();
+            let _ = bus.wait();
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -1695,6 +1988,247 @@ fn a_tone_driven_through_each_lane_reaches_that_lane_and_no_other() {
 }
 
 #[test]
+fn a_mono_sink_that_appears_is_played_to_through_a_stereo_pair_its_adapter_down_mixes() {
+    // A Bluetooth headset that has just switched to its call profile, as the output lane meets
+    // it: a new output with one channel. Windows refused such a device (`sndDevices.h:32-39`), and
+    // so did this port — the moment the sink's info said "one channel", the next run of the rules
+    // tore the lane down and the music went to the speakers for the length of the call.
+    let Some(graph) = PrivateGraph::start("mono") else {
+        return;
+    };
+    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+        .into_iter()
+        .find(|tool| !installed(tool))
+    {
+        skip(&format!(
+            "{missing} is not available, so no mono sink was played to"
+        ));
+        return;
+    }
+    if graph.add_tone("t_tone").is_none() {
+        skip(concat!(
+            "the tone never appeared (is audiotestsrc installed?), ",
+            "so no mono sink was played to"
+        ));
+        return;
+    }
+    let mut handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    said.until(
+        &handle,
+        "a device list",
+        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
+    );
+    // The output lane attaches by itself, to one of the graph's stereo sinks. Let it settle there,
+    // so that the rules have run over every device the graph started with.
+    assert!(
+        said.heard(&handle, "the output lane attached", |m| matches!(
+            m,
+            AudioToUi::Attached {
+                direction: DeviceDirection::Output,
+                node_name: Some(_)
+            }
+        )),
+        "the output lane never attached to anything"
+    );
+    said.settle(&handle);
+
+    // The mono sink arrives. Rule 5 takes it — it is new — whatever its channel count.
+    let arrived = said.0.len();
+    assert!(
+        graph.add_mono_sink("t_mono").is_some(),
+        "the mono sink never appeared"
+    );
+    assert!(
+        said.attached(&handle, DeviceDirection::Output, Some("t_mono")),
+        "the output lane should move to the sink that just appeared, mono as it is"
+    );
+
+    // Its info — one channel — has had time to arrive; now give the rules a reason to run again,
+    // which is where the refusal used to strike: another output goes away.
+    said.settle(&handle);
+    assert!(
+        graph.remove_node("t_71").is_some(),
+        "the 7.1 sink could not be taken out of the graph"
+    );
+    assert!(
+        said.heard_since(&handle, arrived, "a device list without t_71", |m| {
+            matches!(m, AudioToUi::Devices(d) if !d.iter().any(|d| d.name == "t_71"))
+        }),
+        "the engine never noticed the 7.1 sink go"
+    );
+    said.settle(&handle);
+    let since = &said.0[arrived..];
+    let moves: Vec<Option<&str>> = since
+        .iter()
+        .filter_map(|message| match message {
+            AudioToUi::Attached {
+                direction: DeviceDirection::Output,
+                node_name,
+            } => Some(node_name.as_deref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        moves,
+        [Some("t_mono")],
+        "the output lane should have moved to the mono sink once and stayed there"
+    );
+    let complaints: Vec<&AudioToUi> = since
+        .iter()
+        .filter(|message| {
+            matches!(
+                message,
+                AudioToUi::Error {
+                    direction: Some(DeviceDirection::Output) | None,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        complaints.is_empty(),
+        "a mono sink is not an error: {complaints:?}"
+    );
+    let listed = said
+        .0
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AudioToUi::Devices(devices) => Some(devices),
+            _ => None,
+        })
+        .expect("heard a moment ago");
+    assert!(
+        listed
+            .iter()
+            .any(|d| d.name == "t_mono" && d.direction == DeviceDirection::Output),
+        "the mono sink should be offered as an output: {listed:?}"
+    );
+
+    // The pair it built: NODE 1 stays stereo, and NODE 2 declares the same stereo — the ring
+    // between them is read at the stride it is written at — aimed at the mono sink, with
+    // remixing left on for its adapter to down-mix.
+    for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME] {
+        assert_eq!(
+            graph.node_format(node).flatten(),
+            Some((48_000, 2)),
+            "{node} should run a stereo pair in front of the mono sink"
+        );
+    }
+    assert_eq!(
+        graph.node_prop(OUTPUT_NODE_NAME, "target.object").flatten(),
+        Some("t_mono".to_owned())
+    );
+    assert_eq!(
+        graph
+            .node_prop(OUTPUT_NODE_NAME, "stream.dont-remix")
+            .flatten(),
+        Some("false".to_owned()),
+        "the playback stream must let its adapter remix, or the session manager would not \
+         set its ports up at the sink's layout"
+    );
+
+    // Now play through it. The playback stream's ports are set up at the sink's own one-channel
+    // layout, as WirePlumber sets up a stream that may be remixed, so its adapter turns the
+    // stereo pair into one channel. What comes out of the sink is heard on the other side of it:
+    // the input lane records the sink's monitor, on a microphone it was attached to only to have
+    // a capture stream to link.
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_mic".to_owned(),
+        direction: DeviceDirection::Input,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
+    assert_eq!(
+        graph
+            .settles_on(&[
+                SINK_NODE_NAME,
+                OUTPUT_NODE_NAME,
+                CAPTURE_NODE_NAME,
+                SOURCE_NODE_NAME
+            ])
+            .map(|settled| settled.map(drop)),
+        Some(Ok(())),
+        "both pairs should be in the graph"
+    );
+    for (node, direction, positions) in [
+        ("t_tone", "Output", &["MONO"][..]),
+        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+        (OUTPUT_NODE_NAME, "Output", &["MONO"][..]),
+        (CAPTURE_NODE_NAME, "Input", &["MONO"][..]),
+    ] {
+        assert!(
+            graph.configure_ports(node, direction, positions).is_some(),
+            "{node} was not given ports"
+        );
+    }
+    assert!(
+        graph
+            .configure_monitored_ports("t_mono", &["MONO"])
+            .is_some(),
+        "the mono sink was not given a port and a monitor"
+    );
+    assert_eq!(
+        graph
+            .ports(OUTPUT_NODE_NAME, "out")
+            .map(|ports| ports.len()),
+        Some(1),
+        "the stereo playback stream should come out of its adapter as one channel"
+    );
+    assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_mono"));
+    assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
+    assert_eq!(
+        graph.runs_until("t_mono", true).map(drop),
+        Ok(()),
+        "the mono sink should run while something plays into FxSound"
+    );
+    assert!(
+        meters_until(&mut handle, DeviceDirection::Output, |m| {
+            m.peak_left > 0.1 && m.peak_right > 0.1
+        })
+        .is_some(),
+        "the tone never reached the output lane's meters"
+    );
+    // The input lane's meters read its signal before its chain, so what they show is what the
+    // mono sink was handed.
+    assert!(graph.link_nodes("t_mono", CAPTURE_NODE_NAME));
+    assert!(
+        meters_until(&mut handle, DeviceDirection::Input, |m| m.input_peak > 0.1).is_some(),
+        "the tone went into the stereo pair and never came out of the mono sink"
+    );
+
+    said.settle(&handle);
+    let output = said
+        .0
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AudioToUi::Status {
+                direction: DeviceDirection::Output,
+                status,
+            } => Some(*status),
+            _ => None,
+        })
+        .expect("a lane that played has reported its status");
+    assert_eq!(
+        (output.sample_rate, output.channels),
+        (48_000, 2),
+        "the output lane runs a stereo pair"
+    );
+    assert_eq!(
+        output.format_mismatches, 0,
+        "the two nodes of the pair disagreed about their format"
+    );
+    assert_eq!(
+        said.attachments(DeviceDirection::Output).last(),
+        Some(&Some("t_mono".to_owned())),
+        "playing moved the output lane off the mono sink"
+    );
+    handle.shutdown();
+}
+
+#[test]
 fn the_speakers_sleep_while_nothing_plays_into_the_sink_and_wake_the_moment_something_does() {
     let Some(graph) = PrivateGraph::start("asleep") else {
         return;
@@ -2557,6 +3091,519 @@ fn a_server_that_goes_away_is_reported_rather_than_hung_on() {
     // And the engine is still alive and retrying, rather than having taken the thread down with
     // it: shutdown still returns.
     handle.shutdown();
+}
+
+/// The headset of the tests below: its card's Bluetooth address, and its sink's name.
+const HEADSET_ADDRESS: &str = "00:11:22:33:44:55";
+const HEADSET: &str = "t_headset";
+
+/// A graph with a headset in it — a card, and a sink that `belongs` says how it belongs to —
+/// beside the graph's own speakers, and an engine whose output lane the user put on the headset.
+/// `None`, having said why, when that cannot be had here.
+fn engine_on_a_headset(
+    tag: &str,
+    belongs: &dyn Fn(&CardHolder) -> String,
+) -> Option<(PrivateGraph, CardHolder, EngineHandle, Transcript)> {
+    let graph = PrivateGraph::start_with_cards(tag)?;
+    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+        .into_iter()
+        .find(|tool| !installed(tool))
+    {
+        skip(&format!("{missing} is not available, so {tag} cannot run"));
+        return None;
+    }
+    let Some(card) = graph.add_card("t_headset_card", HEADSET_ADDRESS) else {
+        skip(&format!(
+            "the headset's card never appeared, so {tag} cannot run"
+        ));
+        return None;
+    };
+    assert!(
+        graph.add_card_sink(HEADSET, &belongs(&card)).is_some(),
+        "the headset's sink never appeared"
+    );
+
+    let handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    said.until(
+        &handle,
+        "a device list with the headset",
+        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == HEADSET)),
+    );
+    handle.send(UiToAudio::SelectDevice {
+        node_name: HEADSET.to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(
+        said.attached(&handle, DeviceDirection::Output, Some(HEADSET)),
+        "the output lane never attached to the headset"
+    );
+    assert_eq!(
+        graph.node_prop(OUTPUT_NODE_NAME, "target.object").flatten(),
+        Some(HEADSET.to_owned())
+    );
+    // The node's info and the card's — where the addresses are — have had time to arrive.
+    said.settle(&handle);
+    Some((graph, card, handle, said))
+}
+
+/// Where the output lane said it went, from message `from` on.
+fn output_moves_since(said: &Transcript, from: usize) -> Vec<Option<String>> {
+    said.0[from..]
+        .iter()
+        .filter_map(|message| match message {
+            AudioToUi::Attached {
+                direction: DeviceDirection::Output,
+                node_name,
+            } => Some(node_name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_headset_between_profiles_keeps_the_output_lane_and_its_sink_is_linked_again() {
+    // WirePlumber's own recipe for a Bluetooth sink: `device.id` names the headset's card.
+    let belongs = |card: &CardHolder| format!("device.id = {}", card.id);
+    let Some((graph, card, handle, mut said)) = engine_on_a_headset("blink", &belongs) else {
+        return;
+    };
+
+    // What WirePlumber does with the playback stream the engine built: links it to the headset.
+    let mut handled = Vec::new();
+    assert_eq!(
+        graph.link_like_wireplumber(&mut handled),
+        Some(true),
+        "the playback stream could not be linked to the headset"
+    );
+    assert_eq!(graph.linked(OUTPUT_NODE_NAME, HEADSET), Some(true));
+    let first = graph
+        .our_nodes()
+        .and_then(|nodes| serial_of(&nodes, OUTPUT_NODE_NAME))
+        .expect("the playback stream is in the graph");
+    let from = said.0.len();
+
+    // The headset switches profile: its sink goes, and comes back under the same name a moment
+    // later, on the same card. The gap is two supervisor ticks and more, each of which found the
+    // headset gone and moved the lane to the speakers before the lane waited for it.
+    assert!(
+        graph.remove_node(HEADSET).is_some(),
+        "the headset's sink could not be taken out of the graph"
+    );
+    let gone = Instant::now();
+    std::thread::sleep(2 * crate::engine::SUPERVISOR_PERIOD);
+    // The contract's blink: the sink re-added within 500 ms of going (`docs/0.4.0-upstream.md`,
+    // U8). This is the moment the test asks the server for it, which only a sleep stands before.
+    let readded = gone.elapsed();
+    assert!(
+        readded < Duration::from_millis(500),
+        "the sink was re-added {readded:?} after it went, not within the 500 ms this test is for"
+    );
+    assert!(
+        graph.add_card_sink(HEADSET, &belongs(&card)).is_some(),
+        "the headset's sink never came back on its card"
+    );
+    let gap = gone.elapsed();
+    println!("the headset's sink was away for {gap:?}, re-added after {readded:?}");
+    // The gap as seen from here is held to the lane's wait and not to 500 ms, on purpose. On top of
+    // the re-add it counts `pw-cli` starting and `pw-dump` polling until the sink is listed, which a
+    // loaded runner slows by more than the 100 ms left — and a longer blink only makes the lane
+    // wait longer, which is harder to pass, never easier: every way this test fails on a broken
+    // engine (a move to the speakers, a pair kept on the old serial) shows at any gap. What a slow
+    // runner can make is a gap the lane is right to give up on, which would fail below for a
+    // reason that is no bug; this says so instead.
+    assert!(
+        gap >= 2 * crate::engine::SUPERVISOR_PERIOD,
+        "the sink was away for {gap:?}, too short for a supervisor tick to have seen it gone"
+    );
+    assert!(
+        gap < crate::engine::RETURN_WAIT,
+        "the sink was away for {gap:?}, longer than the lane waits for it: the runner is too \
+         slow for this test to say anything"
+    );
+
+    // The pair is rebuilt on the node that came back, because the stream WirePlumber linked
+    // once is never linked again — and the new stream is linked.
+    let rebuilt = graph.nodes_until(|nodes| {
+        serial_of(nodes, OUTPUT_NODE_NAME).is_some_and(|serial| serial != first)
+    });
+    assert!(
+        matches!(rebuilt, Some(Ok(_))),
+        "the playback stream was never rebuilt for the sink that came back: {rebuilt:?}"
+    );
+    said.settle(&handle);
+    assert_eq!(
+        graph.link_like_wireplumber(&mut handled),
+        Some(true),
+        "the rebuilt playback stream could not be linked"
+    );
+    assert_eq!(
+        graph.linked(OUTPUT_NODE_NAME, HEADSET),
+        Some(true),
+        "NODE 2 should be linked to the headset again"
+    );
+    assert_eq!(
+        graph.node_prop(OUTPUT_NODE_NAME, "target.object").flatten(),
+        Some(HEADSET.to_owned())
+    );
+
+    said.settle(&handle);
+    let moves = output_moves_since(&said, from);
+    assert!(
+        moves.iter().all(|to| to.as_deref() == Some(HEADSET)),
+        "the output lane left the headset while it switched profile: {moves:?}"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn a_headset_that_goes_for_good_is_given_up_once_the_lane_has_waited_for_it() {
+    // Tied to its card by its Bluetooth address alone: the other way the engine asks.
+    let Some((graph, card, handle, mut said)) = engine_on_a_headset("gone", &|_| {
+        format!("api.bluez5.address = \"{HEADSET_ADDRESS}\"")
+    }) else {
+        return;
+    };
+    assert_eq!(
+        graph.card_prop("t_headset_card", "api.bluez5.address"),
+        Some(Some(HEADSET_ADDRESS.to_owned())),
+        "the card should carry the address the sink shares with it"
+    );
+    let from = said.0.len();
+
+    assert!(
+        graph.remove_node(HEADSET).is_some(),
+        "the headset's sink could not be taken out of the graph"
+    );
+    let gone = Instant::now();
+    let moved = said.until(&handle, "the output lane leaving the headset", |m| {
+        matches!(m, AudioToUi::Attached {
+            direction: DeviceDirection::Output,
+            node_name: Some(to),
+        } if to != HEADSET)
+    });
+    let waited = gone.elapsed();
+    assert!(moved, "the output lane never left a headset that had gone");
+    println!("the output lane left the headset after {waited:?}");
+    assert!(
+        waited + Duration::from_millis(300) >= crate::engine::RETURN_WAIT,
+        "the lane moved after {waited:?}, before its wait for the headset was up"
+    );
+    let moves = output_moves_since(&said, from);
+    let Some(Some(to)) = moves.first() else {
+        panic!("no move was heard: {moves:?}");
+    };
+    assert!(
+        ["t_stereo", "t_71"].contains(&to.as_str()),
+        "the lane should have moved to the graph's own speakers: {moves:?}"
+    );
+    assert_eq!(
+        graph.node_prop(OUTPUT_NODE_NAME, "target.object").flatten(),
+        Some(to.clone())
+    );
+    drop(card);
+    handle.shutdown();
+}
+
+#[test]
+fn a_headset_switched_off_is_left_as_soon_as_its_card_goes_after_its_sink() {
+    // Switched off, a headset takes its sink and its card with it, and the registry can name the
+    // sink first: for that moment the sink looks like one between profiles.
+    let belongs = |card: &CardHolder| format!("device.id = {}", card.id);
+    let Some((graph, card, handle, mut said)) = engine_on_a_headset("off", &belongs) else {
+        return;
+    };
+    let from = said.0.len();
+
+    assert!(
+        graph.remove_node(HEADSET).is_some(),
+        "the headset's sink could not be taken out of the graph"
+    );
+    let sink_gone = Instant::now();
+    // Three ticks with the card still here: the lane waits, which is what makes the card's going
+    // worth testing.
+    said.settle(&handle);
+    let moves = output_moves_since(&said, from);
+    assert!(
+        moves.is_empty(),
+        "the output lane should wait while the headset's card is still here: {moves:?}"
+    );
+
+    drop(card);
+    let card_gone = Instant::now();
+    let moved = said.until(&handle, "the output lane leaving the headset", |m| {
+        matches!(m, AudioToUi::Attached {
+            direction: DeviceDirection::Output,
+            node_name: Some(to),
+        } if to != HEADSET)
+    });
+    let (after_card, after_sink) = (card_gone.elapsed(), sink_gone.elapsed());
+    assert!(moved, "the output lane never left a headset that had gone");
+    println!(
+        "the output lane left the headset {after_card:?} after its card went, \
+         {after_sink:?} after its sink"
+    );
+    assert_eq!(
+        graph.card_prop("t_headset_card", "device.name"),
+        Some(None),
+        "the card should have gone with the client that made it"
+    );
+    assert!(
+        after_sink + Duration::from_millis(500) < crate::engine::RETURN_WAIT,
+        "the lane moved {after_sink:?} after the sink went: it waited out its whole wait for a \
+         headset whose card had gone"
+    );
+    let moves = output_moves_since(&said, from);
+    let Some(Some(to)) = moves.first() else {
+        panic!("no move was heard: {moves:?}");
+    };
+    assert!(
+        ["t_stereo", "t_71"].contains(&to.as_str()),
+        "the lane should have moved to the graph's own speakers: {moves:?}"
+    );
+    assert_eq!(
+        graph.node_prop(OUTPUT_NODE_NAME, "target.object").flatten(),
+        Some(to.clone())
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn speakers_on_no_card_that_go_are_replaced_at_once() {
+    // A virtual sink, or the graph's own null sinks: no card, so nothing to come back.
+    let Some(graph) = PrivateGraph::start("cardless") else {
+        return;
+    };
+    let handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    said.until(
+        &handle,
+        "a device list",
+        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_71")),
+    );
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_71".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_71")));
+    said.settle(&handle);
+
+    if unless_skipped(graph.remove_node("t_71"), "pw-cli", "the 7.1 sink going").is_none() {
+        handle.shutdown();
+        return;
+    }
+    let gone = Instant::now();
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    let waited = gone.elapsed();
+    println!("the output lane left the 7.1 sink after {waited:?}");
+    assert!(
+        waited + Duration::from_millis(500) < crate::engine::RETURN_WAIT,
+        "a sink on no card has nothing to come back with, yet the lane waited {waited:?}"
+    );
+    handle.shutdown();
+}
+
+/// WirePlumber 0.5's microphone for the test headset: the loopback it puts in front of the
+/// headset's SCO source, named by the address with its colons (`create-loopback-node.lua:45`).
+const LOOPBACK: &str = "bluez_input.00:11:22:33:44:55";
+/// The SCO source behind it, which WirePlumber 0.5 marks `api.bluez5.internal`
+/// (`create-node.lua:31-36`).
+const SCO_SOURCE: &str = "bluez_input.00_11_22_33_44_55.0";
+/// Another headset's microphone as WirePlumber 0.4 lists it: the SCO source itself, on no card
+/// this graph has, so only its info can say it is a headset's.
+const WP04_MICROPHONE: &str = "bluez_input.66_77_88_99_AA_BB.0";
+
+/// The last device list the engine sent, as `(node.name, form factor)`.
+fn last_device_list(said: &Transcript) -> Vec<(String, String)> {
+    said.0
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AudioToUi::Devices(devices) => Some(
+                devices
+                    .iter()
+                    .map(|d| (d.name.clone(), d.form_factor.clone()))
+                    .collect(),
+            ),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// How many warnings the engine has sent so far.
+fn warnings_heard(said: &Transcript) -> usize {
+    said.0
+        .iter()
+        .filter(|message| matches!(message, AudioToUi::Warning { .. }))
+        .count()
+}
+
+#[test]
+fn a_headsets_microphone_from_either_wireplumber_is_offered_as_a_headset_and_warned_about_once() {
+    // The headset's sink as the bluez5 plugin names it in A2DP; its microphone and the SCO source
+    // behind it follow.
+    let belongs = |card: &CardHolder| {
+        format!(
+            "device.id = {} api.bluez5.address = \"{HEADSET_ADDRESS}\" \
+             api.bluez5.profile = a2dp-sink api.bluez5.codec = sbc",
+            card.id
+        )
+    };
+    let Some((graph, card, handle, mut said)) = engine_on_a_headset("u9", &belongs) else {
+        return;
+    };
+    let source = |name: &str, props: &str| {
+        graph.add_adapter(
+            name,
+            &format!(
+                "factory.name = support.null-audio-sink node.name = \"{name}\" \
+                 node.description = \"Test Headset\" media.class = Audio/Source \
+                 priority.driver = 2010 priority.session = 2010 audio.channels = 1 \
+                 audio.position = [ MONO ] {props}"
+            ),
+        )
+    };
+    // As `create-loopback-node.lua:44-55` makes it: `bluez5.loopback`, the card, no address.
+    assert!(
+        source(
+            LOOPBACK,
+            &format!("bluez5.loopback = true device.id = {}", card.id)
+        )
+        .is_some(),
+        "the loopback microphone never appeared"
+    );
+    assert!(
+        source(
+            SCO_SOURCE,
+            &format!(
+                "device.id = {} api.bluez5.address = \"{HEADSET_ADDRESS}\" \
+                 api.bluez5.profile = headset-head-unit api.bluez5.codec = msbc \
+                 api.bluez5.internal = true bluez5.loopback = false",
+                card.id
+            )
+        )
+        .is_some(),
+        "the SCO source never appeared"
+    );
+    assert!(
+        source(
+            WP04_MICROPHONE,
+            "api.bluez5.address = \"66:77:88:99:AA:BB\" \
+             api.bluez5.profile = headset-head-unit api.bluez5.codec = cvsd"
+        )
+        .is_some(),
+        "the other headset's microphone never appeared"
+    );
+
+    // The registry announces none of what makes these headsets' microphones; their info does.
+    let headsets = |list: &[(String, String)]| {
+        [LOOPBACK, WP04_MICROPHONE].iter().all(|name| {
+            list.iter()
+                .any(|(listed, form)| listed == name && form == "headset")
+        })
+    };
+    assert!(
+        said.until(&handle, "both microphones listed as headsets", |m| {
+            matches!(m, AudioToUi::Devices(d) if headsets(
+                &d.iter().map(|d| (d.name.clone(), d.form_factor.clone())).collect::<Vec<_>>()
+            ))
+        }),
+        "the microphones were never offered as headsets: {:?}",
+        last_device_list(&said)
+    );
+    said.settle(&handle);
+    let list = last_device_list(&said);
+    assert!(headsets(&list), "{list:?}");
+    assert!(
+        !list.iter().any(|(name, _)| name == SCO_SOURCE),
+        "WirePlumber's internal SCO source was offered as a microphone: {list:?}"
+    );
+    assert!(
+        list.iter()
+            .any(|(name, form)| name == HEADSET && form == "headphone"),
+        "the headset's sink in A2DP is a pair of headphones: {list:?}"
+    );
+    assert_eq!(warnings_heard(&said), 0, "one lane is not both");
+
+    // The user takes the headset's microphone for the input lane, the music on the headset.
+    handle.send(UiToAudio::SelectDevice {
+        node_name: LOOPBACK.to_owned(),
+        direction: DeviceDirection::Input,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Input, Some(LOOPBACK)));
+    assert_eq!(
+        graph
+            .node_prop(CAPTURE_NODE_NAME, "target.object")
+            .flatten(),
+        Some(LOOPBACK.to_owned()),
+        "the capture stream records from the loopback, not from the SCO source behind it"
+    );
+    assert!(
+        said.heard(&handle, "the one-headset warning", |m| matches!(
+            m,
+            AudioToUi::Warning { direction: None, message } if message.contains("16 kHz")
+        )),
+        "one headset on both lanes was never warned about"
+    );
+    said.settle(&handle);
+    assert_eq!(warnings_heard(&said), 1, "once, not on every tick");
+
+    // The music goes to the speakers and comes back: a new attachment, a new warning.
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_stereo".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    said.settle(&handle);
+    assert_eq!(
+        warnings_heard(&said),
+        1,
+        "the speakers and the headset are two devices"
+    );
+    handle.send(UiToAudio::SelectDevice {
+        node_name: HEADSET.to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some(HEADSET)));
+    said.settle(&handle);
+    assert_eq!(warnings_heard(&said), 2);
+    handle.shutdown();
+}
+
+/// [`CONFIG`] for a daemon that can hold cards ([`PrivateGraph::start_with_cards`]): D-Bus support
+/// on, which the daemon is pointed at a private bus for, the Bluetooth plugin to make a card
+/// from, and the factory that makes it.
+fn card_config() -> String {
+    let edits = [
+        (
+            "support.dbus                = false",
+            "support.dbus                = true",
+        ),
+        (
+            "    support.*       = support/libspa-support\n",
+            concat!(
+                "    support.*       = support/libspa-support\n",
+                "    api.bluez5.*    = bluez5/libspa-bluez5\n",
+            ),
+        ),
+        (
+            "    { name = libpipewire-module-adapter }\n",
+            concat!(
+                "    { name = libpipewire-module-adapter }\n",
+                "    { name = libpipewire-module-spa-device-factory }\n",
+            ),
+        ),
+    ];
+    edits.iter().fold(CONFIG.to_owned(), |config, (from, to)| {
+        assert_eq!(
+            config.matches(from).count(),
+            1,
+            "CONFIG no longer has {from:?}"
+        );
+        config.replace(from, to)
+    })
 }
 
 /// One daemon, three synthetic devices, and nothing that touches the session.

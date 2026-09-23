@@ -59,17 +59,12 @@ pub const TIMEOUT_WITH_LINK_MS: u32 = 8000;
 /// lives here with the message it delays.
 pub const TRAY_HINT_DELAY: Duration = Duration::from_millis(2000);
 
-/// Where the "what's new" link goes (`FxController.cpp:719`).
-pub const CHANGELOG_URL: &str = "https://www.fxsound.com/changelog";
-/// Where the survey link goes (`FxController.cpp:938-960`).
-pub const SURVEY_URL: &str = "https://forms.gle/ATx1ayXDWRaMdiR59";
-
 /// The clickable half of a message. On Windows it is an `FxHyperlink` drawn inside the toast; here
 /// it becomes the notification's default action, so clicking the body follows it
 /// (`docs/spec/07-startup-tray.md` §6.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
-    /// The link text, e.g. `"Take the survey."`.
+    /// The link text.
     pub label: String,
     /// An `http`/`https` URL. Anything else is refused when the action fires.
     pub url: String,
@@ -119,19 +114,12 @@ impl Message {
 
     // ---- the catalogue ---------------------------------------------------------------------
     // Every `pushMessage` call site in the Windows tree, in the order `docs/spec/07-startup-tray.md`
-    // §6.4 tabulates them. The English `TRANS` keys are reproduced verbatim; `Resources/Strings/`
-    // is empty in this checkout, so they are the only authoritative strings there are.
-
-    /// First run after a version change (`FxController.cpp:719`). The body really is a single
-    /// space: the message is the link.
-    #[must_use]
-    pub fn whats_new() -> Self {
-        Self::with_link(
-            " ",
-            "Click here to see what's new on this version!",
-            CHANGELOG_URL,
-        )
-    }
+    // §6.4 tabulates them, but two. The English `TRANS` keys are reproduced verbatim;
+    // `Resources/Strings/` is empty in this checkout, so they are the only authoritative strings
+    // there are. Not ported: the "what's new" link to the upstream website after an update
+    // (`FxController.cpp:719`) and the survey on the upstream developers' form
+    // (`FxController.cpp:938-960`). This fork gathers nothing for upstream and sends nobody to
+    // its site; the changelog is the bundled one, in Settings ▸ Help.
 
     /// First hide-to-tray of the session (`FxController.cpp:920-926`), after [`TRAY_HINT_DELAY`].
     ///
@@ -158,18 +146,6 @@ impl Message {
             "FxSound is still running, but this session has no tray icon.\nRun 'fxsound --show' \
              to bring the window back.",
         ))
-    }
-
-    /// Shown from `showMainWindow` once the 7-day `survey_timer` has elapsed
-    /// (`FxController.cpp:938-960`).
-    #[must_use]
-    pub fn survey() -> Self {
-        Self::with_link(
-            "Thanks for using FxSound! Would you be\r\ninterested in helping us by taking a quick \
-             4 minute\r\nsurvey so we can make FxSound better?",
-            "Take the survey.",
-            SURVEY_URL,
-        )
     }
 
     /// Preset changed with `notify == true` and power on (`FxController.cpp:1099-1102`).
@@ -484,14 +460,15 @@ mod tests {
     #[test]
     fn a_message_with_a_link_gets_the_longer_timeout_and_a_default_action() {
         // 8000 ms rather than 7000 (`FxNotification.cpp:185-192`).
-        let notification = build(&Message::survey(), None);
+        let message = Message::with_link("A page to read.", "Read it.", "https://example.org/");
+        let notification = build(&message, None);
         assert_eq!(
             notification.timeout,
             Timeout::Milliseconds(TIMEOUT_WITH_LINK_MS)
         );
         assert_eq!(
             notification.actions,
-            vec!["default".to_owned(), "Take the survey.".to_owned()],
+            vec!["default".to_owned(), "Read it.".to_owned()],
             "the id must be `default` so a click on the body follows the link"
         );
     }
@@ -504,6 +481,9 @@ mod tests {
             "FxSound in system tray\nClick FxSound icon to reopen"
         );
         assert!(!notification.body.contains('\r'));
+        // The original's own texts break lines with `\r\n`, which the daemon would show as is.
+        let crlf = build(&Message::new("Two\r\nlines"), None);
+        assert_eq!(crlf.body, "Two\nlines");
     }
 
     #[test]
@@ -519,11 +499,6 @@ mod tests {
 
     #[test]
     fn the_catalogue_reproduces_the_windows_strings() {
-        assert_eq!(Message::whats_new().body, " ");
-        assert_eq!(
-            Message::whats_new().link.unwrap().url,
-            "https://www.fxsound.com/changelog"
-        );
         assert_eq!(Message::preset_selected("Rock").body, "Preset: Rock");
         assert_eq!(
             Message::output_selected("Speakers", None).body,
@@ -559,12 +534,29 @@ mod tests {
     }
 
     #[test]
-    fn the_survey_message_keeps_its_three_lines() {
-        // `FxNotification.cpp:53` drops anything past the third line; the daemon wraps instead, so
-        // the text is passed through untouched apart from the line endings.
-        let body = build(&Message::survey(), None).body;
-        assert_eq!(body.lines().count(), 3);
-        assert!(body.starts_with("Thanks for using FxSound!"));
+    fn no_message_sends_anyone_to_the_upstream_website_or_its_survey() {
+        // The original's "what's new" link and its survey went to the upstream developers' site
+        // and form. This fork gathers nothing for upstream, so no message in the catalogue carries
+        // a link, and this file names neither address (upstream review §8).
+        for message in [
+            Message::minimised_to_tray(),
+            Message::hidden_with_no_tray(),
+            Message::preset_selected("Rock"),
+            Message::output_selected("Speakers", Some("Rock")),
+            Message::output_disconnected(),
+            Message::preset_overwritten("Rock"),
+            Message::preset_saved("Rock"),
+            Message::preset_limit_reached(),
+            Message::preset_deleted("Rock"),
+            Message::presets_restored(),
+            Message::power_toggled(true),
+        ] {
+            assert!(message.link.is_none(), "{message:?}");
+        }
+        let source = include_str!("notify.rs");
+        for host in [concat!("fxsound", ".com"), concat!("forms", ".gle")] {
+            assert!(!source.contains(host), "notify.rs names {host}");
+        }
     }
 
     #[test]

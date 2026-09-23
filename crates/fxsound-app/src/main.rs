@@ -52,7 +52,7 @@ use clap::Parser as _;
 use eframe::egui;
 use fxsound_app::{
     App, WindowVisibility,
-    app::{FORBIDDEN_PRESET_NAME_CHARS, MAX_PRESET_NAME_CHARS, preset_name_available},
+    app::{FORBIDDEN_PRESET_NAME_CHARS, MAX_PRESET_NAME_CHARS, PresetMenu, preset_name_available},
     cli::{Cli, Command},
     commands::{self, WindowRequest},
     dbus::{self, DbusHandle},
@@ -713,16 +713,18 @@ impl<'a> Shell<'a> {
         };
         let anchor = chrome.menu.rect().translate(self.content_origin.to_vec2());
 
-        // The enablement predicates of `FxMainWindow.cpp:536-543`.
+        // The enablement predicates of `FxMainWindow.cpp:536-543`: the preset items are the
+        // controller's one rule, which the command line and D-Bus are refused by too.
         let preset = app.state.preset();
         let power = app.state.power;
         let modified = preset.is_some_and(|p| p.modified);
-        let user_preset = preset.is_some_and(|p| !p.factory);
-        let can_save_new = modified && app.user_preset_count() < app.max_user_presets() && power;
-        let can_overwrite = modified && user_preset && power;
-        let can_undo = modified && power;
-        let can_rename = !modified && user_preset && power;
-        let can_delete = user_preset && power;
+        let PresetMenu {
+            save_new: can_save_new,
+            overwrite: can_overwrite,
+            undo: can_undo,
+            rename: can_rename,
+            delete: can_delete,
+        } = app.preset_menu();
         let can_transfer = !modified && power;
         let overwrite_label = if can_overwrite {
             format!(

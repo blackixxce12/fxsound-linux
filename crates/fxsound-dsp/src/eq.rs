@@ -122,6 +122,121 @@ pub fn band_frequency_range(
     (low, high)
 }
 
+/// Carry a curve over to a new band count by relative position, so the user's shape survives the
+/// change instead of being wiped flat.
+///
+/// A line-for-line port of the remap in `GraphicEqSetNumBands` (`GraphicEqSet.cpp:200-245`,
+/// upstream 182a329): the first band lands on the first band and the last on the last, and in
+/// between
+///
+/// - **one old band** is copied to every new band;
+/// - **fewer bands** each take the nearest old band, `1 + (int)((i-1)*(old-1)/(new-1) + 0.5)`
+///   evaluated in `double` and truncated, as the C does — a selection, never an average, so a
+///   narrow boost keeps its height rather than being smeared into its neighbours;
+/// - **more bands** interpolate linearly between the two old bands either side, the index computed
+///   in `double` and stored as `float` (`realtype`), the fraction and the blend in `float`, so the
+///   results match the original's bits and not merely its values. The last new band falls exactly
+///   on the last old one, where there is no upper neighbour; the original's `upper_index` guard
+///   copies it, and so does this.
+///
+/// Remapping is by position, not frequency — which is why it survives a ladder change such as
+/// ten bands at 62.5 Hz–16 kHz becoming thirty-one at 20 Hz–20 kHz. It is also not reversible: a
+/// shrink keeps only the bands it selects, so 10 → 31 → 10 comes back close to, not equal to, the
+/// curve it started from, exactly as it does in the original.
+///
+/// Where the original has no answer the port picks one and says so:
+///
+/// - **An equal count** copies. The original returns before remapping (`GraphicEqSet.cpp:131-133`);
+///   running the interpolation instead would give the same numbers for every finite gain, and a
+///   NaN for an infinite one.
+/// - **No old bands** gives a flat curve, which is what the original's freshly initialised sections
+///   hold when its `old_num_bands >= 1` guard skips the remap.
+/// - **One new band from several** takes the first. The C divides `0.0` by `new - 1 = 0` there and
+///   truncates the resulting NaN to an `int`, which is undefined; the first band is the limit the
+///   formula tends to, since `i - 1` is zero.
+///
+/// Every index is additionally clamped to the old curve. The clamps never move an index the
+/// formula produces (both formulas stay inside `1..=old` by construction), but the spec's warning
+/// that the original is "safe by luck, not construction" (`docs/spec/09-dsp-eq.md` §14) is the
+/// reason they are there: a band count reaches this from the command line and D-Bus as well as
+/// from the window, and no count may be able to make it panic.
+#[must_use]
+pub fn remap_band_gains(old: &[Real], new_count: usize) -> Vec<Real> {
+    let old_num_bands = old.len();
+    if old_num_bands == 0 {
+        return vec![0.0; new_count];
+    }
+    if old_num_bands == new_count {
+        return old.to_vec();
+    }
+
+    let num_bands = new_count;
+    let last = old_num_bands - 1;
+    (1..=num_bands)
+        .map(|i| {
+            if old_num_bands == 1 {
+                old[0]
+            } else if num_bands == 1 {
+                // Undefined in the original (see above); the first band.
+                old[0]
+            } else if num_bands < old_num_bands {
+                // Fewer bands: pick the nearest old band (equidistant selection).
+                let source_index = 1
+                    + ((i as f64 - 1.0) * (old_num_bands as f64 - 1.0) / (num_bands as f64 - 1.0)
+                        + 0.5) as usize;
+                old[(source_index - 1).min(last)]
+            } else {
+                // More bands: linear interpolation between old bands.
+                let source_index = (1.0
+                    + f64::from((i - 1) as Real) * (old_num_bands as f64 - 1.0)
+                        / (num_bands as f64 - 1.0)) as Real;
+                let lower_index = (source_index as usize).clamp(1, old_num_bands);
+                let upper_index = lower_index + 1;
+                let fraction = source_index - lower_index as Real;
+
+                if upper_index <= old_num_bands {
+                    old[lower_index - 1] + (old[upper_index - 1] - old[lower_index - 1]) * fraction
+                } else {
+                    old[lower_index - 1]
+                }
+            }
+        })
+        .collect()
+}
+
+/// The gains a preset's curve takes on the user's live band ladder.
+///
+/// The port of `DfxDspPrivate::getGraphicEqInfoFromVals` (`DfxDspEq.cpp:127-247`, upstream
+/// 38e3343, f3d9f23, 12003f0), which is why a user on thirty-one bands who picks a ten-band factory
+/// preset stays on thirty-one bands:
+///
+/// - **Different band counts:** the live ladder is kept and only the gains move, remapped by
+///   position. The upstream comment explains why the frequencies are not interpolated too:
+///   carrying centres across counts "produced incorrect/overlapping ranges". The remap is the
+///   one [`remap_band_gains`] ports; `DfxDspEq.cpp` carries its own copy of it, identical for every
+///   count except the two edge cases where it is undefined — a one-band live ladder, and an index
+///   landing outside the curve, where it leaves the output uninitialised — and the spec asks for
+///   one routine with the `GraphicEqSet` behaviour (`docs/spec/09-dsp-eq.md`, "Open questions").
+/// - **Equal band counts:** the gains are copied as they are. The original also copies the
+///   preset's centre frequencies onto the live ladder then (`DfxDspEq.cpp:229-241`); that half is
+///   the caller's, since this returns gains only — pair the result with `preset_centres` when the
+///   counts match and with `live_centres` when they do not.
+/// - **A preset with no equalizer:** a flat curve at the live count. The original also switches
+///   the equalizer on for such a preset (`DfxDspEq.cpp:144-158`); that too is the caller's.
+///
+/// A preset band is a centre with a gain, so the preset's band count is the shorter of the two
+/// slices, the same rule [`GraphicEq::set_bands`] applies to a curve that reaches it. Nothing else
+/// about the preset's centres enters the result: the fit is by position, not by frequency.
+#[must_use]
+pub fn fit_preset_gains(
+    preset_centres: &[Real],
+    preset_gains: &[Real],
+    live_centres: &[Real],
+) -> Vec<Real> {
+    let preset_bands = preset_centres.len().min(preset_gains.len());
+    remap_band_gains(&preset_gains[..preset_bands], live_centres.len())
+}
+
 /// The graphic equalizer: a cascade of peaking sections, one per band.
 #[derive(Clone, Debug)]
 pub struct GraphicEq {
@@ -211,6 +326,11 @@ impl GraphicEq {
     /// Rebuild the band ladder for a new band count, resetting every gain to flat.
     ///
     /// Clamped to `1..=SOS_MAX_SECTIONS`, as `GraphicEqNew` does.
+    ///
+    /// Flat on purpose, although the original's `GraphicEqSetNumBands` has remapped the old curve
+    /// since 182a329: the one caller on the audio thread is [`GraphicEq::set_bands`], which
+    /// installs the caller's gains straight afterwards, and the curve a user sees survive a band
+    /// count change is remapped where the settings live, with [`remap_band_gains`].
     pub fn set_num_bands(&mut self, num_bands: usize) {
         let num_bands = num_bands.clamp(1, SOS_MAX_SECTIONS);
         self.num_bands = num_bands;
@@ -585,5 +705,398 @@ mod tests {
                 assert!(next_low > high, "band {band} overlaps its successor");
             }
         }
+    }
+
+    // --- Band-count remapping (U1) and preset fitting (U2) ------------------------------------
+    //
+    // The `*_BITS` expectations below are the original's own output: the loops of
+    // `GraphicEqSet.cpp:200-245` and `DfxDspEq.cpp:182-227`, compiled verbatim with gcc on x86-64
+    // (`realtype` is `float`, `codedefs.h:150`) and printed with `%.9g`, which round-trips an
+    // `f32`. The two upstream copies agree on every case here. The hand-worked entries next to
+    // them are the arithmetic a reader can check on paper; the bit patterns are what proves the
+    // port evaluates it in the same precisions, in the same order.
+
+    /// A ten-band curve with both signs, a zero, the full ±12 dB and fractional gains.
+    const TEN: [Real; 10] = [6.0, 4.5, -3.0, 0.0, 2.25, -12.0, 12.0, 1.5, -0.75, 3.0];
+    const FIVE: [Real; 5] = [-6.0, 3.0, 0.0, 9.0, -1.5];
+
+    /// Thirty-one bands whose gain is their own 1-based index, so a selection reads as the list of
+    /// bands it selected.
+    fn thirty_one_numbered() -> Vec<Real> {
+        (1..=31).map(|band| band as Real).collect()
+    }
+
+    fn assert_close(got: Real, want: Real, what: &str) {
+        assert!(
+            (got - want).abs() < 1e-5,
+            "{what}: got {got}, expected {want}"
+        );
+    }
+
+    #[test]
+    fn ten_bands_grow_to_thirty_one_by_interpolating_the_way_the_original_does() {
+        let remapped = remap_band_gains(&TEN, 31);
+        assert_eq!(remapped.len(), 31);
+
+        // Band i reads old position 1 + (i-1)*9/30 = 1 + 0.3*(i-1).
+        assert_close(remapped[0], 6.0, "band 1 sits on old band 1");
+        assert_close(remapped[1], 5.55, "band 2: 6 + (4.5-6)*0.3");
+        assert_close(remapped[4], 3.0, "band 5: 4.5 + (-3-4.5)*0.2");
+        assert_close(remapped[10], 0.0, "band 11 sits on old band 4");
+        assert_close(remapped[15], -4.875, "band 16: 2.25 + (-12-2.25)*0.5");
+        assert_close(remapped[20], 12.0, "band 21 sits on old band 7");
+        assert_close(
+            remapped[30],
+            3.0,
+            "band 31 is the upper-index guard's copy of old band 10",
+        );
+
+        const TEN_TO_THIRTY_ONE_BITS: [Real; 31] = [
+            6.0,
+            5.55,
+            5.1,
+            4.65,
+            2.9999995,
+            0.75,
+            -1.4999995,
+            -2.7000003,
+            -1.7999997,
+            -0.89999986,
+            0.0,
+            0.6750004,
+            1.3499998,
+            2.025,
+            -0.5999973,
+            -4.875,
+            -9.1500025,
+            -9.600002,
+            -2.3999977,
+            4.7999954,
+            12.0,
+            8.849998,
+            5.700001,
+            2.5499992,
+            1.0500004,
+            0.375,
+            -0.30000043,
+            -0.37499857,
+            0.74999857,
+            1.8749993,
+            3.0,
+        ];
+        assert_eq!(remapped, TEN_TO_THIRTY_ONE_BITS);
+    }
+
+    #[test]
+    fn thirty_one_bands_shrink_to_ten_by_picking_the_nearest_band() {
+        // 1 + (int)((i-1)*30/9 + 0.5): 0.5, 3.83, 7.17, 10.5, 13.83, 17.17, 20.5, 23.83, 27.17,
+        // 30.5, truncated — note 10.5 and 20.5 truncate down, they do not round half up.
+        assert_eq!(
+            remap_band_gains(&thirty_one_numbered(), 10),
+            [1.0, 4.0, 8.0, 11.0, 14.0, 18.0, 21.0, 24.0, 28.0, 31.0]
+        );
+    }
+
+    #[test]
+    fn thirty_one_bands_shrink_to_five_by_picking_the_nearest_band() {
+        // 1 + (int)((i-1)*30/4 + 0.5): 0.5, 8.0, 15.5, 23.0, 30.5.
+        assert_eq!(
+            remap_band_gains(&thirty_one_numbered(), 5),
+            [1.0, 9.0, 16.0, 24.0, 31.0]
+        );
+    }
+
+    #[test]
+    fn a_shrink_selects_a_band_rather_than_averaging_its_neighbours() {
+        // Ten bands to five: bands 1, 3, 6, 8 and 10 (0.5, 2.75, 5.0, 7.25, 9.5 truncated). Old
+        // band 6's full -12 dB cut and old band 7's +12 dB boost sit side by side, and the one
+        // selected keeps its whole height instead of the two cancelling out.
+        assert_eq!(remap_band_gains(&TEN, 5), [6.0, -3.0, -12.0, 1.5, 3.0]);
+    }
+
+    #[test]
+    fn five_bands_grow_to_twenty_by_interpolating_the_way_the_original_does() {
+        let remapped = remap_band_gains(&FIVE, 20);
+
+        // Band i reads old position 1 + (i-1)*4/19.
+        assert_close(remapped[0], -6.0, "band 1 sits on old band 1");
+        assert_close(
+            remapped[1],
+            -6.0 + 9.0 * 4.0 / 19.0,
+            "band 2: 4/19 of the way to 3 dB",
+        );
+        assert_close(
+            remapped[5],
+            3.0 + (0.0 - 3.0) * 1.0 / 19.0,
+            "band 6: old position 2+1/19",
+        );
+        assert_close(
+            remapped[19],
+            -1.5,
+            "band 20 is the guard's copy of old band 5",
+        );
+
+        const FIVE_TO_TWENTY_BITS: [Real; 20] = [
+            -6.0, -4.1052628, -2.210527, -0.3157897, 1.5789475, 2.8421052, 2.2105265, 1.5789471,
+            0.9473684, 0.3157897, 0.9473691, 2.8421052, 4.736841, 6.6315794, 8.526316, 7.342107,
+            5.1315784, 2.921051, 0.7105274, -1.5,
+        ];
+        assert_eq!(remapped, FIVE_TO_TWENTY_BITS);
+    }
+
+    #[test]
+    fn a_single_band_is_copied_to_every_new_band() {
+        assert_eq!(remap_band_gains(&[4.5], 10), [4.5; 10]);
+        assert_eq!(remap_band_gains(&[-7.25], 31), [-7.25; 31]);
+    }
+
+    #[test]
+    fn the_band_counts_the_window_offers_remap_bit_for_bit_with_the_original() {
+        // 10 -> 15 and 10 -> 20 exercise fractions that 10 -> 31 does not (9/14 and 9/19).
+        const TEN_TO_FIFTEEN_BITS: [Real; 15] = [
+            6.0,
+            5.035714,
+            2.357142,
+            -2.4642859,
+            -1.2857144,
+            0.48214316,
+            1.9285716,
+            -4.875,
+            -8.57143,
+            6.8571396,
+            7.500002,
+            1.3392863,
+            -0.10714316,
+            0.5892842,
+            3.0,
+        ];
+        const TEN_TO_TWENTY_BITS: [Real; 20] = [
+            6.0,
+            5.2894735,
+            4.5789475,
+            1.3421049,
+            -2.2105255,
+            -1.8947368,
+            -0.47368455,
+            0.7105268,
+            1.7763155,
+            -1.4999993,
+            -8.250001,
+            -6.947365,
+            4.421047,
+            10.342107,
+            5.3684216,
+            1.2631588,
+            0.1973691,
+            -0.55263233,
+            1.2236838,
+            3.0,
+        ];
+        assert_eq!(remap_band_gains(&TEN, 15), TEN_TO_FIFTEEN_BITS);
+        assert_eq!(remap_band_gains(&TEN, 20), TEN_TO_TWENTY_BITS);
+    }
+
+    #[test]
+    fn a_round_trip_through_thirty_one_bands_comes_back_close_but_not_identical() {
+        // The shrink back selects bands 1, 4, 8, 11, ... of the thirty-one, which sit at old
+        // positions 1.0, 1.9, 3.1, 4.0, ... — the ends and every third band come home exactly,
+        // the rest come home interpolated. The original does the same.
+        let there = remap_band_gains(&TEN, 31);
+        let back = remap_band_gains(&there, 10);
+        const ROUND_TRIP_BITS: [Real; 10] = [
+            6.0,
+            4.65,
+            -2.7000003,
+            0.0,
+            2.025,
+            -9.600002,
+            12.0,
+            2.5499992,
+            -0.37499857,
+            3.0,
+        ];
+        assert_eq!(back, ROUND_TRIP_BITS);
+        assert_eq!(back[0], TEN[0]);
+        assert_eq!(back[3], TEN[3]);
+        assert_eq!(back[6], TEN[6]);
+        assert_eq!(back[9], TEN[9]);
+        assert_ne!(back, TEN);
+    }
+
+    #[test]
+    fn an_equal_band_count_is_copied_bit_for_bit() {
+        // Including the values an interpolation at fraction zero would not preserve: an infinity
+        // turns into NaN through `(inf - inf) * 0`, and a negative zero into a positive one.
+        let odd = [f32::INFINITY, -0.0, 1e-30, -12.0, 3.0];
+        let copied = remap_band_gains(&odd, 5);
+        for (got, want) in copied.iter().zip(odd) {
+            assert_eq!(got.to_bits(), want.to_bits());
+        }
+        assert_eq!(remap_band_gains(&TEN, 10), TEN);
+    }
+
+    #[test]
+    fn an_empty_curve_remaps_to_a_flat_one() {
+        assert_eq!(remap_band_gains(&[], 10), [0.0; 10]);
+        assert!(remap_band_gains(&[], 0).is_empty());
+    }
+
+    #[test]
+    fn a_band_count_of_zero_gives_an_empty_curve() {
+        assert!(remap_band_gains(&TEN, 0).is_empty());
+    }
+
+    #[test]
+    fn shrinking_to_a_single_band_keeps_the_first() {
+        // Undefined in the original, which truncates 0.0 / 0.0 to an int.
+        assert_eq!(remap_band_gains(&TEN, 1), [6.0]);
+        assert_eq!(remap_band_gains(&thirty_one_numbered(), 1), [1.0]);
+    }
+
+    #[test]
+    fn every_pair_of_band_counts_keeps_the_ends_and_invents_no_gain() {
+        // Every count the engine can hold, both ways, as a proof that no pair of counts reaches
+        // an index outside the old curve: an out-of-range index would panic here.
+        for old_count in 1..=SOS_MAX_SECTIONS {
+            let old: Vec<Real> = (0..old_count)
+                .map(|band| ((band * 7 % 11) as Real - 5.0) * 2.0)
+                .collect();
+            let (low, high) = old
+                .iter()
+                .fold((Real::INFINITY, Real::NEG_INFINITY), |(lo, hi), g| {
+                    (lo.min(*g), hi.max(*g))
+                });
+            for new_count in 0..=SOS_MAX_SECTIONS {
+                let remapped = remap_band_gains(&old, new_count);
+                assert_eq!(remapped.len(), new_count, "{old_count} -> {new_count}");
+                if new_count == 0 {
+                    continue;
+                }
+                assert_eq!(
+                    remapped[0], old[0],
+                    "{old_count} -> {new_count}: first band"
+                );
+                if new_count > 1 {
+                    assert_eq!(
+                        remapped[new_count - 1],
+                        old[old_count - 1],
+                        "{old_count} -> {new_count}: last band"
+                    );
+                }
+                for (band, gain) in remapped.iter().enumerate() {
+                    assert!(
+                        (low..=high).contains(gain),
+                        "{old_count} -> {new_count}: band {band} is {gain}, outside {low}..={high}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_flat_curve_stays_flat_and_a_constant_one_stays_constant_at_any_count() {
+        for old_count in 1..=SOS_MAX_SECTIONS {
+            for new_count in 1..=SOS_MAX_SECTIONS {
+                assert!(
+                    remap_band_gains(&vec![0.0; old_count], new_count)
+                        .iter()
+                        .all(|g| *g == 0.0),
+                    "{old_count} -> {new_count}"
+                );
+                assert!(
+                    remap_band_gains(&vec![3.5; old_count], new_count)
+                        .iter()
+                        .all(|g| *g == 3.5),
+                    "{old_count} -> {new_count}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_ten_band_preset_lands_on_a_thirty_one_band_ladder_by_position() {
+        let (live, _, _) = band_table(31).expect("the 31-band table");
+        let (centres, _, _) = band_table(10).expect("the 10-band table");
+        let fitted = fit_preset_gains(centres, &TEN, live);
+        assert_eq!(fitted.len(), 31);
+        // `DfxDspEq.cpp` gives the same bits as `GraphicEqSet.cpp` here.
+        assert_eq!(fitted, remap_band_gains(&TEN, 31));
+        assert_eq!(fitted[20], 12.0);
+    }
+
+    #[test]
+    fn a_thirty_one_band_preset_on_a_ten_band_ladder_selects_the_nearest_bands() {
+        let (live, _, _) = band_table(10).expect("the 10-band table");
+        let (centres, _, _) = band_table(31).expect("the 31-band table");
+        assert_eq!(
+            fit_preset_gains(centres, &thirty_one_numbered(), live),
+            [1.0, 4.0, 8.0, 11.0, 14.0, 18.0, 21.0, 24.0, 28.0, 31.0]
+        );
+    }
+
+    #[test]
+    fn a_preset_with_the_live_band_count_keeps_its_gains_whatever_its_ladder() {
+        // The shipped presets carry their own ten centres (115 Hz where the table says 115.734);
+        // with equal counts the gains go across untouched and the centres are the caller's to copy.
+        let preset_centres = [
+            62.5, 115.0, 250.0, 450.0, 630.0, 1250.0, 2700.0, 5300.0, 7500.0, 13000.0,
+        ];
+        let (live, _, _) = band_table(10).expect("the 10-band table");
+        assert_eq!(fit_preset_gains(&preset_centres, &TEN, live), TEN);
+    }
+
+    #[test]
+    fn a_preset_without_an_equalizer_fits_as_a_flat_curve() {
+        let (live, _, _) = band_table(20).expect("the 20-band table");
+        assert_eq!(fit_preset_gains(&[], &[], live), [0.0; 20]);
+    }
+
+    #[test]
+    fn a_preset_is_fitted_by_position_so_its_centres_do_not_move_a_gain() {
+        // Upstream deliberately stopped carrying frequencies across band counts; the same five
+        // gains on two very different ladders must land identically.
+        let (live, _, _) = band_table(15).expect("the 15-band table");
+        let low_ladder = [30.0, 60.0, 120.0, 240.0, 480.0];
+        let wide_ladder = [62.5, 250.0, 1000.0, 4000.0, 16000.0];
+        assert_eq!(
+            fit_preset_gains(&low_ladder, &FIVE, live),
+            fit_preset_gains(&wide_ladder, &FIVE, live)
+        );
+        assert_eq!(
+            fit_preset_gains(&wide_ladder, &FIVE, live),
+            remap_band_gains(&FIVE, 15)
+        );
+    }
+
+    #[test]
+    fn a_preset_band_needs_both_a_centre_and_a_gain() {
+        let (live, _, _) = band_table(10).expect("the 10-band table");
+        let (ten_centres, _, _) = band_table(10).expect("the 10-band table");
+
+        // An eleventh gain with no centre is not a band: the preset still has ten, and copies.
+        let mut eleven_gains = TEN.to_vec();
+        eleven_gains.push(9.0);
+        assert_eq!(fit_preset_gains(ten_centres, &eleven_gains, live), TEN);
+
+        // Nine centres make a nine-band preset, remapped onto the ten live bands.
+        assert_eq!(
+            fit_preset_gains(&ten_centres[..9], &TEN, live),
+            remap_band_gains(&TEN[..9], 10)
+        );
+    }
+
+    #[test]
+    fn a_one_band_preset_fills_the_whole_live_ladder() {
+        let (live, _, _) = band_table(31).expect("the 31-band table");
+        assert_eq!(fit_preset_gains(&[1000.0], &[-4.0], live), [-4.0; 31]);
+    }
+
+    #[test]
+    fn a_preset_fitted_to_a_single_live_band_takes_its_first_band() {
+        assert_eq!(
+            fit_preset_gains(&[62.5, 1000.0], &[2.0, 8.0], &[1000.0]),
+            [2.0]
+        );
+        assert!(fit_preset_gains(&[62.5], &[2.0], &[]).is_empty());
     }
 }

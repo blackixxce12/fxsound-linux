@@ -254,7 +254,9 @@ pub struct Settings {
     /// its own toplevel, so the compositor decides and these are only written, never applied.
     pub window_x: i32,
     pub window_y: i32,
-    /// Requested by the app through `ViewportCommand::WindowLevel`; Hyprland honours it.
+    /// Kept so the key survives a round trip through this port. Nothing sets or applies it: winit's
+    /// Wayland backend ignores window levels, so neither the hamburger menu nor the tray offers
+    /// Always On Top.
     pub always_on_top: bool,
     /// Start with no window, tray only.
     pub run_minimized: bool,

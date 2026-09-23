@@ -234,8 +234,7 @@ pub enum AudioError {
     #[error("no output devices present")]            NoOutputDevices,      // ≡ 209
     #[error("selected output is not present")]       DeviceNotPresent,     // ≡ -2
     #[error("output device is unavailable")]         DeviceUnavailable,    // ≡ -54
-    #[error("no usable (stereo or better) output")]  NoValidOutput,        // ≡ -57
-    #[error("please choose an output device")]       AskUserSelectOutput,  // ≡ -58
+    // -57 NoValidOutput / -58 AskUserSelectOutput: retired in 0.4.0, mono outputs are accepted
     #[error("PipeWire is not available: {0}")]       PipewireUnavailable(String),
     #[error("lost connection to PipeWire")]          PipewireDisconnected,
     #[error("format negotiation failed")]            FormatNegotiation,    // ≡ -35/-36
@@ -835,7 +834,8 @@ clean; every constant in `layout.rs` and `theme.rs` has a `path:line` citation i
   verified spellings in `docs/api/pipewire-0.10-rust.md:2215-2266`. `node.link-group = "fxsound"`
   on **both** — without it, the moment our sink becomes default, our own output stream autoconnects
   to our own sink and feeds back.
-* `rules.rs` with unit tests covering all seven branches and the mono guard.
+* `rules.rs` with unit tests covering all seven branches and the mono guard (the guard itself was
+  retired in 0.4.0; its tests now pin that mono devices are accepted).
 * Default-sink takeover and the five-step restore, wired to `Drop`, `SIGINT`, `SIGTERM`.
 * Reconnect FSM with 200 / 400 / 800 / 1600 / 3200 / 5000 ms backoff.
 * `Engine` present but `power = false` → clean pass-through.
@@ -850,7 +850,9 @@ clean; every constant in `layout.rs` and `theme.rs` has a `path:line` citation i
 5. `systemctl --user restart pipewire wireplumber` mid-playback → reconnect < 2 s, one audible gap,
    backoff never tighter than 200 ms.
 6. USB DAC unplugged mid-playback → node 2 moves, node 1 untouched, clients never disconnected.
-7. A mono-only sink yields `NoValidOutput`; mono + stereo yields `AskUserSelectOutput`.
+7. A mono sink is rendered to like any other, through a stereo pair its adapter down-mixes
+   (0.4.0; this item originally asked for `NoValidOutput` / `AskUserSelectOutput`, see open
+   question 4).
 
 ### Phase 2 — DSP live
 
@@ -997,10 +999,11 @@ with an unlisted device sorting last; 7 s / 8 s notification timeouts, 3 lines m
    time we run on a machine where the user never picked a default. This document specifies **500**
    (never wins implicitly) plus the explicit §7 takeover path — but that is a product decision, and
    it differs from the Windows behaviour.
-4. **Mono outputs are refused, not downmixed.** Ported faithfully from
-   `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES`. There is no driver bug on Linux forcing this, and a
-   mono BT headset is perfectly drivable. Fixing it would delete the `NoValidOutput` /
-   `AskUserSelectOutput` states entirely. Decision deferred to Phase 1 review.
+4. **Mono outputs — decided in 0.4.0: accepted and down-mixed.** 0.3.0 refused them, ported
+   faithfully from `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES`, a Windows driver workaround. With two
+   lanes that moved the music out of a Bluetooth headset the moment it switched to its call
+   profile, so the refusal and the `NoValidOutput` / `AskUserSelectOutput` states are gone; the
+   decision and its details are in `12-audio-io.md`, open question 6.
 5. **Does the maximizer's 16-bit quantise/shaped-dither stage actually run?** `Play32.c:414-415`
    sets it but `MAXIMIZE_QUANTIZE_ON` is never written by `dfxpComm.cpp`. Adding a spurious 16-bit
    dither to a float pipeline would raise the noise floor by ~90 dB. Verify against a real build

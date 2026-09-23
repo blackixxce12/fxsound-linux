@@ -130,7 +130,7 @@
 //!   `docs/spec/12-audio-io.md` §19.7.
 //! * **It never resamples.** The zero-order-hold upsampler at `sndDevicesDoPlayback.cpp:79-89` is
 //!   not ported; PipeWire's sinc resampler handles any rate mismatch — and its channel mixer turns
-//!   a mono microphone into the stereo pair the DSP runs on.
+//!   a mono microphone into the stereo pair the DSP runs on, and that pair into a mono headset.
 //! * **It never wins the default implicitly.** `priority.session` is deliberately low, so a
 //!   WirePlumber that has never been told a default picks real hardware, not us; the default is
 //!   taken only through the explicit metadata write above, which is also the only thing that can
@@ -288,6 +288,17 @@ pub const OUTPUT_STREAM_DESCRIPTION: &str = "FxSound output";
 /// `node.description` of the capture stream (input direction, NODE 1). Not localised, as above.
 pub const CAPTURE_STREAM_DESCRIPTION: &str = "FxSound capture";
 
+/// What the engine tells the user, translated, when one Bluetooth headset is the target of both
+/// lanes ([`AudioToUi::Warning`], `docs/0.4.0-upstream.md` U9): the headset runs its call profile
+/// while anything records from it through FxSound, and the music lane's sink goes with it — one
+/// channel, 8 to 32 kHz depending on the codec, 16 kHz on nearly every headset.
+///
+/// The English text is the key [`fxsound_core::i18n::tr`] looks the translation up by. Public so
+/// the app's translation tables and their audit can name it: the audit reads the crates that draw
+/// text, and this string reaches the screen from here.
+pub const ONE_HEADSET_ON_BOTH_LANES: &str =
+    "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz";
+
 /// The `node.name` of FxSound's virtual device for a direction — the value written into that
 /// direction's `default.configured.audio.*` key.
 #[must_use]
@@ -330,6 +341,12 @@ pub const START_TIMEOUT: Duration = Duration::from_millis(1500);
 ///
 /// The comments give the `sndDevices.h:74-143` code each variant replaces, so
 /// `FxController`'s existing error branches port without re-deriving the mapping.
+///
+/// Two of those states have no variant: `-57 SND_DEVICES_NO_VALID_PLAYBACK_DEVICE` ("no stereo
+/// output") and `-58 SND_DEVICES_ASK_USER_SELECT_PLAYBACK_DEVICE` ("the chosen output is mono,
+/// pick another"). Both existed only to refuse mono playback devices, a workaround for a Windows
+/// driver bug (`sndDevices.h:32-39`); PipeWire drives a mono device perfectly well, so the port
+/// attaches to one instead (`docs/spec/12-audio-io.md`, open question 6).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AudioError {
     /// No `Audio/Sink` node exists other than ours. ≡ `209 SND_DEVICES_NO_REAL_DEVICES_FOUND`.
@@ -345,14 +362,6 @@ pub enum AudioError {
     /// The device is present but refused the stream. ≡ `-54` plus `playbackDeviceIsUnavailable`.
     #[error("audio device is unavailable")]
     DeviceUnavailable,
-    /// Every candidate is mono. ≡ `-57 SND_DEVICES_NO_VALID_PLAYBACK_DEVICE`. Outputs only: a mono
-    /// microphone is accepted.
-    #[error("no usable (stereo or better) output")]
-    NoValidOutput,
-    /// The chosen device is mono but a usable one exists.
-    /// ≡ `-58 SND_DEVICES_ASK_USER_SELECT_PLAYBACK_DEVICE`.
-    #[error("please choose an output device")]
-    AskUserSelectOutput,
     /// PipeWire could not be reached at all — no socket, no `XDG_RUNTIME_DIR`, or the connection
     /// was refused. There is no Windows analogue: the driver was always present.
     #[error("PipeWire is not available: {0}")]

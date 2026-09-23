@@ -218,8 +218,14 @@ sliders appear in:
 
 ```
 in ─► 31-band graphic EQ ─► master gain · balance ─► volume levelling
+      └───────────── skipped whole while the EQ is off ─────────────┘
    ─► Fidelity ─► Ambience ─► Surround ─► Bass ─► Dynamic Boost ─► out
 ```
+
+The first three stages are one block in the original, and the equalizer's switch is that block's
+switch: with the EQ off, the master gain, the balance and the volume levelling go with it, and only
+the effects run. Power off bypasses everything but the master gain, which still applies — without
+the balance, and only while the EQ is on.
 
 | Effect | Algorithm |
 |---|---|
@@ -309,6 +315,10 @@ directions between this port and the Windows build.
 | Unsaved edits | `~/.local/share/fxsound/presets/AutoSave/` |
 | Settings | `~/.config/fxsound/settings.toml` |
 
+A preset lands on your band count, as in the original since 1.2.11: pick a ten-band preset while on
+31 bands and its curve is fitted onto the 31, and changing the band count carries the curve over
+instead of flattening it. Export writes a preset as last saved, never its unsaved edits.
+
 The settings file keeps the original's key names so it can be diffed against the Windows
 `FxSound.settings`. Settings and presets are written durably — temporary file, fsync, rename — so an
 interrupted save cannot truncate what was there.
@@ -326,6 +336,11 @@ Each of these is a considered decision, not an oversight:
 - **Q multiplier no longer resets the band layout.** Changing the filter width in the original
   silently discards preset-supplied band frequencies and resets the sample rate to 44100 until the
   next buffer. That is a bug; this port only redesigns the coefficients.
+- **Preset commands work with the power off.** The original's command line ignores `--preset`,
+  `--save_preset` and the rest while processing is off. Here they run either way, and are refused
+  exactly where the hamburger menu greys the item out — an overwrite or rename of a factory
+  preset, a rename with unsaved changes, a name already taken, the user-preset limit — with the
+  reason on stderr, exit status 1, and `org.fxsound.FxSound.Error.Refused` on D-Bus.
 - **Global hotkeys live in the compositor.** See above.
 - **Window position is not restored.** Wayland gives a client no way to place its own toplevel. The
   setting is still written so it survives a move back to X11.

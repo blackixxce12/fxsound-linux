@@ -144,9 +144,9 @@ impl AppEvent {
     /// lane's non-silent buffers, like the window's logo, and a lane that runs on silence is still
     /// `processing` there.
     ///
-    /// What the tray draws that no event names — the theme, Always On Top, the language, a preset
-    /// list that grew or shrank under an unchanged selection, sound starting or stopping — the
-    /// controller flags on its own ([`App::take_tray_refresh`]).
+    /// What the tray draws that no event names — the theme, the language, a preset list that grew
+    /// or shrank under an unchanged selection, sound starting or stopping — the controller flags
+    /// on its own ([`App::take_tray_refresh`]).
     #[must_use]
     pub const fn touches_tray(&self) -> bool {
         matches!(
@@ -1138,19 +1138,13 @@ mod tests {
     #[test]
     fn a_rename_the_command_line_cannot_do_says_no_preset_changed() {
         let (mut app, _engine, _dir) = started();
-        // A factory preset stays where it is, and says why.
+        // A factory preset stays where it is, and the command says why, as the menu would by
+        // offering no Rename at all.
         let outcome = command_line(&mut app, &["--rename_preset", "Ours"]);
-        let events = said(&mut app);
-        assert!(
-            matches!(events.as_slice(), [AppEvent::Notice { .. }]),
-            "{events:?}"
-        );
+        assert!(outcome.failed);
+        assert!(outcome.stderr.contains("factory"), "{}", outcome.stderr);
+        assert_eq!(said(&mut app), []);
         assert!(!app.lane_has_preset(OUT, "Ours"));
-        assert!(
-            !outcome.failed,
-            "the menu's notice, not an error: {}",
-            outcome.stderr
-        );
 
         // Unsaved edits would stay behind under a name that is gone, so the command refuses.
         app.handle(&[UiAction::SavePresetAs("Mine".to_owned())]);
@@ -1697,12 +1691,6 @@ mod tests {
                 "the theme",
                 Box::new(|app: &mut App| app.handle(&[UiAction::ToggleTheme]))
                     as Box<dyn Fn(&mut App)>,
-            ),
-            (
-                "always on top",
-                Box::new(|app: &mut App| {
-                    app.handle_tray(crate::tray::TrayCommand::SetAlwaysOnTop(true));
-                }),
             ),
             (
                 "the effect sliders",

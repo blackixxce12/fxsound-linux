@@ -88,7 +88,13 @@ the output lane only; a microphone uses the voice chain instead.
 .TP
 .BI \-\-num_bands= N
 Number of equalizer bands. Only 5, 10, 15, 20 and 31 are accepted; anything
-else is an error rather than a silent fallback.
+else is an error rather than a silent fallback. The curve is carried over to
+the new count by position rather than reset, and every output preset is then
+fitted onto this count: a ten-band preset picked on 31 bands stays on 31.
+With
+.B \-\-edit=input
+it sets the voice preset's band count, and the speakers' setting is left as it
+is.
 .TP
 .BI \-\-set_band_freq= BAND:HZ[,BAND:HZ...]
 Move band centre frequencies. Band indices are 0-based. The outer bound is
@@ -144,20 +150,27 @@ reaches it. A device named on the same command line is selected first, so
 finds the preset in the microphone's list.
 .TP
 .BI \-\-save_preset= NAME
-Save the current modified settings as a new user preset.
+Save the current modified settings as a new user preset. Refused with nothing
+modified, with a name a preset already has (in any case), and at the
+user-preset limit.
 .TP
 .B \-\-overwrite_preset
-Overwrite the selected user preset with its unsaved changes.
+Overwrite the selected user preset with its unsaved changes. A factory preset
+is refused: save its changes as a new preset instead.
 .TP
 .B \-\-undo_preset
 Discard the selected preset's unsaved changes.
 .TP
 .BI \-\-rename_preset= NAME
-Rename the selected user preset. One with unsaved changes is refused: save or
-undo them first.
+Rename the selected user preset. A factory preset, one with unsaved changes
+(save or undo them first) and a name already taken are refused.
 .TP
 .B \-\-delete_preset
-Delete the selected user preset.
+Delete the selected user preset. A factory preset is refused.
+.PP
+Each of these is refused exactly where the window's menu greys its item out,
+with the reason on standard error, except that they also run while processing
+is off.
 .PP
 A preset name becomes a
 .I .fac
@@ -351,7 +364,8 @@ every check that ran passed.
 .TP
 .B 1
 The command failed and standard error or the report says why: the running
-instance refused it (an unknown preset or device name, for example) or could
+instance refused it (an unknown preset or device name, or a factory preset to
+overwrite, for example) or could
 not be reached, there is no running instance for
 .BR \-\-status " or " \-\-watch
 to ask,
@@ -421,11 +435,13 @@ takes
 Unlike a typed command line, no method raises the window but
 .BR Show " and " ToggleWindow .
 A command the running instance refuses fails with
-.B org.freedesktop.DBus.Error.Failed
+.B org.fxsound.FxSound.Error.Refused
 and the message
 .B fxsound
 would print; an argument the option would not take either, with
-.BR org.freedesktop.DBus.Error.InvalidArgs .
+.BR org.freedesktop.DBus.Error.InvalidArgs ;
+a command it did not answer within four seconds, with
+.BR org.freedesktop.DBus.Error.Failed .
 .PP
 Properties:
 .BR Version " (s, constant), " Power " (b), " Preset " (s), "

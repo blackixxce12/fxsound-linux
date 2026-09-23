@@ -226,6 +226,20 @@ impl Response {
         }
     }
 
+    /// What a caller hears when the GUI thread took its command and did not answer within
+    /// [`HANDLER_TIMEOUT`]: failed, but not refused — the command may still be running.
+    #[must_use]
+    pub fn unanswered() -> Self {
+        Self::failed(NO_ANSWER_IN_TIME)
+    }
+
+    /// Whether this is [`Response::unanswered`] rather than an answer: D-Bus reports that as a
+    /// failure, and every other `ok = false` as FxSound refusing the command.
+    #[must_use]
+    pub fn is_unanswered(&self) -> bool {
+        !self.ok && self.stderr == NO_ANSWER_IN_TIME
+    }
+
     /// The process exit code the forwarding process should use.
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
@@ -644,7 +658,7 @@ impl Control {
             Ok(Ok(response)) => response,
             // Dropped without its `Drop` running: the process is going away, as in `dispatch`.
             Ok(Err(_)) => Response::ok(),
-            Err(_) => Response::failed(NO_ANSWER_IN_TIME),
+            Err(_) => Response::unanswered(),
         }
     }
 }
@@ -1138,7 +1152,7 @@ fn dispatch(request: Request, tx: &Sender<Forwarded>) -> Response {
 
     match reply_rx.recv_timeout(HANDLER_TIMEOUT) {
         Ok(response) => response,
-        Err(RecvTimeoutError::Timeout) => Response::failed(NO_ANSWER_IN_TIME),
+        Err(RecvTimeoutError::Timeout) => Response::unanswered(),
         // The handler dropped the `Forwarded` without answering and without the `Drop` impl
         // running, which can only mean the process is going away.
         Err(RecvTimeoutError::Disconnected) => Response::ok(),
@@ -1950,6 +1964,17 @@ mod tests {
         let response = caller.join().expect("the caller");
         assert!(!response.ok);
         assert_eq!(response.stderr, "no output preset is called \"Nope\"");
+    }
+
+    #[test]
+    fn a_command_nobody_answered_in_time_is_told_apart_from_a_refusal() {
+        let unanswered = Response::unanswered();
+        assert!(!unanswered.ok);
+        assert_eq!(unanswered.exit_code(), 1);
+        assert!(unanswered.is_unanswered());
+        assert!(!Response::failed("no output preset is called \"Nope\"").is_unanswered());
+        assert!(!Response::failed(SHUTTING_DOWN).is_unanswered());
+        assert!(!Response::ok().is_unanswered());
     }
 
     #[test]

@@ -25,10 +25,12 @@
 //! Every method builds the command list the matching option builds ([`Call::commands`]) and hands
 //! it to the GUI thread through the control socket's own channel ([`Control::call`]). There the
 //! `commands::run` that answers `fxsound --next-preset` answers it too, under the same four-second
-//! cap. A refusal comes back as `org.freedesktop.DBus.Error.Failed` carrying the text `fxsound`
-//! would print on stderr; an argument that cannot be parsed, as `InvalidArgs`. What a method does
-//! not copy is the original's habit of raising the window after a command line: a bus call comes
-//! from a keybind or a status bar, and only `Show` and `ToggleWindow` bring the window up.
+//! cap. A refusal comes back as `org.fxsound.FxSound.Error.Refused` ([`REFUSED`]) carrying the
+//! text `fxsound` would print on stderr — an unknown name, a factory preset asked to be
+//! overwritten, the user-preset cap; an argument that cannot be parsed, as `InvalidArgs`; no
+//! answer in time, as `Failed`. What a method does not copy is the original's habit of raising
+//! the window after a command line: a bus call comes from a keybind or a status bar, and only
+//! `Show` and `ToggleWindow` bring the window up.
 //!
 //! `Preset`, `GetPreset` and `Direction` are about the edit direction, the lane the window shows,
 //! as `--status`'s `preset:` is. `Output` and `Input` are the lanes' devices by description, as
@@ -205,14 +207,66 @@ fn device_command(device: &str) -> Result<DeviceCommand, String> {
         .ok_or_else(|| "a device name cannot be empty; `off` detaches the lane".to_owned())
 }
 
-/// A method's result, out of the GUI thread's answer: its stdout, or `Failed` with its stderr.
-fn answer(response: Response) -> fdo::Result<String> {
+/// The error name of FxSound refusing a command: what `fxsound` exits 1 for, with its stderr as
+/// the message (upstream review item U15).
+pub const REFUSED: &str = "org.fxsound.FxSound.Error.Refused";
+
+/// What a method answers with when it does not do what it was asked.
+#[derive(Debug)]
+pub enum MethodError {
+    /// [`REFUSED`]: FxSound heard the command and says no — the answer `fxsound` prints on stderr
+    /// and exits 1 for, from the same `commands::run`.
+    Refused(String),
+    /// A standard error: `InvalidArgs` for an argument the option would not take either, `Failed`
+    /// when the answer could not be had or read.
+    Standard(fdo::Error),
+}
+
+impl From<fdo::Error> for MethodError {
+    fn from(err: fdo::Error) -> Self {
+        Self::Standard(err)
+    }
+}
+
+impl zbus::DBusError for MethodError {
+    fn create_reply(
+        &self,
+        call: &zbus::message::Header<'_>,
+    ) -> zbus::Result<zbus::message::Message> {
+        match self {
+            Self::Refused(text) => zbus::message::Message::error(call, self.name())?.build(text),
+            Self::Standard(err) => err.create_reply(call),
+        }
+    }
+
+    fn name(&self) -> zbus::names::ErrorName<'_> {
+        match self {
+            Self::Refused(_) => zbus::names::ErrorName::from_static_str_unchecked(REFUSED),
+            Self::Standard(err) => err.name(),
+        }
+    }
+
+    fn description(&self) -> Option<&str> {
+        match self {
+            Self::Refused(text) => Some(text),
+            Self::Standard(err) => err.description(),
+        }
+    }
+}
+
+/// A method's result, out of the GUI thread's answer: its stdout, or [`REFUSED`] with its
+/// stderr — `Failed` only when there was no answer in time, which refuses nothing.
+fn answer(response: Response) -> Result<String, MethodError> {
     if response.ok {
         Ok(response.stdout)
+    } else if response.is_unanswered() {
+        Err(fdo::Error::Failed(response.stderr).into())
     } else if response.stderr.is_empty() {
-        Err(fdo::Error::Failed("FxSound refused the command".to_owned()))
+        Err(MethodError::Refused(
+            "FxSound refused the command".to_owned(),
+        ))
     } else {
-        Err(fdo::Error::Failed(response.stderr))
+        Err(MethodError::Refused(response.stderr))
     }
 }
 
@@ -504,14 +558,14 @@ struct Service {
 
 impl Service {
     /// Carry `call` out on the GUI thread and return what it printed.
-    async fn run(&self, call: Call) -> fdo::Result<String> {
+    async fn run(&self, call: Call) -> Result<String, MethodError> {
         let _busy = self.in_flight.enter();
         let commands = call.commands().map_err(fdo::Error::InvalidArgs)?;
         answer(self.control.call(commands).await)
     }
 
     /// [`Service::run`], for a method that returns nothing.
-    async fn run_quietly(&self, call: Call) -> fdo::Result<()> {
+    async fn run_quietly(&self, call: Call) -> Result<(), MethodError> {
         self.run(call).await.map(drop)
     }
 
@@ -524,94 +578,94 @@ impl Service {
 impl Service {
     /// Turn processing off if it is on and on if it is off, as `--toggle-power` does; returns
     /// whether it is on now.
-    async fn toggle_power(&self) -> fdo::Result<bool> {
+    async fn toggle_power(&self) -> Result<bool, MethodError> {
         let status = self.run(Call::TogglePower).await?;
-        power_of_status(&status).map_err(fdo::Error::Failed)
+        Ok(power_of_status(&status).map_err(fdo::Error::Failed)?)
     }
 
     /// Turn processing on or off, as `--power` does.
-    async fn set_power(&self, on: bool) -> fdo::Result<()> {
+    async fn set_power(&self, on: bool) -> Result<(), MethodError> {
         self.run_quietly(Call::SetPower(on)).await
     }
 
     /// Select the edit direction's next preset, wrapping, as `--next-preset` does.
-    async fn next_preset(&self) -> fdo::Result<()> {
+    async fn next_preset(&self) -> Result<(), MethodError> {
         self.run_quietly(Call::NextPreset).await
     }
 
     /// Select the edit direction's previous preset, wrapping, as `--prev-preset` does.
-    async fn prev_preset(&self) -> fdo::Result<()> {
+    async fn prev_preset(&self) -> Result<(), MethodError> {
         self.run_quietly(Call::PrevPreset).await
     }
 
     /// Select a preset by its exact name, as `--preset` does. Fails for a name that is not one.
-    async fn set_preset(&self, name: &str) -> fdo::Result<()> {
+    async fn set_preset(&self, name: &str) -> Result<(), MethodError> {
         self.run_quietly(Call::SetPreset(name.to_owned())).await
     }
 
     /// The edit direction's preset, without the marker for unsaved changes; empty for none.
-    async fn get_preset(&self) -> fdo::Result<String> {
+    async fn get_preset(&self) -> Result<String, MethodError> {
         let status = self.run(Call::GetPreset).await?;
-        preset_of_status(&status).map_err(fdo::Error::Failed)
+        Ok(preset_of_status(&status).map_err(fdo::Error::Failed)?)
     }
 
     /// Attach the output lane to a playback device by `node.name` or description, or detach it
     /// with `off`, as `--output` does.
-    async fn set_output(&self, device: &str) -> fdo::Result<()> {
+    async fn set_output(&self, device: &str) -> Result<(), MethodError> {
         self.run_quietly(Call::SetOutput(device.to_owned())).await
     }
 
     /// Attach the input lane to a microphone by `node.name` or description, or detach it with
     /// `off`, as `--input` does.
-    async fn set_input(&self, device: &str) -> fdo::Result<()> {
+    async fn set_input(&self, device: &str) -> Result<(), MethodError> {
         self.run_quietly(Call::SetInput(device.to_owned())).await
     }
 
     /// Move the output lane to the next playback device, wrapping, as `--next-output` does.
-    async fn next_output(&self) -> fdo::Result<()> {
+    async fn next_output(&self) -> Result<(), MethodError> {
         self.run_quietly(Call::NextOutput).await
     }
 
     /// Move the input lane to the next microphone, wrapping, as `--next-input` does.
-    async fn next_input(&self) -> fdo::Result<()> {
+    async fn next_input(&self) -> Result<(), MethodError> {
         self.run_quietly(Call::NextInput).await
     }
 
     /// The microphone's noise suppression: `off`, `light`, `medium`, `strong`, or `preset` to
     /// follow the voice preset, as `--noise-suppression` takes it.
-    async fn set_noise_suppression(&self, level: &str) -> fdo::Result<()> {
+    async fn set_noise_suppression(&self, level: &str) -> Result<(), MethodError> {
         self.run_quietly(Call::SetNoiseSuppression(level.to_owned()))
             .await
     }
 
     /// The lane the window edits, `output` or `input`, as `--edit` takes it.
-    async fn set_edit_direction(&self, direction: &str) -> fdo::Result<()> {
+    async fn set_edit_direction(&self, direction: &str) -> Result<(), MethodError> {
         self.run_quietly(Call::SetEditDirection(direction.to_owned()))
             .await
     }
 
     /// The document `fxsound --status --json` prints.
-    async fn get_status(&self) -> fdo::Result<String> {
+    async fn get_status(&self) -> Result<String, MethodError> {
         self.run(Call::GetStatus).await
     }
 
     /// Show and raise the window, as `--show` does.
-    async fn show(&self) -> fdo::Result<()> {
+    async fn show(&self) -> Result<(), MethodError> {
         self.run_quietly(Call::Show).await
     }
 
     /// Hide the window to the tray, as `--hide` does.
-    async fn hide(&self) -> fdo::Result<()> {
+    async fn hide(&self) -> Result<(), MethodError> {
         self.run_quietly(Call::Hide).await
     }
 
     /// Show the window if it is hidden and hide it if it is showing, as `--toggle-window` does.
-    async fn toggle_window(&self) -> fdo::Result<()> {
+    async fn toggle_window(&self) -> Result<(), MethodError> {
         self.run_quietly(Call::ToggleWindow).await
     }
 
     /// Quit, as `--quit` does. The reply comes before the connection closes.
-    async fn quit(&self) -> fdo::Result<()> {
+    async fn quit(&self) -> Result<(), MethodError> {
         self.run_quietly(Call::Quit).await
     }
 
@@ -1327,16 +1381,16 @@ mod tests {
 
     // ---- answers --------------------------------------------------------------------------------
 
-    fn failed_text(result: fdo::Result<String>) -> String {
+    fn refused_text(result: Result<String, MethodError>) -> String {
         match result {
-            Err(fdo::Error::Failed(text)) => text,
-            other => panic!("expected Failed, got {other:?}"),
+            Err(MethodError::Refused(text)) => text,
+            other => panic!("expected Refused, got {other:?}"),
         }
     }
 
     #[test]
-    fn a_refusal_comes_back_as_failed_with_the_text_fxsound_prints() {
-        let text = failed_text(answer(Response::failed(
+    fn a_refusal_comes_back_as_refused_with_the_text_fxsound_prints() {
+        let text = refused_text(answer(Response::failed(
             "no output preset is called \"Nope\"",
         )));
         assert_eq!(text, "no output preset is called \"Nope\"");
@@ -1346,7 +1400,31 @@ mod tests {
     fn a_refusal_without_text_still_says_something() {
         let mut response = Response::failed("");
         response.stderr.clear();
-        assert!(!failed_text(answer(response)).is_empty());
+        assert!(!refused_text(answer(response)).is_empty());
+    }
+
+    #[test]
+    fn no_answer_in_time_is_a_failure_rather_than_a_refusal() {
+        match answer(Response::unanswered()) {
+            Err(MethodError::Standard(fdo::Error::Failed(text))) => {
+                assert!(text.contains("did not answer"), "{text}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refusal_goes_on_the_bus_as_org_fxsound_fxsound_error_refused_and_the_rest_as_standard() {
+        use zbus::DBusError as _;
+        let refused = MethodError::Refused("\"Rock\" is a factory preset".to_owned());
+        assert_eq!(refused.name().as_str(), "org.fxsound.FxSound.Error.Refused");
+        assert_eq!(refused.description(), Some("\"Rock\" is a factory preset"));
+        let invalid = MethodError::from(fdo::Error::InvalidArgs("loud".to_owned()));
+        assert_eq!(
+            invalid.name().as_str(),
+            "org.freedesktop.DBus.Error.InvalidArgs"
+        );
+        assert_eq!(invalid.description(), Some("loud"));
     }
 
     #[test]
@@ -2354,7 +2432,7 @@ mod tests {
 
         // The refusal fxsound would print, and an argument the option would not take.
         let (name, detail) = method_error(proxy.call("SetPreset", &("Nope",)));
-        assert_eq!(name, "org.freedesktop.DBus.Error.Failed");
+        assert_eq!(name, REFUSED);
         assert!(detail.contains("Nope"), "{detail}");
         let (name, detail) = method_error(proxy.call("SetNoiseSuppression", &("loud",)));
         assert_eq!(name, "org.freedesktop.DBus.Error.InvalidArgs");
