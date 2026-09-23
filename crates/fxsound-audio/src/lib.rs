@@ -164,6 +164,7 @@
 #![deny(unsafe_code)]
 
 mod aec;
+mod app_routes;
 mod app_streams;
 pub mod devices;
 pub mod engine;
@@ -357,6 +358,17 @@ pub const KEEP_AWAKE_STREAM_DESCRIPTION: &str = "FxSound microphone check";
 /// text, and this string reaches the screen from here.
 pub const ONE_HEADSET_ON_BOTH_LANES: &str =
     "Using this headset's microphone switches it to call quality: music plays in mono at 16 kHz";
+
+/// What the engine tells the user, translated, when an application's preset cannot get a route of
+/// its own ([`AudioToUi::Warning`], `docs/0.4.0-apps.md`): its lane runs as many routes as it may
+/// already, every one of them in use, so the application plays — or records — through the lane's
+/// own preset. The first `%s` is the application's name as the window shows it, the second the
+/// most presets a lane runs for applications at once ([`fxsound_core::MAX_ROUTES_PER_LANE`]).
+///
+/// Public for the reason [`ONE_HEADSET_ON_BOTH_LANES`] is: the app's translation tables and their
+/// audit name it, and this string reaches the screen from here.
+pub const TOO_MANY_APPLICATION_PRESETS: &str =
+    "%s stays on FxSound's preset: at most %s application presets can run at once";
 
 /// The `node.name` of FxSound's virtual device for a direction — the value written into that
 /// direction's `default.configured.audio.*` key.
@@ -557,6 +569,7 @@ impl AudioEngine {
             options,
             aec::WEBRTC_LIBRARY,
             volume::wireplumber_state_file(),
+            app_routes::ROUTE_IDLE,
         )
     }
 
@@ -569,7 +582,30 @@ impl AudioEngine {
     /// first pair starts where the test says, not where this machine's FxSound was last left.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start_with_remote(remote: Option<&str>) -> Result<EngineHandle, AudioError> {
-        Self::start_with(remote, StartOptions::default(), aec::WEBRTC_LIBRARY, None)
+        Self::start_with(
+            remote,
+            StartOptions::default(),
+            aec::WEBRTC_LIBRARY,
+            None,
+            app_routes::ROUTE_IDLE,
+        )
+    }
+
+    /// [`Self::start_with_remote`], with a per-application route nobody uses kept for `idle`
+    /// rather than [`app_routes::ROUTE_IDLE`]: a test watches a route go without waiting ten
+    /// seconds for it.
+    #[cfg(test)]
+    pub(crate) fn start_with_route_idle(
+        remote: Option<&str>,
+        idle: Duration,
+    ) -> Result<EngineHandle, AudioError> {
+        Self::start_with(
+            remote,
+            StartOptions::default(),
+            aec::WEBRTC_LIBRARY,
+            None,
+            idle,
+        )
     }
 
     /// [`Self::start_with_remote`], with [`StartOptions`], and WirePlumber's state read from
@@ -580,7 +616,13 @@ impl AudioEngine {
         options: StartOptions,
         wireplumber_state: Option<std::path::PathBuf>,
     ) -> Result<EngineHandle, AudioError> {
-        Self::start_with(remote, options, aec::WEBRTC_LIBRARY, wireplumber_state)
+        Self::start_with(
+            remote,
+            options,
+            aec::WEBRTC_LIBRARY,
+            wireplumber_state,
+            app_routes::ROUTE_IDLE,
+        )
     }
 
     /// [`Self::start_with_remote`], with the echo canceller running `library` rather than WebRTC.
@@ -593,7 +635,13 @@ impl AudioEngine {
         remote: Option<&str>,
         library: &'static str,
     ) -> Result<EngineHandle, AudioError> {
-        Self::start_with(remote, StartOptions::default(), library, None)
+        Self::start_with(
+            remote,
+            StartOptions::default(),
+            library,
+            None,
+            app_routes::ROUTE_IDLE,
+        )
     }
 
     fn start_with(
@@ -601,6 +649,7 @@ impl AudioEngine {
         options: StartOptions,
         aec_library: &'static str,
         wireplumber_state: Option<std::path::PathBuf>,
+        route_idle: Duration,
     ) -> Result<EngineHandle, AudioError> {
         // Whether the *socket* exists is left to `pw_context_connect`, which resolves
         // `remote.name` itself and reports the failure precisely. What has to be checked first is
@@ -623,6 +672,7 @@ impl AudioEngine {
             input: input_priority,
         };
         config.wireplumber_state = wireplumber_state;
+        config.route_idle = route_idle;
         let join = std::thread::Builder::new()
             .name("fxsound-audio".to_owned())
             .spawn(move || engine::run(config))
@@ -740,6 +790,7 @@ impl EngineHandle {
             target_volumes: Vec::new(),
             device_priority: PerDirection::default(),
             wireplumber_state: None,
+            route_idle: app_routes::ROUTE_IDLE,
         };
         let handle = Self {
             engine: AudioEngine {

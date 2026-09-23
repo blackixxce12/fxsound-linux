@@ -60,6 +60,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod apps;
+mod routes;
 mod sleep;
 mod volume;
 

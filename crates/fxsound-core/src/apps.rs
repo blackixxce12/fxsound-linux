@@ -141,6 +141,36 @@ impl AppKey {
         }
     }
 
+    /// Which of `rules` — keys a rule was written for — names this application most
+    /// specifically, by its index among them; `None` when none matches it.
+    ///
+    /// The order [`AppRules::rule`] ranks rules in: one matched by the Flatpak id wins over one
+    /// matched by the binary, which wins over one matched by the name; between two matched as
+    /// strongly, the one with exactly this key's identifiers wins, and then the one listed first.
+    /// Public so that everything that picks a rule for a stream picks the same one — the engine
+    /// choosing which route an application's stream goes onto (`docs/0.4.0-apps.md`) as much as
+    /// the store answering for it.
+    #[must_use]
+    pub fn best_match<'a>(&self, rules: impl IntoIterator<Item = &'a Self>) -> Option<usize> {
+        let mut best: Option<(usize, Decider, bool)> = None;
+        for (index, rule) in rules.into_iter().enumerate() {
+            let Some(strength) = rule.match_strength(self) else {
+                continue;
+            };
+            let exact = rule.same_identity(self);
+            let better = match best {
+                None => true,
+                Some((_, best_strength, best_exact)) => {
+                    (strength, exact) > (best_strength, best_exact)
+                }
+            };
+            if better {
+                best = Some((index, strength, exact));
+            }
+        }
+        best.map(|(index, ..)| index)
+    }
+
     /// The identifier that decided a match between the two keys, or `None` when they do not
     /// match. A stronger decider is a more specific rule: see [`AppRules::rule`].
     fn match_strength(&self, other: &Self) -> Option<Decider> {
@@ -545,23 +575,7 @@ impl AppRules {
 
     /// The index of the rule [`AppRules::rule`] answers with.
     fn best_match(&self, key: &AppKey) -> Option<usize> {
-        let mut best: Option<(usize, Decider, bool)> = None;
-        for (index, rule) in self.apps.iter().enumerate() {
-            let Some(strength) = rule.key.match_strength(key) else {
-                continue;
-            };
-            let exact = rule.key.same_identity(key);
-            let better = match best {
-                None => true,
-                Some((_, best_strength, best_exact)) => {
-                    (strength, exact) > (best_strength, best_exact)
-                }
-            };
-            if better {
-                best = Some((index, strength, exact));
-            }
-        }
-        best.map(|(index, ..)| index)
+        key.best_match(self.apps.iter().map(|rule| &rule.key))
     }
 
     /// Keep at most [`MAX_REMEMBERED_APPS`] rules, forgetting the ones seen longest ago; between
@@ -1496,6 +1510,60 @@ last_seen = 40
         );
         assert_eq!(rules.apps[2].output_preset, "Movies");
         assert_eq!(rules.rename_preset(OUT, "Movies", "Movies"), 0);
+    }
+
+    #[test]
+    fn the_most_specific_of_many_rule_keys_is_picked_as_the_store_picks_it() {
+        let stream = key("discord", "Discord", "com.discordapp.Discord");
+        let rules = [
+            key("", "Discord", ""),
+            key("Discord", "", ""),
+            key("", "", "com.discordapp.Discord"),
+            key("", "", "com.discordapp.Discord"),
+        ];
+        assert_eq!(
+            stream.best_match(&rules),
+            Some(2),
+            "the Flatpak id beats the binary, which beats the name; the first of two equals wins"
+        );
+        assert_eq!(stream.best_match(&rules[..2]), Some(1));
+        assert_eq!(stream.best_match(&rules[..1]), Some(0));
+        assert_eq!(
+            stream.best_match(&[key("", "Slack", ""), key("", "", "com.slack.Slack")]),
+            None
+        );
+        assert_eq!(stream.best_match(std::iter::empty()), None);
+
+        // Between two matched as strongly, the one with exactly the stream's identifiers wins.
+        let general = key("discord", "", "");
+        let exact = key("Discord", "Discord", "");
+        let stream = key("discord", "Discord", "");
+        assert_eq!(stream.best_match([&general, &exact]), Some(1));
+        assert_eq!(stream.best_match([&exact, &general]), Some(0));
+    }
+
+    #[test]
+    fn the_store_and_a_list_of_keys_agree_on_which_rule_names_an_application() {
+        let rules = AppRules {
+            apps: vec![
+                rule(key("", "Chromium", ""), "Movies", "", 1),
+                rule(key("brave", "", ""), "Volume Boost", "", 2),
+                rule(key("", "", "com.brave.Browser"), "Gaming", "", 3),
+            ],
+        };
+        for stream in [
+            key("brave", "Chromium", ""),
+            key("brave", "Chromium", "com.brave.Browser"),
+            key("chromium", "Chromium", ""),
+            key("", "Chromium", ""),
+            key("mpv", "mpv", ""),
+        ] {
+            let by_store = rules.rule(&stream).map(|rule| rule.output_preset.clone());
+            let by_keys = stream
+                .best_match(rules.apps.iter().map(|rule| &rule.key))
+                .map(|index| rules.apps[index].output_preset.clone());
+            assert_eq!(by_store, by_keys, "{stream:?}");
+        }
     }
 
     #[test]

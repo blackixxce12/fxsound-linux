@@ -424,8 +424,21 @@ pub(crate) struct AppStreams {
     fxsound_default: bool,
     /// Something changed that the next report may differ by.
     changed: bool,
+    /// The preset of the route each stream has been moved onto, by stream id
+    /// (`engine::route_pairs`): what [`AppStream::route`] reports.
+    routes: HashMap<u32, String>,
     /// What the app was last told: nothing, until something was.
     reported: Vec<AppStream>,
+}
+
+/// One stream [`AppStreams::report`] lists, as the per-application routes plan with it
+/// (`crate::app_routes`): who it is, its lane, and why it may not be moved, if it may not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Listed {
+    pub(crate) id: u32,
+    pub(crate) direction: DeviceDirection,
+    pub(crate) app: AppKey,
+    pub(crate) pin: Option<Pin>,
 }
 
 impl AppStreams {
@@ -514,6 +527,7 @@ impl AppStreams {
     pub(crate) fn remove(&mut self, id: u32) -> Option<Tracked> {
         if let Some(index) = self.streams.iter().position(|stream| stream.id == id) {
             self.streams.remove(index);
+            self.routes.remove(&id);
             self.changed = true;
             return Some(Tracked::Stream);
         }
@@ -535,8 +549,18 @@ impl AppStreams {
         self.streams.clear();
         self.clients.clear();
         self.own.clear();
+        self.routes.clear();
         self.fxsound_default = false;
         self.changed = true;
+    }
+
+    /// Which stream is on which preset's route now, by stream id: every stream the engine has moved
+    /// onto a route, and no other. The next report says so, if it changes what was said.
+    pub(crate) fn set_routes(&mut self, routes: HashMap<u32, String>) {
+        if routes != self.routes {
+            self.routes = routes;
+            self.changed = true;
+        }
     }
 
     /// The session's default sink is now `node_name` (`default.audio.sink`, the one in effect).
@@ -612,6 +636,29 @@ impl AppStreams {
         Some(line)
     }
 
+    /// Every stream [`Self::report`] lists, in its order, with why it may not be moved: what the
+    /// per-application routes are planned from. A stream the app is not told of is moved nowhere,
+    /// since no rule the app could write would be about it.
+    #[must_use]
+    pub(crate) fn listed(&self) -> Vec<Listed> {
+        let mut listed: Vec<Listed> = self
+            .streams
+            .iter()
+            .filter(|stream| self.reportable(stream))
+            .filter_map(|stream| {
+                let app = self.key(stream);
+                (!app.is_empty()).then(|| Listed {
+                    id: stream.id,
+                    direction: stream.direction,
+                    app,
+                    pin: self.pin(stream),
+                })
+            })
+            .collect();
+        listed.sort_by_key(|stream| (stream.direction == DeviceDirection::Input, stream.id));
+        listed
+    }
+
     /// Every application stream to tell the app about, outputs first, each direction by id:
     /// complete, with its client's info in, not a recorder of what a sink plays unless it records
     /// FxSound ([`Self::records_a_sink`]), and with at least one identifier — a stream that says
@@ -624,11 +671,11 @@ impl AppStreams {
             .filter(|stream| self.reportable(stream))
             .filter_map(|stream| {
                 let app = self.key(stream);
-                (!app.is_empty()).then_some(AppStream {
+                (!app.is_empty()).then(|| AppStream {
                     id: stream.id,
                     direction: stream.direction,
                     app,
-                    route: None,
+                    route: self.routes.get(&stream.id).cloned(),
                 })
             })
             .collect();
@@ -1719,5 +1766,98 @@ mod tests {
             assert!(line.contains(part), "{part:?} missing from {line:?}");
         }
         assert_eq!(streams.describe(20), None);
+    }
+
+    #[test]
+    fn the_routes_plan_with_every_listed_stream_and_why_it_may_not_move() {
+        let mut streams = AppStreams::default();
+        streams.stream_appeared(recorder(9, "Discord"));
+        streams.stream_appeared(player(4, "Battlefield 6"));
+        streams.stream_appeared(stream(
+            5,
+            &[
+                ("media.class", PLAYBACK_MEDIA_CLASS),
+                ("application.name", "Kiosk"),
+                ("node.dont-move", "true"),
+            ],
+        ));
+        // Not complete yet: neither listed nor planned with.
+        let mut pending = StreamNode::from_props(
+            6,
+            &props(&[
+                ("media.class", PLAYBACK_MEDIA_CLASS),
+                ("application.name", "Later"),
+            ]),
+        )
+        .expect("a stream");
+        pending.complete = false;
+        streams.stream_appeared(pending);
+
+        let planned: Vec<(u32, DeviceDirection, String, Option<Pin>)> = streams
+            .listed()
+            .into_iter()
+            .map(|stream| (stream.id, stream.direction, stream.app.name, stream.pin))
+            .collect();
+        assert_eq!(
+            planned,
+            vec![
+                (4, DeviceDirection::Output, "Battlefield 6".to_owned(), None),
+                (
+                    5,
+                    DeviceDirection::Output,
+                    "Kiosk".to_owned(),
+                    Some(Pin::DontMove)
+                ),
+                (9, DeviceDirection::Input, "Discord".to_owned(), None),
+            ],
+            "the order and the streams of the report"
+        );
+        assert_eq!(
+            planned.iter().map(|(id, ..)| *id).collect::<Vec<_>>(),
+            streams
+                .report()
+                .iter()
+                .map(|stream| stream.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_stream_on_a_route_is_reported_with_its_preset_and_goes_with_it() {
+        let mut streams = AppStreams::default();
+        streams.stream_appeared(player(4, "Battlefield 6"));
+        streams.stream_appeared(player(7, "Brave"));
+        let first = streams.news().expect("the first list");
+        assert!(first.iter().all(|stream| stream.route.is_none()));
+
+        streams.set_routes(HashMap::from([(4, "Gaming".to_owned())]));
+        let routed = streams.news().expect("the route is news");
+        assert_eq!(
+            routed
+                .iter()
+                .map(|stream| (stream.id, stream.route.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![(4, Some("Gaming")), (7, None)]
+        );
+        streams.set_routes(HashMap::from([(4, "Gaming".to_owned())]));
+        assert_eq!(streams.news(), None, "the same routes are no news");
+
+        // The game quits, and a new stream under its id is on no route.
+        streams.remove(4);
+        streams.stream_appeared(player(4, "Battlefield 6"));
+        let back = streams.news().expect("news");
+        assert!(back.iter().all(|stream| stream.route.is_none()));
+        streams.set_routes(HashMap::from([(7, "Movies".to_owned())]));
+        streams.clear();
+        assert_eq!(streams.news(), Some(Vec::new()));
+        streams.stream_appeared(player(7, "Brave"));
+        assert!(
+            streams
+                .news()
+                .expect("news")
+                .iter()
+                .all(|stream| stream.route.is_none()),
+            "a new session starts with no stream on a route"
+        );
     }
 }

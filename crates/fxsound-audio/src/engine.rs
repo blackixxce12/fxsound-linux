@@ -176,7 +176,8 @@
 //! both lanes fall silent after their chains — the snapshots' own `mute` path, set from here
 //! rather than by the GUI ([`Lane::system_mute`]) — and no device rules run, so nothing chooses a
 //! device from a graph that is coming apart under the suspend. On waking, both chains' filter
-//! history is cleared, and both lanes' rules run with the wait of "A device that blinks" in front
+//! history is cleared, and every per-application route's with them (see "Applications"), and
+//! both lanes' rules run with the wait of "A device that blinks" in front
 //! of them: a lane whose device is not back yet waits up to [`RETURN_WAIT`] for it
 //! ([`Lane::wake_wait`]), card or no card, because a Bluetooth headset reconnects a few seconds
 //! after the system does. A lane is heard again once its rules have attached it, or after
@@ -193,6 +194,14 @@
 //! not say about themselves. FxSound's own streams are left out by name. The GUI hears the list on
 //! the supervisor's tick, whole, and only when it has changed ([`AudioToUi::AppStreams`]), so an
 //! application that starts is one message however many events announced it.
+//!
+//! An application the app has given a preset of its own ([`UiToAudio::SetAppRoutes`]) is moved
+//! onto a *route*: another pair of FxSound's nodes on its lane's device, running that preset
+//! (`route_pairs`, planned by `crate::app_routes`). The move is a `target.object` key in the
+//! `default` metadata, which WirePlumber follows; deleting it moves the application back. Routes
+//! follow their lanes — built beside a lane's pair, rebuilt with it on another device, taken down
+//! with it — and go once nothing has used them for a while. On the way out the keys are deleted
+//! with the hand-back of the defaults, confirmed by the same `sync`, before any node goes.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
@@ -230,9 +239,9 @@ use crate::{
     AEC_SOURCE_NODE_NAME, AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION,
     DEFAULT_QUANTUM_FRAMES, DEFAULT_SAMPLE_RATE, KEEP_AWAKE_NODE_NAME,
     KEEP_AWAKE_STREAM_DESCRIPTION, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS,
-    ONE_HEADSET_ON_BOTH_LANES, OUR_NODE_NAMES, OUTPUT_NODE_NAME, OUTPUT_STREAM_DESCRIPTION,
-    RING_CAPACITY_FRAMES, SINK_DESCRIPTION, SINK_NODE_NAME, SOURCE_NODE_NAME, is_fxsound_node,
-    link_group, locale, our_node_name,
+    ONE_HEADSET_ON_BOTH_LANES, OUTPUT_NODE_NAME, OUTPUT_STREAM_DESCRIPTION, RING_CAPACITY_FRAMES,
+    SINK_DESCRIPTION, SINK_NODE_NAME, SOURCE_NODE_NAME, is_fxsound_node, link_group, locale,
+    our_node_name,
 };
 
 /// The rate the capture stream asks for, whatever the microphone runs at.
@@ -1161,6 +1170,9 @@ pub(crate) struct Config {
     /// WirePlumber's `stream-properties` file, to read the level it kept for our nodes before
     /// 0.4.0 from ([`volume::inherited`]); `None` to read nothing, which is what the tests do.
     pub(crate) wireplumber_state: Option<std::path::PathBuf>,
+    /// How long a per-application route nobody uses is kept ([`crate::app_routes::ROUTE_IDLE`]);
+    /// shorter in the tests, which would otherwise wait ten seconds to see one go.
+    pub(crate) route_idle: Duration,
 }
 
 /// One lane's two PipeWire nodes and everything that must die with them.
@@ -1918,6 +1930,11 @@ struct Shared {
     /// engine sends a chain itself: clearing its filter history when the system wakes. `None` in
     /// the tests that build a [`Shared`] without a handle behind it.
     lane_events: PerDirection<Option<Sender<DspEvent>>>,
+    /// The per-application routes (`docs/0.4.0-apps.md`, `route_pairs`): the rules the app sent,
+    /// the routes each lane runs for them, and what the `default` metadata says about where each
+    /// application's stream goes. The rules are kept across reconnects; the routes belong to the
+    /// session, and go with it ([`close_session`]).
+    routes: route_pairs::Routes,
 }
 
 impl Shared {
@@ -1974,6 +1991,7 @@ impl Shared {
             keep_input_awake: false,
             asleep_since: None,
             lane_events: PerDirection::default(),
+            routes: route_pairs::Routes::new(crate::app_routes::ROUTE_IDLE),
         }
     }
 
@@ -2195,6 +2213,7 @@ pub(crate) fn run(config: Config) {
         target_volumes,
         device_priority,
         wireplumber_state,
+        route_idle,
     } = config;
 
     pw::init();
@@ -2243,6 +2262,7 @@ pub(crate) fn run(config: Config) {
         // its first device without the user's ranking.
         state.target_volumes = remembered_volumes(target_volumes);
         start_ranked(&mut state, device_priority);
+        state.routes.set_idle(route_idle);
         if let Some(path) = wireplumber_state {
             state.inherited_volumes = volume::inherited_from(&path);
             for (direction, inherited) in state.inherited_volumes.iter() {
@@ -2330,7 +2350,8 @@ fn attach_wake<'l>(
     attached
 }
 
-/// The exit hand-back, made to actually arrive.
+/// The exit hand-back, made to actually arrive: every session default FxSound holds, and every
+/// application stream it moved onto a per-application route ([`route_pairs::move_everything_back`]).
 ///
 /// `Metadata::set_property` does not write to the socket. libpipewire queues the message and only
 /// sends it from the loop, once the fd reports writable (`module-protocol-native.c`:
@@ -2343,15 +2364,19 @@ fn attach_wake<'l>(
 ///
 /// Called with no callback on the stack — after `run()`, with the supervisor and the control
 /// channel already detached — so the `borrow_mut` cannot collide with anything, and the only
-/// callbacks the pump can reach (`done`, the metadata echo of our own write, stream state) all
-/// `try_borrow_mut` and never touch the default.
+/// callbacks the pump can reach (`done`, the metadata echo of our own writes, stream state) all
+/// `try_borrow_mut` and never touch the default, nor write a stream's target.
 fn release_defaults_before_exit(
     shared: &Rc<RefCell<Shared>>,
     mainloop: &pw::main_loop::MainLoopRc,
 ) {
     let pending = {
         let mut guard = shared.borrow_mut();
-        if !release_all_defaults(&mut guard) {
+        // The defaults, and every application stream FxSound moved onto a route: both are
+        // metadata writes, and one `sync` behind them confirms both, before any node goes.
+        let released = release_all_defaults(&mut guard);
+        let moved_back = route_pairs::move_everything_back(&mut guard);
+        if !released && !moved_back {
             return;
         }
         let Some(session) = guard.session.as_ref() else {
@@ -2360,7 +2385,7 @@ fn release_defaults_before_exit(
         match session.core.sync(RELEASE_SEQ) {
             Ok(seq) => seq,
             Err(error) => {
-                log::warn!("could not confirm the hand-back of the session default: {error}");
+                log::warn!("could not confirm the exit hand-back: {error}");
                 return;
             }
         }
@@ -2369,11 +2394,11 @@ fn release_defaults_before_exit(
 
     let deadline = Instant::now() + RELEASE_TIMEOUT;
     if pump_until_release_confirmed(shared, mainloop.loop_(), deadline) {
-        log::debug!("the server confirmed the hand-back of the session default");
+        log::debug!("the server confirmed the exit hand-back");
     } else {
         log::warn!(
-            "the server did not confirm the hand-back of the session default within \
-             {RELEASE_TIMEOUT:?}; closing the connection regardless"
+            "the server did not confirm the exit hand-back within {RELEASE_TIMEOUT:?}; closing \
+             the connection regardless"
         );
     }
 }
@@ -2519,16 +2544,7 @@ fn control(shared: &mut Shared, message: UiToAudio) {
         UiToAudio::SystemSleeping(true) => go_to_sleep(shared, Instant::now()),
         UiToAudio::SystemSleeping(false) => wake_up(shared, Instant::now()),
         UiToAudio::KeepInputAwake(awake) => keep_input_awake(shared, awake),
-        UiToAudio::SetAppRoutes(routes) => {
-            // Per-application routes (`docs/0.4.0-apps.md`) are not built yet. The message is
-            // accepted so the app can already send the set it resolved, and every application
-            // stays on its lane's chain until the routes exist — the same place a route that
-            // could not be made leaves it.
-            log::debug!(
-                "{} per-application routes asked for; routes are not built yet",
-                routes.len()
-            );
-        }
+        UiToAudio::SetAppRoutes(routes) => route_pairs::set_rules(shared, routes),
         UiToAudio::Shutdown => unreachable!("handled by handle_control"),
     }
     // A detached microphone lane, another microphone or other speakers: whatever the message
@@ -2539,6 +2555,9 @@ fn control(shared: &mut Shared, message: UiToAudio) {
     // And a microphone pair the message built — or rebuilt, for the canceller — is held awake at
     // once when it is to be, rather than a tick later.
     reconcile_keep_awake(shared);
+    // And the per-application routes follow at once too: new rules, a lane moved to another
+    // device, a lane detached — whose streams go back and whose routes go with it.
+    route_pairs::reconcile(shared, Instant::now());
 }
 
 /// Switch echo cancellation on or off, and answer with an [`AudioToUi::EchoCancel`] saying where
@@ -2852,9 +2871,9 @@ fn go_to_sleep(shared: &mut Shared, now: Instant) {
     }
 }
 
-/// The system has woken (module docs, "Sleep"): clear both chains' history, let both lanes' rules
-/// run with a wait for their devices in front of them, and hear each lane again once it is
-/// attached.
+/// The system has woken (module docs, "Sleep"): clear both lanes' chain history and every
+/// route's ([`route_pairs::wake_up`]), let both lanes' rules run with a wait for their devices in
+/// front of them, and hear each lane again once it is attached.
 ///
 /// A wake with no sleep before it — the app saying so at start, or saying it twice — changes
 /// nothing. [`SLEEP_LIMIT`] calls this too, when no wake has come.
@@ -2893,6 +2912,8 @@ fn wake_up(shared: &mut Shared, now: Instant) {
     }
     // A chain on the main loop has nothing else to apply its events.
     apply_idle_lane_events(shared);
+    // A route's chain saw what its lane's saw, and forgets it with the lane's.
+    route_pairs::wake_up(shared);
 }
 
 /// Take the system to have woken without saying so, once it has been going to sleep, awake, for
@@ -3225,6 +3246,10 @@ fn close_session(shared: &mut Shared) {
     // next ones once the lanes are back. Its source goes from the registry with the rest.
     shared.aec.unload();
     shared.aec.forget_sources();
+    // The routes' pairs, beside the lanes', on this connection too. Their keys in the metadata are
+    // the server's now: moved back on the way out already ([`release_defaults_before_exit`]), and
+    // found again by the next connection otherwise.
+    route_pairs::close(shared);
     for direction in DeviceDirection::ALL {
         retire_volume(shared, direction);
     }
@@ -3385,6 +3410,10 @@ fn supervise(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) {
             supervise_lane(&mut guard, direction, now);
         }
         reconcile_keep_awake(&mut guard);
+
+        // 4b. The per-application routes, after the lanes they follow: the streams onto their
+        //     routes and back, the routes built, moved with their lane, and taken down.
+        route_pairs::reconcile(&mut guard, now);
 
         // 5. Tell the GUI what changed.
         publish(&mut guard);
@@ -3604,6 +3633,8 @@ fn on_global(
             if is_fxsound_node(name) {
                 let serial = props.get("object.serial").and_then(|s| s.parse().ok());
                 guard.apps.own_node_appeared(global.id, serial, name);
+                // A route's virtual node: the serial its streams are moved onto.
+                route_pairs::node_appeared(&mut guard, global.id, serial, name);
             }
             // An application's stream: a player or a recorder. Never a device either.
             if let Some(stream) = StreamNode::from_props(global.id, &|key: &str| props.get(key)) {
@@ -3756,12 +3787,13 @@ fn on_global(
                 log::debug!("could not bind the `{name}` metadata object");
                 return;
             };
+            let default = name == "default";
             let listener = metadata
                 .add_listener_local()
                 .property({
                     let shared = Rc::clone(shared);
-                    move |_subject, key, _type, value| {
-                        on_metadata_property(&shared, key, value);
+                    move |subject, key, _type, value| {
+                        on_metadata_event(&shared, default, subject, key, value);
                         0
                     }
                 })
@@ -4021,13 +4053,15 @@ fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
         Some(Tracked::Stream) => {
             log::debug!("application stream {id} went");
             retire_probe(&mut guard, id);
+            route_pairs::stream_removed(&mut guard, id);
             return;
         }
         Some(Tracked::Client) => {
             retire_probe(&mut guard, id);
             return;
         }
-        Some(Tracked::Own) | None => {}
+        Some(Tracked::Own) => route_pairs::node_removed(&mut guard, id),
+        None => {}
     }
     if guard.aec.source_removed(id) {
         log::debug!("the echo canceller's source went away ({id})");
@@ -4465,6 +4499,30 @@ fn on_node_info(
     }
 }
 
+/// One property event of the `default` or the `settings` metadata object (`default` says which).
+///
+/// Keys about one object rather than about the session are, in the `default` object, where each
+/// application stream is to go ([`route_pairs`]); a `None` key clears every key of the subject.
+/// Everything about the session is on the core's id, and [`on_metadata_property`]'s.
+fn on_metadata_event(
+    shared: &Rc<RefCell<Shared>>,
+    default: bool,
+    subject: u32,
+    key: Option<&str>,
+    value: Option<&str>,
+) {
+    if subject == pw::core::PW_ID_CORE {
+        on_metadata_property(shared, key, value);
+        return;
+    }
+    if default
+        && key.is_none_or(|key| key == crate::app_routes::TARGET_OBJECT_KEY)
+        && let Ok(mut guard) = shared.try_borrow_mut()
+    {
+        route_pairs::metadata_target(&mut guard, subject, value.filter(|_| key.is_some()));
+    }
+}
+
 fn on_metadata_property(shared: &Rc<RefCell<Shared>>, key: Option<&str>, value: Option<&str>) {
     let Some(key) = key else {
         return;
@@ -4527,10 +4585,12 @@ fn on_metadata_property(shared: &Rc<RefCell<Shared>>, key: Option<&str>, value: 
 // The session default
 // ---------------------------------------------------------------------------------------------
 
-/// Whether `node_name` is one of the nodes FxSound makes ([`OUR_NODE_NAMES`]): never a default
-/// to remember, nor one to hand back to.
+/// Whether `node_name` is one of the nodes FxSound makes ([`is_fxsound_node`]): a lane's, the echo
+/// canceller's, a per-application route's. Never a default to remember, nor one to hand back to:
+/// a route's sink is an `Audio/Sink` too, and one WirePlumber fell back to must not be written to
+/// the settings file as the device the user had.
 fn is_ours(node_name: &str) -> bool {
-    OUR_NODE_NAMES.contains(&node_name)
+    is_fxsound_node(node_name)
 }
 
 /// Become the session default for a lane's direction, politely: remember what was there first.
@@ -6582,6 +6642,8 @@ fn published_devices(shared: &Shared) -> Vec<AudioDevice> {
     }
     published
 }
+
+mod route_pairs;
 
 #[cfg(test)]
 mod live_session;
@@ -9298,6 +9360,96 @@ mod tests {
         );
     }
 
+    /// A route's preset: the music chain's busy parameters, or the voice chain's defaults.
+    fn route_preset(direction: DeviceDirection, name: &str) -> crate::app_routes::RoutePreset {
+        use fxsound_core::messages::RouteParams;
+        crate::app_routes::RoutePreset {
+            direction,
+            name: name.to_owned(),
+            params: match direction {
+                DeviceDirection::Output => {
+                    RouteParams::Output(crate::lane_dsp::tests::busy_output_params(false))
+                }
+                DeviceDirection::Input => RouteParams::Input(InputDspParams::default()),
+            },
+            chain: String::new(),
+        }
+    }
+
+    #[test]
+    fn waking_clears_every_routes_chain_history_with_its_lanes() {
+        use crate::app_routes::RouteSlot;
+        use crate::lane_dsp::tests::{busy_output_params, largest_difference, run_block};
+        use fxsound_core::messages::RouteParams;
+
+        // Two routes: a game's on the speakers, whose pair has played for a while and has since
+        // been dropped, its DSP sent home; and a call's on the microphone, whose DSP is away with
+        // its pair, on an audio thread this test does not run.
+        let mut shared = shared_for_tests();
+        let _lanes = with_lane_queues(&mut shared);
+        let game = RouteSlot::new(DeviceDirection::Output, 1);
+        let call = RouteSlot::new(DeviceDirection::Input, 1);
+        shared
+            .routes
+            .add_for_tests(game, route_preset(DeviceDirection::Output, "Gaming"));
+        shared
+            .routes
+            .add_for_tests(call, route_preset(DeviceDirection::Input, "Calls"));
+        let mut played = shared
+            .routes
+            .take_dsp_for_tests(game)
+            .expect("built on the main loop");
+        played.set_format(48_000.0, 2);
+        for index in 0..40 {
+            run_block(&mut played, index);
+        }
+        shared.routes.send_dsp_home_for_tests(game, played);
+        let mut away = shared
+            .routes
+            .take_dsp_for_tests(call)
+            .expect("built on the main loop");
+
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        assert_eq!(
+            shared.routes.events_waiting(),
+            [(game, 0), (call, 0)],
+            "nothing is cleared on the way down"
+        );
+        control(&mut shared, UiToAudio::SystemSleeping(false));
+        assert_eq!(
+            shared.routes.events_waiting(),
+            [(game, 0), (call, 1)],
+            "the game's reset applied on the main loop, where its chain is; the call's waiting \
+             for the block its audio thread runs next"
+        );
+
+        // The game's chain starts its next pair where a route built only now would.
+        let mut woken = shared
+            .routes
+            .take_dsp_for_tests(game)
+            .expect("home, on the main loop");
+        let (mut fresh, _, _, _fresh_events) = lane_dsp::route(
+            RouteParams::Output(busy_output_params(false)),
+            ChainSpec::voice(),
+        );
+        fresh.set_format(48_000.0, 2);
+        let difference = largest_difference(&run_block(&mut woken, 40), &run_block(&mut fresh, 40));
+        assert!(difference < 1e-6, "{difference}");
+        shared.routes.send_dsp_home_for_tests(game, woken);
+
+        // Another sleep and wake before the call's pair has run a block: its reset is still
+        // waiting, and one is as good as two.
+        control(&mut shared, UiToAudio::SystemSleeping(true));
+        control(&mut shared, UiToAudio::SystemSleeping(false));
+        assert_eq!(shared.routes.events_waiting(), [(game, 0), (call, 1)]);
+        away.refresh();
+        assert_eq!(
+            shared.routes.events_waiting(),
+            [(game, 0), (call, 0)],
+            "taken on the call's next block"
+        );
+    }
+
     #[test]
     fn a_wake_with_no_sleep_before_it_changes_nothing() {
         let mut shared = shared_for_tests();
@@ -9532,7 +9684,7 @@ mod tests {
     }
 
     #[test]
-    fn per_application_routes_are_accepted_and_change_nothing_until_routes_exist() {
+    fn per_application_rules_are_kept_without_a_server_and_build_nothing_until_there_is_one() {
         use fxsound_core::messages::{AppRoute, DspParams, RouteParams};
 
         let (mut shared, messages) = shared_with_messages();
@@ -9548,7 +9700,18 @@ mod tests {
             chain: String::new(),
         };
         control(&mut shared, UiToAudio::SetAppRoutes(vec![route]));
+        assert_eq!(
+            shared.routes.rule_count(),
+            1,
+            "kept for the connection to come"
+        );
+        assert_eq!(
+            shared.routes.counts(),
+            (0, 0),
+            "with no graph there is no route"
+        );
         control(&mut shared, UiToAudio::SetAppRoutes(Vec::new()));
+        assert_eq!(shared.routes.rule_count(), 0);
         assert!(drained(&messages).is_empty(), "nothing to report");
         assert!(shared.lanes.output.nodes.is_none());
         assert!(shared.lanes.input.nodes.is_none());
@@ -10812,7 +10975,7 @@ mod tests {
     #[test]
     fn no_node_of_ours_is_ever_seeded_as_a_remembered_default() {
         let mut shared = shared_for_tests();
-        for name in OUR_NODE_NAMES {
+        for name in crate::OUR_NODE_NAMES {
             control(
                 &mut shared,
                 UiToAudio::SeedRememberedDefaults {
