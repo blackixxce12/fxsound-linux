@@ -273,6 +273,29 @@ mod tests {
     }
 
     #[test]
+    fn a_voice_export_writes_the_saved_preset_and_never_its_unsaved_edits() {
+        let tmp = tempdir("export-saved");
+        let mut store = store_in(&tmp);
+        let (mut clean, _) = store.load("Clean Voice").expect("load");
+        let saved = clean.makeup_db;
+        clean.makeup_db = saved - 4.0;
+        store.autosave(&clean).expect("autosave");
+        store.rescan();
+        assert!(store.find("Clean Voice").unwrap().modified);
+
+        let out = tmp.join("export");
+        std::fs::create_dir_all(&out).expect("mkdir");
+        let path = store.export("Clean Voice", &out).expect("export");
+        let exported = InputPreset::load(&path).expect("parse export");
+        assert_eq!(exported.name, "Clean Voice");
+        assert_eq!(exported.makeup_db, saved, "the saved value, not the edit");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("Clean Voice.toml")
+        );
+    }
+
+    #[test]
     fn factory_presets_cannot_be_deleted() {
         let tmp = tempdir("delete");
         let mut store = store_in(&tmp);

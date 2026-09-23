@@ -1729,6 +1729,33 @@ mod tests {
     }
 
     #[test]
+    fn a_voice_preset_picked_while_the_microphone_waits_is_the_one_it_remembers() {
+        // What a held `--output` does with the `--preset` beside it, a held `--input` does too:
+        // once the list arrives the microphone keeps the voice preset and remembers it, under
+        // its own lane, for the next time it is picked.
+        use fxsound_core::DeviceDirection::{Input, Output};
+        let mut a = app_with_presets("held-microphone-remembers");
+        let outcome = run_line(&mut a, &["--input=alsa_input.pci", "--preset=Flat Voice"]);
+        assert!(!outcome.failed, "{:?}", outcome.stderr);
+        assert_eq!(
+            a.settings().preset_for_device("alsa_input.pci", Input),
+            None,
+            "nothing to remember it against yet"
+        );
+
+        devices_arrive(&mut a);
+        assert_eq!(a.lane_preset(Input), Some(("Flat Voice", false)));
+        assert_eq!(
+            a.settings().preset_for_device("alsa_input.pci", Input),
+            Some("Flat Voice")
+        );
+        assert_eq!(
+            a.settings().preset_for_device("alsa_input.pci", Output),
+            None
+        );
+    }
+
+    #[test]
     fn a_preset_picked_while_the_device_waits_beats_the_one_the_device_remembers() {
         use fxsound_core::DeviceDirection::Output;
         let mut a = app_with_presets("held-preset-beats-remembered");
@@ -2094,5 +2121,110 @@ mod tests {
         // Status ran last, so it reports what the earlier commands did.
         assert!(outcome.stdout.contains("ambience: 3"));
         assert!(outcome.stdout.contains("master_gain: -6 dB"));
+    }
+
+    /// The directory `app_with_presets(tag)` keeps its user presets in: the speakers' `.fac`
+    /// files directly, the microphone's voice presets under `Input/`.
+    fn user_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("fxsound-commands-{}-{tag}", std::process::id()))
+            .join("user")
+    }
+
+    /// Where `lane` files a user preset called `name` under `user`, and where the other lane
+    /// would have, had its kind of file been written for it.
+    fn files(user: &std::path::Path, lane: DeviceDirection, name: &str) -> [std::path::PathBuf; 2] {
+        let music = user.join(format!("{name}.fac"));
+        let voice = user.join("Input").join(format!("{name}.toml"));
+        match lane {
+            DeviceDirection::Output => [music, voice],
+            DeviceDirection::Input => [voice, music],
+        }
+    }
+
+    fn preset(command: PresetCommand) -> Command {
+        Command::Preset(command)
+    }
+
+    #[test]
+    fn the_preset_commands_save_undo_rename_and_delete_in_either_lane() {
+        // The hamburger's items from the command line: the same on the speakers' `.fac` set and
+        // on the microphone's voice set, each lane's files in its own store and of its own kind.
+        for lane in DeviceDirection::ALL {
+            let tag = format!("preset-commands-{}", lane.key());
+            let mut a = app_with_presets(&tag);
+            let user = user_dir(&tag);
+            run(&mut a, &[Command::EditDirection(lane)]);
+            let first = a.state.presets[0].name.clone();
+            run(&mut a, &[preset(PresetCommand::Select(first))]);
+            run(&mut a, &[Command::BandGains(vec![(0, 6.0)])]);
+            assert!(a.state.preset().is_some_and(|p| p.modified), "{lane:?}");
+
+            let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("Mine".into()))]);
+            assert!(!outcome.failed, "{lane:?}: {}", outcome.stderr);
+            let [own, other] = files(&user, lane, "Mine");
+            assert!(own.is_file(), "{lane:?}: {}", own.display());
+            assert!(!other.exists(), "{lane:?}: {}", other.display());
+            assert_eq!(a.lane_preset(lane), Some(("Mine", false)), "{lane:?}");
+            assert!(a.lane_has_preset(lane, "Mine"));
+            assert!(!a.lane_has_preset(lane.other(), "Mine"));
+
+            run(&mut a, &[Command::BandGains(vec![(0, -3.0)])]);
+            assert_eq!(a.lane_preset(lane), Some(("Mine", true)), "{lane:?}");
+            run(&mut a, &[preset(PresetCommand::Overwrite)]);
+            assert_eq!(a.lane_preset(lane), Some(("Mine", false)), "{lane:?}");
+
+            run(&mut a, &[Command::BandGains(vec![(0, 2.0)])]);
+            run(&mut a, &[preset(PresetCommand::Undo)]);
+            assert_eq!(a.lane_preset(lane), Some(("Mine", false)), "{lane:?}");
+            assert_eq!(a.state.eq_bands[0].boost_db, -3.0, "{lane:?}: as saved");
+
+            run(&mut a, &[preset(PresetCommand::Rename("Yours".into()))]);
+            let [renamed, _] = files(&user, lane, "Yours");
+            assert!(renamed.is_file(), "{lane:?}");
+            assert!(!own.exists(), "{lane:?}");
+            assert_eq!(a.lane_preset(lane), Some(("Yours", false)), "{lane:?}");
+
+            run(&mut a, &[preset(PresetCommand::Delete)]);
+            assert!(!renamed.exists(), "{lane:?}");
+            assert!(!a.lane_has_preset(lane, "Yours"), "{lane:?}");
+            let _ = std::fs::remove_dir_all(user.parent().expect("the root"));
+        }
+    }
+
+    #[test]
+    fn a_user_voice_preset_is_selected_by_name_and_reported_with_its_changes() {
+        let tag = "user-voice";
+        let mut a = app_with_presets(tag);
+        run(
+            &mut a,
+            &[
+                Command::EditDirection(DeviceDirection::Input),
+                preset(PresetCommand::Select("Flat Voice".into())),
+                Command::BandGains(vec![(0, 6.0)]),
+                preset(PresetCommand::SaveAs("Mine".into())),
+                preset(PresetCommand::Select("Clean Voice".into())),
+            ],
+        );
+        let outcome = run(&mut a, &[preset(PresetCommand::Select("Mine".into()))]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(a.settings().input_preset, "Mine");
+
+        run(&mut a, &[Command::BandGains(vec![(1, 3.0)])]);
+        let json = status(&mut a);
+        assert_eq!(json["input"]["preset"], "Mine");
+        assert_eq!(json["input"]["modified"], true, "{json}");
+        assert_eq!(json["preset"], "Mine*");
+
+        // From the speakers, the voice preset is the other lane's, and the refusal says so.
+        run(&mut a, &[Command::EditDirection(DeviceDirection::Output)]);
+        let outcome = run(&mut a, &[preset(PresetCommand::Select("Mine".into()))]);
+        assert!(outcome.failed);
+        assert!(
+            outcome.stderr.contains("--edit=input"),
+            "{}",
+            outcome.stderr
+        );
+        let _ = std::fs::remove_dir_all(user_dir(tag).parent().expect("the root"));
     }
 }

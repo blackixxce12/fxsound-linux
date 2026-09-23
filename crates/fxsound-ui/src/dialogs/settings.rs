@@ -563,14 +563,16 @@ pub struct SettingsState {
     pub settings: Settings,
     /// Which pane is showing.
     pub tab: SettingsTab,
-    /// The device priority list, in priority order.
+    /// The output device priority list, in priority order. Output devices only: a microphone
+    /// remembers its voice preset in the same settings, but has no row here.
     pub devices: Vec<DevicePriority>,
     /// The selected row, which is what ▲/▼ and Shift+Up/Shift+Down act on.
     pub selected_device: Option<usize>,
-    /// Every preset name, for the per-device preset picker.
+    /// Every speakers' preset name, for the per-device preset picker.
     pub presets: Vec<String>,
     /// Whether the user has anything to lose: the reset button is enabled iff there is at least
-    /// one user preset **or** some preset is modified (`FxSettingsDialog.cpp:210-220`).
+    /// one user preset **or** some preset is modified (`FxSettingsDialog.cpp:210-220`), on either
+    /// lane.
     pub can_reset_presets: bool,
     /// The application version, shown as `"v" + version` and never translated
     /// (`FxSettingsDialog.cpp:542`). Pass `env!("CARGO_PKG_VERSION")`.

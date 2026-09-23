@@ -1390,6 +1390,47 @@ mod tests {
     }
 
     #[test]
+    fn a_users_own_preset_answers_on_the_bus_in_either_lane() {
+        // SetPreset, GetPreset and the Preset property run the command line's commands, so a
+        // voice preset the user saved is as reachable as a `.fac` they saved, and each lane keeps
+        // its own.
+        let (mut app, _dir) = app_with_presets("own-preset", &["Alpha", "Beta"]);
+        let call = |app: &mut App, call: Call| {
+            let outcome = crate::commands::run(app, &commands(call));
+            assert!(!outcome.failed, "{}", outcome.stderr);
+            outcome.stdout
+        };
+        for (lane, saved) in [("output", "My Music"), ("input", "My Voice")] {
+            call(&mut app, Call::SetEditDirection(lane.to_owned()));
+            let shipped = app.state.presets[0].name.clone();
+            call(&mut app, Call::SetPreset(shipped.clone()));
+            let outcome = crate::commands::run(
+                &mut app,
+                &[
+                    Command::BandGains(vec![(0, 6.0)]),
+                    Command::Preset(PresetCommand::SaveAs(saved.to_owned())),
+                ],
+            );
+            assert!(!outcome.failed, "{}", outcome.stderr);
+            assert_eq!(
+                Properties::of(&app).preset(),
+                saved,
+                "{lane}: saved and selected"
+            );
+            call(&mut app, Call::SetPreset(shipped.clone()));
+            assert_eq!(Properties::of(&app).preset(), shipped, "{lane}");
+            call(&mut app, Call::SetPreset(saved.to_owned()));
+            let status = call(&mut app, Call::GetPreset);
+            assert_eq!(preset_of_status(&status).unwrap(), saved, "{lane}");
+            assert_eq!(Properties::of(&app).preset(), saved, "{lane}");
+        }
+        assert_eq!(
+            Properties::of(&app).presets,
+            [Some("My Music".to_owned()), Some("My Voice".to_owned())]
+        );
+    }
+
+    #[test]
     fn toggle_power_answers_with_the_state_the_toggle_left() {
         let mut app = App::headless_for_tests();
         let before = app.state.power;

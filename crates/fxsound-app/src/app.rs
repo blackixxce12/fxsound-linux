@@ -19,7 +19,7 @@ use fxsound_core::{
     messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio},
     scale,
 };
-use fxsound_preset::PresetStore;
+use fxsound_preset::{InputPresetStore, PresetFile, PresetStore, Store, input::InputPreset};
 use fxsound_ui::{
     AssetCache, Palette, UiAction, UiState,
     dialogs::{ExportState, ImportState, ImportSummary, OverwriteChoice, PresetsAction},
@@ -197,6 +197,105 @@ pub(crate) fn apply_microphone_settings(
     };
 }
 
+/// A lane's controls as the kind of preset file that lane keeps: a `.fac` for the speakers, a TOML
+/// voice preset for the microphone.
+///
+/// Every path that writes a preset — Save, Save New Preset, the autosave on switching away and the
+/// one on the way out — builds one of these from the lane it is about and hands it to that lane's
+/// store ([`App::autosave_lane_preset`], [`App::save_lane_preset`]). 0.3.0 built a `.fac` from the
+/// window whichever lane it showed, so saving on a microphone filed the voice preset's equalizer
+/// as a music preset named after it, in the speakers' store; with the kind carried in the type,
+/// a voice preset has no route into the `.fac` store at all.
+#[derive(Debug, Clone, PartialEq)]
+enum LanePreset {
+    Music(Preset),
+    Voice(InputPreset),
+}
+
+impl LanePreset {
+    fn name(&self) -> &str {
+        match self {
+            Self::Music(preset) => &preset.name,
+            Self::Voice(preset) => &preset.name,
+        }
+    }
+
+    fn direction(&self) -> DeviceDirection {
+        match self {
+            Self::Music(_) => DeviceDirection::Output,
+            Self::Voice(_) => DeviceDirection::Input,
+        }
+    }
+}
+
+/// What the controller asks of a lane's preset store that does not depend on the file format:
+/// the list, the unsaved-changes shadow, delete, rename, import and export. Both stores are a
+/// [`Store`], so both answer through the one implementation below; loading, applying and saving
+/// a preset do depend on the format and go through [`LanePreset`] instead.
+///
+/// Errors are the store's own message: they reach the log, and the window says only which preset
+/// the operation failed on.
+trait LaneStore {
+    fn entries(&self) -> &[fxsound_preset::PresetEntry];
+    /// The extension the store's files carry, without the dot — what Import looks for.
+    fn extension(&self) -> &'static str;
+    /// The file `name` is kept under, and so the one an export of it writes.
+    fn file_name(&self, name: &str) -> Option<String>;
+    fn rescan(&mut self);
+    fn clear_autosave(&mut self, name: &str);
+    fn delete(&mut self, name: &str) -> Result<(), String>;
+    /// Save the preset under `new` and remove `old`, as the original does through its preset list
+    /// rather than a filesystem rename (`FxController.cpp:1244-1276`). What moves is the saved
+    /// file; an autosave under `old` goes with `old`. A failure to remove `old` once the copy
+    /// exists is logged, not returned: the rename has happened.
+    fn rename(&mut self, old: &str, new: &str) -> Result<(), String>;
+    fn import(&mut self, source: &Path) -> Result<String, String>;
+    fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, String>;
+}
+
+impl<F: PresetFile> LaneStore for Store<F> {
+    fn entries(&self) -> &[fxsound_preset::PresetEntry] {
+        Store::entries(self)
+    }
+
+    fn extension(&self) -> &'static str {
+        F::EXTENSION
+    }
+
+    fn file_name(&self, name: &str) -> Option<String> {
+        Store::<F>::file_name(name).ok()
+    }
+
+    fn rescan(&mut self) {
+        Store::rescan(self);
+    }
+
+    fn clear_autosave(&mut self, name: &str) {
+        Store::clear_autosave(self, name);
+    }
+
+    fn delete(&mut self, name: &str) -> Result<(), String> {
+        Store::delete(self, name).map_err(|err| err.to_string())
+    }
+
+    fn rename(&mut self, old: &str, new: &str) -> Result<(), String> {
+        let preset = self.load_saved(old).map_err(|err| err.to_string())?;
+        self.save_as(&preset, new).map_err(|err| err.to_string())?;
+        if let Err(err) = Store::delete(self, old) {
+            log::warn!("could not remove the old preset {old}: {err}");
+        }
+        Ok(())
+    }
+
+    fn import(&mut self, source: &Path) -> Result<String, String> {
+        Store::import(self, source).map_err(|err| err.to_string())
+    }
+
+    fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, String> {
+        Store::export(self, name, dir).map_err(|err| err.to_string())
+    }
+}
+
 /// A `--output` or `--input` that arrived before the device list did (see
 /// [`App::select_device_when_listed`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,12 +325,12 @@ pub struct App {
     /// Not part of the snapshot, because the audio thread cannot act on it in place: a chain is
     /// built, not set, and the building happens on its main loop.
     input_chain: String,
-    /// The shipped voice presets, read once at start-up.
+    /// The microphone's presets: the shipped voice set, read-only, and the user's own under
+    /// `presets/Input/`, with their unsaved edits under `Input/AutoSave/` (0.4.0 design §1.4).
     ///
-    /// A separate list from `presets`, not a second source for the same one: a `.fac` and a voice
-    /// preset describe different chains, and the only thing they share is that exactly one of them
-    /// is selected at a time — whichever direction is live.
-    input_presets: Vec<fxsound_preset::input::InputPreset>,
+    /// A separate store from `presets`, not a second source for the same one: a `.fac` and a voice
+    /// preset describe different chains, and a name can mean one thing in each.
+    voice_presets: InputPresetStore,
     /// Whether a device list has ever arrived from the audio thread.
     ///
     /// The control socket answers as soon as the GUI thread is up, which is before PipeWire has
@@ -261,8 +360,14 @@ pub struct App {
     settings: Settings,
     /// Factory and user presets.
     presets: PresetStore,
-    /// The preset as loaded, so "undo changes" has something to go back to.
+    /// The speakers' preset as loaded, so "undo changes" has something to go back to and a save
+    /// keeps what the window has no control for.
     loaded_preset: Option<Preset>,
+    /// The microphone's voice preset as loaded, for the same two reasons: a voice preset saved
+    /// from the window keeps its gate, compressor, de-esser, denoiser and chain, none of which the
+    /// window can move. Kept per lane, as `loaded_preset` is, so either lane can be saved or
+    /// stashed whichever one the window shows.
+    loaded_voice: Option<InputPreset>,
     /// The audio engine, or `None` when PipeWire could not be reached.
     engine: Option<AudioLink>,
     /// Rasterised artwork.
@@ -308,11 +413,13 @@ impl App {
         let settings = Settings::load();
         let mut presets = PresetStore::with_default_dirs();
         presets.rescan();
+        let mut voice_presets = InputPresetStore::with_default_dirs();
+        voice_presets.rescan();
         let notifier = Notifier::new(settings.hide_notifications);
         Self::start(
             settings,
             presets,
-            fxsound_preset::input::InputPreset::load_shipped(),
+            voice_presets,
             engine.map(AudioLink::Engine),
             notifier,
             true,
@@ -325,7 +432,7 @@ impl App {
     fn start(
         settings: Settings,
         presets: PresetStore,
-        input_presets: Vec<fxsound_preset::input::InputPreset>,
+        voice_presets: InputPresetStore,
         engine: Option<AudioLink>,
         notifier: Notifier,
         persist: bool,
@@ -347,7 +454,7 @@ impl App {
             input_voicing: PresetVoicing::of(&unvoiced_input_params()),
             echo_cancel_detail: String::new(),
             input_chain: fxsound_preset::input::DEFAULT_CHAIN.to_owned(),
-            input_presets,
+            voice_presets,
             devices_seen: false,
             audio_status: [fxsound_core::AudioStatus::default(); 2],
             attached: [None, None],
@@ -357,6 +464,7 @@ impl App {
             settings,
             presets,
             loaded_preset: None,
+            loaded_voice: None,
             engine,
             assets: AssetCache::new(),
             settings_dirty: false,
@@ -386,13 +494,14 @@ impl App {
 
     /// An app started the way [`App::new`] starts one — from `settings`, these presets and these
     /// voice presets — against `engine`, a stand-in that records what it is told. Nothing is
-    /// written to disk and nothing reaches the desktop's notifications.
+    /// written to the settings file and nothing reaches the desktop's notifications; the stores
+    /// write where they were pointed.
     #[doc(hidden)]
     #[must_use]
     pub fn start_for_tests(
         settings: Settings,
         presets: PresetStore,
-        voices: Vec<fxsound_preset::input::InputPreset>,
+        voices: InputPresetStore,
         engine: &FakeEngine,
     ) -> Self {
         Self::start(
@@ -775,9 +884,15 @@ impl App {
 
             UiAction::SetMasterGain(db) => {
                 self.state.master_gain_db = db.clamp(-20.0, 20.0);
-                if self.state.direction == DeviceDirection::Output {
-                    self.settings.master_gain = self.state.master_gain_db;
-                    self.settings_dirty = true;
+                match self.state.direction {
+                    // The speakers' master gain is a setting over every `.fac`, as the original's.
+                    DeviceDirection::Output => {
+                        self.settings.master_gain = self.state.master_gain_db;
+                        self.settings_dirty = true;
+                    }
+                    // On a voice it is the preset's own makeup, which a save writes into the
+                    // preset: moving it is an edit to the preset like an equalizer move.
+                    DeviceDirection::Input => self.mark_preset_modified(),
                 }
                 self.sync_params_from_state();
             }
@@ -821,42 +936,45 @@ impl App {
         }
     }
 
-    /// Rebuild the list the picker shows, from whichever chain is live.
+    /// Rebuild the list the picker shows, from the edit direction's store.
     ///
     /// The two sets are never merged. A music preset on a microphone is wrong by construction, and
-    /// a list mixing both would make picking the wrong one a normal thing to do.
+    /// a list mixing both would make picking the wrong one a normal thing to do. Both lists come
+    /// from a store the same way, so a voice preset is factory or the user's, and carries the
+    /// unsaved-changes marker of an autosave, exactly as a `.fac` does.
     fn refresh_preset_list(&mut self) {
-        self.state.presets = match self.state.direction {
-            DeviceDirection::Output => self
-                .presets
-                .entries()
-                .iter()
-                .map(|entry| PresetEntry {
-                    name: entry.name.clone(),
-                    factory: entry.source == fxsound_preset::PresetSource::Factory,
-                    modified: entry.modified,
-                })
-                .collect(),
-            // Voice presets are read-only for now: they ship with the application, nothing writes
-            // one, and `modified` is therefore always false. Saving over one is the next piece of
-            // work, and until it exists the interface should not imply it is possible.
-            DeviceDirection::Input => self
-                .input_presets
-                .iter()
-                .map(|preset| PresetEntry {
-                    name: preset.name.clone(),
-                    factory: true,
-                    modified: false,
-                })
-                .collect(),
-        };
+        self.state.presets = self
+            .store(self.state.direction)
+            .entries()
+            .iter()
+            .map(|entry| PresetEntry {
+                name: entry.name.clone(),
+                factory: entry.source == fxsound_preset::PresetSource::Factory,
+                modified: entry.modified,
+            })
+            .collect();
+    }
+
+    /// `lane`'s preset store: the `.fac` set for the speakers, the voice set for the microphone.
+    fn store(&self, lane: DeviceDirection) -> &dyn LaneStore {
+        match lane {
+            DeviceDirection::Output => &self.presets,
+            DeviceDirection::Input => &self.voice_presets,
+        }
+    }
+
+    fn store_mut(&mut self, lane: DeviceDirection) -> &mut dyn LaneStore {
+        match lane {
+            DeviceDirection::Output => &mut self.presets,
+            DeviceDirection::Input => &mut self.voice_presets,
+        }
     }
 
     /// Put a voice preset's settings into the interface and publish them.
     ///
     /// The four stage switches live in [`UiState`] rather than in the mapping precisely so that
     /// this can move them: without it a preset's gate is a number nothing reads.
-    fn apply_input_preset(&mut self, preset: &fxsound_preset::input::InputPreset) {
+    fn apply_input_preset(&mut self, preset: &InputPreset) {
         let params = preset.to_params();
         self.state.eq_on = params.eq_on;
         self.state.eq_bands = params
@@ -892,52 +1010,48 @@ impl App {
         }
     }
 
+    /// Select the edit direction's preset `index`: load it from that lane's store — its autosave
+    /// when it has unsaved edits — and put it in the window and the lane's snapshot.
+    ///
+    /// The same steps on both lanes, as the original's `setPreset` (`FxController.cpp:1048-1104`):
+    /// switching away from unsaved edits stashes them first, so nothing the user did is silently
+    /// lost; the device in use remembers the preset; and the lane's filter history is cleared,
+    /// since a new band layout makes the old one meaningless.
     fn select_preset(&mut self, index: usize) {
         let Some(entry) = self.state.presets.get(index) else {
             return;
         };
         let name = entry.name.clone();
+        let lane = self.state.direction;
 
-        // A microphone's presets are a different set in a different format, and they are read-only:
-        // none of the autosave, overwrite or modified-marker machinery below applies to one yet.
-        if self.state.direction == DeviceDirection::Input {
-            let Some(preset) = self
-                .input_presets
-                .iter()
-                .find(|preset| preset.name == name)
-                .cloned()
-            else {
-                return;
-            };
-            self.apply_input_preset(&preset);
-            self.state.selected_preset = Some(index);
-            self.notify(Message::preset_selected(&name));
-            // Recorded against the lane rather than the edit direction, which start-up has not
-            // entered yet when it loads the lane off screen.
-            self.settings
-                .set_preset_for_direction(DeviceDirection::Input, &name);
-            self.settings_dirty = true;
-            if let Some(engine) = &self.engine {
-                engine.send_event(DeviceDirection::Input, DspEvent::ResetFilterState);
-            }
-            return;
-        }
-
-        // Switching away from unsaved edits stashes them, exactly as the original does
-        // (`FxController.cpp:1061-1065`), so nothing the user did is silently lost.
         if let Some(current) = self.state.preset()
             && current.modified
             && current.name != name
             && let Some(preset) = self.current_preset_snapshot()
-            && let Err(err) = self.presets.autosave(&preset)
         {
-            log::warn!("could not autosave {}: {err}", preset.name);
+            self.autosave_lane_preset(&preset);
         }
 
-        match self.presets.load(&name) {
-            Ok((preset, from_autosave)) => {
-                self.apply_preset(&preset);
-                self.loaded_preset = Some(preset);
+        let loaded = match lane {
+            DeviceDirection::Output => self.presets.load(&name).map_or_else(
+                |err| Err(err.to_string()),
+                |(preset, from_autosave)| {
+                    self.apply_preset(&preset);
+                    self.loaded_preset = Some(preset);
+                    Ok(from_autosave)
+                },
+            ),
+            DeviceDirection::Input => self.voice_presets.load(&name).map_or_else(
+                |err| Err(err.to_string()),
+                |(preset, from_autosave)| {
+                    self.apply_input_preset(&preset);
+                    self.loaded_voice = Some(preset);
+                    Ok(from_autosave)
+                },
+            ),
+        };
+        match loaded {
+            Ok(from_autosave) => {
                 self.state.selected_preset = Some(index);
                 if let Some(entry) = self.state.presets.get_mut(index) {
                     entry.modified = from_autosave;
@@ -945,13 +1059,12 @@ impl App {
                 // `"Preset: "` + name on every change (`FxController.cpp:1101`).
                 self.notify(Message::preset_selected(&name));
                 self.remember_preset_for_selected_device(&name);
-                self.settings
-                    .set_preset_for_direction(DeviceDirection::Output, &name);
+                // Recorded against the lane rather than through the edit direction: start-up
+                // loads the lane off screen through here too, and the two are the same by now.
+                self.settings.set_preset_for_direction(lane, &name);
                 self.settings_dirty = true;
-                // A new band layout means the old filter history is meaningless. A `.fac` preset
-                // is the music chain's.
                 if let Some(engine) = &self.engine {
-                    engine.send_event(DeviceDirection::Output, DspEvent::ResetFilterState);
+                    engine.send_event(lane, DspEvent::ResetFilterState);
                 }
             }
             Err(err) => {
@@ -999,15 +1112,55 @@ impl App {
         self.sync_params_from_state();
     }
 
-    /// The current UI state expressed as a preset, ready to save.
-    fn current_preset_snapshot(&self) -> Option<Preset> {
-        let name = self.state.preset()?.name.clone();
-        Some(self.music_preset_from(
-            name,
-            &self.state.effects,
-            &self.state.eq_bands,
-            self.state.eq_on,
-        ))
+    /// The edit direction's controls as that lane's kind of preset, under the selected preset's
+    /// name, ready to save: a `.fac` on the speakers, a TOML voice preset on the microphone.
+    /// `None` with no preset selected.
+    fn current_preset_snapshot(&self) -> Option<LanePreset> {
+        self.lane_snapshot(self.state.direction)
+            .map(|(preset, _)| preset)
+    }
+
+    /// `lane`'s controls as that lane's kind of preset, and whether they carry unsaved changes —
+    /// read wherever the controls are: in [`UiState`] while the window edits the lane, in the
+    /// lane's slot of [`App::lane_controls`] while it edits the other one.
+    ///
+    /// Each lane's controls become only its own kind of file. A microphone's equalizer filed as a
+    /// `.fac` under the voice preset's name — 0.3.0's save and autosave on a microphone — is the
+    /// voice lane leaking into the music store, and can overwrite the autosave of a music preset
+    /// that shares the name.
+    fn lane_snapshot(&self, lane: DeviceDirection) -> Option<(LanePreset, bool)> {
+        let (entry, effects, eq_bands, eq_on, gain_db) = if lane == self.state.direction {
+            let state = &self.state;
+            (
+                state.preset()?,
+                &state.effects,
+                state.eq_bands.as_slice(),
+                state.eq_on,
+                state.master_gain_db,
+            )
+        } else {
+            let controls = self.lane_controls[lane_index(lane)].as_ref()?;
+            let entry = controls
+                .selected_preset
+                .and_then(|i| controls.presets.get(i))?;
+            (
+                entry,
+                &controls.effects,
+                controls.eq_bands.as_slice(),
+                controls.eq_on,
+                controls.master_gain_db,
+            )
+        };
+        let name = entry.name.clone();
+        let preset = match lane {
+            DeviceDirection::Output => {
+                LanePreset::Music(self.music_preset_from(name, effects, eq_bands, eq_on))
+            }
+            DeviceDirection::Input => {
+                LanePreset::Voice(self.voice_preset_from(name, eq_bands, eq_on, gain_db)?)
+            }
+        };
+        Some((preset, entry.modified))
     }
 
     /// A music lane's controls written over the `.fac` they were loaded from, under `name`.
@@ -1031,33 +1184,75 @@ impl App {
         preset
     }
 
-    /// The speakers' unsaved edits as a `.fac`, ready for the music autosave — read from the lane's
-    /// own controls wherever they are: in [`UiState`] while the window edits the speakers, in the
-    /// lane's slot of [`App::lane_controls`] while it edits the microphone. `None` when the
-    /// selected preset carries no unsaved changes.
+    /// A voice lane's controls written over the voice preset they were loaded from, under `name`.
     ///
-    /// Never built from the microphone's controls: a voice preset's equalizer filed as a `.fac`
-    /// under the voice preset's name is the voice lane leaking into the music store, and can
-    /// overwrite the autosave of a music preset that shares the name.
-    fn unsaved_music_preset(&self) -> Option<Preset> {
-        let (entry, effects, eq_bands, eq_on) = if self.state.direction == DeviceDirection::Output {
-            let state = &self.state;
-            (
-                state.preset()?,
-                &state.effects,
-                &state.eq_bands,
-                state.eq_on,
-            )
-        } else {
-            let controls = self.lane_controls[lane_index(DeviceDirection::Output)].as_ref()?;
-            let entry = controls
-                .selected_preset
-                .and_then(|i| controls.presets.get(i))?;
-            (entry, &controls.effects, &controls.eq_bands, controls.eq_on)
+    /// Only what the window can move on a voice is written: the equalizer — its switch, its
+    /// ladder and its curve — and the output gain, which is the chain's makeup. Everything else
+    /// is the preset's and is kept as loaded: the high-pass, the gate, compressor and de-esser
+    /// tables, the denoiser, the de-reverb and the chain. In particular a noise-suppression level
+    /// pinned in Settings is a setting over every preset, not part of this one, so it is never
+    /// written into the file (the window's denoiser switch shows the level in force, which is why
+    /// it is not read here). `None` when no voice preset was loaded to write over: a preset is
+    /// never made up from defaults.
+    fn voice_preset_from(
+        &self,
+        name: String,
+        eq_bands: &[EqBand],
+        eq_on: bool,
+        makeup_db: f32,
+    ) -> Option<InputPreset> {
+        let mut preset = self.loaded_voice.clone()?;
+        preset.name = name;
+        preset.eq.centers_hz = eq_bands.iter().map(|band| band.center_hz).collect();
+        preset.eq.gains_db = eq_bands.iter().map(|band| band.boost_db).collect();
+        preset.eq.enabled = eq_on;
+        preset.makeup_db = makeup_db;
+        Some(preset)
+    }
+
+    /// `lane`'s unsaved edits as that lane's kind of preset, for the autosave on the way out.
+    /// `None` when its selected preset carries no unsaved changes.
+    fn unsaved_lane_preset(&self, lane: DeviceDirection) -> Option<LanePreset> {
+        self.lane_snapshot(lane)
+            .and_then(|(preset, modified)| modified.then_some(preset))
+    }
+
+    /// Stash unsaved edits in their own lane's store, so they survive a preset switch or a
+    /// restart. A failure is logged: the edits are still in the window, and nothing the user
+    /// asked for has failed.
+    fn autosave_lane_preset(&self, preset: &LanePreset) {
+        let result = match preset {
+            LanePreset::Music(preset) => self.presets.autosave(preset).map_err(|e| e.to_string()),
+            LanePreset::Voice(preset) => self
+                .voice_presets
+                .autosave(preset)
+                .map_err(|e| e.to_string()),
         };
-        entry
-            .modified
-            .then(|| self.music_preset_from(entry.name.clone(), effects, eq_bands, eq_on))
+        if let Err(err) = result {
+            log::warn!("could not autosave {}: {err}", preset.name());
+        }
+    }
+
+    /// Save `preset` as a user preset called `name` in its own lane's store — the overwrite when
+    /// the name is taken — and make it what that lane's undo goes back to.
+    fn save_lane_preset(&mut self, preset: LanePreset, name: &str) -> Result<(), String> {
+        match preset {
+            LanePreset::Music(mut preset) => {
+                self.presets
+                    .save_as(&preset, name)
+                    .map_err(|e| e.to_string())?;
+                name.clone_into(&mut preset.name);
+                self.loaded_preset = Some(preset);
+            }
+            LanePreset::Voice(mut preset) => {
+                self.voice_presets
+                    .save_as(&preset, name)
+                    .map_err(|e| e.to_string())?;
+                name.clone_into(&mut preset.name);
+                self.loaded_voice = Some(preset);
+            }
+        }
+        Ok(())
     }
 
     fn mark_preset_modified(&mut self) {
@@ -1068,20 +1263,24 @@ impl App {
         }
     }
 
+    /// Save the edit direction's controls: over the selected preset (`None`), or as a new user
+    /// preset called `new_name` — into that lane's store, as that lane's kind of file.
     fn save_preset(&mut self, new_name: Option<String>) {
-        let Some(mut preset) = self.current_preset_snapshot() else {
+        let Some(preset) = self.current_preset_snapshot() else {
             return;
         };
+        let lane = preset.direction();
         let is_new = new_name.is_some();
-        let name = new_name.unwrap_or_else(|| preset.name.clone());
-        preset.name = name.clone();
+        let name = new_name.unwrap_or_else(|| preset.name().to_owned());
 
-        match self.presets.save_as(&preset, &name) {
-            Ok(_) => {
-                self.loaded_preset = Some(preset);
+        match self.save_lane_preset(preset, &name) {
+            Ok(()) => {
                 self.refresh_preset_list();
-                self.state.selected_preset = self.presets.index_of(&name);
-                self.settings.set_selected_preset(&name);
+                self.state.selected_preset = self.state.presets.iter().position(|p| p.name == name);
+                self.settings.set_preset_for_direction(lane, &name);
+                // The selection moved to what was saved, so that is what the device in use brings
+                // back next time, as it would had the preset been picked.
+                self.remember_preset_for_selected_device(&name);
                 self.settings_dirty = true;
                 // `FxController.cpp:1221` / `:1234`, the same text on the desktop and in the strip.
                 let message = if is_new {
@@ -1100,6 +1299,8 @@ impl App {
         }
     }
 
+    /// Drop the selected preset's unsaved edits and load it as saved, on either lane
+    /// (`FxController.cpp:1317-1332`).
     fn undo_preset_changes(&mut self) {
         let Some(index) = self.state.selected_preset else {
             return;
@@ -1107,10 +1308,11 @@ impl App {
         let Some(name) = self.state.presets.get(index).map(|p| p.name.clone()) else {
             return;
         };
-        self.presets.clear_autosave(&name);
+        self.store_mut(self.state.direction).clear_autosave(&name);
         self.select_preset(index);
     }
 
+    /// Delete the selected user preset from the edit direction's store; a factory preset refuses.
     fn delete_preset(&mut self) {
         let Some(index) = self.state.selected_preset else {
             return;
@@ -1123,7 +1325,7 @@ impl App {
             return;
         }
         let name = entry.name.clone();
-        match self.presets.delete(&name) {
+        match self.store_mut(self.state.direction).delete(&name) {
             Ok(()) => {
                 self.refresh_preset_list();
                 let next = index.min(self.state.presets.len().saturating_sub(1));
@@ -1313,7 +1515,8 @@ impl App {
         //
         // A preset picked while the device waited for the list is the later word and wins. It
         // was selected when it was picked, before this device was, so what is left to do is what
-        // picking it now would add: an output device remembers the preset it is used with.
+        // picking it now would add: the device remembers the preset it is used with — a
+        // microphone its voice preset, as a speaker its `.fac`.
         let picked = picked.and_then(|preset| {
             let at = self.state.presets.iter().position(|e| e.name == preset)?;
             Some((at, preset))
@@ -1321,7 +1524,7 @@ impl App {
         if let Some((at, preset)) = picked {
             if self.state.selected_preset != Some(at) {
                 self.select_preset(at);
-            } else if direction == DeviceDirection::Output {
+            } else {
                 self.remember_preset_for_selected_device(&preset);
             }
         } else if let Some(preset) = remembered
@@ -1373,13 +1576,24 @@ impl App {
             }
             return false;
         }
+        self.settings.set_edit_direction(direction);
+        self.settings_dirty = true;
+        self.show_lane(direction);
+        true
+    }
+
+    /// Put `direction`'s controls in the window and park the other lane's — the part of switching
+    /// the edit direction the window sees, without recording the switch. [`App::in_lane`] uses it
+    /// alone to act on the lane off screen and come back.
+    fn show_lane(&mut self, direction: DeviceDirection) {
+        if direction == self.state.direction {
+            return;
+        }
         // Stored before the other lane is entered, so that whatever entering it asks about the lane
         // being left finds that lane's own controls.
         self.lane_controls[lane_index(self.state.direction)] =
             Some(LaneControls::take(&self.state));
         self.state.direction = direction;
-        self.settings.set_edit_direction(direction);
-        self.settings_dirty = true;
 
         match self.lane_controls[lane_index(direction)].take() {
             Some(controls) => {
@@ -1403,7 +1617,24 @@ impl App {
             }
             None => self.enter_lane_for_the_first_time(direction),
         }
-        true
+    }
+
+    /// Do `act` with `lane`'s controls in the window, whichever lane the window is editing, and
+    /// leave the window as it was: for what acts on both lanes' presets at once, such as Reset
+    /// Presets in Settings, where the lane off screen must change in the engine now rather than
+    /// the next time it is looked at. The edit direction is not touched, and nothing `act` says
+    /// about the lane off screen reaches the desktop.
+    fn in_lane(&mut self, lane: DeviceDirection, act: impl FnOnce(&mut Self)) {
+        let edit = self.state.direction;
+        if lane == edit {
+            act(self);
+            return;
+        }
+        let armed = std::mem::replace(&mut self.notifications_armed, false);
+        self.show_lane(lane);
+        act(self);
+        self.show_lane(edit);
+        self.notifications_armed = armed;
     }
 
     /// Show a lane the window has not edited yet this session.
@@ -1648,13 +1879,11 @@ impl App {
     }
 
     /// Whether `lane`'s preset list has one called `name` — the `.fac` store for the speakers,
-    /// the voice presets for the microphone — whichever lane the window is showing.
+    /// the voice store, the user's own voice presets included, for the microphone — whichever
+    /// lane the window is showing.
     #[must_use]
     pub fn lane_has_preset(&self, lane: DeviceDirection, name: &str) -> bool {
-        match lane {
-            DeviceDirection::Output => self.presets.entries().iter().any(|e| e.name == name),
-            DeviceDirection::Input => self.input_presets.iter().any(|p| p.name == name),
-        }
+        self.store(lane).entries().iter().any(|e| e.name == name)
     }
 
     /// Pin the microphone's noise suppression, or hand it back to the voice preset — the Settings
@@ -1677,16 +1906,23 @@ impl App {
 
     /// Point a headless app at these preset directories and these voice presets, and show the
     /// edit direction's list — the command-line tests' way to a preset list without the user's.
+    ///
+    /// The voices are written as the factory set into `VoiceFactory/` under `user_dir`, and the
+    /// user's voice presets go to `Input/` under it, the layout the real stores use.
     #[doc(hidden)]
     pub fn use_presets_for_tests(
         &mut self,
         factory_dirs: Vec<PathBuf>,
         user_dir: PathBuf,
-        voices: Vec<fxsound_preset::input::InputPreset>,
+        voices: Vec<InputPreset>,
     ) {
-        self.presets = PresetStore::with_dirs(factory_dirs, user_dir);
+        self.presets = PresetStore::with_dirs(factory_dirs, user_dir.clone());
         self.presets.rescan();
-        self.input_presets = voices;
+        self.voice_presets = voice_store_for_tests(
+            &voices,
+            &user_dir.join("VoiceFactory"),
+            user_dir.join("Input"),
+        );
         self.refresh_preset_list();
         self.state.selected_preset = None;
     }
@@ -1724,7 +1960,10 @@ impl App {
             input_voicing: PresetVoicing::of(&unvoiced_input_params()),
             echo_cancel_detail: String::new(),
             input_chain: fxsound_preset::input::DEFAULT_CHAIN.to_owned(),
-            input_presets: Vec::new(),
+            voice_presets: InputPresetStore::with_dirs(
+                Vec::new(),
+                std::env::temp_dir().join("fxsound-app-test").join("Input"),
+            ),
             devices_seen: false,
             audio_status: [fxsound_core::AudioStatus::default(); 2],
             attached: [None, None],
@@ -1737,6 +1976,7 @@ impl App {
                 std::env::temp_dir().join("fxsound-app-test"),
             ),
             loaded_preset: None,
+            loaded_voice: None,
             engine: None,
             assets: AssetCache::new(),
             settings_dirty: false,
@@ -1752,15 +1992,15 @@ impl App {
 
     /// Persist settings and stash unsaved preset edits. Called on the way out.
     ///
-    /// The speakers' unsaved edits are stashed whichever lane the window is editing, read from that
-    /// lane's own controls, so a restart brings them back as a preset switch would. The
-    /// microphone's are not: voice presets have no autosave store in the app yet, and a voice
-    /// preset's controls never go into the music store.
+    /// Each lane's unsaved edits are stashed whichever lane the window is editing, read from that
+    /// lane's own controls and filed in that lane's own store — the speakers' as a `.fac` autosave,
+    /// the microphone's as a voice one under `Input/AutoSave/` — so a restart brings them back as a
+    /// preset switch would.
     pub fn shutdown(&mut self) {
-        if let Some(preset) = self.unsaved_music_preset()
-            && let Err(err) = self.presets.autosave(&preset)
-        {
-            log::warn!("could not autosave on exit: {err}");
+        for lane in DeviceDirection::ALL {
+            if let Some(preset) = self.unsaved_lane_preset(lane) {
+                self.autosave_lane_preset(&preset);
+            }
         }
         if self.persist
             && let Err(err) = self.settings.save()
@@ -1887,14 +2127,18 @@ impl App {
         preset_name_available(&self.state.presets, name)
     }
 
-    /// `FxController::renamePreset` — the menu's Rename Preset item.
+    /// `FxController::renamePreset` — the menu's Rename Preset item, on the edit direction's
+    /// store.
     ///
     /// User presets only; a factory preset refuses with a notification, as deleting one does.
     /// Implemented as save-under-the-new-name then delete-the-old, which is what the original does
     /// through its preset list rather than a filesystem rename. The saved file is what gets
     /// renamed, not unsaved edits: the menu only offers Rename while the preset is unmodified
     /// (`docs/spec/03-controls.md` §8.5), and a caller that ignores that keeps its edits in the
-    /// autosave under the *old* name, which `PresetStore::delete` then removes.
+    /// autosave under the *old* name, which the store's delete then removes.
+    ///
+    /// Everything that named the preset follows it: the lane's saved preset and every device that
+    /// remembers it, so plugging one back in does not look for a name that no longer exists.
     pub fn rename_preset(&mut self, new_name: &str) {
         let new_name = new_name.trim();
         let Some(entry) = self.state.preset() else {
@@ -1914,32 +2158,34 @@ impl App {
             return;
         }
 
-        let (mut preset, _) = match self.presets.load(&old) {
-            Ok(loaded) => loaded,
-            Err(err) => {
-                log::warn!("could not load preset {old} to rename it: {err}");
-                self.state
-                    .notify(tr_args("Could not rename %s", &[old.as_str()]));
-                return;
-            }
-        };
-        preset.name = new_name.to_owned();
-        if let Err(err) = self.presets.save_as(&preset, new_name) {
-            log::warn!("could not save preset {new_name}: {err}");
+        let lane = self.state.direction;
+        if let Err(err) = self.store_mut(lane).rename(&old, new_name) {
+            log::warn!("could not rename preset {old} to {new_name}: {err}");
             self.state
                 .notify(tr_args("Could not rename %s", &[old.as_str()]));
             return;
         }
-        if let Err(err) = self.presets.delete(&old) {
-            // The copy under the new name exists, so the rename has happened; only the cleanup
-            // failed. Say so and carry on with the new name selected.
-            log::warn!("could not remove the old preset {old}: {err}");
-        }
 
-        self.loaded_preset = Some(preset);
+        match lane {
+            DeviceDirection::Output => {
+                if let Some(preset) = &mut self.loaded_preset {
+                    new_name.clone_into(&mut preset.name);
+                }
+            }
+            DeviceDirection::Input => {
+                if let Some(preset) = &mut self.loaded_voice {
+                    new_name.clone_into(&mut preset.name);
+                }
+            }
+        }
         self.refresh_preset_list();
-        self.state.selected_preset = self.presets.index_of(new_name);
-        self.settings.set_selected_preset(new_name);
+        self.state.selected_preset = self.state.presets.iter().position(|p| p.name == new_name);
+        self.settings.set_preset_for_direction(lane, new_name);
+        for config in &mut self.settings.device_configs {
+            if config.direction == lane && config.preset == old {
+                new_name.clone_into(&mut config.preset);
+            }
+        }
         self.settings_dirty = true;
         self.state
             .notify(tr_args("Renamed %s to %s", &[old.as_str(), new_name]));
@@ -1948,22 +2194,25 @@ impl App {
     }
 
     /// `FxController::importPresets()` (`FxController.cpp:1419-1458`) over the non-recursive
-    /// `*.fac` glob of `FxPresetImportDialog.cpp:255-278`.
+    /// glob of `FxPresetImportDialog.cpp:255-278`, into the edit direction's store: `*.fac` into
+    /// the speakers' presets, `*.toml` voice presets into the microphone's.
     ///
-    /// Returns `None` when the folder holds no preset files at all — the caller shows
+    /// Returns `None` when the folder holds no preset files of that kind at all — the caller shows
     /// `"Preset files not found in the selected folder."` and leaves the window open. Otherwise
     /// every file whose name is already taken (case-insensitively) is skipped and the rest are
-    /// copied into the user preset directory.
+    /// copied into the lane's user preset directory.
     pub fn import_presets(&mut self, folder: &Path) -> Option<ImportSummary> {
+        let lane = self.state.direction;
+        let extension = self.store(lane).extension();
         let mut files: Vec<PathBuf> = match std::fs::read_dir(folder) {
             Ok(entries) => entries
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())
                 .filter(|path| {
                     path.is_file()
-                        && path.extension().is_some_and(|ext| {
-                            ext.eq_ignore_ascii_case(fxsound_ui::dialogs::presets::PRESET_EXTENSION)
-                        })
+                        && path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
                 })
                 .collect(),
             Err(err) => {
@@ -1982,12 +2231,12 @@ impl App {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .map_or_else(|| path.display().to_string(), str::to_owned);
-            // `PresetStore::import` names the preset after the file, so that is the name to check.
+            // `Store::import` names the preset after the file, so that is the name to check.
             if !self.is_preset_name_available(&stem) {
                 summary.skipped.push(stem);
                 continue;
             }
-            match self.presets.import(&path) {
+            match self.store_mut(lane).import(&path) {
                 Ok(name) => summary.imported.push(name),
                 Err(err) => {
                     // Not a duplicate, but the summary has no third column; the log has the reason.
@@ -2115,17 +2364,25 @@ impl App {
         }
     }
 
-    /// The presets among `names` whose file already exists in the export directory.
+    /// The presets among `names` whose file already exists in the export directory — the file the
+    /// edit direction's store will write, asked of the store, so the question comes up for exactly
+    /// the files an export would replace.
     fn export_collisions(&self, names: &[String]) -> Vec<String> {
+        let store = self.store(self.state.direction);
         names
             .iter()
-            .filter(|name| self.export_dir.join(export_file_name(name)).exists())
+            .filter(|name| {
+                store
+                    .file_name(name)
+                    .is_some_and(|file| self.export_dir.join(file).exists())
+            })
             .cloned()
             .collect()
     }
 
-    /// Write `names` into the export directory. Returns how many files were written, which is
-    /// what `FxController::exportPresets()` reduces to a `bool`.
+    /// Write `names`, from the edit direction's store, into the export directory — each as last
+    /// saved. Returns how many files were written, which is what `FxController::exportPresets()`
+    /// reduces to a `bool`.
     fn export_presets(&mut self, names: &[String]) -> usize {
         if let Err(err) = std::fs::create_dir_all(&self.export_dir) {
             log::warn!("could not create {}: {err}", self.export_dir.display());
@@ -2133,8 +2390,9 @@ impl App {
             return 0;
         }
         let mut written = 0;
+        let lane = self.state.direction;
         for name in names {
-            match self.presets.export(name, &self.export_dir) {
+            match self.store(lane).export(name, &self.export_dir) {
                 Ok(_) => written += 1,
                 Err(err) => {
                     log::warn!("could not export {name}: {err}");
@@ -2155,7 +2413,7 @@ impl App {
         let Some((name, modified)) = selected else {
             return;
         };
-        self.state.selected_preset = self.presets.index_of(&name);
+        self.state.selected_preset = self.state.presets.iter().position(|p| p.name == name);
         if modified
             && let Some(index) = self.state.selected_preset
             && let Some(entry) = self.state.presets.get_mut(index)
@@ -2163,6 +2421,34 @@ impl App {
             entry.modified = true;
         }
     }
+}
+
+/// A voice store whose factory set is `voices`, written into `factory` as the shipped files are,
+/// with the user's voice presets in `user_dir` — for the tests of this crate, which need voice
+/// presets on disk now that selecting one loads it from its store.
+#[doc(hidden)]
+#[must_use]
+pub fn voice_store_for_tests(
+    voices: &[InputPreset],
+    factory: &Path,
+    user_dir: PathBuf,
+) -> InputPresetStore {
+    if let Err(err) = std::fs::create_dir_all(factory) {
+        log::warn!("{}: {err}", factory.display());
+    }
+    for voice in voices {
+        match InputPresetStore::file_name(&voice.name) {
+            Ok(file) => {
+                if let Err(err) = voice.save(&factory.join(file)) {
+                    log::warn!("{}: {err}", voice.name);
+                }
+            }
+            Err(err) => log::warn!("{}: {err}", voice.name),
+        }
+    }
+    let mut store = InputPresetStore::with_dirs(vec![factory.to_path_buf()], user_dir);
+    store.rescan();
+    store
 }
 
 /// The microphone snapshot before any voice preset is chosen: an 80 Hz second-order high-pass, a
@@ -2383,23 +2669,6 @@ fn default_export_dir() -> PathBuf {
         .join("Export")
 }
 
-/// The file `PresetStore::export` writes `name` to, so a collision can be detected before the
-/// overwrite prompt. Mirrors the store's private `sanitise` (`fxsound-preset/src/store.rs:311`):
-/// only the path separators and NUL are replaced.
-fn export_file_name(name: &str) -> String {
-    let stem: String = name
-        .chars()
-        .map(|c| {
-            if matches!(c, '/' | '\\' | '\0') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-    format!("{stem}.{}", fxsound_ui::dialogs::presets::PRESET_EXTENSION)
-}
-
 /// `File::revealToUser()` (`FxPresetExportDialog.cpp:196`): open the export folder in whatever
 /// the desktop uses for folders.
 ///
@@ -2438,34 +2707,108 @@ impl App {
         let mut state = SettingsState::new(self.settings.clone());
         state.version = env!("CARGO_PKG_VERSION").to_owned();
         state.launch_on_startup = autostart_enabled();
-        state.presets = self.state.presets.iter().map(|p| p.name.clone()).collect();
-        // The reset button is enabled iff there is something to lose (`FxSettingsDialog.cpp:210-220`).
-        state.can_reset_presets = self.state.presets.iter().any(|p| !p.factory || p.modified);
-        state.devices = self
-            .settings
+        // The rows' preset combos offer the speakers' presets, whichever lane the window edits:
+        // the list is the Output Device Preference.
+        state.presets = self
+            .presets
+            .entries()
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        // The reset button is enabled iff there is something to lose
+        // (`FxSettingsDialog.cpp:210-220`), on either lane, since the reset covers both.
+        state.can_reset_presets = DeviceDirection::ALL.into_iter().any(|lane| {
+            self.lane_preset(lane).is_some_and(|(_, modified)| modified)
+                || self
+                    .store(lane)
+                    .entries()
+                    .iter()
+                    .any(|p| p.source != fxsound_preset::PresetSource::Factory || p.modified)
+        });
+        state.devices = self.output_device_rows();
+        self.refresh_settings_state(&mut state);
+        state
+    }
+
+    /// The Audio pane's Output Device Preference rows (`FxOutputPreference.cpp:104-181`): the
+    /// speakers' remembered devices, in their rank order, each with its `.fac` preset.
+    ///
+    /// A microphone remembers its voice preset in the same `device_configs`, but it is not an
+    /// output device and its preset is not in the combo's list — offered one, it would remember a
+    /// `.fac` it can never load — so it has no row here. Rows count output devices only; the
+    /// actions that name a row find its entry through [`App::output_config_index`].
+    fn output_device_rows(&self) -> Vec<DevicePriority> {
+        let playing = self
+            .state
+            .device_for(DeviceDirection::Output)
+            .map(|d| d.name.as_str());
+        self.settings
             .device_configs
             .iter()
+            .filter(|config| config.direction == DeviceDirection::Output)
             .map(|config| DevicePriority {
                 id: config.device_id.clone(),
                 name: config.device_name.clone(),
-                preset: self
-                    .state
-                    .presets
-                    .iter()
-                    .position(|p| p.name == config.preset),
-                connected: self
-                    .state
-                    .device()
-                    .is_some_and(|d| d.name == config.device_id),
+                preset: self.presets.index_of(&config.preset),
+                connected: playing == Some(config.device_id.as_str()),
                 present: self
                     .state
                     .devices
                     .iter()
-                    .any(|d| d.name == config.device_id),
+                    .any(|d| d.direction == DeviceDirection::Output && d.name == config.device_id),
             })
-            .collect();
-        self.refresh_settings_state(&mut state);
+            .collect()
+    }
+
+    /// The `device_configs` entry the Output Device Preference's `row` shows.
+    fn output_config_index(&self, row: usize) -> Option<usize> {
+        self.settings
+            .device_configs
+            .iter()
+            .enumerate()
+            .filter(|(_, config)| config.direction == DeviceDirection::Output)
+            .nth(row)
+            .map(|(index, _)| index)
+    }
+
+    /// The device list changed under the open pane: copy it over, rows and all.
+    fn device_configs_changed(&mut self, state: &mut fxsound_ui::dialogs::settings::SettingsState) {
         state
+            .settings
+            .device_configs
+            .clone_from(&self.settings.device_configs);
+        state.devices = self.output_device_rows();
+        self.persist_settings();
+    }
+
+    /// Settings ▸ Reset Presets: every preset of **both** lanes back to what shipped or was last
+    /// saved, by dropping every autosave in both stores.
+    ///
+    /// Each lane's selected preset is then loaded again as saved — the one in the window and the
+    /// one off screen alike, so the engine stops running edits that no longer exist anywhere,
+    /// rather than the lane off screen keeping them until it is next looked at.
+    fn reset_presets(&mut self) {
+        for lane in DeviceDirection::ALL {
+            let names: Vec<String> = self
+                .store(lane)
+                .entries()
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect();
+            let store = self.store_mut(lane);
+            for name in &names {
+                store.clear_autosave(name);
+            }
+            store.rescan();
+        }
+        for lane in DeviceDirection::ALL {
+            self.in_lane(lane, |app| {
+                app.refresh_preset_list_keeping_selection();
+                if let Some(index) = app.state.selected_preset {
+                    app.select_preset(index);
+                }
+            });
+        }
     }
 
     /// `--language <code>` from the command line: an explicit pick, or `system`/`default` to
@@ -2567,42 +2910,31 @@ impl App {
                 }
             }
 
-            A::RemoveDevice(index) => {
-                if *index < self.settings.device_configs.len() {
-                    self.settings.device_configs.remove(*index);
-                    state
-                        .settings
-                        .device_configs
-                        .clone_from(&self.settings.device_configs);
-                    self.persist_settings();
+            // The rows are the output devices only (see `output_device_rows`), so a row is found
+            // among them, never by its place in the whole list.
+            A::RemoveDevice(row) => {
+                if let Some(index) = self.output_config_index(*row) {
+                    self.settings.device_configs.remove(index);
+                    self.device_configs_changed(state);
                 }
             }
-            A::MoveDeviceUp(index) => self.swap_device_config(state, *index, index.wrapping_sub(1)),
-            A::MoveDeviceDown(index) => self.swap_device_config(state, *index, index + 1),
+            A::MoveDeviceUp(row) => {
+                if let Some(above) = row.checked_sub(1) {
+                    self.swap_device_config(state, *row, above);
+                }
+            }
+            A::MoveDeviceDown(row) => self.swap_device_config(state, *row, row + 1),
             A::SetDevicePreset { device, preset } => {
-                let name = self.state.presets.get(*preset).map(|p| p.name.clone());
-                if let (Some(config), Some(name)) =
-                    (self.settings.device_configs.get_mut(*device), name)
-                {
-                    config.preset = name;
-                    state
-                        .settings
-                        .device_configs
-                        .clone_from(&self.settings.device_configs);
-                    self.persist_settings();
+                // A name from the speakers' store, the list the combo offers.
+                let name = self.presets.entries().get(*preset).map(|p| p.name.clone());
+                if let (Some(index), Some(name)) = (self.output_config_index(*device), name) {
+                    self.settings.device_configs[index].preset = name;
+                    self.device_configs_changed(state);
                 }
             }
 
             A::ResetPresets => {
-                // Drop every autosave, so each preset reverts to what shipped or was last saved.
-                for entry in self.state.presets.clone() {
-                    self.presets.clear_autosave(&entry.name);
-                }
-                self.presets.rescan();
-                self.refresh_preset_list();
-                if let Some(index) = self.state.selected_preset {
-                    self.select_preset(index);
-                }
+                self.reset_presets();
                 let message = Message::presets_restored();
                 self.state.notify(message.body.clone());
                 self.notify(message);
@@ -2659,20 +2991,17 @@ impl App {
         }
     }
 
+    /// Swap two Output Device Preference rows — two output devices' places in `device_configs`,
+    /// whatever microphones sit between them.
     fn swap_device_config(
         &mut self,
         state: &mut fxsound_ui::dialogs::settings::SettingsState,
         a: usize,
         b: usize,
     ) {
-        let len = self.settings.device_configs.len();
-        if a < len && b < len {
+        if let (Some(a), Some(b)) = (self.output_config_index(a), self.output_config_index(b)) {
             self.settings.device_configs.swap(a, b);
-            state
-                .settings
-                .device_configs
-                .clone_from(&self.settings.device_configs);
-            self.persist_settings();
+            self.device_configs_changed(state);
         }
     }
 
@@ -2956,8 +3285,24 @@ mod tests {
         }
     }
 
+    /// Give `app` these voice presets, as the factory set of a voice store in a scratch directory
+    /// the returned guard keeps alive: selecting one loads it from its file.
+    fn use_voices(
+        app: &mut App,
+        voices: &[fxsound_preset::input::InputPreset],
+    ) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        app.voice_presets = voice_store_for_tests(
+            voices,
+            &dir.path().join("voice-factory"),
+            dir.path().join("user").join("Input"),
+        );
+        dir
+    }
+
     /// Two voice presets, so a crossing has somewhere to land.
-    fn with_voice_presets(app: &mut App) {
+    #[must_use]
+    fn with_voice_presets(app: &mut App) -> tempfile::TempDir {
         use fxsound_preset::input::{Equalizer, InputPreset};
         let voice = |name: &str, hz: f32| InputPreset {
             name: name.to_owned(),
@@ -2971,12 +3316,13 @@ mod tests {
             eq: Equalizer {
                 centers_hz: fxsound_core::eq::DEFAULT_CENTERS_HZ.to_vec(),
                 gains_db: vec![0.0; 10],
+                enabled: true,
             },
             makeup_db: 0.0,
             ceiling_db: -3.0,
             ..InputPreset::default()
         };
-        app.input_presets = vec![voice("Clean Voice", 80.0), voice("Flat", 75.0)];
+        use_voices(app, &[voice("Clean Voice", 80.0), voice("Flat", 75.0)])
     }
 
     #[test]
@@ -2984,7 +3330,7 @@ mod tests {
         // The two sets are never merged: a music preset on a voice is wrong by construction, and a
         // list holding both would make picking the wrong one a normal thing to do.
         let mut app = app_with_two_presets("directions");
-        with_voice_presets(&mut app);
+        let _voices = with_voice_presets(&mut app);
         app.state.devices = vec![
             device("alsa_output.speakers", DeviceDirection::Output, true),
             device("alsa_input.mic", DeviceDirection::Input, false),
@@ -3025,21 +3371,32 @@ mod tests {
         use fxsound_preset::input::{DEFAULT_CHAIN, InputPreset};
         let mut app = App::headless_for_tests();
         app.state.direction = DeviceDirection::Input;
-        app.input_presets = vec![
-            InputPreset {
-                name: "Voice".to_owned(),
-                ..InputPreset::default()
-            },
-            InputPreset {
-                name: "Podcast".to_owned(),
-                chain: "podcast".to_owned(),
-                ..InputPreset::default()
-            },
-        ];
+        let _voices = use_voices(
+            &mut app,
+            &[
+                InputPreset {
+                    name: "Voice".to_owned(),
+                    ..InputPreset::default()
+                },
+                InputPreset {
+                    name: "Podcast".to_owned(),
+                    chain: "podcast".to_owned(),
+                    ..InputPreset::default()
+                },
+            ],
+        );
         app.refresh_preset_list();
         assert_eq!(app.input_chain(), DEFAULT_CHAIN);
+        // The store lists by name, so the list is Podcast, Voice.
+        let at = |app: &App, name: &str| {
+            app.state
+                .presets
+                .iter()
+                .position(|p| p.name == name)
+                .expect("listed")
+        };
 
-        app.handle(&[UiAction::SelectPreset(1)]);
+        app.handle(&[UiAction::SelectPreset(at(&app, "Podcast"))]);
         assert_eq!(app.input_chain(), "podcast");
         let spec =
             fxsound_dsp::ChainSpec::by_name(app.input_chain()).expect("a chain the engine builds");
@@ -3052,7 +3409,7 @@ mod tests {
         );
 
         // Back to a preset that names none: the default chain, said again.
-        app.handle(&[UiAction::SelectPreset(0)]);
+        app.handle(&[UiAction::SelectPreset(at(&app, "Voice"))]);
         assert_eq!(app.input_chain(), DEFAULT_CHAIN);
     }
 
@@ -3063,38 +3420,42 @@ mod tests {
         use fxsound_preset::input::{Compressor, Equalizer, Gate, InputPreset};
         let mut app = App::headless_for_tests();
         app.state.direction = DeviceDirection::Input;
-        app.input_presets = vec![InputPreset {
-            name: "Voiced".to_owned(),
-            description: String::new(),
-            rnnoise: true,
-            highpass_hz: 90.0,
-            highpass_order: 4,
-            gate: Some(Gate {
-                threshold_db: -40.0,
-                ratio: 2.0,
-                range_db: -12.0,
-                attack_ms: 5.0,
-                release_ms: 150.0,
-                hold_ms: 200.0,
-                detection: fxsound_core::Detection::Rms,
-            }),
-            compressor: Some(Compressor {
-                threshold_db: -20.0,
-                ratio: 4.0,
-                knee_db: 6.0,
-                attack_ms: 20.0,
-                release_ms: 150.0,
-                detection: fxsound_core::Detection::Rms,
-            }),
-            deesser: None,
-            eq: Equalizer {
-                centers_hz: fxsound_core::eq::DEFAULT_CENTERS_HZ.to_vec(),
-                gains_db: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0],
-            },
-            makeup_db: 4.0,
-            ceiling_db: -3.0,
-            ..InputPreset::default()
-        }];
+        let _voices = use_voices(
+            &mut app,
+            &[InputPreset {
+                name: "Voiced".to_owned(),
+                description: String::new(),
+                rnnoise: true,
+                highpass_hz: 90.0,
+                highpass_order: 4,
+                gate: Some(Gate {
+                    threshold_db: -40.0,
+                    ratio: 2.0,
+                    range_db: -12.0,
+                    attack_ms: 5.0,
+                    release_ms: 150.0,
+                    hold_ms: 200.0,
+                    detection: fxsound_core::Detection::Rms,
+                }),
+                compressor: Some(Compressor {
+                    threshold_db: -20.0,
+                    ratio: 4.0,
+                    knee_db: 6.0,
+                    attack_ms: 20.0,
+                    release_ms: 150.0,
+                    detection: fxsound_core::Detection::Rms,
+                }),
+                deesser: None,
+                eq: Equalizer {
+                    centers_hz: fxsound_core::eq::DEFAULT_CENTERS_HZ.to_vec(),
+                    gains_db: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0],
+                    enabled: true,
+                },
+                makeup_db: 4.0,
+                ceiling_db: -3.0,
+                ..InputPreset::default()
+            }],
+        );
         app.refresh_preset_list();
         app.handle(&[UiAction::SelectPreset(0)]);
 
@@ -3565,7 +3926,7 @@ mod tests {
     #[test]
     fn switching_the_edit_direction_swaps_the_preset_list_and_back() {
         let mut app = app_with_two_presets("edit-direction");
-        with_voice_presets(&mut app);
+        let _voices = with_voice_presets(&mut app);
         app.settings.input_preset = "Flat".to_owned();
         app.handle(&[UiAction::SelectPreset(1)]);
         assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Beta"));
@@ -3588,7 +3949,7 @@ mod tests {
     #[test]
     fn switching_the_edit_direction_keeps_unsaved_edits_on_both_lanes() {
         let mut app = app_with_two_presets("edit-direction-edits");
-        with_voice_presets(&mut app);
+        let _voices = with_voice_presets(&mut app);
         app.handle(&[UiAction::SelectPreset(0)]);
         app.handle(&[UiAction::SetEffect(Effect::Bass, 7.0)]);
 
@@ -3620,7 +3981,7 @@ mod tests {
     #[test]
     fn switching_the_edit_direction_changes_nothing_the_engine_runs() {
         let mut app = app_with_two_presets("edit-direction-engine");
-        with_voice_presets(&mut app);
+        let _voices = with_voice_presets(&mut app);
         app.state
             .devices
             .push(device("alsa_input.mic", DeviceDirection::Input, false));
@@ -3853,7 +4214,7 @@ mod tests {
             std::env::temp_dir().join(format!("fxsound-restart-user-{}-{tag}", std::process::id())),
         );
         app.presets.rescan();
-        with_voice_presets(&mut app);
+        let _voices = with_voice_presets(&mut app);
         app.settings.device_direction = edit;
         saved.0.clone_into(&mut app.settings.output_preset);
         saved.1.clone_into(&mut app.settings.input_preset);
@@ -4832,9 +5193,26 @@ mod tests {
     }
 
     #[test]
-    fn the_export_file_name_only_touches_path_separators() {
-        assert_eq!(export_file_name("Rock & Roll"), "Rock & Roll.fac");
-        assert_eq!(export_file_name("a/b\\c"), "a_b_c.fac");
+    fn the_export_asks_about_exactly_the_file_the_store_writes() {
+        // The collision check used to keep its own copy of the naming rule, which the store had
+        // since replaced: `a/b` was looked for as `a_b.fac` while `ab.fac` was the file written,
+        // so an export replaced it without asking. It now asks the store.
+        let (mut app, dir) = with_store();
+        add_user_preset(&mut app, "Mu:sic?");
+        std::fs::create_dir_all(dir.path().join("export")).unwrap();
+        std::fs::write(dir.path().join("export/Music.fac"), "an earlier export").unwrap();
+
+        let mut state = ExportState {
+            presets: vec!["Mu:sic?".into()],
+            selected: [0].into_iter().collect(),
+            ..ExportState::default()
+        };
+        app.handle_export(&PresetsAction::Export, &mut state);
+        assert_eq!(state.collisions, ["Mu:sic?"], "asked before replacing it");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("export/Music.fac")).unwrap(),
+            "an earlier export"
+        );
     }
 
     // ---- the Settings pane's microphone settings (0.4.0 design §1.4, §2 & 3, §7) -------------
@@ -5041,17 +5419,20 @@ mod tests {
         use fxsound_preset::input::{Denoise, InputPreset};
         let mut app = headless();
         app.state.direction = DeviceDirection::Input;
-        app.input_presets = vec![InputPreset {
-            name: "Tuned".to_owned(),
-            rnnoise: true,
-            denoise: Some(Denoise {
-                level: DenoiseLevel::Light,
-                channels: DenoiseChannelMode::Linked,
-                max_suppression_db: Some(9.0),
-                ..Denoise::default()
-            }),
-            ..InputPreset::default()
-        }];
+        let _voices = use_voices(
+            &mut app,
+            &[InputPreset {
+                name: "Tuned".to_owned(),
+                rnnoise: true,
+                denoise: Some(Denoise {
+                    level: DenoiseLevel::Light,
+                    channels: DenoiseChannelMode::Linked,
+                    max_suppression_db: Some(9.0),
+                    ..Denoise::default()
+                }),
+                ..InputPreset::default()
+            }],
+        );
         app.refresh_preset_list();
         app.handle(&[UiAction::SelectPreset(0)]);
         let voiced = *app.input_params();
@@ -5092,7 +5473,7 @@ mod tests {
     #[test]
     fn an_override_survives_picking_another_voice_preset() {
         let mut app = headless();
-        with_voice_presets(&mut app);
+        let _voices = with_voice_presets(&mut app);
         app.state.direction = DeviceDirection::Input;
         app.refresh_preset_list();
         app.settings.noise_suppression = NoiseSuppressionOverride::Medium;
@@ -5286,9 +5667,19 @@ mod tests {
         (store, dir)
     }
 
+    /// A voice store in `dir` holding [`voice_list`] as its factory set, with the user's voice
+    /// presets in `user/Input`, the layout the real stores use beside [`music_store`]'s.
+    fn voices(dir: &tempfile::TempDir) -> InputPresetStore {
+        voice_store_for_tests(
+            &voice_list(),
+            &dir.path().join("voice-factory"),
+            dir.path().join("user").join("Input"),
+        )
+    }
+
     /// Two voice presets: `Loud`, with 9 dB of makeup and the podcast chain, and `Quiet`, with
     /// none and a 75 Hz high-pass.
-    fn voices() -> Vec<fxsound_preset::input::InputPreset> {
+    fn voice_list() -> Vec<fxsound_preset::input::InputPreset> {
         use fxsound_preset::input::InputPreset;
         vec![
             InputPreset {
@@ -5327,7 +5718,7 @@ mod tests {
     fn started_with(settings: Settings) -> (App, FakeEngine, tempfile::TempDir) {
         let engine = FakeEngine::new();
         let (store, dir) = music_store();
-        let app = App::start_for_tests(settings, store, voices(), &engine);
+        let app = App::start_for_tests(settings, store, voices(&dir), &engine);
         let _ = engine.take_sent();
         let _ = engine.take_events();
         (app, engine, dir)
@@ -5373,8 +5764,8 @@ mod tests {
         settings.device_volumes = vec![volume.clone()];
 
         let engine = FakeEngine::new();
-        let (store, _dir) = music_store();
-        let _app = App::start_for_tests(settings, store, voices(), &engine);
+        let (store, dir) = music_store();
+        let _app = App::start_for_tests(settings, store, voices(&dir), &engine);
         let sent = engine.take_sent();
         assert!(
             matches!(sent[0], UiToAudio::SeedRememberedDefaults { .. }),
@@ -5396,8 +5787,8 @@ mod tests {
     fn a_start_publishes_each_lanes_snapshot_from_its_own_saved_preset() {
         for edit in [OUT, IN] {
             let engine = FakeEngine::new();
-            let (store, _dir) = music_store();
-            let app = App::start_for_tests(saved_settings(edit), store, voices(), &engine);
+            let (store, dir) = music_store();
+            let app = App::start_for_tests(saved_settings(edit), store, voices(&dir), &engine);
             let output = engine
                 .params()
                 .expect("the speakers' snapshot was published");
@@ -6083,7 +6474,7 @@ mod tests {
         let mut store =
             PresetStore::with_dirs(vec![dir.path().join("factory")], dir.path().join("user"));
         store.rescan();
-        App::start_for_tests(saved_settings(edit), store, voices(), &FakeEngine::new())
+        App::start_for_tests(saved_settings(edit), store, voices(dir), &FakeEngine::new())
     }
 
     #[test]
@@ -6140,5 +6531,599 @@ mod tests {
         assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
         app.shutdown();
         assert_eq!(music_autosaves(&dir), Vec::<String>::new());
+    }
+
+    // ---- writable voice presets (0.4.0 design §1.4, §11) ----------------------------------------
+
+    /// Every `.fac` under the speakers' user directory, its AutoSave included, by path relative
+    /// to it.
+    fn music_files(dir: &tempfile::TempDir) -> Vec<String> {
+        let root = dir.path().join("user");
+        let mut found = Vec::new();
+        let mut pending = vec![root.clone()];
+        while let Some(at) = pending.pop() {
+            for entry in std::fs::read_dir(&at).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "fac") {
+                    let relative = path.strip_prefix(&root).expect("under the root");
+                    found.push(relative.display().to_string());
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// The voice presets in `sub` of the user's voice directory (`user/Input`), by file name.
+    fn voice_files(dir: &tempfile::TempDir, sub: &str) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("user/Input").join(sub))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|e| e == "toml"))
+            .filter_map(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A user voice preset as it is on disk.
+    fn saved_voice(dir: &tempfile::TempDir, file: &str) -> InputPreset {
+        InputPreset::load(&dir.path().join("user/Input").join(file)).expect("a voice preset")
+    }
+
+    /// Where `name` is in the list the window shows.
+    fn at(app: &App, name: &str) -> usize {
+        app.state
+            .presets
+            .iter()
+            .position(|p| p.name == name)
+            .unwrap_or_else(|| panic!("{name} is listed"))
+    }
+
+    /// The entry the window shows for `name`.
+    fn entry<'a>(app: &'a App, name: &str) -> &'a PresetEntry {
+        &app.state.presets[at(app, name)]
+    }
+
+    /// Loud as shipped, for comparing what a save kept.
+    fn loud() -> InputPreset {
+        voice_list().remove(0)
+    }
+
+    #[test]
+    fn a_voice_preset_is_never_filed_as_a_fac_by_a_save_or_an_autosave() {
+        // 0.3.0 built a `.fac` from the window whichever lane it showed: Save on a microphone
+        // filed the voice preset's equalizer as a music preset named after it, and the autosaves
+        // on switching away and on the way out did the same in the music AutoSave — where a voice
+        // preset named like a `.fac` overwrote that music preset's unsaved edits.
+        let (mut app, _engine, dir) = editing_the_microphone();
+        assert!(music_files(&dir).is_empty());
+
+        app.handle(&[UiAction::SetBandGain(0, 6.0)]);
+        // The speakers' preset's own name, free in the voice list.
+        app.handle(&[UiAction::SavePresetAs("Beta".into())]);
+        app.handle(&[UiAction::SetBandGain(1, 4.0), UiAction::SavePreset]);
+        app.handle(&[UiAction::SetBandGain(2, 3.0)]);
+        app.handle(&[UiAction::SelectPreset(at(&app, "Quiet"))]);
+        app.handle(&[UiAction::SetBandGain(3, 2.0)]);
+        app.shutdown();
+
+        assert_eq!(
+            music_files(&dir),
+            Vec::<String>::new(),
+            "no .fac anywhere, saved or stashed"
+        );
+        assert_eq!(voice_files(&dir, ""), ["Beta.toml"]);
+        assert_eq!(voice_files(&dir, "AutoSave"), ["Beta.toml", "Quiet.toml"]);
+        let beta = saved_voice(&dir, "Beta.toml");
+        assert_eq!(&beta.eq.gains_db[..2], [6.0, 4.0]);
+
+        // The speakers' Beta is still the factory one, with nothing waiting to be saved.
+        let next = started_again(&dir, OUT);
+        assert_eq!(next.lane_preset(OUT), Some(("Beta", false)));
+        assert!((next.params().effect(Effect::Bass) - 0.6).abs() < 0.02);
+    }
+
+    #[test]
+    fn save_new_preset_on_the_microphone_files_a_user_voice_preset_and_selects_it() {
+        let (mut app, _engine, dir) = editing_the_microphone();
+        app.handle(&[UiAction::SetBandGain(0, 6.0), UiAction::SetMasterGain(3.0)]);
+        assert!(entry(&app, "Loud").modified);
+
+        app.handle(&[UiAction::SavePresetAs("Mine".into())]);
+
+        let mine = app.state.preset().expect("the new preset is selected");
+        assert_eq!(mine.name, "Mine");
+        assert!(!mine.factory, "the user's own");
+        assert!(!mine.modified, "and saved");
+        assert!(!entry(&app, "Loud").modified, "the edits went to Mine");
+        assert!(entry(&app, "Loud").factory);
+        assert_eq!(app.settings.input_preset, "Mine");
+        assert_eq!(
+            app.settings.output_preset, "Beta",
+            "the speakers' is their own"
+        );
+        assert_eq!(app.settings.preset_for_device(MIC, IN), Some("Mine"));
+        assert_eq!(app.settings.preset_for_device(MIC, OUT), None);
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some("New preset Mine is saved.")
+        );
+
+        let saved = saved_voice(&dir, "Mine.toml");
+        assert_eq!(saved.name, "Mine");
+        assert_eq!(saved.eq.gains_db[0], 6.0);
+        assert_eq!(
+            saved.makeup_db, 3.0,
+            "the makeup is the voice's output gain"
+        );
+        // Everything the window has no control for is Loud's, as Loud had it.
+        let loud = loud();
+        assert_eq!(saved.chain, "podcast");
+        assert_eq!(saved.gate, loud.gate);
+        assert_eq!(saved.compressor, loud.compressor);
+        assert_eq!(saved.deesser, loud.deesser);
+        assert_eq!(saved.highpass_hz, loud.highpass_hz);
+        assert_eq!(saved.ceiling_db, loud.ceiling_db);
+        assert_eq!(voice_files(&dir, "AutoSave"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_user_voice_preset_is_listed_as_the_users_at_the_next_start() {
+        let (mut app, _engine, dir) = editing_the_microphone();
+        app.handle(&[UiAction::SetBandGain(0, 6.0)]);
+        app.handle(&[UiAction::SavePresetAs("Mine".into())]);
+        app.shutdown();
+
+        let mut settings = saved_settings(IN);
+        settings.input_preset = "Mine".to_owned();
+        let mut store =
+            PresetStore::with_dirs(vec![dir.path().join("factory")], dir.path().join("user"));
+        store.rescan();
+        let next = App::start_for_tests(settings, store, voices(&dir), &FakeEngine::new());
+        assert_eq!(next.lane_preset(IN), Some(("Mine", false)));
+        assert!(!entry(&next, "Mine").factory);
+        assert!(entry(&next, "Loud").factory);
+        assert!(next.lane_has_preset(IN, "Mine"));
+        assert!(!next.lane_has_preset(OUT, "Mine"));
+        assert_eq!(next.input_params().bands().1[0], 6.0);
+        assert_eq!(next.input_chain(), "podcast");
+    }
+
+    #[test]
+    fn overwriting_a_user_voice_preset_saves_the_edits_over_it_and_keeps_the_last_version() {
+        let (mut app, _engine, dir) = editing_the_microphone();
+        app.handle(&[UiAction::SetBandGain(0, 6.0)]);
+        app.handle(&[UiAction::SavePresetAs("Mine".into())]);
+        let listed = app.state.presets.len();
+        app.handle(&[UiAction::SetBandGain(0, -4.0)]);
+        assert!(entry(&app, "Mine").modified);
+
+        app.handle(&[UiAction::SavePreset]);
+
+        assert!(!entry(&app, "Mine").modified);
+        assert_eq!(
+            app.state.presets.len(),
+            listed,
+            "the same preset, not a new one"
+        );
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Mine"));
+        assert_eq!(saved_voice(&dir, "Mine.toml").eq.gains_db[0], -4.0);
+        let backup = InputPreset::load(&dir.path().join("user/Input/Mine.toml.bak"))
+            .expect("the version it replaced");
+        assert_eq!(backup.eq.gains_db[0], 6.0);
+    }
+
+    #[test]
+    fn a_voice_preset_saved_with_the_equalizer_off_comes_back_off() {
+        let (mut app, engine, dir) = editing_the_microphone();
+        app.handle(&[UiAction::SetEqEnabled(false)]);
+        assert!(entry(&app, "Loud").modified, "the switch is an edit");
+        app.handle(&[UiAction::SavePresetAs("Dry".into())]);
+        assert!(!saved_voice(&dir, "Dry.toml").eq.enabled);
+
+        app.handle(&[UiAction::SelectPreset(at(&app, "Quiet"))]);
+        assert!(app.state.eq_on);
+        assert!(engine.input_params().expect("published").eq_on);
+        app.handle(&[UiAction::SelectPreset(at(&app, "Dry"))]);
+        assert!(!app.state.eq_on);
+        assert!(!engine.input_params().expect("published").eq_on);
+    }
+
+    #[test]
+    fn switching_voice_presets_stashes_the_edits_and_brings_them_back_marked() {
+        let (mut app, engine, dir) = editing_the_microphone();
+        app.handle(&[UiAction::SetBandGain(4, 5.0)]);
+        app.handle(&[UiAction::SelectPreset(at(&app, "Quiet"))]);
+
+        assert_eq!(voice_files(&dir, "AutoSave"), ["Loud.toml"]);
+        assert!(entry(&app, "Loud").modified, "the list still says so");
+        assert!(!entry(&app, "Quiet").modified);
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+
+        app.handle(&[UiAction::SelectPreset(at(&app, "Loud"))]);
+        assert_eq!(app.lane_preset(IN), Some(("Loud", true)));
+        assert_eq!(app.state.eq_bands[4].boost_db, 5.0);
+        assert_eq!(engine.input_params().expect("published").bands().1[4], 5.0);
+        assert_eq!(
+            voice_files(&dir, ""),
+            Vec::<String>::new(),
+            "a stash is not a save"
+        );
+    }
+
+    #[test]
+    fn undo_on_the_microphone_drops_the_stash_and_loads_the_voice_as_saved() {
+        let (mut app, engine, dir) = editing_the_microphone();
+        let saved_band = app.state.eq_bands[4].boost_db;
+        app.handle(&[UiAction::SetBandGain(4, 5.0), UiAction::SetMasterGain(12.0)]);
+        app.handle(&[UiAction::SelectPreset(at(&app, "Quiet"))]);
+        app.handle(&[UiAction::SelectPreset(at(&app, "Loud"))]);
+        assert_eq!(app.lane_preset(IN), Some(("Loud", true)));
+
+        app.handle(&[UiAction::UndoPresetChanges]);
+
+        assert_eq!(app.lane_preset(IN), Some(("Loud", false)));
+        assert_eq!(voice_files(&dir, "AutoSave"), Vec::<String>::new());
+        assert_eq!(app.state.eq_bands[4].boost_db, saved_band);
+        assert_eq!(app.state.master_gain_db, 9.0);
+        let published = engine.input_params().expect("published");
+        assert_eq!(published.makeup_db, 9.0);
+        assert_eq!(published.bands().1[4], saved_band);
+    }
+
+    #[test]
+    fn deleting_a_user_voice_preset_removes_its_file_and_a_shipped_voice_refuses() {
+        let (mut app, _engine, dir) = editing_the_microphone();
+        app.handle(&[UiAction::SetBandGain(0, 6.0)]);
+        app.handle(&[UiAction::SavePresetAs("Mine".into())]);
+        assert_eq!(voice_files(&dir, ""), ["Mine.toml"]);
+
+        app.handle(&[UiAction::DeletePreset]);
+        assert_eq!(voice_files(&dir, ""), Vec::<String>::new());
+        assert_eq!(names(&app), ["Loud", "Quiet"]);
+        assert!(
+            app.state.preset().is_some(),
+            "the selection moved to a listed voice"
+        );
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some("Preset Mine is deleted.")
+        );
+
+        app.handle(&[UiAction::SelectPreset(at(&app, "Loud"))]);
+        app.handle(&[UiAction::DeletePreset]);
+        assert_eq!(names(&app), ["Loud", "Quiet"]);
+        assert!(dir.path().join("voice-factory/Loud.toml").is_file());
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some("Factory presets cannot be deleted")
+        );
+    }
+
+    #[test]
+    fn renaming_a_user_voice_preset_moves_its_file_and_what_named_it() {
+        let (mut app, _engine, dir) = editing_the_microphone();
+        // A speaker that remembers a `.fac` of the same name: another lane's name, left alone.
+        app.settings
+            .remember_device_preset(SPEAKERS, "Speakers", "Mine", "", OUT);
+        app.handle(&[UiAction::SetBandGain(0, 6.0)]);
+        app.handle(&[UiAction::SavePresetAs("Mine".into())]);
+        assert_eq!(app.settings.preset_for_device(MIC, IN), Some("Mine"));
+
+        app.rename_preset("Yours");
+
+        assert_eq!(voice_files(&dir, ""), ["Yours.toml"]);
+        assert_eq!(saved_voice(&dir, "Yours.toml").name, "Yours");
+        assert_eq!(saved_voice(&dir, "Yours.toml").eq.gains_db[0], 6.0);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Yours"));
+        assert!(!app.state.preset().is_some_and(|p| p.modified));
+        assert_eq!(app.settings.input_preset, "Yours");
+        assert_eq!(app.settings.output_preset, "Beta");
+        assert_eq!(app.settings.preset_for_device(MIC, IN), Some("Yours"));
+        assert_eq!(app.settings.preset_for_device(SPEAKERS, OUT), Some("Mine"));
+        assert_eq!(
+            app.loaded_voice.as_ref().map(|p| p.name.as_str()),
+            Some("Yours")
+        );
+        assert!(music_files(&dir).is_empty());
+
+        // A shipped voice refuses, as a shipped `.fac` does.
+        app.handle(&[UiAction::SelectPreset(at(&app, "Quiet"))]);
+        app.rename_preset("Hushed");
+        assert_eq!(names(&app), ["Loud", "Quiet", "Yours"]);
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some("Factory presets cannot be renamed")
+        );
+    }
+
+    #[test]
+    fn importing_takes_the_edit_directions_kind_of_file_and_leaves_the_other() {
+        let (mut app, _engine, dir) = editing_the_microphone();
+        let incoming = dir.path().join("incoming");
+        std::fs::create_dir_all(&incoming).unwrap();
+        let podcast = InputPreset {
+            name: "Podcast Mic".to_owned(),
+            ..InputPreset::default()
+        };
+        podcast.save(&incoming.join("Podcast Mic.toml")).unwrap();
+        // Taken, case-insensitively, by the shipped Quiet.
+        podcast.save(&incoming.join("quiet.toml")).unwrap();
+        let rock = Preset {
+            name: "Rock".to_owned(),
+            ..Preset::default()
+        };
+        fxsound_preset::save(&rock, &incoming.join("Rock.fac")).unwrap();
+
+        let mut state = ImportState {
+            folder: Some(incoming.clone()),
+            ..ImportState::default()
+        };
+        app.handle_import(&PresetsAction::Import, &mut state);
+        let summary = state.summary.clone().expect("import ran");
+        assert_eq!(summary.imported, ["Podcast Mic"]);
+        assert_eq!(summary.skipped, ["quiet"]);
+        assert_eq!(voice_files(&dir, ""), ["Podcast Mic.toml"]);
+        assert!(music_files(&dir).is_empty(), "the .fac is the speakers'");
+        assert!(!entry(&app, "Podcast Mic").factory);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Loud"));
+
+        // On the speakers the same folder gives the `.fac` and leaves the voices alone.
+        app.handle(&[UiAction::SetEditDirection(OUT)]);
+        let mut state = ImportState {
+            folder: Some(incoming),
+            ..ImportState::default()
+        };
+        app.handle_import(&PresetsAction::Import, &mut state);
+        assert_eq!(state.summary.expect("import ran").imported, ["Rock"]);
+        assert_eq!(music_files(&dir), ["Rock.fac"]);
+        assert_eq!(voice_files(&dir, ""), ["Podcast Mic.toml"]);
+    }
+
+    #[test]
+    fn exporting_on_the_microphone_writes_voice_files_as_last_saved() {
+        let (mut app, _engine, dir) = editing_the_microphone();
+        app.export_dir = dir.path().join("export");
+        app.handle(&[UiAction::SetBandGain(0, 6.0)]);
+        app.handle(&[UiAction::SavePresetAs("Mine".into())]);
+        // An edit, stashed by the switch away: not what "Mine" says until it is saved.
+        app.handle(&[UiAction::SetBandGain(0, 2.0)]);
+        app.handle(&[UiAction::SelectPreset(at(&app, "Quiet"))]);
+        assert!(entry(&app, "Mine").modified);
+
+        let mut state = ExportState {
+            presets: app.state.presets.iter().map(|p| p.name.clone()).collect(),
+            selected: [at(&app, "Loud"), at(&app, "Mine")].into_iter().collect(),
+            ..ExportState::default()
+        };
+        app.handle_export(&PresetsAction::Export, &mut state);
+        assert_eq!(state.finished, Some(true));
+
+        let exported = |file: &str| {
+            InputPreset::load(&dir.path().join("export").join(file)).expect("a voice preset")
+        };
+        assert_eq!(exported("Mine.toml").eq.gains_db[0], 6.0, "as saved");
+        assert_eq!(exported("Loud.toml").makeup_db, 9.0);
+        assert!(!dir.path().join("export/Mine.fac").exists());
+
+        // A second export asks about exactly the voice files that are there.
+        let mut again = ExportState {
+            presets: state.presets.clone(),
+            selected: state.selected.clone(),
+            ..ExportState::default()
+        };
+        app.handle_export(&PresetsAction::Export, &mut again);
+        assert_eq!(again.collisions, ["Loud", "Mine"]);
+    }
+
+    #[test]
+    fn a_quit_files_each_lanes_edits_in_its_own_store_and_a_restart_brings_both_back() {
+        let (mut app, _engine, dir) = started_with(saved_settings(OUT));
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 7.0)]);
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        app.handle(&[UiAction::SetBandGain(0, 6.0), UiAction::SetMasterGain(2.0)]);
+        app.handle(&[UiAction::SetEditDirection(OUT)]);
+
+        app.shutdown();
+
+        assert_eq!(music_autosaves(&dir), ["Beta.fac"]);
+        assert_eq!(voice_files(&dir, "AutoSave"), ["Loud.toml"]);
+        let stashed = saved_voice(&dir, "AutoSave/Loud.toml");
+        assert_eq!(stashed.eq.gains_db[0], 6.0);
+        assert_eq!(stashed.makeup_db, 2.0);
+        assert_eq!(stashed.chain, "podcast", "the rest is Loud's");
+
+        for edit in [OUT, IN] {
+            let next = started_again(&dir, edit);
+            assert_eq!(
+                next.lane_preset(OUT),
+                Some(("Beta", true)),
+                "editing {edit:?}"
+            );
+            assert_eq!(
+                next.lane_preset(IN),
+                Some(("Loud", true)),
+                "editing {edit:?}"
+            );
+            assert_eq!(next.input_params().makeup_db, 2.0);
+            assert_eq!(next.input_params().bands().1[0], 6.0);
+            assert!((next.params().effect(Effect::Bass) - 0.7).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn a_microphone_brings_back_the_voice_preset_it_was_last_used_with() {
+        const HEADSET: &str = "alsa_input.headset";
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        let mut devices = two_lane_devices();
+        devices.push(device(HEADSET, IN, false));
+        engine.feed(AudioToUi::Devices(devices));
+        app.poll_audio();
+        let index = |app: &App, name: &str| {
+            app.state
+                .devices
+                .iter()
+                .position(|d| d.name == name)
+                .expect("listed")
+        };
+
+        app.handle(&[UiAction::SelectInput(index(&app, MIC))]);
+        app.handle(&[UiAction::SelectPreset(at(&app, "Quiet"))]);
+        // The first time, the headset leaves the preset alone; then it is given its own.
+        app.handle(&[UiAction::SelectInput(index(&app, HEADSET))]);
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+        app.handle(&[UiAction::SelectPreset(at(&app, "Loud"))]);
+
+        app.handle(&[UiAction::SelectInput(index(&app, MIC))]);
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+        app.handle(&[UiAction::SelectInput(index(&app, HEADSET))]);
+        assert_eq!(app.lane_preset(IN), Some(("Loud", false)));
+
+        assert_eq!(app.settings.preset_for_device(MIC, IN), Some("Quiet"));
+        assert_eq!(app.settings.preset_for_device(HEADSET, IN), Some("Loud"));
+        assert_eq!(app.settings.preset_for_device(MIC, OUT), None);
+        assert_eq!(
+            app.lane_preset(OUT),
+            Some(("Beta", false)),
+            "the speakers kept theirs"
+        );
+    }
+
+    #[test]
+    fn the_makeup_is_part_of_a_voice_preset_and_the_speakers_master_gain_is_not_part_of_a_fac() {
+        let (mut app, _engine, _dir) = editing_the_microphone();
+        app.handle(&[UiAction::SetMasterGain(3.0)]);
+        assert_eq!(app.lane_preset(IN), Some(("Loud", true)));
+
+        app.handle(&[
+            UiAction::SetEditDirection(OUT),
+            UiAction::SetMasterGain(1.0),
+        ]);
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        assert_eq!(app.settings.master_gain, 1.0, "a setting over every .fac");
+    }
+
+    #[test]
+    fn a_pinned_noise_suppression_level_is_never_written_into_a_saved_voice_preset() {
+        let (mut app, engine, dir) = editing_the_microphone();
+        app.set_noise_suppression(NoiseSuppressionOverride::Strong);
+        assert!(engine.input_params().expect("published").rnnoise);
+        app.handle(&[UiAction::SetBandGain(0, 6.0)]);
+        app.handle(&[UiAction::SavePresetAs("Mine".into())]);
+
+        let saved = saved_voice(&dir, "Mine.toml");
+        assert!(saved.denoise.is_none(), "Loud has no denoiser of its own");
+        assert!(!saved.rnnoise);
+    }
+
+    #[test]
+    fn the_output_device_preference_lists_the_speakers_devices_with_the_speakers_presets() {
+        // A microphone remembers its voice preset in the same list, but it is neither an output
+        // device nor something a `.fac` can be given.
+        let (mut app, _engine, _dir) = started_with(saved_settings(IN));
+        let remember = |app: &mut App, node: &str, preset: &str, direction| {
+            app.settings
+                .remember_device_preset(node, node, preset, "", direction);
+        };
+        remember(&mut app, MIC, "Quiet", IN);
+        remember(&mut app, SPEAKERS, "Alpha", OUT);
+        remember(&mut app, HEADPHONES, "Beta", OUT);
+
+        let mut pane = app.settings_state();
+        let ids = |pane: &SettingsState| -> Vec<String> {
+            pane.devices.iter().map(|d| d.id.clone()).collect()
+        };
+        assert_eq!(ids(&pane), [SPEAKERS, HEADPHONES]);
+        assert_eq!(
+            pane.presets,
+            ["Alpha", "Beta"],
+            "the .fac list, on the microphone too"
+        );
+        assert_eq!(pane.devices[1].preset, Some(1));
+
+        app.handle_settings(
+            &SettingsAction::SetDevicePreset {
+                device: 0,
+                preset: 1,
+            },
+            &mut pane,
+        );
+        assert_eq!(app.settings.preset_for_device(SPEAKERS, OUT), Some("Beta"));
+        assert_eq!(app.settings.preset_for_device(MIC, IN), Some("Quiet"));
+        assert_eq!(pane.devices[0].preset, Some(1), "the row follows");
+
+        app.handle_settings(&SettingsAction::MoveDeviceUp(0), &mut pane);
+        assert_eq!(
+            ids(&pane),
+            [SPEAKERS, HEADPHONES],
+            "nothing above the first row"
+        );
+        app.handle_settings(&SettingsAction::MoveDeviceDown(0), &mut pane);
+        assert_eq!(ids(&pane), [HEADPHONES, SPEAKERS]);
+        let order: Vec<&str> = app
+            .settings
+            .device_configs
+            .iter()
+            .map(|c| c.device_id.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            [MIC, HEADPHONES, SPEAKERS],
+            "the microphone stays put"
+        );
+        assert_eq!(pane.settings.device_configs, app.settings.device_configs);
+
+        app.handle_settings(&SettingsAction::RemoveDevice(1), &mut pane);
+        assert_eq!(ids(&pane), [HEADPHONES]);
+        assert_eq!(app.settings.preset_for_device(SPEAKERS, OUT), None);
+        assert_eq!(app.settings.preset_for_device(MIC, IN), Some("Quiet"));
+    }
+
+    #[test]
+    fn reset_presets_drops_both_lanes_edits_and_the_engine_runs_what_was_saved() {
+        let (mut app, engine, dir) = started_with(saved_settings(OUT));
+        assert!(
+            !app.settings_state().can_reset_presets,
+            "nothing to lose yet"
+        );
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 9.0)]);
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        app.handle(&[UiAction::SetBandGain(0, 6.0)]);
+        app.handle(&[UiAction::SelectPreset(at(&app, "Quiet"))]);
+        app.handle(&[UiAction::SetMasterGain(5.0)]);
+        app.handle(&[UiAction::SetEditDirection(OUT)]);
+        assert_eq!(voice_files(&dir, "AutoSave"), ["Loud.toml"]);
+        assert_eq!(engine.input_params().expect("published").makeup_db, 5.0);
+
+        let mut pane = app.settings_state();
+        assert!(pane.can_reset_presets);
+        app.handle_settings(&SettingsAction::ResetPresets, &mut pane);
+
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+        assert_eq!(music_autosaves(&dir), Vec::<String>::new());
+        assert_eq!(voice_files(&dir, "AutoSave"), Vec::<String>::new());
+        assert!((engine.params().expect("published").effect(Effect::Bass) - 0.6).abs() < 0.02);
+        assert_eq!(
+            engine.input_params().expect("published").makeup_db,
+            0.0,
+            "the lane off screen runs Quiet as saved at once"
+        );
+        assert_eq!(app.state.direction, OUT, "the window stayed where it was");
+        assert_eq!(app.settings.device_direction, OUT);
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some("Presets are restored to factory defaults")
+        );
+        assert!(!app.settings_state().can_reset_presets);
+
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        assert!(!entry(&app, "Loud").modified);
+        assert_eq!(app.state.master_gain_db, 0.0);
     }
 }

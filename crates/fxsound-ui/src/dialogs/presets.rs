@@ -53,9 +53,11 @@ pub enum PresetsAction {
     /// Run a folder picker — `rfd::AsyncFileDialog::pick_folder()`, started from the app layer and
     /// polled, never the blocking variant (`docs/spec/06-dialogs.md` §9.3).
     ChooseImportFolder,
-    /// Import every `.fac` in [`ImportState::folder`]. If the glob comes back empty the app puts
-    /// `"Preset files not found in the selected folder."` in [`ImportState::notice`] and leaves
-    /// the window open, exactly as `FxPresetImportDialog.cpp:262-267` does.
+    /// Import every preset file of the edit direction's kind — `.fac` for the speakers, a voice
+    /// preset's `.toml` for the microphone — in [`ImportState::folder`]. If the glob comes back
+    /// empty the app puts `"Preset files not found in the selected folder."` in
+    /// [`ImportState::notice`] and leaves the window open, exactly as
+    /// `FxPresetImportDialog.cpp:262-267` does.
     Import,
     /// The notice box was acknowledged.
     DismissNotice,
@@ -79,7 +81,7 @@ pub enum PresetsAction {
 /// How to resolve every colliding file at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OverwriteChoice {
-    /// Yes: overwrite each existing `.fac`.
+    /// Yes: overwrite each existing file.
     OverwriteAll,
     /// No: keep the existing files and export only the presets that do not collide.
     SkipAll,
@@ -144,8 +146,6 @@ pub const NO_PRESETS_FOUND: &str = "Preset files not found in the selected folde
 pub const IMPORTED_LABEL: &str = "Presets successfully imported";
 /// `"Duplicate presets not imported"` (`FxPresetImportDialog.cpp:126`).
 pub const SKIPPED_LABEL: &str = "Duplicate presets not imported";
-/// The extension the import glob looks for (`FxPresetImportDialog.cpp:261`).
-pub const PRESET_EXTENSION: &str = "fac";
 
 /// What `FxController::importPresets()` reported (`FxController.cpp:1419-1458`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -542,7 +542,7 @@ pub fn format_string(template: &str, argument: &str) -> String {
     template.replacen("%s", argument, 1)
 }
 
-/// The question to ask about `names`, which are the presets whose `.fac` already exists.
+/// The question to ask about `names`, which are the presets whose file already exists.
 #[must_use]
 pub fn overwrite_message(names: &[String]) -> String {
     match names {
