@@ -167,6 +167,7 @@ pub mod engine;
 mod lane_dsp;
 pub mod locale;
 mod per_direction;
+mod routes;
 
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -180,7 +181,7 @@ use crate::per_direction::PerDirection;
 
 pub use devices::{
     BLUEZ_HEADSET_RATE, ChannelMap, DeviceInfo, FormFactor, MAX_CHANNELS, MAX_SAMPLE_RATE,
-    MIN_CHANNELS, Selection, SelectionMemory,
+    MIN_CHANNELS, Preference, Selection, SelectionMemory,
 };
 pub use locale::{node_description, sink_description, source_description};
 

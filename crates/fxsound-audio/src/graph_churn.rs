@@ -3572,6 +3572,187 @@ fn a_headsets_microphone_from_either_wireplumber_is_offered_as_a_headset_and_war
     handle.shutdown();
 }
 
+// ---- The priority list (U4) -------------------------------------------------------------------
+
+impl PrivateGraph {
+    /// Add a stereo sink, or a stereo microphone, while the engine runs: how a device is plugged
+    /// in here. With the driver priority a real device carries (see [`Self::add_mono_sink`] for
+    /// why that matters on this daemon). `None` when it never appears.
+    fn add_device(&self, name: &str, direction: DeviceDirection) -> Option<()> {
+        let media_class = match direction {
+            DeviceDirection::Output => "Audio/Sink",
+            DeviceDirection::Input => "Audio/Source/Virtual",
+        };
+        self.add_adapter(
+            name,
+            &format!(
+                "factory.name = support.null-audio-sink node.name = {name} \
+                 node.description = \"Test {name}\" media.class = {media_class} \
+                 priority.driver = 1010 audio.channels = 2 audio.position = [ FL FR ]"
+            ),
+        )
+    }
+}
+
+/// Where a lane said it went, from message `from` on.
+fn moves_since(said: &Transcript, direction: DeviceDirection, from: usize) -> Vec<Option<String>> {
+    said.0[from..]
+        .iter()
+        .filter_map(|message| match message {
+            AudioToUi::Attached {
+                direction: d,
+                node_name,
+            } if *d == direction => Some(node_name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn rank(direction: DeviceDirection, names: &[&str]) -> UiToAudio {
+    UiToAudio::SetDevicePriority {
+        direction,
+        names: names.iter().map(|&name| name.to_owned()).collect(),
+    }
+}
+
+/// One lane through the priority list on a real graph. The user picks `current`; `above`, ranked
+/// above it, is plugged in and takes the lane; `below`, ranked under both, is plugged in and takes
+/// nothing; `above` is unplugged, and the lane goes to the first present by rank, `current` — not
+/// to `below`, the newest. Under the Windows rules the second step would not happen at all, and the
+/// third would move the lane back to the user's pick (rule 4).
+fn a_lane_follows_its_ranking(
+    tag: &str,
+    direction: DeviceDirection,
+    current: &str,
+    below: &str,
+    above: &str,
+) {
+    let Some(graph) = PrivateGraph::start(tag) else {
+        return;
+    };
+    if !installed("pw-cli") {
+        skip(&format!("pw-cli is not available, so {tag} cannot run"));
+        return;
+    }
+    let handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    said.until(
+        &handle,
+        "a device list",
+        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == current)),
+    );
+    handle.send(rank(direction, &[above, current, below]));
+    handle.send(UiToAudio::SelectDevice {
+        node_name: current.to_owned(),
+        direction,
+    });
+    assert!(said.attached(&handle, direction, Some(current)));
+    said.settle(&handle);
+
+    assert!(
+        graph.add_device(above, direction).is_some(),
+        "{above} never appeared"
+    );
+    assert!(
+        said.attached(&handle, direction, Some(above)),
+        "{above} is ranked above the device the lane is on"
+    );
+    said.settle(&handle);
+
+    let from = said.0.len();
+    assert!(
+        graph.add_device(below, direction).is_some(),
+        "{below} never appeared"
+    );
+    // The rules run on the tick after the registry's news; give them a few.
+    said.settle(&handle);
+    said.settle(&handle);
+    assert_eq!(
+        moves_since(&said, direction, from),
+        [],
+        "{below} is ranked below the device the lane is on, and the user's older pick is only \
+         a ranked device like any other"
+    );
+
+    assert!(graph.remove_node(above).is_some(), "{above} never went");
+    assert!(
+        said.attached(&handle, direction, Some(current)),
+        "with {above} gone, the first present by rank is {current}, not {below}"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn the_speakers_lane_takes_only_a_sink_ranked_above_it_and_falls_back_down_the_ranking() {
+    a_lane_follows_its_ranking(
+        "rankout",
+        DeviceDirection::Output,
+        "t_stereo",
+        "t_low",
+        "t_high",
+    );
+}
+
+#[test]
+fn the_microphone_lane_takes_only_a_microphone_ranked_above_it_and_falls_back_down_the_ranking() {
+    a_lane_follows_its_ranking(
+        "rankin",
+        DeviceDirection::Input,
+        "t_mic",
+        "t_mic_low",
+        "t_mic_high",
+    );
+}
+
+#[test]
+fn an_empty_ranking_hands_the_lane_back_to_the_old_rules() {
+    let Some(graph) = PrivateGraph::start("rankoff") else {
+        return;
+    };
+    if !installed("pw-cli") {
+        skip("pw-cli is not available, so rankoff cannot run");
+        return;
+    }
+    let handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    said.until(
+        &handle,
+        "a device list",
+        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_71")),
+    );
+    handle.send(rank(
+        DeviceDirection::Output,
+        &["t_high", "t_71", "t_stereo"],
+    ));
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_stereo".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    said.settle(&handle);
+
+    // Ranked above the user's pick, a sink plugged in takes the lane…
+    assert!(
+        graph
+            .add_device("t_high", DeviceDirection::Output)
+            .is_some()
+    );
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_high")));
+
+    // …and with the ranking gone, the Windows rules are back: the user's pick that is present
+    // outranks the device that arrived since (rule 4).
+    let from = said.0.len();
+    handle.send(rank(DeviceDirection::Output, &[]));
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    assert_eq!(
+        moves_since(&said, DeviceDirection::Output, from),
+        [Some("t_stereo".to_owned())]
+    );
+    handle.shutdown();
+}
+
 /// [`CONFIG`] for a daemon that can hold cards ([`PrivateGraph::start_with_cards`]): D-Bus support
 /// on, which the daemon is pointed at a private bus for, the Bluetooth plugin to make a card
 /// from, and the factory that makes it.

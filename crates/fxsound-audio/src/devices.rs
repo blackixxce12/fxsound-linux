@@ -348,6 +348,11 @@ pub(crate) fn bluez_address<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> Optio
         .map(str::to_owned)
 }
 
+/// `card.profile.device`: which device of its card a node is ([`DeviceInfo::profile_device`]).
+pub(crate) fn profile_device<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> Option<u32> {
+    get("card.profile.device").and_then(|device| device.trim().parse().ok())
+}
+
 /// A PipeWire `Device` object: the sound card, or the Bluetooth headset, that nodes belong to —
 /// what WirePlumber names `alsa_card.*` and `bluez_card.*`.
 ///
@@ -658,6 +663,17 @@ pub struct DeviceInfo {
     /// none. The card outlives its nodes' comings and goings, which is what
     /// [`DeviceInfo::card_present`] asks about.
     pub card_id: Option<u32>,
+    /// `card.profile.device`: which of its card's devices — one path through the card's active
+    /// profile, the thing a card's route names — this node is. Runtime only. What ties the node to
+    /// the port behind it, and so to whether anything is plugged in there ([`Self::available`]).
+    /// Not in the registry global; the engine reads it from the node's info.
+    pub profile_device: Option<u32>,
+    /// Whether the node can be heard, as far as its card says: `false` only while the port behind
+    /// it reports nothing plugged in (`available = no`) — an HDMI sink with no monitor, a headset
+    /// jack with nothing in it (`crate::routes`). The rules pass over such a node whenever any
+    /// device of its direction can be heard ([`choose_device`]). `true` for a node on no card, and
+    /// until its card has said otherwise.
+    pub available: bool,
     /// `api.bluez5.address`, on a node PipeWire's Bluetooth plugin made: the other way to tell
     /// which [`Card`] it belongs to. The registry global does not carry it; the engine reads it
     /// from the node's own info.
@@ -739,6 +755,8 @@ impl DeviceInfo {
             object_id,
             object_serial: get("object.serial").and_then(|s| s.parse::<u64>().ok()),
             card_id: get("device.id").and_then(|s| s.parse::<u32>().ok()),
+            profile_device: profile_device(get),
+            available: true,
             bluez_address: bluez_address(get),
             name,
             description,
@@ -989,11 +1007,78 @@ fn find<'a>(devices: &'a [&DeviceInfo], name: &str) -> Option<&'a DeviceInfo> {
     devices.iter().copied().find(|s| s.name == name)
 }
 
-/// Pick the real device of one direction, reproducing `sndDevicesImplementDeviceRules()`.
+/// How the user wants one direction's device chosen, beside what the Windows rules remember
+/// (U4, `docs/0.4.0-upstream.md`): the device priority list of upstream's Settings ▸ Outputs.
+///
+/// Not a Windows registry slot, so not in [`SelectionMemory`]: upstream 1.2 keeps the list in its
+/// own settings (`DeviceConfig.cpp`), beside and not instead of the rules this crate ports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preference {
+    /// The user's ranking of real devices, as `node.name`s, most preferred first — what
+    /// [`UiToAudio::SetDevicePriority`] last sent. Empty means "follow the system": the Windows
+    /// rules decide exactly as they did before there was a ranking (upstream issue #629).
+    ///
+    /// [`UiToAudio::SetDevicePriority`]: fxsound_core::messages::UiToAudio::SetDevicePriority
+    pub ranking: Vec<String>,
+    /// The user has just picked [`SelectionMemory::user_selected`], and the lane's rules have not
+    /// run on it since — or they chose it, the pair they built on it failed, and the retry is to
+    /// choose it again. Any other run spends it, whatever it chose: a pick that is absent or unheard
+    /// when the rules run has lost to the ranking, and does not take the lane later just for
+    /// turning up.
+    ///
+    /// With a ranking, this is the one moment the pick outranks the ranking: upstream's menu sets
+    /// the output and leaves the list alone (`FxController::setOutput`), and from then on the pick
+    /// is simply the current device, kept until a better-ranked one arrives or it goes.
+    pub fresh_pick: bool,
+}
+
+impl Preference {
+    /// Where `name` stands in the ranking: its place when it is ranked, and after every ranked
+    /// device when it is not. Equal places keep the graph's order wherever this is used as a key.
+    #[must_use]
+    pub fn rank(&self, name: &str) -> usize {
+        self.ranking
+            .iter()
+            .position(|ranked| ranked == name)
+            .unwrap_or(self.ranking.len())
+    }
+}
+
+/// The devices of `direction` the rules choose among: every real one that can be heard — or, when
+/// none can, every real one there is.
+///
+/// A node whose card says nothing is plugged into the port behind it ([`DeviceInfo::available`]) is
+/// passed over for any that can be heard: ranked first, or reached by rule 7's "first device there
+/// is", it would take the lane and play into an empty jack (`docs/0.4.0-upstream.md` U4, and the
+/// review's correction to item 4). With nothing to be heard at all — a desktop whose only output is
+/// a sleeping monitor's — the rules run on what is there rather than end in "no devices": that
+/// would take FxSound's own node away and move every application off it, to come back when the
+/// monitor wakes, where a pair left on the silent port simply plays again. The contract records
+/// this as U4's one exception, for both directions.
+#[must_use]
+pub fn candidates<'a>(
+    devices: &'a [DeviceInfo],
+    direction: DeviceDirection,
+    our_node: &str,
+) -> Vec<&'a DeviceInfo> {
+    let real = devices
+        .iter()
+        .filter(move |d| d.direction == direction && d.name != our_node);
+    if real.clone().any(|d| d.available) {
+        real.filter(|d| d.available).collect()
+    } else {
+        real.collect()
+    }
+}
+
+/// Pick the real device of one direction, reproducing `sndDevicesImplementDeviceRules()` — or,
+/// when the user has ranked the direction's devices, upstream 1.2's priority list.
 ///
 /// `devices` may carry both directions; only those matching `direction` take part, and
-/// `our_node` — `fxsound_sink` or `fxsound_source` — is never a candidate. The branch order is
-/// the one drawn at `docs/spec/12-audio-io.md` §19.5, which is in turn the order of
+/// `our_node` — `fxsound_sink` or `fxsound_source` — is never a candidate. Nor is a device nothing
+/// is plugged into while another can be heard ([`candidates`]): "present" below means present and
+/// heard. With an empty [`Preference::ranking`] the branch order is the one drawn at
+/// `docs/spec/12-audio-io.md` §19.5, which is in turn the order of
 /// `sndDevicesImplementDeviceRules.cpp:97-284`:
 ///
 /// 1. no devices at all → [`AudioError::NoOutputDevices`] / [`AudioError::NoInputDevices`]
@@ -1009,14 +1094,20 @@ fn find<'a>(devices: &'a [&DeviceInfo], name: &str) -> Option<&'a DeviceInfo> {
 /// 7. otherwise the first of `most_recent_playback`, `most_recent_default`, `prior_default`,
 ///    `original_default` that is present, else the first device (`:257-284`).
 ///
+/// With a ranking, rules 2 to 7 give way to upstream 1.2's own (`choose_ranked`).
+///
 /// The Windows rules then ran a mono guard (`:290-327`) that refused a mono playback device and
 /// ended in `-58` or `-57`. It is not ported: it worked around a Windows driver bug, and a mono
 /// device of either direction is attached like any other (module docs).
 ///
-/// `previous_names` is the snapshot of real device names of this direction from the previous
+/// `previous_names` is the snapshot of [`candidates`] names of this direction from the previous
 /// enumeration, the equivalent of `pwszIDPreviousRealDevices` (`sndDevices.h:349`); pass an empty
 /// slice on the first call — and on the first call after a lane is switched on again — so rule 5
-/// cannot fire.
+/// cannot fire. A device that becomes audible while another of its direction could already be
+/// heard is not in it, and so arrives as a new one: the monitor plugged in is the HDMI endpoint
+/// appearing, as it is on Windows. When nothing of the direction could be heard, [`candidates`]
+/// fell back to every node, so the snapshot already holds the silent ones and a port that wakes
+/// is not a newcomer — it is simply the only candidate left.
 ///
 /// # Errors
 /// [`AudioError::NoOutputDevices`] / [`AudioError::NoInputDevices`] when the direction has no real
@@ -1029,16 +1120,19 @@ pub fn choose_device(
     current_default: Option<&str>,
     previous_names: &[String],
     memory: &SelectionMemory,
+    preference: &Preference,
 ) -> Result<Selection, AudioError> {
-    let real: Vec<&DeviceInfo> = devices
-        .iter()
-        .filter(|d| d.direction == direction && d.name != our_node)
-        .collect();
+    let real = candidates(devices, direction, our_node);
     if real.is_empty() {
         return Err(match direction {
             DeviceDirection::Output => AudioError::NoOutputDevices,
             DeviceDirection::Input => AudioError::NoInputDevices,
         });
+    }
+    if !preference.ranking.is_empty() {
+        // Never `None`: there is a device, and the last branch takes the best of them.
+        return choose_ranked(&real, previous_names, memory, preference)
+            .ok_or(AudioError::DeviceNotPresent);
     }
     // "The current default, unless the current default is us."
     let foreign_default = current_default.filter(|d| *d != our_node);
@@ -1129,6 +1223,57 @@ pub fn choose_device(
     })
 }
 
+/// [`choose_device`] for a direction the user has ranked: upstream 1.2's `updateOutputs`
+/// (`FxController.cpp:1540-1612`), for either direction.
+///
+/// 1. the device the user has just picked, when it is present ([`Preference::fresh_pick`]);
+/// 2. the current device — the one the lane last attached to — while it is present, unless a
+///    device that was not there at the last enumeration ranks above it (`:1558-1584`): a newcomer
+///    ranked below it never takes the lane from it;
+/// 3. once the current device has gone, the first present device by rank (`getPreferredOutput`,
+///    `:2677-2698`); unranked devices come after every ranked one, in the graph's order
+///    (`sortByDeviceConfigPriority`, a stable sort, `:1714-1725`).
+///
+/// Upstream counted devices to tell that one had been added (`:1559`); that misses a device that
+/// arrives as another leaves, so a newcomer here is a name that was not in `previous_names`, as in
+/// rule 5 of the old rules. Taking one re-dates the remembered defaults, as rule 5 does; the rest
+/// do not.
+fn choose_ranked(
+    real: &[&DeviceInfo],
+    previous_names: &[String],
+    memory: &SelectionMemory,
+    preference: &Preference,
+) -> Option<Selection> {
+    let selection = |device: &DeviceInfo, write_previous_default| Selection {
+        target: device.name.clone(),
+        write_previous_default,
+    };
+    if preference.fresh_pick
+        && let Some(picked) = find(real, &memory.user_selected)
+    {
+        return Some(selection(picked, false));
+    }
+    let rank = |device: &&DeviceInfo| preference.rank(&device.name);
+    // `min_by_key` keeps the first of equals, so unranked devices stay in the graph's order.
+    let newcomer = if previous_names.is_empty() {
+        None
+    } else {
+        real.iter()
+            .copied()
+            .filter(|device| !previous_names.iter().any(|name| name == &device.name))
+            .min_by_key(rank)
+    };
+    if let Some(current) = find(real, &memory.most_recent_playback) {
+        return Some(match newcomer {
+            Some(newcomer) if rank(&newcomer) < rank(&current) => selection(newcomer, true),
+            _ => selection(current, false),
+        });
+    }
+    let best = real.iter().copied().min_by_key(rank)?;
+    let arrived = newcomer.is_some_and(|newcomer| newcomer.name == best.name);
+    Some(selection(best, arrived))
+}
+
 /// Record a committed selection, the equivalent of the registry writes at
 /// `sndDevicesImplementDeviceRules.cpp:364-376`.
 ///
@@ -1159,27 +1304,36 @@ pub fn commit(memory: &mut SelectionMemory, selection: &Selection) {
 /// `original_default`, first one that is actually present *in that direction*. `None` means
 /// "nothing we remember is here any more", in which case the caller must leave the default alone
 /// and let WirePlumber pick.
+///
+/// A remembered device that can be heard comes before one that cannot ([`DeviceInfo::available`]),
+/// wherever the two stand in that order: a microphone picked once and then unplugged from the
+/// headset jack is still a node on a UCM card, and handing every application's recording to its
+/// empty jack is no way to give the user their default back. Only when nothing remembered can be
+/// heard does the order alone decide, as it did before there were routes to ask.
 #[must_use]
 pub fn restore_default_candidate(
     memory: &SelectionMemory,
     devices: &[DeviceInfo],
     direction: DeviceDirection,
 ) -> Option<String> {
-    [
+    let remembered = [
         &memory.user_selected,
         &memory.most_recent_playback,
         &memory.most_recent_default,
         &memory.prior_default,
         &memory.original_default,
-    ]
-    .into_iter()
-    .find(|name| {
+    ];
+    let present = |name: &String, heard: bool| {
         !name.is_empty()
             && devices
                 .iter()
-                .any(|d| d.direction == direction && &d.name == *name)
-    })
-    .cloned()
+                .any(|d| d.direction == direction && &d.name == name && (d.available || !heard))
+    };
+    remembered
+        .into_iter()
+        .find(|name| present(name, true))
+        .or_else(|| remembered.into_iter().find(|name| present(name, false)))
+        .cloned()
 }
 
 /// Pull the `name` out of a `Spa:String:JSON` default-metadata value.
@@ -1581,6 +1735,8 @@ mod tests {
             positions: ChannelMap::default_for(channels),
             form_factor: FormFactor::Unknown,
             direction,
+            profile_device: None,
+            available: true,
         }
     }
 
@@ -1607,6 +1763,7 @@ mod tests {
             current_default,
             previous_names,
             memory,
+            &Preference::default(),
         )
     }
 
@@ -2486,7 +2643,8 @@ mod tests {
                 "fxsound_source",
                 Some("fxsound_source"),
                 &[],
-                &memory
+                &memory,
+                &Preference::default()
             ),
             Err(AudioError::NoInputDevices),
             "a sink is never an input candidate, and neither is our own source"
@@ -2519,6 +2677,7 @@ mod tests {
             Some("internal-mic"),
             &[],
             &memory,
+            &Preference::default(),
         )
         .expect("an input target");
         assert_eq!(
@@ -2545,10 +2704,16 @@ mod tests {
             (&sources, DeviceDirection::Input, "fxsound_source"),
             (&sinks, DeviceDirection::Output, "fxsound_sink"),
         ] {
-            let selection = choose_device(devices, direction, ours, Some("mono"), &[], &memory)
-                .expect(
-                    "a mono device is a perfectly good target; on Windows the output side was -58",
-                );
+            let selection = choose_device(
+                devices,
+                direction,
+                ours,
+                Some("mono"),
+                &[],
+                &memory,
+                &Preference::default(),
+            )
+            .expect("a mono device is a perfectly good target; on Windows the output side was -58");
             assert_eq!(selection.target, "mono", "{direction:?}");
 
             // Rule 5, too: a newly plugged mono device is taken, whichever way it faces.
@@ -2558,8 +2723,16 @@ mod tests {
                 most_recent_playback: "stereo".into(),
                 ..SelectionMemory::default()
             };
-            let plugged = choose_device(devices, direction, ours, Some(ours), &previous, &fresh)
-                .expect("a target");
+            let plugged = choose_device(
+                devices,
+                direction,
+                ours,
+                Some(ours),
+                &previous,
+                &fresh,
+                &Preference::default(),
+            )
+            .expect("a target");
             assert_eq!(plugged.target, "mono", "{direction:?}");
             assert!(plugged.write_previous_default);
         }
@@ -2597,6 +2770,7 @@ mod tests {
             Some("fifine-mic"),
             &[],
             &memory,
+            &Preference::default(),
         )
         .expect("a target");
         assert_eq!(selection.target, "internal-mic");
@@ -2740,6 +2914,7 @@ mod tests {
             Some("fxsound_source"),
             &previous,
             &memory,
+            &Preference::default(),
         )
         .expect("a target");
         assert_eq!(selection.target, "new-headset");
@@ -3471,5 +3646,711 @@ mod tests {
         assert_eq!(announced.bluez_address, None);
         let alsa = Card::from_props(45, &props_of(&[("device.api", "alsa")]));
         assert!(!alsa.bluetooth);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The priority list (U4): a ranking, a fresh pick, and devices nothing is plugged into.
+    // ---------------------------------------------------------------------------------------
+
+    fn ranked(names: &[&str]) -> Preference {
+        Preference {
+            ranking: names.iter().map(|&name| name.to_owned()).collect(),
+            fresh_pick: false,
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|&name| name.to_owned()).collect()
+    }
+
+    /// A device whose card says nothing is plugged in behind it.
+    fn unheard(device: DeviceInfo) -> DeviceInfo {
+        DeviceInfo {
+            available: false,
+            ..device
+        }
+    }
+
+    /// The lane was last attached to `current`.
+    fn on(current: &str) -> SelectionMemory {
+        SelectionMemory {
+            original_default: current.into(),
+            most_recent_default: current.into(),
+            most_recent_playback: current.into(),
+            ..SelectionMemory::default()
+        }
+    }
+
+    /// What the rules pick for `direction`, with the session default elsewhere — on one of the
+    /// devices, so that rule 6 would have something to say — and `previous` the last run's names.
+    fn picked(
+        devices: &[DeviceInfo],
+        direction: DeviceDirection,
+        previous: &[&str],
+        memory: &SelectionMemory,
+        preference: &Preference,
+    ) -> Selection {
+        let ours = match direction {
+            DeviceDirection::Output => "fxsound_sink",
+            DeviceDirection::Input => "fxsound_source",
+        };
+        let default = devices
+            .iter()
+            .find(|device| device.direction == direction)
+            .map(|device| device.name.as_str());
+        choose_device(
+            devices,
+            direction,
+            ours,
+            default,
+            &names(previous),
+            memory,
+            preference,
+        )
+        .expect("a device to attach to")
+    }
+
+    fn output(
+        devices: &[DeviceInfo],
+        previous: &[&str],
+        memory: &SelectionMemory,
+        preference: &Preference,
+    ) -> String {
+        picked(
+            devices,
+            DeviceDirection::Output,
+            previous,
+            memory,
+            preference,
+        )
+        .target
+    }
+
+    #[test]
+    fn a_device_not_in_the_ranking_ranks_after_every_one_that_is() {
+        let preference = ranked(&["usb-dac", "speakers"]);
+        assert_eq!(preference.rank("usb-dac"), 0);
+        assert_eq!(preference.rank("speakers"), 1);
+        assert_eq!(preference.rank("hdmi"), 2);
+        assert_eq!(preference.rank("tv"), 2, "every unranked device ties");
+    }
+
+    #[test]
+    fn a_ranked_device_that_appears_above_the_current_one_takes_the_lane() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["speakers"],
+            &on("speakers"),
+            &ranked(&["usb-dac", "speakers"]),
+        );
+        assert_eq!(selection.target, "usb-dac");
+        assert!(
+            selection.write_previous_default,
+            "an arrival re-dates the remembered defaults, as rule 5 does"
+        );
+    }
+
+    #[test]
+    fn a_ranked_device_that_appears_below_the_current_one_does_not_take_it() {
+        let devices = [sink("usb-dac", 2), sink("speakers", 2)];
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["usb-dac"],
+            &on("usb-dac"),
+            &ranked(&["usb-dac", "speakers"]),
+        );
+        assert_eq!(selection.target, "usb-dac");
+        assert!(!selection.write_previous_default);
+    }
+
+    #[test]
+    fn with_no_ranking_the_same_arrival_takes_the_lane_as_rule_five_says() {
+        // The Windows rules, untouched when the list is empty: whatever arrives is taken.
+        let devices = [sink("usb-dac", 2), sink("speakers", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &["usb-dac"],
+                &on("usb-dac"),
+                &Preference::default()
+            ),
+            "speakers"
+        );
+    }
+
+    #[test]
+    fn an_unranked_device_that_appears_never_takes_the_lane_from_a_ranked_one() {
+        let devices = [sink("speakers", 2), sink("tv", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &ranked(&["usb-dac", "speakers"])
+            ),
+            "speakers"
+        );
+    }
+
+    #[test]
+    fn an_unranked_device_that_appears_does_not_take_the_lane_from_another_unranked_one() {
+        // Equal places: the device the lane is on keeps it.
+        let devices = [sink("tv", 2), sink("projector", 2)];
+        assert_eq!(
+            output(&devices, &["tv"], &on("tv"), &ranked(&["usb-dac"])),
+            "tv"
+        );
+    }
+
+    #[test]
+    fn of_several_arrivals_the_best_ranked_one_is_weighed_against_the_current_device() {
+        let devices = [
+            sink("speakers", 2),
+            sink("tv", 2),
+            sink("headphones", 2),
+            sink("usb-dac", 2),
+        ];
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &ranked(&["usb-dac", "speakers", "headphones"])
+            ),
+            "usb-dac",
+            "the first arrival in the graph is unranked, the best is ranked first"
+        );
+    }
+
+    #[test]
+    fn when_the_current_device_goes_the_first_present_by_rank_is_taken() {
+        let devices = [sink("speakers", 2), sink("headphones", 2), sink("tv", 2)];
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["speakers", "headphones", "tv", "usb-dac"],
+            &on("usb-dac"),
+            &ranked(&["usb-dac", "headphones", "speakers"]),
+        );
+        assert_eq!(selection.target, "headphones");
+        assert!(!selection.write_previous_default);
+    }
+
+    #[test]
+    fn unranked_devices_come_after_every_ranked_one_in_the_graphs_order() {
+        let devices = [sink("tv", 2), sink("projector", 2), sink("speakers", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &[],
+                &SelectionMemory::default(),
+                &ranked(&["usb-dac", "speakers"])
+            ),
+            "speakers",
+            "a ranked device outranks every unranked one, wherever it is in the graph"
+        );
+        let unranked_only = [sink("tv", 2), sink("projector", 2)];
+        assert_eq!(
+            output(
+                &unranked_only,
+                &[],
+                &SelectionMemory::default(),
+                &ranked(&["usb-dac"])
+            ),
+            "tv",
+            "with nothing ranked present, the graph's order"
+        );
+    }
+
+    #[test]
+    fn a_ranking_takes_the_best_device_on_a_first_run_rather_than_the_session_default() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        // `picked` puts the session default on the first sink, the speakers.
+        assert_eq!(
+            output(
+                &devices,
+                &[],
+                &SelectionMemory::default(),
+                &ranked(&["usb-dac", "speakers"])
+            ),
+            "usb-dac"
+        );
+        assert_eq!(
+            output(
+                &devices,
+                &[],
+                &SelectionMemory::default(),
+                &Preference::default()
+            ),
+            "speakers",
+            "following the system, the first run adopts the session default"
+        );
+    }
+
+    #[test]
+    fn with_a_ranking_the_session_default_does_not_move_the_lane() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        // The session default is the speakers; the lane is on the DAC, and nothing arrived.
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers", "usb-dac"],
+                &on("usb-dac"),
+                &ranked(&["speakers", "usb-dac"])
+            ),
+            "usb-dac"
+        );
+    }
+
+    #[test]
+    fn a_device_the_user_has_just_picked_wins_over_the_ranking() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        let memory = SelectionMemory {
+            user_selected: "speakers".into(),
+            ..on("usb-dac")
+        };
+        let preference = Preference {
+            fresh_pick: true,
+            ..ranked(&["usb-dac", "speakers"])
+        };
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["speakers", "usb-dac"],
+            &memory,
+            &preference,
+        );
+        assert_eq!(selection.target, "speakers");
+        assert!(!selection.write_previous_default, "rule 4 never did");
+    }
+
+    #[test]
+    fn once_the_pick_is_the_current_device_a_better_ranked_arrival_takes_the_lane_from_it() {
+        // The user picked the speakers over the ranking; later the DAC is plugged in.
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        let memory = SelectionMemory {
+            user_selected: "speakers".into(),
+            ..on("speakers")
+        };
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &memory,
+                &ranked(&["usb-dac", "speakers"])
+            ),
+            "usb-dac"
+        );
+    }
+
+    #[test]
+    fn a_pick_that_went_and_came_back_is_an_arrival_like_any_other() {
+        // Following the system, rule 4 would take it back; with a ranking it has to outrank the
+        // device the lane went to meanwhile.
+        let devices = [sink("usb-dac", 2), sink("speakers", 2)];
+        let memory = SelectionMemory {
+            user_selected: "speakers".into(),
+            ..on("usb-dac")
+        };
+        assert_eq!(
+            output(
+                &devices,
+                &["usb-dac"],
+                &memory,
+                &ranked(&["usb-dac", "speakers"])
+            ),
+            "usb-dac"
+        );
+        assert_eq!(
+            output(&devices, &["usb-dac"], &memory, &Preference::default()),
+            "speakers"
+        );
+    }
+
+    #[test]
+    fn a_pick_that_is_not_there_leaves_the_choice_to_the_ranking() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        let memory = SelectionMemory {
+            user_selected: "headphones".into(),
+            ..SelectionMemory::default()
+        };
+        let preference = Preference {
+            fresh_pick: true,
+            ..ranked(&["usb-dac", "speakers"])
+        };
+        assert_eq!(output(&devices, &[], &memory, &preference), "usb-dac");
+    }
+
+    #[test]
+    fn the_input_lane_is_ranked_the_same_way() {
+        let sources = [
+            source("internal-mic", 2),
+            source("usb-mic", 1),
+            sink("usb-dac", 2),
+        ];
+        let preference = ranked(&["headset-mic", "usb-mic", "internal-mic"]);
+        let input = |previous: &[&str], memory: &SelectionMemory| {
+            picked(
+                &sources,
+                DeviceDirection::Input,
+                previous,
+                memory,
+                &preference,
+            )
+            .target
+        };
+        assert_eq!(
+            input(&["internal-mic"], &on("internal-mic")),
+            "usb-mic",
+            "arrived, ranked above"
+        );
+        assert_eq!(
+            input(&["usb-mic"], &on("usb-mic")),
+            "usb-mic",
+            "the internal one arrived below it"
+        );
+        assert_eq!(
+            input(
+                &["internal-mic", "usb-mic", "headset-mic"],
+                &on("headset-mic")
+            ),
+            "usb-mic",
+            "the headset went: the next by rank"
+        );
+    }
+
+    #[test]
+    fn an_unheard_device_is_passed_over_even_when_ranked_first() {
+        let devices = [unheard(sink("hdmi", 2)), sink("speakers", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &[],
+                &SelectionMemory::default(),
+                &ranked(&["hdmi", "speakers"])
+            ),
+            "speakers"
+        );
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &ranked(&["hdmi", "speakers"])
+            ),
+            "speakers",
+            "nor does it count as an arrival"
+        );
+    }
+
+    #[test]
+    fn a_current_device_gone_silent_is_left_for_the_next_by_rank() {
+        let devices = [unheard(sink("hdmi", 2)), sink("speakers", 2), sink("tv", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &["hdmi", "speakers", "tv"],
+                &on("hdmi"),
+                &ranked(&["hdmi", "speakers"])
+            ),
+            "speakers"
+        );
+    }
+
+    #[test]
+    fn a_device_that_becomes_heard_arrives_as_a_new_one() {
+        // The monitor is plugged in: the HDMI sink was there all along, but not among what the
+        // rules chose from last time.
+        let devices = [sink("hdmi", 2), sink("speakers", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &ranked(&["hdmi", "speakers"])
+            ),
+            "hdmi"
+        );
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &Preference::default()
+            ),
+            "hdmi",
+            "following the system too, as the HDMI endpoint appearing does on Windows"
+        );
+    }
+
+    #[test]
+    fn an_unheard_device_is_never_rule_sevens_first_device() {
+        // We are the default, nothing is remembered, nothing is new: rule 7 ends in the first
+        // device there is, which here is the silent one.
+        let devices = [unheard(sink("hdmi", 2)), sink("speakers", 2)];
+        let selection = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &[],
+            &SelectionMemory {
+                most_recent_default: "gone".into(),
+                ..SelectionMemory::default()
+            },
+        )
+        .expect("a device");
+        assert_eq!(selection.target, "speakers");
+    }
+
+    #[test]
+    fn an_unheard_device_wins_no_rule_while_anything_can_be_heard() {
+        let devices = [unheard(sink("hdmi", 2)), sink("speakers", 2)];
+        let everything_says_hdmi = SelectionMemory {
+            original_default: "hdmi".into(),
+            most_recent_default: "hdmi".into(),
+            prior_default: "hdmi".into(),
+            most_recent_playback: "hdmi".into(),
+            user_selected: "hdmi".into(),
+        };
+        let selection = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("hdmi"),
+            &names(&["speakers"]),
+            &everything_says_hdmi,
+        )
+        .expect("a device");
+        assert_eq!(selection.target, "speakers", "rules 2 to 7 all name it");
+        let fresh = Preference {
+            fresh_pick: true,
+            ..ranked(&["hdmi"])
+        };
+        assert_eq!(
+            output(&devices, &[], &everything_says_hdmi, &fresh),
+            "speakers",
+            "nor a pick of it, ranked or not"
+        );
+    }
+
+    #[test]
+    fn with_nothing_heard_at_all_the_rules_run_on_what_is_there() {
+        // A desktop whose only outputs are two sleeping monitors: tearing FxSound's node down for
+        // "no devices" would move every application off it until one wakes. The exception U4
+        // records in `docs/0.4.0-upstream.md`.
+        let devices = [unheard(sink("hdmi-1", 2)), unheard(sink("hdmi-2", 2))];
+        assert_eq!(
+            output(&devices, &[], &on("hdmi-2"), &ranked(&["hdmi-1", "hdmi-2"])),
+            "hdmi-2",
+            "the device the lane is on is kept"
+        );
+        assert_eq!(
+            output(&devices, &[], &on("hdmi-2"), &Preference::default()),
+            "hdmi-1",
+            "the session default, following the system"
+        );
+        assert_eq!(
+            candidates(&devices, DeviceDirection::Output, "fxsound_sink").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_lone_sleeping_monitor_keeps_the_output_lane_rather_than_ending_in_no_devices() {
+        let devices = [unheard(sink("hdmi", 2)), sink("fxsound_sink", 2)];
+        let selection = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &names(&["hdmi"]),
+            &on("hdmi"),
+        );
+        assert_eq!(
+            selection.map(|selection| selection.target),
+            Ok("hdmi".to_owned()),
+            "rule 3, not NoOutputDevices"
+        );
+        assert_eq!(
+            output(&devices, &["hdmi"], &on("hdmi"), &ranked(&["hdmi"])),
+            "hdmi",
+            "and ranked the same"
+        );
+    }
+
+    #[test]
+    fn an_empty_headset_jack_that_is_the_only_microphone_keeps_the_input_lane() {
+        let sources = [
+            unheard(source("headset-mic", 1)),
+            unheard(source("line-in", 2)),
+            source("fxsound_source", 2),
+        ];
+        let lone = [unheard(source("headset-mic", 1))];
+        assert_eq!(
+            choose_device(
+                &lone,
+                DeviceDirection::Input,
+                "fxsound_source",
+                None,
+                &[],
+                &SelectionMemory::default(),
+                &Preference::default(),
+            )
+            .map(|selection| selection.target),
+            Ok("headset-mic".to_owned()),
+            "rule 3, not NoInputDevices"
+        );
+        assert_eq!(
+            picked(
+                &sources,
+                DeviceDirection::Input,
+                &["headset-mic", "line-in"],
+                &on("line-in"),
+                &ranked(&["headset-mic", "line-in"]),
+            )
+            .target,
+            "line-in",
+            "the ranked rules keep the device the lane is on"
+        );
+        assert_eq!(
+            candidates(&sources, DeviceDirection::Input, "fxsound_source").len(),
+            2,
+            "every real microphone, and never ours"
+        );
+    }
+
+    #[test]
+    fn once_anything_can_be_heard_again_the_silent_devices_drop_out() {
+        let asleep = [unheard(sink("hdmi-1", 2)), unheard(sink("hdmi-2", 2))];
+        let one_awake = [unheard(sink("hdmi-1", 2)), sink("hdmi-2", 2)];
+        assert_eq!(
+            output(&asleep, &[], &on("hdmi-1"), &ranked(&["hdmi-1", "hdmi-2"])),
+            "hdmi-1"
+        );
+        assert_eq!(
+            output(
+                &one_awake,
+                &["hdmi-1", "hdmi-2"],
+                &on("hdmi-1"),
+                &ranked(&["hdmi-1", "hdmi-2"]),
+            ),
+            "hdmi-2",
+            "the lane leaves the silent device it was kept on"
+        );
+    }
+
+    #[test]
+    fn the_candidates_are_the_heard_devices_of_the_direction_and_never_ours() {
+        let devices = [
+            unheard(sink("hdmi", 2)),
+            sink("speakers", 2),
+            sink("fxsound_sink", 2),
+            source("mic", 1),
+            unheard(source("headset-mic", 1)),
+        ];
+        let named = |direction, ours| -> Vec<String> {
+            candidates(&devices, direction, ours)
+                .into_iter()
+                .map(|device| device.name.clone())
+                .collect()
+        };
+        assert_eq!(named(DeviceDirection::Output, "fxsound_sink"), ["speakers"]);
+        assert_eq!(named(DeviceDirection::Input, "fxsound_source"), ["mic"]);
+    }
+
+    #[test]
+    fn the_default_is_handed_back_to_a_remembered_device_that_can_be_heard_first() {
+        let sources = [unheard(source("headset-mic", 1)), source("dmic", 2)];
+        let memory = SelectionMemory {
+            user_selected: "headset-mic".into(),
+            most_recent_playback: "dmic".into(),
+            ..SelectionMemory::default()
+        };
+        assert_eq!(
+            restore_default_candidate(&memory, &sources, DeviceDirection::Input).as_deref(),
+            Some("dmic")
+        );
+        let silent = [unheard(source("headset-mic", 1))];
+        assert_eq!(
+            restore_default_candidate(&memory, &silent, DeviceDirection::Input).as_deref(),
+            Some("headset-mic"),
+            "with nothing remembered heard, the order alone decides"
+        );
+    }
+
+    #[test]
+    fn a_nodes_card_device_is_read_from_its_properties() {
+        let hdmi = DeviceInfo::from_props(
+            52,
+            &props_of(&[
+                ("media.class", "Audio/Sink"),
+                ("node.name", "hdmi"),
+                ("card.profile.device", "2"),
+            ]),
+        )
+        .expect("a sink");
+        assert_eq!(hdmi.profile_device, Some(2));
+        assert!(hdmi.available, "heard until its card says otherwise");
+        let virtual_sink = DeviceInfo::from_props(
+            80,
+            &props_of(&[("media.class", "Audio/Sink"), ("node.name", "virtual")]),
+        )
+        .expect("a sink");
+        assert_eq!(virtual_sink.profile_device, None);
+    }
+
+    // The UCM laptop (`crate::routes`' fixture): every HDMI port empty, nothing in the headset jack.
+
+    use crate::routes::tests::{
+        DMIC, HDMI1, HDMI2, HDMI3, HEADSET_MIC, SPEAKER, ucm_devices_as_heard,
+    };
+
+    #[test]
+    fn on_the_ucm_laptop_a_ranking_with_hdmi_first_still_plays_to_the_speakers() {
+        let devices = ucm_devices_as_heard();
+        let preference = ranked(&[HDMI1, HDMI2, HDMI3, SPEAKER]);
+        assert_eq!(
+            output(&devices, &[], &SelectionMemory::default(), &preference),
+            SPEAKER
+        );
+        assert_eq!(
+            output(&devices, &[SPEAKER], &on(SPEAKER), &preference),
+            SPEAKER
+        );
+    }
+
+    #[test]
+    fn on_the_ucm_laptop_rule_sevens_first_device_is_not_a_silent_hdmi_sink() {
+        // The speakers' node made last, as it is after the headphones come out and the card
+        // switches profile: the graph lists the HDMI sinks first.
+        let mut devices = ucm_devices_as_heard();
+        devices.sort_by_key(|device| device.name != HDMI1);
+        assert_eq!(devices[0].name, HDMI1);
+        let selection = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &[],
+            &SelectionMemory {
+                most_recent_default: "gone".into(),
+                ..SelectionMemory::default()
+            },
+        )
+        .expect("a device");
+        assert_eq!(selection.target, SPEAKER);
+    }
+
+    #[test]
+    fn on_the_ucm_laptop_the_empty_headset_jacks_microphone_is_passed_over() {
+        let devices = ucm_devices_as_heard();
+        let selection = picked(
+            &devices,
+            DeviceDirection::Input,
+            &[],
+            &SelectionMemory::default(),
+            &ranked(&[HEADSET_MIC, DMIC]),
+        );
+        assert_eq!(selection.target, DMIC);
     }
 }
