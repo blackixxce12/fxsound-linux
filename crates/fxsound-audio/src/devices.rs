@@ -224,6 +224,57 @@ fn is_bluez_headset_profile<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> bool 
     get("api.bluez5.profile").is_some_and(|p| p.starts_with("headset") || p.starts_with("hfp"))
 }
 
+/// `api.bluez5.address`, the one key a Bluetooth node and its card both carry, when it says
+/// anything.
+pub(crate) fn bluez_address<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> Option<String> {
+    get("api.bluez5.address")
+        .filter(|address| !address.is_empty())
+        .map(str::to_owned)
+}
+
+/// A PipeWire `Device` object: the sound card, or the Bluetooth headset, that nodes belong to —
+/// what WirePlumber names `alsa_card.*` and `bluez_card.*`.
+///
+/// Kept for one question: when the node a lane is attached to goes, did its card go with it? A
+/// card that stays is a card between profiles. WirePlumber 0.5.17 switches a headset to its call
+/// profile when something records from it, and back to A2DP when the recording ends
+/// (`device/autoswitch-bluetooth-profile.lua`), and every switch removes the headset's sink and
+/// adds it back under the same name about half a second later (`monitors/bluez/name-node.lua:52-55`
+/// names a Bluetooth node by address and node number, not by profile). An ALSA card switched to
+/// another profile does the same to its nodes. The engine waits for such a node rather than
+/// moving the music to the speakers for the length of the switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Card {
+    /// The registry global id: what a node names in `device.id`. Runtime only.
+    pub object_id: u32,
+    /// `api.bluez5.address`, for a Bluetooth card. Not in the registry global; the engine reads it
+    /// from the card's own info once it is bound.
+    pub bluez_address: Option<String>,
+}
+
+impl Card {
+    /// Build a card from a `Device` object's property dictionary.
+    #[must_use]
+    pub fn from_props<'a>(object_id: u32, get: &impl Fn(&str) -> Option<&'a str>) -> Self {
+        Self {
+            object_id,
+            bluez_address: bluez_address(get),
+        }
+    }
+
+    /// Whether a node that names `card_id` in `device.id`, or carries `bluez_address`, belongs to
+    /// this card. Either is enough; neither is nothing — two unknowns are not the same card.
+    ///
+    /// Asked with the two keys of a node that has just gone ([`DeviceInfo::card_present`]), and
+    /// again, with the same two kept, when a card goes after it: a lane waiting for a node whose
+    /// card has gone too waits no more.
+    #[must_use]
+    pub fn owns(&self, card_id: Option<u32>, bluez_address: Option<&str>) -> bool {
+        card_id == Some(self.object_id)
+            || (bluez_address.is_some() && bluez_address == self.bluez_address.as_deref())
+    }
+}
+
 /// The most positioned channels FxSound will ever declare, `SND_DEVICES_MAX_NUM_CHANS`.
 pub const MAX_POSITIONS: usize = MAX_CHANNELS as usize;
 
@@ -473,7 +524,21 @@ pub struct DeviceInfo {
     /// The registry global id. Runtime only.
     pub object_id: u32,
     /// `object.serial`, monotonic within one server lifetime. Runtime only.
+    ///
+    /// What tells this node from another that has since taken its name: the server hands a freed
+    /// id to the next object, but never a serial. A Bluetooth headset switching profile has its
+    /// sink removed and added back under the same `node.name` with a new serial, and a pair built
+    /// on the old one has to be rebuilt on the new one for anything to link to it again.
     pub object_serial: Option<u64>,
+    /// `device.id`: the [`Card`] — PipeWire's `Device` object, the sound card or the Bluetooth
+    /// headset — this node belongs to, when it belongs to one. Runtime only; a virtual sink has
+    /// none. The card outlives its nodes' comings and goings, which is what
+    /// [`DeviceInfo::card_present`] asks about.
+    pub card_id: Option<u32>,
+    /// `api.bluez5.address`, on a node PipeWire's Bluetooth plugin made: the other way to tell
+    /// which [`Card`] it belongs to. The registry global does not carry it; the engine reads it
+    /// from the node's own info.
+    pub bluez_address: Option<String>,
     /// `node.name` — the stable identity, the analogue of the WASAPI endpoint id string.
     pub name: String,
     /// `node.description` — what the device picker shows (`deviceFriendlyName`).
@@ -549,6 +614,8 @@ impl DeviceInfo {
         Some(Self {
             object_id,
             object_serial: get("object.serial").and_then(|s| s.parse::<u64>().ok()),
+            card_id: get("device.id").and_then(|s| s.parse::<u32>().ok()),
+            bluez_address: bluez_address(get),
             name,
             description,
             nick,
@@ -578,6 +645,23 @@ impl DeviceInfo {
             None if self.bluez_headset => Some(BLUEZ_HEADSET_RATE as f32),
             None => None,
         }
+    }
+
+    /// Whether the card this node belongs to is among `cards`: the one it names in `device.id`,
+    /// or a card with its Bluetooth address.
+    ///
+    /// Asked about a node that has just gone. Yes means it went because its card is changing
+    /// profile, and a node of the same name is about to come back ([`Card`]); no — a node on no
+    /// card at all, like a virtual sink, or one whose card went too — means it is gone. The
+    /// address is the second way to ask because it is the one both sides of a Bluetooth pair are
+    /// known to carry, whatever made the node; WirePlumber also puts `device.id` on every node it
+    /// makes for a card, the loopback microphone included (`monitors/bluez/name-node.lua:34`,
+    /// `create-loopback-node.lua:50`).
+    #[must_use]
+    pub fn card_present(&self, cards: &[Card]) -> bool {
+        cards
+            .iter()
+            .any(|card| card.owns(self.card_id, self.bluez_address.as_deref()))
     }
 
     /// Project into the type the GUI consumes over [`fxsound_core::messages::AudioToUi`].
@@ -1227,6 +1311,8 @@ mod tests {
         DeviceInfo {
             object_id: 0,
             object_serial: None,
+            card_id: None,
+            bluez_address: None,
             name: name.to_owned(),
             description: name.to_owned(),
             nick: name.to_owned(),
@@ -1874,6 +1960,157 @@ mod tests {
             on_a2dp.positions.resized(on_a2dp.clamped_channels()),
             headset.positions.resized(headset.clamped_channels())
         );
+    }
+
+    /// Every card in a `pw-dump`, parsed the way the engine parses a `Device` object.
+    fn cards_in(dump: &str) -> Vec<Card> {
+        objects_in(dump)
+            .into_iter()
+            .filter(|(_, type_, _)| type_ == "PipeWire:Interface:Device")
+            .map(|(id, _, props)| {
+                Card::from_props(id, &|key: &str| {
+                    props
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.as_str())
+                })
+            })
+            .collect()
+    }
+
+    /// The headset's sink in the Bluetooth fixture.
+    fn headset_sink() -> DeviceInfo {
+        devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP)
+            .into_iter()
+            .find(|d| d.name == HEADSET_SINK)
+            .expect("the headset's sink is in the fixture")
+    }
+
+    #[test]
+    fn a_node_says_which_card_it_belongs_to_and_a_bluetooth_node_its_address() {
+        let devices = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let headset = headset_sink();
+        assert_eq!(headset.card_id, Some(60));
+        assert_eq!(headset.bluez_address.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(headset.object_serial, Some(70));
+
+        let speakers = devices
+            .iter()
+            .find(|d| d.name == LAPTOP_SPEAKERS)
+            .expect("the laptop's speakers are in the fixture");
+        assert_eq!(speakers.card_id, Some(45));
+        assert_eq!(speakers.bluez_address, None, "an ALSA node has no address");
+
+        // A virtual sink belongs to no card.
+        let virtual_sink = DeviceInfo::from_props(90, &|key: &str| match key {
+            "media.class" => Some(SINK_MEDIA_CLASS),
+            "node.name" => Some("easyeffects_sink"),
+            "object.serial" => Some("900"),
+            _ => None,
+        })
+        .expect("a virtual sink is still a sink");
+        assert_eq!(virtual_sink.object_serial, Some(900));
+        assert_eq!(virtual_sink.card_id, None);
+        assert_eq!(virtual_sink.bluez_address, None);
+    }
+
+    #[test]
+    fn a_card_reads_its_bluetooth_address_and_an_empty_address_is_no_address() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        assert_eq!(
+            cards,
+            [Card {
+                object_id: 60,
+                bluez_address: Some("00:11:22:33:44:55".to_owned()),
+            }],
+            "the fixture's one card is the headset's"
+        );
+        let blank = Card::from_props(7, &|key: &str| (key == "api.bluez5.address").then_some(""));
+        assert_eq!(blank.bluez_address, None);
+    }
+
+    #[test]
+    fn a_card_owns_a_node_by_its_id_or_its_address_and_never_by_two_unknowns() {
+        let headset = Card {
+            object_id: 60,
+            bluez_address: Some("00:11:22:33:44:55".to_owned()),
+        };
+        assert!(headset.owns(Some(60), None), "by `device.id`");
+        assert!(
+            headset.owns(None, Some("00:11:22:33:44:55")),
+            "by `api.bluez5.address`"
+        );
+        assert!(
+            headset.owns(Some(60), Some("66:77:88:99:AA:BB")),
+            "either is enough"
+        );
+        assert!(!headset.owns(Some(61), Some("66:77:88:99:AA:BB")));
+        assert!(!headset.owns(None, None));
+
+        let alsa = Card {
+            object_id: 45,
+            bluez_address: None,
+        };
+        assert!(alsa.owns(Some(45), None));
+        assert!(
+            !alsa.owns(None, None),
+            "a card with no address and a node with none are not the same card"
+        );
+    }
+
+    #[test]
+    fn a_headsets_sink_that_went_while_its_card_stayed_still_has_its_card() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        assert!(
+            headset_sink().card_present(&cards),
+            "the call profile's sink went; the headset did not"
+        );
+        assert!(
+            !headset_sink().card_present(&[]),
+            "with the headset's card gone too, the headset is gone"
+        );
+    }
+
+    #[test]
+    fn a_bluetooth_node_without_a_device_id_is_matched_to_its_card_by_address() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let unnumbered = DeviceInfo {
+            card_id: None,
+            ..headset_sink()
+        };
+        assert!(unnumbered.card_present(&cards));
+
+        let another_headset = DeviceInfo {
+            card_id: None,
+            bluez_address: Some("66:77:88:99:AA:BB".to_owned()),
+            ..headset_sink()
+        };
+        assert!(
+            !another_headset.card_present(&cards),
+            "another headset's card is not this one's"
+        );
+    }
+
+    #[test]
+    fn a_node_on_no_card_or_on_a_card_that_is_not_there_has_no_card_to_wait_for() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let speakers = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP)
+            .into_iter()
+            .find(|d| d.name == LAPTOP_SPEAKERS)
+            .expect("the laptop's speakers are in the fixture");
+        assert!(
+            !speakers.card_present(&cards),
+            "the fixture leaves the ALSA card out, so the speakers' card is not there"
+        );
+        // Neither an id nor an address: nothing matches, not even a card with no address of its
+        // own — two unknowns are not the same card.
+        let virtual_sink = sink("easyeffects_sink", 2);
+        let cards_without_addresses = [Card {
+            object_id: 0,
+            bluez_address: None,
+        }];
+        assert!(!virtual_sink.card_present(&cards_without_addresses));
+        assert!(!virtual_sink.card_present(&cards));
     }
 
     #[test]
