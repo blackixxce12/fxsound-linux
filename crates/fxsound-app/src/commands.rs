@@ -15,7 +15,7 @@
 use crate::app::{App, detach, select_on};
 use crate::cli::{Command, DeviceCommand, PowerCommand, PresetCommand, WindowCommand};
 use fxsound_core::{AudioDevice, DeviceDirection, Effect, ThemeMode, ViewMode, eq};
-use fxsound_ui::UiAction;
+use fxsound_ui::{UiAction, state::UiState};
 use serde::Serialize;
 
 /// What executing a command asks the window layer to do.
@@ -120,13 +120,13 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
             };
         }
 
-        // The stream is served by the control socket itself, which hands a watching connection to
-        // a broadcaster instead of to this function (0.4.0 design §10). A `Watch` that gets here
-        // came some other way, and one answer is not a stream.
+        // The stream is served by the control socket itself, which hands a frame with `watch`
+        // set to a broadcaster instead of to this function (0.4.0 design §10). A `Watch` that
+        // gets here came in a frame that expects one answer, and one answer is not a stream.
         Command::Watch { .. } => {
             return Outcome::refused(
-                "--watch needs the event stream of the control socket, and this instance does not \
-                 serve one",
+                "--watch is a stream: subscribe with a watch request on the control socket, as \
+                 `fxsound --watch` does",
             );
         }
 
@@ -644,26 +644,32 @@ pub fn status_document(app: &App) -> StatusDocument {
             noise_suppression: app.settings().noise_suppression.key(),
             denoise_level: state.denoise_level.key(),
         },
-        input_meters: InputMeters {
-            voice_probability: rounded(state.voice_probability, 2),
-            // Read as the strip reads it: a floor is a measurement only while the microphone is
-            // delivering and once the running minimum has come down from full scale — `0.0` is
-            // `Meters::default()`, and a room at 0 dBFS is not a reading anyone will get.
-            noise_floor_db: (state.input_active
-                && state.noise_floor_db.is_finite()
-                && state.noise_floor_db < 0.0)
-                .then(|| rounded(state.noise_floor_db, 1)),
-            denoise_reduction_db: rounded(state.denoise_reduction_db, 1),
-            gate_reduction_db: rounded(state.gate_reduction_db, 1),
-            compressor_reduction_db: rounded(state.compressor_reduction_db, 1),
-            deesser_reduction_db: rounded(state.deesser_reduction_db, 1),
-            denoise_running: state.denoise_running,
-            deesser_running: state.deesser_running,
-        },
+        input_meters: input_meters(state),
         echo_cancel: EchoCancelStatus {
             on: state.echo_cancel_on,
             running: state.echo_cancel_running,
         },
+    }
+}
+
+/// The microphone's telemetry as `--status` and the `input_meters` event report it.
+#[must_use]
+pub fn input_meters(state: &UiState) -> InputMeters {
+    InputMeters {
+        voice_probability: rounded(state.voice_probability, 2),
+        // Read as the strip reads it: a floor is a measurement only while the microphone is
+        // delivering and once the running minimum has come down from full scale — `0.0` is
+        // `Meters::default()`, and a room at 0 dBFS is not a reading anyone will get.
+        noise_floor_db: (state.input_active
+            && state.noise_floor_db.is_finite()
+            && state.noise_floor_db < 0.0)
+            .then(|| rounded(state.noise_floor_db, 1)),
+        denoise_reduction_db: rounded(state.denoise_reduction_db, 1),
+        gate_reduction_db: rounded(state.gate_reduction_db, 1),
+        compressor_reduction_db: rounded(state.compressor_reduction_db, 1),
+        deesser_reduction_db: rounded(state.deesser_reduction_db, 1),
+        denoise_running: state.denoise_running,
+        deesser_running: state.deesser_running,
     }
 }
 
@@ -1949,6 +1955,11 @@ mod tests {
             }],
         );
         assert!(outcome.failed);
+        assert!(
+            outcome.stderr.contains("watch request"),
+            "{}",
+            outcome.stderr
+        );
         assert!(outcome.stdout.is_empty());
         assert!(outcome.window.is_empty());
     }

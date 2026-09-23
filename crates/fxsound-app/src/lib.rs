@@ -8,6 +8,7 @@
 pub mod app;
 pub mod cli;
 pub mod commands;
+pub mod events;
 pub mod ipc;
 pub mod notify;
 pub mod selftest;

@@ -10,9 +10,10 @@
 //!    take a lock, open a socket, show a window or write a setting (0.4.0 design §13).
 //! 2. Try to become the single instance. If another one is already running, forward the command
 //!    line to it over the control socket, print whatever it says and exit — which is what makes
-//!    `fxsound --next-preset` usable as a compositor keybind. `--quit` with nobody to forward to
-//!    reports that FxSound is not running and stops right here, before step 3 could claim the
-//!    session default sink.
+//!    `fxsound --next-preset` usable as a compositor keybind. `--watch` subscribes instead and
+//!    prints the running instance's events until it quits. `--quit`, `--status` and `--watch`
+//!    with nobody to forward to report that FxSound is not running and stop right here, before
+//!    step 3 could claim the session default sink.
 //! 3. Start the audio engine. A missing or broken PipeWire is **not** fatal: the window still
 //!    opens and says so. The Windows build quits hard when its driver is missing; on Linux the
 //!    same conditions are routine and recoverable (`docs/spec/00-architecture.md` §10, open
@@ -48,8 +49,9 @@ use eframe::egui;
 use fxsound_app::{
     App, WindowVisibility,
     app::{FORBIDDEN_PRESET_NAME_CHARS, MAX_PRESET_NAME_CHARS, preset_name_available},
-    cli::Cli,
+    cli::{Cli, Command},
     commands::{self, WindowRequest},
+    events::{self, AppEvent},
     ipc::{self, Instance},
     selftest,
     tray::{self, TrayCommand, TrayDevice, TrayHandle, TrayPreset, TrayState},
@@ -107,6 +109,11 @@ fn main() -> eframe::Result<()> {
     let listener = match Instance::acquire() {
         Ok(Instance::Primary(listener)) => listener,
         Ok(Instance::Secondary(client)) => {
+            // A stream, not one answer: print events until the running instance quits. Decided by
+            // the same `commands()` the primary runs, so `--status --watch` stays a `--status`.
+            if let [Command::Watch { meters, .. }] = cli.commands().as_slice() {
+                std::process::exit(client.watch(*meters));
+            }
             // The primary re-parses our argv itself, so nothing is lost in translation.
             match client.forward() {
                 Ok(response) => {
@@ -226,6 +233,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let mut runtime = Runtime {
+        events: events::Snapshot::of(&app),
         app,
         server,
         tray,
@@ -286,6 +294,8 @@ enum HeadlessExit {
 struct Runtime {
     app: App,
     server: ipc::Server,
+    /// What the `--watch` stream last said, so each tick publishes only what changed.
+    events: events::Snapshot,
     tray: Option<TrayHandle>,
     tray_rx: crossbeam_channel::Receiver<TrayCommand>,
     /// What the tray was last told, so it is only updated on a real change.
@@ -339,7 +349,23 @@ impl Runtime {
         // Flush settings a tray or IPC path may have dirtied without going through `handle`.
         self.app.handle(&[]);
         self.sync_tray();
+        self.publish_events();
         request
+    }
+
+    /// Tell the `--watch` subscribers what changed this tick.
+    ///
+    /// Diffed from a snapshot of the controller for now; the controller queuing events as it
+    /// makes the changes (`App::drain_events`) replaces this, and feeds D-Bus and the tray too.
+    fn publish_events(&mut self) {
+        let server = &self.server;
+        self.events.diff(&self.app, |event| server.publish(&event));
+        // Gathered only for a subscriber that asked; `publish` holds each to four a second.
+        if server.wants_meters() {
+            server.publish(&AppEvent::InputMeters(commands::input_meters(
+                &self.app.state,
+            )));
+        }
     }
 
     /// Run one window until it is closed. Returns why.
@@ -350,6 +376,7 @@ impl Runtime {
         self.app.assets.clear();
         let options = native_options(self.app.state.view);
 
+        self.server.publish(&AppEvent::Window { visible: true });
         let runtime = &mut *self;
         eframe::run_native(
             "FxSound",
@@ -363,6 +390,10 @@ impl Runtime {
                 Ok(Box::new(Shell::new(runtime, palette.mode())))
             }),
         )?;
+        // A quit is announced by `shutdown`, as `quit`.
+        if self.exit == WindowExit::Hidden {
+            self.server.publish(&AppEvent::Window { visible: false });
+        }
         Ok(self.exit)
     }
 
@@ -398,8 +429,10 @@ impl Runtime {
     }
 
     /// The only way out: stash unsaved edits, restore the system default device and stop the
-    /// engine, remove the tray item. Dropping the server unlinks the control socket.
+    /// engine, remove the tray item. Dropping the server unlinks the control socket and ends
+    /// every `--watch` stream, right after the `quit` event said why.
     fn shutdown(mut self) {
+        self.server.publish(&AppEvent::Quit);
         self.app.shutdown();
         if let Some(tray) = &self.tray {
             tray.shutdown();
