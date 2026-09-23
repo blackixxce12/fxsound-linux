@@ -2452,6 +2452,16 @@ fn control(shared: &mut Shared, message: UiToAudio) {
         UiToAudio::SystemSleeping(true) => go_to_sleep(shared, Instant::now()),
         UiToAudio::SystemSleeping(false) => wake_up(shared, Instant::now()),
         UiToAudio::KeepInputAwake(awake) => keep_input_awake(shared, awake),
+        UiToAudio::SetAppRoutes(routes) => {
+            // Per-application routes (`docs/0.4.0-apps.md`) are not built yet. The message is
+            // accepted so the app can already send the set it resolved, and every application
+            // stays on its lane's chain until the routes exist — the same place a route that
+            // could not be made leaves it.
+            log::debug!(
+                "{} per-application routes asked for; routes are not built yet",
+                routes.len()
+            );
+        }
         UiToAudio::Shutdown => unreachable!("handled by handle_control"),
     }
     // A detached microphone lane, another microphone or other speakers: whatever the message
@@ -9200,6 +9210,30 @@ mod tests {
         assert!(shared.keep_input_awake, "a sleep does not let go of it");
         control(&mut shared, UiToAudio::KeepInputAwake(false));
         assert!(!shared.keep_input_awake);
+    }
+
+    #[test]
+    fn per_application_routes_are_accepted_and_change_nothing_until_routes_exist() {
+        use fxsound_core::messages::{AppRoute, DspParams, RouteParams};
+
+        let (mut shared, messages) = shared_with_messages();
+        let route = AppRoute {
+            direction: DeviceDirection::Output,
+            app: fxsound_core::AppKey {
+                binary: "bf6.exe".to_owned(),
+                name: "Battlefield 6".to_owned(),
+                flatpak: String::new(),
+            },
+            preset: "Gaming".to_owned(),
+            params: RouteParams::Output(DspParams::default()),
+            chain: String::new(),
+        };
+        control(&mut shared, UiToAudio::SetAppRoutes(vec![route]));
+        control(&mut shared, UiToAudio::SetAppRoutes(Vec::new()));
+        assert!(drained(&messages).is_empty(), "nothing to report");
+        assert!(shared.lanes.output.nodes.is_none());
+        assert!(shared.lanes.input.nodes.is_none());
+        assert!(!shared.needs_publish, "and no device list to republish");
     }
 
     #[test]

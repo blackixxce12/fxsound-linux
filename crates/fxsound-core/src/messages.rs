@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::apps::AppKey;
 use crate::{
     AudioDevice, AudioStatus, DeEsserMode, DenoiseChannelMode, DenoiseControl, DenoiseLevel,
     DereverbLevel, Detection, DeviceDirection, Effect, EqBand, NUM_SPECTRUM_BARS, SpectrumFrame,
@@ -668,6 +669,94 @@ impl TargetVolume {
     }
 }
 
+/// One application's stream, as the engine sees it in the graph (`docs/0.4.0-apps.md`).
+///
+/// Every client stream that is not FxSound's own and not the echo canceller's: a player's
+/// playback stream, a recorder's capture stream. Reported in full ([`AudioToUi::AppStreams`]),
+/// which is what the Applications list shows as running and what the app matches its rules
+/// against. Plain data with serde, so the command line's `--list-apps --json` and D-Bus's
+/// `ListApps` can hand it on as it is.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppStream {
+    /// PipeWire node id of the stream. Not stable across restarts of the application; the
+    /// subject the engine writes the stream's `target.object` for.
+    pub id: u32,
+    /// Playback (`Output`) or recording (`Input`), which is also the lane whose device it uses.
+    pub direction: DeviceDirection,
+    /// Who the stream belongs to.
+    pub app: AppKey,
+    /// The preset of the route the stream was moved onto, or `None` while it plays or records
+    /// through its lane's own chain — including when its rule asked for a route that could not
+    /// be made.
+    pub route: Option<String>,
+}
+
+/// The chain parameters a route runs: an output preset's for a playback route, an input
+/// preset's for a recording route.
+///
+/// `Copy`, like the snapshots it carries: the engine publishes it into the route's own triple
+/// buffer on the control thread, and the audio thread reads it from there, never from a message.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RouteParams {
+    /// For a route in front of the output lane's device.
+    Output(DspParams),
+    /// For a route behind the input lane's device.
+    Input(InputDspParams),
+}
+
+impl RouteParams {
+    /// The direction the parameters are for: the chain they can drive.
+    #[must_use]
+    pub const fn direction(&self) -> DeviceDirection {
+        match self {
+            Self::Output(_) => DeviceDirection::Output,
+            Self::Input(_) => DeviceDirection::Input,
+        }
+    }
+
+    /// Force the snapshot into the ranges its chain accepts: [`DspParams::sanitise`] or
+    /// [`InputDspParams::sanitise`].
+    pub fn sanitise(&mut self) {
+        match self {
+            Self::Output(params) => params.sanitise(),
+            Self::Input(params) => params.sanitise(),
+        }
+    }
+}
+
+/// One application that is to run through a preset of its own (`docs/0.4.0-apps.md`).
+///
+/// The app resolves every rule of the store (`crate::apps::AppRules`) to one of these — it owns
+/// the preset stores, so it is the one that can turn a preset's name into parameters — and sends
+/// the whole set in [`UiToAudio::SetAppRoutes`]. Routes are per preset, not per application:
+/// every entry of one lane naming the same preset shares one pair of nodes, up to
+/// [`MAX_ROUTES_PER_LANE`](crate::apps::MAX_ROUTES_PER_LANE) presets per lane.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppRoute {
+    /// The lane the application's stream belongs to.
+    pub direction: DeviceDirection,
+    /// Which application's streams to move onto the route.
+    pub app: AppKey,
+    /// The preset's name: what the route's node is called in a mixer, and how entries sharing a
+    /// route are grouped.
+    pub preset: String,
+    /// The preset resolved to chain parameters, for `direction`.
+    pub params: RouteParams,
+    /// The stage ordering an input route runs, by name, as in [`UiToAudio::SetInputChain`];
+    /// unused for an output route.
+    pub chain: String,
+}
+
+impl AppRoute {
+    /// Whether the parameters are for the route's own direction. A route that is not would hand
+    /// one chain the other's snapshot; the engine refuses it rather than guess which was meant.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.params.direction() == self.direction
+    }
+}
+
 /// Control-thread requests. These may allocate and may block; they never reach the RT thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiToAudio {
@@ -763,6 +852,14 @@ pub enum UiToAudio {
     /// about a second after the message, once the profile has switched. Kept until `false`,
     /// across devices and reconnects.
     KeepInputAwake(bool),
+    /// Every application that is to run through a preset of its own, both lanes at once
+    /// (`docs/0.4.0-apps.md`). The full set each time, never a change: the engine compares it
+    /// with what it runs, builds the routes that are new, moves the streams, and tears down what
+    /// is no longer asked for. Empty means no application has a preset of its own.
+    ///
+    /// Resent whenever a rule changes, a preset a rule uses is saved, renamed or deleted, or the
+    /// output levels every chain shares — master gain, balance, levelling, band count — change.
+    SetAppRoutes(Vec<AppRoute>),
 }
 
 /// Control-thread notifications for the GUI.
@@ -815,6 +912,10 @@ pub enum AudioToUi {
         direction: Option<DeviceDirection>,
         message: String,
     },
+    /// Every application stream in the graph, both directions, whenever the set or a stream's
+    /// route changes (`docs/0.4.0-apps.md`). The full list each time, so the Applications list is
+    /// always what the graph holds and never an accumulation of changes.
+    AppStreams(Vec<AppStream>),
 }
 
 #[cfg(test)]
@@ -1302,6 +1403,147 @@ mod tests {
                 message: "call quality".to_owned(),
             },
             "a warning is not an error, even with the same text"
+        );
+    }
+
+    fn battlefield() -> AppKey {
+        AppKey {
+            binary: "bf6.exe".to_owned(),
+            name: "Battlefield 6".to_owned(),
+            flatpak: String::new(),
+        }
+    }
+
+    #[test]
+    fn route_parameters_know_which_chain_they_drive() {
+        assert_eq!(
+            RouteParams::Output(DspParams::default()).direction(),
+            DeviceDirection::Output
+        );
+        assert_eq!(
+            RouteParams::Input(InputDspParams::default()).direction(),
+            DeviceDirection::Input
+        );
+    }
+
+    #[test]
+    fn route_parameters_are_sanitised_by_the_rules_of_their_own_chain() {
+        let mut output = RouteParams::Output(DspParams {
+            master_gain_db: f32::NAN,
+            ..DspParams::default()
+        });
+        output.sanitise();
+        let RouteParams::Output(params) = output else {
+            panic!("still an output snapshot");
+        };
+        assert_eq!(params.master_gain_db, DspParams::default().master_gain_db);
+
+        let mut input = RouteParams::Input(InputDspParams {
+            ceiling_db: f32::NAN,
+            ..InputDspParams::default()
+        });
+        input.sanitise();
+        let RouteParams::Input(params) = input else {
+            panic!("still an input snapshot");
+        };
+        assert_eq!(params.ceiling_db, InputDspParams::default().ceiling_db);
+    }
+
+    #[test]
+    fn a_route_is_consistent_only_when_its_parameters_are_for_its_own_lane() {
+        let mut route = AppRoute {
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            preset: "Gaming".to_owned(),
+            params: RouteParams::Output(DspParams::default()),
+            chain: String::new(),
+        };
+        assert!(route.is_consistent());
+        route.params = RouteParams::Input(InputDspParams::default());
+        assert!(
+            !route.is_consistent(),
+            "an input snapshot for a playback route"
+        );
+        route.direction = DeviceDirection::Input;
+        route.chain = "voice".to_owned();
+        assert!(route.is_consistent());
+    }
+
+    #[test]
+    fn the_route_set_compares_by_value_so_the_engine_can_diff_it() {
+        let route = AppRoute {
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            preset: "Gaming".to_owned(),
+            params: RouteParams::Output(DspParams::default()),
+            chain: String::new(),
+        };
+        let set = UiToAudio::SetAppRoutes(vec![route.clone()]);
+        assert_eq!(set.clone(), set);
+        let louder = AppRoute {
+            params: RouteParams::Output(DspParams {
+                master_gain_db: 3.0,
+                ..DspParams::default()
+            }),
+            ..route.clone()
+        };
+        assert_ne!(
+            set,
+            UiToAudio::SetAppRoutes(vec![louder]),
+            "a changed level is a changed set"
+        );
+        assert_ne!(set, UiToAudio::SetAppRoutes(Vec::new()));
+        let other_preset = AppRoute {
+            preset: "Movies".to_owned(),
+            ..route
+        };
+        assert_ne!(set, UiToAudio::SetAppRoutes(vec![other_preset]));
+    }
+
+    #[test]
+    fn an_app_stream_round_trips_through_toml_with_and_without_a_route() {
+        let routed = AppStream {
+            id: 87,
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            route: Some("Gaming".to_owned()),
+        };
+        let text = toml::to_string(&routed).expect("serialise");
+        for line in ["id = 87", "direction = \"output\"", "route = \"Gaming\""] {
+            assert!(text.contains(line), "missing {line:?} in:\n{text}");
+        }
+        assert_eq!(toml::from_str::<AppStream>(&text).expect("parse"), routed);
+
+        let on_its_lane = AppStream {
+            id: 91,
+            direction: DeviceDirection::Input,
+            app: AppKey {
+                binary: "discord".to_owned(),
+                name: "Discord".to_owned(),
+                flatpak: "com.discordapp.Discord".to_owned(),
+            },
+            route: None,
+        };
+        let text = toml::to_string(&on_its_lane).expect("serialise");
+        assert!(!text.contains("route"), "no route, no key: {text}");
+        assert_eq!(
+            toml::from_str::<AppStream>(&text).expect("parse"),
+            on_its_lane
+        );
+    }
+
+    #[test]
+    fn the_stream_report_is_its_own_message() {
+        let streams = AudioToUi::AppStreams(vec![AppStream {
+            id: 87,
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            route: None,
+        }]);
+        assert_eq!(streams.clone(), streams);
+        assert_ne!(streams, AudioToUi::AppStreams(Vec::new()));
+        assert!(
+            matches!(streams, AudioToUi::AppStreams(list) if list[0].app.display() == "Battlefield 6")
         );
     }
 
