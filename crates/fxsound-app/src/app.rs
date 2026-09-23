@@ -593,6 +593,13 @@ pub struct App {
     /// application, the applications playing and recording now, and the routes the engine was
     /// last given for them (see [`per_app`]).
     apps: per_app::AppPresets,
+    /// The window is up ([`App::set_window_shown`]): its microphone meters can be looking.
+    window_shown: bool,
+    /// The calibration wizard's hold on the microphone, as it last asked (U9, U19).
+    wizard_holds_microphone: bool,
+    /// What the engine was last told about holding the microphone awake
+    /// ([`UiToAudio::KeepInputAwake`], [`App::hold_microphone_as_needed`]).
+    microphone_held: bool,
 }
 
 impl App {
@@ -696,6 +703,9 @@ impl App {
             } else {
                 per_app::AppPresets::default()
             },
+            window_shown: false,
+            wizard_holds_microphone: false,
+            microphone_held: false,
         };
 
         // What the settings file asks of the audio thread before it does anything else. See
@@ -874,6 +884,7 @@ impl App {
 
         // Last, so the wizard sees the lane as this poll left it: attached, processing, listed.
         self.drive_calibration(now, &microphone);
+        self.hold_microphone_as_needed();
     }
 
     /// Act on one thing the audio thread said. Crate-visible so the tests of what follows from a
@@ -1254,6 +1265,9 @@ impl App {
         for action in actions {
             self.handle_one(action.clone());
         }
+        // The view, the lane the window edits, the power and the microphone's lane all decide
+        // whether the microphone meters are in sight.
+        self.hold_microphone_as_needed();
         self.save_settings_if_dirty();
     }
 
@@ -2700,6 +2714,9 @@ impl App {
             shown_meters: Meters::default(),
             meters_moved: false,
             apps: per_app::AppPresets::default(),
+            window_shown: false,
+            wizard_holds_microphone: false,
+            microphone_held: false,
         };
         app.start_the_stream_here();
         app
@@ -3646,6 +3663,30 @@ fn device_priority(settings: &Settings, direction: DeviceDirection) -> UiToAudio
     }
 }
 
+/// What the engine is started with from the settings file ([`fxsound_audio::StartOptions`]): the
+/// language of its nodes' descriptions, the per-device volumes of FxSound's own nodes (U10), and
+/// each lane's device ranking (U4), with where a device the ranking does not name yet goes.
+///
+/// The engine builds the output lane's first pair a round trip after it connects, before a message
+/// sent once it has started is sure to have been read: a ranking sent only as
+/// [`UiToAudio::SetDevicePriority`] could arrive after the Windows rules had put the lane on the
+/// session default, which the ranking then had to take it away from, and the first pair on a
+/// remembered device would start at a level chosen without its volume. [`startup_messages`] still
+/// says both, with the same values.
+#[must_use]
+pub fn engine_start_options(settings: &Settings, language: &str) -> fxsound_audio::StartOptions {
+    let ranking = |direction| fxsound_audio::DevicePriority {
+        names: priority::ranking(settings, direction),
+        new_devices_first: settings.prioritize_new_output,
+    };
+    fxsound_audio::StartOptions {
+        language: Some(language.to_owned()),
+        target_volumes: settings.device_volumes.clone(),
+        output_priority: ranking(DeviceDirection::Output),
+        input_priority: ranking(DeviceDirection::Input),
+    }
+}
+
 /// Both lanes' claim on the session default, taken (`want`) or handed back — what the power switch
 /// does to the path the system's sound takes (U12).
 ///
@@ -3940,10 +3981,21 @@ fn lane_selection(
 /// lane on beside the speakers only when it was on when FxSound last ran, and a speakers' lane
 /// left off was detached at start-up ([`startup_messages`]) and stays so.
 ///
-/// `announced` is what was last sent for this lane. A device list that merely changed *around*
-/// the saved device sends nothing again; a device that vanished and came back is announced afresh,
-/// which the engine's own rules make a no-op when the lane is already attached to it. An empty
-/// saved name never matches a node, so nothing is sent on a first run.
+/// `announced` is what was last sent for this lane — or, while the priority list chooses the
+/// device, the saved device whose one announcement is spent. A device list that merely changed
+/// *around* the saved device sends nothing again. An empty saved name never matches a node, so
+/// nothing is sent on a first run.
+///
+/// A saved device that is not there — unplugged, or not plugged in when FxSound started — is
+/// where the two ways of choosing part. While the system's default decides (no ranking), it is
+/// announced afresh when it appears, which the engine's own rules make a no-op when the lane is
+/// already attached to it. While the priority list decides (U4), it is not: every `SelectDevice`
+/// is a fresh pick that beats the ranking once, so announcing a device that comes back would let
+/// one ranked below the lane's device take the lane from it. It competes by its rank in the
+/// engine instead, as a device plugged in does in upstream's `updateOutputs`
+/// (`FxController.cpp:1540-1612`), and the lane's `AudioToUi::Attached` says where it went. So
+/// with a ranking the saved device is announced at start-up and when the lane is switched back
+/// on, and otherwise only by the user's own picks.
 fn saved_device_to_announce(
     settings: &Settings,
     devices: &[AudioDevice],
@@ -3954,8 +4006,13 @@ fn saved_device_to_announce(
     let listed = devices
         .iter()
         .any(|d| d.name == wanted && d.direction == direction);
-    if !listed || !settings.lane_enabled(direction) {
+    if !settings.lane_enabled(direction) {
         *announced = None;
+        return None;
+    }
+    if !listed {
+        let ranked = !priority::ranking(settings, direction).is_empty();
+        *announced = (ranked && !wanted.is_empty()).then(|| wanted.to_owned());
         return None;
     }
     if announced.as_deref() == Some(wanted) {
@@ -4643,20 +4700,57 @@ impl App {
         self.carry_out_calibration(commands);
     }
 
-    /// Tell the engine what the wizard asked for.
-    fn carry_out_calibration(&self, commands: Vec<CalibrationCommand>) {
-        let Some(engine) = &self.engine else {
-            return;
-        };
+    /// Tell the engine what the wizard asked for. Its hold on the microphone is one of two, and
+    /// goes to the engine with the other ([`App::hold_microphone_as_needed`]).
+    fn carry_out_calibration(&mut self, commands: Vec<CalibrationCommand>) {
         for command in commands {
             match command {
                 CalibrationCommand::KeepInputAwake(awake) => {
-                    engine.send(UiToAudio::KeepInputAwake(awake));
+                    self.wizard_holds_microphone = awake;
+                    self.hold_microphone_as_needed();
                 }
                 CalibrationCommand::ResetCaptureStats => {
-                    engine.send_event(DeviceDirection::Input, DspEvent::ResetCaptureStats);
+                    if let Some(engine) = &self.engine {
+                        engine.send_event(DeviceDirection::Input, DspEvent::ResetCaptureStats);
+                    }
                 }
             }
+        }
+    }
+
+    /// The window came up (`true`) or went away (`false`): `main.rs` says so around each run of
+    /// one. While it is up, the Pro view's microphone meters may be in sight, and they hold the
+    /// microphone awake ([`App::hold_microphone_as_needed`]).
+    pub fn set_window_shown(&mut self, shown: bool) {
+        self.window_shown = shown;
+        self.hold_microphone_as_needed();
+    }
+
+    /// Whether the microphone meters are in sight: the window is up in the Pro view, editing a
+    /// microphone lane that is on, with the power on — the readout strip under the equalizer,
+    /// which reads the input lane's meters (0.4.0 design §1.4).
+    fn meters_watch_the_microphone(&self) -> bool {
+        self.window_shown
+            && self.state.view == ViewMode::Pro
+            && self.state.direction == DeviceDirection::Input
+            && self.state.power
+            && self.settings.lane_enabled(DeviceDirection::Input)
+    }
+
+    /// Hold the microphone awake while the calibration wizard or the microphone meters need its
+    /// signal, and let it sleep once neither does (U9, U19).
+    ///
+    /// The input lane's capture stream is passive, so the microphone runs only while something
+    /// records from FxSound (Input): with nobody recording, the wizard would measure nothing and
+    /// the strip would stand still on the last buffer. The engine's one switch for it,
+    /// [`UiToAudio::KeepInputAwake`], has the engine record its own source, which also switches a
+    /// Bluetooth headset to its call profile; the two needs share it, so it is said once when the
+    /// first of them starts and once when the last of them ends.
+    fn hold_microphone_as_needed(&mut self) {
+        let hold = self.wizard_holds_microphone || self.meters_watch_the_microphone();
+        if hold != self.microphone_held {
+            self.microphone_held = hold;
+            self.send(UiToAudio::KeepInputAwake(hold));
         }
     }
 
@@ -8030,16 +8124,110 @@ mod tests {
             "the user's choice is kept for when they come back"
         );
 
-        // They come back: the saved choice is announced again, and the engine's answer shown.
+        // They come back. The priority list chooses now, so the engine is asked nothing: the
+        // headphones compete by their rank, and where the lane went is the engine's answer.
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        app.poll_audio();
+        assert_eq!(select_devices(&engine.take_sent()), [] as [&UiToAudio; 0]);
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+        assert_eq!(selected(&app, OUT), Some(HEADPHONES));
+    }
+
+    #[test]
+    fn a_saved_device_that_comes_back_is_left_to_the_priority_list() {
+        // The headphones are the user's pick, ranked below the speakers. Unplugged, the engine
+        // takes the speakers; plugged back in, a `SelectDevice` would be a fresh pick that beats
+        // the ranking and takes the lane from the better-ranked speakers, so none is sent (U4).
+        let mut settings = saved_settings(OUT);
+        settings.device_configs = [SPEAKERS, HEADPHONES]
+            .map(|name| fxsound_core::settings::DeviceConfig {
+                device_id: name.to_owned(),
+                direction: OUT,
+                ..Default::default()
+            })
+            .to_vec();
+        let (mut app, engine, _dir) = started_with(settings);
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        app.poll_audio();
+        assert_eq!(
+            select_devices(&engine.take_sent()),
+            [&select(HEADPHONES, OUT), &select(MIC, IN)],
+            "at start-up the saved picks are announced, as upstream's init sets its saved output"
+        );
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+
+        engine.feed(AudioToUi::Devices(without_the_headphones()));
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        app.poll_audio();
+        assert_eq!(select_devices(&engine.take_sent()), [] as [&UiToAudio; 0]);
+        assert_eq!(
+            selected(&app, OUT),
+            Some(SPEAKERS),
+            "the engine said nothing new"
+        );
+        assert_eq!(
+            app.settings.device_name(OUT),
+            HEADPHONES,
+            "the pick is still the one the next start announces"
+        );
+
+        // A pick is the user's word, and goes to the engine whatever the ranking says.
+        app.handle(&[UiAction::SelectOutput(device_at(&app, HEADPHONES))]);
+        assert_eq!(
+            select_devices(&engine.take_sent()),
+            [&select(HEADPHONES, OUT)]
+        );
+    }
+
+    #[test]
+    fn a_saved_device_absent_at_start_up_is_left_to_the_priority_list_when_it_arrives() {
+        let mut settings = saved_settings(OUT);
+        settings.device_configs = vec![fxsound_core::settings::DeviceConfig {
+            device_id: SPEAKERS.to_owned(),
+            direction: OUT,
+            ..Default::default()
+        }];
+        let (mut app, engine, _dir) = started_with(settings);
+        engine.feed(AudioToUi::Devices(without_the_headphones()));
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
+        assert_eq!(
+            select_devices(&engine.take_sent()),
+            [&select(MIC, IN)],
+            "only the microphone is there to announce"
+        );
+        // Plugged in later: a newcomer, which goes where the list puts newcomers and takes the
+        // lane only if the engine ranks it above the speakers.
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        app.poll_audio();
+        assert_eq!(select_devices(&engine.take_sent()), [] as [&UiToAudio; 0]);
+    }
+
+    #[test]
+    fn while_the_system_decides_a_saved_device_that_comes_back_is_asked_for_again() {
+        // No ranking: the engine's Windows rules keep the user's pick, and announcing it again is
+        // what brings the lane back to it.
+        let mut settings = saved_settings(OUT);
+        settings.follow_system_default = true;
+        let (mut app, engine, _dir) = started_with(settings);
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+        let _ = engine.take_sent();
+
+        engine.feed(AudioToUi::Devices(without_the_headphones()));
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
         engine.feed(AudioToUi::Devices(two_lane_devices()));
         app.poll_audio();
         assert_eq!(
             select_devices(&engine.take_sent()),
             [&select(HEADPHONES, OUT)]
         );
-        engine.feed(attached(OUT, Some(HEADPHONES)));
-        app.poll_audio();
-        assert_eq!(selected(&app, OUT), Some(HEADPHONES));
     }
 
     #[test]
@@ -8297,6 +8485,78 @@ mod tests {
         assert!(
             app.state.notice_clock.is_some(),
             "raised through its clock, so it expires"
+        );
+    }
+
+    #[test]
+    fn a_warning_about_a_lane_is_no_answer_to_its_pick_where_an_error_is() {
+        // The two are different things even when their texts are the same: an error about a lane
+        // is the engine's answer to what the lane was asked for, and is said in the interface's
+        // own words; a warning is news beside it, shown as the engine translated it.
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+        app.handle(&[UiAction::SelectOutput(device_at(&app, SPEAKERS))]);
+        let text = "Heads up".to_owned();
+
+        engine.feed(AudioToUi::Warning {
+            direction: Some(OUT),
+            message: text.clone(),
+        });
+        app.poll_audio();
+        assert_eq!(
+            selected(&app, OUT),
+            Some(SPEAKERS),
+            "the pick is still on its way"
+        );
+        assert_eq!(app.state.notification.as_deref(), Some("Heads up"));
+
+        engine.feed(AudioToUi::Error {
+            direction: Some(OUT),
+            message: text,
+        });
+        app.poll_audio();
+        assert_eq!(
+            selected(&app, OUT),
+            Some(HEADPHONES),
+            "the error answered it"
+        );
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some("The audio engine reported an error")
+        );
+    }
+
+    #[test]
+    fn a_warning_repeated_by_a_re_attach_is_shown_and_streamed_again() {
+        // The engine warns once per attachment, so a second warning is a second attachment, and
+        // is news again rather than a duplicate to drop.
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        let _ = app.drain_events();
+        let message = "Using this headset's microphone switches it to call quality";
+        for _ in 0..2 {
+            engine.feed(AudioToUi::Warning {
+                direction: None,
+                message: message.to_owned(),
+            });
+            app.poll_audio();
+            assert_eq!(app.state.notification.as_deref(), Some(message));
+        }
+        let notices: Vec<AppEvent> = app
+            .drain_events()
+            .into_iter()
+            .filter(|event| matches!(event, AppEvent::Notice { .. }))
+            .collect();
+        assert_eq!(
+            notices,
+            vec![
+                AppEvent::Notice {
+                    message: message.to_owned()
+                };
+                2
+            ],
+            "`--watch` and D-Bus hear both"
         );
     }
 
@@ -9381,6 +9641,94 @@ mod tests {
         app.calibration_view_at(now).map(|view| view.phase)
     }
 
+    /// A start with the microphone's lane on, the window up in the Pro view on the speakers.
+    fn with_the_window_up() -> (App, FakeEngine, tempfile::TempDir) {
+        let mut settings = saved_settings(OUT);
+        settings.view = ViewMode::Pro;
+        let (mut app, engine, dir) = started_with(settings);
+        app.set_window_shown(true);
+        (app, engine, dir)
+    }
+
+    const NONE: [bool; 0] = [];
+
+    #[test]
+    fn the_microphone_meters_hold_the_microphone_while_they_are_in_sight() {
+        let (mut app, engine, _dir) = with_the_window_up();
+        assert_eq!(
+            awake_requests(&engine.take_sent()),
+            NONE,
+            "the speakers' face shows no microphone meters"
+        );
+
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        assert_eq!(awake_requests(&engine.take_sent()), [true]);
+        app.poll_audio();
+        app.handle(&[]);
+        assert_eq!(awake_requests(&engine.take_sent()), NONE, "said once");
+
+        app.handle(&[UiAction::SetEditDirection(OUT)]);
+        assert_eq!(awake_requests(&engine.take_sent()), [false]);
+
+        // Back on the microphone, and the window goes to the tray: nothing is in sight.
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        app.set_window_shown(false);
+        assert_eq!(awake_requests(&engine.take_sent()), [true, false]);
+        app.set_window_shown(true);
+        assert_eq!(awake_requests(&engine.take_sent()), [true]);
+    }
+
+    #[test]
+    fn the_lite_view_the_power_off_and_a_microphone_switched_off_hold_nothing() {
+        let (mut app, engine, _dir) = with_the_window_up();
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        let _ = engine.take_sent();
+
+        // The Lite view has no readout strip.
+        app.handle(&[UiAction::ToggleView]);
+        assert_eq!(awake_requests(&engine.take_sent()), [false]);
+        app.handle(&[UiAction::ToggleView]);
+        assert_eq!(awake_requests(&engine.take_sent()), [true]);
+
+        // FxSound off is FxSound out of the path, microphone and all.
+        app.handle(&[UiAction::TogglePower]);
+        assert_eq!(awake_requests(&engine.take_sent()), [false]);
+        app.handle(&[UiAction::TogglePower]);
+        assert_eq!(awake_requests(&engine.take_sent()), [true]);
+
+        // A lane that is off has no microphone to hold.
+        app.handle(&[UiAction::DetachInput]);
+        assert_eq!(awake_requests(&engine.take_sent()), [false]);
+    }
+
+    #[test]
+    fn the_wizard_and_the_meters_share_one_hold_on_the_microphone() {
+        let (mut app, engine, _dir, t0) = calibrating(IN);
+        if app.state.view != ViewMode::Pro {
+            app.handle(&[UiAction::ToggleView]);
+        }
+        app.set_window_shown(true);
+        assert_eq!(
+            awake_requests(&engine.take_sent()),
+            [true],
+            "the meters took it"
+        );
+
+        // The wizard's run starts and ends inside the meters' hold: nothing more is said.
+        assert!(app.open_calibration());
+        app.calibration_action_at(CalibrationAction::Start, t0);
+        app.calibration_action_at(CalibrationAction::Cancel, t0);
+        assert_eq!(awake_requests(&engine.take_sent()), NONE);
+
+        // Inside the wizard's hold, the meters leaving says nothing either; the wizard's end does.
+        assert!(app.open_calibration());
+        app.calibration_action_at(CalibrationAction::Start, t0);
+        app.set_window_shown(false);
+        assert_eq!(awake_requests(&engine.take_sent()), NONE);
+        app.cancel_calibration();
+        assert_eq!(awake_requests(&engine.take_sent()), [false]);
+    }
+
     #[test]
     fn a_run_holds_the_microphone_resets_the_input_lane_on_each_phase_and_lets_go_after_the_last() {
         let (mut app, engine, _dir, t0) = calibrating(OUT);
@@ -10144,7 +10492,7 @@ mod tests {
         engine.feed(attached(OUT, Some(SPEAKERS)));
         app.poll_audio();
         assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
-        // Plugged back in: announced again, and back on Beta.
+        // Plugged back in: the priority list takes the lane back to them, and they bring Beta.
         engine.feed(AudioToUi::Devices(two_lane_devices()));
         engine.feed(attached(OUT, Some(HEADPHONES)));
         app.poll_audio();
@@ -10267,7 +10615,16 @@ mod tests {
     fn the_saved_device_listed_again_while_the_lane_has_no_nodes_still_brings_its_preset() {
         // The lane was last on the speakers, with their Alpha, when the connection dropped; the
         // headphones are back in the first list after it. That is a move, nodes or no nodes.
-        let (mut app, engine, _dir) = on_the_headphones();
+        // With the system's default deciding the engine is asked for them again (with a ranking
+        // they compete by rank: `a_saved_device_that_comes_back_is_left_to_the_priority_list`).
+        let mut settings = saved_settings(OUT);
+        settings.follow_system_default = true;
+        settings.remember_device_preset(SPEAKERS, "Speakers", "Alpha", "speaker", OUT);
+        let (mut app, engine, _dir) = started_with(settings);
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
         app.settings
             .remember_device_preset(HEADPHONES, "Headphones", "Beta", "headphones", OUT);
         engine.feed(AudioToUi::Devices(without_the_headphones()));
@@ -10633,6 +10990,52 @@ mod tests {
             rankings(&messages),
             [(OUT, owned(&[SPEAKERS, HEADPHONES])), (IN, owned(&[MIC]))]
         );
+    }
+
+    #[test]
+    fn the_engine_is_started_with_the_rankings_and_the_volumes_before_its_first_pair() {
+        // BU8: a ranking that only follows the start as a message may reach the engine after the
+        // output lane's first pair was built by the Windows rules.
+        let mut settings = saved_settings(OUT);
+        settings.remember_device_preset(SPEAKERS, "Speakers", "", "", OUT);
+        settings.remember_device_preset(MIC, "Mic", "", "", IN);
+        settings.remember_device_preset(HEADPHONES, "Headphones", "", "", OUT);
+        settings.prioritize_new_output = true;
+        let volume = TargetVolume {
+            direction: OUT,
+            target: HEADPHONES.to_owned(),
+            port: "analog-output-headphones".to_owned(),
+            channel_volumes: vec![0.3, 0.3],
+            mute: false,
+        };
+        settings.device_volumes = vec![volume.clone()];
+
+        let options = engine_start_options(&settings, "ru");
+        assert_eq!(options.language.as_deref(), Some("ru"));
+        assert_eq!(options.target_volumes, [volume]);
+        assert_eq!(
+            options.output_priority,
+            fxsound_audio::DevicePriority {
+                names: owned(&[SPEAKERS, HEADPHONES]),
+                new_devices_first: true,
+            }
+        );
+        assert_eq!(options.input_priority.names, owned(&[MIC]));
+        assert!(options.input_priority.new_devices_first);
+        assert_eq!(
+            rankings(&startup_messages(&settings)),
+            [
+                (OUT, options.output_priority.names.clone()),
+                (IN, options.input_priority.names.clone())
+            ],
+            "the messages that follow say the same"
+        );
+
+        // Following the system's default, neither lane is ranked.
+        settings.follow_system_default = true;
+        let options = engine_start_options(&settings, "en");
+        assert!(options.output_priority.names.is_empty());
+        assert!(options.input_priority.names.is_empty());
     }
 
     #[test]

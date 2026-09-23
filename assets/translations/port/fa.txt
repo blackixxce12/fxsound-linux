@@ -105,3 +105,4 @@ countries: ir
 "Applications" = "برنامه‌ها"
 "FxSound's preset" = "پیش‌تنظیم FxSound"
 "No application has played or recorded through FxSound yet" = "هنوز هیچ برنامه‌ای از طریق FxSound پخش یا ضبط نکرده است"
+"A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "میکروفون بلوتوث فقط وقتی فعال می‌شود که برنامه‌ای از FxSound (ورودی) ضبط کند، و آن‌وقت هدست را به کیفیت تماس می‌برد."

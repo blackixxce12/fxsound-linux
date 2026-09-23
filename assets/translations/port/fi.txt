@@ -103,3 +103,4 @@ countries: fi
 "Applications" = "Sovellukset"
 "FxSound's preset" = "FxSoundin esiasetus"
 "No application has played or recorded through FxSound yet" = "Mikään sovellus ei ole vielä toistanut tai tallentanut FxSoundin kautta"
+"A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Bluetooth-mikrofoni herää vain, kun jokin sovellus nauhoittaa lähteestä FxSound (Tulo), ja vaihtaa silloin kuulokemikrofonin puhelulaatuun."

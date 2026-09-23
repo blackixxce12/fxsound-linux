@@ -103,3 +103,4 @@ countries: ja
 "Applications" = "アプリ"
 "FxSound's preset" = "FxSound のプリセット"
 "No application has played or recorded through FxSound yet" = "FxSound を通して再生・録音したアプリはまだありません"
+"A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Bluetooth マイクは、アプリが FxSound (入力) から録音している間だけ起動し、そのときヘッドセットを通話品質に切り替えます。"

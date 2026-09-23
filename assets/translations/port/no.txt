@@ -108,3 +108,4 @@ countries: no
 "Applications" = "Programmer"
 "FxSound's preset" = "FxSounds forhåndsinnstilling"
 "No application has played or recorded through FxSound yet" = "Ingen programmer har spilt av eller tatt opp gjennom FxSound ennå"
+"A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "En Bluetooth-mikrofon våkner bare mens et program tar opp fra FxSound (Inngang), og bytter da hodesettet til samtalekvalitet."

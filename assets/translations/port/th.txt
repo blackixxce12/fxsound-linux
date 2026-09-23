@@ -103,3 +103,4 @@ countries: th
 "Applications" = "แอป"
 "FxSound's preset" = "พรีเซ็ตของ FxSound"
 "No application has played or recorded through FxSound yet" = "ยังไม่มีแอปที่เล่นหรืออัดเสียงผ่าน FxSound"
+"A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "ไมโครโฟนบลูทูธจะทำงานเฉพาะเมื่อมีแอปบันทึกเสียงจาก FxSound (อินพุต) และเมื่อนั้นจะสลับชุดหูฟังไปเป็นคุณภาพการโทร"

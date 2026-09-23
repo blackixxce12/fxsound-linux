@@ -232,6 +232,36 @@ pub(crate) fn preset_combo(
     combo
 }
 
+/// What a microphone picker says on hover while it shows a Bluetooth headset's microphone
+/// **(port addition, `docs/0.4.0-upstream.md` U9)**. FxSound's capture of a microphone is passive
+/// (U19), so a headset's microphone is woken — and the headset switched from music to its call
+/// profile — only by something recording from FxSound (Input); picked and never recorded from,
+/// it neither sounds nor costs anything, which is exactly what looks broken without a word.
+pub const BLUETOOTH_MICROPHONE_TIP: &str = "A Bluetooth microphone wakes only while an application \
+     records from FxSound (Input), and then switches its headset to call quality.";
+
+/// Whether `device` is a Bluetooth headset's microphone: under WirePlumber 0.4 the headset's own
+/// `bluez_input.<address>.0`, under 0.5 the loopback `bluez_input.<address>` in front of it. The
+/// node name says so either way; a form factor of `headset` would take a USB headset in too.
+#[must_use]
+pub fn is_bluetooth_microphone(device: &AudioDevice) -> bool {
+    device.direction == DeviceDirection::Input && device.name.starts_with("bluez_input.")
+}
+
+/// The hint a device picker's box gives on hover for the device of `direction` it shows
+/// ([`BLUETOOTH_MICROPHONE_TIP`] for a Bluetooth microphone), or `None` — no tooltip at all — for
+/// any other device, and while "Hide help tips" is ticked, as for every tip in the window.
+#[must_use]
+pub fn device_tip(state: &UiState, direction: DeviceDirection) -> Option<String> {
+    if state.hide_tooltips {
+        return None;
+    }
+    state
+        .device_for(direction)
+        .filter(|device| is_bluetooth_microphone(device))
+        .map(|_| tr(BLUETOOTH_MICROPHONE_TIP))
+}
+
 /// One row of a device menu **(port addition)**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceRow {
@@ -425,6 +455,9 @@ pub(crate) fn lane_combos(
         if box_response.clicked() && !edited && !response.contains(&switch) {
             response.push(switch);
         }
+        if let Some(tip) = device_tip(state, direction) {
+            let _ = box_response.on_hover_text(tip);
+        }
     }
 }
 
@@ -437,7 +470,7 @@ pub(crate) fn device_combo(
     rect: Rect,
     response: &mut UiResponse,
 ) {
-    DeviceMenu::both(state).show(
+    let box_response = DeviceMenu::both(state).show(
         ui,
         state,
         palette,
@@ -447,6 +480,10 @@ pub(crate) fn device_combo(
         "output_list",
         response,
     );
+    // The closed box shows the edit direction's device.
+    if let Some(tip) = device_tip(state, state.direction) {
+        let _ = box_response.on_hover_text(tip);
+    }
 }
 
 /// A headless window for the view tests: real fonts, real artwork, frames driven by hand.
@@ -947,6 +984,96 @@ mod tests {
                 UiAction::SelectInput(2)
             ]
         );
+    }
+
+    /// A Bluetooth headset's microphone, as WirePlumber 0.5 names its loopback.
+    fn bluetooth_microphone() -> AudioDevice {
+        AudioDevice {
+            name: "bluez_input.AC_80_0A_12_34_56".to_owned(),
+            description: "WH-1000XM4".to_owned(),
+            form_factor: "headset".into(),
+            ..device("WH-1000XM4", DeviceDirection::Input)
+        }
+    }
+
+    /// The window on the microphone's lane, attached to `microphone`, beside some speakers.
+    fn on_the_microphone(microphone: AudioDevice) -> UiState {
+        let mut state = UiState {
+            view: ViewMode::Pro,
+            direction: DeviceDirection::Input,
+            devices: vec![device("Speakers", DeviceDirection::Output), microphone],
+            ..UiState::default()
+        };
+        state.set_selection(DeviceDirection::Output, Some(0));
+        state.set_selection(DeviceDirection::Input, Some(1));
+        state
+    }
+
+    #[test]
+    fn only_a_bluetooth_microphone_s_picker_explains_when_it_wakes() {
+        let state = on_the_microphone(bluetooth_microphone());
+        assert_eq!(
+            device_tip(&state, DeviceDirection::Input).as_deref(),
+            Some(BLUETOOTH_MICROPHONE_TIP)
+        );
+        assert_eq!(device_tip(&state, DeviceDirection::Output), None);
+
+        // A USB headset says `headset` too, and is awake whenever its lane is.
+        let usb = AudioDevice {
+            name: "alsa_input.usb-Jabra_Evolve2".to_owned(),
+            form_factor: "headset".into(),
+            ..device("Jabra Evolve2", DeviceDirection::Input)
+        };
+        assert_eq!(
+            device_tip(&on_the_microphone(usb), DeviceDirection::Input),
+            None
+        );
+
+        // WirePlumber 0.4's own node for the headset's microphone is one as well.
+        let old = AudioDevice {
+            name: "bluez_input.AC_80_0A_12_34_56.0".to_owned(),
+            ..bluetooth_microphone()
+        };
+        assert!(is_bluetooth_microphone(&old));
+
+        let quiet = UiState {
+            hide_tooltips: true,
+            ..on_the_microphone(bluetooth_microphone())
+        };
+        assert_eq!(
+            device_tip(&quiet, DeviceDirection::Input),
+            None,
+            "\"Hide help tips\" hides it"
+        );
+    }
+
+    #[test]
+    fn hovering_a_bluetooth_microphone_s_picker_shows_the_tip() {
+        use crate::layout;
+        use egui::Event;
+        use fxsound_core::ThemeMode;
+
+        let mut harness = testing::Harness::new(ThemeMode::Dark);
+        harness.ctx.all_styles_mut(|style| {
+            style.interaction.tooltip_delay = 0.0;
+            style.interaction.show_tooltips_only_when_still = false;
+        });
+        let over = layout::pro::device_combo(DeviceDirection::Input).center();
+        // A frame to hover, one to lay the tip out, one that paints it.
+        let shown = |harness: &mut testing::Harness, state: &UiState| {
+            harness.frame(state, vec![Event::PointerMoved(over)]);
+            harness.frame(state, Vec::new());
+            let (_, shapes) = harness.frame(state, Vec::new());
+            testing::texts(&shapes)
+                .into_iter()
+                .any(|(text, _, _)| text == BLUETOOTH_MICROPHONE_TIP)
+        };
+        assert!(shown(
+            &mut harness,
+            &on_the_microphone(bluetooth_microphone())
+        ));
+        let usb = device("USB microphone", DeviceDirection::Input);
+        assert!(!shown(&mut harness, &on_the_microphone(usb)));
     }
 
     #[test]

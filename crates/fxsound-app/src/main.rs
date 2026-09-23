@@ -204,11 +204,14 @@ fn main() -> eframe::Result<()> {
     // The UI language, decided before anything is drawn or named: the desktop's unless the
     // settings say otherwise (`fxsound_core::i18n`). The engine gets it too, for the node
     // descriptions the sound settings show.
-    let language = fxsound_core::Settings::load().effective_language();
+    let settings = fxsound_core::Settings::load();
+    let language = settings.effective_language();
     fxsound_core::i18n::set_language(language);
 
-    // Step 3: audio. Report the failure and carry on.
-    let engine = match fxsound_audio::AudioEngine::start_with_language(language) {
+    // Step 3: audio, started with what its first pair of nodes depends on — the language, the
+    // per-device volumes and both lanes' device rankings. Report the failure and carry on.
+    let options = fxsound_app::app::engine_start_options(&settings, language);
+    let engine = match fxsound_audio::AudioEngine::start_with_options(options) {
         Ok(handle) => Some(handle),
         Err(err) => {
             log::error!("audio engine did not start: {err}");
@@ -472,6 +475,7 @@ impl Runtime {
         let options = native_options(self.app.state.view);
 
         self.announce(&AppEvent::Window { visible: true });
+        self.app.set_window_shown(true);
         let runtime = &mut *self;
         let run = eframe::run_native(
             "FxSound",
@@ -489,6 +493,8 @@ impl Runtime {
         );
         // Whatever arrives now is the headless pump's to wait for.
         self.waker.detach();
+        // The meters went with the window, and let go of the microphone they held.
+        self.app.set_window_shown(false);
         run?;
         // The wizard is a pane of the window that just went: a run it was in the middle of stops,
         // and the microphone is let go rather than held for a window that is not there.

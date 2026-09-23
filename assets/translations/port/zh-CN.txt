@@ -103,3 +103,4 @@ countries: cn sg
 "Applications" = "应用"
 "FxSound's preset" = "FxSound 的预设"
 "No application has played or recorded through FxSound yet" = "尚无应用通过 FxSound 播放或录音"
+"A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "蓝牙麦克风仅在有应用从 FxSound (输入) 录音时才会启用，此时会将耳机切换到通话音质。"

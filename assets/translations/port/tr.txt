@@ -103,3 +103,4 @@ countries: tr
 "Applications" = "Uygulamalar"
 "FxSound's preset" = "FxSound'un ön ayarı"
 "No application has played or recorded through FxSound yet" = "Henüz hiçbir uygulama FxSound üzerinden çalmadı veya kaydetmedi"
+"A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Bluetooth mikrofon yalnızca bir uygulama FxSound (Giriş) üzerinden kayıt yaparken uyanır ve o zaman kulaklığı arama kalitesine geçirir."

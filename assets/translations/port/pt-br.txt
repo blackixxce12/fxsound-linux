@@ -105,3 +105,4 @@ countries: br
 "Applications" = "Aplicativos"
 "FxSound's preset" = "Preset do FxSound"
 "No application has played or recorded through FxSound yet" = "Nenhum aplicativo reproduziu ou gravou pelo FxSound ainda"
+"A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Um microfone Bluetooth só é ativado enquanto um aplicativo grava do FxSound (Entrada), e então coloca o headset em qualidade de chamada."

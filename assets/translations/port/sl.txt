@@ -105,3 +105,4 @@ countries: sl
 "Applications" = "Aplikacije"
 "FxSound's preset" = "Prednastavitev FxSound"
 "No application has played or recorded through FxSound yet" = "Nobena aplikacija še ni predvajala ali snemala prek FxSound"
+"A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Mikrofon Bluetooth se vklopi le, ko aplikacija snema iz FxSound (Vhod), in takrat preklopi slušalke na kakovost klica."

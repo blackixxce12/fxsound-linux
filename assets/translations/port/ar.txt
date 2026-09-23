@@ -104,3 +104,4 @@ countries: EG sa
 "Applications" = "التطبيقات"
 "FxSound's preset" = "الإعداد المسبق لـ FxSound"
 "No application has played or recorded through FxSound yet" = "لم يشغّل أي تطبيق صوتًا أو يسجّله عبر FxSound بعد"
+"A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "لا يعمل ميكروفون البلوتوث إلا أثناء تسجيل تطبيق من FxSound (الإدخال)، وعندها يحوّل سماعة الرأس إلى جودة المكالمات."

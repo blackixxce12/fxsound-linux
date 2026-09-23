@@ -105,3 +105,4 @@ countries: ro
 "Applications" = "Aplicații"
 "FxSound's preset" = "Presetul FxSound"
 "No application has played or recorded through FxSound yet" = "Nicio aplicație nu a redat sau înregistrat încă prin FxSound"
+"A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Un microfon Bluetooth pornește doar cât timp o aplicație înregistrează din FxSound (Intrare) și atunci trece căștile pe calitate de apel."

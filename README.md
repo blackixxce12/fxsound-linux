@@ -386,6 +386,17 @@ Each of these is a considered decision, not an oversight:
   every device seen joins it, at the bottom or, with *Prioritize new output devices*, at the top.
   *Follow the system's default device*, which the Windows build does not have (its issue #629),
   hands that choice back to the desktop's sound settings and keeps the list for later.
+- **Mono outputs are accepted.** The Windows build refuses an output with fewer than two channels,
+  a workaround for a Windows driver (`sndDevices.h:32-39`). Here a Bluetooth headset in its
+  hands-free (call) profile or a mono USB headset is an output like any other, and PipeWire mixes
+  FxSound's stereo down for it. And a device plugged in at the moment another goes — a USB DAC
+  swapped for another, a headset changing profile — is noticed as a new device, which the Windows
+  build misses (its open PR #532).
+- **A Bluetooth microphone wakes only when something records.** FxSound holds a microphone open
+  only while an application records from `FxSound (Input)`, the calibration wizard runs, or the Pro
+  view shows the microphone's meters, so a headset is not switched to its call profile — mono,
+  16 kHz — just because its microphone is picked. The picker says so on hover, and using one
+  headset for both lanes says what it costs.
 - **Suspend mutes, resume starts clean, nothing waits.** FxSound listens for logind's
   `PrepareForSleep` on the system bus: going to sleep mutes both lanes, and on resume their filters
   are cleared before they are unmuted, as the Windows build does from its suspend notification. It
