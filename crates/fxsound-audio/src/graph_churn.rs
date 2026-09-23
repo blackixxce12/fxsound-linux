@@ -33,11 +33,13 @@
 //!
 //! Nothing links anything in this graph, and not only because there is no WirePlumber to make the
 //! links: there is nothing to link. An adapter has no ports until someone sets its `PortConfig`,
-//! and that is the session manager's job too. So the one test that needs audio to flow does both
-//! steps itself — `pw-cli set-param … PortConfig` on every node involved, then `pw-link`. Its
-//! source is a tone from PipeWire's `audiotestsrc`, added with `pw-cli create-node`, rather than
-//! the null microphone: a null device plays silence, and silence moves no meter, so it could show
-//! that a lane is scheduled but never that it is fed — and on this server those are not the same.
+//! and that is the session manager's job too. So the tests that need audio to flow — or a node to
+//! run at all, which is what the idle tests watch — do both steps themselves: `pw-cli set-param …
+//! PortConfig` on every node involved, then `pw-link`, and `pw-link -d` for an application that
+//! stops. Their source is a tone from PipeWire's `audiotestsrc`, added with `pw-cli create-node`,
+//! rather than the null microphone: a null device plays silence, and silence moves no meter, so it
+//! could show that a lane is scheduled but never that it is fed — and on this server those are not
+//! the same.
 //!
 //! When `pipewire` is not installed these tests print why and pass, because a contributor without
 //! it must still be able to run `cargo test` — but they say so loudly rather than quietly doing
@@ -70,7 +72,7 @@ const REQUIRE_TOOLS: &str = "FXSOUND_REQUIRE_PIPEWIRE_TOOLS";
 
 /// Report a check that could not run: a `SKIPPED` line and a pass on a contributor's machine, a
 /// failure under [`REQUIRE_TOOLS`].
-fn skip(reason: &str) {
+pub(crate) fn skip(reason: &str) {
     assert!(
         std::env::var_os(REQUIRE_TOOLS).is_none_or(|value| value != "1"),
         "{reason}, and {REQUIRE_TOOLS}=1 says nothing here may be skipped"
@@ -267,7 +269,12 @@ impl PrivateGraph {
     /// something does an adapter has no ports at all. Waits until the ports are there, since they
     /// appear a moment after the parameter is set. `None` when the node is not in the graph, a
     /// tool is missing or refused, or the ports never came.
-    fn configure_ports(&self, node: &str, direction: &str, positions: &[&str]) -> Option<()> {
+    pub(crate) fn configure_ports(
+        &self,
+        node: &str,
+        direction: &str,
+        positions: &[&str],
+    ) -> Option<()> {
         let id = self.node_id(node)?.to_string();
         let channels = positions.len();
         let listed = positions
@@ -300,32 +307,71 @@ impl PrivateGraph {
     /// Link `from`'s outputs to `to`'s inputs channel by channel, as a session manager would — or,
     /// from a node with a single output, that one to every input. Whether every link was made;
     /// `false` as well when either side has no ports to link.
-    fn link_nodes(&self, from: &str, to: &str) -> bool {
+    pub(crate) fn link_nodes(&self, from: &str, to: &str) -> bool {
+        self.wire(from, to, &[])
+    }
+
+    /// Undo [`Self::link_nodes`]: the links an application leaves behind when it closes its
+    /// stream. Whether every one of them was removed.
+    pub(crate) fn unlink_nodes(&self, from: &str, to: &str) -> bool {
+        self.wire(from, to, &["-d"])
+    }
+
+    /// Run `pw-link` with `flags` over every port pair [`Self::link_nodes`] would link.
+    fn wire(&self, from: &str, to: &str, flags: &[&str]) -> bool {
         let (Some(outputs), Some(inputs)) = (self.ports(from, "out"), self.ports(to, "in")) else {
             return false;
         };
-        let mut linked = !outputs.is_empty() && !inputs.is_empty();
+        let mut done = !outputs.is_empty() && !inputs.is_empty();
         for (output, channel) in &outputs {
             for (input, _) in inputs
                 .iter()
                 .filter(|(_, other)| outputs.len() == 1 || other == channel)
             {
                 let (output, input) = (format!("{from}:{output}"), format!("{to}:{input}"));
-                let made = self.tool("pw-link", &[&output, &input]).is_some();
+                let args: Vec<&str> = flags.iter().copied().chain([&*output, &*input]).collect();
+                let made = self.tool("pw-link", &args).is_some();
                 if !made {
-                    println!("pw-link refused {output} -> {input}");
+                    println!("pw-link {flags:?} refused {output} -> {input}");
                 }
-                linked &= made;
+                done &= made;
             }
         }
-        linked
+        done
+    }
+
+    /// The state the server holds a node in — `"running"`, `"idle"`, `"suspended"`, … — or `None`
+    /// when `pw-dump` is not there to ask or the node is not in the graph.
+    pub(crate) fn node_state(&self, name: &str) -> Option<String> {
+        let objects = self.dump()?;
+        Self::node_object(&objects, name)?["info"]["state"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    /// Wait until `name` runs (`running`) or does not. `Ok` with the state it settled in, `Err`
+    /// with the last one seen when it never did.
+    pub(crate) fn runs_until(&self, name: &str, running: bool) -> Result<String, Option<String>> {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let state = self.node_state(name);
+            if let Some(state) = &state
+                && (state == "running") == running
+            {
+                return Ok(state.clone());
+            }
+            if Instant::now() >= deadline {
+                return Err(state);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Add a source that plays a steady tone: PipeWire's `audiotestsrc` behind an adapter, which
     /// is what makes a lane's meters move where a null device's silence cannot. Created by a
     /// client that then leaves, so it lingers. `None` when the plugin is not installed and the node
     /// never appears.
-    fn add_tone(&self, name: &str) -> Option<()> {
+    pub(crate) fn add_tone(&self, name: &str) -> Option<()> {
         let props = format!(
             "{{ factory.name = audiotestsrc node.name = {name} node.description = \"Test Tone\" \
              media.class = Audio/Source object.linger = true }}"
@@ -438,7 +484,7 @@ impl PrivateGraph {
 /// Whether a program can be started at all. Asked up front by a test that cannot do without a
 /// tool, because [`PrivateGraph::tool`]'s `None` also means "ran and refused", which for such a
 /// test is a failure and not a reason to skip.
-fn installed(program: &str) -> bool {
+pub(crate) fn installed(program: &str) -> bool {
     Command::new(program)
         .arg("--version")
         .stdout(Stdio::null())
@@ -1260,12 +1306,15 @@ fn a_restart_rebuilds_every_lane_that_was_running() {
 /// picked as the microphone, into the capture stream; the same tone into the sink, standing in for
 /// an application playing; the output stream into the stereo sink.
 ///
-/// Wired one lane at a time and checked in both after each step, because being scheduled is not
-/// being fed. On PipeWire 1.6.8, linking the input lane alone already has the output lane report
-/// `processing`: the server drives the members of a `node.link-group` together, and all four of
-/// our nodes share `fxsound`. So `processing` cannot tell the lanes apart, and the meters can: the
-/// tone reaches the voice chain's with the music chain's still silent, and the music chain's only
-/// once something plays into the sink.
+/// Wired one lane at a time and checked in both after each step. The server drives the members of
+/// a `node.link-group` together, and each lane's pair now has a group of its own — `fxsound`,
+/// `fxsound-input` — so linking the microphone alone schedules the input pair and nothing else:
+/// the output lane must not so much as report `processing` until something plays into the sink.
+/// (With one group for all four nodes, as an earlier revision of `docs/spec/12-audio-io.md` §29.2
+/// had it, PipeWire 1.6.8 ran the output pair the moment the microphone was linked.) The meters are still what shows each
+/// lane is *fed*, because being scheduled is not being fed: the tone reaches the voice chain's
+/// with the music chain's still silent, and the music chain's only once something plays into the
+/// sink.
 #[test]
 fn a_tone_driven_through_each_lane_reaches_that_lane_and_no_other() {
     let Some(graph) = PrivateGraph::start("flow") else {
@@ -1338,6 +1387,14 @@ fn a_tone_driven_through_each_lane_reaches_that_lane_and_no_other() {
         music.peak_left < 1e-3 && music.peak_right < 1e-3,
         "the microphone was heard in the output lane: {music:?}"
     );
+    let woken = said.0.iter().find(|message| {
+        matches!(message, AudioToUi::Status { direction: DeviceDirection::Output, status }
+            if status.processing)
+    });
+    assert!(
+        woken.is_none(),
+        "the output lane ran because the microphone did: {woken:?}"
+    );
 
     // Now something plays, and the speakers are connected.
     assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
@@ -1399,6 +1456,218 @@ fn a_tone_driven_through_each_lane_reaches_that_lane_and_no_other() {
             "wiring the {} lane disturbed the format its pair was built with",
             direction.key()
         );
+    }
+    handle.shutdown();
+}
+
+#[test]
+fn the_speakers_sleep_while_nothing_plays_into_the_sink_and_wake_the_moment_something_does() {
+    let Some(graph) = PrivateGraph::start("asleep") else {
+        return;
+    };
+    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+        .into_iter()
+        .find(|tool| !installed(tool))
+    {
+        skip(&format!(
+            "{missing} is not available, so the output lane's idle was not checked"
+        ));
+        return;
+    }
+    if graph.add_tone("t_tone").is_none() {
+        skip(concat!(
+            "the tone never appeared (is audiotestsrc installed?), ",
+            "so the output lane's idle was not checked"
+        ));
+        return;
+    }
+    let mut handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    said.until(
+        &handle,
+        "a device list",
+        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
+    );
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_stereo".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    assert_eq!(
+        graph
+            .settles_on(&[SINK_NODE_NAME, OUTPUT_NODE_NAME])
+            .map(|settled| settled.map(drop)),
+        Some(Ok(())),
+        "the output lane's pair should be in the graph"
+    );
+    for (node, direction, positions) in [
+        ("t_tone", "Output", &["MONO"][..]),
+        ("t_stereo", "Input", &["FL", "FR"][..]),
+        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+        (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
+    ] {
+        assert!(
+            graph.configure_ports(node, direction, positions).is_some(),
+            "{node} was not given ports"
+        );
+    }
+
+    // The playback stream is linked to the speakers as soon as the pair is up, as WirePlumber
+    // links it, and nothing plays into the sink. In 0.3.0 that was enough to run both nodes and
+    // the speakers for as long as FxSound was open.
+    assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
+    for node in [OUTPUT_NODE_NAME, SINK_NODE_NAME, "t_stereo"] {
+        assert_eq!(
+            graph.runs_until(node, false).map(drop),
+            Ok(()),
+            "{node} should not run while nothing plays into the sink"
+        );
+    }
+    // Not merely for a moment: for longer than a playback stream paced by hand is given to fall
+    // asleep, so that whichever way this server idles the pair, the pair has had time to wake.
+    let quiet_until = Instant::now() + engine::SLEEP_AFTER * 2;
+    while Instant::now() < quiet_until {
+        for node in [OUTPUT_NODE_NAME, "t_stereo"] {
+            assert_ne!(
+                graph.node_state(node).as_deref(),
+                Some("running"),
+                "{node} ran with nothing to play"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // And a lane doing nothing has nothing to say: no status for the GUI to wake up for.
+    said.settle(&handle);
+    let idle_from = said.0.len();
+    said.settle(&handle);
+    let idle_statuses: Vec<_> = said.0[idle_from..]
+        .iter()
+        .filter(|m| {
+            matches!(
+                m,
+                AudioToUi::Status {
+                    direction: DeviceDirection::Output,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        idle_statuses.is_empty(),
+        "an idle output lane kept reporting: {idle_statuses:?}"
+    );
+
+    // Something plays: the sink, the playback stream and the speakers all run, and the tone gets
+    // through the chain.
+    assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
+    for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME, "t_stereo"] {
+        assert_eq!(
+            graph.runs_until(node, true).map(drop),
+            Ok(()),
+            "{node} should run while something plays into the sink"
+        );
+    }
+    let played = meters_until(&mut handle, DeviceDirection::Output, |m| {
+        m.peak_left > 0.1 && m.peak_right > 0.1
+    });
+    assert!(
+        played.is_some(),
+        "the tone never reached the output lane's meters"
+    );
+
+    // It stops — the application closed its stream — and so does everything it woke.
+    assert!(graph.unlink_nodes("t_tone", SINK_NODE_NAME));
+    for node in [OUTPUT_NODE_NAME, SINK_NODE_NAME, "t_stereo"] {
+        assert_eq!(
+            graph.runs_until(node, false).map(drop),
+            Ok(()),
+            "{node} should stop once nothing plays into the sink"
+        );
+    }
+    handle.shutdown();
+}
+
+#[test]
+fn a_microphone_being_captured_does_not_keep_the_speakers_awake() {
+    let Some(graph) = PrivateGraph::start("micawake") else {
+        return;
+    };
+    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+        .into_iter()
+        .find(|tool| !installed(tool))
+    {
+        skip(&format!(
+            "{missing} is not available, so the two lanes' idle was not checked"
+        ));
+        return;
+    }
+    if graph.add_tone("t_tone").is_none() {
+        skip(concat!(
+            "the tone never appeared (is audiotestsrc installed?), ",
+            "so the two lanes' idle was not checked"
+        ));
+        return;
+    }
+    let handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    said.until(
+        &handle,
+        "a device list",
+        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
+    );
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_stereo".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_tone".to_owned(),
+        direction: DeviceDirection::Input,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
+    assert_eq!(
+        graph
+            .settles_on(&OUR_NODE_NAMES)
+            .map(|settled| settled.map(drop)),
+        Some(Ok(())),
+        "both pairs should be in the graph at once"
+    );
+    for (node, direction, positions) in [
+        ("t_tone", "Output", &["MONO"][..]),
+        ("t_stereo", "Input", &["FL", "FR"][..]),
+        (CAPTURE_NODE_NAME, "Input", &["MONO"][..]),
+        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+        (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
+    ] {
+        assert!(
+            graph.configure_ports(node, direction, positions).is_some(),
+            "{node} was not given ports"
+        );
+    }
+    assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
+    assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
+
+    // The microphone lane runs — that is what it is for — and the speakers' lane, with nothing
+    // playing into its sink, does not. With one link-group for all four nodes the capture stream
+    // made the other pair runnable with it, and the speakers never slept while the microphone
+    // lane was on.
+    assert_eq!(
+        graph.runs_until(CAPTURE_NODE_NAME, true).map(drop),
+        Ok(()),
+        "the capture stream should run while its microphone does"
+    );
+    let quiet_until = Instant::now() + engine::SLEEP_AFTER * 2;
+    while Instant::now() < quiet_until {
+        for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME, "t_stereo"] {
+            assert_ne!(
+                graph.node_state(node).as_deref(),
+                Some("running"),
+                "{node} ran because the microphone did"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
     handle.shutdown();
 }

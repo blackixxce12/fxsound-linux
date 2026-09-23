@@ -44,12 +44,50 @@
 //! It is still a timer rather than pure event handling for one reason — it is the natural home for
 //! the "don't hammer" backoff of `docs/spec/12-audio-io.md` §22, the direct descendant of the
 //! `INVALID_HANDLE_VALUE` pause sentinel at `AudioPassthruPrivate.cpp:452-460`.
+//!
+//! # Idle
+//!
+//! The output lane's NODE 2 is a playback stream linked to the user's real speakers, and a linked
+//! stream keeps its device running — so in 0.3.0, FxSound kept the speakers, the graph and both of
+//! its own process callbacks running for as long as it was open, playing silence into a device
+//! WirePlumber would otherwise have suspended (`docs/0.4.0-design.md` §12). NODE 2 has nothing to
+//! play unless something plays into NODE 1, so it should run exactly when NODE 1 does, and there
+//! are two ways to get that, depending on the server:
+//!
+//! * **PipeWire 0.3.68 and later** schedules the members of a `node.link-group` together: a node
+//!   made runnable by a link of its own makes the rest of its group runnable too (`run_nodes` in
+//!   `src/pipewire/context.c`). So NODE 2 is declared `node.passive`: its link to the speakers no
+//!   longer keeps them awake, and it runs whenever an application's link into NODE 1 makes NODE 1
+//!   run — in the same cycle, with no help from this thread. It is `module-loopback`'s virtual-sink
+//!   recipe, and WirePlumber's own audio-group loopback is built the same way.
+//! * **Older servers** knew the link-group only as a hint to WirePlumber, so a passive NODE 2 would
+//!   never be woken by NODE 1's clients: FxSound would fall silent. There NODE 2 stays an ordinary
+//!   stream and the main loop paces it by hand, as `docs/0.4.0-design.md` §1.3 describes —
+//!   `set_active(false)` once NODE 1 has been paused for `SLEEP_AFTER`, `set_active(true)` the
+//!   moment it streams again (`SecondNodePace`). That only works on a server this old: on a newer
+//!   one, a NODE 2 that is not passive and runs keeps its whole group running, NODE 1 included,
+//!   so NODE 1 would never pause and NODE 2 never be put to sleep.
+//!
+//! Either way the ring re-primes, and the next sound starts the way a pair's first sound does:
+//! from an empty ring that fills to its target before anything is heard. A NODE 2 paced by hand
+//! gets there by itself, playing the ring dry while it waits out `SLEEP_AFTER`. A passive one
+//! cannot. It stops in the same cycle as NODE 1, with the ring's cushion — the block and a
+//! half NODE 1 had processed and NODE 2 not yet played — still in it, and it next runs whenever
+//! something plays into NODE 1 again: minutes later, perhaps, and another application. Played
+//! then, the cushion would put the tail of the last sound in front of the next one. So NODE 1's
+//! `Paused` marks the ring stale, and NODE 2's first `pop` after it skips what was left
+//! (`SampleRing::mark_stale`). What that costs is the same block and a half of a player that was
+//! merely paused and resumed — 16 ms at the quantum FxSound asks for — which it resumes that much
+//! further on than it stopped.
+//!
+//! The input lane is left running either way: the capture stream is what makes the microphone
+//! produce anything, and a recorder may link to the virtual source at any moment.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
@@ -71,9 +109,9 @@ use crate::lane_dsp::{self, ChainHandover, LaneDsp};
 use crate::per_direction::PerDirection;
 use crate::{
     AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION, DEFAULT_QUANTUM_FRAMES,
-    DEFAULT_SAMPLE_RATE, LINK_GROUP, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS,
-    OUTPUT_NODE_NAME, OUTPUT_STREAM_DESCRIPTION, RING_CAPACITY_FRAMES, SINK_DESCRIPTION,
-    SINK_NODE_NAME, SOURCE_NODE_NAME, locale, our_node_name,
+    DEFAULT_SAMPLE_RATE, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS, OUTPUT_NODE_NAME,
+    OUTPUT_STREAM_DESCRIPTION, RING_CAPACITY_FRAMES, SINK_DESCRIPTION, SINK_NODE_NAME,
+    SOURCE_NODE_NAME, link_group, locale, our_node_name,
 };
 
 /// The rate the capture stream asks for, whatever the microphone runs at.
@@ -111,6 +149,23 @@ const RELEASE_TIMEOUT: Duration = Duration::from_millis(300);
 /// and an unanswered registry sync — shutdown right after a reconnect — would otherwise pass for
 /// the confirmation before the metadata write had reached the server.
 const RELEASE_SEQ: i32 = 1;
+
+/// How long the output lane's NODE 1 has to have been paused before its NODE 2 is put to sleep,
+/// on a server that does not do that by itself ([`SecondNodePace`]).
+///
+/// Not at once, for two reasons. NODE 2 still has the ring's tail to play when NODE 1 stops —
+/// up to four target fills, a quarter of a second at the largest quantum — and put to sleep on top
+/// of it, it would play that stale tail as the first thing it hears when it wakes. And a player
+/// that closes its stream at the end of a track and opens another for the next one pauses NODE 1
+/// for a moment it has no business sleeping through. A second is long enough for both and short
+/// beside the five seconds WirePlumber waits before it suspends the speakers themselves.
+pub(crate) const SLEEP_AFTER: Duration = Duration::from_secs(1);
+
+/// The first PipeWire whose scheduler runs the members of a `node.link-group` together, which is
+/// what lets the output lane's NODE 2 be passive (module docs, "Idle"). Found by reading
+/// `src/pipewire/context.c` release by release: 0.3.67 has no `run_nodes` at all, 0.3.68 has it
+/// with the link-group walk that every release since has kept.
+const LINK_GROUPS_SCHEDULED_SINCE: (u32, u32, u32) = (0, 3, 68);
 
 /// Target ring fill, in quanta. 1.5 × quantum per `docs/spec/12-audio-io.md` §19.6; expressed in
 /// halves so it stays integer arithmetic.
@@ -158,6 +213,13 @@ pub(crate) struct SampleRing {
     /// The Windows "don't start playing until the capture ring is half full" rule
     /// (`sndDevicesDoCapture.cpp:129-140`), which is also what stops a start-up click.
     primed: AtomicBool,
+    /// [`Self::mark_stale`] asked the consumer to skip everything up to `stale_until` on its next
+    /// [`Self::pop`]. Written by the main loop, taken by the consumer with a `swap`, so each mark
+    /// is acted on once.
+    stale: AtomicBool,
+    /// Where the write cursor stood when the ring was marked stale: everything before it belongs
+    /// to a sound that has ended.
+    stale_until: AtomicUsize,
     dropped_frames: AtomicU64,
     underrun_frames: AtomicU64,
     resyncs: AtomicU64,
@@ -181,6 +243,8 @@ impl SampleRing {
             channels: AtomicUsize::new(0),
             target_fill_frames: AtomicUsize::new(DEFAULT_QUANTUM_FRAMES as usize),
             primed: AtomicBool::new(false),
+            stale: AtomicBool::new(false),
+            stale_until: AtomicUsize::new(0),
             dropped_frames: AtomicU64::new(0),
             underrun_frames: AtomicU64::new(0),
             resyncs: AtomicU64::new(0),
@@ -203,8 +267,38 @@ impl SampleRing {
             Ordering::Relaxed,
         );
         self.primed.store(false, Ordering::Relaxed);
+        // A mark left by the previous pair's NODE 1 describes samples this reset drops anyway.
+        self.stale.store(false, Ordering::Relaxed);
         let write = self.write.load(Ordering::Relaxed);
         self.read.store(write, Ordering::Release);
+    }
+
+    /// Have the consumer's next [`Self::pop`] skip everything pushed so far, and prime again
+    /// before it plays anything. Main loop: NODE 1's `state_changed`, when a pair whose NODE 2 is
+    /// passive stops (module docs, "Idle").
+    ///
+    /// Such a pair stops in one cycle, both nodes together, and leaves the ring's cushion behind:
+    /// the last block and a half of a sound that has ended. The next thing to wake the pair may
+    /// be another application minutes later, and without this the first thing it played would be
+    /// that tail.
+    ///
+    /// It cannot empty the ring itself. Emptying means moving the read cursor, and the read
+    /// cursor is the consumer's — the one rule the ring's wait-freedom rests on, and the reason
+    /// [`Self::reconfigure`] is main-loop-only as well. So it only records where the *write*
+    /// cursor stands, which is the producer's to move and anyone's to read, and leaves the
+    /// skipping to the consumer. Recording a position rather than asking for "everything" is also
+    /// what keeps a block NODE 1 pushes in the cycle that wakes the pair: that one is the new
+    /// sound's.
+    pub(crate) fn mark_stale(&self) {
+        self.stale_until
+            .store(self.write.load(Ordering::Acquire), Ordering::Relaxed);
+        self.stale.store(true, Ordering::Release);
+    }
+
+    /// Whether a [`Self::mark_stale`] is still waiting for the consumer.
+    #[cfg(test)]
+    pub(crate) fn stale_pending(&self) -> bool {
+        self.stale.load(Ordering::Acquire)
     }
 
     /// How many channels the samples currently in the ring are interleaved at.
@@ -257,11 +351,30 @@ impl SampleRing {
     ///   change, or the producer briefly outrunning us — the *consumer* skips the excess. Doing it
     ///   here rather than in `push` keeps the ring strictly single-writer-per-cursor, which is
     ///   what makes the whole thing wait-free.
+    /// * **Stale samples.** What [`Self::mark_stale`] marked is skipped, for the same reason, and
+    ///   the ring primes again: the next sound starts the way a pair just built starts.
     pub(crate) fn pop(&self, out: &mut [f32]) -> usize {
         let channels = self.channels.load(Ordering::Relaxed).max(1);
         let mut read = self.read.load(Ordering::Relaxed);
         let write = self.write.load(Ordering::Acquire);
         let mut available = write.wrapping_sub(read);
+
+        // A plain load first, so the cycles with no mark — all of them but one — cost no
+        // read-modify-write.
+        if self.stale.load(Ordering::Relaxed) && self.stale.swap(false, Ordering::Acquire) {
+            // The cursors are free-running and never further apart than the ring is long, so a
+            // mark behind `read` — nothing it covers is left — comes out of the subtraction far
+            // larger than that, and is ignored. A mark ahead of the `write` loaded above means
+            // the producer moved in between, and everything visible here is older than it.
+            let stale = self.stale_until.load(Ordering::Relaxed).wrapping_sub(read);
+            if (1..=self.slots.len()).contains(&stale) {
+                let skip = stale.min(available) / channels * channels;
+                read = read.wrapping_add(skip);
+                available -= skip;
+                self.read.store(read, Ordering::Release);
+                self.primed.store(false, Ordering::Relaxed);
+            }
+        }
 
         // The cushion has to be measured against the block the consumer actually takes, not
         // against the quantum the nodes were *built* with. Those are the same number only while
@@ -392,6 +505,13 @@ pub(crate) struct StreamStatus {
     sink_error: AtomicBool,
     output_error: AtomicBool,
     output_streaming: AtomicBool,
+    /// What NODE 1's last state asks of NODE 2, as a [`Wish`]. Written on every state NODE 1
+    /// reports, in both lanes; only an output pair that is paced by hand acts on it
+    /// ([`pace_second_node`]).
+    second_wish: AtomicU8,
+    /// How many states NODE 1 has reported since the pair was built, so the main loop can tell
+    /// "paused all along" from "paused, played and paused again" between two looks.
+    first_changes: AtomicU32,
 }
 
 impl StreamStatus {
@@ -402,6 +522,115 @@ impl StreamStatus {
         self.sink_error.store(false, Ordering::Relaxed);
         self.output_error.store(false, Ordering::Relaxed);
         self.output_streaming.store(false, Ordering::Relaxed);
+        self.second_wish
+            .store(Wish::AsYouWere as u8, Ordering::Relaxed);
+        self.first_changes.store(0, Ordering::Relaxed);
+    }
+
+    /// NODE 1 reported `state`. Its `state_changed`, on the main loop — which may be inside
+    /// `Stream::connect`, with [`Shared`] borrowed by whoever is building the pair, and is why the
+    /// wish goes through atomics rather than straight to NODE 2.
+    fn first_node_moved(&self, state: &StreamState) {
+        self.second_wish
+            .store(second_node_wish(state) as u8, Ordering::Relaxed);
+        self.first_changes.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// What NODE 2 should be doing, going by NODE 1's last state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Wish {
+    /// NODE 1 says nothing either way: it is not on the server yet, it is leaving it, or it is in
+    /// error and about to be rebuilt with its partner.
+    AsYouWere = 0,
+    /// Something plays into NODE 1.
+    Run = 1,
+    /// Nothing does.
+    Sleep = 2,
+}
+
+impl Wish {
+    /// Read back what [`StreamStatus::first_node_moved`] stored. Anything else is the cleared
+    /// value, which asks for nothing.
+    const fn from_code(code: u8) -> Self {
+        match code {
+            1 => Self::Run,
+            2 => Self::Sleep,
+            _ => Self::AsYouWere,
+        }
+    }
+}
+
+/// What a state of NODE 1 asks of NODE 2.
+///
+/// A `pw_stream` is `Paused` from the moment the server has bound it (`proxy_bound_props` in
+/// `src/pipewire/stream.c`) until the graph starts it, and again whenever the graph pauses it — the
+/// last client linked into it went away or went quiet — or a session manager suspends it; it is
+/// `Streaming` exactly while the graph runs it. So the two are the whole answer, and the states
+/// either side of them — connecting, disconnecting, failed — are no answer at all.
+const fn second_node_wish(first: &StreamState) -> Wish {
+    match first {
+        StreamState::Streaming => Wish::Run,
+        StreamState::Paused => Wish::Sleep,
+        StreamState::Unconnected | StreamState::Connecting | StreamState::Error(_) => {
+            Wish::AsYouWere
+        }
+    }
+}
+
+/// NODE 2's schedule in an output pair the server does not idle by itself (module docs, "Idle").
+///
+/// Pure bookkeeping, so it can be tested without a server: [`Self::next`] says what to tell
+/// NODE 2, and [`pace_second_node`] tells it. It wakes NODE 2 the moment NODE 1 streams, because
+/// every block NODE 1 pushes before NODE 2 runs again is latency the ring then carries for the
+/// rest of the stream. It puts NODE 2 to sleep only once NODE 1 has asked for it for
+/// [`SLEEP_AFTER`] without changing its mind, for the reasons given there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SecondNodePace {
+    /// What NODE 2 was last told. It is connected active.
+    active: bool,
+    /// Since when NODE 1 has been asking for sleep, and how many states it had reported when that
+    /// was first seen. A count that has moved means it streamed in between, and the wait starts
+    /// again.
+    sleep_asked: Option<(u32, Instant)>,
+}
+
+impl SecondNodePace {
+    /// A NODE 2 that has just been connected, and so is active.
+    const fn new() -> Self {
+        Self {
+            active: true,
+            sleep_asked: None,
+        }
+    }
+
+    /// The `set_active` to make now, if any, given NODE 1's latest wish and how many states it has
+    /// reported. Nothing changes until [`Self::told`] confirms the call was made.
+    fn next(&mut self, wish: Wish, changes: u32, now: Instant) -> Option<bool> {
+        match wish {
+            Wish::AsYouWere => None,
+            Wish::Run => {
+                self.sleep_asked = None;
+                (!self.active).then_some(true)
+            }
+            Wish::Sleep if !self.active => None,
+            Wish::Sleep => match self.sleep_asked {
+                Some((seen, since)) if seen == changes => {
+                    (now.saturating_duration_since(since) >= SLEEP_AFTER).then_some(false)
+                }
+                _ => {
+                    self.sleep_asked = Some((changes, now));
+                    None
+                }
+            },
+        }
+    }
+
+    /// NODE 2 has been told to be `active`.
+    const fn told(&mut self, active: bool) {
+        self.active = active;
+        self.sleep_asked = None;
     }
 }
 
@@ -495,11 +724,16 @@ struct Nodes {
     /// Kept reachable rather than merely alive: the supervisor republishes this node's
     /// `ProcessLatency` when the DSP's delay changes under it.
     first: pw::stream::StreamRc,
-    _second: pw::stream::StreamRc,
+    /// Kept reachable so that an output pair paced by hand can put it to sleep and wake it.
+    second: pw::stream::StreamRc,
     /// `node.name` of the real device NODE 2 renders to, or NODE 1 captures from.
     target: String,
     /// What both nodes were declared at.
     format: PairFormat,
+    /// NODE 2's schedule, in an output pair whose server does not run a link-group together and
+    /// so cannot idle it by itself (module docs, "Idle"). `None` in every other pair: the input
+    /// lane's, which is left running, and an output pair whose NODE 2 is passive.
+    pace: Option<SecondNodePace>,
 }
 
 /// The format a lane's pair runs at: decided once per build, declared on both of its nodes, and
@@ -846,6 +1080,21 @@ struct Shared {
     last_devices: Vec<AudioDevice>,
     /// The last error about the connection as a whole, rather than about one lane.
     connection_error: Option<AudioError>,
+    /// The server runs the members of a `node.link-group` together, so an output pair's NODE 2
+    /// can be passive ([`LINK_GROUPS_SCHEDULED_SINCE`]). Learned from the server's core info on
+    /// every connect, and `false` until it has arrived — the answer that is merely less idle,
+    /// never silent, when it is wrong.
+    ///
+    /// A cell of its own, shared with the core listener, rather than a field that listener would
+    /// have to borrow `Shared` to set. The info event is the only place the answer is learned,
+    /// once per connection, and a borrow that happened to be taken when it came would lose it for
+    /// the whole connection — with nothing to show for it but an output lane paced by hand on a
+    /// server where that never lets it sleep.
+    link_groups_scheduled: Rc<Cell<bool>>,
+    /// Wakes the main loop to [`pace_second_node`] the moment an output lane's NODE 1 reports a
+    /// state, rather than on the next tick. `None` until [`run`] attaches its receiver — so in
+    /// tests, which pace by hand — and then the supervisor alone does the pacing.
+    wake: Option<pw::channel::Sender<()>>,
 }
 
 impl Shared {
@@ -885,6 +1134,8 @@ impl Shared {
             language,
             last_devices: Vec::new(),
             connection_error: None,
+            link_groups_scheduled: Rc::new(Cell::new(false)),
+            wake: None,
         }
     }
 
@@ -1006,6 +1257,24 @@ fn republish_latency(shared: &mut Shared, direction: DeviceDirection) {
     lane.published_latency = current;
 }
 
+/// Whether a server reporting `version` runs the members of a `node.link-group` together
+/// ([`LINK_GROUPS_SCHEDULED_SINCE`]). A version that cannot be read is taken to be older: that
+/// answer, when wrong, costs idle power, where the other would cost the user their sound.
+fn schedules_link_groups(version: &str) -> bool {
+    let mut parts = version.trim().split('.').map(|part| {
+        let digits = part
+            .find(|c: char| !c.is_ascii_digit())
+            .map_or(part, |end| &part[..end]);
+        digits.parse::<u32>().ok()
+    });
+    let (Some(Some(major)), Some(Some(minor)), Some(Some(micro))) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    (major, minor, micro) >= LINK_GROUPS_SCHEDULED_SINCE
+}
+
 /// The word for a direction in log lines.
 const fn noun(direction: DeviceDirection) -> &'static str {
     match direction {
@@ -1094,6 +1363,8 @@ pub(crate) fn run(config: Config) {
         move |message| handle_control(&shared, &mainloop, message)
     });
 
+    let wake_source = attach_wake(mainloop.loop_(), &shared);
+
     // The first attempt is made synchronously so `AudioEngine::start` can report it. Connecting
     // to a socket that is not there fails at `connect(2)`, so this does not delay start-up.
     let first = connect(&shared, &context);
@@ -1120,9 +1391,39 @@ pub(crate) fn run(config: Config) {
     // a default straight back, and a late control message could do the same.
     drop(timer);
     drop(control_source);
+    drop(wake_source);
     release_defaults_before_exit(&shared, &mainloop);
     close_session(&mut shared.borrow_mut());
     log::info!("FxSound audio thread stopped");
+}
+
+/// Hear an output lane's NODE 1 start and stop streaming the moment it does, rather than on the
+/// next tick, and pace its NODE 2 accordingly when the pair is paced by hand (module docs, "Idle").
+/// Gives `shared` the sending end, which each such pair's NODE 1 takes a copy of.
+///
+/// The channel's lock is held while the callback runs, and NODE 1's `state_changed` is the only
+/// sender, so the callback must never do anything to a NODE 1 — it only ever touches NODE 2.
+fn attach_wake<'l>(
+    loop_: &'l pw::loop_::Loop,
+    shared: &Rc<RefCell<Shared>>,
+) -> pw::channel::AttachedReceiver<'l, ()> {
+    let (wake, woken) = pw::channel::channel::<()>();
+    let attached = woken.attach(loop_, {
+        let shared = Rc::clone(shared);
+        move |()| {
+            // Nothing holds the state between two turns of the loop, but a callback cannot prove
+            // it; were it held, the wish would wait in the lane's atomics for the next tick, which
+            // paces every lane itself.
+            if let Ok(mut shared) = shared.try_borrow_mut() {
+                let now = Instant::now();
+                for direction in DeviceDirection::ALL {
+                    pace_second_node(&mut shared, direction, now);
+                }
+            }
+        }
+    });
+    shared.borrow_mut().wake = Some(wake);
+    attached
 }
 
 /// The exit hand-back, made to actually arrive.
@@ -1360,7 +1661,15 @@ fn connect(
     shared: &Rc<RefCell<Shared>>,
     context: &pw::context::ContextRc,
 ) -> Result<(), AudioError> {
-    let remote = shared.borrow().remote.clone();
+    let (remote, link_groups_scheduled) = {
+        let shared = shared.borrow();
+        (
+            shared.remote.clone(),
+            Rc::clone(&shared.link_groups_scheduled),
+        )
+    };
+    // Whatever the last server was, this one has not said yet.
+    link_groups_scheduled.set(false);
     let props = remote.map(|name| {
         properties! {
             *pw::keys::REMOTE_NAME => name,
@@ -1373,6 +1682,22 @@ fn connect(
 
     let core_listener = core
         .add_listener_local()
+        .info(move |info| {
+            // The server's version, not this library's: the scheduler that decides what runs is
+            // the server's. Sent once on connect, ahead of the registry dump, so it is known
+            // before any pair is built on this connection.
+            let scheduled = schedules_link_groups(info.version());
+            log::info!(
+                "PipeWire {}: the output lane's playback stream {}",
+                info.version(),
+                if scheduled {
+                    "is passive and sleeps with the sink"
+                } else {
+                    "is put to sleep by hand while the sink has no clients"
+                }
+            );
+            link_groups_scheduled.set(scheduled);
+        })
         .error({
             let shared = Rc::clone(shared);
             move |id, _seq, res, message| {
@@ -1613,6 +1938,56 @@ fn supervise_lane(shared: &mut Shared, direction: DeviceDirection, now: Instant)
     // d. Keep the published delay honest. Switching the denoiser on adds ten milliseconds, and
     //    only the audio thread knows it happened.
     republish_latency(shared, direction);
+
+    // e. Put a NODE 2 paced by hand to sleep once its NODE 1 has been paused long enough — the
+    //    one step of the pacing that waits for time rather than for an event — and catch any wake
+    //    the channel could not deliver.
+    pace_second_node(shared, direction, now);
+}
+
+/// Tell a lane's NODE 2 to sleep or wake, if its pair is paced by hand and NODE 1 has asked for it
+/// ([`SecondNodePace`]). Main loop: from the wake channel as soon as NODE 1 reports a state, and
+/// from every supervisor tick.
+///
+/// A pair whose server idles it by itself, and the input lane's pair, have no pace and are left
+/// alone.
+fn pace_second_node(shared: &mut Shared, direction: DeviceDirection, now: Instant) {
+    let lane = shared.lanes.get_mut(direction);
+    let Some(nodes) = lane.nodes.as_mut() else {
+        return;
+    };
+    let Some(pace) = nodes.pace.as_mut() else {
+        return;
+    };
+    let wish = Wish::from_code(lane.status.second_wish.load(Ordering::Relaxed));
+    let changes = lane.status.first_changes.load(Ordering::Relaxed);
+    let Some(active) = pace.next(wish, changes, now) else {
+        return;
+    };
+    // The ring needs nothing from here (module docs, "Idle"): by the time NODE 2 is put to sleep
+    // it has played the ring dry and dropped out of priming (`SampleRing::pop`).
+    match nodes.second.set_active(active) {
+        Ok(()) => {
+            pace.told(active);
+            if active {
+                log::debug!(
+                    "{} lane: something plays into NODE 1; NODE 2 wakes",
+                    direction.key()
+                );
+            } else {
+                log::debug!(
+                    "{} lane: nothing plays into NODE 1; NODE 2 sleeps",
+                    direction.key()
+                );
+            }
+        }
+        // Asked again on the next tick: NODE 1's wish is still in the lane's atomics.
+        Err(error) => log::warn!(
+            "could not {} the {} lane's NODE 2: {error}",
+            if active { "wake" } else { "put to sleep" },
+            direction.key()
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2263,6 +2638,9 @@ fn build_nodes(
     let quantum = DEFAULT_QUANTUM_FRAMES.min(MAX_QUANTUM_FRAMES as u32);
     let latency = format!("{quantum}/{rate}");
 
+    let (passive, pace) = idle_plan(direction, shared.link_groups_scheduled.get());
+    let wake = pace.and(shared.wake.clone());
+
     // ---- NODE 1: the node the DSP runs in ----------------------------------------------------
     //
     // Output: the virtual sink. A `pw_stream` with `media.class = "Audio/Sink"` *is* a sink node;
@@ -2285,7 +2663,7 @@ fn build_nodes(
         ),
         DeviceDirection::Input => (
             CAPTURE_NODE_NAME,
-            stream_props(direction, &target.name, &latency),
+            stream_props(direction, &target.name, &latency, false),
             StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
         ),
     };
@@ -2338,6 +2716,16 @@ fn build_nodes(
         .add_local_listener_with_user_data(first_data)
         .state_changed(move |_stream, data, _old, new| {
             log::debug!("{first_name}: {new:?}");
+            data.status.first_node_moved(&new);
+            if passive && matches!(new, StreamState::Paused) {
+                // A passive NODE 2 stopped in the same cycle, and what it had not played yet is
+                // the tail of a sound that has ended (module docs, "Idle").
+                data.ring.mark_stale();
+            }
+            if let Some(wake) = &wake {
+                // Only fails once the main loop is gone, and then there is nothing left to pace.
+                let _ = wake.send(());
+            }
             if let StreamState::Error(message) = &new {
                 log::warn!("{first_name} error: {message}");
                 data.status.sink_error.store(true, Ordering::Relaxed);
@@ -2387,7 +2775,7 @@ fn build_nodes(
     let (second_name, second_props, second_flags) = match direction {
         DeviceDirection::Output => (
             OUTPUT_NODE_NAME,
-            stream_props(direction, &target.name, &latency),
+            stream_props(direction, &target.name, &latency, passive),
             StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS | StreamFlags::RT_PROCESS,
         ),
         DeviceDirection::Input => (
@@ -2450,10 +2838,28 @@ fn build_nodes(
         _first_listener: first_listener,
         _second_listener: second_listener,
         first,
-        _second: second,
+        second,
         target: target.name.clone(),
         format,
+        pace,
     })
+}
+
+/// How a new pair keeps its NODE 2 from running while nothing plays into its NODE 1 (module docs,
+/// "Idle"): whether NODE 2 is declared passive, and the pace it is kept to by hand when it is not.
+///
+/// The output lane's NODE 2 is passive where the server runs a link-group together and paced by
+/// hand where it does not. The input lane's pair is left running: its NODE 1 is what makes the
+/// microphone produce anything, and a recorder may link to its NODE 2 at any moment.
+fn idle_plan(
+    direction: DeviceDirection,
+    link_groups_scheduled: bool,
+) -> (bool, Option<SecondNodePace>) {
+    match direction {
+        DeviceDirection::Input => (false, None),
+        DeviceDirection::Output if link_groups_scheduled => (true, None),
+        DeviceDirection::Output => (false, Some(SecondNodePace::new())),
+    }
 }
 
 /// The properties of FxSound's virtual device — the sink of the output lane, the source of
@@ -2485,7 +2891,7 @@ fn virtual_node_props(
         *pw::keys::NODE_DESCRIPTION   => description.as_str(),
         *pw::keys::NODE_NICK          => description.as_str(),
         *pw::keys::NODE_VIRTUAL       => "true",
-        *pw::keys::NODE_LINK_GROUP    => LINK_GROUP,
+        *pw::keys::NODE_LINK_GROUP    => link_group(direction),
         *pw::keys::NODE_WANT_DRIVER   => "true",
         *pw::keys::NODE_ALWAYS_PROCESS => "false",
         *pw::keys::NODE_LATENCY       => latency,
@@ -2506,8 +2912,14 @@ fn virtual_node_props(
 
 /// The properties of the stream that touches the real device — the playback stream of the output
 /// lane, the capture stream of the input lane (`docs/spec/12-audio-io.md` §20 NODE 2, §28.2
-/// NODE 1). `target` is the real device's `node.name`.
-fn stream_props(direction: DeviceDirection, target: &str, latency: &str) -> PropertiesBox {
+/// NODE 1). `target` is the real device's `node.name`; `passive` says whether the stream's link
+/// to it may keep it awake (module docs, "Idle").
+fn stream_props(
+    direction: DeviceDirection,
+    target: &str,
+    latency: &str,
+    passive: bool,
+) -> PropertiesBox {
     let (media_class, category, name, description) = match direction {
         DeviceDirection::Output => (
             "Stream/Output/Audio",
@@ -2535,10 +2947,17 @@ fn stream_props(direction: DeviceDirection, target: &str, latency: &str) -> Prop
         // The same group as the virtual node. Without it WirePlumber links this stream straight
         // back into our own sink (or our own source) the moment that node becomes the default,
         // and the graph feeds back.
-        *pw::keys::NODE_LINK_GROUP     => LINK_GROUP,
+        *pw::keys::NODE_LINK_GROUP     => link_group(direction),
         *pw::keys::NODE_AUTOCONNECT    => "true",
         *pw::keys::NODE_DONT_RECONNECT => "false",
-        *pw::keys::NODE_PASSIVE        => "false",
+        // Passive, the playback stream's link no longer keeps the speakers running; what runs it
+        // is the virtual sink, whenever an application's link makes that run, because the server
+        // runs a link-group together. That is true from PipeWire 0.3.68 on, and only there does
+        // the caller ask for it. On an older server the two nodes are not linked in the graph —
+        // the ring between them is invisible to it — and nothing would ever wake a passive NODE 2
+        // but the speakers running for somebody else: FxSound would play nothing. The capture
+        // stream is never passive. It is what makes the microphone produce anything at all.
+        *pw::keys::NODE_PASSIVE        => if passive { "true" } else { "false" },
         *pw::keys::NODE_LATENCY        => latency,
         *pw::keys::STREAM_DONT_REMIX   => "false",
         *pw::keys::TARGET_OBJECT       => target,
@@ -2909,6 +3328,11 @@ fn publish_lane(shared: &mut Shared, direction: DeviceDirection) {
 /// flap on a long quantum.
 fn publish_attachment(shared: &mut Shared, direction: DeviceDirection) {
     let lane = shared.lanes.get_mut(direction);
+    // Every tick asks, and nearly every tick the answer is the one already given: compared in
+    // place, so a lane that is merely running does not copy its target's name five times a second.
+    if lane.attached.as_deref() == lane.nodes.as_ref().map(|nodes| nodes.target.as_str()) {
+        return;
+    }
     let target = lane.nodes.as_ref().map(|nodes| nodes.target.clone());
     if let Some(node_name) = lane.note_attachment(target.as_deref()) {
         shared.notify(AudioToUi::Attached {
@@ -3158,6 +3582,86 @@ mod tests {
         assert_eq!(ring.pop(&mut out), 8);
     }
 
+    /// A passive NODE 2 stops in the same cycle as NODE 1 with the cushion still in the ring, and
+    /// next runs whenever something plays into NODE 1 again — which may be another application,
+    /// minutes later (module docs, "Idle"). What wakes it is heard from its start, after a
+    /// re-prime like a new pair's, and never behind the tail of the sound before it.
+    #[test]
+    fn a_ring_marked_stale_skips_what_the_last_sound_left_and_primes_again_for_the_next() {
+        let ring = ring_for(2, 4); // target fill = 6 frames = 12 samples
+        let mut out = [0.0_f32; 8]; // 4 frames per cycle
+
+        // A sound plays, and the pair stops with some of it still in the ring.
+        ring.push(&[0.5; 16]);
+        assert_eq!(ring.pop(&mut out), 8);
+        assert_eq!(ring.fill_frames(), 4, "the cushion the pair stopped with");
+        ring.mark_stale();
+        assert!(ring.stale_pending());
+
+        // Another sound wakes it, and NODE 1 is first in the cycle: a block of the new sound is
+        // in the ring before NODE 2's first pop.
+        ring.push(&[-0.25; 8]);
+        assert_eq!(
+            ring.pop(&mut out),
+            0,
+            "a woken pair re-primes, as a new one does"
+        );
+        assert_eq!(out, [0.0; 8]);
+        assert!(!ring.stale_pending(), "a mark is acted on once");
+        assert_eq!(
+            ring.fill_frames(),
+            4,
+            "only the old sound was skipped, not the new one's first block"
+        );
+
+        ring.push(&[-0.25; 8]);
+        assert_eq!(ring.pop(&mut out), 8);
+        assert_eq!(
+            out, [-0.25; 8],
+            "the tail of the last sound was played to the next one"
+        );
+    }
+
+    /// The mark records a position, not "whatever is in the ring": a pair that stopped with the
+    /// ring already dry, or whose `Paused` reaches the main loop only after the new sound has
+    /// started, loses nothing of the new sound to it.
+    #[test]
+    fn a_stale_mark_never_costs_the_next_sound_a_sample() {
+        let ring = ring_for(2, 4); // target fill = 6 frames = 12 samples
+        let mut out = [0.0_f32; 8];
+        ring.push(&[0.5; 12]);
+        assert_eq!(ring.pop(&mut out), 8);
+        assert_eq!(ring.pop(&mut out), 4, "played dry before the pair stopped");
+        ring.mark_stale();
+
+        ring.push(&[-0.25; 12]); // exactly the target
+        assert_eq!(
+            ring.pop(&mut out),
+            8,
+            "a dry ring's mark delayed the next sound"
+        );
+        assert_eq!(out, [-0.25; 8]);
+
+        // A mark taken after the new sound had started: the ring holds only what was pushed
+        // before it, and a later block stays.
+        let ring = ring_for(2, 4);
+        ring.push(&[0.5; 8]);
+        ring.mark_stale();
+        ring.push(&[-0.25; 16]);
+        assert_eq!(ring.pop(&mut out), 8);
+        assert_eq!(out, [-0.25; 8], "the samples before the mark were played");
+        assert_eq!(ring.fill_frames(), 4, "samples after the mark were skipped");
+    }
+
+    #[test]
+    fn rebuilding_a_ring_forgets_a_stale_mark_it_had_not_acted_on() {
+        let ring = ring_for(2, 4);
+        ring.push(&[0.5; 16]);
+        ring.mark_stale();
+        ring.reconfigure(2, 4);
+        assert!(!ring.stale_pending());
+    }
+
     #[test]
     fn the_consumer_drops_the_oldest_audio_when_latency_runs_away() {
         // A quantum change or a briefly faster producer must not leave a permanently deeper
@@ -3251,6 +3755,177 @@ mod tests {
     }
 
     #[test]
+    fn only_streaming_wakes_node_two_and_only_paused_puts_it_to_sleep() {
+        assert_eq!(second_node_wish(&StreamState::Streaming), Wish::Run);
+        assert_eq!(second_node_wish(&StreamState::Paused), Wish::Sleep);
+        // On the way to the server, on the way off it, or failed: nothing to go by, and a NODE 1 in
+        // error takes its NODE 2 down with it anyway.
+        for state in [
+            StreamState::Unconnected,
+            StreamState::Connecting,
+            StreamState::Error("gone".to_owned()),
+        ] {
+            assert_eq!(second_node_wish(&state), Wish::AsYouWere, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn node_one_s_wish_crosses_to_the_main_loop_intact_and_a_new_pair_starts_with_none() {
+        let status = StreamStatus::default();
+        assert_eq!(
+            Wish::from_code(status.second_wish.load(Ordering::Relaxed)),
+            Wish::AsYouWere,
+            "a pair that has said nothing asks for nothing"
+        );
+        for (state, wish) in [
+            (StreamState::Connecting, Wish::AsYouWere),
+            (StreamState::Paused, Wish::Sleep),
+            (StreamState::Streaming, Wish::Run),
+            (StreamState::Paused, Wish::Sleep),
+        ] {
+            status.first_node_moved(&state);
+            assert_eq!(
+                Wish::from_code(status.second_wish.load(Ordering::Relaxed)),
+                wish
+            );
+        }
+        assert_eq!(status.first_changes.load(Ordering::Relaxed), 4);
+
+        status.clear();
+        assert_eq!(
+            Wish::from_code(status.second_wish.load(Ordering::Relaxed)),
+            Wish::AsYouWere,
+            "the next pair must not be put to sleep on the word of the last one"
+        );
+        assert_eq!(status.first_changes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn node_two_sleeps_only_once_node_one_has_been_paused_for_the_whole_wait() {
+        let start = Instant::now();
+        let mut pace = SecondNodePace::new();
+        assert!(pace.active, "NODE 2 is connected active");
+
+        // NODE 1 comes up paused: nothing plays into it yet.
+        assert_eq!(pace.next(Wish::Sleep, 1, start), None, "not at once");
+        assert_eq!(
+            pace.next(Wish::Sleep, 1, start + SLEEP_AFTER / 2),
+            None,
+            "not half way through the wait"
+        );
+        assert_eq!(pace.next(Wish::Sleep, 1, start + SLEEP_AFTER), Some(false));
+        // Nothing is taken as done until the call has been made: asked again, it says so again.
+        assert_eq!(
+            pace.next(Wish::Sleep, 1, start + SLEEP_AFTER * 2),
+            Some(false)
+        );
+        pace.told(false);
+        assert_eq!(
+            pace.next(Wish::Sleep, 1, start + SLEEP_AFTER * 3),
+            None,
+            "asleep is asleep"
+        );
+    }
+
+    #[test]
+    fn node_two_wakes_the_moment_node_one_streams() {
+        let start = Instant::now();
+        let mut pace = SecondNodePace::new();
+        pace.told(false);
+
+        assert_eq!(
+            pace.next(Wish::Run, 2, start),
+            Some(true),
+            "no waiting on the way up: every block NODE 1 pushes before NODE 2 runs is latency"
+        );
+        pace.told(true);
+        assert_eq!(pace.next(Wish::Run, 2, start), None, "awake is awake");
+    }
+
+    #[test]
+    fn a_pause_that_ended_and_began_again_between_two_looks_starts_the_wait_again() {
+        let start = Instant::now();
+        let mut pace = SecondNodePace::new();
+        assert_eq!(pace.next(Wish::Sleep, 1, start), None);
+
+        // Two more states went by unseen — it streamed and paused again — just before the wait
+        // would have run out. The pause that counts is the one that began a moment ago.
+        let later = start + SLEEP_AFTER;
+        assert_eq!(pace.next(Wish::Sleep, 3, later), None);
+        assert_eq!(
+            pace.next(Wish::Sleep, 3, later + SLEEP_AFTER / 2),
+            None,
+            "the wait restarted"
+        );
+        assert_eq!(pace.next(Wish::Sleep, 3, later + SLEEP_AFTER), Some(false));
+
+        // And a stream that was seen cancels a wait in progress outright.
+        let mut pace = SecondNodePace::new();
+        assert_eq!(pace.next(Wish::Sleep, 1, start), None);
+        assert_eq!(pace.next(Wish::Run, 2, start + SLEEP_AFTER / 2), None);
+        assert_eq!(pace.next(Wish::Sleep, 3, start + SLEEP_AFTER), None);
+        assert_eq!(
+            pace.next(Wish::Sleep, 3, start + SLEEP_AFTER * 2),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn a_node_one_that_says_nothing_leaves_node_two_as_it_is() {
+        let start = Instant::now();
+        for active in [true, false] {
+            let mut pace = SecondNodePace::new();
+            pace.told(active);
+            for later in [Duration::ZERO, SLEEP_AFTER * 10] {
+                assert_eq!(pace.next(Wish::AsYouWere, 1, start + later), None);
+            }
+            assert_eq!(pace.active, active);
+        }
+    }
+
+    #[test]
+    fn a_passive_playback_stream_is_asked_of_every_server_that_runs_a_link_group_together() {
+        for version in [
+            "0.3.68",
+            "0.3.85",
+            "1.0.5",
+            "1.2.7",
+            "1.6.8",
+            "2.0.0",
+            " 1.6.8 ",
+            "1.4.2-rc1",
+        ] {
+            assert!(schedules_link_groups(version), "{version}");
+        }
+        // Older servers, and anything that cannot be read as a version, pace NODE 2 by hand:
+        // guessing wrong that way costs idle power, guessing wrong the other way costs the sound.
+        for version in ["0.3.65", "0.3.67", "0.2.99", "", "1.6", "pipewire", "x.y.z"] {
+            assert!(!schedules_link_groups(version), "{version:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_output_lane_idles_and_only_an_old_server_needs_it_done_by_hand() {
+        assert_eq!(
+            idle_plan(DeviceDirection::Output, true),
+            (true, None),
+            "a server that runs a link-group together idles a passive NODE 2 by itself"
+        );
+        assert_eq!(
+            idle_plan(DeviceDirection::Output, false),
+            (false, Some(SecondNodePace::new())),
+            "an older one gets an ordinary NODE 2, paced by hand"
+        );
+        for scheduled in [true, false] {
+            assert_eq!(
+                idle_plan(DeviceDirection::Input, scheduled),
+                (false, None),
+                "the microphone's pair is left running"
+            );
+        }
+    }
+
+    #[test]
     fn the_format_pod_round_trips_through_libspa() {
         let positions = ChannelMap::default_for(6);
         let bytes = format_pod(48_000, 6, &positions);
@@ -3294,7 +3969,7 @@ mod tests {
         );
         assert_eq!(sink.get("media.class"), Some("Audio/Sink"));
         assert_eq!(sink.get("node.name"), Some(SINK_NODE_NAME));
-        assert_eq!(sink.get("node.link-group"), Some(LINK_GROUP));
+        assert_eq!(sink.get("node.link-group"), Some(crate::LINK_GROUP));
         assert_eq!(sink.get("node.virtual"), Some("true"));
         assert_eq!(sink.get("node.want-driver"), Some("true"));
         assert_eq!(sink.get("audio.channels"), Some("2"));
@@ -3322,7 +3997,7 @@ mod tests {
             "not Audio/Source/Virtual"
         );
         assert_eq!(source.get("node.name"), Some(SOURCE_NODE_NAME));
-        assert_eq!(source.get("node.link-group"), Some(LINK_GROUP));
+        assert_eq!(source.get("node.link-group"), Some(crate::INPUT_LINK_GROUP));
         assert_eq!(source.get("node.virtual"), Some("true"));
         assert_eq!(source.get("node.want-driver"), Some("true"));
         assert_eq!(source.get("audio.channels"), Some("2"));
@@ -3333,7 +4008,7 @@ mod tests {
             "the two virtual nodes must be distinguishable in a device list"
         );
 
-        let output = stream_props(DeviceDirection::Output, "alsa_output.x", "512/48000");
+        let output = stream_props(DeviceDirection::Output, "alsa_output.x", "512/48000", true);
         assert_eq!(output.get("media.class"), Some("Stream/Output/Audio"));
         assert_eq!(output.get("media.category"), Some("Playback"));
         assert_eq!(output.get("media.role"), Some("Production"));
@@ -3342,12 +4017,23 @@ mod tests {
             output.get("node.description"),
             Some(OUTPUT_STREAM_DESCRIPTION)
         );
-        assert_eq!(output.get("node.link-group"), Some(LINK_GROUP));
+        assert_eq!(
+            output.get("node.link-group"),
+            sink.get("node.link-group"),
+            "the playback stream is in its sink's group"
+        );
+        assert_eq!(output.get("node.passive"), Some("true"));
+        assert_eq!(
+            stream_props(DeviceDirection::Output, "alsa_output.x", "512/48000", false)
+                .get("node.passive"),
+            Some("false"),
+            "a server that does not run a link-group together gets an ordinary stream"
+        );
         assert_eq!(output.get("node.autoconnect"), Some("true"));
         assert_eq!(output.get("target.object"), Some("alsa_output.x"));
         assert_eq!(output.get("stream.capture.sink"), None);
 
-        let capture = stream_props(DeviceDirection::Input, "alsa_input.mic", "512/48000");
+        let capture = stream_props(DeviceDirection::Input, "alsa_input.mic", "512/48000", false);
         assert_eq!(capture.get("media.class"), Some("Stream/Input/Audio"));
         assert_eq!(capture.get("media.category"), Some("Capture"));
         assert_eq!(capture.get("media.role"), Some("Production"));
@@ -3356,7 +4042,17 @@ mod tests {
             capture.get("node.description"),
             Some(CAPTURE_STREAM_DESCRIPTION)
         );
-        assert_eq!(capture.get("node.link-group"), Some(LINK_GROUP));
+        assert_eq!(
+            capture.get("node.link-group"),
+            source.get("node.link-group"),
+            "the capture stream is in its source's group"
+        );
+        assert_ne!(
+            capture.get("node.link-group"),
+            output.get("node.link-group"),
+            "one group for both lanes runs the speakers for as long as the microphone runs"
+        );
+        assert_eq!(capture.get("node.passive"), Some("false"));
         assert_eq!(capture.get("node.autoconnect"), Some("true"));
         assert_eq!(capture.get("target.object"), Some("alsa_input.mic"));
         assert_eq!(

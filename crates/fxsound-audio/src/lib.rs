@@ -14,12 +14,13 @@
 //!
 //! # Topology
 //!
-//! One pair of nodes per **lane** — one lane per [`fxsound_core::DeviceDirection`] — every node
-//! carrying `node.link-group = "fxsound"`: the design `docs/spec/12-audio-io.md` §18 chose (Option
-//! A), §19.1 draws, and §29 extends to two lanes. Either lane can be enabled or detached on its
-//! own, and both pairs can exist at once (`docs/0.4.0-design.md` §1). The two lanes are mirror
-//! images of each other, and the two process callbacks and the ring between them are the same
-//! code in both — each lane has its own ring, its own chain and its own paths to the GUI:
+//! One pair of nodes per **lane** — one lane per [`fxsound_core::DeviceDirection`] — the two nodes
+//! of a pair sharing a `node.link-group` of their own ([`link_group`]): the design
+//! `docs/spec/12-audio-io.md` §18 chose (Option A), §19.1 draws, and §29 extends to two lanes.
+//! Either lane can be enabled or detached on its own, and both pairs can exist at once
+//! (`docs/0.4.0-design.md` §1). The two lanes are mirror images of each other, and the two process
+//! callbacks and the ring between them are the same code in both — each lane has its own ring,
+//! its own chain and its own paths to the GUI:
 //!
 //! ```text
 //!  OUTPUT LANE (the Windows behaviour; enabled at start):
@@ -52,8 +53,19 @@
 //! The `node.link-group` is not decoration: it is how WirePlumber learns our nodes are one
 //! logical device and refuses to link `fxsound_output` back into `fxsound_sink` — or, in the input
 //! lane, `fxsound_capture` into `fxsound_source` — which is otherwise exactly what happens the
-//! moment our node becomes the default. All four nodes share the one group, which is safe because
-//! no link either lane needs ever joins two of our own nodes (`docs/spec/12-audio-io.md` §29).
+//! moment our node becomes the default.
+//!
+//! It is not only WirePlumber's business, either. Since 0.3.68 the PipeWire server schedules the
+//! members of a link-group together: a node made runnable by a link of its own makes every other
+//! member runnable too (`run_nodes` in `src/pipewire/context.c`). That is what lets the output
+//! lane's playback stream sleep while nothing plays into the sink (see `engine`, "Idle"), and it is
+//! why each lane has a group **of its own** — `fxsound` for the speakers, `fxsound-input` for the
+//! microphone (`docs/spec/12-audio-io.md` §29.2). WirePlumber would be content either way: each
+//! stream still shares a group with its own virtual node, which is all its refusal needs, and no
+//! link either lane needs ever joins two of our own nodes. The server is not. With one group, a
+//! capture stream fed by a microphone — which runs for as long as the input lane is enabled —
+//! made the speakers' pair runnable with it, and the speakers never went idle again while the
+//! microphone lane was on.
 //!
 //! With both lanes enabled the system sees *two* FxSound devices: "FxSound (Output)" under its
 //! sinks and "FxSound (Input)" under its sources, each with the word in the system language
@@ -110,10 +122,11 @@
 //!   WirePlumber that has never been told a default picks real hardware, not us; the default is
 //!   taken only through the explicit metadata write above, which is also the only thing that can
 //!   be handed back.
-//! * **It never feeds one lane from the other.** The two lanes share a link-group and nothing
-//!   else: each has its own ring, its own chain, its own counters and its own claim on a default,
-//!   so the music chain cannot reach the microphone's signal or the other way round, and one lane
-//!   failing leaves the other playing.
+//! * **It never feeds one lane from the other.** The two lanes share nothing, not even a
+//!   link-group: each has its own group, its own ring, its own chain, its own counters and its own
+//!   claim on a default, so the music chain cannot reach the microphone's signal or the other way
+//!   round, the microphone running cannot keep the speakers awake, and one lane failing leaves the
+//!   other playing.
 //!
 //! [`DspParams`]: fxsound_core::messages::DspParams
 //! [`InputDspParams`]: fxsound_core::messages::InputDspParams
@@ -176,8 +189,24 @@ pub const OUR_NODE_NAMES: [&str; 4] = [
     SOURCE_NODE_NAME,
 ];
 
-/// The `node.link-group` all our nodes carry. **Mandatory**; see the module docs.
+/// The `node.link-group` of the output lane's two nodes. **Mandatory**; see the module docs.
+///
+/// The same string 0.3.0 gave its one pair, so the speakers' pair looks to anything outside the
+/// process exactly as it always has.
 pub const LINK_GROUP: &str = "fxsound";
+
+/// The `node.link-group` of the input lane's two nodes: a group of their own, not the output
+/// lane's, because the server runs a group's members together (module docs).
+pub const INPUT_LINK_GROUP: &str = "fxsound-input";
+
+/// The `node.link-group` of a lane's pair.
+#[must_use]
+pub const fn link_group(direction: DeviceDirection) -> &'static str {
+    match direction {
+        DeviceDirection::Output => LINK_GROUP,
+        DeviceDirection::Input => INPUT_LINK_GROUP,
+    }
+}
 
 /// The product name every description starts with, and the `media.name` of the two streams.
 ///
@@ -798,6 +827,12 @@ mod tests {
         assert_eq!(CAPTURE_NODE_NAME, "fxsound_capture");
         assert_eq!(SOURCE_NODE_NAME, "fxsound_source");
         assert_eq!(LINK_GROUP, "fxsound");
+        assert_eq!(link_group(DeviceDirection::Output), LINK_GROUP);
+        assert_eq!(link_group(DeviceDirection::Input), INPUT_LINK_GROUP);
+        assert_ne!(
+            LINK_GROUP, INPUT_LINK_GROUP,
+            "one group for both lanes keeps the speakers running for as long as the microphone is"
+        );
         assert_eq!(our_node_name(DeviceDirection::Output), SINK_NODE_NAME);
         assert_eq!(our_node_name(DeviceDirection::Input), SOURCE_NODE_NAME);
         // Names are matched by string and written into metadata: ASCII, no spaces, all distinct.

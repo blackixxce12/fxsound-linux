@@ -1786,13 +1786,13 @@ the ring unchanged. Only properties, targets, metadata keys and bookkeeping diff
                                     ▼
  ╔══════════════════════════════════════════════════════════════════════════╗
  ║  NODE 1  "fxsound_capture"        media.class = Stream/Input/Audio         ║
- ║  pw_stream, direction = Input,    node.link-group = "fxsound"              ║
+ ║  pw_stream, direction = Input,    node.link-group = "fxsound-input"        ║
  ║   process():  dequeue → DSP in place → push to ring   (== §19.6 NODE 1)   ║
  ╚══════════════════════════════════╤═══════════════════════════════════════╝
                                     │  the same SPSC ring as §19.1
  ╔══════════════════════════════════▼═══════════════════════════════════════╗
  ║  NODE 2  "fxsound_source"         media.class = Audio/Source               ║
- ║  pw_stream, direction = Output,   node.link-group = "fxsound"              ║
+ ║  pw_stream, direction = Output,   node.link-group = "fxsound-input"        ║
  ║   process():  dequeue → pop from ring (zero-fill on underrun) → queue      ║
  ╚══════════════════════════════════╤═══════════════════════════════════════╝
                                     │  links created by WirePlumber because
@@ -1813,7 +1813,7 @@ the ring unchanged. Only properties, targets, metadata keys and bookkeeping diff
 | `media.name` | `"FxSound"` | |
 | `node.name` | `"fxsound_capture"` | Fixed ASCII; never listed as a device (`OUR_NODE_NAMES`). |
 | `node.description` | `"FxSound capture"` | Internal node; not localised. |
-| `node.link-group` | `"fxsound"` | **Mandatory** — see 28.3. |
+| `node.link-group` | `"fxsound-input"` (`"fxsound"` in 0.3.0) | **Mandatory** — see 28.3; the input lane's own group since 0.4.0, 29.2. |
 | `target.object` | the chosen source's `node.name` | |
 | `stream.capture.sink` | `"false"` | Capture the microphone itself, not a sink monitor. |
 | `node.autoconnect` / `node.dont-reconnect` / `node.passive` | `"true"` / `"false"` / `"false"` | As NODE 2 of §20. |
@@ -1829,7 +1829,7 @@ the ring unchanged. Only properties, targets, metadata keys and bookkeeping diff
 | `node.name` | `"fxsound_source"` | The stable ID written into the default metadata. |
 | `node.description` / `node.nick` | `"FxSound (<Input>)"`, localised — 28.4 | |
 | `node.virtual` | `"true"` | |
-| `node.link-group` | `"fxsound"` | **Mandatory** — see 28.3. |
+| `node.link-group` | `"fxsound-input"` (`"fxsound"` in 0.3.0) | **Mandatory** — see 28.3; the input lane's own group since 0.4.0, 29.2. |
 | `node.want-driver` | `"true"` | Scheduled by whatever driver is running even before a recorder links to it. |
 | `node.always-process` | `"false"` | |
 | `audio.channels` / `audio.rate` / `audio.format` / `audio.position` | as §20 NODE 1: `clamp(source.channels, 2, 8)`, graph rate, `F32`, the source's positions | A **mono microphone is accepted**: the stream declares `2` and PipeWire's adapter up-mixes. `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES` was a playback-driver workaround and does not apply to capture. |
@@ -1843,8 +1843,9 @@ The format is decided once per `build_nodes` and declared on both nodes, exactly
 Once `fxsound_source` is the default source, any capture stream without an explicit target is
 linked to it by WirePlumber — including, without the group, our own `fxsound_capture` the moment
 its microphone goes away and `node.dont-reconnect = false` sends it looking for a new target. With
-both nodes in link-group `fxsound`, `linking-utils.lua`'s `canLinkGroupCheck` refuses that link, so
-the capture stream can never be fed by our own source. WirePlumber's `find-best-default-node.lua`
+both nodes in one link-group (`fxsound` in 0.3.0, the input lane's own `fxsound-input` since 0.4.0,
+29.2), `linking-utils.lua`'s `canLinkGroupCheck` refuses that link, so the capture stream can never
+be fed by our own source. WirePlumber's `find-best-default-node.lua`
 only excludes *smart* filters (`filter.smart = true`) from being default, so a plain link-group node
 is still allowed to become `default.audio.source` — which is what we need.
 
@@ -1982,35 +1983,58 @@ pair goes for any reason; `Error { direction: Some(d), .. }` for that lane's fai
 `Error { direction: None, .. }` for the connection's. A lane that has never run reports the
 default status and is not announced at all.
 
-### 29.2 Why one link-group for all four nodes is still safe
+### 29.2 One link-group per lane
 
-All four nodes keep `node.link-group = "fxsound"`. WirePlumber consults the group in exactly one
-place that matters here, `linking-utils.lua` `canLink` (0.5.17, verified on disk), and only when
-the node *being linked* carries a group — our two streams, `fxsound_output` and `fxsound_capture`;
-applications have none, so their links to `fxsound_sink` and from `fxsound_source` are never
-examined. For our two streams it refuses a target in the same group, which is the protection §28.3
-relies on, and it stays exactly as strong with four members as with two: neither stream can be
-linked into our own virtual device, whichever lane that device belongs to.
+Each lane's pair has a `node.link-group` of its own. `fxsound_sink` and `fxsound_output` carry
+`fxsound` (`LINK_GROUP`). It is the string 0.3.0 gave its one pair, so from outside the process
+the speakers' pair looks as it always has. `fxsound_capture` and `fxsound_source` carry
+`fxsound-input` (`INPUT_LINK_GROUP`). An earlier revision of this section kept all four nodes in
+`fxsound`, and its reasoning about WirePlumber still holds (below). But WirePlumber is not the
+only thing that reads the group.
 
-What the shared group cannot do is refuse a link either lane needs, because **no such link joins
-two of our nodes**: `fxsound_output` → a real sink, a real source → `fxsound_capture`, applications
-→ `fxsound_sink`, `fxsound_source` → applications. The cross-lane links the group *would* refuse —
-`fxsound_output` into `fxsound_source` (not a sink), `fxsound_capture` from `fxsound_sink`'s monitor
-(`stream.capture.sink = false`, and our nodes are never offered as targets, `OUR_NODE_NAMES`) — are
-ones FxSound never asks for. The rings are per lane, so no signal crosses between the lanes inside
-the process either.
+**The server runs a group together.** Since 0.3.68, PipeWire's scheduler puts every active member
+of a link-group under one driver (`collect_nodes`) and makes all of them runnable as soon as one
+is (`run_nodes`, `src/pipewire/context.c`). The input lane's capture stream runs for as long as
+the lane is on, because the microphone feeds it. In one group with the output pair, it made
+`fxsound_output` runnable, and `fxsound_output`'s link made the speakers run: the speakers never
+went idle while the microphone lane was on. That undid the idle work of the 0.4.0 design (§1.3,
+§12), which makes the output lane's NODE 2 passive so that it runs only with its sink. Measured
+on PipeWire 1.6.8 in a private daemon: with one group, linking the microphone alone had the output
+lane report `processing`. With a group per lane, `graph_churn::a_microphone_being_captured_does_not_keep_the_speakers_awake`
+holds the speakers' pair and the speakers idle while the microphone is captured, and
+`graph_churn::a_tone_driven_through_each_lane_reaches_that_lane_and_no_other` holds the output
+lane silent until something plays into its sink.
 
-One indirect case is refused, stated plainly. `canLink` also walks through a third-party filter to
-the far side of its own link-group, up to eight hops, and refuses a link that would reach our group
-again. So a user whose output lane targets one filter's sink half (say PipeWire's own
-`echo-cancel-sink`) while the input lane captures from *the same filter's* source half
-(`echo-cancel-source`) gets the second of those two links refused — WirePlumber reads it as FxSound
-feeding itself through the filter, which, audio-wise, it is not. Separate groups per lane would
-allow it; one group was kept because it is the design's contract, it is what `LINK_GROUP` and every
-node property test pin, and that topology is the one §7 of the 0.4.0 design replaces with its own
-echo canceller.
+**WirePlumber is still satisfied, because each stream shares a group with its own virtual
+node.** WirePlumber consults the group in one place that matters here, `linking-utils.lua`
+`canLink` (0.5.17, verified on disk). It does so only when the node *being linked* carries a
+group: our two streams, `fxsound_output` and `fxsound_capture`. Applications have no group, so
+their links to `fxsound_sink` and from `fxsound_source` are never examined. For each of our
+streams, `canLink` refuses a target in the stream's own group. So the links §19.1 and §28.3 guard
+against, a stream fed by its own lane's virtual device, are refused exactly as before:
+`fxsound_output` → `fxsound_sink` and `fxsound_capture` → `fxsound_source`. That includes the
+fallback to a default the lane has just claimed. `fxsound_output` → `fxsound_source` is refused
+earlier, on direction, because a source is not a playback target. The one refusal the split gives
+up is `fxsound_capture` → `fxsound_sink`'s monitor. With the groups apart, the walk from
+`fxsound_sink`'s group reaches only the speakers, which have none. That refusal was never the
+guard that mattered: the capture stream carries `stream.capture.sink = false`, so it is not
+offered a sink's monitor, and FxSound targets it at a named microphone and never at one of its
+own nodes (`OUR_NODE_NAMES`). The rings are per lane, so no signal crosses between the lanes
+inside the process either.
 
-That canceller is the one place the group needs care. §7 of the design gives its three nodes
-`node.link-group = fxsound`; taken literally, `fxsound_aec_source` would share a group with
-`fxsound_capture`, which targets it, and the direct same-group check — not even the walk — would
-refuse the capture link outright. The canceller's nodes need a group of their own.
+**A filter shared by the two lanes now links.** `canLink` also walks through a third-party filter
+to the far side of the filter's own link-group, up to eight hops, and refuses a link that would
+reach the linking stream's group again. With one group, a user whose output lane targets one
+filter's sink half (say PipeWire's own `echo-cancel-sink`) while the input lane captures from the
+same filter's source half (`echo-cancel-source`) had the second of those links refused.
+WirePlumber read it as FxSound feeding itself through the filter, which in terms of the audio it
+is not. Now the walk from the filter reaches the other lane's group, not the linking stream's,
+and from there only applications. Both links are made.
+
+**FxSound's own echo canceller gets a third group**, `fxsound-aec` (0.4.0 design §7).
+`fxsound-input` would be refused outright: `fxsound_capture` targets `fxsound_aec_source`, and
+the same-group check comes before the walk. `fxsound` would pass `canLink`, but the server would
+run the output pair whenever the canceller's capture stream runs, which is the problem above.
+§7 also records what echo cancellation costs in idle whichever group it is given: the module
+puts its streams in one `node.group` as well, and the monitor stream it records the speakers with
+keeps them and the output pair running.

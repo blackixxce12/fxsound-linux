@@ -10,7 +10,7 @@
 //! there: nothing here may touch the session's graph.
 
 use super::*;
-use crate::graph_churn::{PATIENCE, PrivateGraph, unless_skipped};
+use crate::graph_churn::{PATIENCE, PrivateGraph, installed, skip, unless_skipped};
 use crate::lane_dsp::tests::lanes_for_tests;
 
 /// A main loop of the test's own, connected to a private daemon.
@@ -86,6 +86,44 @@ impl Harness {
         }
     }
 
+    /// [`Self::until`], with NODE 2 paced on every turn of the loop as the supervisor's tick paces
+    /// it — for the steps that wait for time to pass rather than for an event.
+    fn pacing_until(&self, what: &str, done: impl Fn(&Shared) -> bool) -> bool {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            {
+                let mut shared = self.shared.borrow_mut();
+                pace_second_node(&mut shared, DeviceDirection::Output, Instant::now());
+                if done(&shared) {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                println!("gave up waiting for {what}");
+                return false;
+            }
+            self.mainloop
+                .loop_()
+                .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(10)));
+        }
+    }
+
+    /// Do something to the graph from another thread while this one keeps the loop turning. A
+    /// port configured or a link made on one of our nodes is not done until this client has
+    /// answered for it, and this client only answers from its loop.
+    fn meanwhile<T: Send>(&self, work: impl FnOnce(&PrivateGraph) -> T + Send) -> T {
+        std::thread::scope(|scope| {
+            let graph = &self.graph;
+            let job = scope.spawn(move || work(graph));
+            while !job.is_finished() {
+                self.mainloop
+                    .loop_()
+                    .iterate(pw::loop_::Timeout::Finite(Duration::from_millis(10)));
+            }
+            job.join().expect("the graph tool thread panicked")
+        })
+    }
+
     /// The registry id of the device called `name`.
     fn id_of(&self, name: &str) -> u32 {
         self.shared
@@ -132,6 +170,17 @@ fn pair_of(shared: &Shared, direction: DeviceDirection) -> Option<(String, u32)>
         .nodes
         .as_ref()
         .map(|nodes| (nodes.target.clone(), nodes.format.channels))
+}
+
+/// What the output lane's NODE 2 was last told, when its pair is paced by hand.
+fn pace_of(shared: &Shared) -> Option<bool> {
+    shared
+        .lanes
+        .output
+        .nodes
+        .as_ref()?
+        .pace
+        .map(|pace| pace.active)
 }
 
 /// The rate a lane's pair was built at.
@@ -358,5 +407,251 @@ fn a_failed_build_waits_out_its_backoff_whatever_the_registry_says_meanwhile() {
     assert_eq!(
         pair_of(&shared, DeviceDirection::Input),
         Some(("t_mic".to_owned(), 2))
+    );
+}
+
+/// On a server older than 0.3.68 the output lane's NODE 2 cannot be passive, and the main loop
+/// paces it by hand (module docs of `engine`, "Idle"): asleep once NODE 1 has been paused for
+/// [`SLEEP_AFTER`], awake the moment NODE 1 streams — on NODE 1's own word, through the wake
+/// channel, without waiting for a tick.
+///
+/// This daemon is newer, so the engine is told it is not. And NODE 2 is left unlinked: on a server
+/// this new, a running NODE 2 linked to a sink keeps its whole link-group running, NODE 1 included,
+/// and NODE 1 would never be seen to pause — which is exactly why such a server gets a passive NODE
+/// 2 instead.
+#[test]
+fn a_playback_stream_paced_by_hand_sleeps_while_its_sink_is_paused_and_wakes_the_moment_it_streams()
+{
+    let Some(graph) = PrivateGraph::start("pace") else {
+        return;
+    };
+    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+        .into_iter()
+        .find(|tool| !installed(tool))
+    {
+        skip(&format!(
+            "{missing} is not available, so pacing by hand was not checked"
+        ));
+        return;
+    }
+    let harness = Harness::connect(graph);
+    let _wake = attach_wake(harness.mainloop.loop_(), &harness.shared);
+    if harness
+        .meanwhile(|graph| graph.add_tone("t_tone"))
+        .is_none()
+    {
+        skip(concat!(
+            "the tone never appeared (is audiotestsrc installed?), ",
+            "so pacing by hand was not checked"
+        ));
+        return;
+    }
+    {
+        let mut shared = harness.shared.borrow_mut();
+        shared.link_groups_scheduled.set(false);
+        shared.memory.output.user_selected = "t_stereo".to_owned();
+        run_rules(&mut shared, DeviceDirection::Output);
+        assert_eq!(
+            pace_of(&shared),
+            Some(true),
+            "an older server's output pair is paced by hand, and its NODE 2 starts awake"
+        );
+    }
+    for (node, direction, positions) in [
+        ("t_tone", "Output", &["MONO"][..]),
+        ("t_stereo", "Input", &["FL", "FR"][..]),
+        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+        (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
+    ] {
+        assert!(
+            harness
+                .meanwhile(|graph| graph.configure_ports(node, direction, positions))
+                .is_some(),
+            "{node} was not given ports"
+        );
+    }
+
+    // Nothing plays into the sink, which has been paused since the server bound it: once it has
+    // been for the whole wait, NODE 2 is put to sleep.
+    assert!(
+        harness.pacing_until("NODE 2 put to sleep", |shared| pace_of(shared)
+            == Some(false)),
+        "NODE 2 was left running under a paused sink"
+    );
+
+    // Asleep on the server's side too, not only in the bookkeeping: linked to the speakers now,
+    // an active NODE 2 would run them — on this server it would run NODE 1 as well — and an
+    // inactive one runs nothing.
+    assert!(harness.meanwhile(|graph| graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo")));
+    let quiet_until = Instant::now() + SLEEP_AFTER;
+    while Instant::now() < quiet_until {
+        let state = harness.meanwhile(|graph| graph.node_state(OUTPUT_NODE_NAME));
+        assert_ne!(
+            state.as_deref(),
+            Some("running"),
+            "NODE 2 was told to sleep and ran as soon as it had somewhere to play"
+        );
+    }
+    assert!(harness.meanwhile(|graph| graph.unlink_nodes(OUTPUT_NODE_NAME, "t_stereo")));
+
+    // Something plays. From here on nothing paces NODE 2 but the wake channel: no tick runs.
+    assert!(harness.meanwhile(|graph| graph.link_nodes("t_tone", SINK_NODE_NAME)));
+    assert!(
+        harness.until("NODE 2 woken", |shared| pace_of(shared) == Some(true)),
+        "NODE 1 streamed and nothing woke NODE 2"
+    );
+    // And the server runs it, which it was just shown not to do while NODE 2 slept: awake again,
+    // NODE 2 is part of the group the tone is running.
+    assert_eq!(
+        harness
+            .meanwhile(|graph| graph.runs_until(OUTPUT_NODE_NAME, true))
+            .map(drop),
+        Ok(()),
+        "NODE 2 was told to wake and the server never ran it"
+    );
+
+    // It stops, and NODE 2 goes back to sleep.
+    assert!(harness.meanwhile(|graph| graph.unlink_nodes("t_tone", SINK_NODE_NAME)));
+    assert!(
+        harness.pacing_until("NODE 2 put back to sleep", |shared| pace_of(shared)
+            == Some(false)),
+        "NODE 2 was left running once the sink had nothing to play"
+    );
+    assert_eq!(
+        harness
+            .meanwhile(|graph| graph.runs_until(OUTPUT_NODE_NAME, false))
+            .map(drop),
+        Ok(()),
+        "NODE 2 was told to sleep and the server kept running it"
+    );
+}
+
+/// On a server that runs a link-group together the output lane's NODE 2 is passive, and it stops
+/// in the same cycle as NODE 1 with the ring's cushion still in it (module docs of `engine`,
+/// "Idle"). The next thing to wake the pair must not be heard behind that tail: NODE 1's `Paused`
+/// marks the ring stale, and NODE 2's first cycle once something plays again skips what was left
+/// and re-primes, as a new pair does.
+///
+/// This daemon runs the pair itself, so the test watches what the server does and what the ring
+/// holds, and the loop it pumps is only there to hear NODE 1's states.
+#[test]
+fn a_passive_pair_that_stops_does_not_play_its_last_sound_to_the_next_one() {
+    let Some(graph) = PrivateGraph::start("resume") else {
+        return;
+    };
+    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+        .into_iter()
+        .find(|tool| !installed(tool))
+    {
+        skip(&format!(
+            "{missing} is not available, so a passive pair's resume was not checked"
+        ));
+        return;
+    }
+    let harness = Harness::connect(graph);
+    if !harness.shared.borrow().link_groups_scheduled.get() {
+        skip(concat!(
+            "the private daemon is older than PipeWire 0.3.68 and paces NODE 2 by hand, ",
+            "so a passive pair's resume was not checked"
+        ));
+        return;
+    }
+    if harness
+        .meanwhile(|graph| graph.add_tone("t_tone"))
+        .is_none()
+    {
+        skip(concat!(
+            "the tone never appeared (is audiotestsrc installed?), ",
+            "so a passive pair's resume was not checked"
+        ));
+        return;
+    }
+    {
+        let mut shared = harness.shared.borrow_mut();
+        shared.memory.output.user_selected = "t_stereo".to_owned();
+        run_rules(&mut shared, DeviceDirection::Output);
+        assert_eq!(
+            pair_of(&shared, DeviceDirection::Output),
+            Some(("t_stereo".to_owned(), 2))
+        );
+        assert_eq!(
+            pace_of(&shared),
+            None,
+            "a passive NODE 2 is not paced by hand"
+        );
+    }
+    for (node, direction, positions) in [
+        ("t_tone", "Output", &["MONO"][..]),
+        ("t_stereo", "Input", &["FL", "FR"][..]),
+        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+        (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
+    ] {
+        assert!(
+            harness
+                .meanwhile(|graph| graph.configure_ports(node, direction, positions))
+                .is_some(),
+            "{node} was not given ports"
+        );
+    }
+    assert!(harness.meanwhile(|graph| graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo")));
+
+    // A sound plays through the pair.
+    assert!(harness.meanwhile(|graph| graph.link_nodes("t_tone", SINK_NODE_NAME)));
+    assert_eq!(
+        harness
+            .meanwhile(|graph| graph.runs_until(OUTPUT_NODE_NAME, true))
+            .map(drop),
+        Ok(()),
+        "the playback stream should run while something plays into the sink"
+    );
+    let ring = Arc::clone(&harness.shared.borrow().lanes.output.ring);
+    assert!(
+        harness.until("the ring to be primed", |_| ring
+            .primed
+            .load(Ordering::Relaxed)),
+        "the tone never reached the playback stream"
+    );
+    assert!(
+        !ring.stale_pending(),
+        "the mark NODE 1's first Paused left should have been taken by NODE 2's first cycle"
+    );
+
+    // It stops, and so does the pair, both nodes in one cycle, with some of the sound still in
+    // the ring for NODE 2 to have played.
+    assert!(harness.meanwhile(|graph| graph.unlink_nodes("t_tone", SINK_NODE_NAME)));
+    assert_eq!(
+        harness
+            .meanwhile(|graph| graph.runs_until(OUTPUT_NODE_NAME, false))
+            .map(drop),
+        Ok(()),
+        "the playback stream should stop once nothing plays into the sink"
+    );
+    assert!(
+        harness.until("NODE 1 to report Paused", |_| ring.stale_pending()),
+        "NODE 1 paused and the ring was not marked stale"
+    );
+    assert!(
+        ring.fill_frames() > 0,
+        "the pair stopped with nothing left in the ring, so this test shows nothing"
+    );
+    let underruns = ring.underrun_frames.load(Ordering::Relaxed);
+
+    // Another sound wakes the pair. Its first cycle takes the mark and plays silence while the
+    // ring fills to its target; had it played the cushion, it would have been primed from the
+    // start and missed nothing.
+    assert!(harness.meanwhile(|graph| graph.link_nodes("t_tone", SINK_NODE_NAME)));
+    assert!(
+        harness.until("NODE 2's first cycle since", |_| !ring.stale_pending()),
+        "the pair woke and NODE 2 never took the mark"
+    );
+    assert!(
+        harness.until("the ring to be primed again", |_| ring
+            .primed
+            .load(Ordering::Relaxed)),
+        "the woken pair never primed"
+    );
+    assert!(
+        ring.underrun_frames.load(Ordering::Relaxed) > underruns,
+        "the woken pair started on the last sound's cushion instead of re-priming"
     );
 }
