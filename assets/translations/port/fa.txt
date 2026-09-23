@@ -101,3 +101,4 @@ countries: ir
 "the echo canceller could not be loaded" = "حذف‌کننده اکو بارگیری نشد"
 "the echo canceller stopped" = "حذف‌کننده اکو متوقف شد"
 "waiting for the speakers" = "در انتظار بلندگوها"
+"Applications that used %s now follow FxSound's preset" = "برنامه‌هایی که از %s استفاده می‌کردند اکنون از پیش‌تنظیم FxSound پیروی می‌کنند"

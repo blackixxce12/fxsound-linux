@@ -99,3 +99,4 @@ countries: cz
 "the echo canceller could not be loaded" = "potlačení ozvěny se nepodařilo načíst"
 "the echo canceller stopped" = "potlačení ozvěny se zastavilo"
 "waiting for the speakers" = "čeká se na reproduktory"
+"Applications that used %s now follow FxSound's preset" = "Aplikace, které používaly %s, se nyní řídí presetem FxSound"

@@ -147,7 +147,7 @@ const NO_ANSWER_IN_TIME: &str = "FxSound did not answer in time; the command may
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// How many callers may be in the middle of being answered at once. Each has a thread for at most
-/// [`REQUEST_TIMEOUT`] plus [`HANDLER_TIMEOUT`]; past this the caller is told to try again. The
+/// `REQUEST_TIMEOUT` plus `HANDLER_TIMEOUT`; past this the caller is told to try again. The
 /// D-Bus service holds its calls in flight to the same number (`crate::dbus`).
 pub const MAX_CONNECTIONS: usize = 32;
 
@@ -556,7 +556,7 @@ impl Server {
     ///
     /// Sticky: from here on every caller is refused at once, on the socket and on the bus, and a
     /// command that slips into the channel after this drain is refused when the server drops it
-    /// ([`Closing`]).
+    /// (`Closing`).
     pub fn refuse_pending(&self) {
         self.shared.closing.set();
         for forwarded in self.rx.try_iter() {
@@ -910,7 +910,7 @@ const STREAM_CUT_OFF: &str =
 ///
 /// * `0` when the instance hung up after its `quit` event — it quit — or when `out` stopped
 ///   taking lines, which is what `fxsound --watch | head -n 1` does on purpose;
-/// * `1` with [`STREAM_CUT_OFF`] on `err` when the stream ended without that event: the instance
+/// * `1` with `STREAM_CUT_OFF` on `err` when the stream ended without that event: the instance
 ///   dropped a reader that fell behind, or it died. A supervisor that restarts `--watch` until it
 ///   exits 0 then keeps it running for as long as FxSound does, instead of stopping as though
 ///   FxSound had quit;

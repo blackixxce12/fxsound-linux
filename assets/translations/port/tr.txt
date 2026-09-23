@@ -99,3 +99,4 @@ countries: tr
 "the echo canceller could not be loaded" = "yankı engelleme yüklenemedi"
 "the echo canceller stopped" = "yankı engelleme durdu"
 "waiting for the speakers" = "hoparlörler bekleniyor"
+"Applications that used %s now follow FxSound's preset" = "%s kullanan uygulamalar artık FxSound'un ön ayarını izliyor"

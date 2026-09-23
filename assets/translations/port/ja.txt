@@ -99,3 +99,4 @@ countries: ja
 "the echo canceller could not be loaded" = "エコーキャンセラーを読み込めませんでした"
 "the echo canceller stopped" = "エコーキャンセラーが停止しました"
 "waiting for the speakers" = "スピーカーを待っています"
+"Applications that used %s now follow FxSound's preset" = "%s を使っていたアプリは FxSound のプリセットに従います"

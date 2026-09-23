@@ -642,12 +642,14 @@ impl Properties {
                 changed: Vec::new(),
             },
             // The stream's own business: its first document, the device list, the meters, the
-            // window and the stream's end have no signal of their own on the bus.
+            // window, an application's route and the stream's end have no signal of their own on
+            // the bus.
             AppEvent::Status(_)
             | AppEvent::DevicesChanged { .. }
             | AppEvent::InputMeters(_)
             | AppEvent::EchoCancel { .. }
             | AppEvent::Calibrated(_)
+            | AppEvent::AppRouted { .. }
             | AppEvent::Window { .. }
             | AppEvent::Quit => Update::default(),
         }

@@ -101,3 +101,4 @@ countries: de at ch
 "the echo canceller could not be loaded" = "die Echounterdrückung konnte nicht geladen werden"
 "the echo canceller stopped" = "die Echounterdrückung wurde beendet"
 "waiting for the speakers" = "wartet auf die Lautsprecher"
+"Applications that used %s now follow FxSound's preset" = "Anwendungen, die %s verwendet haben, folgen jetzt dem Preset von FxSound"

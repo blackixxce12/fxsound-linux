@@ -101,3 +101,4 @@ countries: ro
 "the echo canceller could not be loaded" = "anularea ecoului nu a putut fi încărcată"
 "the echo canceller stopped" = "anularea ecoului s-a oprit"
 "waiting for the speakers" = "se așteaptă difuzoarele"
+"Applications that used %s now follow FxSound's preset" = "Aplicațiile care foloseau %s urmează acum presetul FxSound"

@@ -101,3 +101,4 @@ countries: sl
 "the echo canceller could not be loaded" = "odpravljanja odmeva ni bilo mogoče naložiti"
 "the echo canceller stopped" = "odpravljanje odmeva se je ustavilo"
 "waiting for the speakers" = "čakanje na zvočnike"
+"Applications that used %s now follow FxSound's preset" = "Aplikacije, ki so uporabljale %s, zdaj sledijo prednastavitvi FxSound"

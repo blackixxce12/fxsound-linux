@@ -100,3 +100,4 @@ countries: ru
 "the echo canceller could not be loaded" = "не удалось загрузить эхоподавление"
 "the echo canceller stopped" = "эхоподавление остановилось"
 "waiting for the speakers" = "ожидание динамиков"
+"Applications that used %s now follow FxSound's preset" = "Приложения, использовавшие %s, теперь следуют пресету FxSound"

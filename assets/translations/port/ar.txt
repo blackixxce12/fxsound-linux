@@ -100,3 +100,4 @@ countries: EG sa
 "the echo canceller could not be loaded" = "تعذّر تحميل مُلغي الصدى"
 "the echo canceller stopped" = "توقف مُلغي الصدى"
 "waiting for the speakers" = "في انتظار مكبرات الصوت"
+"Applications that used %s now follow FxSound's preset" = "التطبيقات التي كانت تستخدم %s تتبع الآن الإعداد المسبق لـ FxSound"

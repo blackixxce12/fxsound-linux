@@ -100,3 +100,4 @@ countries: vn
 "the echo canceller could not be loaded" = "không thể tải bộ khử tiếng vọng"
 "the echo canceller stopped" = "bộ khử tiếng vọng đã dừng"
 "waiting for the speakers" = "đang chờ loa"
+"Applications that used %s now follow FxSound's preset" = "Các ứng dụng từng dùng %s giờ dùng theo preset của FxSound"

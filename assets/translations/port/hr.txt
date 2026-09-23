@@ -102,3 +102,4 @@ countries: HR
 "the echo canceller could not be loaded" = "poništavanje jeke nije se moglo učitati"
 "the echo canceller stopped" = "poništavanje jeke se zaustavilo"
 "waiting for the speakers" = "čeka se na zvučnike"
+"Applications that used %s now follow FxSound's preset" = "Aplikacije koje su koristile %s sada prate FxSound preset"

@@ -99,3 +99,4 @@ countries: Taiwan
 "the echo canceller could not be loaded" = "無法載入回音消除"
 "the echo canceller stopped" = "回音消除已停止"
 "waiting for the speakers" = "正在等待喇叭"
+"Applications that used %s now follow FxSound's preset" = "使用 %s 的應用程式現在跟隨 FxSound 的預設"

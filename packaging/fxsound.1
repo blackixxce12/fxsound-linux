@@ -324,8 +324,12 @@ until it succeeds keeps it running. The first event is
 document); after that
 .BR power ", " preset_changed ", " device_changed ", " devices_changed ", "
 .BR audio_state ", " direction ", " notice ", " echo_cancel ", " calibrated ", "
-.BR window " and " quit
-as they happen. Plain output is
+.BR app_routed ", " window " and " quit
+as they happen;
+.B app_routed
+says where an application's streams went
+.RB ( app ", " binary ", " flatpak ", " direction ", " preset ,
+the preset being empty once they are back on FxSound's own). Plain output is
 .I event key=value ...
 per line; with
 .B \-\-json

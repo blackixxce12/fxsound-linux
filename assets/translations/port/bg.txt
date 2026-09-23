@@ -99,3 +99,4 @@ countries: bg
 "the echo canceller could not be loaded" = "потискането на ехото не можа да се зареди"
 "the echo canceller stopped" = "потискането на ехото спря"
 "waiting for the speakers" = "изчакват се високоговорителите"
+"Applications that used %s now follow FxSound's preset" = "Приложенията, които използваха %s, вече следват пресета на FxSound"

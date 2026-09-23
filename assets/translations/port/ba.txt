@@ -99,3 +99,4 @@ countries: ba
 "the echo canceller could not be loaded" = "poništavač eha se nije mogao učitati"
 "the echo canceller stopped" = "poništavač eha se zaustavio"
 "waiting for the speakers" = "čeka se na zvučnike"
+"Applications that used %s now follow FxSound's preset" = "Aplikacije koje su koristile %s sada prate FxSound preset"

@@ -100,3 +100,4 @@ countries: se
 "the echo canceller could not be loaded" = "ekoelimineringen kunde inte läsas in"
 "the echo canceller stopped" = "ekoelimineringen stannade"
 "waiting for the speakers" = "väntar på högtalarna"
+"Applications that used %s now follow FxSound's preset" = "Program som använde %s följer nu FxSounds förinställning"

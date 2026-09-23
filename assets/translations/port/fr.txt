@@ -102,3 +102,4 @@ countries: fr
 "the echo canceller could not be loaded" = "l'annulation d'écho n'a pas pu être chargée"
 "the echo canceller stopped" = "l'annulation d'écho s'est arrêtée"
 "waiting for the speakers" = "en attente des haut-parleurs"
+"Applications that used %s now follow FxSound's preset" = "Les applications qui utilisaient %s suivent désormais le preset de FxSound"

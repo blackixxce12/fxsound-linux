@@ -99,3 +99,4 @@ countries: ar co es mx
 "the echo canceller could not be loaded" = "no se pudo cargar la cancelación de eco"
 "the echo canceller stopped" = "la cancelación de eco se detuvo"
 "waiting for the speakers" = "esperando a los altavoces"
+"Applications that used %s now follow FxSound's preset" = "Las aplicaciones que usaban %s ahora siguen el preset de FxSound"

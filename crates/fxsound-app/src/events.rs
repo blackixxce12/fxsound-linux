@@ -22,7 +22,8 @@
 //!
 //! The controller is the one source of events. [`App`] queues one at every mutation that changes
 //! something the stream reports — the power, a lane's preset or device, the device list, the edit
-//! direction, a lane's audio state, a notice, echo cancellation, a calibration — and says nothing
+//! direction, a lane's audio state, a notice, echo cancellation, a calibration, an application
+//! moved onto a route of its own or off it — and says nothing
 //! for a mutation that leaves it as the stream last described it: [`Published`] is its record of
 //! that. Each tick [`fan_out`] drains the queue once and hands the same events to every
 //! consumer: the `--watch` streams, the D-Bus signals, and the tray, which is redrawn only when
@@ -31,7 +32,7 @@
 use std::fmt::Write as _;
 
 use fxsound_core::settings::CalibrationRecord;
-use fxsound_core::{AudioDevice, AudioStatus, DeviceDirection};
+use fxsound_core::{AppKey, AudioDevice, AudioStatus, DeviceDirection};
 use serde_json::Value;
 
 use crate::App;
@@ -88,6 +89,15 @@ pub enum AppEvent {
     /// The calibration wizard's result was applied: the voice preset it wrote, the microphone it
     /// measured and what it measured there.
     Calibrated(CalibrationRecord),
+    /// An application's streams of one lane moved onto the route of a preset of its own, or back
+    /// onto the lane (`preset` is `None`) — as the engine reports it, so a rule whose route could
+    /// not be made says nothing (`docs/0.4.0-apps.md`). An application that stops playing while
+    /// routed is back on nothing, and says so the same way.
+    AppRouted {
+        app: AppKey,
+        direction: DeviceDirection,
+        preset: Option<String>,
+    },
     /// The window was opened or hidden to the tray.
     Window { visible: bool },
     /// The instance is quitting; the stream ends right after this.
@@ -134,6 +144,7 @@ impl AppEvent {
             Self::Notice { .. } => "notice",
             Self::EchoCancel { .. } => "echo_cancel",
             Self::Calibrated(_) => "calibrated",
+            Self::AppRouted { .. } => "app_routed",
             Self::Window { .. } => "window",
             Self::Quit => "quit",
         }
@@ -291,6 +302,18 @@ impl AppEvent {
                     ("clipped_ratio", Value::from(rounded(*clipped_ratio, 4))),
                 ]
             }
+            Self::AppRouted {
+                app,
+                direction: lane,
+                preset,
+            } => vec![
+                // The name the window shows, then what `--app-preset` can match it by.
+                ("app", Value::from(app.display())),
+                ("binary", Value::from(app.binary.as_str())),
+                ("flatpak", Value::from(app.flatpak.as_str())),
+                ("direction", direction(lane)),
+                ("preset", Value::from(preset.clone())),
+            ],
             Self::Window { visible } => vec![("visible", Value::from(*visible))],
             Self::Quit => Vec::new(),
         }
@@ -745,6 +768,43 @@ mod tests {
     }
 
     #[test]
+    fn an_application_routed_names_itself_as_the_window_does_and_by_what_a_rule_can_match() {
+        let routed = AppEvent::AppRouted {
+            app: AppKey {
+                binary: "bf6.exe".to_owned(),
+                name: "Battlefield 6".to_owned(),
+                flatpak: String::new(),
+            },
+            direction: DeviceDirection::Output,
+            preset: Some("Gaming".to_owned()),
+        };
+        assert_eq!(
+            routed.to_json(7),
+            r#"{"v":1,"event":"app_routed","ts":7,"app":"Battlefield 6","binary":"bf6.exe","flatpak":"","direction":"output","preset":"Gaming"}"#
+        );
+        assert_eq!(
+            routed.to_plain(),
+            r#"app_routed app="Battlefield 6" binary=bf6.exe flatpak="" direction=output preset=Gaming"#
+        );
+
+        // Back on its lane: the preset is null, as a detached lane's device is.
+        let back = AppEvent::AppRouted {
+            app: AppKey {
+                binary: String::new(),
+                name: String::new(),
+                flatpak: "com.discordapp.Discord".to_owned(),
+            },
+            direction: DeviceDirection::Input,
+            preset: None,
+        };
+        let json = parse(&back.to_json(0));
+        assert_eq!(json["app"], "com.discordapp.Discord");
+        assert_eq!(json["direction"], "input");
+        assert_eq!(json["preset"], Value::Null);
+        assert!(back.to_plain().ends_with(" direction=input preset="));
+    }
+
+    #[test]
     fn every_event_has_a_snake_case_name_and_quit_has_no_fields() {
         assert_eq!(AppEvent::Quit.to_plain(), "quit");
         assert_eq!(
@@ -902,6 +962,11 @@ mod tests {
                 detail: None,
             },
             AppEvent::Calibrated(CalibrationRecord::default()),
+            AppEvent::AppRouted {
+                app: AppKey::default(),
+                direction: lane,
+                preset: None,
+            },
             AppEvent::Window { visible: true },
             AppEvent::Quit,
         ] {

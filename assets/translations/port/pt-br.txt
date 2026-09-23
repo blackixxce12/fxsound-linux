@@ -101,3 +101,4 @@ countries: br
 "the echo canceller could not be loaded" = "não foi possível carregar o cancelamento de eco"
 "the echo canceller stopped" = "o cancelamento de eco parou"
 "waiting for the speakers" = "aguardando os alto-falantes"
+"Applications that used %s now follow FxSound's preset" = "Os aplicativos que usavam %s agora seguem o preset do FxSound"

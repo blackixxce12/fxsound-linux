@@ -43,6 +43,10 @@ use fxsound_core::i18n::{self, tr, tr_args};
 use fxsound_core::settings::CalibrationRecord;
 use fxsound_ui::dialogs::settings::{DevicePriority, SettingsState};
 
+mod per_app;
+
+pub use per_app::AppRuleRefusal;
+
 /// The characters `PresetNameInputFilter` strips from a typed preset name
 /// (`FxPresetNameEditor.cpp:6-33`): the Windows reserved-filename set, kept on Linux so a preset
 /// saved here can be copied to a Windows FxSound unchanged (`docs/spec/03-controls.md` §11.2).
@@ -585,6 +589,10 @@ pub struct App {
     /// §12, [`App::meters_moved`]).
     shown_meters: Meters,
     meters_moved: bool,
+    /// Per-application presets (`docs/0.4.0-apps.md`): the store of what the user chose for each
+    /// application, the applications playing and recording now, and the routes the engine was
+    /// last given for them (see [`per_app`]).
+    apps: per_app::AppPresets,
 }
 
 impl App {
@@ -681,6 +689,13 @@ impl App {
             sleeping: false,
             shown_meters: Meters::default(),
             meters_moved: false,
+            // `apps.toml`, beside the settings file. A run that must not write the user's files
+            // keeps its choices in memory, as it keeps its settings.
+            apps: if persist {
+                per_app::AppPresets::load()
+            } else {
+                per_app::AppPresets::default()
+            },
         };
 
         // What the settings file asks of the audio thread before it does anything else. See
@@ -762,8 +777,9 @@ impl App {
     }
 
     /// When the controller next has something to do that nothing will wake it for: the notice to
-    /// take down after its four seconds, the per-device volumes to write. `None` while there is
-    /// nothing of the kind; the pump's keepalive covers what is left (0.4.0 design §12).
+    /// take down after its four seconds, the per-device volumes to write, the store of
+    /// per-application presets to write. `None` while there is nothing of the kind; the pump's
+    /// keepalive covers what is left (0.4.0 design §12).
     ///
     /// A notice written straight into [`UiState::notification`] has no clock until the next poll
     /// stamps it, so it asks for that poll now.
@@ -779,7 +795,11 @@ impl App {
                 }
                 _ => Instant::now(),
             });
-        notice.into_iter().chain(self.volume_save_due).min()
+        notice
+            .into_iter()
+            .chain(self.volume_save_due)
+            .chain(self.app_rules_save_due())
+            .min()
     }
 
     /// The channel the audio thread's notifications arrive on, for the headless pump to wait on
@@ -806,6 +826,8 @@ impl App {
             self.volume_save_due = None;
             self.settings_dirty = true;
         }
+        // The applications seen playing since the store was last written, likewise a while later.
+        self.save_app_rules_if_due(now);
 
         self.meters_moved = false;
         let Some(engine) = self.engine.as_mut() else {
@@ -982,9 +1004,9 @@ impl App {
                         .get_or_insert_with(|| Instant::now() + VOLUME_SAVE_DELAY);
                 }
             }
-            // Application streams (per-application presets): the engine reports them, but the
-            // Applications list that reads them is not in this crate yet.
-            AudioToUi::AppStreams(_) => {}
+            // Every application playing or recording, in full: remembered in the store, matched
+            // against the rules, and the routes that follow sent on (see [`per_app`]).
+            AudioToUi::AppStreams(streams) => self.adopt_app_streams(streams),
         }
     }
 
@@ -1629,23 +1651,17 @@ impl App {
     /// the live ladder is kept and the preset's gains are fitted onto it by position
     /// ([`fxsound_dsp::eq::fit_preset_gains`]). Only a preset of the live count brings its own
     /// centre frequencies. A preset with no equalizer at all is the original's "old preset": the
-    /// equalizer on and flat.
+    /// equalizer on and flat. See [`music_controls`], which an application's route reads its
+    /// preset with too.
     fn apply_preset(&mut self, preset: &Preset) {
-        for effect in Effect::ALL {
-            self.state.effects[effect as usize] =
-                scale::value_to_slider_for(effect, preset.effect(effect));
-        }
-        let ladder = self.music_ladder();
-        (self.state.eq_on, self.state.eq_bands) = if preset.eq_bands.is_empty() {
-            (true, bands_of(&ladder, &vec![0.0; ladder.len()]))
-        } else if preset.eq_bands.len() == ladder.len() {
-            (preset.eq_on, preset.eq_bands.clone())
-        } else {
-            let centres: Vec<f32> = preset.eq_bands.iter().map(|b| b.center_hz).collect();
-            let gains: Vec<f32> = preset.eq_bands.iter().map(|b| b.boost_db).collect();
-            let fitted = fxsound_dsp::eq::fit_preset_gains(&centres, &gains, &ladder);
-            (preset.eq_on, bands_of(&ladder, &fitted))
-        };
+        let MusicControls {
+            effects,
+            eq_on,
+            eq_bands,
+        } = music_controls(preset, &self.music_ladder());
+        self.state.effects = effects;
+        self.state.eq_on = eq_on;
+        self.state.eq_bands = eq_bands;
         self.sync_params_from_state();
     }
 
@@ -1837,6 +1853,9 @@ impl App {
                 // back next time, as it would had the preset been picked.
                 self.remember_preset_for_selected_device(&name);
                 self.settings_dirty = true;
+                // An application whose rule names the preset runs what was just saved, and one
+                // whose rule named it before it existed runs it from now on.
+                self.app_presets_changed();
                 // `FxController.cpp:1221` / `:1234`, the same text on the desktop and in the strip.
                 let message = if is_new {
                     Message::preset_saved(&name)
@@ -1880,8 +1899,11 @@ impl App {
             return;
         }
         let name = entry.name.clone();
-        match self.store_mut(self.state.direction).delete(&name) {
+        let lane = self.state.direction;
+        match self.store_mut(lane).delete(&name) {
             Ok(()) => {
+                // First, so that nothing below publishes a route still running the preset.
+                let followed = self.app_preset_deleted(lane, &name);
                 self.refresh_preset_list();
                 // The old index is the neighbour that slid into the deleted slot now. Left
                 // selected, the pick below would take it for the current preset and, were it
@@ -1901,6 +1923,11 @@ impl App {
                 let message = Message::preset_deleted(&name);
                 self.raise_notice(message.body.clone());
                 self.notify(message);
+                // Once, however many applications it was, and after the deletion's own notice so
+                // that this is the one the window shows: it is the news the deletion does not say.
+                if followed {
+                    self.raise_notice(per_app::followed_notice(&name));
+                }
             }
             Err(err) => {
                 log::warn!("could not delete preset {name}: {err}");
@@ -1996,22 +2023,27 @@ impl App {
             engine.set_params(self.params);
             engine.set_input_params(self.input_params);
         }
+        // An application's route shares what every chain of its lane shares — the power, the
+        // speakers' levels and band count, the microphone settings, the sleep — so it follows
+        // the lane's snapshot wherever that goes. Sent only when a route's parameters changed.
+        self.refresh_app_routes();
     }
 
-    /// The window's controls, mapped onto the music chain.
+    /// The window's controls, mapped onto the music chain ([`write_music_params`]).
     fn sync_output_params_from_state(&mut self) {
-        for effect in Effect::ALL {
-            self.params.set_effect(
-                effect,
-                scale::slider_to_value_for(effect, self.state.effects[effect as usize]),
-            );
-        }
-        self.params.eq_on = self.state.eq_on;
-        self.params.set_bands(&self.state.eq_bands);
-        self.params.filter_q = self.state.filter_q;
-        self.params.master_gain_db = self.state.master_gain_db;
-        self.params.balance = self.state.balance_db;
-        self.params.volume_leveling_db = self.state.volume_leveling;
+        let state = &self.state;
+        write_music_params(
+            &mut self.params,
+            &state.effects,
+            state.eq_on,
+            &state.eq_bands,
+            MusicLevels {
+                filter_q: state.filter_q,
+                master_gain_db: state.master_gain_db,
+                balance_db: state.balance_db,
+                volume_leveling: state.volume_leveling,
+            },
+        );
     }
 
     /// What the readout strip reports about the voice chain that the meters do not: the level in
@@ -2594,6 +2626,7 @@ impl App {
         self.refresh_preset_list();
         self.state.selected_preset = None;
         self.note_presets();
+        self.app_presets_changed();
     }
 
     /// The microphone snapshot currently published, for tests and for `--status`.
@@ -2666,6 +2699,7 @@ impl App {
             sleeping: false,
             shown_meters: Meters::default(),
             meters_moved: false,
+            apps: per_app::AppPresets::default(),
         };
         app.start_the_stream_here();
         app
@@ -2733,6 +2767,7 @@ impl App {
         {
             log::warn!("could not save settings on exit: {err}");
         }
+        self.save_app_rules_on_exit();
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
@@ -3225,6 +3260,8 @@ impl App {
             self.raise_notice(tr_args("Could not rename %s", &[old.as_str()]));
             return;
         }
+        // Every application that ran the preset follows it to its new name.
+        self.app_preset_renamed(lane, &old, new_name);
 
         match lane {
             DeviceDirection::Output => {
@@ -3326,6 +3363,8 @@ impl App {
 
         if !summary.imported.is_empty() {
             self.refresh_preset_list_keeping_selection();
+            // A rule may name a preset that was missing until now.
+            self.app_presets_changed();
         }
         Some(summary)
     }
@@ -3633,7 +3672,6 @@ pub(crate) const fn detach(lane: DeviceDirection) -> UiAction {
     }
 }
 
-/// An equalizer as the window holds it, from a snapshot's two parallel arrays.
 /// The engine's band ladder for `count` bands: the original's hard-coded table where it has
 /// one, else the geometric ladder `GraphicEq` builds.
 fn ladder(count: usize) -> Vec<f32> {
@@ -3647,6 +3685,7 @@ fn ladder(count: usize) -> Vec<f32> {
     )
 }
 
+/// An equalizer as the window holds it, from a snapshot's two parallel arrays.
 fn bands_of(centres: &[f32], boosts: &[f32]) -> Vec<EqBand> {
     centres
         .iter()
@@ -3656,6 +3695,90 @@ fn bands_of(centres: &[f32], boosts: &[f32]) -> Vec<EqBand> {
             boost_db,
         })
         .collect()
+}
+
+/// What a music preset puts in the window: the five effects at their slider positions, and the
+/// equalizer's switch and bands.
+#[derive(Debug, Clone, PartialEq)]
+struct MusicControls {
+    effects: [f32; Effect::COUNT],
+    eq_on: bool,
+    eq_bands: Vec<EqBand>,
+}
+
+/// A music preset read into the window's controls on `ladder`, the live band ladder — the one
+/// reading of a `.fac` there is: the lane's own ([`App::apply_preset`]) and an application's
+/// route ([`per_app`]) both go through it, so a preset sounds the same on either.
+///
+/// The effects land where the slider shows them, which is where they sound: a Dynamic Boost past
+/// the slider's dead top is read as the top ([`scale::value_to_slider_for`]). The curve is the
+/// preset's own when it has as many bands as the ladder, fitted onto the ladder by position when
+/// it has another count ([`fxsound_dsp::eq::fit_preset_gains`]), and flat with the equalizer on
+/// when it has none, the original's "old preset".
+fn music_controls(preset: &Preset, ladder: &[f32]) -> MusicControls {
+    let effects =
+        Effect::ALL.map(|effect| scale::value_to_slider_for(effect, preset.effect(effect)));
+    let (eq_on, eq_bands) = if preset.eq_bands.is_empty() {
+        (true, bands_of(ladder, &vec![0.0; ladder.len()]))
+    } else if preset.eq_bands.len() == ladder.len() {
+        (preset.eq_on, preset.eq_bands.clone())
+    } else {
+        let centres: Vec<f32> = preset.eq_bands.iter().map(|b| b.center_hz).collect();
+        let gains: Vec<f32> = preset.eq_bands.iter().map(|b| b.boost_db).collect();
+        let fitted = fxsound_dsp::eq::fit_preset_gains(&centres, &gains, ladder);
+        (preset.eq_on, bands_of(ladder, &fitted))
+    };
+    MusicControls {
+        effects,
+        eq_on,
+        eq_bands,
+    }
+}
+
+/// The levels every music chain shares: settings over every `.fac`, as the original's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MusicLevels {
+    filter_q: f32,
+    master_gain_db: f32,
+    balance_db: f32,
+    volume_leveling: f32,
+}
+
+impl MusicLevels {
+    /// The levels the settings file holds, which are the speakers' whichever lane the window
+    /// edits.
+    const fn of(settings: &Settings) -> Self {
+        Self {
+            filter_q: settings.filter_q,
+            master_gain_db: settings.master_gain,
+            balance_db: settings.balance,
+            volume_leveling: settings.volume_leveling,
+        }
+    }
+}
+
+/// Map a music chain's controls onto its snapshot: the effects from their slider positions, the
+/// equalizer, and the shared levels. Everything else in `params` is left as it is — the power and
+/// the mute are the whole application's.
+fn write_music_params(
+    params: &mut DspParams,
+    effects: &[f32; Effect::COUNT],
+    eq_on: bool,
+    eq_bands: &[EqBand],
+    levels: MusicLevels,
+) {
+    for effect in Effect::ALL {
+        params.set_effect(
+            effect,
+            scale::slider_to_value_for(effect, effects[effect as usize]),
+        );
+    }
+    params.eq_on = eq_on;
+    params.set_bands(eq_bands);
+    params.filter_q = levels.filter_q;
+    params.master_gain_db = levels.master_gain_db;
+    params.balance = levels.balance_db;
+    params.volume_leveling_db = levels.volume_leveling;
 }
 
 /// Copy what the engine's lanes measured into what the window draws.
@@ -4028,6 +4151,8 @@ impl App {
             }
             store.rescan();
         }
+        // The stores were read again from disk; what the routes run is read again with them.
+        self.app_presets_changed();
         for lane in DeviceDirection::ALL {
             self.in_lane(lane, |app| {
                 // Rebuilt without the unsaved-changes marker the selection carried: every stash
@@ -4551,6 +4676,8 @@ impl App {
             self.raise_notice(tr_args("Could not save %s", &[name.as_str()]));
             return false;
         }
+        // A recording application whose rule names the calibrated preset runs the new numbers.
+        self.app_presets_changed();
 
         self.in_lane(DeviceDirection::Input, |app| {
             app.refresh_preset_list_keeping_selection();
@@ -5916,6 +6043,7 @@ mod tests {
         let bare = concat!(".state.notification", " = ");
         for (file, source) in [
             ("app.rs", include_str!("app.rs")),
+            ("app/per_app.rs", include_str!("app/per_app.rs")),
             ("main.rs", include_str!("main.rs")),
         ] {
             for (number, line) in source.lines().enumerate() {
@@ -5936,6 +6064,7 @@ mod tests {
         let mut callers = Vec::new();
         for (file, source) in [
             ("app.rs", include_str!("app.rs")),
+            ("app/per_app.rs", include_str!("app/per_app.rs")),
             ("main.rs", include_str!("main.rs")),
             ("commands.rs", include_str!("commands.rs")),
             ("dbus.rs", include_str!("dbus.rs")),

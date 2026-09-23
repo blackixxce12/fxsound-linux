@@ -100,3 +100,4 @@ countries: pl
 "the echo canceller could not be loaded" = "nie udało się załadować usuwania echa"
 "the echo canceller stopped" = "usuwanie echa zatrzymało się"
 "waiting for the speakers" = "oczekiwanie na głośniki"
+"Applications that used %s now follow FxSound's preset" = "Aplikacje, które używały %s, korzystają teraz z presetu FxSound"
