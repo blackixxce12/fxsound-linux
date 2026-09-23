@@ -1080,7 +1080,7 @@ Do the DSP in **NODE 1's** `process()`, not NODE 2's. Reasons:
 | --- | --- |
 | Push the DFX device to 44100 or 48000 based on `playbackRate % 48000` | **Run the virtual sink at the target sink's own `audio.rate`** (read from the sink node's `Format`/`node.rate`, or from `clock.rate` in `SPA_IO_Position`). Fall back to `48000`. |
 | Integer zero-order-hold upsample | **Never resample ourselves.** If the target sink runs at a different rate, PipeWire's `adapter` resamples with its sinc resampler at whatever quality `resample.quality` is set to (default 4). |
-| Clamp channels to `[2,8]`, quad → 6, mono → silence | Keep the clamp: `channels = clamp(target_channels, 2, 8)`. **Refuse mono targets** exactly as Windows does (`SND_DEVICES_NO_VALID_PLAYBACK_DEVICE`), and surface the same two user-facing states. |
+| Clamp channels to `[2,8]`, quad → 6, mono → silence | Keep the clamp: `channels = clamp(target_channels, 2, 8)`. **Accept mono targets** (0.4.0, open question 6): NODE 1 stays stereo and NODE 2's adapter down-mixes into the device (`stream.dont-remix = false`), as the capture stream's adapter up-mixes a mono microphone. The `-57`/`-58` states are not ported. |
 | Hand-written 6→2/6→4/6→8/2→4 mixdowns | Declare `audio.position` on NODE 1 to match the target's `audio.position` and let PipeWire's channel mixer handle client remixing into us. Only the *identity* case then exists inside `process()`. If parity with FxSound's deliberate "fill side channels with back channels" 6→8 upmix is wanted, set `stream.dont-remix = true` on NODE 2 and reproduce the table in §11 — but default to letting PipeWire do it. |
 | Format is always F32 interleaved | Same: `SPA_AUDIO_FORMAT_F32` (native-endian `F32`, i.e. `F32LE` on x86/ARM LE). Ask for `SPA_AUDIO_FORMAT_F32P` (planar/DSP) on NODE 1 if the DSP prefers deinterleaved — PipeWire supports both; interleaved `F32` is the simpler port since `DfxDsp::processAudio` takes interleaved. |
 
@@ -1164,24 +1164,22 @@ Algorithm — identical shape to `sndDevicesImplementDeviceRules`, with two subs
 2. most_recent_default == ""                  -> first run:
      if current_default != our_sink:
          original_default = most_recent_default = current_default
-         target = current_default;  goto MonoCheck
-3. real_sinks.len() == 1                       -> target = real_sinks[0];  goto MonoCheck
-4. user_selected_playback resolves & active    -> target = it;  goto MonoCheck
-5. a NEW sink appeared since last enumeration  -> target = first new sink with >= 2 channels
-                                                  write_prev_default = true;  goto MonoCheck
+         target = current_default;  goto Commit
+3. real_sinks.len() == 1                       -> target = real_sinks[0];  goto Commit
+4. user_selected_playback resolves & active    -> target = it;  goto Commit
+5. a sink whose name was not in the previous   -> target = first such sink, whatever its channels
+   enumeration (previous one non-empty),          write_prev_default = true;  goto Commit
+   whether or not the count grew
 6. current_default != our_sink                 -> target = current_default
-                                                  write_prev_default = true;  goto MonoCheck
+                                                  write_prev_default = true;  goto Commit
 7. else (we are already the default)           -> first active of:
        most_recent_playback, most_recent_default, prior_default, original_default,
        else real_sinks[0]
 
-MonoCheck:
-   if target.channels == 1:
-       retry most_recent_playback
-       if that is also mono:
-           non_mono = real_sinks.iter().filter(|d| d.channels >= 2).count()
-           if non_mono >= 1 -> Error::AskUserSelectOutput      (≡ -58)
-           else             -> Error::NoValidOutput            (≡ -57)
+(No MonoCheck. Windows' `:290-327` refused a mono target — retry most_recent_playback, else
+-58 AskUserSelectOutput / -57 NoValidOutput — to dodge its own driver bug; see open question 6.
+Rule 5 no longer asks for the count to have grown, which missed a device that arrived in the
+same batch as another left: upstream PR #532.)
 
 Commit:
    most_recent_playback = target.id
@@ -1598,8 +1596,8 @@ pub enum AudioError {
     #[error("no output devices present")]            NoOutputDevices,        // ≡ 209
     #[error("selected output is not present")]        DeviceNotPresent,       // ≡ -2
     #[error("output device is unavailable")]          DeviceUnavailable,      // ≡ -54 + playbackDeviceIsUnavailable
-    #[error("no usable (stereo or better) output")]   NoValidOutput,          // ≡ -57
-    #[error("please choose an output device")]        AskUserSelectOutput,    // ≡ -58
+    // -57 NoValidOutput and -58 AskUserSelectOutput: retired in 0.4.0 with the mono refusal
+    // (open question 6).
     #[error("PipeWire is not available: {0}")]        PipewireUnavailable(String),
     #[error("lost connection to PipeWire")]           PipewireDisconnected,
     #[error("format negotiation failed")]             FormatNegotiation,      // ≡ -35/-36
@@ -1656,8 +1654,11 @@ Because this module can silence a user's machine, the following must all be gree
    than 200 ms (assert with a counter).
 5. **Hot-unplug test.** Unplug a USB DAC that is the current target mid-playback. Expect NODE 2 to
    move to the next device per §19.5, NODE 1 untouched, clients never disconnected.
-6. **Mono test.** `pactl load-module module-null-sink channels=1` as the only output. Expect
-   `NoValidOutput`; with a stereo sink also present, expect `AskUserSelectOutput`.
+6. **Mono test.** A one-channel null sink appears while FxSound plays to a stereo one. Expect
+   the output lane to move to it (rule 5) and stay there once its info says one channel, with a
+   stereo NODE 1 and a stereo NODE 2 whose adapter down-mixes into the sink, and the tone heard on
+   the sink's monitor (`graph_churn.rs`,
+   `a_mono_sink_that_appears_is_played_to_through_a_stereo_pair_its_adapter_down_mixes`).
 7. **Rate-change test.** Switch the target sink between 44.1/48/96 kHz. Expect no crash, no
    zero-order-hold artefacts (spectrum-analyse a 10 kHz sine for images).
 8. **Xrun test.** Run at `Low` under `stress-ng --cpu $(nproc)`. Expect underruns counted and the
@@ -1703,12 +1704,33 @@ Because this module can silence a user's machine, the following must all be gree
    parity with Windows surround output is a requirement, `stream.dont-remix = true` plus a hand-ported
    mixer is needed. **Assume it is not required** unless told otherwise.
 
-6. **Mono output is refused, not downmixed.** Ported faithfully from
-   `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES` / `_FORCE_SILENCE` (`sndDevices.h:37-39`,
-   `sndDevicesDoCapture.cpp:350-372`). On Linux there is no driver bug forcing this — a mono BT
-   headset (HSP/HFP) is perfectly drivable. Consider **fixing** it (downmix to mono and allow the
-   device) rather than porting the refusal, which would remove the `-57`/`-58` states entirely.
-   Needs a decision; the spec above ports the refusal to stay faithful.
+6. **Mono output — decided in 0.4.0: accepted and down-mixed, not refused.** 0.3.0 ported the
+   refusal faithfully from `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES` / `_FORCE_SILENCE`
+   (`sndDevices.h:32-39`, `sndDevicesDoCapture.cpp:350-372`; upstream 11d7edf, a28f37e, b21e084,
+   56e9cda). That was a workaround for a Windows driver bug, and PipeWire has none: a mono device is
+   perfectly drivable. With two lanes it had also become harmful. Picking a Bluetooth headset's
+   microphone switches the headset to its call profile (`headset-head-unit`), where WirePlumber
+   removes `bluez_output.<addr>.1` and adds it back under the same name with one channel. The
+   refusal struck on the first run of the rules after the node's info said "one channel" (the
+   registry global carries no count), so mid-call the music left the headset for the speakers.
+   **Decision** (upstream-review item U7, `docs/0.4.0-upstream.md`):
+   * `choose_device` refuses nothing for its channel count, in either direction: the mono guard
+     of `sndDevicesImplementDeviceRules.cpp:290-327` and rule 5's mono skip (`:202-210`) are gone,
+     and so are the `-57`/`-58` states (`AudioError::NoValidOutput` / `AskUserSelectOutput`).
+   * The device list offers mono outputs like any other.
+   * The pair still runs `clamp(channels, 2, 8)`: NODE 1 (`fxsound_sink`) stays stereo, NODE 2
+     (`fxsound_output`) declares the same stereo format, and its adapter down-mixes into the
+     device because the stream leaves `stream.dont-remix = false`, which is also what lets the
+     session manager set its ports up at the device's layout. A mono device's `MONO` layout is
+     replaced by `FL,FR` for the pair (`ChannelMap::resized`), so a headset whose one-channel info
+     arrives after its pair was built at the unknown-count fallback is not rebuilt for it.
+   * Tested with a composed `pw-dump` of a headset in `headset-head-unit`
+     (`tests/fixtures/pw-dump-bluez-headset-head-unit.json`) and on a private daemon with a
+     one-channel null sink (§26 test 6).
+
+   What is left for the GUI: nothing greys a mono device out any more, and a warning when one
+   Bluetooth device is the target of both lanes — music in mono at 16 kHz for the length of the
+   call — belongs to U9.
 
 7. **The `isUserSelectedPlaybackDevice` bug.** `AudioPassthruPrivate.cpp:215` compares against an
    uninitialised buffer (§15). Nothing in the GUI reads the flag today, so the Linux port should
@@ -1865,9 +1887,11 @@ Node **names** are never localised: they are matched by string and written into 
 run over the devices of one direction with `our_node = fxsound_source` and `current_default =
 default.audio.source`. Differences from the output run:
 
-* rule 1 ends in `NoInputDevices` rather than `NoOutputDevices`;
-* rule 5 accepts a newly plugged mono microphone;
-* the mono guard (`-57`/`-58`) does not run.
+* rule 1 ends in `NoInputDevices` rather than `NoOutputDevices`.
+
+(0.3.0 listed two more: rule 5 accepting a newly plugged mono microphone, and the mono guard
+(`-57`/`-58`) not running. Since 0.4.0 neither direction has a mono guard, so both are simply how
+the rules run — open question 6.)
 
 One deviation applies to **both** directions: rule 2 (first run adopts the current default) yields
 to an explicit `user_selected` device that is present. Windows never wrote `user_selected` (open
@@ -1934,7 +1958,7 @@ stream error is one of these, a rebuild of that lane alone on its own backoff (`
 
 `AudioToUi::Devices` carries both directions, grouped: every output sorted by description, then
 every input sorted by description, each with `is_default` judged against the default *of its own
-direction*. Mono outputs are omitted (they could never be chosen); mono inputs are listed. The tray
+direction*. Every device is listed, mono outputs included (0.4.0, open question 6). The tray
 draws the same list as two radio groups under disabled "Output" / "Input" header rows, and its
 tooltip's second line reads `Output: …` or `Input: …` after the selected device's direction.
 

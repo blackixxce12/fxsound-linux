@@ -775,16 +775,20 @@ struct PairFormat {
     /// The target's channel count, clamped to `2..=8` (`sndDevices.h:190-191`).
     channels: u32,
     rate: u32,
-    /// The target's own layout at that count.
+    /// The target's own channel positions when the clamp keeps its count, and PipeWire's default
+    /// layout for the clamped count otherwise — a mono device's pair runs `FL,FR`
+    /// ([`ChannelMap::resized`]).
     positions: ChannelMap,
 }
 
 impl PairFormat {
     /// The format a pair attached to `target` runs at, with the graph's clock at `graph_rate`.
     ///
-    /// The target's channel count clamped to `2..=8`, its own channel positions, and — for the
-    /// output lane — the device's rate when it publishes one and the graph's clock rate when it
-    /// does not, which is most ALSA sinks. The input lane asks for [`CAPTURE_RATE`] whatever the
+    /// The target's channel count clamped to `2..=8`; its own channel positions when the clamp
+    /// keeps its count, PipeWire's default layout for the clamped count otherwise (a mono device
+    /// runs `FL,FR`, and the adapter converts between that and the device's `MONO`); and — for
+    /// the output lane — the device's rate when it publishes one and the graph's clock rate when
+    /// it does not, which is most ALSA sinks. The input lane asks for [`CAPTURE_RATE`] whatever the
     /// microphone runs at, and lets PipeWire resample. RNNoise exists at 48 kHz and nowhere else,
     /// and a voice preset has to mean one thing on every device — a preset whose denoiser
     /// silently drops out on a 44.1 kHz microphone is a preset describing half its own sound. The
@@ -3104,7 +3108,10 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
 /// Windows design wholesale — no `IPolicyConfigVista::SetDeviceFormat`, no rate pushed onto a
 /// driver, no zero-order-hold upsampler. If the real device wants something else, the adapter in
 /// front of it converts — which is also how a mono microphone arrives here as the stereo pair the
-/// DSP runs on.
+/// DSP runs on, and how the output lane's stereo pair reaches a mono headset: NODE 1 stays stereo
+/// ([`DeviceInfo::clamped_channels`]) and the playback stream, which leaves `stream.dont-remix`
+/// off, is down-mixed by its adapter. Nothing is refused for being mono: the Windows rules refused
+/// a mono sink only to dodge a bug in their own driver (`sndDevices.h:32-39`).
 ///
 /// `via` is the node the input lane's capture stream records from instead of the microphone — the
 /// echo canceller's source ([`aec::route`]) — or `None` to record the microphone itself. The pair's
@@ -3121,9 +3128,6 @@ fn build_nodes(
     };
     let core = session.core.clone();
 
-    if target.is_refused_mono() {
-        return Err(AudioError::NoValidOutput);
-    }
     let direction = target.direction;
     let PairFormat {
         channels,
@@ -3455,6 +3459,10 @@ fn stream_props(
         // stream is never passive. It is what makes the microphone produce anything at all.
         *pw::keys::NODE_PASSIVE        => if passive { "true" } else { "false" },
         *pw::keys::NODE_LATENCY        => latency,
+        // Remixing stays on: it is what lets the pair run stereo on a device that is not. The
+        // adapter down-mixes the playback stream into a mono headset and up-mixes a mono
+        // microphone into the capture stream, and the session manager sets the stream's ports up
+        // at the device's own layout only while this is off.
         *pw::keys::STREAM_DONT_REMIX   => "false",
         *pw::keys::TARGET_OBJECT       => target,
         *pw::keys::APP_NAME            => "FxSound",
@@ -3846,8 +3854,8 @@ fn publish_attachment(shared: &mut Shared, direction: DeviceDirection) {
 
 /// The device list as the GUI wants it: every output sorted by description, then every input
 /// sorted by description. The GUI draws its section headers off that grouping, so the order is
-/// part of the contract. Mono *outputs* are left out (they could never be chosen); mono inputs
-/// stay in.
+/// part of the contract. Every device is listed, mono ones included: a Bluetooth headset in its
+/// call profile is an output like any other, and one the user may well want to pick.
 fn published_devices(shared: &Shared) -> Vec<AudioDevice> {
     let mut published = Vec::with_capacity(shared.devices.len());
     for (direction, default) in shared.defaults.iter() {
@@ -3855,7 +3863,7 @@ fn published_devices(shared: &Shared) -> Vec<AudioDevice> {
         let mut group: Vec<AudioDevice> = shared
             .devices
             .iter()
-            .filter(|d| d.direction == direction && !d.is_refused_mono())
+            .filter(|d| d.direction == direction)
             .map(|d| d.to_audio_device(default))
             .collect();
         group.sort_by(|a, b| a.description.cmp(&b.description));
@@ -5659,6 +5667,69 @@ mod tests {
         assert!(guard.defaults.input.disowned);
         hand_back_disowned_defaults(&mut guard);
         assert!(!guard.defaults.input.holding, "the opt-out was ignored");
+    }
+
+    #[test]
+    fn a_mono_headset_is_listed_among_the_outputs_the_gui_may_pick() {
+        // The list used to leave a mono output out altogether, because the rules would have
+        // refused it: a headset in its call profile simply vanished from the picker.
+        let (mut shared, messages) = shared_with_messages();
+        let headset = DeviceInfo::from_props(50, &|key: &str| match key {
+            "media.class" => Some(devices::SINK_MEDIA_CLASS),
+            "node.name" => Some("bluez_output.00_11_22_33_44_55.1"),
+            "node.description" => Some("Headset"),
+            "api.bluez5.profile" => Some("headset-head-unit"),
+            "audio.channels" => Some("1"),
+            _ => None,
+        })
+        .expect("a sink that is not one of ours");
+        assert!(headset.is_mono());
+        add_device(&mut shared, headset);
+        add_device(&mut shared, device(51, "speakers", DeviceDirection::Output));
+        add_device(
+            &mut shared,
+            device(52, "alsa_input.pci", DeviceDirection::Input),
+        );
+
+        let listed: Vec<(String, DeviceDirection, String)> = published_devices(&shared)
+            .into_iter()
+            .map(|d| (d.name, d.direction, d.form_factor))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (
+                    "bluez_output.00_11_22_33_44_55.1".to_owned(),
+                    DeviceDirection::Output,
+                    "headset".to_owned()
+                ),
+                (
+                    "speakers".to_owned(),
+                    DeviceDirection::Output,
+                    "unknown".to_owned()
+                ),
+                (
+                    "alsa_input.pci".to_owned(),
+                    DeviceDirection::Input,
+                    "microphone".to_owned()
+                ),
+            ],
+            "every output by description, the mono one included, then every input"
+        );
+
+        publish(&mut shared);
+        let sent = drained(&messages)
+            .into_iter()
+            .find_map(|message| match message {
+                AudioToUi::Devices(devices) => Some(devices),
+                _ => None,
+            });
+        assert!(
+            sent.is_some_and(|devices| devices
+                .iter()
+                .any(|d| d.name == "bluez_output.00_11_22_33_44_55.1")),
+            "the GUI is told about it"
+        );
     }
 
     #[test]

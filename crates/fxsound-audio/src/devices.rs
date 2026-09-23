@@ -13,10 +13,16 @@
 //! The Linux port adds one axis the Windows code never had: **direction**. The same rules run,
 //! unchanged, over `Audio/Source` nodes when FxSound sits behind a microphone
 //! (`docs/spec/12-audio-io.md` §28), with "the current default" then read from
-//! `default.audio.source`. The one deliberate difference is the mono guard: Windows refused mono
-//! *playback* devices because of a driver bug (`sndDevices.h:39`), but a mono microphone is the
-//! normal case and is accepted — the capture stream declares stereo and PipeWire's adapter
-//! up-mixes.
+//! `default.audio.source`.
+//!
+//! One branch of the Windows rules is deliberately not ported: the mono guard. Windows refused
+//! mono *playback* devices to work around a bug in its own driver (`sndDevices.h:32-39`,
+//! `SND_DEVICES_MONO_BUG_*`), and PipeWire has no such bug to work around. So no device is refused
+//! for its channel count, in either direction: a lane's pair always runs at least a stereo pair,
+//! and the adapter PipeWire puts in front of the real device converts — it up-mixes a mono
+//! microphone into the pair, and down-mixes the pair into a mono headset. That is what keeps the
+//! music playing in a Bluetooth headset that has just switched to its call profile, which is mono
+//! (`docs/spec/12-audio-io.md`, open question 6).
 //!
 //! Everything here is a pure function over property dictionaries. Nothing in this module talks to
 //! a PipeWire server, which is what lets the rules be tested against a captured `pw-dump` rather
@@ -28,9 +34,11 @@ use crate::{AudioError, OUR_NODE_NAMES};
 
 /// `SND_DEVICES_MIN_NUM_CHANS` (`audiopassthru/include/sndDevices.h:190`).
 ///
-/// A sink with fewer channels than this is refused rather than down-mixed, exactly as
-/// `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES` (`sndDevices.h:39`) makes Windows refuse it. A
-/// *source* with fewer channels is up-mixed instead; see [`DeviceInfo::is_refused_mono`].
+/// The fewest channels a lane's pair ever runs, not the fewest a device may have. A device with
+/// fewer is attached like any other and its adapter converts: a mono microphone is up-mixed into
+/// the pair and the pair is down-mixed into a mono headset (see [`DeviceInfo::clamped_channels`]).
+/// Windows refused such a *sink* instead (`SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES`,
+/// `sndDevices.h:39`), to work around a driver bug PipeWire does not have.
 pub const MIN_CHANNELS: u32 = 2;
 
 /// `SND_DEVICES_MAX_NUM_CHANS` (`sndDevices.h:191`).
@@ -358,7 +366,6 @@ impl ChannelMap {
         }
     }
 
-    /// Truncate or pad the layout so it describes exactly `channels` channels.
     /// Index of the low-frequency-effects channel, if the layout has one.
     ///
     /// The stages that must not touch the subwoofer need a position, not an index: it sits at 3 in
@@ -390,6 +397,10 @@ impl ChannelMap {
         (left != right).then_some((left, right))
     }
 
+    /// The layout for exactly `channels` channels: this one when it already has that many, and
+    /// PipeWire's default layout for the count when it does not — which is how a mono device's
+    /// `MONO` becomes the `FL,FR` its lane's pair runs, whichever way the adapter then converts.
+    #[must_use]
     pub fn resized(self, channels: u32) -> Self {
         if usize::from(self.len) == channels as usize {
             return self;
@@ -493,8 +504,8 @@ impl DeviceInfo {
     /// Mirrors pass 1 of `sndDevices_GetAll.cpp:141-267`, including its fallbacks: a node with no
     /// `node.description` is labelled with its `node.name` rather than being dropped (the Windows
     /// code wrote `L"Unknown"`, `:260-262`), and a node that does not publish a channel count gets
-    /// 0, which the mono guard in [`choose_device`] then treats the way Windows treated
-    /// `deviceNumChannel = 0`.
+    /// 0 — unknown, which [`DeviceInfo::clamped_channels`] runs as stereo until the node's own
+    /// info says otherwise.
     #[must_use]
     pub fn from_props<'a>(object_id: u32, get: &impl Fn(&str) -> Option<&'a str>) -> Option<Self> {
         let direction = direction_of_media_class(get("media.class")?)?;
@@ -587,25 +598,13 @@ impl DeviceInfo {
 
     /// Whether the device *says* it has fewer than two channels.
     ///
-    /// Only a *known* channel count below two counts. PipeWire's registry globals do not carry
-    /// `audio.channels` — it lives in the node's info, which arrives only after binding to the
-    /// node — so a device discovered through the registry reports `0` here. Treating that as mono
-    /// refused every output on the system and left the engine with nothing to render to.
+    /// A description, never a verdict: nothing is refused for it, in either direction (module
+    /// docs). Only a *known* channel count below two counts. PipeWire's registry globals do not
+    /// carry `audio.channels` — it lives in the node's info, which arrives only after binding to
+    /// the node — so a device discovered through the registry reports `0` here until then.
     #[must_use]
     pub const fn is_mono(&self) -> bool {
         self.channels != 0 && self.channels < MIN_CHANNELS
-    }
-
-    /// Whether the rules must refuse this device for being mono
-    /// (`sndDevicesImplementDeviceRules.cpp:300`).
-    ///
-    /// Outputs only. `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES` (`sndDevices.h:39`) worked around a
-    /// *playback* driver bug; a mono microphone is what most microphones are, and the capture
-    /// stream declares [`MIN_CHANNELS`] regardless so PipeWire's adapter up-mixes it
-    /// (`docs/spec/12-audio-io.md` §28).
-    #[must_use]
-    pub const fn is_refused_mono(&self) -> bool {
-        matches!(self.direction, DeviceDirection::Output) && self.is_mono()
     }
 
     /// `true` when the node never told us how many channels it has.
@@ -615,8 +614,13 @@ impl DeviceInfo {
     }
 
     /// The channel count FxSound will actually run, clamped to `2..=8`
-    /// (`sndDevices.h:190-191`; `docs/spec/12-audio-io.md` §19.3 keeps the clamp). For a mono
-    /// microphone this is the stereo pair PipeWire up-mixes it into.
+    /// (`sndDevices.h:190-191`; `docs/spec/12-audio-io.md` §19.3 keeps the clamp).
+    ///
+    /// For a mono device this is a stereo pair, in either direction: PipeWire's adapter up-mixes
+    /// a mono microphone into it, and down-mixes it into a mono headset — the playback stream
+    /// leaves `stream.dont-remix` off for exactly that. The same answer whether the device's
+    /// channel count is still unknown or has arrived as one, so a headset whose info comes in
+    /// after its pair was built is not rebuilt for it.
     #[must_use]
     pub const fn clamped_channels(&self) -> u32 {
         if self.channels < MIN_CHANNELS {
@@ -685,18 +689,17 @@ fn find<'a>(devices: &'a [&DeviceInfo], name: &str) -> Option<&'a DeviceInfo> {
 /// 2. first run after install → whatever the session default is, if it is not us (`:146-167`) —
 ///    unless the user has already picked a device that is present, in which case rule 4 wins
 ///    (see the comment in the body);
-/// 3. exactly one device → that one, *without* skipping the mono check (`:172-183`);
+/// 3. exactly one device → that one (`:172-183`);
 /// 4. an explicit user choice that still exists (`:188-193`);
-/// 5. a device that appeared since the last enumeration, usable per the mono rule (`:197-231`);
+/// 5. a device whose name was not there at the last enumeration (`:197-231`), whether or not the
+///    number of devices grew — see the comment in the body;
 /// 6. the session default, if it is not us (`:237-249`);
 /// 7. otherwise the first of `most_recent_playback`, `most_recent_default`, `prior_default`,
 ///    `original_default` that is present, else the first device (`:257-284`).
 ///
-/// Then the mono guard of `:290-327`, **outputs only**: a mono target is retried as
-/// `most_recent_playback`, and if that is mono too the answer is
-/// [`AudioError::AskUserSelectOutput`] when some other sink is usable and
-/// [`AudioError::NoValidOutput`] when none is — `-58` and `-57` respectively. A mono microphone
-/// passes straight through ([`DeviceInfo::is_refused_mono`]).
+/// The Windows rules then ran a mono guard (`:290-327`) that refused a mono playback device and
+/// ended in `-58` or `-57`. It is not ported: it worked around a Windows driver bug, and a mono
+/// device of either direction is attached like any other (module docs).
 ///
 /// `previous_names` is the snapshot of real device names of this direction from the previous
 /// enumeration, the equivalent of `pwszIDPreviousRealDevices` (`sndDevices.h:349`); pass an empty
@@ -704,8 +707,9 @@ fn find<'a>(devices: &'a [&DeviceInfo], name: &str) -> Option<&'a DeviceInfo> {
 /// cannot fire.
 ///
 /// # Errors
-/// Returns the same four states the Windows rules could end in, so the GUI's existing error
-/// surfaces port unchanged, plus the input-side twin of "no devices".
+/// [`AudioError::NoOutputDevices`] / [`AudioError::NoInputDevices`] when the direction has no real
+/// device at all — the one state of the Windows rules that survives the mono guard's removal, plus
+/// its input-side twin.
 pub fn choose_device(
     devices: &[DeviceInfo],
     direction: DeviceDirection,
@@ -744,7 +748,8 @@ pub fn choose_device(
         target = find(&real, default_name);
     }
 
-    // 3 — exactly one real device (`:172-183`).
+    // 3 — exactly one real device (`:172-183`). Windows checked it for being mono afterwards
+    // like every other branch; nothing here does.
     if target.is_none() && real.len() == 1 {
         target = Some(real[0]);
     }
@@ -754,13 +759,24 @@ pub fn choose_device(
         target = find(&real, &memory.user_selected);
     }
 
-    // 5 — a device was just added (`:197-231`). Windows compared counts first; comparing the name
-    // sets directly is the same test without the off-by-one at `:223` (see spec §15).
-    if target.is_none() && !previous_names.is_empty() && real.len() > previous_names.len() {
+    // 5 — a device was just added (`:197-231`). Windows only looked for the new device when the
+    // count had grown (`:197`), and so missed it whenever something left in the same batch of
+    // registry events: a USB DAC swapped for another, a dock handing its outputs over, a device
+    // that changes its node name when it changes profile — an ALSA card going from stereo to 5.1.
+    // Upstream has an open PR for the same miss (#532, `reconnectedDeviceGuid`; Discussion #311).
+    // Here the name sets decide, whatever the counts did, which also drops the off-by-one at
+    // `:223` (see spec §15). A device that comes back under the name it left with — a Bluetooth
+    // headset between profiles — is not new when it comes back within the same run of the rules:
+    // the rules below find it again as what it was, the user's pick or the device we last played
+    // to. If its removal had a run of its own — the engine runs the rules from its supervisor tick,
+    // which a slow profile switch can straddle, and every run replaces `previous_names` — rule 5
+    // takes it back as new: the same device either way, only with the remembered defaults written
+    // again.
+    if target.is_none() && !previous_names.is_empty() {
         target = real
             .iter()
             .copied()
-            .find(|s| !previous_names.iter().any(|p| p == &s.name) && !s.is_refused_mono());
+            .find(|s| !previous_names.iter().any(|p| p == &s.name));
         write_previous_default = target.is_some();
     }
 
@@ -791,22 +807,9 @@ pub fn choose_device(
         }
     }
 
-    let mut chosen = target.ok_or(AudioError::DeviceNotPresent)?;
-
-    // The mono guard (`:290-327`) — outputs only.
-    if chosen.is_refused_mono() {
-        match find(&real, &memory.most_recent_playback).filter(|s| !s.is_refused_mono()) {
-            Some(fallback) => chosen = fallback,
-            None => {
-                let usable = real.iter().filter(|s| !s.is_refused_mono()).count();
-                return Err(if usable >= 1 {
-                    AudioError::AskUserSelectOutput
-                } else {
-                    AudioError::NoValidOutput
-                });
-            }
-        }
-    }
+    // Rule 7 always ends in a device, so this cannot fail. `:290-327` would refuse it here for
+    // being mono; see the doc comment for why that is not ported.
+    let chosen = target.ok_or(AudioError::DeviceNotPresent)?;
 
     Ok(Selection {
         target: chosen.name.clone(),
@@ -902,6 +905,30 @@ mod tests {
     /// objects this module cares about. Captured rather than hand-written so the property spellings
     /// are the server's, not this author's memory of them.
     const PW_DUMP: &str = include_str!("../tests/fixtures/pw-dump-sinks.json");
+
+    /// A Bluetooth headset in its call profile, `headset-head-unit`, beside a laptop's own speakers
+    /// and microphone: the graph WirePlumber 0.5.17 builds while something records from the
+    /// headset's microphone.
+    ///
+    /// Composed rather than captured, because no headset was at hand and the session graph is not
+    /// ours to probe. Every property is one something in that stack sets: WirePlumber's
+    /// `monitors/bluez/name-node.lua` (the node names, description, priorities, `device.id`,
+    /// `factory.name`, `spa.object.id`, `node.pause-on-idle`), `create-node.lua`
+    /// (`api.bluez5.internal` and `bluez5.loopback` on the SCO source), `create-loopback-node.lua`
+    /// (the loopback microphone and its internal capture stream, as written there), and the
+    /// `api.bluez5.*` keys PipeWire's bluez5 plugin puts on the nodes it emits. The sink's one
+    /// channel is the SCO link's; the engine reads it from the node's info, not from the registry
+    /// global, and the fixture holds it where `pw-dump` would print it.
+    const BLUEZ_HEADSET_HEAD_UNIT_DUMP: &str =
+        include_str!("../tests/fixtures/pw-dump-bluez-headset-head-unit.json");
+
+    /// The headset's sink in that fixture. The same name it has on A2DP: WirePlumber names a
+    /// Bluetooth node by its address and its node id on the device, not by profile
+    /// (`name-node.lua:52-55`).
+    const HEADSET_SINK: &str = "bluez_output.00_11_22_33_44_55.1";
+
+    /// The laptop's speakers in that fixture.
+    const LAPTOP_SPEAKERS: &str = "alsa_output.pci-0000_00_1f.3.analog-stereo";
 
     // ---------------------------------------------------------------------------------------
     // A minimal JSON reader, test-only.
@@ -1093,9 +1120,14 @@ mod tests {
     /// dictionary — the same thing the registry hands a client.
     type FixtureObject = (u32, String, Vec<(String, String)>);
 
-    /// Every object in the fixture.
+    /// Every object in the captured desktop fixture.
     fn fixture_objects() -> Vec<FixtureObject> {
-        let Json::Arr(objects) = Parser::new(PW_DUMP).value() else {
+        objects_in(PW_DUMP)
+    }
+
+    /// Every object in a `pw-dump`.
+    fn objects_in(dump: &str) -> Vec<FixtureObject> {
+        let Json::Arr(objects) = Parser::new(dump).value() else {
             panic!("fixture is not a JSON array");
         };
         objects
@@ -1125,9 +1157,14 @@ mod tests {
             .collect()
     }
 
-    /// The `default` metadata object's entries, as `(key, value)`, the way `pw-dump` prints them.
+    /// The captured desktop fixture's `default` metadata entries.
     fn fixture_default_metadata() -> Vec<(String, String)> {
-        let Json::Arr(objects) = Parser::new(PW_DUMP).value() else {
+        default_metadata_in(PW_DUMP)
+    }
+
+    /// The `default` metadata object's entries, as `(key, value)`, the way `pw-dump` prints them.
+    fn default_metadata_in(dump: &str) -> Vec<(String, String)> {
+        let Json::Arr(objects) = Parser::new(dump).value() else {
             panic!("fixture is not a JSON array");
         };
         let object = objects
@@ -1165,8 +1202,14 @@ mod tests {
             .collect()
     }
 
+    /// Every device in the captured desktop fixture.
     fn fixture_devices() -> Vec<DeviceInfo> {
-        fixture_objects()
+        devices_in(PW_DUMP)
+    }
+
+    /// Every device in a `pw-dump`, parsed the way the engine parses a registry global.
+    fn devices_in(dump: &str) -> Vec<DeviceInfo> {
+        objects_in(dump)
             .into_iter()
             .filter(|(_, type_, _)| type_ == "PipeWire:Interface:Node")
             .filter_map(|(id, _, props)| {
@@ -1307,15 +1350,15 @@ mod tests {
         assert_eq!(alc.form_factor, FormFactor::Speakers);
         assert!(!alc.is_mono());
 
-        // A sink whose channel count never reached us is not mono — it is unknown, and refusing it
-        // is what made the engine report "no usable output" on a perfectly ordinary desktop.
+        // A sink whose channel count never reached us is not mono — it is unknown, and runs as
+        // stereo until the node's info says what it is.
         let unknown = DeviceInfo {
             channels: 0,
             ..alc.clone()
         };
         assert!(
             !unknown.is_mono(),
-            "an unknown channel count must not be refused"
+            "an unknown channel count is not a known one"
         );
         assert!(unknown.channels_unknown());
         assert_eq!(
@@ -1328,11 +1371,12 @@ mod tests {
             channels: 1,
             ..alc.clone()
         };
-        assert!(
-            real_mono.is_mono(),
-            "a device that says it is mono is still refused"
+        assert!(real_mono.is_mono(), "a device that says it is mono is");
+        assert_eq!(
+            real_mono.clamped_channels(),
+            MIN_CHANNELS,
+            "and it runs a stereo pair that its adapter down-mixes"
         );
-        assert!(real_mono.is_refused_mono());
         assert_eq!(alc.clamped_channels(), 2);
     }
 
@@ -1366,10 +1410,6 @@ mod tests {
     fn a_mono_microphone_is_an_input_that_runs_as_stereo() {
         let mono = source("mono-mic", 1);
         assert!(mono.is_mono(), "it does say it is mono");
-        assert!(
-            !mono.is_refused_mono(),
-            "but the Windows mono bug was a playback bug; a capture device is not refused"
-        );
         assert_eq!(
             mono.clamped_channels(),
             MIN_CHANNELS,
@@ -1380,6 +1420,34 @@ mod tests {
                 .resized(mono.clamped_channels())
                 .to_property_value(),
             "FL,FR"
+        );
+    }
+
+    #[test]
+    fn a_mono_sink_is_an_output_that_runs_as_stereo_like_a_mono_microphone() {
+        let mono = sink("mono-headset", 1);
+        assert!(mono.is_mono());
+        assert_eq!(mono.positions.to_property_value(), "MONO");
+        assert_eq!(
+            mono.clamped_channels(),
+            MIN_CHANNELS,
+            "NODE 1 stays stereo; the playback stream's adapter down-mixes into the headset"
+        );
+        assert_eq!(
+            mono.positions
+                .resized(mono.clamped_channels())
+                .to_property_value(),
+            "FL,FR",
+            "the pair gets the stereo layout, not a two-slot MONO"
+        );
+
+        // Whether the headset's info has arrived yet or not, the pair it wants is the same one, so
+        // the info arriving is never a reason to rebuild a pair that is already playing.
+        let unknown = sink("mono-headset", 0);
+        assert_eq!(unknown.clamped_channels(), mono.clamped_channels());
+        assert_eq!(
+            unknown.positions.resized(unknown.clamped_channels()),
+            mono.positions.resized(mono.clamped_channels())
         );
     }
 
@@ -1662,6 +1730,231 @@ mod tests {
     }
 
     #[test]
+    fn a_bluetooth_headset_in_its_call_profile_parses_as_a_one_channel_output() {
+        let devices = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let outputs: Vec<&str> = devices
+            .iter()
+            .filter(|d| d.direction == DeviceDirection::Output)
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(
+            outputs,
+            [LAPTOP_SPEAKERS, HEADSET_SINK],
+            "the headset is listed as an output, not dropped for being mono"
+        );
+
+        let headset = devices
+            .iter()
+            .find(|d| d.name == HEADSET_SINK)
+            .expect("the headset's sink is in the fixture");
+        assert_eq!(headset.object_id, 70);
+        assert_eq!(headset.description, "Test Headset");
+        assert_eq!(headset.channels, 1);
+        assert!(headset.is_mono());
+        assert_eq!(headset.positions.to_property_value(), "MONO");
+        assert!(headset.bluez_headset);
+        assert_eq!(headset.form_factor, FormFactor::Headset);
+        assert_eq!(
+            headset.native_rate(),
+            Some(16_000.0),
+            "mSBC, the call profile's wide band"
+        );
+
+        // What the output lane builds for it: a stereo NODE 1, which the playback stream's adapter
+        // down-mixes into the one SCO channel.
+        assert_eq!(headset.clamped_channels(), 2);
+        assert_eq!(
+            headset
+                .positions
+                .resized(headset.clamped_channels())
+                .to_property_value(),
+            "FL,FR"
+        );
+
+        // And the GUI is told it is the default, which on this graph it is.
+        let entries = default_metadata_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let default_sink = entries
+            .iter()
+            .find(|(k, _)| k == default_key(DeviceDirection::Output))
+            .and_then(|(_, v)| parse_default_node_name(v));
+        assert_eq!(default_sink.as_deref(), Some(HEADSET_SINK));
+        let shown = headset.to_audio_device(default_sink.as_deref());
+        assert!(shown.is_default);
+        assert_eq!(shown.direction, DeviceDirection::Output);
+        assert_eq!(shown.form_factor, "headset");
+    }
+
+    #[test]
+    fn the_rules_take_a_headset_in_its_call_profile_as_they_would_a_stereo_output() {
+        let devices = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let output =
+            |current_default: Option<&str>, previous: &[String], memory: &SelectionMemory| {
+                choose_output(&devices, "fxsound_sink", current_default, previous, memory)
+                    .expect("an output target")
+            };
+
+        // 2 — the first run adopts the session default, which is the headset.
+        let first = output(Some(HEADSET_SINK), &[], &SelectionMemory::default());
+        assert_eq!(first.target, HEADSET_SINK);
+
+        // 4 — the user picked it while the speakers are the session default.
+        let picked = output(
+            Some(LAPTOP_SPEAKERS),
+            &[],
+            &SelectionMemory {
+                most_recent_default: LAPTOP_SPEAKERS.into(),
+                user_selected: HEADSET_SINK.into(),
+                ..SelectionMemory::default()
+            },
+        );
+        assert_eq!(picked.target, HEADSET_SINK);
+
+        // 5 — it connected, straight into its call profile, while FxSound was the default.
+        let speakers_only = [LAPTOP_SPEAKERS.to_owned()];
+        let at_our_default = SelectionMemory {
+            most_recent_default: LAPTOP_SPEAKERS.into(),
+            most_recent_playback: LAPTOP_SPEAKERS.into(),
+            ..SelectionMemory::default()
+        };
+        let connected = output(Some("fxsound_sink"), &speakers_only, &at_our_default);
+        assert_eq!(connected.target, HEADSET_SINK);
+        assert!(connected.write_previous_default);
+
+        // 6 — the session default moved to it.
+        let followed = output(Some(HEADSET_SINK), &[], &at_our_default);
+        assert_eq!(followed.target, HEADSET_SINK);
+    }
+
+    #[test]
+    fn a_headset_that_comes_back_mono_under_the_same_name_keeps_the_output_lane() {
+        // Something starts recording from the headset: WirePlumber switches it from A2DP to its
+        // call profile, which removes `bluez_output.….1` and adds it back under the same name with
+        // one channel. The previous enumeration is the A2DP graph — the same two names.
+        let devices = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let previous = vec![LAPTOP_SPEAKERS.to_owned(), HEADSET_SINK.to_owned()];
+        let memory = SelectionMemory {
+            original_default: LAPTOP_SPEAKERS.into(),
+            most_recent_default: HEADSET_SINK.into(),
+            prior_default: LAPTOP_SPEAKERS.into(),
+            most_recent_playback: HEADSET_SINK.into(),
+            user_selected: String::new(),
+        };
+        let selection = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &previous,
+            &memory,
+        )
+        .expect("the headset is still a target; Windows answered -58 here");
+        assert_eq!(
+            selection.target, HEADSET_SINK,
+            "the music stays in the headset for the call instead of moving to the speakers"
+        );
+        assert!(
+            !selection.write_previous_default,
+            "a device back under its own name within the same run of the rules is not a new one \
+             (rule 7, not rule 5)"
+        );
+
+        // Nor does its new shape ask for a different pair: the stereo pair built for A2DP is the
+        // pair the call profile wants, so the lane can keep the nodes it has.
+        let headset = devices
+            .iter()
+            .find(|d| d.name == HEADSET_SINK)
+            .expect("the headset's sink is in the fixture");
+        let on_a2dp = DeviceInfo {
+            channels: 2,
+            positions: ChannelMap::default_for(2),
+            bluez_headset: false,
+            ..headset.clone()
+        };
+        assert_eq!(on_a2dp.clamped_channels(), headset.clamped_channels());
+        assert_eq!(
+            on_a2dp.positions.resized(on_a2dp.clamped_channels()),
+            headset.positions.resized(headset.clamped_channels())
+        );
+    }
+
+    #[test]
+    fn a_headset_whose_removal_had_a_run_of_its_own_comes_back_as_new_to_the_same_target() {
+        // The same profile switch, slow enough to straddle two supervisor ticks: one run of the
+        // rules sees the headset gone, the next sees it back. The engine replaces `previous_names`
+        // after every run, so the second one no longer remembers the name.
+        let devices = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let without_headset: Vec<DeviceInfo> = devices
+            .iter()
+            .filter(|d| d.name != HEADSET_SINK)
+            .cloned()
+            .collect();
+        let before = SelectionMemory {
+            original_default: LAPTOP_SPEAKERS.into(),
+            most_recent_default: HEADSET_SINK.into(),
+            prior_default: LAPTOP_SPEAKERS.into(),
+            most_recent_playback: HEADSET_SINK.into(),
+            user_selected: String::new(),
+        };
+        let on_a2dp = vec![LAPTOP_SPEAKERS.to_owned(), HEADSET_SINK.to_owned()];
+
+        // The removal's run: the speakers are all there is (rule 3), and nothing new was added.
+        let mut memory = before.clone();
+        let gone = choose_output(
+            &without_headset,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &on_a2dp,
+            &memory,
+        )
+        .expect("the speakers are still a target");
+        assert_eq!(gone.target, LAPTOP_SPEAKERS);
+        assert!(!gone.write_previous_default, "rule 3 writes no default");
+        commit(&mut memory, &gone);
+        assert_eq!(memory.most_recent_playback, LAPTOP_SPEAKERS);
+
+        // The re-add's run: the headset is missing from the names the last run saw, so rule 5
+        // takes it as new — and picks the device rule 7 would have picked in a single run.
+        let speakers_only = vec![LAPTOP_SPEAKERS.to_owned()];
+        let back = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &speakers_only,
+            &memory,
+        )
+        .expect("the headset is a target again");
+        assert_eq!(
+            back.target, HEADSET_SINK,
+            "the music goes back to the headset, the same device either way"
+        );
+        assert!(
+            back.write_previous_default,
+            "a name the last run did not see is a new device to rule 5"
+        );
+        commit(&mut memory, &back);
+
+        // The single-run path leaves the memory it had, the playback slot rewritten in place.
+        let mut in_one_run = before.clone();
+        let kept = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &on_a2dp,
+            &in_one_run,
+        )
+        .expect("the headset is still a target");
+        assert_eq!(kept.target, HEADSET_SINK);
+        commit(&mut in_one_run, &kept);
+
+        // Rule 5 wrote the default slots again, and here they already held what it wrote: the
+        // headset as the most recent default, the speakers played to in between as the prior one.
+        assert_eq!(
+            memory, in_one_run,
+            "two runs or one, the headset ends up remembered the same way"
+        );
+        assert_eq!(in_one_run, before);
+    }
+
+    #[test]
     fn no_sinks_at_all_is_the_no_output_devices_state() {
         let memory = SelectionMemory::default();
         assert_eq!(
@@ -1740,49 +2033,36 @@ mod tests {
     }
 
     #[test]
-    fn a_mono_microphone_is_accepted_where_a_mono_sink_would_be_refused() {
+    fn a_mono_device_is_accepted_in_either_direction() {
         let memory = SelectionMemory {
-            most_recent_default: "mono-mic".into(),
-            user_selected: "mono-mic".into(),
+            most_recent_default: "mono".into(),
+            user_selected: "mono".into(),
             ..SelectionMemory::default()
         };
-        let devices = [source("mono-mic", 1), source("stereo-mic", 2)];
-        let selection = choose_device(
-            &devices,
-            DeviceDirection::Input,
-            "fxsound_source",
-            Some("mono-mic"),
-            &[],
-            &memory,
-        )
-        .expect("a mono microphone is a perfectly good input");
-        assert_eq!(selection.target, "mono-mic");
+        let sources = [source("mono", 1), source("stereo", 2)];
+        let sinks = [sink("mono", 1), sink("stereo", 2)];
+        for (devices, direction, ours) in [
+            (&sources, DeviceDirection::Input, "fxsound_source"),
+            (&sinks, DeviceDirection::Output, "fxsound_sink"),
+        ] {
+            let selection = choose_device(devices, direction, ours, Some("mono"), &[], &memory)
+                .expect(
+                    "a mono device is a perfectly good target; on Windows the output side was -58",
+                );
+            assert_eq!(selection.target, "mono", "{direction:?}");
 
-        // The same shape on the output side is the -58 state.
-        let sinks = [sink("mono-mic", 1), sink("stereo-mic", 2)];
-        assert_eq!(
-            choose_output(&sinks, "fxsound_sink", Some("mono-mic"), &[], &memory),
-            Err(AudioError::AskUserSelectOutput)
-        );
-
-        // Rule 5, too: a newly plugged mono microphone is taken, a newly plugged mono sink is not.
-        let previous = vec!["stereo-mic".to_owned()];
-        let fresh = SelectionMemory {
-            most_recent_default: "stereo-mic".into(),
-            most_recent_playback: "stereo-mic".into(),
-            ..SelectionMemory::default()
-        };
-        let plugged = choose_device(
-            &devices,
-            DeviceDirection::Input,
-            "fxsound_source",
-            Some("fxsound_source"),
-            &previous,
-            &fresh,
-        )
-        .expect("a target");
-        assert_eq!(plugged.target, "mono-mic");
-        assert!(plugged.write_previous_default);
+            // Rule 5, too: a newly plugged mono device is taken, whichever way it faces.
+            let previous = vec!["stereo".to_owned()];
+            let fresh = SelectionMemory {
+                most_recent_default: "stereo".into(),
+                most_recent_playback: "stereo".into(),
+                ..SelectionMemory::default()
+            };
+            let plugged = choose_device(devices, direction, ours, Some(ours), &previous, &fresh)
+                .expect("a target");
+            assert_eq!(plugged.target, "mono", "{direction:?}");
+            assert!(plugged.write_previous_default);
+        }
     }
 
     #[test]
@@ -1889,7 +2169,9 @@ mod tests {
     }
 
     #[test]
-    fn a_newly_appeared_mono_sink_is_skipped() {
+    fn a_newly_appeared_mono_sink_is_taken_like_any_other() {
+        // Windows skipped it here (`:202-210`); a Bluetooth headset that connects straight into
+        // its call profile is exactly the device the user just asked for.
         let sinks = [sink("speakers", 2), sink("mono-bt", 1)];
         let previous = vec!["speakers".to_owned()];
         let memory = SelectionMemory {
@@ -1905,7 +2187,160 @@ mod tests {
             &memory,
         )
         .expect("a target");
-        assert_eq!(selection.target, "speakers");
+        assert_eq!(selection.target, "mono-bt");
+        assert!(selection.write_previous_default);
+    }
+
+    #[test]
+    fn a_device_that_arrives_as_another_leaves_is_taken_though_the_count_did_not_grow() {
+        // One batch of registry events: the old DAC's node went, the new one came. Windows only
+        // looked for a new device when the count had grown, so it never saw this one.
+        let sinks = [sink("speakers", 2), sink("new-dac", 2)];
+        let previous = vec!["speakers".to_owned(), "old-dac".to_owned()];
+        let mut memory = SelectionMemory {
+            most_recent_default: "old-dac".into(),
+            most_recent_playback: "old-dac".into(),
+            prior_default: "speakers".into(),
+            ..SelectionMemory::default()
+        };
+        let selection = choose_output(
+            &sinks,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &previous,
+            &memory,
+        )
+        .expect("a target");
+        assert_eq!(
+            selection.target, "new-dac",
+            "rule 7 would have fallen back to the speakers"
+        );
+        assert!(
+            selection.write_previous_default,
+            "a device taken by rule 5 re-dates the remembered defaults, whatever the count did"
+        );
+
+        commit(&mut memory, &selection);
+        assert_eq!(memory.most_recent_playback, "new-dac");
+        assert_eq!(memory.most_recent_default, "new-dac");
+        assert_eq!(memory.prior_default, "old-dac");
+
+        // The same holds for microphones: the rules are the same rules.
+        let sources = [source("internal-mic", 2), source("new-headset", 1)];
+        let previous = vec!["internal-mic".to_owned(), "old-headset".to_owned()];
+        let memory = SelectionMemory {
+            most_recent_default: "old-headset".into(),
+            most_recent_playback: "old-headset".into(),
+            ..SelectionMemory::default()
+        };
+        let selection = choose_device(
+            &sources,
+            DeviceDirection::Input,
+            "fxsound_source",
+            Some("fxsound_source"),
+            &previous,
+            &memory,
+        )
+        .expect("a target");
+        assert_eq!(selection.target, "new-headset");
+    }
+
+    #[test]
+    fn a_device_that_arrives_while_two_leave_is_taken_though_the_count_shrank() {
+        // A dock unplugged and a headset plugged in within the same batch.
+        let sinks = [sink("speakers", 2), sink("headset", 2)];
+        let previous = vec![
+            "speakers".to_owned(),
+            "dock-hdmi".to_owned(),
+            "dock-analog".to_owned(),
+        ];
+        let memory = SelectionMemory {
+            most_recent_default: "dock-analog".into(),
+            most_recent_playback: "dock-analog".into(),
+            ..SelectionMemory::default()
+        };
+        let selection = choose_output(
+            &sinks,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &previous,
+            &memory,
+        )
+        .expect("a target");
+        assert_eq!(selection.target, "headset");
+        assert!(selection.write_previous_default);
+    }
+
+    #[test]
+    fn when_several_devices_arrive_at_once_the_first_new_one_in_the_graph_is_taken() {
+        // `:196`: "if more than one device was added this will set playback to the first device
+        // found" — found in the graph's order, not the previous list's.
+        let sinks = [
+            sink("speakers", 2),
+            sink("second-new", 2),
+            sink("first-new", 2),
+        ];
+        let previous = vec!["speakers".to_owned(), "gone".to_owned()];
+        let selection = choose_output(
+            &sinks,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &previous,
+            &SelectionMemory {
+                most_recent_default: "speakers".into(),
+                most_recent_playback: "speakers".into(),
+                ..SelectionMemory::default()
+            },
+        )
+        .expect("a target");
+        assert_eq!(selection.target, "second-new");
+    }
+
+    #[test]
+    fn a_device_leaving_is_not_mistaken_for_one_arriving() {
+        let sinks = [sink("a", 2), sink("b", 2)];
+        let previous = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let selection = choose_output(
+            &sinks,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &previous,
+            &SelectionMemory {
+                most_recent_default: "b".into(),
+                most_recent_playback: "c".into(),
+                ..SelectionMemory::default()
+            },
+        )
+        .expect("a target");
+        assert_eq!(
+            selection.target, "b",
+            "nothing is new, so rule 7 walks on from the device that left"
+        );
+        assert!(
+            !selection.write_previous_default,
+            "and a device found by rule 7 re-dates nothing"
+        );
+    }
+
+    #[test]
+    fn nothing_counts_as_newly_arrived_without_a_previous_enumeration() {
+        // The first run of a lane, and the first after it is switched on again: every device is
+        // "not in the previous list", and none of them may be taken for being new.
+        let sinks = [sink("a", 2), sink("b", 2)];
+        let selection = choose_output(
+            &sinks,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &[],
+            &SelectionMemory {
+                most_recent_default: "b".into(),
+                most_recent_playback: "b".into(),
+                ..SelectionMemory::default()
+            },
+        )
+        .expect("a target");
+        assert_eq!(selection.target, "b");
+        assert!(!selection.write_previous_default);
     }
 
     #[test]
@@ -1977,22 +2412,24 @@ mod tests {
     }
 
     #[test]
-    fn a_mono_target_with_a_stereo_alternative_asks_the_user_to_choose() {
+    fn a_mono_output_the_user_picked_is_used_though_a_stereo_one_is_there() {
+        // Windows answered -58 here, SND_DEVICES_ASK_USER_SELECT_PLAYBACK_DEVICE: asked the user
+        // to pick an output when the user had just picked one.
         let sinks = [sink("mono-bt", 1), sink("speakers", 2)];
         let memory = SelectionMemory {
             most_recent_default: "mono-bt".into(),
             user_selected: "mono-bt".into(),
             ..SelectionMemory::default()
         };
-        assert_eq!(
-            choose_output(&sinks, "fxsound_sink", Some("mono-bt"), &[], &memory),
-            Err(AudioError::AskUserSelectOutput),
-            "this is the -58 SND_DEVICES_ASK_USER_SELECT_PLAYBACK_DEVICE state"
-        );
+        let selection =
+            choose_output(&sinks, "fxsound_sink", Some("mono-bt"), &[], &memory).expect("a target");
+        assert_eq!(selection.target, "mono-bt");
     }
 
     #[test]
-    fn a_mono_target_falls_back_to_the_last_stereo_device_we_used() {
+    fn a_mono_output_is_not_swapped_for_the_last_stereo_device_we_used() {
+        // Windows retried `most_recent_playback` for a mono target (`:300-302`), which moved the
+        // music out of a headset in its call profile and onto the speakers mid-call.
         let sinks = [sink("mono-bt", 1), sink("speakers", 2)];
         let memory = SelectionMemory {
             most_recent_default: "mono-bt".into(),
@@ -2002,23 +2439,33 @@ mod tests {
         };
         let selection =
             choose_output(&sinks, "fxsound_sink", Some("mono-bt"), &[], &memory).expect("a target");
-        assert_eq!(selection.target, "speakers");
+        assert_eq!(selection.target, "mono-bt");
     }
 
     #[test]
-    fn only_mono_sinks_present_is_the_no_valid_output_state() {
-        // Both sinks must *say* they are mono. A channel count of 0 means "the node never told
-        // us", which is the normal case for a registry global and is not a reason to refuse it.
+    fn a_graph_of_nothing_but_mono_sinks_still_has_an_output() {
+        // Windows answered -57 here, SND_DEVICES_NO_VALID_PLAYBACK_DEVICE, and played nothing.
         let sinks = [sink("mono-a", 1), sink("mono-b", 1)];
         let memory = SelectionMemory {
             most_recent_default: "mono-a".into(),
             ..SelectionMemory::default()
         };
-        assert_eq!(
-            choose_output(&sinks, "fxsound_sink", Some("mono-a"), &[], &memory),
-            Err(AudioError::NoValidOutput),
-            "this is the -57 SND_DEVICES_NO_VALID_PLAYBACK_DEVICE state"
-        );
+        let selection =
+            choose_output(&sinks, "fxsound_sink", Some("mono-a"), &[], &memory).expect("a target");
+        assert_eq!(selection.target, "mono-a");
+        assert!(selection.write_previous_default, "rule 6, as for any sink");
+
+        // Rule 3 as well: the only device there is, is the device, whatever its channel count.
+        let only = [sink("mono-only", 1)];
+        let selection = choose_output(
+            &only,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &[],
+            &SelectionMemory::default(),
+        )
+        .expect("a target");
+        assert_eq!(selection.target, "mono-only");
     }
 
     #[test]

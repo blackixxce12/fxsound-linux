@@ -433,10 +433,41 @@ impl PrivateGraph {
     /// client that then leaves, so it lingers. `None` when the plugin is not installed and the node
     /// never appears.
     pub(crate) fn add_tone(&self, name: &str) -> Option<()> {
-        let props = format!(
-            "{{ factory.name = audiotestsrc node.name = {name} node.description = \"Test Tone\" \
-             media.class = Audio/Source object.linger = true }}"
-        );
+        self.add_adapter(
+            name,
+            &format!(
+                "factory.name = audiotestsrc node.name = {name} node.description = \"Test Tone\" \
+                 media.class = Audio/Source"
+            ),
+        )
+    }
+
+    /// Add a one-channel sink while the engine runs: a null sink laid out `MONO`, which is what a
+    /// Bluetooth headset in its call profile or a mono USB headset looks like to the rules. The
+    /// graph's own devices are all stereo or better, so a test that wants a mono one adds it — and
+    /// adding it later is also how it arrives as a *new* device. `None` when it never appears.
+    ///
+    /// It gets the `priority.driver` WirePlumber gives a Bluetooth sink (`name-node.lua`), and not
+    /// only for likeness. Left at 0 it ties with the tone, which is a driver too and was created
+    /// first; with two drivers of equal priority joined through our pair, this daemon was seen to
+    /// stop the whole graph after half a second — a runtime-made stereo null sink the same, the
+    /// graph's own `t_stereo` not. No session builds that graph: every real device carries a
+    /// priority of its own.
+    pub(crate) fn add_mono_sink(&self, name: &str) -> Option<()> {
+        self.add_adapter(
+            name,
+            &format!(
+                "factory.name = support.null-audio-sink node.name = {name} \
+                 node.description = \"Test Mono Out\" media.class = Audio/Sink \
+                 priority.driver = 1010 audio.channels = 1 audio.position = [ MONO ]"
+            ),
+        )
+    }
+
+    /// Create an adapter node with `props`, by a client that then leaves, so it lingers — and wait
+    /// until the server lists it under `name`.
+    fn add_adapter(&self, name: &str, props: &str) -> Option<()> {
+        let props = format!("{{ {props} object.linger = true }}");
         // What `pw-cli` exits with says less than whether the node turns up, so only that is asked.
         let _ = self.tool("pw-cli", &["create-node", "adapter", &props]);
         // The same patience as every other wait here: a slow runner that is merely late to show
@@ -444,6 +475,23 @@ impl PrivateGraph {
         let deadline = Instant::now() + PATIENCE;
         while Instant::now() < deadline {
             if self.node_id(name).is_some() {
+                return Some(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        None
+    }
+
+    /// Take the node called `name` out of the graph, the way a device goes when it is unplugged,
+    /// and wait until the server no longer lists it. `None` when it was not there to take, or
+    /// never went.
+    pub(crate) fn remove_node(&self, name: &str) -> Option<()> {
+        let id = self.node_id(name)?.to_string();
+        // As for creating one: whether it goes is the answer, not what `pw-cli` exits with.
+        let _ = self.tool("pw-cli", &["destroy", &id]);
+        let deadline = Instant::now() + PATIENCE;
+        while Instant::now() < deadline {
+            if self.node_id(name).is_none() {
                 return Some(());
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -1691,6 +1739,247 @@ fn a_tone_driven_through_each_lane_reaches_that_lane_and_no_other() {
             direction.key()
         );
     }
+    handle.shutdown();
+}
+
+#[test]
+fn a_mono_sink_that_appears_is_played_to_through_a_stereo_pair_its_adapter_down_mixes() {
+    // A Bluetooth headset that has just switched to its call profile, as the output lane meets
+    // it: a new output with one channel. Windows refused such a device (`sndDevices.h:32-39`), and
+    // so did this port — the moment the sink's info said "one channel", the next run of the rules
+    // tore the lane down and the music went to the speakers for the length of the call.
+    let Some(graph) = PrivateGraph::start("mono") else {
+        return;
+    };
+    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+        .into_iter()
+        .find(|tool| !installed(tool))
+    {
+        skip(&format!(
+            "{missing} is not available, so no mono sink was played to"
+        ));
+        return;
+    }
+    if graph.add_tone("t_tone").is_none() {
+        skip(concat!(
+            "the tone never appeared (is audiotestsrc installed?), ",
+            "so no mono sink was played to"
+        ));
+        return;
+    }
+    let mut handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    said.until(
+        &handle,
+        "a device list",
+        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
+    );
+    // The output lane attaches by itself, to one of the graph's stereo sinks. Let it settle there,
+    // so that the rules have run over every device the graph started with.
+    assert!(
+        said.heard(&handle, "the output lane attached", |m| matches!(
+            m,
+            AudioToUi::Attached {
+                direction: DeviceDirection::Output,
+                node_name: Some(_)
+            }
+        )),
+        "the output lane never attached to anything"
+    );
+    said.settle(&handle);
+
+    // The mono sink arrives. Rule 5 takes it — it is new — whatever its channel count.
+    let arrived = said.0.len();
+    assert!(
+        graph.add_mono_sink("t_mono").is_some(),
+        "the mono sink never appeared"
+    );
+    assert!(
+        said.attached(&handle, DeviceDirection::Output, Some("t_mono")),
+        "the output lane should move to the sink that just appeared, mono as it is"
+    );
+
+    // Its info — one channel — has had time to arrive; now give the rules a reason to run again,
+    // which is where the refusal used to strike: another output goes away.
+    said.settle(&handle);
+    assert!(
+        graph.remove_node("t_71").is_some(),
+        "the 7.1 sink could not be taken out of the graph"
+    );
+    assert!(
+        said.heard_since(&handle, arrived, "a device list without t_71", |m| {
+            matches!(m, AudioToUi::Devices(d) if !d.iter().any(|d| d.name == "t_71"))
+        }),
+        "the engine never noticed the 7.1 sink go"
+    );
+    said.settle(&handle);
+    let since = &said.0[arrived..];
+    let moves: Vec<Option<&str>> = since
+        .iter()
+        .filter_map(|message| match message {
+            AudioToUi::Attached {
+                direction: DeviceDirection::Output,
+                node_name,
+            } => Some(node_name.as_deref()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        moves,
+        [Some("t_mono")],
+        "the output lane should have moved to the mono sink once and stayed there"
+    );
+    let complaints: Vec<&AudioToUi> = since
+        .iter()
+        .filter(|message| {
+            matches!(
+                message,
+                AudioToUi::Error {
+                    direction: Some(DeviceDirection::Output) | None,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        complaints.is_empty(),
+        "a mono sink is not an error: {complaints:?}"
+    );
+    let listed = said
+        .0
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AudioToUi::Devices(devices) => Some(devices),
+            _ => None,
+        })
+        .expect("heard a moment ago");
+    assert!(
+        listed
+            .iter()
+            .any(|d| d.name == "t_mono" && d.direction == DeviceDirection::Output),
+        "the mono sink should be offered as an output: {listed:?}"
+    );
+
+    // The pair it built: NODE 1 stays stereo, and NODE 2 declares the same stereo — the ring
+    // between them is read at the stride it is written at — aimed at the mono sink, with
+    // remixing left on for its adapter to down-mix.
+    for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME] {
+        assert_eq!(
+            graph.node_format(node).flatten(),
+            Some((48_000, 2)),
+            "{node} should run a stereo pair in front of the mono sink"
+        );
+    }
+    assert_eq!(
+        graph.node_prop(OUTPUT_NODE_NAME, "target.object").flatten(),
+        Some("t_mono".to_owned())
+    );
+    assert_eq!(
+        graph
+            .node_prop(OUTPUT_NODE_NAME, "stream.dont-remix")
+            .flatten(),
+        Some("false".to_owned()),
+        "the playback stream must let its adapter remix, or the session manager would not \
+         set its ports up at the sink's layout"
+    );
+
+    // Now play through it. The playback stream's ports are set up at the sink's own one-channel
+    // layout, as WirePlumber sets up a stream that may be remixed, so its adapter turns the
+    // stereo pair into one channel. What comes out of the sink is heard on the other side of it:
+    // the input lane records the sink's monitor, on a microphone it was attached to only to have
+    // a capture stream to link.
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_mic".to_owned(),
+        direction: DeviceDirection::Input,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
+    assert_eq!(
+        graph
+            .settles_on(&[
+                SINK_NODE_NAME,
+                OUTPUT_NODE_NAME,
+                CAPTURE_NODE_NAME,
+                SOURCE_NODE_NAME
+            ])
+            .map(|settled| settled.map(drop)),
+        Some(Ok(())),
+        "both pairs should be in the graph"
+    );
+    for (node, direction, positions) in [
+        ("t_tone", "Output", &["MONO"][..]),
+        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+        (OUTPUT_NODE_NAME, "Output", &["MONO"][..]),
+        (CAPTURE_NODE_NAME, "Input", &["MONO"][..]),
+    ] {
+        assert!(
+            graph.configure_ports(node, direction, positions).is_some(),
+            "{node} was not given ports"
+        );
+    }
+    assert!(
+        graph
+            .configure_monitored_ports("t_mono", &["MONO"])
+            .is_some(),
+        "the mono sink was not given a port and a monitor"
+    );
+    assert_eq!(
+        graph
+            .ports(OUTPUT_NODE_NAME, "out")
+            .map(|ports| ports.len()),
+        Some(1),
+        "the stereo playback stream should come out of its adapter as one channel"
+    );
+    assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_mono"));
+    assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
+    assert_eq!(
+        graph.runs_until("t_mono", true).map(drop),
+        Ok(()),
+        "the mono sink should run while something plays into FxSound"
+    );
+    assert!(
+        meters_until(&mut handle, DeviceDirection::Output, |m| {
+            m.peak_left > 0.1 && m.peak_right > 0.1
+        })
+        .is_some(),
+        "the tone never reached the output lane's meters"
+    );
+    // The input lane's meters read its signal before its chain, so what they show is what the
+    // mono sink was handed.
+    assert!(graph.link_nodes("t_mono", CAPTURE_NODE_NAME));
+    assert!(
+        meters_until(&mut handle, DeviceDirection::Input, |m| m.input_peak > 0.1).is_some(),
+        "the tone went into the stereo pair and never came out of the mono sink"
+    );
+
+    said.settle(&handle);
+    let output = said
+        .0
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AudioToUi::Status {
+                direction: DeviceDirection::Output,
+                status,
+            } => Some(*status),
+            _ => None,
+        })
+        .expect("a lane that played has reported its status");
+    assert_eq!(
+        (output.sample_rate, output.channels),
+        (48_000, 2),
+        "the output lane runs a stereo pair"
+    );
+    assert_eq!(
+        output.format_mismatches, 0,
+        "the two nodes of the pair disagreed about their format"
+    );
+    assert_eq!(
+        said.attachments(DeviceDirection::Output).last(),
+        Some(&Some("t_mono".to_owned())),
+        "playing moved the output lane off the mono sink"
+    );
     handle.shutdown();
 }
 

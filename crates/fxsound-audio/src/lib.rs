@@ -130,7 +130,7 @@
 //!   `docs/spec/12-audio-io.md` §19.7.
 //! * **It never resamples.** The zero-order-hold upsampler at `sndDevicesDoPlayback.cpp:79-89` is
 //!   not ported; PipeWire's sinc resampler handles any rate mismatch — and its channel mixer turns
-//!   a mono microphone into the stereo pair the DSP runs on.
+//!   a mono microphone into the stereo pair the DSP runs on, and that pair into a mono headset.
 //! * **It never wins the default implicitly.** `priority.session` is deliberately low, so a
 //!   WirePlumber that has never been told a default picks real hardware, not us; the default is
 //!   taken only through the explicit metadata write above, which is also the only thing that can
@@ -330,6 +330,12 @@ pub const START_TIMEOUT: Duration = Duration::from_millis(1500);
 ///
 /// The comments give the `sndDevices.h:74-143` code each variant replaces, so
 /// `FxController`'s existing error branches port without re-deriving the mapping.
+///
+/// Two of those states have no variant: `-57 SND_DEVICES_NO_VALID_PLAYBACK_DEVICE` ("no stereo
+/// output") and `-58 SND_DEVICES_ASK_USER_SELECT_PLAYBACK_DEVICE` ("the chosen output is mono,
+/// pick another"). Both existed only to refuse mono playback devices, a workaround for a Windows
+/// driver bug (`sndDevices.h:32-39`); PipeWire drives a mono device perfectly well, so the port
+/// attaches to one instead (`docs/spec/12-audio-io.md`, open question 6).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AudioError {
     /// No `Audio/Sink` node exists other than ours. ≡ `209 SND_DEVICES_NO_REAL_DEVICES_FOUND`.
@@ -345,14 +351,6 @@ pub enum AudioError {
     /// The device is present but refused the stream. ≡ `-54` plus `playbackDeviceIsUnavailable`.
     #[error("audio device is unavailable")]
     DeviceUnavailable,
-    /// Every candidate is mono. ≡ `-57 SND_DEVICES_NO_VALID_PLAYBACK_DEVICE`. Outputs only: a mono
-    /// microphone is accepted.
-    #[error("no usable (stereo or better) output")]
-    NoValidOutput,
-    /// The chosen device is mono but a usable one exists.
-    /// ≡ `-58 SND_DEVICES_ASK_USER_SELECT_PLAYBACK_DEVICE`.
-    #[error("please choose an output device")]
-    AskUserSelectOutput,
     /// PipeWire could not be reached at all — no socket, no `XDG_RUNTIME_DIR`, or the connection
     /// was refused. There is no Windows analogue: the driver was always present.
     #[error("PipeWire is not available: {0}")]
