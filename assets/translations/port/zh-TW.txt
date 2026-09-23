@@ -84,3 +84,5 @@ countries: Taiwan
 "Follow the system's default device" = "跟隨系統預設裝置"
 "Input Device Preference" = "輸入裝置設定"
 "Makeup Gain" = "補償增益"
+"Output Presets" = "輸出預設"
+"Input Presets" = "輸入預設"

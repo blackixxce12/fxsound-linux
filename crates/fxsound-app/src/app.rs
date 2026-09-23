@@ -576,6 +576,11 @@ pub struct App {
     /// The system is asleep, or about to be: logind said `PrepareForSleep(true)` and has not said
     /// `false` since (U13, [`App::system_sleeping`]). Both lanes' snapshots carry it as `mute`.
     sleeping: bool,
+    /// The shown lane's meters as the last poll read them, and whether they differed from the
+    /// poll's before: the window paints at sixty a second only while they move (0.4.0 design
+    /// §12, [`App::meters_moved`]).
+    shown_meters: Meters,
+    meters_moved: bool,
 }
 
 impl App {
@@ -583,8 +588,12 @@ impl App {
     ///
     /// A missing sound server is not fatal: the UI comes up, says so, and keeps working, which is
     /// far more useful than refusing to start.
+    ///
+    /// What the audio thread says wakes the GUI thread through `waker` (0.4.0 design §12): the
+    /// engine's notifications are carried to the controller by a thread of their own that wakes
+    /// it for each ([`crate::wake::forward`]).
     #[must_use]
-    pub fn new(engine: Option<EngineHandle>) -> Self {
+    pub fn new(engine: Option<EngineHandle>, waker: &crate::wake::Waker) -> Self {
         let settings = Settings::load();
         let mut presets = PresetStore::with_default_dirs();
         presets.rescan();
@@ -595,7 +604,7 @@ impl App {
             settings,
             presets,
             voice_presets,
-            engine.map(AudioLink::Engine),
+            engine.map(|engine| AudioLink::engine(engine, waker)),
             notifier,
             true,
         )
@@ -665,6 +674,8 @@ impl App {
             calibration: None,
             priority_sent: [None, None],
             sleeping: false,
+            shown_meters: Meters::default(),
+            meters_moved: false,
         };
 
         // What the settings file asks of the audio thread before it does anything else. See
@@ -734,6 +745,42 @@ impl App {
         self.engine.is_some()
     }
 
+    /// Whether the last poll found the shown lane's meters different from the poll before it:
+    /// sound moving through the visualizer. The window paints at sixty a second only while they
+    /// move and the visualizer has something to show (0.4.0 design §12).
+    #[must_use]
+    pub const fn meters_moved(&self) -> bool {
+        self.meters_moved
+    }
+
+    /// When the controller next has something to do that nothing will wake it for: the notice to
+    /// take down after its four seconds, the per-device volumes to write. `None` while there is
+    /// nothing of the kind; the pump's keepalive covers what is left (0.4.0 design §12).
+    ///
+    /// A notice written straight into [`UiState::notification`] has no clock until the next poll
+    /// stamps it, so it asks for that poll now.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let notice = self
+            .state
+            .notification
+            .as_ref()
+            .map(|text| match &self.state.notice_clock {
+                Some((stamped, since)) if stamped == text => {
+                    *since + fxsound_ui::state::NOTICE_LIFETIME
+                }
+                _ => Instant::now(),
+            });
+        notice.into_iter().chain(self.volume_save_due).min()
+    }
+
+    /// The channel the audio thread's notifications arrive on, for the headless pump to wait on
+    /// — not to read from: [`App::poll_audio`] does that. `None` without an engine.
+    #[must_use]
+    pub fn audio_notifications(&self) -> Option<&crossbeam_channel::Receiver<AudioToUi>> {
+        self.engine.as_ref().and_then(AudioLink::notifications)
+    }
+
     /// Pull everything the audio thread has published. Call once per frame, before rendering.
     pub fn poll_audio(&mut self) {
         self.poll_audio_at(Instant::now());
@@ -752,6 +799,7 @@ impl App {
             self.settings_dirty = true;
         }
 
+        self.meters_moved = false;
         let Some(engine) = self.engine.as_mut() else {
             // Nothing will ever flow: a run that was started waits out its wake-up and says so.
             self.drive_calibration(now, &Meters::default());
@@ -764,17 +812,29 @@ impl App {
         let microphone = engine.meters(DeviceDirection::Input);
         let was_playing = self.state.audio_active;
         show_meters(&mut self.state, &shown, &microphone);
-        // The tray's processing icon is the logo's and the visualizer's "sound is playing", which
-        // no event names: redrawn when it starts or stops, not on every buffer.
-        if self.state.audio_active != was_playing {
-            self.tray_stale = true;
-        }
+        self.meters_moved = shown != self.shown_meters;
+        self.shown_meters = shown;
 
         // Drained first and acted on after, in arrival order, once the engine is no longer
         // borrowed: a device list and a pick call back into the whole controller.
         let messages: Vec<AudioToUi> = std::iter::from_fn(|| engine.try_recv()).collect();
         for message in messages {
             self.receive(message);
+        }
+
+        // Sound is playing on the shown lane only while the lane is running, as its own status
+        // says. The meters come from inside the lane's process callback, so a lane whose node
+        // went to sleep — its last client gone in the middle of a song — leaves its last meters
+        // standing, `active` and all: the visualizer froze on its last frame and was repainted
+        // thirty times a second for as long as nothing played, and the logo and the tray's icon
+        // stayed lit. After the messages, so a status that says the lane started counts at once.
+        if !lane_running(&self.state, self.state.direction) {
+            self.state.audio_active = false;
+        }
+        // The tray's processing icon is the logo's and the visualizer's "sound is playing", which
+        // no event names: redrawn when it starts or stops, not on every buffer.
+        if self.state.audio_active != was_playing {
+            self.tray_stale = true;
         }
 
         // After the lists: selecting a device calls back into the whole controller.
@@ -2498,6 +2558,8 @@ impl App {
             calibration: None,
             priority_sent: [None, None],
             sleeping: false,
+            shown_meters: Meters::default(),
+            meters_moved: false,
         };
         app.start_the_stream_here();
         app
@@ -2741,7 +2803,8 @@ impl App {
         self.settings.run_minimized
     }
 
-    /// A fresh mirror of the model for the tray to draw its menu and tooltip from.
+    /// A fresh mirror of the model for the tray to draw its menu and tooltip from: both lanes,
+    /// each with its presets and its device (0.4.0 design §1.4).
     #[must_use]
     pub fn tray_state(&self) -> crate::tray::TrayState {
         crate::tray::TrayState {
@@ -2753,32 +2816,42 @@ impl App {
             processing: self.state.audio_active,
             power_enabled: true,
             theme: self.state.theme,
-            presets: self
-                .state
-                .presets
-                .iter()
-                .map(|p| crate::tray::TrayPreset {
-                    name: p.name.clone(),
-                    factory: p.factory,
-                    modified: p.modified,
-                })
-                .collect(),
-            selected_preset: self.state.selected_preset,
+            output: self.tray_lane(DeviceDirection::Output),
+            input: self.tray_lane(DeviceDirection::Input),
             devices: self
                 .state
                 .devices
                 .iter()
                 .map(|d| crate::tray::TrayDevice {
                     name: d.description.clone(),
-                    // PipeWire sinks this port will render to are stereo or better; the field
-                    // exists so the menu can grey out a mono device, as the original does.
-                    channels: 2,
                     direction: d.direction,
                 })
                 .collect(),
-            selected_device: self.state.selected_device(),
             language: i18n::current(),
-            pixmaps: crate::tray::TrayPixmaps::default(),
+        }
+    }
+
+    /// One lane as the tray draws it: the lane's presets as its picker lists them, whichever lane
+    /// the window is editing, and its device — an index into the same list the tray's devices are.
+    fn tray_lane(&self, lane: DeviceDirection) -> crate::tray::TrayLane {
+        let presets = self.lane_preset_list(lane);
+        let selected_preset = if lane == self.state.direction {
+            self.state.selected_preset
+        } else {
+            self.lane_preset(lane)
+                .and_then(|(name, _)| presets.iter().position(|p| p.name == name))
+        };
+        crate::tray::TrayLane {
+            presets: presets
+                .into_iter()
+                .map(|p| crate::tray::TrayPreset {
+                    name: p.name,
+                    factory: p.factory,
+                    modified: p.modified,
+                })
+                .collect(),
+            selected_preset,
+            device: self.state.selection(lane),
         }
     }
 
@@ -2794,8 +2867,22 @@ impl App {
                     self.handle(&[UiAction::TogglePower]);
                 }
             }
-            TrayCommand::SelectPreset(index) => self.handle(&[UiAction::SelectPreset(index)]),
-            TrayCommand::SelectDevice(index) => self.handle(&[UiAction::SelectDevice(index)]),
+            TrayCommand::SelectPreset { direction, name } => {
+                self.select_lane_preset(direction, &name);
+            }
+            // A pick in the tray is the later word on its lane, as a later command line's is: a
+            // `--output` still waiting for the device list must not take the lane back when the
+            // list comes.
+            TrayCommand::SelectDevice(index) => {
+                if let Some(direction) = self.state.devices.get(index).map(|d| d.direction) {
+                    self.cancel_pending_device(direction);
+                }
+                self.handle(&[UiAction::SelectDevice(index)]);
+            }
+            TrayCommand::Detach(direction) => {
+                self.cancel_pending_device(direction);
+                self.handle(&[UiAction::detach(direction)]);
+            }
             TrayCommand::SetTheme(theme) => {
                 if theme != self.state.theme {
                     self.handle(&[UiAction::ToggleTheme]);
@@ -2805,6 +2892,19 @@ impl App {
             // Handled by the shell.
             TrayCommand::ToggleWindow | TrayCommand::Open | TrayCommand::Exit => {}
         }
+    }
+
+    /// Select `lane`'s preset called `name`, whichever lane the window is editing, and leave the
+    /// window on the lane it was showing — the tray's two preset submenus. Picked as the window's
+    /// list picks one, toast and all; a name the lane does not have (the list changed after the
+    /// menu was drawn) does nothing.
+    fn select_lane_preset(&mut self, lane: DeviceDirection, name: &str) {
+        let edit = self.state.direction;
+        self.show_lane(lane);
+        if let Some(at) = self.state.presets.iter().position(|p| p.name == name) {
+            self.handle(&[UiAction::SelectPreset(at)]);
+        }
+        self.show_lane(edit);
     }
 }
 
@@ -3440,6 +3540,14 @@ fn show_meters(state: &mut UiState, shown: &Meters, microphone: &Meters) {
     state.denoise_reduction_db = microphone.denoise_reduction_db;
     state.dereverb_reduction_db = microphone.dereverb_reduction_db;
     state.deesser_hz = microphone.deesser_hz;
+}
+
+/// Whether a lane's last status said it was processing (see [`set_lane_active`]).
+const fn lane_running(state: &UiState, direction: DeviceDirection) -> bool {
+    match direction {
+        DeviceDirection::Output => state.output_active,
+        DeviceDirection::Input => state.input_active,
+    }
 }
 
 /// Record whether a lane is processing, for the strip's Floor slot, `--status` and `--watch`.
@@ -10518,5 +10626,199 @@ mod tests {
             assert_eq!(engine.take_sent(), [UiToAudio::SystemSleeping(sleeping)]);
             assert_eq!(engine.params().expect("published").mute, sleeping);
         }
+    }
+
+    // ---- the tray's two lanes and the pump's pacing (0.4.0 design §1.4, §12) ------------------
+
+    /// [`listed_with`] on the headphones, the microphone attached as well.
+    fn both_lanes_attached() -> (App, FakeEngine, tempfile::TempDir) {
+        let (mut app, engine, dir) = listed_with(saved_settings(OUT), HEADPHONES);
+        engine.feed(attached(IN, Some(MIC)));
+        app.poll_audio();
+        let _ = engine.take_sent();
+        let _ = engine.take_events();
+        let _ = app.drain_events();
+        let _ = app.take_tray_refresh();
+        (app, engine, dir)
+    }
+
+    fn tray_names(lane: &crate::tray::TrayLane) -> Vec<&str> {
+        lane.presets.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    #[test]
+    fn the_tray_draws_both_lanes_each_with_its_presets_its_tick_and_its_device() {
+        let (app, _engine, _dir) = both_lanes_attached();
+        let tray = app.tray_state();
+        assert_eq!(tray_names(&tray.output), ["Alpha", "Beta"]);
+        assert_eq!(tray.output.selected_preset, Some(1), "Beta");
+        assert_eq!(tray_names(&tray.input), ["Loud", "Quiet"]);
+        assert_eq!(tray.input.selected_preset, Some(0), "Loud, off screen");
+        assert_eq!(tray.output.device, Some(device_at(&app, HEADPHONES)));
+        assert_eq!(tray.input.device, Some(device_at(&app, MIC)));
+        assert_eq!(
+            tray.device(IN).map(|d| d.name.as_str()),
+            Some(MIC),
+            "the index is into the tray's own list, the window's"
+        );
+    }
+
+    #[test]
+    fn a_voice_preset_picked_in_the_tray_changes_the_microphone_and_leaves_the_window_where_it_was()
+    {
+        let (mut app, engine, _dir) = both_lanes_attached();
+        assert_eq!(app.state.direction, OUT);
+        app.handle_tray(crate::tray::TrayCommand::SelectPreset {
+            direction: IN,
+            name: "Quiet".to_owned(),
+        });
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+        assert_eq!(
+            app.lane_preset(OUT),
+            Some(("Beta", false)),
+            "the speakers keep theirs"
+        );
+        assert_eq!(
+            app.state.direction, OUT,
+            "the window still shows the speakers"
+        );
+        assert_eq!(app.settings().device_direction, OUT);
+        assert_eq!(
+            engine.input_params().expect("published").highpass_hz,
+            75.0,
+            "the microphone's chain runs the new voice at once"
+        );
+        let events = app.drain_events();
+        assert!(
+            events.contains(&AppEvent::PresetChanged {
+                direction: IN,
+                name: Some("Quiet".to_owned()),
+                modified: false,
+            }),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AppEvent::Direction { .. })),
+            "{events:?}"
+        );
+        assert_eq!(app.tray_state().input.selected_preset, Some(1));
+    }
+
+    #[test]
+    fn a_music_preset_picked_in_the_tray_is_the_window_s_own_pick() {
+        let (mut app, _engine, _dir) = both_lanes_attached();
+        app.handle_tray(crate::tray::TrayCommand::SelectPreset {
+            direction: OUT,
+            name: "Alpha".to_owned(),
+        });
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Alpha"));
+        assert_eq!(app.lane_preset(IN), Some(("Loud", false)));
+    }
+
+    #[test]
+    fn a_preset_the_lane_no_longer_has_changes_nothing() {
+        let (mut app, engine, _dir) = both_lanes_attached();
+        let params = engine.input_params();
+        app.handle_tray(crate::tray::TrayCommand::SelectPreset {
+            direction: IN,
+            name: "Beta".to_owned(),
+        });
+        assert_eq!(app.lane_preset(IN), Some(("Loud", false)));
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        assert_eq!(engine.input_params(), params);
+        assert_eq!(app.state.direction, OUT);
+    }
+
+    #[test]
+    fn off_in_the_tray_detaches_that_lane_and_leaves_the_other_alone() {
+        let (mut app, engine, _dir) = both_lanes_attached();
+        app.handle_tray(crate::tray::TrayCommand::Detach(IN));
+        assert_eq!(app.state.selected_input, None);
+        assert_eq!(selected(&app, OUT), Some(HEADPHONES));
+        assert!(engine.take_sent().contains(&UiToAudio::DetachLane(IN)));
+        let tray = app.tray_state();
+        assert_eq!(tray.input.device, None);
+        assert_eq!(
+            tray.device_line(IN),
+            format!("{}{}", tr("Input: "), tr("Off"))
+        );
+    }
+
+    #[test]
+    fn a_tray_pick_is_the_later_word_on_a_lane_a_command_line_left_waiting() {
+        let (mut app, _engine, _dir) = both_lanes_attached();
+        app.select_device_when_listed("usb-headset-not-yet-listed", OUT);
+        app.select_device_when_listed("usb-mic-not-yet-listed", IN);
+        app.handle_tray(crate::tray::TrayCommand::SelectDevice(device_at(
+            &app, SPEAKERS,
+        )));
+        assert_eq!(app.pending_device(OUT), None, "the tray's pick stands");
+        assert_eq!(
+            app.pending_device(IN),
+            Some("usb-mic-not-yet-listed"),
+            "the other lane still waits"
+        );
+        app.handle_tray(crate::tray::TrayCommand::Detach(IN));
+        assert_eq!(app.pending_device(IN), None, "and Off is a word too");
+    }
+
+    #[test]
+    fn a_notice_is_the_next_deadline_until_it_is_taken_down() {
+        let mut app = headless();
+        assert_eq!(app.next_deadline(), None, "nothing is due");
+        let before = Instant::now();
+        app.raise_notice("Saved");
+        let due = app.next_deadline().expect("the notice's end");
+        assert!(due >= before + fxsound_ui::state::NOTICE_LIFETIME);
+        assert!(due <= Instant::now() + fxsound_ui::state::NOTICE_LIFETIME);
+        app.handle(&[UiAction::DismissNotice]);
+        assert_eq!(app.next_deadline(), None);
+
+        // A notice written straight into the state has no clock yet: the next poll is due now.
+        app.state.notification = Some("Unstamped".to_owned());
+        assert!(app.next_deadline().expect("due") <= Instant::now());
+        app.poll_audio();
+        assert!(app.next_deadline().expect("due") > Instant::now());
+    }
+
+    #[test]
+    fn the_volumes_delayed_save_is_a_deadline_too() {
+        let mut app = headless();
+        let due = Instant::now() + std::time::Duration::from_millis(700);
+        app.volume_save_due = Some(due);
+        assert_eq!(app.next_deadline(), Some(due));
+    }
+
+    #[test]
+    fn meters_moved_says_whether_the_shown_lane_s_meters_changed_since_the_last_poll() {
+        let (mut app, engine, _dir) = both_lanes_attached();
+        let playing = |level: f32| Meters {
+            active: true,
+            spectrum: [level; fxsound_core::NUM_SPECTRUM_BARS],
+            sample_rate: 48_000,
+            ..Meters::default()
+        };
+        engine.set_meters(OUT, playing(0.4));
+        app.poll_audio();
+        assert!(app.meters_moved());
+        app.poll_audio();
+        assert!(!app.meters_moved(), "the same meters again");
+        engine.set_meters(OUT, playing(0.5));
+        app.poll_audio();
+        assert!(app.meters_moved());
+        // The microphone off screen is not what the visualizer shows.
+        engine.set_meters(IN, playing(0.9));
+        app.poll_audio();
+        assert!(!app.meters_moved());
+    }
+
+    #[test]
+    fn a_controller_with_no_engine_has_no_notifications_to_wait_on_and_no_meters_moving() {
+        let mut app = headless();
+        assert!(app.audio_notifications().is_none());
+        app.poll_audio();
+        assert!(!app.meters_moved());
     }
 }

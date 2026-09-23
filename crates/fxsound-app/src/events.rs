@@ -1772,6 +1772,18 @@ mod tests {
     fn the_tray_is_redrawn_once_when_sound_starts_or_stops_and_not_while_it_goes_on() {
         let (mut app, engine, _dir) = started();
         let tray = Recorder::default();
+        // The speakers' lane is running, on silence to begin with.
+        hear(
+            &mut app,
+            &engine,
+            [
+                AudioToUi::Devices(listed()),
+                attached(OUT, SPEAKERS),
+                status(OUT, true, 48_000),
+            ],
+        );
+        fan_out(&mut app, &[], Some(&tray));
+        let _ = tray.redraws.take();
         for (step, lane, sound, redrawn_with) in [
             ("sound starts", OUT, true, Some(true)),
             ("sound goes on", OUT, true, None),
@@ -1822,5 +1834,46 @@ mod tests {
         fan_out(&mut app, &[], Some(&tray));
         assert_eq!(shown(&app), (true, true, "processing"));
         assert_eq!(tray.redrawn(), 1);
+    }
+
+    #[test]
+    fn a_lane_that_went_to_sleep_with_sound_in_its_last_meters_is_not_playing() {
+        let (mut app, engine, _dir) = started();
+        let tray = Recorder::default();
+        engine.set_meters(OUT, meters(true));
+        hear(
+            &mut app,
+            &engine,
+            [
+                AudioToUi::Devices(listed()),
+                attached(OUT, SPEAKERS),
+                status(OUT, true, 48_000),
+            ],
+        );
+        fan_out(&mut app, &[], Some(&tray));
+        let _ = tray.redraws.take();
+        assert!(app.state.audio_active, "a song is playing");
+
+        // The player is closed in the middle of it: the lane's node sleeps, its meters are never
+        // published again, and the last of them still say `active`. The lane's status is the word.
+        hear(&mut app, &engine, [status(OUT, false, 48_000)]);
+        fan_out(&mut app, &[], Some(&tray));
+        assert!(
+            !app.state.audio_active,
+            "the logo and the visualizer go quiet"
+        );
+        assert!(!app.tray_state().processing, "and so does the tray's icon");
+        assert_eq!(crate::commands::status_document(&app).audio, "idle");
+        assert_eq!(tray.redrawn(), 1, "told once");
+
+        // The frozen meters, read again and again, change nothing more.
+        app.poll_audio();
+        fan_out(&mut app, &[], Some(&tray));
+        assert!(!app.state.audio_active);
+        assert!(
+            !app.meters_moved(),
+            "and the window has nothing to paint for them"
+        );
+        assert_eq!(tray.redrawn(), 0);
     }
 }

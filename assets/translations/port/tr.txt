@@ -84,3 +84,5 @@ countries: tr
 "Follow the system's default device" = "Sistemin varsayılan aygıtını izle"
 "Input Device Preference" = "Giriş aygıtı tercihi"
 "Makeup Gain" = "Telafi kazancı"
+"Output Presets" = "Çıkış ön ayarları"
+"Input Presets" = "Giriş ön ayarları"

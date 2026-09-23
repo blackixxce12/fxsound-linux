@@ -51,6 +51,11 @@ tokio = { workspace = true, features = ["net", "sync", "time"] }
 # `blocking-api` for `zbus::blocking`, which nothing else enables (the tests call the service
 # through a blocking proxy).
 zbus = { workspace = true, features = ["tokio", "blocking-api"] }
+# The tray's status icons, rasterised once at start-up for hosts that do not look them up by name
+# in the icon theme (0.4.0 design §11). The same three the UI crate draws its artwork with.
+resvg = { workspace = true }
+usvg = { workspace = true }
+tiny-skia = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

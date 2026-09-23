@@ -31,7 +31,7 @@ use std::task::Poll;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
+use crate::wake::WakingSender;
 use tokio::sync::oneshot;
 use zbus::export::futures_core::Stream;
 use zbus::message::Type;
@@ -101,14 +101,18 @@ pub struct SleepWatch {
 impl SleepWatch {
     /// Listen for logind's `PrepareForSleep` on the system bus, and send what each one says on
     /// `sleeping`. Never fails: without a system bus the watcher logs why and ends.
+    ///
+    /// A [`WakingSender`] wakes the GUI thread with each one (0.4.0 design §12): nothing holds
+    /// the suspend up, so the mute has to happen now rather than at the pump's next keepalive.
     #[must_use]
-    pub fn start(sleeping: Sender<bool>) -> Self {
+    pub fn start(sleeping: impl Into<WakingSender<bool>>) -> Self {
         Self::start_on(SleepBus::System, sleeping)
     }
 
     /// [`SleepWatch::start`] on `bus`.
     #[must_use]
-    pub fn start_on(bus: SleepBus, sleeping: Sender<bool>) -> Self {
+    pub fn start_on(bus: SleepBus, sleeping: impl Into<WakingSender<bool>>) -> Self {
+        let sleeping = sleeping.into();
         let (stop, stopped) = oneshot::channel();
         let state = Arc::new(StateCell {
             state: Mutex::new(WatchState::Starting),
@@ -209,7 +213,7 @@ pub fn prepare_for_sleep(message: &Message) -> Option<bool> {
 /// be heard, and both lanes would stay muted for the rest of the session.
 fn watch(
     bus: &SleepBus,
-    sleeping: &Sender<bool>,
+    sleeping: &WakingSender<bool>,
     mut stopped: oneshot::Receiver<()>,
     state: &StateCell,
 ) {

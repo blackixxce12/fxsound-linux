@@ -86,3 +86,5 @@ countries: ro
 "Follow the system's default device" = "Urmează dispozitivul implicit al sistemului"
 "Input Device Preference" = "Preferință dispozitiv de intrare"
 "Makeup Gain" = "Câștig de compensare"
+"Output Presets" = "Presetări de ieșire"
+"Input Presets" = "Presetări de intrare"

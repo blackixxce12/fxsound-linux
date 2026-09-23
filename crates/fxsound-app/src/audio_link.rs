@@ -10,23 +10,50 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crossbeam_channel::Receiver;
 use fxsound_audio::EngineHandle;
 use fxsound_core::DeviceDirection;
 use fxsound_core::messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio};
 
+use crate::wake::{self, Waker};
+
 /// What the controller holds while there is an engine to talk to.
 pub(crate) enum AudioLink {
     /// The audio thread.
-    Engine(EngineHandle),
+    Engine {
+        engine: EngineHandle,
+        /// Where its notifications arrive: carried from the engine's channel by a thread that
+        /// wakes the GUI thread for each one (0.4.0 design §12, [`wake::forward`]).
+        notifications: Receiver<AudioToUi>,
+    },
     /// A recording stand-in ([`FakeEngine`]).
     Fake(FakeEngine),
 }
 
 impl AudioLink {
+    /// The audio thread, its notifications waking the GUI thread through `waker`.
+    pub(crate) fn engine(engine: EngineHandle, waker: &Waker) -> Self {
+        let notifications =
+            wake::forward("fxsound-audio-wake", engine.notifications(), waker.clone());
+        Self::Engine {
+            engine,
+            notifications,
+        }
+    }
+
+    /// The channel the audio thread's notifications arrive on, for the headless pump to wait on;
+    /// `None` for the stand-in, which is only ever polled.
+    pub(crate) const fn notifications(&self) -> Option<&Receiver<AudioToUi>> {
+        match self {
+            Self::Engine { notifications, .. } => Some(notifications),
+            Self::Fake(_) => None,
+        }
+    }
+
     /// A control-plane request.
     pub(crate) fn send(&self, message: UiToAudio) {
         match self {
-            Self::Engine(engine) => engine.send(message),
+            Self::Engine { engine, .. } => engine.send(message),
             Self::Fake(fake) => fake.record().sent.push(message),
         }
     }
@@ -34,7 +61,7 @@ impl AudioLink {
     /// A one-shot event for one lane's chain.
     pub(crate) fn send_event(&self, direction: DeviceDirection, event: DspEvent) {
         match self {
-            Self::Engine(engine) => engine.send_event(direction, event),
+            Self::Engine { engine, .. } => engine.send_event(direction, event),
             Self::Fake(fake) => fake.record().events.push((direction, event)),
         }
     }
@@ -42,7 +69,7 @@ impl AudioLink {
     /// The output lane's snapshot.
     pub(crate) fn set_params(&mut self, params: DspParams) {
         match self {
-            Self::Engine(engine) => engine.set_params(params),
+            Self::Engine { engine, .. } => engine.set_params(params),
             Self::Fake(fake) => {
                 // What the audio thread would read: the engine sanitises on the way in.
                 let mut params = params;
@@ -55,7 +82,7 @@ impl AudioLink {
     /// The input lane's snapshot.
     pub(crate) fn set_input_params(&mut self, params: InputDspParams) {
         match self {
-            Self::Engine(engine) => engine.set_input_params(params),
+            Self::Engine { engine, .. } => engine.set_input_params(params),
             Self::Fake(fake) => {
                 let mut params = params;
                 params.sanitise();
@@ -67,7 +94,7 @@ impl AudioLink {
     /// The latest meters one lane published.
     pub(crate) fn meters(&mut self, direction: DeviceDirection) -> Meters {
         match self {
-            Self::Engine(engine) => engine.meters(direction),
+            Self::Engine { engine, .. } => engine.meters(direction),
             Self::Fake(fake) => fake.record().meters[lane(direction)],
         }
     }
@@ -75,7 +102,7 @@ impl AudioLink {
     /// The next notification, if any.
     pub(crate) fn try_recv(&self) -> Option<AudioToUi> {
         match self {
-            Self::Engine(engine) => engine.try_recv(),
+            Self::Engine { notifications, .. } => notifications.try_recv().ok(),
             Self::Fake(fake) => fake.record().feed.pop_front(),
         }
     }
@@ -83,7 +110,7 @@ impl AudioLink {
     /// Stop the engine; see [`EngineHandle::shutdown`].
     pub(crate) fn shutdown(self) {
         match self {
-            Self::Engine(engine) => engine.shutdown(),
+            Self::Engine { engine, .. } => engine.shutdown(),
             Self::Fake(fake) => fake.record().shut_down = true,
         }
     }

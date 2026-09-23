@@ -86,3 +86,5 @@ countries: de at ch
 "Follow the system's default device" = "Dem Standardgerät des Systems folgen"
 "Input Device Preference" = "Einstellung für Eingabegerät"
 "Makeup Gain" = "Make-up-Gain"
+"Output Presets" = "Ausgabe-Voreinstellungen"
+"Input Presets" = "Eingabe-Voreinstellungen"

@@ -84,3 +84,5 @@ countries: fi
 "Follow the system's default device" = "Seuraa järjestelmän oletuslaitetta"
 "Input Device Preference" = "Sisääntulolaitepreferenssi"
 "Makeup Gain" = "Tasausvahvistus"
+"Output Presets" = "Ulostulon esiasetukset"
+"Input Presets" = "Sisääntulon esiasetukset"

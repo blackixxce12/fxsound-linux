@@ -686,6 +686,17 @@ impl EngineHandle {
         self.notifications.try_recv().ok()
     }
 
+    /// The notification channel itself, for a caller that waits on it rather than polling
+    /// [`Self::try_recv`]: the application's thread that wakes the GUI when the audio thread has
+    /// something to say (0.4.0 design §12).
+    ///
+    /// A second end of the same channel, not a copy of what is on it: each notification goes to
+    /// whichever end takes it first, so a caller that takes this one reads only from it.
+    #[must_use]
+    pub fn notifications(&self) -> Receiver<AudioToUi> {
+        self.notifications.clone()
+    }
+
     /// Stop the engine and wait for the PipeWire thread to finish tearing down.
     ///
     /// Tearing down in order matters: every session default FxSound holds — the sink, the source,

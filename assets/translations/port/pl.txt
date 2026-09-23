@@ -85,3 +85,5 @@ countries: pl
 "Follow the system's default device" = "Używaj domyślnego urządzenia systemu"
 "Input Device Preference" = "Preferencje urządzenia wejściowego"
 "Makeup Gain" = "Wzmocnienie wyrównawcze"
+"Output Presets" = "Presety wyjścia"
+"Input Presets" = "Presety wejścia"

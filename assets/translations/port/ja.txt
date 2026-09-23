@@ -84,3 +84,5 @@ countries: ja
 "Follow the system's default device" = "システムの既定のデバイスに従う"
 "Input Device Preference" = "入力デバイス設定"
 "Makeup Gain" = "メイクアップゲイン"
+"Output Presets" = "出力プリセット"
+"Input Presets" = "入力プリセット"

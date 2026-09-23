@@ -85,3 +85,5 @@ countries: ru
 "Follow the system's default device" = "Брать устройство по умолчанию из системы"
 "Input Device Preference" = "Настройка устройства ввода"
 "Makeup Gain" = "Компенсирующее усиление"
+"Output Presets" = "Шаблоны вывода"
+"Input Presets" = "Шаблоны ввода"

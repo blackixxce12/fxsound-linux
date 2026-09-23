@@ -26,6 +26,18 @@
 //!    not a failure. Then the suspend watcher (`fxsound_app::sleep`), on a thread of its own too,
 //!    listening for logind on the system bus; no system bus is a log line as well.
 //!
+//! ## What wakes the pump
+//!
+//! Nothing is polled on a timer any more (0.4.0 design §12). Whatever hands the GUI thread work
+//! wakes it through the one [`Waker`]: the control socket's connection threads and the D-Bus
+//! service (through the channel they share), the tray's callbacks, the suspend watcher, the
+//! termination signals, and the audio thread's notifications, which a small thread carries to the
+//! controller ([`fxsound_app::wake`]). With a window, a wake-up is a repaint of it; without one,
+//! the pump blocks on those channels ([`Runtime::wait`]). Either way it also looks once a second
+//! ([`KEEPALIVE`]), sooner when a notice is due to go or a `--watch --meters` stream is open, and
+//! the window paints at sixty a second only while the Pro view's visualizer has sound moving
+//! through it ([`frame_interval`]).
+//!
 //! ## Two states: a window, or the tray alone
 //!
 //! The original hides to the tray on ✕, on the minimise button and on the compositor's close
@@ -39,13 +51,16 @@
 //! [`eframe::run_native`] may be called again and again in one process. To hide, the shell
 //! sends `ViewportCommand::Close`; the window is destroyed and `run_native` returns. To show, a
 //! fresh window is run. In between, [`Runtime::run_headless`] pumps the engine, the control
-//! socket and the tray at 10 Hz — audio never stops, `fxsound --show` and the tray still work.
+//! socket and the tray as they wake it — audio never stops, `fxsound --show` and the tray still
+//! work. What the window showed that is not the controller's — an open pane, the face the effect
+//! column was turned to — is kept for the next window ([`Panes`]), so hiding and showing it again
+//! looks the way hiding a window does.
 //!
 //! The window renders without vsync. eframe's glow backend otherwise lets Mesa's
 //! `eglSwapBuffers` wait for a frame callback, which a Wayland compositor never sends for a
 //! surface it is not showing — so a window parked on another Hyprland workspace stopped
 //! answering `xdg_wm_base` pings and the compositor called the app unresponsive. Without vsync
-//! the loop is paced by [`FRAME_INTERVAL`] instead.
+//! the loop is paced by [`FRAME_INTERVAL`] instead, and only while something moves.
 
 #![forbid(unsafe_code)]
 
@@ -62,6 +77,7 @@ use fxsound_app::{
     selftest,
     sleep::SleepWatch,
     tray::{self, TrayCommand, TrayHandle},
+    wake::{Waker, WakingSender},
 };
 use fxsound_core::{ThemeMode, ViewMode, i18n::tr};
 use fxsound_ui::{
@@ -80,12 +96,15 @@ use fxsound_ui::{
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// How often the engine, the control socket and the tray are polled when nothing else wakes the
-/// loop. Ten hertz is imperceptible in CPU terms and puts a hard ceiling on how long a forwarded
-/// command (`fxsound --next-preset` from a compositor keybind) can sit unread.
-const PUMP_INTERVAL: Duration = Duration::from_millis(100);
+/// How long the pump goes without looking when nothing wakes it (0.4.0 design §12).
+///
+/// Everything that hands the GUI thread work wakes it (see the module docs), so this is only for
+/// what nothing announces: sound starting or stopping on a device that was running already, which
+/// the tray's icon and the window's logo show. Once a second costs nothing measurable; the 10 Hz
+/// poll it replaces kept an idle FxSound on the CPU for as long as it ran.
+const KEEPALIVE: Duration = Duration::from_secs(1);
 
 /// The changelog Settings ▸ Help shows; bundled, since this fork never sends the user to the
 /// upstream website.
@@ -143,7 +162,9 @@ fn main() -> eframe::Result<()> {
             std::process::exit(1);
         }
     };
-    let server = match listener.serve() {
+    // The one waker every producer below holds a clone of (see the module docs).
+    let waker = Waker::new();
+    let server = match listener.serve_waking(waker.clone()) {
         Ok(server) => server,
         Err(err) => {
             eprintln!("could not serve the control socket: {err}");
@@ -184,7 +205,7 @@ fn main() -> eframe::Result<()> {
         }
     };
 
-    let mut app = App::new(engine);
+    let mut app = App::new(engine, &waker);
 
     // Step 4: the options a cold start honours, before anything is drawn.
     let cold = commands::run(&mut app, &cli.cold_start_commands());
@@ -211,7 +232,7 @@ fn main() -> eframe::Result<()> {
     let _ = app.take_tray_refresh();
 
     let (tray_tx, tray_rx) = crossbeam_channel::unbounded();
-    let tray = match tray::spawn(app.tray_state(), tray_tx) {
+    let tray = match tray::spawn(app.tray_state(), WakingSender::new(tray_tx, waker.clone())) {
         Ok(handle) => Some(handle),
         Err(err) => {
             log::warn!("no system tray: {err}");
@@ -222,9 +243,10 @@ fn main() -> eframe::Result<()> {
     // A Wayland client never sees `kill`, `systemctl --user stop` or a logout hook as a close
     // request, and a process that just dies leaves `default.configured.audio.*` naming a node
     // that vanished with its socket. SIGTERM, SIGINT and SIGHUP therefore become the tray's Exit:
-    // the flag is polled by the pump (`Runtime::tick`), and the quit it triggers runs the same
-    // hand-back-then-stop sequence, which blocks until the server has confirmed the write. A
-    // second Ctrl+C while that is in flight still gets the user out, with the conventional 130.
+    // the flag is read by the pump (`Runtime::tick`), which a thread of its own wakes for it, and
+    // the quit it triggers runs the same hand-back-then-stop sequence, which blocks until the
+    // server has confirmed the write. A second Ctrl+C while that is in flight still gets the user
+    // out, with the conventional 130.
     let terminate = Arc::new(AtomicBool::new(false));
     if let Err(err) = signal_hook::flag::register_conditional_shutdown(
         signal_hook::consts::SIGINT,
@@ -242,6 +264,7 @@ fn main() -> eframe::Result<()> {
             log::warn!("could not install the handler for signal {signal}: {err}");
         }
     }
+    let signals = wake_on_signals(&waker);
 
     // Step 5: the D-Bus service (0.4.0 design §9), on a thread of its own so that a slow bus
     // never holds the window up. With no session bus, or with the name owned already, it says so
@@ -252,7 +275,7 @@ fn main() -> eframe::Result<()> {
     // channel, and the controller mutes both lanes on the way down and starts them clean on the
     // way up. Nothing holds the suspend up (upstream PR #533).
     let (sleep_tx, sleep_rx) = crossbeam_channel::unbounded();
-    let sleep = SleepWatch::start(sleep_tx);
+    let sleep = SleepWatch::start(WakingSender::new(sleep_tx, waker.clone()));
 
     let mut runtime = Runtime {
         app,
@@ -266,6 +289,9 @@ fn main() -> eframe::Result<()> {
         settings_requested: false,
         terminate,
         terminating: false,
+        waker,
+        signals,
+        panes: Panes::default(),
     };
 
     loop {
@@ -337,6 +363,14 @@ struct Runtime {
     terminate: Arc<AtomicBool>,
     /// The signal has been seen and turned into a quit request, so it is only logged once.
     terminating: bool,
+    /// What every producer wakes the GUI thread with; the window's context is attached to it
+    /// while there is a window.
+    waker: Waker,
+    /// The thread that wakes the pump for a termination signal ([`wake_on_signals`]); closed in
+    /// [`Runtime::shutdown`].
+    signals: Option<signal_hook::iterator::Handle>,
+    /// What the last window showed that the next one shows again.
+    panes: Panes,
 }
 
 impl Runtime {
@@ -422,7 +456,7 @@ impl Runtime {
 
         self.announce(&AppEvent::Window { visible: true });
         let runtime = &mut *self;
-        eframe::run_native(
+        let run = eframe::run_native(
             "FxSound",
             options,
             Box::new(move |cc| {
@@ -431,9 +465,14 @@ impl Runtime {
                 // The zoom factor is ours (see `fit_zoom`); Ctrl+/- must not fight it.
                 cc.egui_ctx
                     .options_mut(|options| options.zoom_with_keyboard = false);
+                // From here on a producer's wake-up is a frame of this window.
+                runtime.waker.attach(&cc.egui_ctx);
                 Ok(Box::new(Shell::new(runtime, palette.mode())))
             }),
-        )?;
+        );
+        // Whatever arrives now is the headless pump's to wait for.
+        self.waker.detach();
+        run?;
         // The wizard is a pane of the window that just went: a run it was in the middle of stops,
         // and the microphone is let go rather than held for a window that is not there.
         self.app.cancel_calibration();
@@ -444,10 +483,13 @@ impl Runtime {
         Ok(self.exit)
     }
 
-    /// The tray-only state: pump until something asks for the window or for the exit.
+    /// The tray-only state: pump until something asks for the window or for the exit, blocking
+    /// in between until something arrives ([`Runtime::wait`]).
     fn run_headless(&mut self) -> HeadlessExit {
         log::info!("window hidden; FxSound keeps running in the system tray");
         loop {
+            // Before the tick, so that a wake-up that comes during it is still pending after it.
+            self.waker.clear();
             let request = self.tick();
             if request.quit {
                 return HeadlessExit::Quit;
@@ -456,8 +498,42 @@ impl Runtime {
             if request.show || request.toggle || self.settings_requested {
                 return HeadlessExit::Show;
             }
-            std::thread::sleep(PUMP_INTERVAL);
+            self.wait(self.pump_interval(Instant::now()));
         }
+    }
+
+    /// How long the pump may go before it looks again when nothing wakes it: [`KEEPALIVE`], or
+    /// less when the controller has something due sooner ([`App::next_deadline`]) or a `--watch
+    /// --meters` stream is open, whose meters go out four times a second
+    /// ([`ipc::METER_INTERVAL`]).
+    fn pump_interval(&self, now: Instant) -> Duration {
+        let mut interval = KEEPALIVE;
+        if self.server.wants_meters() {
+            interval = interval.min(ipc::METER_INTERVAL);
+        }
+        if let Some(due) = self.app.next_deadline() {
+            interval = interval.min(due.saturating_duration_since(now));
+        }
+        interval
+    }
+
+    /// Block until something has arrived for the pump, or `timeout` has passed — the headless
+    /// state's sleep (0.4.0 design §12): a forwarded command line or a D-Bus call, a tray click,
+    /// the suspend watcher, the audio thread, or a wake-up that has no channel of its own.
+    fn wait(&self, timeout: Duration) {
+        let watched: Vec<&dyn Watched> = [
+            Some(self.server.arrivals() as &dyn Watched),
+            Some(&self.tray_rx),
+            Some(&self.sleep_rx),
+            self.app
+                .audio_notifications()
+                .map(|audio| audio as &dyn Watched),
+            Some(self.waker.pending()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        wait_for_any(&watched, Instant::now() + timeout);
     }
 
     /// The only way out: stash unsaved edits, restore the system default device and stop the
@@ -481,6 +557,86 @@ impl Runtime {
         if let Some(tray) = &self.tray {
             tray.shutdown();
         }
+        if let Some(signals) = self.signals.take() {
+            signals.close();
+        }
+    }
+}
+
+/// Wake the pump for SIGTERM, SIGINT and SIGHUP, on a thread of its own: the handlers only raise
+/// the terminate flag, which is all a signal handler may do, and the pump would otherwise read it
+/// at its next keepalive. Registered after the flag's handlers, so the flag is up before the
+/// wake-up arrives. `None`, with a log line, when the thread cannot be had; the flag is still read
+/// then, only later.
+fn wake_on_signals(waker: &Waker) -> Option<signal_hook::iterator::Handle> {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    let mut signals = match signal_hook::iterator::Signals::new([SIGTERM, SIGINT, SIGHUP]) {
+        Ok(signals) => signals,
+        Err(err) => {
+            log::warn!("a termination signal will wait for the next keepalive: {err}");
+            return None;
+        }
+    };
+    let handle = signals.handle();
+    let waker = waker.clone();
+    let spawned = std::thread::Builder::new()
+        .name("fxsound-signals".to_owned())
+        .spawn(move || {
+            for _ in signals.forever() {
+                waker.wake();
+            }
+        });
+    match spawned {
+        Ok(_) => Some(handle),
+        Err(err) => {
+            log::warn!("a termination signal will wait for the next keepalive: {err}");
+            None
+        }
+    }
+}
+
+/// A channel the headless pump waits on, whatever it carries.
+trait Watched {
+    /// Wait on it in `select`; the operation's index.
+    fn watch<'a>(&'a self, select: &mut crossbeam_channel::Select<'a>) -> usize;
+    /// Whether a message is waiting in it.
+    fn holds_message(&self) -> bool;
+}
+
+impl<T> Watched for crossbeam_channel::Receiver<T> {
+    fn watch<'a>(&'a self, select: &mut crossbeam_channel::Select<'a>) -> usize {
+        select.recv(self)
+    }
+
+    fn holds_message(&self) -> bool {
+        !self.is_empty()
+    }
+}
+
+/// Block until one of `channels` holds a message, or until `deadline`. Returns whether one does.
+///
+/// Waits without taking anything: the pump's tick drains each channel in its own way. A channel
+/// that reports ready with nothing in it is one whose senders are all gone — a tray that could not
+/// register, a suspend watcher with no system bus — and is dropped from this wait rather than
+/// spun on; a spurious readiness drops one for this wait only, which a producer's
+/// wake-up still covers ([`Waker::pending`] is among the channels and never closes).
+fn wait_for_any(channels: &[&dyn Watched], deadline: Instant) -> bool {
+    let mut select = crossbeam_channel::Select::new();
+    for channel in channels {
+        channel.watch(&mut select);
+    }
+    loop {
+        let Ok(index) = select.ready_deadline(deadline) else {
+            return false;
+        };
+        // Registered in order, so an operation's index is its channel's.
+        if channels
+            .get(index)
+            .is_some_and(|channel| channel.holds_message())
+        {
+            return true;
+        }
+        select.remove(index);
     }
 }
 
@@ -521,13 +677,33 @@ fn native_options(view: ViewMode) -> eframe::NativeOptions {
 // The window
 // =============================================================================================
 
+/// What a window shows that is neither the controller's nor the window's own, and outlives the
+/// window: the panes that were open, the folder picker still running for one of them, and the
+/// face the effect column was turned to.
+///
+/// Hiding to the tray destroys the window (see the module docs); the next window takes these
+/// back, so hiding and showing again looks the way it does in the original, whose window is only
+/// hidden. The hamburger menu is not kept — a popup closes with its window — and neither is the
+/// calibration wizard, whose run [`Runtime::run_window`] cancels rather than holding the
+/// microphone for a window that is not there.
+#[derive(Default)]
+struct Panes {
+    scratch: ViewScratch,
+    settings: Option<SettingsState>,
+    import: Option<ImportState>,
+    export: Option<ExportState>,
+    folder_picker: Option<crossbeam_channel::Receiver<Option<PathBuf>>>,
+    changelog: bool,
+}
+
 /// The eframe application: one window, one frame at a time, over a borrowed [`Runtime`].
 ///
-/// Everything here is per-window and is rebuilt from scratch each time a window is shown: the
-/// views' scratch state, the applied size and theme, the menu, and the panes. Nothing in it may
-/// stop the engine or the tray — `eframe::App::on_exit` is deliberately left at its no-op
-/// default, because the window going away is how *hiding* works (see the module docs), and only
-/// [`Runtime::shutdown`] ends the audio.
+/// Built each time a window is shown, from the [`Panes`] the last window left, and giving them
+/// back when it is dropped; the applied size and theme, the menu and the textures are the
+/// window's own and start afresh. Nothing in it may stop the engine or the tray —
+/// `eframe::App::on_exit` is deliberately left at its no-op default, because the window going
+/// away is how *hiding* works (see the module docs), and only [`Runtime::shutdown`] ends the
+/// audio.
 struct Shell<'a> {
     rt: &'a mut Runtime,
     scratch: ViewScratch,
@@ -566,20 +742,39 @@ struct Shell<'a> {
 
 impl<'a> Shell<'a> {
     fn new(rt: &'a mut Runtime, applied_theme: ThemeMode) -> Self {
+        let Panes {
+            scratch,
+            mut settings,
+            import,
+            export,
+            folder_picker,
+            changelog,
+        } = std::mem::take(&mut rt.panes);
         // The tray's Settings item may have been chosen while there was no window.
-        let settings = std::mem::take(&mut rt.settings_requested).then(|| rt.app.settings_state());
+        if std::mem::take(&mut rt.settings_requested) && settings.is_none() {
+            settings = Some(rt.app.settings_state());
+        }
+        // A gesture in progress and the visualizer's history went with the last window, as the
+        // original's visualizer is reset when it pauses; the column's face is the user's, and the
+        // logo shows what is playing now rather than fading towards it.
+        let lit = rt.app.state.audio_active && rt.app.state.power;
+        let scratch = ViewScratch {
+            column_face: scratch.column_face,
+            logo_fade: if lit { 1.0 } else { 0.0 },
+            ..ViewScratch::default()
+        };
         Self {
             rt,
-            scratch: ViewScratch::default(),
+            scratch,
             applied_size: None,
             applied_theme,
             menu: Menu::default(),
             settings,
             settings_icons: NavIcons::new(),
-            import: None,
-            export: None,
-            folder_picker: None,
-            changelog: false,
+            import,
+            export,
+            folder_picker,
+            changelog,
             calibration: None,
             content_origin: egui::Pos2::ZERO,
         }
@@ -933,7 +1128,7 @@ impl<'a> Shell<'a> {
         let Some(mut state) = self.settings.take() else {
             return;
         };
-        dim_backdrop(ui, window);
+        dim_backdrop(ui, window, "settings");
         let outer = egui::Rect::from_center_size(window.center(), dialogs::settings::WINDOW_SIZE);
 
         // What the audio thread has said since the pane opened: the echo canceller's state and
@@ -977,7 +1172,7 @@ impl<'a> Shell<'a> {
             return;
         }
         let window = self.window_rect();
-        dim_backdrop(ui, window);
+        dim_backdrop(ui, window, "changelog");
         let outer = egui::Rect::from_center_size(window.center(), dialogs::changelog::WINDOW_SIZE);
         let response =
             ChangelogPane::new(CHANGELOG).show(ui, outer, palette, &mut self.rt.app.assets);
@@ -994,7 +1189,7 @@ impl<'a> Shell<'a> {
         let Some(view) = self.calibration.take() else {
             return;
         };
-        dim_backdrop(ui, window);
+        dim_backdrop(ui, window, "calibration");
         let outer = egui::Rect::from_center_size(window.center(), view.window_size());
         let response =
             CalibrationDialog::new(&view).show(ui, outer, palette, &mut self.rt.app.assets, "main");
@@ -1006,13 +1201,13 @@ impl<'a> Shell<'a> {
 
     /// Draw the Import Presets pane, if it is open — the chooser, then the summary
     /// (`docs/spec/06-dialogs.md` §2).
-    fn show_import(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, palette: Palette) {
-        self.poll_folder_picker(ctx);
+    fn show_import(&mut self, ui: &mut egui::Ui, palette: Palette) {
+        self.poll_folder_picker();
         let window = self.window_rect();
         let Some(mut state) = self.import.take() else {
             return;
         };
-        dim_backdrop(ui, window);
+        dim_backdrop(ui, window, "import");
         let dialog = ImportDialog::new(&state);
         let outer = egui::Rect::from_center_size(window.center(), dialog.window_size());
         let response = dialog.show(ui, outer, palette, &mut self.rt.app.assets, "main");
@@ -1039,7 +1234,7 @@ impl<'a> Shell<'a> {
         let Some(mut state) = self.export.take() else {
             return;
         };
-        dim_backdrop(ui, window);
+        dim_backdrop(ui, window, "export");
         let outer =
             egui::Rect::from_center_size(window.center(), dialogs::presets::export::WINDOW_SIZE);
         let response =
@@ -1064,6 +1259,8 @@ impl<'a> Shell<'a> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         // JUCE's browser starts in the documents folder (`FxPresetImportDialog.cpp`).
         let start = dirs::document_dir().or_else(dirs::home_dir);
+        // The answer wakes the window, or the headless pump if the window was hidden meanwhile.
+        let waker = self.rt.waker.clone();
         let spawned = std::thread::Builder::new()
             .name("fxsound-folder-picker".into())
             .spawn(move || {
@@ -1073,7 +1270,9 @@ impl<'a> Shell<'a> {
                     dialog = dialog.set_directory(start);
                 }
                 // The receiver may be gone if the pane was closed meanwhile; nothing to do then.
-                let _ = tx.send(dialog.pick_folder());
+                if tx.send(dialog.pick_folder()).is_ok() {
+                    waker.wake();
+                }
             });
         match spawned {
             Ok(_) => self.folder_picker = Some(rx),
@@ -1087,7 +1286,7 @@ impl<'a> Shell<'a> {
     }
 
     /// Take the picker's answer, if it has one.
-    fn poll_folder_picker(&mut self, ctx: &egui::Context) {
+    fn poll_folder_picker(&mut self) {
         let Some(rx) = &self.folder_picker else {
             return;
         };
@@ -1102,8 +1301,8 @@ impl<'a> Shell<'a> {
             Ok(None) | Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 self.folder_picker = None;
             }
-            // Still up; egui will not repaint on its own while the user is in another window.
-            Err(crossbeam_channel::TryRecvError::Empty) => ctx.request_repaint_after(PUMP_INTERVAL),
+            // Still up. Its answer wakes the window when it comes (`start_folder_picker`).
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
         }
     }
 }
@@ -1121,11 +1320,10 @@ impl eframe::App for Shell<'_> {
         }
         self.apply_window_request(ctx, request);
 
-        // Keep the loop ticking even with nothing on screen to redraw: the control socket and the
-        // tray are drained from here, and eframe otherwise sleeps until something asks for a
-        // frame — which left a compositor keybind doing nothing until the user happened to move
-        // the mouse over the window.
-        ctx.request_repaint_after(PUMP_INTERVAL);
+        // The keepalive: what the producers bring wakes the window on its own (see the module
+        // docs), and this is for what nothing announces — a notice due to go, sound starting on a
+        // device that was running already. Once a second, sooner when something is due.
+        ctx.request_repaint_after(self.rt.pump_interval(Instant::now()));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1209,17 +1407,68 @@ impl eframe::App for Shell<'_> {
         self.show_settings(&ctx, ui, palette);
         self.show_changelog(ui, palette);
         self.show_calibration(ui, palette);
-        self.show_import(&ctx, ui, palette);
+        self.show_import(ui, palette);
         self.show_export(ui, palette);
         self.show_menu(&ctx, palette);
 
-        // The visualizer and the meters are live, so keep painting while audio flows — at a
-        // fixed cadence, since there is no vsync to pace the loop. The calibration wizard's
-        // countdown and live level are too, while it wakes the microphone, measures or analyses.
-        if self.rt.app.state.audio_active || self.rt.app.calibration_is_live() {
-            ctx.request_repaint_after(FRAME_INTERVAL);
+        // Sixty frames a second only while they show something moving (see `frame_interval`).
+        let (minimised, focused) = ctx.input(|i| (i.viewport().minimized, i.viewport().focused));
+        let pacing = Pacing {
+            pro: self.rt.app.state.view == ViewMode::Pro,
+            visualizer_settled: self.scratch.visualizer.is_settled(),
+            meters_moved: self.rt.app.meters_moved(),
+            calibrating: self.rt.app.calibration_is_live(),
+            out_of_sight: minimised == Some(true) && focused != Some(true),
+        };
+        if let Some(interval) = frame_interval(&pacing) {
+            ctx.request_repaint_after(interval);
         }
     }
+}
+
+/// The window gives what it showed back to the runtime for the next window ([`Panes`]).
+impl Drop for Shell<'_> {
+    fn drop(&mut self) {
+        self.rt.panes = Panes {
+            scratch: std::mem::take(&mut self.scratch),
+            settings: self.settings.take(),
+            import: self.import.take(),
+            export: self.export.take(),
+            folder_picker: self.folder_picker.take(),
+            changelog: self.changelog,
+        };
+    }
+}
+
+/// What decides the window's frame rate beyond the keepalive, as one frame left it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pacing {
+    /// The Pro view is showing: the only one with a visualizer.
+    pro: bool,
+    /// The visualizer has come to rest ([`fxsound_ui::VisualizerAnimation::is_settled`]).
+    visualizer_settled: bool,
+    /// The shown lane's meters changed since the poll before ([`App::meters_moved`]).
+    meters_moved: bool,
+    /// The calibration wizard is counting down, measuring or analysing.
+    calibrating: bool,
+    /// Minimised and not focused, where the compositor can say so (X11; Wayland never tells).
+    out_of_sight: bool,
+}
+
+/// When the window wants its next frame for what it shows moving (0.4.0 design §12), beyond the
+/// keepalive ([`KEEPALIVE`]) and the frames the widgets ask for their own animations — the
+/// visualizer's 30 Hz ripple while it settles, the logo's fade, a pane's progress bar.
+///
+/// [`FRAME_INTERVAL`] while the Pro view's visualizer has sound moving through it — not yet at
+/// rest, and fed meters that changed since the last frame — and while the calibration wizard runs.
+/// Never in the Lite view, which has no visualizer, and never for a window minimised out of
+/// sight: 0.3.0 painted sixty frames a second whenever sound played, wherever the window was.
+fn frame_interval(pacing: &Pacing) -> Option<Duration> {
+    if pacing.calibrating {
+        return Some(FRAME_INTERVAL);
+    }
+    let moving = pacing.pro && !pacing.visualizer_settled && pacing.meters_moved;
+    (moving && !pacing.out_of_sight).then_some(FRAME_INTERVAL)
 }
 
 /// `size` grown to fit `pane`.
@@ -1229,7 +1478,15 @@ fn grown(size: egui::Vec2, pane: egui::Vec2) -> egui::Vec2 {
 
 /// Dim what is behind a pane, so it reads as modal the way the original's dialogs did — inside
 /// the window's own rounded outline, so the transparent corners stay transparent.
-fn dim_backdrop(ui: &egui::Ui, window: egui::Rect) {
+///
+/// And make it modal: the backdrop takes the pointer over the whole window, so the view under
+/// the pane neither answers a click nor puts up a tooltip through it — an equalizer knob's hint
+/// used to appear over Settings wherever the pointer rested above one. What the pane draws
+/// afterwards sits on top of the backdrop and gets the pointer as before.
+fn dim_backdrop(ui: &egui::Ui, window: egui::Rect, pane: &str) {
+    // One per pane: the changelog and the wizard open over Settings, each over its own backdrop.
+    let id = egui::Id::new(("fxsound.pane.backdrop", pane));
+    ui.interact(window, id, egui::Sense::click_and_drag());
     ui.painter().rect_filled(
         window,
         egui::CornerRadius::same(layout::WINDOW_CORNER_RADIUS as u8),
@@ -1536,6 +1793,9 @@ mod runtime_tests {
             settings_requested: false,
             terminate: Arc::new(AtomicBool::new(false)),
             terminating: false,
+            waker: Waker::new(),
+            signals: None,
+            panes: Panes::default(),
         }
     }
 
@@ -1703,6 +1963,185 @@ mod runtime_tests {
     }
 
     #[test]
+    fn the_pump_looks_once_a_second_and_sooner_for_a_meters_stream_or_a_notice_due() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let now = Instant::now();
+        assert_eq!(runtime.pump_interval(now), KEEPALIVE);
+
+        runtime.app.raise_notice("Saved");
+        let notice = runtime.pump_interval(Instant::now());
+        assert_eq!(
+            notice, KEEPALIVE,
+            "four seconds away: the keepalive comes first"
+        );
+        runtime.app.state.notice_clock = runtime
+            .app
+            .state
+            .notice_clock
+            .take()
+            .map(|(text, since)| (text, since - Duration::from_millis(3_700)));
+        let due = runtime.pump_interval(Instant::now());
+        assert!(
+            due <= Duration::from_millis(300),
+            "the notice goes when it is due, not at the next keepalive: {due:?}"
+        );
+        runtime.app.handle(&[UiAction::DismissNotice]);
+
+        let (metered, _watcher) = watch(runtime.server.path(), &["--watch", "--meters"]);
+        next_line(&mut runtime, &metered);
+        assert_eq!(runtime.pump_interval(Instant::now()), ipc::METER_INTERVAL);
+    }
+
+    #[test]
+    fn with_no_window_the_pump_sleeps_until_a_tray_click_wakes_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let (tray_tx, tray_rx) = crossbeam_channel::unbounded();
+        runtime.tray_rx = tray_rx;
+        let clicked = Instant::now();
+        let tray = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            tray_tx
+                .send(TrayCommand::Open)
+                .expect("the pump is listening");
+            tray_tx
+        });
+        runtime.wait(Duration::from_secs(10));
+        assert!(
+            clicked.elapsed() < Duration::from_secs(5),
+            "the click, not the timeout, ended the wait"
+        );
+        let _tray_tx = tray.join().expect("tray");
+        assert!(
+            runtime.tick().show,
+            "and the tick that follows carries it out"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_command_line_wakes_the_sleeping_pump_and_is_answered() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let socket = runtime.server.path().to_path_buf();
+        let asked = Instant::now();
+        let forwarded = std::thread::spawn(move || {
+            ipc::forward_to(
+                &socket,
+                &["fxsound".to_owned(), "--power=off".to_owned()],
+                Path::new("/"),
+                Duration::from_secs(5),
+            )
+        });
+        runtime.wait(Duration::from_secs(10));
+        assert!(asked.elapsed() < Duration::from_secs(5));
+        runtime.tick();
+        assert!(forwarded.join().expect("client").expect("answered").ok);
+        assert!(!runtime.app.state.power);
+    }
+
+    #[test]
+    fn with_nothing_arriving_the_pump_sleeps_out_its_interval_even_beside_a_closed_channel() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runtime = runtime(dir.path());
+        // `runtime()` dropped the tray's sender, as a tray that could not register does: its
+        // channel is always ready, and must not be taken for an arrival.
+        let started = Instant::now();
+        runtime.wait(Duration::from_millis(300));
+        assert!(started.elapsed() >= Duration::from_millis(290));
+    }
+
+    #[test]
+    fn a_wake_up_with_no_channel_of_its_own_ends_the_wait() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let runtime = runtime(dir.path());
+        let waker = runtime.waker.clone();
+        let woken = Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            waker.wake();
+        });
+        runtime.wait(Duration::from_secs(10));
+        assert!(woken.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Set, to a marker file's path, in the child copy of this binary that raises the signal.
+    const SIGNAL_CHILD: &str = "FXSOUND_TEST_SIGNAL_CHILD";
+
+    /// The signal is raised in a child copy of this test binary, never in this one: signal-hook
+    /// keeps SIGTERM, SIGINT and SIGHUP once it has taken them (unregistering does not put the
+    /// default action back), and a test process that shrugs off Ctrl+C is not one to leave behind.
+    #[test]
+    fn a_termination_signal_wakes_the_pump() {
+        if let Some(marker) = std::env::var_os(SIGNAL_CHILD) {
+            let waker = Waker::new();
+            let signals = wake_on_signals(&waker).expect("the signal thread");
+            // SIGHUP, the one of the three a test runner is not stopped by: the handler
+            // registered above takes it.
+            signal_hook::low_level::raise(signal_hook::consts::SIGHUP).expect("raised");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while waker.pending().is_empty() {
+                assert!(Instant::now() < deadline, "the signal woke nobody");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            signals.close();
+            std::fs::write(marker, "woken").expect("the marker");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("temp dir");
+        let marker = dir.path().join("woken");
+        let (_, module) = module_path!()
+            .split_once("::")
+            .expect("a module of the crate");
+        let name = format!("{module}::a_termination_signal_wakes_the_pump");
+        let output = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+            .env(SIGNAL_CHILD, &marker)
+            .output()
+            .expect("the child ran");
+        assert!(
+            output.status.success(),
+            "the child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // An `--exact` name that matched nothing passes too; the marker says the body ran.
+        assert!(marker.exists(), "the child ran no test called {name}");
+    }
+
+    #[test]
+    fn a_hidden_window_s_pane_and_column_face_are_there_when_it_is_shown_again() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        {
+            let mut shell = Shell::new(&mut runtime, ThemeMode::Dark);
+            shell.open_settings();
+            shell.open_import();
+            shell.scratch.column_face = shell.scratch.column_face.flipped();
+            shell.scratch.window_drag = true;
+            shell.menu.toggle();
+        }
+        let flipped = fxsound_ui::views::ColumnFace::default().flipped();
+        let shell = Shell::new(&mut runtime, ThemeMode::Dark);
+        assert!(shell.settings.is_some(), "Settings is still open");
+        assert!(shell.import.is_some(), "and so is Import Presets");
+        assert_eq!(shell.scratch.column_face, flipped);
+        assert!(!shell.scratch.window_drag, "a gesture ends with its window");
+        assert!(!shell.menu.open, "and so does the menu");
+    }
+
+    #[test]
+    fn the_tray_s_settings_item_while_hidden_opens_the_pane_in_the_next_window() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        runtime.settings_requested = true;
+        let shell = Shell::new(&mut runtime, ThemeMode::Dark);
+        assert!(shell.settings.is_some());
+        drop(shell);
+        assert!(!runtime.settings_requested);
+    }
+
+    #[test]
     fn what_the_suspend_watcher_heard_reaches_the_controller_on_the_next_tick() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut runtime = runtime(dir.path());
@@ -1799,6 +2238,9 @@ mod calibration_tests {
             settings_requested: false,
             terminate: Arc::new(AtomicBool::new(false)),
             terminating: false,
+            waker: Waker::new(),
+            signals: None,
+            panes: Panes::default(),
         }
     }
 
@@ -1845,6 +2287,136 @@ mod calibration_tests {
         shell.rt.app.handle_calibration(CalibrationAction::Cancel);
         assert!(!shell.rt.app.calibration_open());
         assert_eq!(shell.rt.app.calibration_view(), None);
+    }
+}
+
+#[cfg(test)]
+mod backdrop_tests {
+    use super::*;
+    use egui::{Event, PointerButton, Pos2, RawInput, Rect, pos2, vec2};
+
+    const VIEW_BUTTON: Rect = Rect::from_min_max(pos2(40.0, 40.0), pos2(140.0, 80.0));
+    const PANE_BUTTON: Rect = Rect::from_min_max(pos2(200.0, 40.0), pos2(300.0, 80.0));
+
+    /// A view with a button, and when `pane` a pane's backdrop over it with a button of its own:
+    /// move to `at`, press and release. Whether the view's button was ever hovered or clicked,
+    /// and whether the pane's was clicked.
+    fn press(at: Pos2, pane: bool) -> (bool, bool, bool) {
+        let ctx = egui::Context::default();
+        let (mut view_hovered, mut view_clicked, mut pane_clicked) = (false, false, false);
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        for events in [
+            vec![Event::PointerMoved(at)],
+            vec![Event::PointerMoved(at)],
+            vec![Event::PointerMoved(at), button(true)],
+            vec![button(false)],
+        ] {
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(400.0, 200.0))),
+                events,
+                ..RawInput::default()
+            };
+            ctx.run_ui(input, |ui| {
+                let view = ui.put(VIEW_BUTTON, egui::Button::new("knob"));
+                view_hovered |= view.hovered();
+                view_clicked |= view.clicked();
+                if pane {
+                    dim_backdrop(ui, ui.max_rect(), "test");
+                    pane_clicked |= ui.put(PANE_BUTTON, egui::Button::new("close")).clicked();
+                }
+            })
+            .drop_without_applying_deltas();
+        }
+        (view_hovered, view_clicked, pane_clicked)
+    }
+
+    #[test]
+    fn without_a_pane_the_view_answers_the_pointer() {
+        assert_eq!(press(VIEW_BUTTON.center(), false), (true, true, false));
+    }
+
+    #[test]
+    fn a_pane_s_backdrop_keeps_the_pointer_from_the_view_under_it() {
+        assert_eq!(
+            press(VIEW_BUTTON.center(), true),
+            (false, false, false),
+            "no tooltip and no click through the pane"
+        );
+    }
+
+    #[test]
+    fn the_pane_s_own_controls_still_answer_the_pointer() {
+        assert_eq!(press(PANE_BUTTON.center(), true), (false, false, true));
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+
+    const PLAYING: Pacing = Pacing {
+        pro: true,
+        visualizer_settled: false,
+        meters_moved: true,
+        calibrating: false,
+        out_of_sight: false,
+    };
+
+    #[test]
+    fn the_pro_view_paints_sixty_a_second_while_sound_moves_through_its_visualizer() {
+        assert_eq!(frame_interval(&PLAYING), Some(FRAME_INTERVAL));
+        assert_eq!(FRAME_INTERVAL, Duration::from_millis(16));
+    }
+
+    #[test]
+    fn a_settled_visualizer_or_meters_that_stand_still_ask_for_no_frames() {
+        for pacing in [
+            Pacing {
+                visualizer_settled: true,
+                ..PLAYING
+            },
+            Pacing {
+                meters_moved: false,
+                ..PLAYING
+            },
+        ] {
+            assert_eq!(frame_interval(&pacing), None, "{pacing:?}");
+        }
+    }
+
+    #[test]
+    fn the_lite_view_and_a_window_minimised_out_of_sight_never_paint_for_the_meters() {
+        assert_eq!(
+            frame_interval(&Pacing {
+                pro: false,
+                ..PLAYING
+            }),
+            None
+        );
+        assert_eq!(
+            frame_interval(&Pacing {
+                out_of_sight: true,
+                ..PLAYING
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn the_calibration_wizard_is_painted_while_it_runs_whatever_the_view() {
+        let calibrating = Pacing {
+            pro: false,
+            visualizer_settled: true,
+            meters_moved: false,
+            calibrating: true,
+            out_of_sight: false,
+        };
+        assert_eq!(frame_interval(&calibrating), Some(FRAME_INTERVAL));
     }
 }
 

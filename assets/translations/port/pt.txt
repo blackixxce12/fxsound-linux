@@ -85,3 +85,5 @@ countries: pt
 "Follow the system's default device" = "Seguir o dispositivo predefinido do sistema"
 "Input Device Preference" = "Preferência do dispositivo de entrada"
 "Makeup Gain" = "Ganho de compensação"
+"Output Presets" = "Predefinições de saída"
+"Input Presets" = "Predefinições de entrada"

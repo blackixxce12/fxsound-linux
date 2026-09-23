@@ -85,3 +85,5 @@ countries: EG sa
 "Follow the system's default device" = "اتباع الجهاز الافتراضي للنظام"
 "Input Device Preference" = "تفضيلات جهاز الإدخال"
 "Makeup Gain" = "كسب التعويض"
+"Output Presets" = "قوالب الإخراج"
+"Input Presets" = "قوالب الإدخال"

@@ -84,3 +84,5 @@ countries: ar co es mx
 "Follow the system's default device" = "Usar el dispositivo por defecto del sistema"
 "Input Device Preference" = "Preferencia de dispositivo de entrada"
 "Makeup Gain" = "Ganancia de compensación"
+"Output Presets" = "Preajustes de salida"
+"Input Presets" = "Preajustes de entrada"

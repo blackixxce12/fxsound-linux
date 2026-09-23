@@ -597,7 +597,7 @@ impl Cli {
     }
 
     /// [`Cli::commands`] as D-Bus `Apply` hands them over: without the window raise a typed
-    /// command line gets for nothing (0.4.0 design §9, and [`Cli::window_command`]). A bus call
+    /// command line gets for nothing (0.4.0 design §9, and `Cli::window_command`). A bus call
     /// comes from a keybind or a status bar, as every other method's does; `--show`,
     /// `--toggle-window` and `--hide` on the line still do what they say.
     #[must_use]

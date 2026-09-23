@@ -85,3 +85,5 @@ countries: vn
 "Follow the system's default device" = "Theo thiết bị mặc định của hệ thống"
 "Input Device Preference" = "Tùy chọn thiết bị đầu vào"
 "Makeup Gain" = "Độ lợi bù"
+"Output Presets" = "Preset đầu ra"
+"Input Presets" = "Preset đầu vào"

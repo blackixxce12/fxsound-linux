@@ -84,3 +84,5 @@ countries: cn sg
 "Follow the system's default device" = "跟随系统默认设备"
 "Input Device Preference" = "输入设备设置"
 "Makeup Gain" = "补偿增益"
+"Output Presets" = "输出预设"
+"Input Presets" = "输入预设"

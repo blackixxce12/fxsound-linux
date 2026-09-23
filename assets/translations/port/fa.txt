@@ -86,3 +86,5 @@ countries: ir
 "Follow the system's default device" = "پیروی از دستگاه پیش‌فرض سیستم"
 "Input Device Preference" = "ترجیح دستگاه ورودی"
 "Makeup Gain" = "بهره جبرانی"
+"Output Presets" = "پیش‌تنظیم‌های خروجی"
+"Input Presets" = "پیش‌تنظیم‌های ورودی"

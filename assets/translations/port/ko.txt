@@ -84,3 +84,5 @@ countries: kr
 "Follow the system's default device" = "시스템 기본 장치 따르기"
 "Input Device Preference" = "입력 장치 설정"
 "Makeup Gain" = "메이크업 게인"
+"Output Presets" = "출력 프리셋"
+"Input Presets" = "입력 프리셋"

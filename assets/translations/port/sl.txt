@@ -86,3 +86,5 @@ countries: sl
 "Follow the system's default device" = "Sledi privzeti napravi sistema"
 "Input Device Preference" = "Prednostna vhodna naprava"
 "Makeup Gain" = "Izravnalno ojačanje"
+"Output Presets" = "Prednastavitve izhoda"
+"Input Presets" = "Prednastavitve vhoda"

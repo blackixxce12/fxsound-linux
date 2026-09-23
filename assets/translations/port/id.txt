@@ -85,3 +85,5 @@ countries: id
 "Follow the system's default device" = "Ikuti perangkat bawaan sistem"
 "Input Device Preference" = "Preferensi perangkat masukan"
 "Makeup Gain" = "Penguatan kompensasi"
+"Output Presets" = "Preset keluaran"
+"Input Presets" = "Preset masukan"

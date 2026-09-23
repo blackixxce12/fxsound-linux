@@ -20,6 +20,7 @@ mod private_bus;
 pub mod selftest;
 pub mod sleep;
 pub mod tray;
+pub mod wake;
 
 pub use app::{App, WindowVisibility};
 pub use commands::{Outcome, WindowRequest};

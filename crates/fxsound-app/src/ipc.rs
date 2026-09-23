@@ -83,6 +83,14 @@
 //! The D-Bus service (`crate::dbus`, 0.4.0 design §9) does not go through the socket: it hands
 //! its command lists to the same channel through a [`Control`], and they are drained, carried out
 //! and answered exactly like a forwarded command line, under the same [`HANDLER_TIMEOUT`].
+//!
+//! # Waking the GUI thread
+//!
+//! Whatever is put on that channel — a forwarded command line, a D-Bus call, a new subscriber's
+//! request for the status document — wakes the GUI thread through the [`crate::wake::Waker`] the
+//! server was started with ([`Listener::serve_waking`]), so it is answered at once rather than at
+//! the pump's next keepalive (0.4.0 design §12). The headless pump waits on the channel itself
+//! ([`Server::arrivals`]).
 
 use std::fs::{self, File, TryLockError};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -96,11 +104,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser as _;
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, TrySendError, bounded, unbounded};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{Cli, Command};
 use crate::events::{AppEvent, EventSink};
+use crate::wake::{Waker, WakingSender};
 
 /// Frame version. Bump when the shape of [`Request`] or [`Response`] changes incompatibly; a
 /// primary rejects anything it does not recognise rather than guessing.
@@ -336,7 +345,18 @@ impl Listener {
     ///
     /// If the socket cannot be put into the blocking mode the accept loop needs.
     pub fn serve(self) -> io::Result<Server> {
-        self.start(None)
+        self.start(None, Waker::new())
+    }
+
+    /// As [`Listener::serve`], waking the GUI thread through `waker` whenever a forwarded command
+    /// line, a D-Bus call or a new subscriber's status request is waiting for it (0.4.0 design
+    /// §12). The one the binary uses: without it, what arrives waits for the pump's keepalive.
+    ///
+    /// # Errors
+    ///
+    /// As [`Listener::serve`].
+    pub fn serve_waking(self, waker: Waker) -> io::Result<Server> {
+        self.start(None, waker)
     }
 
     /// As [`Listener::serve`], with the `status` event built by `status` instead — on the
@@ -346,10 +366,10 @@ impl Listener {
     ///
     /// As [`Listener::serve`].
     pub fn serve_with_status(self, status: StatusSource) -> io::Result<Server> {
-        self.start(Some(status))
+        self.start(Some(status), Waker::new())
     }
 
-    fn start(self, status: Option<StatusSource>) -> io::Result<Server> {
+    fn start(self, status: Option<StatusSource>, waker: Waker) -> io::Result<Server> {
         let Self {
             listener,
             lock,
@@ -358,6 +378,7 @@ impl Listener {
         listener.set_nonblocking(false)?;
 
         let (tx, rx) = unbounded();
+        let tx = WakingSender::new(tx, waker);
         let status = status.unwrap_or_else(|| status_from_application(tx.clone()));
         let shared = Arc::new(Shared {
             tx,
@@ -390,7 +411,7 @@ impl Listener {
 pub type StatusSource = Arc<dyn Fn() -> Option<serde_json::Value> + Send + Sync>;
 
 /// The default [`StatusSource`]: ask the application, the way `fxsound --status --json` does.
-fn status_from_application(tx: Sender<Forwarded>) -> StatusSource {
+fn status_from_application(tx: WakingSender<Forwarded>) -> StatusSource {
     Arc::new(move || {
         let (reply, answer) = bounded(1);
         tx.try_send(Forwarded::new(
@@ -439,6 +460,13 @@ impl Server {
     #[must_use]
     pub fn drain(&self) -> Vec<Forwarded> {
         self.rx.try_iter().collect()
+    }
+
+    /// The channel forwarded command lines and D-Bus calls arrive on, for the headless pump to
+    /// wait on (0.4.0 design §12). Wait on it, do not take from it: [`Server::drain`] does that.
+    #[must_use]
+    pub const fn arrivals(&self) -> &Receiver<Forwarded> {
+        &self.rx
     }
 
     /// Refuse everything forwarded and not yet drained, with the answer a caller gets from an
@@ -629,15 +657,15 @@ impl std::fmt::Debug for Forwarded {
 /// under the same [`HANDLER_TIMEOUT`] and with the same refusals as a forwarded command line.
 #[derive(Clone)]
 pub struct Control {
-    tx: Sender<Forwarded>,
+    tx: WakingSender<Forwarded>,
 }
 
 impl Control {
     /// A control channel whose other end is `tx` — for a test that plays the GUI thread itself.
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn from_sender(tx: Sender<Forwarded>) -> Self {
-        Self { tx }
+    pub(crate) fn from_sender(tx: crossbeam_channel::Sender<Forwarded>) -> Self {
+        Self { tx: tx.into() }
     }
 
     /// Hand `commands` to the GUI thread and wait for its answer.
@@ -939,7 +967,8 @@ fn write_frame(mut stream: &UnixStream, frame: &impl Serialize) -> io::Result<()
 
 /// What the accept loop and the connection threads share.
 struct Shared {
-    tx: Sender<Forwarded>,
+    /// The way to the GUI thread, which it wakes (0.4.0 design §12).
+    tx: WakingSender<Forwarded>,
     status: StatusSource,
     broadcaster: Broadcaster,
     /// Connections being answered right now, against [`MAX_CONNECTIONS`].
@@ -1128,7 +1157,7 @@ fn watch_flags(request: &Request) -> Result<(bool, bool), Response> {
 /// Parsing happens *here*, on the primary, so that the forwarding process gets the same error text
 /// it would have got had it parsed the line itself — which is the whole reason the frame carries
 /// argv rather than a pre-parsed command list.
-fn dispatch(request: Request, tx: &Sender<Forwarded>) -> Response {
+fn dispatch(request: Request, tx: &WakingSender<Forwarded>) -> Response {
     let cli = match Cli::try_parse_from(&request.argv) {
         Ok(cli) => cli,
         Err(e) => return Response::failed(e.render().to_string()),

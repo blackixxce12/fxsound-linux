@@ -85,3 +85,5 @@ countries: ua
 "Follow the system's default device" = "Використовувати типовий пристрій системи"
 "Input Device Preference" = "Налаштування пристрою вводу"
 "Makeup Gain" = "Компенсувальне підсилення"
+"Output Presets" = "Шаблони виводу"
+"Input Presets" = "Шаблони вводу"

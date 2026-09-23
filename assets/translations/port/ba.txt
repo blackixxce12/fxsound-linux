@@ -84,3 +84,5 @@ countries: ba
 "Follow the system's default device" = "Prati zadani uređaj sistema"
 "Input Device Preference" = "Postavke ulaznog uređaja"
 "Makeup Gain" = "Kompenzacijsko pojačanje"
+"Output Presets" = "Profili izlaza"
+"Input Presets" = "Profili ulaza"

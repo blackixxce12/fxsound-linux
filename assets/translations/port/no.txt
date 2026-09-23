@@ -89,3 +89,5 @@ countries: no
 "Follow the system's default device" = "Følg systemets standardenhet"
 "Input Device Preference" = "Innstilling for inndataenhet"
 "Makeup Gain" = "Utjevningsforsterkning"
+"Output Presets" = "Forhåndsinnstillinger for utgang"
+"Input Presets" = "Forhåndsinnstillinger for inngang"
