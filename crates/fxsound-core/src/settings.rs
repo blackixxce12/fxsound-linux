@@ -207,7 +207,8 @@ pub struct Settings {
     pub follow_system_default: bool,
     /// The volume of FxSound's own node per real target, per direction (U10).
     ///
-    /// One entry per `(direction, target)`. Without it WirePlumber restores one volume for
+    /// One entry per `(direction, target, port)` ([`TargetVolume::same_place`]): the speakers and
+    /// the headphones of one sink keep a level each. Without it WirePlumber restores one volume for
     /// `fxsound_sink` whatever it renders to, and a level set for headphones is the level the
     /// speakers get after an unplug. [`Settings::sanitise`] drops an entry that is not a
     /// volume anyone could have set; see [`TargetVolume::sanitised`].
@@ -515,34 +516,37 @@ impl Settings {
         // Replayed onto the node the user listens through, so an entry that is not a volume
         // anyone set goes, rather than being guessed at. Order is kept: it is the order the
         // devices were first heard on, which is the only history the file has. A second entry
-        // for the same lane and device can only be a hand edit; the first is the one every lookup
-        // answers with, so it is the one kept, and the shadow cannot outlive the next save.
+        // for the same lane, device and port can only be a hand edit; the first is the one every
+        // lookup answers with, so it is the one kept, and the shadow cannot outlive the next save.
         let mut kept: Vec<TargetVolume> = Vec::with_capacity(self.device_volumes.len());
         for entry in std::mem::take(&mut self.device_volumes)
             .into_iter()
             .filter_map(TargetVolume::sanitised)
         {
-            if !kept
-                .iter()
-                .any(|seen| seen.direction == entry.direction && seen.target == entry.target)
-            {
+            if !kept.iter().any(|seen| seen.same_place(&entry)) {
                 kept.push(entry);
             }
         }
         self.device_volumes = kept;
     }
 
-    /// The volume remembered for FxSound's node while attached to `target`, if any.
+    /// The volume remembered for FxSound's node while attached to `target` on its port `port`
+    /// (empty for a device with no port), if any.
     #[must_use]
-    pub fn target_volume(&self, direction: DeviceDirection, target: &str) -> Option<&TargetVolume> {
+    pub fn target_volume(
+        &self,
+        direction: DeviceDirection,
+        target: &str,
+        port: &str,
+    ) -> Option<&TargetVolume> {
         self.device_volumes
             .iter()
-            .find(|entry| entry.direction == direction && entry.target == target)
+            .find(|entry| entry.is_for(direction, target, port))
     }
 
     /// Remember a volume the engine reported ([`crate::AudioToUi::TargetVolume`]), replacing the
-    /// entry for the same direction and target. Returns whether anything changed, so the caller
-    /// saves only when there is something to save — a mixer drag reports on every step.
+    /// entry for the same direction, target and port. Returns whether anything changed, so the
+    /// caller saves only when there is something to save — a mixer drag reports on every step.
     ///
     /// An entry the loader would drop is not stored: the file never records a value it would
     /// have to discard again.
@@ -553,7 +557,7 @@ impl Settings {
         match self
             .device_volumes
             .iter_mut()
-            .find(|entry| entry.direction == volume.direction && entry.target == volume.target)
+            .find(|entry| entry.same_place(&volume))
         {
             Some(entry) if *entry == volume => false,
             Some(entry) => {
@@ -1336,6 +1340,7 @@ device = \"mic\"
         TargetVolume {
             direction,
             target: target.to_owned(),
+            port: String::new(),
             channel_volumes: volumes.to_vec(),
             mute: false,
         }
@@ -1450,7 +1455,7 @@ mute = true
             ..Settings::default()
         };
         let answered = s
-            .target_volume(DeviceDirection::Output, "dock")
+            .target_volume(DeviceDirection::Output, "dock", "")
             .cloned()
             .expect("remembered");
         s.sanitise();
@@ -1460,10 +1465,123 @@ mute = true
             "the same name in the other lane stays"
         );
         assert_eq!(
-            s.target_volume(DeviceDirection::Output, "dock"),
+            s.target_volume(DeviceDirection::Output, "dock", ""),
             Some(&answered)
         );
         assert_eq!(answered.channel_volumes, [0.2, 0.2]);
+    }
+
+    fn on_port(port: &str, entry: TargetVolume) -> TargetVolume {
+        TargetVolume {
+            port: port.to_owned(),
+            ..entry
+        }
+    }
+
+    #[test]
+    fn the_speakers_and_the_headphones_of_one_sink_keep_a_volume_each() {
+        const SINK: &str = "alsa_output.pci-0000_00_1f.3.analog-stereo";
+        let mut s = Settings::default();
+        let speakers = on_port(
+            "analog-output-speaker",
+            volume(DeviceDirection::Output, SINK, &[1.0, 1.0]),
+        );
+        let headphones = on_port(
+            "analog-output-headphones",
+            volume(DeviceDirection::Output, SINK, &[0.2, 0.2]),
+        );
+        assert!(s.remember_target_volume(speakers.clone()));
+        assert!(s.remember_target_volume(headphones.clone()));
+        assert_eq!(
+            s.device_volumes.len(),
+            2,
+            "one node, two ports, two entries"
+        );
+        assert_eq!(
+            s.target_volume(DeviceDirection::Output, SINK, "analog-output-headphones"),
+            Some(&headphones)
+        );
+        assert_eq!(
+            s.target_volume(DeviceDirection::Output, SINK, "analog-output-speaker"),
+            Some(&speakers)
+        );
+        assert_eq!(
+            s.target_volume(DeviceDirection::Output, SINK, ""),
+            None,
+            "the node with no port named is a third place"
+        );
+        assert!(s.remember_target_volume(on_port(
+            "analog-output-headphones",
+            volume(DeviceDirection::Output, SINK, &[0.3, 0.3]),
+        )));
+        assert_eq!(s.device_volumes.len(), 2, "replaced on its own port");
+        assert_eq!(
+            s.target_volume(DeviceDirection::Output, SINK, "analog-output-speaker"),
+            Some(&speakers),
+            "and the other port's is untouched"
+        );
+    }
+
+    #[test]
+    fn a_port_is_written_only_when_there_is_one_and_an_entry_without_one_reads_as_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let original = Settings {
+            device_volumes: vec![
+                on_port(
+                    "analog-output-headphones",
+                    volume(DeviceDirection::Output, "alsa_output.pci", &[0.2, 0.2]),
+                ),
+                volume(DeviceDirection::Output, "bluez_output.x.1", &[0.5, 0.5]),
+            ],
+            ..Settings::default()
+        };
+        original.save_to(&path).expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(
+            text.matches("port = ").count(),
+            1,
+            "only the entry with a port says so:\n{text}"
+        );
+        assert!(text.contains("port = \"analog-output-headphones\""));
+        let mut expected = original.clone();
+        expected.sanitise();
+        assert_eq!(Settings::load_from(&path), expected);
+
+        // A file written before ports were kept.
+        let parsed: Settings = toml::from_str(
+            "[[device_volumes]]\ntarget = \"alsa_output.pci\"\nchannel_volumes = [0.4, 0.4]\n",
+        )
+        .expect("an entry without a port");
+        assert_eq!(parsed.device_volumes[0].port, "");
+    }
+
+    #[test]
+    fn a_hand_edited_duplicate_on_another_port_is_no_duplicate() {
+        let mut s = Settings {
+            device_volumes: vec![
+                on_port(
+                    "speaker",
+                    volume(DeviceDirection::Output, "hda", &[0.9, 0.9]),
+                ),
+                on_port(
+                    "headphones",
+                    volume(DeviceDirection::Output, "hda", &[0.1, 0.1]),
+                ),
+                on_port(
+                    "speaker",
+                    volume(DeviceDirection::Output, "hda", &[0.5, 0.5]),
+                ),
+            ],
+            ..Settings::default()
+        };
+        s.sanitise();
+        assert_eq!(s.device_volumes.len(), 2);
+        assert_eq!(
+            s.target_volume(DeviceDirection::Output, "hda", "speaker")
+                .map(|entry| entry.channel_volumes.clone()),
+            Some(vec![0.9, 0.9])
+        );
     }
 
     #[test]
@@ -1477,17 +1595,17 @@ mute = true
         assert!(s.remember_target_volume(volume(DeviceDirection::Output, "dock", &[0.25, 0.25])));
         assert_eq!(s.device_volumes.len(), 3, "replaced in place, not appended");
         assert_eq!(
-            s.target_volume(DeviceDirection::Output, "dock")
+            s.target_volume(DeviceDirection::Output, "dock", "")
                 .map(|v| v.channel_volumes.clone()),
             Some(vec![0.25, 0.25])
         );
         assert_eq!(
-            s.target_volume(DeviceDirection::Input, "dock")
+            s.target_volume(DeviceDirection::Input, "dock", "")
                 .map(|v| v.channel_volumes.clone()),
             Some(vec![0.8]),
             "the microphone's memory of the same node name is its own"
         );
-        assert_eq!(s.target_volume(DeviceDirection::Input, "hdmi"), None);
+        assert_eq!(s.target_volume(DeviceDirection::Input, "hdmi", ""), None);
 
         // The same report twice is not a change, so a mixer drag that settles saves once.
         assert!(!s.remember_target_volume(volume(DeviceDirection::Output, "dock", &[0.25, 0.25])));
@@ -1505,7 +1623,7 @@ mute = true
         assert!(!s.remember_target_volume(volume(DeviceDirection::Output, "dock", &[f32::NAN])));
         assert!(!s.remember_target_volume(volume(DeviceDirection::Output, "", &[0.5])));
         assert_eq!(
-            s.target_volume(DeviceDirection::Output, "dock")
+            s.target_volume(DeviceDirection::Output, "dock", "")
                 .map(|v| v.channel_volumes.clone()),
             Some(vec![0.5, 0.5]),
             "the good memory is not overwritten by a bad report"
@@ -1513,7 +1631,7 @@ mute = true
         // A report too loud to replay is stored as the loudest level that can be.
         assert!(s.remember_target_volume(volume(DeviceDirection::Output, "dock", &[7.0, 7.0])));
         assert_eq!(
-            s.target_volume(DeviceDirection::Output, "dock")
+            s.target_volume(DeviceDirection::Output, "dock", "")
                 .map(|v| v.channel_volumes.clone()),
             Some(vec![4.0, 4.0])
         );

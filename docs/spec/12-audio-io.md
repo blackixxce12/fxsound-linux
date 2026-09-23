@@ -1268,6 +1268,132 @@ Concretely:
 * `mute(true)` writes zeros into the output rather than stopping NODE 2, so the graph and the
   device stay warm and no xrun storm follows an unmute.
 
+#### 19.7.1 0.4.0: per target, and after the chain (upstream review U10, U11)
+
+> **Scope.** Linux only. Implemented in `crates/fxsound-audio/src/volume.rs`, the volume section of
+> `engine.rs` and the `Tail` stage of `lane_dsp.rs`; the contract is `docs/0.4.0-upstream.md` U10
+> and U11. The bullet above that says "let PipeWire's adapter apply them — preferred" is
+> superseded by the measurement below.
+
+**Where the adapter applies the volume, measured.** A private PipeWire 1.6.8 daemon, the engine's
+output pair on a null sink, pink noise from `pw-play` into `fxsound_sink`, the sink turned down
+20 dB with `pw-cli set-param <fxsound_sink> Props '{ "channelVolumes": [0.1, 0.1] }'`, and the
+level recorded behind NODE 2 from the null sink's monitor with `pw-record`
+(`graph_churn::volume::the_sink_volume_is_measured_behind_node_two_with_the_leveller_bypassed_and_at_four`,
+ignored by default; `--ignored --nocapture` prints the numbers). RMS drops behind NODE 2:
+
+| Chain | Programme | 0.3.0: adapter applies the volume | 0.4.0: the lane applies it after the chain |
+| --- | --- | --- | --- |
+| bypassed (`power = false`) | pink, −20 dBFS RMS | 19.9 dB | 19.9 dB |
+| volume leveller at 4 | pink, −20 dBFS RMS | 19.6 / 19.7 / 19.0 dB at 0–3 / 7–10 / 17–20 s | 19.9 / 20.3 / 19.9 dB |
+| volume leveller at 4 | pink, −12 dBFS RMS | **12.5 / 12.3 / 11.7 dB** | 20.0 / 20.3 / 19.7 dB |
+
+The bypassed row settles where the volume is applied: NODE 2's own volume is untouched and nothing in `process()` applied
+a volume, so the 20 dB were applied by NODE 1's adapter, on the way *into* `process()` — a sink's
+adapter runs its channel mixer before its follower. The quiet programme hides it: the leveller's
+RMS target at 4 (0.5) asks for more than its +12 dB cap at both levels, so it boosts the same
+either way. A programme at a music-like level shows it: at unity the leveller has little to do, at
+−20 dB it boosts by up to its cap, and eight of the twenty decibels the user asked for came back.
+On Windows the DSP sees the programme at full level and the endpoint volume acts after it, so the
+port now does the same:
+
+* **The adapter's volume range is clamped to unity.** Both virtual nodes carry
+  `channelmix.min-volume = channelmix.max-volume = 1.0` (§20, §28.2), which PipeWire's
+  `audioconvert` honours since 0.3.72: it stores and publishes every volume a desktop writes —
+  so every slider shows what it set — and multiplies by `clamp(volume, 1, 1)`. The adapter's
+  `mute` is not clamped: a muted node still hands the chain silence.
+* **The lane applies the published volume after its chain.** NODE 1's `param_changed` (NODE 2's in
+  the input lane, whose virtual node is the source) receives every `Props` write before the adapter
+  does, parses `volume`, `channelVolumes` and `mute`, and stores them in the lane's atomics
+  (`LaneVolume`); NODE 1's `process()` reads the per-channel gains once a block and applies them
+  after the chain and the mute, ramped linearly across the block from the gains the last block
+  ended on. Channel counts that do not match the pair's are spread as their average, as the
+  adapter does; a gain is never above +12 dB (`limits::TARGET_VOLUME`).
+* **Only the part up to unity goes after the chain.** A volume above 100 % (a desktop's
+  over-amplification, `wpctl set-volume 1.5`, a remembered +12 dB) multiplied in behind the chain's
+  last limiting stage — Dynamic Boost's −0.3 dBFS ceiling, the voice limiter — would take every
+  loud transient past full scale, and the device's converter would clip it hard. So each
+  channel's gain is split at unity: the part above it is applied in front of the chain (`Boost` in
+  `lane_dsp.rs`), where the adapter applied it before 0.4.0 and the limiter catches the peaks, and
+  the rest behind it. Upstream's endpoint volume, which also acts after the DSP, cannot go above
+  100 % at all. With the power off nothing limits, as before.
+* **An adapter that does not know the keys is detected.** Before 0.3.72 the adapter would apply the
+  volume as well, and the lane would apply it twice. The adapter lists the keys it knows in the
+  `params` of its `Props`; the engine reads them from its own node's whole `Props` and leaves the
+  volume to an adapter that does not clamp. Never from a write: a write's `params` name only what
+  it sets, so `pw-cli set-param fxsound_sink Props '{ params = [ "channelmix.normalize" true ] }'`
+  lists neither bound, and read alone would look like an adapter that does not clamp. Without the
+  second connection (below) nothing reads them, and the lane goes on applying the volume.
+
+**Per target.** Both virtual nodes carry `state.restore-props = false`, which takes WirePlumber's
+`node/state-stream.lua` out of their volume: it keyed one saved volume by `application.id`, so a
+level set for headphones was what the speakers got after an unplug (upstream #615). The engine
+keeps one volume per real device and direction instead (`AudioToUi::TargetVolume`, reported 200–
+400 ms after the volume stops moving, and on every teardown of the pair; the app keeps them as
+`Settings::device_volumes`), and a new pair starts at:
+
+(A real device is a node *and the port it is on*: `TargetVolume::port` is the name of the card's
+active route for the node, empty for a device whose card names none. On a card that is not UCM
+the speakers and the headphones are two ports of one sink, and plugging headphones in only moves
+the active route, with no node coming or going. When the lane's device moves to another port under
+a running pair, the level is remembered for the port it leaves, the new port's is chosen as a new
+pair's would be — the list below — written to the virtual node, and faded in from silence, without
+the pair being rebuilt.)
+
+1. the remembered volume of its target, if there is one — upward too, as upstream 1.2.16 (PR #620);
+2. otherwise, per channel, the lower of a new node's unity and the lane's last pair's volume — or,
+   before the lane has had a pair this run, the quietest level remembered for any device of its
+   direction — or, with nothing remembered for its direction either, the level WirePlumber kept for
+   the node before 0.4.0 (below). A mute carries over. **A change of device never raises the
+   volume** (upstream #606/#607);
+3. with nothing remembered at all, the unity the node was made with.
+
+**The memory comes with the engine.** The output lane is enabled from the start and builds its pair
+as soon as the registry has been read, a round trip after the connection — before a message the app
+sends once `AudioEngine::start` has returned is sure to have been taken in. A remembered volume that
+came as a message could therefore arrive after the first pair, which would have played at unity
+until then. So the app hands its memory over in `StartOptions::target_volumes`
+(`AudioEngine::start_with_options`), and the thread has it before it connects.
+`UiToAudio::SeedTargetVolumes` still replaces the whole memory later; a pair whose volume nothing
+has moved since it was built is then given its target's remembered level, and the app is told.
+
+**An entry with no level is not a level.** `TargetVolume::sanitised` keeps an entry without
+`channel_volumes` — only a hand edit writes one — as a remembered mute. Replayed as a level it
+would be the unity of an empty list, and ranked for rule 2 it would be silence, starting every
+device never seen silent. So the engine drops such an entry unless it is muted, and a muted one
+is a target never seen that keeps its mute: rule 2's level, muted. It is never the quietest level.
+
+**From before 0.4.0.** Taking WirePlumber out made one start the loudest: the first 0.4.0 run
+after an upgrade. 0.3.0's level stays in WirePlumber's `$XDG_STATE_HOME/wireplumber/stream-properties`
+(`~/.local/state/…` without the variable), under `Audio/Sink:application.id:com.fxsound.FxSound`
+for the sink and `Audio/Source:application.id:com.fxsound.FxSound` for the source — `formKey` in
+`state-stream.lua` — which WirePlumber may no longer restore, while the app's memory starts empty.
+A sink left at 0.064 (about −24 dB) would have started 24 dB up. So the engine reads that file
+once, before it connects, and takes the node's entry (`volume` × `channelVolumes`, and `mute`) as
+the last pair's level for rule 2: the first pair starts at the lower of it and unity. It is read,
+never written; it goes on standing in only while nothing newer is remembered for the direction.
+Only WirePlumber 0.5's file is read: 0.4's `restore-stream.lua` kept `Stream/*` nodes only, as far
+as is known without a 0.4 to check against, so a virtual sink started at unity there under 0.3.0
+too.
+
+The lane's DSP has that volume before the pair's first block, and the node's `Props` are told
+through a proxy bound on a **second connection** (`Session::_volume_core`): the server stops
+reading a client that sets a param on another client's node until that node's owner answers
+(`node_set_param` in `impl-node.c`, `pw_impl_client_set_busy`), and on the owner's own connection
+that answer is never read — the write never showed and every later write to the node hung.
+`pipewire` 0.10.1 binds no `pw_stream_set_param`, and the one binding that writes a stream's
+controls, `Stream::set_control`, calls a variadic C function without its terminator. The proxy is
+bound by `node.name` until the stream knows its own id, so a pair rebuilt before that registry
+announced the last pair's node binds the dead node first; the volume is written again to the node
+that replaces it, or the new node would show unity while the lane plays the lower level, and the
+next volume key would raise it.
+
+**A new pair fades in.** The first 30 ms a new pair processes rise linearly from silence, in both
+lanes, after the volume (`lane_dsp::FADE_IN_SECONDS`).
+
+The rule that matters most is unchanged: **nothing here writes the real device's `Props`.** Only
+FxSound's own two virtual nodes are written, and only with the volume they had or a lower one.
+
 ### 19.8 Idle/suspend behaviour
 
 Windows stops the render client when the ring empties, "to allow PC to sleep"
@@ -1275,6 +1401,37 @@ Windows stops the render client when the ring empties, "to allow PC to sleep"
 `idle` and then `suspended` per `suspend-node` / `session.suspend-timeout-seconds` (WirePlumber
 default 5 s). Do **not** fight it. Set `node.always-process = false` (the default) so our sink can
 suspend; set it to `true` only if you observe first-sound truncation on a specific device.
+
+**0.4.0: the microphone sleeps too** (`docs/0.4.0-upstream.md` U19). The input lane's capture
+stream is passive where the server runs a link-group together (28.2), so the microphone, its
+light and a desktop's recording indicator are held only while an application records from
+`fxsound_source`. Measured on PipeWire 1.6.8 in a private daemon
+(`graph_churn::sleep::a_microphone_runs_only_while_something_records_from_fxsound_input`): linked
+to its microphone with nothing recording, neither the capture stream nor the microphone runs; a
+`pw-record` linked to the source runs both and is handed the processed microphone; unlinked, both
+are idle again. While the app holds the microphone awake (`UiToAudio::KeepInputAwake`, the
+calibration wizard and the microphone meters) the engine records its own source with a stream
+called `fxsound_mic_check` — no link-group, not passive, `target.object = fxsound_source`,
+`node.dont-reconnect`/`dont-fallback`/`dont-move`/`linger` — made with each input pair and gone
+with it. Having no link-group is what makes WirePlumber 0.5 switch a Bluetooth headset to its call
+profile for it: `device/autoswitch-bluetooth-profile.lua` only counts a `Stream/Input/Audio` with
+no `node.link-group` that reaches the headset's loopback microphone, and follows it through
+`fxsound_source`'s group to the capture stream and on to the headset, as it does for a call
+recording from FxSound (Input). The capture stream itself, in the input lane's group, never
+switched a headset. Echo cancellation keeps all of this. The canceller's own capture and monitor
+streams are passive, so with it loaded the microphone and the speakers it listens to also run only
+while something records from FxSound (Input) (29.2).
+
+**0.4.0: the system's sleep** (U13). The app forwards logind's `PrepareForSleep` as
+`UiToAudio::SystemSleeping`. Going to sleep, both lanes are silenced after their chains by the
+engine itself — a per-lane flag their NODE 1 reads beside the snapshot's `mute` — and no device
+rules run. On waking, both chains are sent `ResetFilterState`; every enabled lane's rules are
+owed again, whatever backoff it was serving, and a lane whose device is not back waits up to 2.5 s
+for it (`RETURN_WAIT`) whether or not its card is, since a Bluetooth headset's card goes with the
+suspend and comes back with the reconnection. Each lane is heard again on the tick its rules leave
+it attached — within 200 ms (the next supervisor tick) when its device is there — or after 2 s at
+the latest. A sleep that is never followed by a wake is given up after 60 s of the system being
+awake. There is no sleep inhibitor, by upstream's decision (PR #533).
 
 ---
 
@@ -1302,6 +1459,8 @@ suspend; set it to `true` only if you observe first-sound truncation on a specif
 | `priority.session` | `1010` | Slightly above typical ALSA sinks (≈1000) so that, if the user has never chosen a default, policy prefers us. Set to `500` if you would rather never win by default. |
 | `priority.driver` | `0` | We are not a driver. |
 | `monitor.channel-volumes` | `"false"` | |
+| `state.restore-props` | `"false"` (0.4.0) | WirePlumber restores no volume for the node; the engine keeps one per target (§19.7.1). |
+| `channelmix.min-volume` / `channelmix.max-volume` | `"1.0"` / `"1.0"` (0.4.0) | The adapter keeps every volume written and applies none; the lane applies it after its chain (§19.7.1). |
 
 ### NODE 2 — the output stream
 
@@ -1318,7 +1477,8 @@ suspend; set it to `true` only if you observe first-sound truncation on a specif
 | `node.dont-reconnect` | `"true"` (0.4.0; was `"false"`) | WirePlumber must never move it: with `"false"` it moved the stream onto the fallback sink by itself whenever a Bluetooth headset switched profile. The rules choose the target, and rebuild the pair on a target that came back as a new node, because WirePlumber never links a handled dont-reconnect stream again (`linking/prepare-link.lua:71-76`; `docs/0.4.0-upstream.md` U8). The input lane's capture stream carries the same three keys. |
 | `node.dont-fallback` | `"true"` (0.4.0) | A target that is missing at the first link is waited for rather than replaced by the default (`find-defined-target.lua:116-128`). |
 | `node.linger` | `"true"` (0.4.0) | …and the stream is kept while it waits instead of being sent an error and destroyed (`find-defined-target.lua:117-123`, `prepare-link.lua:106-119`). |
-| `node.passive` | `"false"` | Keep the device awake while audio flows. |
+| `state.restore-props` | `"false"` (0.4.0) | WirePlumber keeps one volume per *application* for streams (`node/state-stream.lua`, `formKey`: media class and `application.id`) and restores it onto every new stream with that key, whatever device it plays to. A level or mute set on this stream in a mixer would come back on every later pair, where FxSound cannot see it. The input lane's capture stream and the keep-awake recorder (19.8) carry it too — those two share one key, so a mute set on the recorder would otherwise land on the microphone. |
+| `node.passive` | `"true"` on PipeWire 0.3.68 and later (0.4.0; was `"false"`), `"false"` before | The speakers run only while something plays into NODE 1: an application's link runs the virtual sink, the server runs the link-group with it (`run_nodes`, `src/pipewire/context.c`), and NODE 2's link runs the speakers; with nothing playing into FxSound they go idle and suspend (19.8). Older servers do not run a link-group together, and a passive NODE 2 there would never be woken: it stays an ordinary stream, and the main loop pauses and resumes it with NODE 1 (`SecondNodePace`, `docs/0.4.0-design.md` §1.3). |
 | `stream.dont-remix` | `"false"` (default) — set `"true"` only if reproducing §11's hand-written upmixes | |
 | `node.latency` | same `"<quantum>/<rate>"` as NODE 1 | |
 | `node.hidden` | `"true"` *(optional)* | Hides the duplicate entry in pavucontrol; the analogue of `AUDCLNT_SESSIONFLAGS_DISPLAY_HIDE` (`sndDevicesSetupDevices.cpp:172`). **Verify per-UI before shipping** — see Open Questions. |
@@ -1453,7 +1613,7 @@ profile removes its sink and adds it back under the same `node.name` about half 
 a new node with a new `object.serial`; an ALSA card switched to another profile does the same to its
 nodes. In 0.3.0 the next tick moved the lane to the laptop's speakers for the length of the switch.
 Since 0.4.0 each lane decides per node that goes (`engine.rs`: `Hold`, `hold_for_return`,
-`remove_card`, `is_same_node`):
+`remove_card`, `is_same_node`, `Departure`):
 
 * **The card stays: hold.** When the node that goes is the one the lane is on, and its card — the
   `Device` object the node names by `device.id`, or, for a Bluetooth node, by
@@ -1461,23 +1621,71 @@ Since 0.4.0 each lane decides per node that goes (`engine.rs`: `Hold`, `hold_for
   `RETURN_WAIT` (2.5 s). NODE 1 and NODE 2 stay as they are, and WirePlumber leaves NODE 2 —
   `node.dont-reconnect`, `node.dont-fallback`, `node.linger` (§20) — unlinked and waiting instead
   of moving it to the fallback or destroying it. Only that lane waits; the other lane goes on as
-  usual, and any other node's going is news for the rules once the hold ends. A node that goes
-  again during its hold keeps the first deadline, so a node that flaps cannot hold a lane for ever.
+  usual. Any other node's going makes the rules run again once the hold ends — though a node that
+  went while its card stayed still counts as seen by them (*Expected back*, below). A node that
+  goes again during its hold keeps the first deadline, so a node that flaps cannot hold a lane for
+  ever.
 * **The card goes: no wait, or the wait ends.** A node on no card (a virtual sink, a null sink),
   or whose card has already gone, is not waited for: the rules re-run on the next tick, as in 0.3.0.
   A card that goes *during* a hold ends it at once, and the rules run on the next tick
   (`remove_card`, `Hold::card_present`). A headset switched off, or a USB card pulled out, removes
   its node and its card in one batch of registry events, and the batch may name the node first: for
   that moment the node looks like one between profiles, and only the card's going shows otherwise.
+* **The card adds it back under another name: the wait ends.** An ALSA card switched to another
+  profile removes its nodes and adds the new profile's, and a node whose path changed comes back
+  renamed — `analog-stereo` as `analog-surround-51`, the speakers as the HDMI output. Its old name
+  never returns, and a lane that waited for it would sit on an unlinked NODE 2, silent, for the
+  whole of `RETURN_WAIT`. So a hold remembers the names of the card's other nodes of the lane's
+  direction that it had when the node went (`Hold.known`), and ends on the next tick once the
+  card — tied as above, by `device.id` or the Bluetooth address — lists a node of that direction
+  under a name it did not have then (`Hold::renamed`); the rules then run on the device list as it
+  is, where the newcomer is a device just plugged in, and the log says which name came back as
+  which. It takes the lane only when the rules put nothing listed above it: unranked, by rule 5;
+  ranked, by its place — a name the ranking does not hold goes after every ranked device unless new
+  devices go first, so a ranked device on another card takes the lane before it. A node the card already had is no rename: a UCM card's other sinks, which a profile
+  applied again removes and puts back one by one under their own names, leave the lane waiting for
+  its own. "Had" is read from two lists (`Hold::after_removal`), because ACP removes a card's
+  nodes one at a time, in the order of its devices, and adds them back in the same order: the
+  card's nodes still listed, and those that went just before the lane's and are still expected
+  back (*Expected back*, below). With the first list alone, a lane on a later node — the
+  headphones or the HDMI output, behind the speakers — knew nothing of the speakers already gone,
+  took them coming back, a tick ahead of its own node, for its node renamed, and was moved to
+  another device while its own was on its way; and with a ranking, its own node came back no
+  newcomer, so the lane stayed there.
+* **Expected back, whichever lane was on it.** Any node that goes while its card stays counts as
+  seen by the rules of its direction until `RETURN_WAIT` is up, whether or not a lane was on it
+  (`Departure`, kept in `Lane.departures`; `choose` adds every one still expected to
+  `previous_names` each time the rules run, §28.5). A hold only keeps the lane that was *on* the
+  node from choosing another device. Without this, the other lane's rules ran during the gap —
+  the supervisor's tick is 200 ms, a Bluetooth profile switch takes about a second — forgot the
+  node, and took it for a device just plugged in when it came back: one ranked above the lane's
+  device, or, unranked, any device at all when nothing is picked, took the lane. A headset ranked
+  above the speakers the user picked took the music from them, in mono at 16 kHz, whenever a call
+  switched it to its call profile. On Windows the endpoints stay through a profile switch, and
+  upstream never sees an arrival. A node that stays away longer and then comes has arrived; one
+  that goes again starts its wait afresh; a card that goes takes its nodes' departures with it
+  (`remove_card`). The same record keeps the app from undoing it: a `UiToAudio::SelectDevice`
+  naming the device the user picked, within `RETURN_WAIT` of its coming back
+  (`Departure::just_back`), is the app announcing its saved device again because it was listed
+  again, not a pick, and does not put that device above the ranking (`repeats_what_the_lane_has`;
+  Phase C part 2 is to stop announcing it). The price is a real click on that same device in that
+  window, which is taken as no more than what the ranking says.
 * **The node comes back: rebuild, do not keep.** The hold ends when a node of that name is listed
-  again — or when the user picks a device, the lane is detached or the connection to PipeWire is
-  lost (the next server lists its devices afresh). If `RETURN_WAIT` runs out first, the rules
-  choose another device and the log says so. Whether the lane's pair is already on what the rules
-  choose is asked of the target's `node.name` **and** its `object.serial` (`is_same_node`), never
-  the name alone: WirePlumber never links a handled `node.dont-reconnect`
-  stream again (`linking/prepare-link.lua:71-76`), so a pair kept because the name matched would
-  play into nothing. The new serial rebuilds the pair, and the new pair's NODE 2 is a new stream,
+  again — or when the card lists the node under another name (above), the user picks a device,
+  the lane is detached or the connection to PipeWire is lost (the next server lists its devices
+  afresh). If `RETURN_WAIT` runs out first, the rules choose another device and the log says so.
+  Whether the lane's pair is already on what the rules choose is asked of the target's
+  `node.name` **and** its `object.serial` (`is_same_node`), never the name alone: WirePlumber
+  never links a handled `node.dont-reconnect` stream again (`linking/prepare-link.lua:71-76`), so
+  a pair kept because the name matched would play into nothing. The new serial rebuilds the pair, and the new pair's NODE 2 is a new stream,
   which WirePlumber links. A server that reports no serial leaves the name to decide, as before.
+* **What is still waited out: a card switched to `off`.** A card set to its `off` profile (in
+  `pavucontrol`'s Configuration tab, or by `wpctl set-profile`) removes its nodes and adds none,
+  and its `Device` object stays. Nothing ends the hold early: no node comes back under the old
+  name or a new one, and the card does not go. The lane sits on its unlinked NODE 2, silent, for
+  the whole of `RETURN_WAIT` (2.5 s) before the rules choose another device, and the card's nodes
+  count as seen for as long (above). From the registry alone that switch looks like the first half
+  of any other; the card's `Profile` param would tell them apart, and the engine does not read it.
 
 Tested against a private daemon in `graph_churn.rs`:
 `a_headset_between_profiles_keeps_the_output_lane_and_its_sink_is_linked_again` (the sink,
@@ -1486,10 +1694,30 @@ rebuilt on the new serial, and NODE 2 is linked to it again),
 `a_headset_that_goes_for_good_is_given_up_once_the_lane_has_waited_for_it` (tied by
 `api.bluez5.address` alone; the lane moves once `RETURN_WAIT` is up),
 `a_headset_switched_off_is_left_as_soon_as_its_card_goes_after_its_sink` (the lane waits while the
-card stays and moves on the tick after the card's `global_remove`) and
-`speakers_on_no_card_that_go_are_replaced_at_once`; the rules themselves by the `Hold`,
-`hold_for_return`, `remove_card` and `is_same_node` unit tests in `engine.rs` and the card-matching
-tests in `devices.rs`.
+card stays and moves on the tick after the card's `global_remove`),
+`speakers_on_no_card_that_go_are_replaced_at_once`,
+`a_sink_its_card_brings_back_under_another_name_ends_the_wait_at_once` (the sink is removed and a
+sink of another name added on its card: the lane is on the new one before `RETURN_WAIT` is up) and
+`a_headset_back_from_a_profile_switch_takes_nothing_from_the_speakers_the_user_picked` (the headset
+is ranked above the speakers, the user picked the speakers; its sink goes while its card stays,
+the output lane's rules run while it is away, and it comes back: the lane never moves).
+Beside them, two tests of what a `Departure` must not swallow — a device that did arrive — and of
+the ranking the rules run on (`docs/0.4.0-upstream.md` U4):
+`a_device_plugged_in_takes_the_lane_while_the_app_puts_new_devices_first` (with
+`SetDevicePriority`'s `new_devices_first`, a device plugged in takes the lane from the picked one
+on its own arrival run, before the app's list that ranks it first can arrive) and
+`a_ranking_handed_over_at_start_makes_the_first_choice_of_output` (with
+`StartOptions::output_priority`, the lane's first device is the ranking's first, not the session
+default moved from a moment later). The rules themselves are tested by the `Hold`,
+`hold_for_return`, `remove_card`, `Hold::renamed`, `Departure` and `is_same_node` unit tests in
+`engine.rs` (among them
+`a_sink_that_leaves_with_its_card_and_comes_back_is_not_new_to_a_lane_that_is_not_on_it`,
+`a_node_of_the_held_card_under_another_name_ends_the_wait_on_the_next_tick`,
+`a_card_that_puts_its_other_nodes_back_under_their_own_names_keeps_the_wait`,
+`a_card_that_removes_the_lanes_node_after_another_still_waits_for_its_own`,
+`a_hold_knows_the_nodes_its_card_removed_just_before_and_no_others` and
+`a_saved_device_announced_again_after_a_profile_switch_does_not_beat_the_ranking`) and the
+card-matching tests in `devices.rs`.
 
 ---
 
@@ -1902,10 +2130,12 @@ the ring unchanged. Only properties, targets, metadata keys and bookkeeping diff
 | `node.link-group` | `"fxsound-input"` (`"fxsound"` in 0.3.0) | **Mandatory** — see 28.3; the input lane's own group since 0.4.0, 29.2. |
 | `target.object` | the chosen source's `node.name` | |
 | `stream.capture.sink` | `"false"` | Capture the microphone itself, not a sink monitor. |
-| `node.autoconnect` / `node.passive` | `"true"` / `"false"` | As NODE 2 of §20. |
+| `node.autoconnect` | `"true"` | As NODE 2 of §20. |
+| `node.passive` | `"true"` on PipeWire 0.3.68 and later (0.4.0; was `"false"`), `"false"` before | The microphone runs only while something records from NODE 2: the recorder's link runs the source, the server runs the link-group with it, and the capture stream's link runs the microphone (19.8). Older servers do not run a link-group together, and a passive capture stream there would never be woken. |
 | `node.dont-reconnect` | `"true"` (0.4.0; was `"false"`) | As NODE 2 of §20: WirePlumber links the stream to its microphone once and never moves it; a microphone that comes back as a new node gets a new pair. |
 | `node.dont-fallback` | `"true"` (0.4.0) | As NODE 2 of §20. |
 | `node.linger` | `"true"` (0.4.0) | As NODE 2 of §20. |
+| `state.restore-props` | `"false"` (0.4.0) | As NODE 2 of §20. Its WirePlumber key, `Input/Audio:application.id:com.fxsound.FxSound`, is also the keep-awake recorder's. |
 | `node.latency`, `stream.dont-remix`, `application.*` | as §20 | |
 | connect | `Direction::Input`, `AUTOCONNECT \| MAP_BUFFERS \| RT_PROCESS` | A capture stream *receives* audio. |
 
@@ -1923,6 +2153,7 @@ the ring unchanged. Only properties, targets, metadata keys and bookkeeping diff
 | `node.always-process` | `"false"` | |
 | `audio.channels` / `audio.rate` / `audio.format` / `audio.position` | as §20 NODE 1: `clamp(source.channels, 2, 8)`, graph rate, `F32`, the source's positions | A **mono microphone is accepted**: the stream declares `2` and PipeWire's adapter up-mixes. `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES` was a playback-driver workaround and does not apply to capture. |
 | `device.class`, `priority.session` = `500`, `priority.driver` = `0`, `monitor.channel-volumes`, icons | as §20 NODE 1 | Never wins the default implicitly (§21, open question 2). |
+| `state.restore-props`, `channelmix.min-volume`, `channelmix.max-volume` | as §20 NODE 1 (0.4.0) | One remembered volume per microphone, applied by the lane after the voice chain (§19.7.1). |
 | connect | `Direction::Output`, `MAP_BUFFERS \| RT_PROCESS` — **no** `AUTOCONNECT` | A source does not connect anywhere; recorders connect *to* it. |
 
 The format is decided once per `build_nodes` and declared on both nodes, exactly as §19.3.
@@ -1977,7 +2208,11 @@ whatever WirePlumber had as the default source instead.
 microphone never forgets which speakers the user had. `pwszIDPreviousRealDevices` is kept per lane
 (`previous_names`) and cleared whenever the lane is switched on again, when it is detached, and on
 every connect and disconnect, so rule 5 cannot treat every device that appeared while the lane was
-not looking as freshly plugged.
+not looking as freshly plugged. Since 0.4.0 it also holds every node of the direction that went
+while its card stayed, until `RETURN_WAIT` is up, whichever lane was on it (`Departure`, §22):
+they are kept in `Lane.departures`, which is cleared on connect and disconnect but kept while the
+lane is detached or off, and added to `previous_names` on every run of the rules, so a node back
+from a profile switch is never a device just plugged in, not even to a lane switched on meanwhile.
 
 `--output NAME` matches a device of either direction (node name first, then description);
 `--next-output` cycles only within the selected device's direction so a compositor keybind never
@@ -2064,9 +2299,10 @@ among its sources.
 
 **Per lane:** enabled flag; the pair of nodes; the DSP (`LaneDsp`) and its recycle channel; the
 ring; the counters and stream flags the process callbacks write; `previous_names` (rule 5's
-snapshot); `want_default`; `needs_rules`; the backoff (`attempts`, `next_attempt`, and `built_at`,
-when the current pair came up); the format mismatch total; the published `ProcessLatency`; the last
-status, error and attachment the GUI was told. **Per direction but not in the lane:**
+snapshot); `departures` (§22, kept while the lane is detached); `want_default`; `needs_rules`;
+the backoff (`attempts`, `next_attempt`, and `built_at`, when the current pair came up); the
+format mismatch total; the published `ProcessLatency`; the last status, error and attachment the
+GUI was told. **Per direction but not in the lane:**
 `SelectionMemory` (§28.5) and the metadata's view of the default (`DefaultState`), which exist
 whether or not the lane runs. **Shared:** the connection, the registry's device list, the node
 probes, the graph rate and the socket's own backoff.
@@ -2092,16 +2328,24 @@ only thing that reads the group.
 
 **The server runs a group together.** Since 0.3.68, PipeWire's scheduler puts every active member
 of a link-group under one driver (`collect_nodes`) and makes all of them runnable as soon as one
-is (`run_nodes`, `src/pipewire/context.c`). The input lane's capture stream runs for as long as
-the lane is on, because the microphone feeds it. In one group with the output pair, it made
-`fxsound_output` runnable, and `fxsound_output`'s link made the speakers run: the speakers never
-went idle while the microphone lane was on. That undid the idle work of the 0.4.0 design (§1.3,
-§12), which makes the output lane's NODE 2 passive so that it runs only with its sink. Measured
-on PipeWire 1.6.8 in a private daemon: with one group, linking the microphone alone had the output
-lane report `processing`. With a group per lane, `graph_churn::a_microphone_being_captured_does_not_keep_the_speakers_awake`
+is (`run_nodes`, `src/pipewire/context.c`). When this section was written, the input lane's
+capture stream ran for as long as the lane was on, because the microphone fed it. In one group
+with the output pair, it made `fxsound_output` runnable, and `fxsound_output`'s link made the
+speakers run: the speakers never went idle while the microphone lane was on. That undid the idle
+work of the 0.4.0 design (§1.3, §12), which makes the output lane's NODE 2 passive so that it runs
+only with its sink. Measured on PipeWire 1.6.8 in a private daemon: with one group, linking the
+microphone alone had the output lane report `processing`. With a group per lane, `graph_churn::a_microphone_being_captured_does_not_keep_the_speakers_awake`
 holds the speakers' pair and the speakers idle while the microphone is captured, and
 `graph_churn::a_tone_driven_through_each_lane_reaches_that_lane_and_no_other` holds the output
 lane silent until something plays into its sink.
+
+Since the upstream review (U19) the capture stream is passive on such a server (28.2, 19.8), and
+runs only while something records from FxSound (Input): an application, or the engine's own
+`fxsound_mic_check` while the app holds the microphone awake. Echo cancellation does not change
+that, because the canceller in front of the capture stream is passive too (below). The groups
+stay split all the same. A recording is exactly what runs the capture stream now, and in one
+group with the output pair it would run the speakers too, so a voice recorder or a call would
+keep them awake whether or not anything played into FxSound (Output).
 
 **WirePlumber is still satisfied, because each stream shares a group with its own virtual
 node.** WirePlumber consults the group in one place that matters here, `linking-utils.lua`
@@ -2135,4 +2379,13 @@ the same-group check comes before the walk. `fxsound` would pass `canLink`, but 
 run the output pair whenever the canceller's capture stream runs, which is the problem above.
 §7 also records what echo cancellation costs in idle whichever group it is given: the module
 puts its streams in one `node.group` as well, and the monitor stream it records the speakers with
-keeps them and the output pair running.
+keeps them and the output pair running for as long as the canceller runs. Since U19, on a server
+that runs a link-group together, the canceller runs only while something records from FxSound
+(Input). PipeWire's module makes its capture and monitor streams passive, and the capture stream
+that records its source is passive now as well, so nothing in the chain runs it by itself.
+Measured on PipeWire 1.6.8 in a private daemon
+(`graph_churn::echo_cancellation_holds_nothing_awake_while_nothing_records_from_fxsound_input`):
+with the canceller wired in front of the microphone and nothing recording, the microphone, the
+canceller, both pairs and the speakers all stay idle. A recording runs all of them, and when it
+stops they are idle again while the canceller stays loaded. Before U19 the capture stream was an
+ordinary one, and its link to the canceller's source ran all of it for as long as the lane was on.

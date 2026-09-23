@@ -1327,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_connection_says_both_lanes_stopped_and_why() {
+    fn a_lost_connection_says_both_lanes_stopped_and_that_the_audio_is_disconnected() {
         let (mut app, engine, _dir) = started();
         hear(
             &mut app,
@@ -1353,8 +1353,13 @@ mod tests {
             })
             .collect();
         assert_eq!(stopped, [(OUT, LaneState::Idle), (IN, LaneState::Idle)]);
-        assert!(
-            matches!(events.last(), Some(AppEvent::Notice { message }) if message.contains("PipeWire went away")),
+        // The notice the window shows, in the user's language; the engine's English reason is
+        // a log line, as an engine error's text is.
+        assert_eq!(
+            events.last(),
+            Some(&AppEvent::Notice {
+                message: "Audio disconnected".to_owned()
+            }),
             "{events:?}"
         );
     }

@@ -39,6 +39,7 @@ use egui::{
     Align2, CornerRadius, Id, Key, Mesh, Rect, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder,
     Vec2, pos2, vec2,
 };
+use fxsound_core::DeviceDirection;
 use fxsound_core::i18n::tr;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -177,6 +178,10 @@ impl ImportSummary {
 /// Everything the import flow remembers between frames.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportState {
+    /// The lane the window was opened for: its store is the one imported into, `.fac` files for
+    /// the speakers and voice presets for the microphone, whichever lane the window has been
+    /// moved to since — by the tray, the command line or D-Bus — when Import is pressed.
+    pub lane: DeviceDirection,
     /// The folder the app's picker came back with, or `None` while nothing is chosen.
     pub folder: Option<PathBuf>,
     /// Set once the import has run; while it is `Some` the summary window is shown instead of the
@@ -554,6 +559,9 @@ pub fn overwrite_message(names: &[String]) -> String {
 /// Everything the export window remembers between frames.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExportState {
+    /// The lane the window was opened for, whose names [`ExportState::presets`] lists: its store
+    /// is the one exported from, whichever lane the window has been moved to since.
+    pub lane: DeviceDirection,
     /// Every preset, factory and user alike — the list comes straight from the model
     /// (`FxPresetExportDialog.cpp:138-141`).
     pub presets: Vec<String>,
@@ -1099,6 +1107,7 @@ mod tests {
         let ctx = test_context();
         let mut assets = AssetCache::new();
         let state = ImportState {
+            lane: DeviceDirection::Output,
             folder: Some(PathBuf::from("/home/u/Documents/presets")),
             summary: Some(ImportSummary {
                 imported: (0..12).map(|i| format!("Imported {i}")).collect(),
@@ -1126,6 +1135,7 @@ mod tests {
         let ctx = test_context();
         let mut assets = AssetCache::new();
         let state = ImportState {
+            lane: DeviceDirection::Output,
             folder: Some(PathBuf::from("/tmp/empty")),
             summary: None,
             notice: Some(NO_PRESETS_FOUND.to_owned()),
@@ -1196,6 +1206,7 @@ mod tests {
         let ctx = test_context();
         let mut assets = AssetCache::new();
         let state = ExportState {
+            lane: DeviceDirection::Output,
             presets: (0..30).map(|i| format!("Preset {i}")).collect(),
             selected: [1, 4].into_iter().collect(),
             exporting: true,

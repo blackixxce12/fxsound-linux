@@ -331,6 +331,7 @@ pub struct FxComboBox<'a> {
     selected: Option<usize>,
     enabled: bool,
     placeholder: &'a str,
+    current: Option<&'a str>,
     error: Option<bool>,
     separator_before: Option<usize>,
     headers: &'a [SectionHeader<'a>],
@@ -350,6 +351,7 @@ impl<'a> FxComboBox<'a> {
             selected,
             enabled: true,
             placeholder: "",
+            current: None,
             error: None,
             separator_before: None,
             headers: &[],
@@ -383,6 +385,15 @@ impl<'a> FxComboBox<'a> {
     #[must_use]
     pub fn placeholder(mut self, text: &'a str) -> Self {
         self.placeholder = text;
+        self
+    }
+
+    /// What the closed box shows when no item is selected and yet something is current: a device
+    /// a lane is on that the list does not carry right now **(port addition)**. Drawn as a
+    /// selected item is, not dimmed as the placeholder, which means nothing is chosen.
+    #[must_use]
+    pub fn current(mut self, text: Option<&'a str>) -> Self {
+        self.current = text;
         self
     }
 
@@ -442,6 +453,7 @@ impl<'a> FxComboBox<'a> {
             selected,
             enabled,
             placeholder,
+            current,
             error,
             separator_before,
             headers,
@@ -465,10 +477,13 @@ impl<'a> FxComboBox<'a> {
             rect,
             palette,
             assets,
-            items,
-            selected,
+            BoxText {
+                items,
+                selected,
+                placeholder,
+                current,
+            },
             enabled,
-            placeholder,
             error,
             accent,
             &response,
@@ -494,6 +509,15 @@ impl<'a> FxComboBox<'a> {
     }
 }
 
+/// What the closed box can show: the selected item, or what is current without being an item,
+/// or the placeholder.
+struct BoxText<'a> {
+    items: &'a [String],
+    selected: Option<usize>,
+    placeholder: &'a str,
+    current: Option<&'a str>,
+}
+
 /// Everything `FxTheme::drawComboBox` puts on screen, in its order (`FxTheme.cpp:135-164`).
 #[allow(clippy::too_many_arguments)]
 fn paint_box(
@@ -501,14 +525,18 @@ fn paint_box(
     rect: Rect,
     palette: Palette,
     assets: &mut AssetCache,
-    items: &[String],
-    selected: Option<usize>,
+    text: BoxText<'_>,
     enabled: bool,
-    placeholder: &str,
     error: Option<bool>,
     accent: bool,
     response: &Response,
 ) {
+    let BoxText {
+        items,
+        selected,
+        placeholder,
+        current,
+    } = text;
     let painter = ui.painter().clone();
     let corner = CornerRadius::same(corner_radius(rect.height()) as u8);
 
@@ -526,10 +554,13 @@ fn paint_box(
     );
 
     let font = theme::semibold(font_size(rect.height()));
-    let text = selected.and_then(|index| items.get(index));
+    let text = selected
+        .and_then(|index| items.get(index))
+        .map(String::as_str)
+        .or(current);
     let (label, colour, left) = match text {
         Some(label) => (
-            label.as_str(),
+            label,
             text_colour(palette, enabled, response.hovered()),
             rect.left() + TEXT_LEFT,
         ),

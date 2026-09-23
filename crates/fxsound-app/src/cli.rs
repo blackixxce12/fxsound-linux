@@ -316,6 +316,16 @@ pub struct Cli {
     )]
     pub run_minimized: bool,
 
+    /// How the D-Bus activation file and the systemd user unit start FxSound: as `--hide`, except
+    /// that when FxSound is already running this process exits at once and forwards nothing.
+    ///
+    /// Linux addition. The bus starts FxSound for a call to a name nobody owns yet, and an
+    /// instance started from the launcher only owns it once its audio engine is up: a status
+    /// bar's poll landing in between used to start `fxsound --hide`, which found the lock taken,
+    /// forwarded `--hide` and hid the window that had just been opened.
+    #[arg(long = "activated")]
+    pub activated: bool,
+
     /// Show and raise the window of the running instance.
     ///
     /// Linux addition (`docs/spec/07-startup-tray.md` §4.7). The original has no such option
@@ -697,7 +707,7 @@ impl Cli {
     fn window_command(&self) -> Option<WindowCommand> {
         if self.is_query() {
             None
-        } else if self.run_minimized {
+        } else if self.run_minimized || self.activated {
             Some(WindowCommand::Hide)
         } else if self.toggle_window {
             Some(WindowCommand::Toggle)
@@ -1378,6 +1388,20 @@ mod tests {
             parse(&["--toggle-window"])
                 .commands()
                 .contains(&Command::Window(WindowCommand::Toggle))
+        );
+    }
+
+    #[test]
+    fn an_activated_start_is_a_hidden_start() {
+        // What the D-Bus activation file and the user unit run: hidden, as `--hide`, and the
+        // hiding is honoured at a cold start. As a second process it forwards nothing at all,
+        // which `main` decides before anything is forwarded.
+        let cli = parse(&["--activated"]);
+        assert!(cli.activated);
+        assert!(!cli.run_minimized);
+        assert_eq!(
+            cli.cold_start_commands(),
+            [Command::Window(WindowCommand::Hide)]
         );
     }
 

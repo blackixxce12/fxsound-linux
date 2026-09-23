@@ -1129,3 +1129,139 @@ fn a_default_the_user_gave_an_opted_out_lane_by_hand_survives_a_reconnect() {
         "and the lane is still opted out"
     );
 }
+
+/// Wait, without turning this main loop, until the server no longer lists the node called `name`.
+/// Whether it came to.
+fn gone_from_the_server(graph: &PrivateGraph, name: &str) -> bool {
+    let deadline = Instant::now() + PATIENCE;
+    while graph.node_id(name).is_some() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    true
+}
+
+/// A running application is known by its stream's properties and its client's, each through a
+/// probe of its own, and both probes go with it: dropped at once when the server removed them
+/// before the registry said the objects had gone, which is the order it keeps for a bind that
+/// succeeded.
+#[test]
+fn a_running_stream_is_known_through_its_own_probe_and_its_clients_and_both_go_with_it() {
+    let Some(graph) = PrivateGraph::start("appprobe") else {
+        return;
+    };
+    if !installed("pw-cat") {
+        skip("pw-cat is not installed, so the probes of application streams were not checked");
+        return;
+    }
+    let harness = Harness::connect(graph);
+    let app = harness
+        .meanwhile(|graph| graph.pw_cat("--playback", "t_player", "application.name = Player", &[]))
+        .expect("pw-cat should play");
+    assert!(
+        harness.until("the player, complete", |shared| {
+            shared
+                .apps
+                .report()
+                .iter()
+                .any(|stream| stream.app.name == "Player")
+        }),
+        "the player was never known well enough to report"
+    );
+    let (stream_id, client_id) = {
+        let shared = harness.shared.borrow();
+        let listed = shared.apps.report();
+        let player = listed
+            .iter()
+            .find(|stream| stream.app.name == "Player")
+            .expect("listed");
+        assert_eq!(
+            player.app.binary, "pw-cat",
+            "a stream that names no binary is known by its client's"
+        );
+        let client = shared
+            .apps
+            .stream(player.id)
+            .and_then(|stream| stream.client)
+            .expect("a stream names its client");
+        assert!(shared.app_probes.contains_key(&player.id));
+        assert!(shared.app_probes.contains_key(&client));
+        (player.id, client)
+    };
+
+    drop(app);
+    assert!(
+        harness.until("the player gone", |shared| {
+            shared.apps.stream(stream_id).is_none() && !shared.app_probes.contains_key(&client_id)
+        }),
+        "the player's stream or client was kept after it exited"
+    );
+    let shared = harness.shared.borrow();
+    assert!(!shared.app_probes.contains_key(&stream_id));
+    assert!(
+        shared.retired_probes.is_empty(),
+        "a probe the server had removed was kept"
+    );
+    assert!(!shared.restart_requested);
+}
+
+/// A client or a stream that has gone before the main loop binds it — a `pw-dump`, a sound played
+/// for a moment — must not cost the connection. The bind fails, and the probe's proxy names an
+/// object the server never made: dropped as the registry says the object went, it would send the
+/// server a `destroy` it answers with a core error, and a core error restarts everything. So such a
+/// probe is retired until the server has removed it, and dropped on the next tick.
+#[test]
+fn a_stream_and_a_client_gone_before_the_main_loop_bound_them_leave_the_connection_alone() {
+    let Some(graph) = PrivateGraph::start("appsrace") else {
+        return;
+    };
+    if !installed("pw-cat") {
+        skip("pw-cat is not installed, so the probes of application streams were not checked");
+        return;
+    }
+    let harness = Harness::connect(graph);
+
+    // Out of this loop's sight: a player comes and goes, and so does every `pw-dump` that watched
+    // it. The loop hears of all of it at once — each object announced, then gone — with its binds
+    // still to reach the server.
+    let blink = harness
+        .graph
+        .pw_cat("--playback", "t_blink", "application.name = Blink", &[])
+        .expect("pw-cat should play");
+    drop(blink);
+    assert!(
+        gone_from_the_server(&harness.graph, "t_blink"),
+        "the player never went"
+    );
+    harness.pump(Duration::from_millis(500));
+    {
+        let shared = harness.shared.borrow();
+        assert!(
+            !shared.restart_requested,
+            "a probe of an object already gone cost the connection"
+        );
+        assert!(
+            !shared.retired_probes.is_empty(),
+            "nothing was bound after it had gone, so this test tested nothing"
+        );
+        assert!(
+            shared
+                .retired_probes
+                .iter()
+                .all(|probe| probe.removed.get()),
+            "the server removed every failed bind within half a second"
+        );
+        assert!(shared.apps.report().is_empty());
+    }
+
+    harness.supervise_for(1);
+    let shared = harness.shared.borrow();
+    assert!(
+        shared.retired_probes.is_empty(),
+        "the tick keeps retired probes the server has removed"
+    );
+    assert!(shared.session.is_some(), "the connection was restarted");
+    assert!(!shared.restart_requested);
+}

@@ -113,7 +113,7 @@ fn demo_state() -> SettingsState {
     SettingsState {
         tab: SettingsTab::Microphone,
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        echo_cancel_detail: "libspa-aec-webrtc is not installed".to_owned(),
+        echo_cancel_trouble: Some(fxsound_ui::state::EchoCancelTrouble::NotLoaded),
         presets: vec!["General".to_owned(), "Music".to_owned()],
         devices: vec![
             row("alsa_output.headphones", "Headphones", true, true),

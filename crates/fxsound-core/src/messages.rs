@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::apps::AppKey;
 use crate::{
     AudioDevice, AudioStatus, DeEsserMode, DenoiseChannelMode, DenoiseControl, DenoiseLevel,
     DereverbLevel, Detection, DeviceDirection, Effect, EqBand, NUM_SPECTRUM_BARS, SpectrumFrame,
@@ -32,9 +33,12 @@ pub struct DspParams {
     /// still applies, without the balance, while `eq_on` is set (`dfxpProcessReal.cpp:158-169`,
     /// `SosProcess.cpp:500-516`); with the equalizer off as well, audio passes through untouched.
     pub power: bool,
-    /// Hand the device silence, whatever `power` says. Set while the system sleeps (U13), so the
-    /// last buffers before suspend and the first after resume — stale filter state, a limiter
-    /// that last saw a different world — never reach the speakers.
+    /// Hand the device silence, whatever `power` says: the snapshot's mute, the app's to set.
+    ///
+    /// The engine silences a lane the same way on its own while the system sleeps (U13,
+    /// [`UiToAudio::SystemSleeping`]), so the last buffers before suspend and the first after
+    /// resume — stale filter state, a limiter that last saw a different world — never reach the
+    /// speakers; this flag need not be set for that.
     ///
     /// Silence *after* the chain rather than a bypass: the filters, the leveller and the
     /// spectrum keep running on what comes in, so unmuting joins a chain that is already in step
@@ -200,9 +204,9 @@ pub struct InputDspParams {
     /// Master bypass. When `false` the chain passes audio through untouched.
     pub power: bool,
     /// Hand whoever records from FxSound (Input) silence, whatever `power` says. The same flag
-    /// as [`DspParams::mute`], for the same reason — the system is going to sleep — and applied
-    /// the same way, after the chain, so the gate, the denoiser and the calibration counters keep
-    /// following the microphone.
+    /// as [`DspParams::mute`], beside the same silence the engine sets itself while the system
+    /// sleeps, and applied the same way, after the chain, so the gate, the denoiser and the
+    /// calibration counters keep following the microphone.
     pub mute: bool,
 
     /// High-pass corner in Hz, and its order — `0` for off, `2` or `4`.
@@ -594,8 +598,8 @@ impl Default for Meters {
 /// level the user last chose for that device. The real device's own volume is never touched.
 ///
 /// Travels both ways — reported by the engine as [`AudioToUi::TargetVolume`] when the node's
-/// `Props` change, seeded back with [`UiToAudio::SeedTargetVolumes`] at start-up — and is kept in
-/// the settings file (`Settings::device_volumes`), which is why it is plain data with serde.
+/// `Props` change, handed back when the engine starts (`fxsound_audio::StartOptions`) — and is
+/// kept in the settings file (`Settings::device_volumes`), which is why it is plain data with serde.
 /// Every field defaults, so a hand edit that leaves an entry short costs that field and not the
 /// whole file.
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
@@ -605,6 +609,17 @@ pub struct TargetVolume {
     pub direction: DeviceDirection,
     /// `node.name` of the real device the lane was attached to.
     pub target: String,
+    /// The port the device was on: the name of its card's active route for the node
+    /// (`SPA_PARAM_Route`), such as `analog-output-headphones`. Empty for a device whose card
+    /// names none — a virtual sink, a card that has not said yet.
+    ///
+    /// One node can be two devices. On most desktops and many laptops (a plain HDA card, not a UCM
+    /// one) the speakers and the headphones are two ports of one sink, and plugging headphones in
+    /// only switches the port, so a volume kept per `node.name` alone was the speakers' level on
+    /// the headphones — upstream's #615 again, under another name. So the entry is one per target
+    /// *and* port, and the settings keep one per port too. Left out of the file when empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub port: String,
     /// `channelVolumes` of FxSound's node, linear amplitude, one per channel in its own order.
     pub channel_volumes: Vec<f32>,
     /// The node's `mute`.
@@ -612,6 +627,20 @@ pub struct TargetVolume {
 }
 
 impl TargetVolume {
+    /// Whether this is the entry for the lane of `direction` on `target`'s port `port` (empty for
+    /// a device with no port).
+    #[must_use]
+    pub fn is_for(&self, direction: DeviceDirection, target: &str, port: &str) -> bool {
+        self.direction == direction && self.target == target && self.port == port
+    }
+
+    /// Whether this and `other` are entries for the same lane, target and port — of which the
+    /// settings keep one.
+    #[must_use]
+    pub fn same_place(&self, other: &Self) -> bool {
+        other.is_for(self.direction, &self.target, &self.port)
+    }
+
     /// The entry as it may be replayed onto a node, or `None` when it cannot be.
     ///
     /// A volume that is not a number, or is below zero, carries no level anyone set, and replaying
@@ -637,6 +666,114 @@ impl TargetVolume {
             *volume = volume.clamp(*TARGET_VOLUME.start(), *TARGET_VOLUME.end());
         }
         Some(self)
+    }
+}
+
+/// One application's stream, as the engine sees it in the graph (`docs/0.4.0-apps.md`,
+/// "Identifying an application").
+///
+/// A player's playback stream or a recorder's capture stream: a node whose media class is exactly
+/// `Stream/Output/Audio` or `Stream/Input/Audio`, and that is not FxSound's own — not a lane's,
+/// not a route's, not the echo canceller's. Of those, three kinds are not reported:
+///
+/// - a stream the engine has not finished reading: its own info, or its client's, has not arrived.
+///   Both follow within milliseconds, and the stream is reported then, once, under its whole key
+///   rather than first under a key that is about to change.
+/// - a stream that says nothing about who it is — no binary, no name, no Flatpak id, its own or its
+///   client's. The list could not name it, and no rule could match it.
+/// - a recorder of what a sink plays that does not record FxSound: a visualiser on the speakers'
+///   monitor records no microphone, and nothing of FxSound's either. One that does record FxSound
+///   is reported, as a recorder: one with `stream.capture.sink` that names one of FxSound's nodes
+///   as its target, or names none while FxSound's sink is the default sink; and one without the
+///   flag whose target is a node of FxSound's output lane the session manager links it to —
+///   FxSound's sink or a playback route's, named by `object.serial` or node id, whose monitor it
+///   records, or FxSound's playback stream or a route's, named any way.
+///
+/// A reported stream is not necessarily one the engine may move: one that says `node.dont-move`,
+/// one whose own properties name a target that is not FxSound's, and a recorder of FxSound are
+/// never moved onto a route, and stay on their lane with no [`route`](Self::route).
+///
+/// Reported in full ([`AudioToUi::AppStreams`]), which is what the Applications list shows as
+/// running and what the app matches its rules against. Plain data with serde, so the command
+/// line's `--list-apps --json` and D-Bus's `ListApps` can hand it on as it is.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppStream {
+    /// PipeWire node id of the stream. Not stable across restarts of the application; the
+    /// subject the engine writes the stream's `target.object` for.
+    pub id: u32,
+    /// Playback (`Output`) or recording (`Input`), which is also the lane whose device it uses.
+    pub direction: DeviceDirection,
+    /// Who the stream belongs to.
+    pub app: AppKey,
+    /// The preset of the route the stream was moved onto, or `None` while it plays or records
+    /// through its lane's own chain — including when its rule asked for a route that could not
+    /// be made.
+    pub route: Option<String>,
+}
+
+/// The chain parameters a route runs: an output preset's for a playback route, an input
+/// preset's for a recording route.
+///
+/// `Copy`, like the snapshots it carries: the engine publishes it into the route's own triple
+/// buffer on the control thread, and the audio thread reads it from there, never from a message.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RouteParams {
+    /// For a route in front of the output lane's device.
+    Output(DspParams),
+    /// For a route behind the input lane's device.
+    Input(InputDspParams),
+}
+
+impl RouteParams {
+    /// The direction the parameters are for: the chain they can drive.
+    #[must_use]
+    pub const fn direction(&self) -> DeviceDirection {
+        match self {
+            Self::Output(_) => DeviceDirection::Output,
+            Self::Input(_) => DeviceDirection::Input,
+        }
+    }
+
+    /// Force the snapshot into the ranges its chain accepts: [`DspParams::sanitise`] or
+    /// [`InputDspParams::sanitise`].
+    pub fn sanitise(&mut self) {
+        match self {
+            Self::Output(params) => params.sanitise(),
+            Self::Input(params) => params.sanitise(),
+        }
+    }
+}
+
+/// One application that is to run through a preset of its own (`docs/0.4.0-apps.md`).
+///
+/// The app resolves every rule of the store (`crate::apps::AppRules`) to one of these — it owns
+/// the preset stores, so it is the one that can turn a preset's name into parameters — and sends
+/// the whole set in [`UiToAudio::SetAppRoutes`]. Routes are per preset, not per application:
+/// every entry of one lane naming the same preset shares one pair of nodes, up to
+/// [`MAX_ROUTES_PER_LANE`](crate::apps::MAX_ROUTES_PER_LANE) presets per lane.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppRoute {
+    /// The lane the application's stream belongs to.
+    pub direction: DeviceDirection,
+    /// Which application's streams to move onto the route.
+    pub app: AppKey,
+    /// The preset's name: what the route's node is called in a mixer, and how entries sharing a
+    /// route are grouped.
+    pub preset: String,
+    /// The preset resolved to chain parameters, for `direction`.
+    pub params: RouteParams,
+    /// The stage ordering an input route runs, by name, as in [`UiToAudio::SetInputChain`];
+    /// unused for an output route.
+    pub chain: String,
+}
+
+impl AppRoute {
+    /// Whether the parameters are for the route's own direction. A route that is not would hand
+    /// one chain the other's snapshot; the engine refuses it rather than guess which was meant.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.params.direction() == self.direction
     }
 }
 
@@ -693,22 +830,56 @@ pub enum UiToAudio {
     ///
     /// Empty means "follow the system": no ranking, the session default decides — the app's
     /// `follow_system_default` switch, and upstream's issue #629.
+    ///
+    /// `new_devices_first` says where a device the ranking does not name yet goes: before every
+    /// ranked device when `true`, after every one when `false` — the app's
+    /// `prioritize_new_output`, which puts a newly seen device at the front of its list or at the
+    /// back. The engine needs it because it decides on an arrival before the app's list that
+    /// ranks the newcomer can reach it; send it with every ranking, and again when the setting
+    /// changes.
     SetDevicePriority {
         direction: DeviceDirection,
         names: Vec<String>,
+        new_devices_first: bool,
     },
-    /// Every remembered per-target volume, from the settings file, sent once at start-up (U10).
-    /// The engine replays the matching one onto its own node when it attaches a lane to that
-    /// target. A later seed replaces the whole memory.
+    /// Every remembered per-target volume, from the settings file (U10), replacing the whole of
+    /// the engine's memory. The engine replays the matching one onto its own node when it attaches
+    /// a lane to that target.
+    ///
+    /// Not how the memory first reaches the engine: the output lane builds its first pair before a
+    /// message sent after start-up is sure to have arrived, so the app hands it over with the
+    /// engine (`fxsound_audio::StartOptions::target_volumes`). This is for a later replacement; a
+    /// pair up already whose volume nothing has moved is then given its target's level.
     SeedTargetVolumes(Vec<TargetVolume>),
     /// logind's `PrepareForSleep`: `true` when the system is about to sleep, `false` when it has
-    /// resumed (U13). The engine defers its device rules across the gap, since Bluetooth devices
-    /// come back under new ids; the mute itself travels in the parameter snapshots.
+    /// resumed (U13).
+    ///
+    /// The engine does the rest itself. On `true` both lanes fall silent after their chains and
+    /// their device rules stop. On `false` both chains' filter history is cleared, both lanes'
+    /// rules run again with a wait of up to 2.5 s for the devices they were on — Bluetooth
+    /// devices reconnect a few seconds after the system does, under new ids — and each lane is
+    /// heard again once it is attached, or after 2 s at the latest. The app need not touch the
+    /// snapshots' `mute` for it. A `true` that is never followed by a `false` is given up on after
+    /// a minute of the system being awake.
     SystemSleeping(bool),
     /// Hold the microphone open while `true`, even with nobody recording from FxSound (Input):
     /// the calibration wizard and the microphone meters need a signal that the passive capture
     /// stream would otherwise not have (U9, U19).
+    ///
+    /// The engine records its own virtual source while it is held, as an application would, which
+    /// runs the input lane and the microphone. That is also what switches a Bluetooth headset to
+    /// its call profile under WirePlumber 0.5, so a headset's microphone delivers audio too —
+    /// about a second after the message, once the profile has switched. Kept until `false`,
+    /// across devices and reconnects.
     KeepInputAwake(bool),
+    /// Every application that is to run through a preset of its own, both lanes at once
+    /// (`docs/0.4.0-apps.md`). The full set each time, never a change: the engine compares it
+    /// with what it runs, builds the routes that are new, moves the streams, and tears down what
+    /// is no longer asked for. Empty means no application has a preset of its own.
+    ///
+    /// Resent whenever a rule changes, a preset a rule uses is saved, renamed or deleted, or the
+    /// output levels every chain shares — master gain, balance, levelling, band count — change.
+    SetAppRoutes(Vec<AppRoute>),
 }
 
 /// Control-thread notifications for the GUI.
@@ -761,6 +932,11 @@ pub enum AudioToUi {
         direction: Option<DeviceDirection>,
         message: String,
     },
+    /// Every application stream in the graph, both directions, whenever the set or a stream's
+    /// route changes (`docs/0.4.0-apps.md`; [`AppStream`] says which streams count). The full
+    /// list each time, so the Applications list is always what the graph holds and never an
+    /// accumulation of changes.
+    AppStreams(Vec<AppStream>),
 }
 
 #[cfg(test)]
@@ -1076,6 +1252,7 @@ mod tests {
         TargetVolume {
             direction: DeviceDirection::Output,
             target: "alsa_output.usb-headphones".to_owned(),
+            port: String::new(),
             channel_volumes: volumes.to_vec(),
             mute: false,
         }
@@ -1140,6 +1317,7 @@ mod tests {
         let entry = TargetVolume {
             direction: DeviceDirection::Input,
             target: "alsa_input.usb-fifine".to_owned(),
+            port: String::new(),
             channel_volumes: vec![0.5, 0.75],
             mute: true,
         };
@@ -1165,6 +1343,7 @@ mod tests {
             TargetVolume {
                 direction: DeviceDirection::Output,
                 target: "alsa_output.pci".to_owned(),
+                port: String::new(),
                 channel_volumes: Vec::new(),
                 mute: false,
             }
@@ -1176,6 +1355,7 @@ mod tests {
         let priority = UiToAudio::SetDevicePriority {
             direction: DeviceDirection::Output,
             names: vec!["alsa_output.usb".to_owned(), "alsa_output.pci".to_owned()],
+            new_devices_first: false,
         };
         assert_eq!(priority.clone(), priority);
         assert_ne!(
@@ -1183,13 +1363,24 @@ mod tests {
             UiToAudio::SetDevicePriority {
                 direction: DeviceDirection::Input,
                 names: vec!["alsa_output.usb".to_owned(), "alsa_output.pci".to_owned()],
+                new_devices_first: false,
             },
             "one ranking per lane"
+        );
+        assert_ne!(
+            priority,
+            UiToAudio::SetDevicePriority {
+                direction: DeviceDirection::Output,
+                names: vec!["alsa_output.usb".to_owned(), "alsa_output.pci".to_owned()],
+                new_devices_first: true,
+            },
+            "where a device not ranked yet goes is part of the ranking"
         );
         // An empty ranking is a message of its own: follow the system.
         let follow = UiToAudio::SetDevicePriority {
             direction: DeviceDirection::Output,
             names: Vec::new(),
+            new_devices_first: false,
         };
         assert_ne!(follow, priority);
 
@@ -1233,6 +1424,147 @@ mod tests {
                 message: "call quality".to_owned(),
             },
             "a warning is not an error, even with the same text"
+        );
+    }
+
+    fn battlefield() -> AppKey {
+        AppKey {
+            binary: "bf6.exe".to_owned(),
+            name: "Battlefield 6".to_owned(),
+            flatpak: String::new(),
+        }
+    }
+
+    #[test]
+    fn route_parameters_know_which_chain_they_drive() {
+        assert_eq!(
+            RouteParams::Output(DspParams::default()).direction(),
+            DeviceDirection::Output
+        );
+        assert_eq!(
+            RouteParams::Input(InputDspParams::default()).direction(),
+            DeviceDirection::Input
+        );
+    }
+
+    #[test]
+    fn route_parameters_are_sanitised_by_the_rules_of_their_own_chain() {
+        let mut output = RouteParams::Output(DspParams {
+            master_gain_db: f32::NAN,
+            ..DspParams::default()
+        });
+        output.sanitise();
+        let RouteParams::Output(params) = output else {
+            panic!("still an output snapshot");
+        };
+        assert_eq!(params.master_gain_db, DspParams::default().master_gain_db);
+
+        let mut input = RouteParams::Input(InputDspParams {
+            ceiling_db: f32::NAN,
+            ..InputDspParams::default()
+        });
+        input.sanitise();
+        let RouteParams::Input(params) = input else {
+            panic!("still an input snapshot");
+        };
+        assert_eq!(params.ceiling_db, InputDspParams::default().ceiling_db);
+    }
+
+    #[test]
+    fn a_route_is_consistent_only_when_its_parameters_are_for_its_own_lane() {
+        let mut route = AppRoute {
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            preset: "Gaming".to_owned(),
+            params: RouteParams::Output(DspParams::default()),
+            chain: String::new(),
+        };
+        assert!(route.is_consistent());
+        route.params = RouteParams::Input(InputDspParams::default());
+        assert!(
+            !route.is_consistent(),
+            "an input snapshot for a playback route"
+        );
+        route.direction = DeviceDirection::Input;
+        route.chain = "voice".to_owned();
+        assert!(route.is_consistent());
+    }
+
+    #[test]
+    fn the_route_set_compares_by_value_so_the_engine_can_diff_it() {
+        let route = AppRoute {
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            preset: "Gaming".to_owned(),
+            params: RouteParams::Output(DspParams::default()),
+            chain: String::new(),
+        };
+        let set = UiToAudio::SetAppRoutes(vec![route.clone()]);
+        assert_eq!(set.clone(), set);
+        let louder = AppRoute {
+            params: RouteParams::Output(DspParams {
+                master_gain_db: 3.0,
+                ..DspParams::default()
+            }),
+            ..route.clone()
+        };
+        assert_ne!(
+            set,
+            UiToAudio::SetAppRoutes(vec![louder]),
+            "a changed level is a changed set"
+        );
+        assert_ne!(set, UiToAudio::SetAppRoutes(Vec::new()));
+        let other_preset = AppRoute {
+            preset: "Movies".to_owned(),
+            ..route
+        };
+        assert_ne!(set, UiToAudio::SetAppRoutes(vec![other_preset]));
+    }
+
+    #[test]
+    fn an_app_stream_round_trips_through_toml_with_and_without_a_route() {
+        let routed = AppStream {
+            id: 87,
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            route: Some("Gaming".to_owned()),
+        };
+        let text = toml::to_string(&routed).expect("serialise");
+        for line in ["id = 87", "direction = \"output\"", "route = \"Gaming\""] {
+            assert!(text.contains(line), "missing {line:?} in:\n{text}");
+        }
+        assert_eq!(toml::from_str::<AppStream>(&text).expect("parse"), routed);
+
+        let on_its_lane = AppStream {
+            id: 91,
+            direction: DeviceDirection::Input,
+            app: AppKey {
+                binary: "discord".to_owned(),
+                name: "Discord".to_owned(),
+                flatpak: "com.discordapp.Discord".to_owned(),
+            },
+            route: None,
+        };
+        let text = toml::to_string(&on_its_lane).expect("serialise");
+        assert!(!text.contains("route"), "no route, no key: {text}");
+        assert_eq!(
+            toml::from_str::<AppStream>(&text).expect("parse"),
+            on_its_lane
+        );
+    }
+
+    #[test]
+    fn the_stream_report_is_its_own_message() {
+        let streams = AudioToUi::AppStreams(vec![AppStream {
+            id: 87,
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            route: None,
+        }]);
+        assert_eq!(streams.clone(), streams);
+        assert_ne!(streams, AudioToUi::AppStreams(Vec::new()));
+        assert!(
+            matches!(streams, AudioToUi::AppStreams(list) if list[0].app.display() == "Battlefield 6")
         );
     }
 

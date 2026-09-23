@@ -227,6 +227,8 @@ pub struct TrayPreset {
 pub struct TrayDevice {
     /// The friendly name, untruncated; [`MENU_LABEL_MAX`] is applied when the menu is built.
     pub name: String,
+    /// The device's `node.name`, which a pick carries back ([`TrayCommand::SelectDevice`]).
+    pub node_name: String,
     /// Playback or capture device: which lane's group the row is in.
     pub direction: DeviceDirection,
 }
@@ -238,8 +240,13 @@ pub struct TrayLane {
     pub presets: Vec<TrayPreset>,
     /// Index into `presets`.
     pub selected_preset: Option<usize>,
-    /// The lane's device, as an index into [`TrayState::devices`]; `None` while the lane is off.
+    /// The lane's device, as an index into [`TrayState::devices`]; `None` while the lane is off,
+    /// or on a device the list does not carry right now.
     pub device: Option<usize>,
+    /// The name of the device the lane is on while the list does not carry it — a Bluetooth
+    /// headset between profiles, the moments before the first list. The tooltip names it, and
+    /// neither `Off` nor any row is ticked: the lane is not off.
+    pub unlisted: Option<String>,
 }
 
 /// The tray's mirror of the model.
@@ -318,9 +325,14 @@ impl TrayState {
             DeviceDirection::Output => "Output: ",
             DeviceDirection::Input => "Input: ",
         };
-        let device = self
-            .device(direction)
-            .map_or_else(|| tr("Off"), |device| device.name.clone());
+        let device = match self.device(direction) {
+            Some(device) => device.name.clone(),
+            None => self
+                .lane(direction)
+                .unlisted
+                .clone()
+                .unwrap_or_else(|| tr("Off")),
+        };
         format!("{}{device}", tr(key))
     }
 
@@ -374,9 +386,14 @@ pub enum TrayCommand {
         direction: DeviceDirection,
         name: String,
     },
-    /// Index into [`TrayState::devices`] (`setOutput(id - 201)`, `:365-368`); the device's own
-    /// direction says which lane.
-    SelectDevice(usize),
+    /// A device of one lane's group (`setOutput(id - 201)`, `:365-368`), by its `node.name` and
+    /// direction rather than by its row: the list can change between drawing the menu and the
+    /// click being handled — a hotplug, a newcomer ranked first — and a row would then pick
+    /// another device, perhaps of the other lane. A device no longer listed does nothing.
+    SelectDevice {
+        direction: DeviceDirection,
+        node_name: String,
+    },
     /// A lane's `Off` row: detach it.
     Detach(DeviceDirection),
     /// Menu ▸ Settings. The Windows handler runs a modal loop here (`:261-265`); this one must
@@ -597,7 +614,9 @@ impl FxTray {
         .collect();
         // Row 0 is `Off`; a device index that no longer points into this direction's rows ticks
         // nothing rather than the wrong row.
-        let selected = match self.state.lane(direction).device {
+        let lane = self.state.lane(direction);
+        let selected = match lane.device {
+            None if lane.unlisted.is_some() => usize::MAX,
             None => 0,
             Some(device) => indices
                 .iter()
@@ -610,8 +629,15 @@ impl FxTray {
                 select: Box::new(move |tray: &mut Self, row| match row {
                     0 => tray.send(TrayCommand::Detach(direction)),
                     row => {
-                        if let Some(&device) = indices.get(row - 1) {
-                            tray.send(TrayCommand::SelectDevice(device));
+                        if let Some(device) = indices
+                            .get(row - 1)
+                            .and_then(|&device| tray.state.devices.get(device))
+                        {
+                            let node_name = device.node_name.clone();
+                            tray.send(TrayCommand::SelectDevice {
+                                direction,
+                                node_name,
+                            });
                         }
                     }
                 }),
@@ -916,7 +942,21 @@ mod tests {
     fn device(name: &str, direction: DeviceDirection) -> TrayDevice {
         TrayDevice {
             name: name.to_owned(),
+            node_name: node_name(name),
             direction,
+        }
+    }
+
+    /// The `node.name` [`device`] gives a device called `name`.
+    fn node_name(name: &str) -> String {
+        format!("node.{}", name.to_lowercase().replace(' ', "_"))
+    }
+
+    /// What picking the device called `name` sends.
+    fn pick(name: &str, direction: DeviceDirection) -> TrayCommand {
+        TrayCommand::SelectDevice {
+            direction,
+            node_name: node_name(name),
         }
     }
 
@@ -933,6 +973,7 @@ mod tests {
                 ],
                 selected_preset: Some(2),
                 device: Some(0),
+                unlisted: None,
             },
             input: TrayLane {
                 presets: vec![
@@ -941,6 +982,7 @@ mod tests {
                 ],
                 selected_preset: Some(0),
                 device: None,
+                unlisted: None,
             },
             devices: vec![
                 device("Built-in Audio Analogue Stereo", OUT),
@@ -1224,6 +1266,24 @@ mod tests {
     }
 
     #[test]
+    fn a_lane_on_a_device_the_list_does_not_carry_is_named_and_not_called_off() {
+        let mut state = populated();
+        state.output.device = None;
+        state.output.unlisted = Some("WH-1000XM4".to_owned());
+        assert_eq!(
+            state.device_line(OUT),
+            format!("{}WH-1000XM4", tr("Output: "))
+        );
+        let (tray, _rx) = with_state(state);
+        let menu = tray.menu();
+        let groups = radio_groups(submenu_of(&menu, "Playback Device Select"));
+        assert!(
+            groups[0].selected >= groups[0].options.len(),
+            "neither Off nor another device is ticked"
+        );
+    }
+
+    #[test]
     fn a_device_index_that_points_into_the_other_direction_ticks_nothing() {
         let mut state = populated();
         state.output.device = Some(3);
@@ -1234,18 +1294,18 @@ mod tests {
     }
 
     #[test]
-    fn picking_a_device_reports_its_index_in_the_whole_list_and_off_detaches_the_lane() {
+    fn picking_a_device_reports_its_node_name_and_lane_and_off_detaches_the_lane() {
         let (mut tray, rx) = with_state(both_lanes());
         let menu = tray.menu();
         let groups = radio_groups(submenu_of(&menu, "Playback Device Select"));
         (groups[1].select)(&mut tray, 2);
         assert_eq!(
             rx.try_recv(),
-            Ok(TrayCommand::SelectDevice(4)),
-            "the second input is the fifth device overall"
+            Ok(pick("Ryzen HD Audio Controller Analogue Stereo", IN)),
+            "the second input, by name: not the fifth row of a list that may have moved"
         );
         (groups[0].select)(&mut tray, 3);
-        assert_eq!(rx.try_recv(), Ok(TrayCommand::SelectDevice(2)));
+        assert_eq!(rx.try_recv(), Ok(pick("Mono Headset", OUT)));
         (groups[1].select)(&mut tray, 0);
         assert_eq!(rx.try_recv(), Ok(TrayCommand::Detach(IN)));
         (groups[0].select)(&mut tray, 0);
@@ -1360,7 +1420,13 @@ mod tests {
 
         let devices = submenu_of(&menu, "Playback Device Select");
         (radio_groups(devices)[0].select)(&mut tray, 2);
-        assert_eq!(rx.try_recv(), Ok(TrayCommand::SelectDevice(1)));
+        assert_eq!(
+            rx.try_recv(),
+            Ok(pick(
+                "HDMI / DisplayPort 3 Output That Goes On Forever",
+                OUT
+            ))
+        );
         assert_eq!(tray.state(), &populated(), "the mirror is as it was drawn");
     }
 

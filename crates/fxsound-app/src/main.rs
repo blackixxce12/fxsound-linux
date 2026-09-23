@@ -135,6 +135,13 @@ fn main() -> eframe::Result<()> {
     let listener = match Instance::acquire() {
         Ok(Instance::Primary(listener)) => listener,
         Ok(Instance::Secondary(client)) => {
+            // Started by the bus or the user unit for an instance that turned out to be running
+            // already: it is the one the bus was waiting for, and nothing is forwarded — least of
+            // all the `--hide` a plain `fxsound --hide` would send to a window just opened.
+            if cli.activated {
+                log::info!("FxSound is running already; nothing to activate");
+                std::process::exit(0);
+            }
             // A stream, not one answer: print events until the running instance quits. Decided by
             // the same `commands()` the primary runs, so `--status --watch` stays a `--status`.
             if let [Command::Watch { meters, .. }] = cli.commands().as_slice() {
@@ -395,6 +402,12 @@ impl Runtime {
         }
         // Commands forwarded by a second invocation — the compositor keybind path.
         for forwarded in self.server.drain() {
+            // Its caller was told FxSound did not answer in time and has gone: carried out now,
+            // a burst of them held up by a busy GUI thread would all land at once.
+            if forwarded.is_abandoned() {
+                log::info!("not running a command whose caller stopped waiting for it");
+                continue;
+            }
             let outcome = commands::run(&mut self.app, forwarded.commands());
             merge(&mut request, outcome.window);
             forwarded.respond_with(outcome.stdout, outcome.stderr, outcome.failed);
@@ -883,7 +896,12 @@ impl<'a> Shell<'a> {
     fn open_import(&mut self) {
         self.menu.close();
         if self.import.is_none() {
-            self.import = Some(ImportState::default());
+            // Into the lane the window is on now, whatever the tray, a keybind or D-Bus does to
+            // the edit direction before Import is pressed.
+            self.import = Some(ImportState {
+                lane: self.rt.app.state.direction,
+                ..ImportState::default()
+            });
         }
     }
 
@@ -899,7 +917,10 @@ impl<'a> Shell<'a> {
                 .iter()
                 .map(|p| p.name.clone())
                 .collect();
+            // The names are this lane's, so the files written are too, whatever happens to the
+            // edit direction before Export is pressed.
             self.export = Some(ExportState {
+                lane: self.rt.app.state.direction,
                 presets,
                 ..ExportState::default()
             });
@@ -953,10 +974,8 @@ impl<'a> Shell<'a> {
         let dark = palette.is_dark();
         let presets = &app.state.presets;
 
-        // An editor whose item has since gone grey has nothing left to do.
-        if self.menu.editor.as_ref().is_some_and(|e| match e.purpose {
-            EditorPurpose::SaveNew => !can_save_new,
-            EditorPurpose::Rename => !can_rename,
+        if self.menu.editor.as_ref().is_some_and(|editor| {
+            !editor.still_applies(app.state.direction, can_save_new, can_rename)
         }) {
             self.menu.editor = None;
         }
@@ -1079,7 +1098,7 @@ impl<'a> Shell<'a> {
                 // Clicking the row again folds the editor back up.
                 self.menu.editor = match self.menu.editor.take() {
                     Some(editor) if editor.purpose == purpose => None,
-                    _ => Some(NameEditor::new(purpose)),
+                    _ => Some(NameEditor::new(purpose, self.rt.app.state.direction)),
                 };
             }
             Some(choice) => {
@@ -1548,6 +1567,8 @@ enum EditorPurpose {
 /// `FxPresetMenuItem` (`FxMainWindow.cpp:27-176`): a live-validating name field.
 struct NameEditor {
     purpose: EditorPurpose,
+    /// The lane it was opened for: the editor closes when the window moves to the other one.
+    lane: fxsound_core::DeviceDirection,
     text: String,
     /// Focus is requested once, on the first frame — not on every paint as the original does
     /// (`docs/spec/03-controls.md` §11.4).
@@ -1555,12 +1576,31 @@ struct NameEditor {
 }
 
 impl NameEditor {
-    fn new(purpose: EditorPurpose) -> Self {
+    fn new(purpose: EditorPurpose, lane: fxsound_core::DeviceDirection) -> Self {
         Self {
             purpose,
+            lane,
             text: String::new(),
             focused: false,
         }
+    }
+
+    /// Whether the editor still has something to do with the window editing `lane`, and its
+    /// item's enablement. One whose item has since gone grey has nothing left to do; nor has one
+    /// opened for the other lane, which the tray, a keybind or D-Bus has moved the window off
+    /// since: the name typed was for that lane's controls and list, and committed now it would
+    /// save or rename the lane the menu shows instead.
+    fn still_applies(
+        &self,
+        lane: fxsound_core::DeviceDirection,
+        can_save_new: bool,
+        can_rename: bool,
+    ) -> bool {
+        self.lane == lane
+            && match self.purpose {
+                EditorPurpose::SaveNew => can_save_new,
+                EditorPurpose::Rename => can_rename,
+            }
     }
 }
 
@@ -2454,5 +2494,31 @@ mod zoom_tests {
             fit_zoom(egui::vec2(0.0, 0.0), egui::vec2(1040.0, 588.0), 0.0),
             1.0
         );
+    }
+}
+
+#[cfg(test)]
+mod name_editor_tests {
+    use super::*;
+    use fxsound_core::DeviceDirection::{Input, Output};
+
+    #[test]
+    fn an_editor_opened_for_one_lane_closes_when_the_window_moves_to_the_other() {
+        // Save New Preset typed on the speakers, then `fxsound --edit=input` from a keybind: the
+        // name was for the speakers' controls and list, and must not save the microphone's.
+        let editor = NameEditor::new(EditorPurpose::SaveNew, Output);
+        assert!(editor.still_applies(Output, true, true));
+        assert!(!editor.still_applies(Input, true, true));
+        let rename = NameEditor::new(EditorPurpose::Rename, Input);
+        assert!(rename.still_applies(Input, false, true));
+        assert!(!rename.still_applies(Output, false, true));
+    }
+
+    #[test]
+    fn an_editor_whose_item_went_grey_closes() {
+        let editor = NameEditor::new(EditorPurpose::SaveNew, Output);
+        assert!(!editor.still_applies(Output, false, true));
+        let rename = NameEditor::new(EditorPurpose::Rename, Output);
+        assert!(!rename.still_applies(Output, true, false));
     }
 }

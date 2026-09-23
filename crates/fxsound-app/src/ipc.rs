@@ -104,7 +104,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser as _;
-use crossbeam_channel::{Receiver, RecvTimeoutError, TrySendError, bounded, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, bounded, unbounded};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::{Cli, Command};
@@ -147,8 +147,15 @@ const NO_ANSWER_IN_TIME: &str = "FxSound did not answer in time; the command may
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 /// How many callers may be in the middle of being answered at once. Each has a thread for at most
-/// [`REQUEST_TIMEOUT`] plus [`HANDLER_TIMEOUT`]; past this the caller is told to try again.
-const MAX_CONNECTIONS: usize = 32;
+/// [`REQUEST_TIMEOUT`] plus [`HANDLER_TIMEOUT`]; past this the caller is told to try again. The
+/// D-Bus service holds its calls in flight to the same number (`crate::dbus`).
+pub const MAX_CONNECTIONS: usize = 32;
+
+/// What a caller past [`MAX_CONNECTIONS`] hears, on the socket and on the bus.
+pub const TOO_MANY_CALLERS: &str = "FxSound is answering too many callers at once; try again";
+
+/// What a caller hears when its request line does not arrive whole within [`REQUEST_TIMEOUT`].
+const REQUEST_TOO_SLOW: &str = "the request did not arrive in time";
 
 /// How many `--watch` streams may be open at once.
 const MAX_SUBSCRIBERS: usize = 64;
@@ -379,9 +386,11 @@ impl Listener {
 
         let (tx, rx) = unbounded();
         let tx = WakingSender::new(tx, waker);
-        let status = status.unwrap_or_else(|| status_from_application(tx.clone()));
+        let closing = Closing::default();
+        let status = status.unwrap_or_else(|| status_from_application(tx.clone(), closing.clone()));
         let shared = Arc::new(Shared {
             tx,
+            closing,
             status,
             broadcaster: Broadcaster::default(),
             connections: AtomicUsize::new(0),
@@ -410,24 +419,96 @@ impl Listener {
 /// when there is none to be had in time, in which case the subscription is refused.
 pub type StatusSource = Arc<dyn Fn() -> Option<serde_json::Value> + Send + Sync>;
 
-/// The default [`StatusSource`]: ask the application, the way `fxsound --status --json` does.
-fn status_from_application(tx: WakingSender<Forwarded>) -> StatusSource {
+/// The default [`StatusSource`]: ask the application, the way `fxsound --status --json` does —
+/// through [`hand_over`], so an instance on its way out answers at once rather than never.
+fn status_from_application(tx: WakingSender<Forwarded>, closing: Closing) -> StatusSource {
     Arc::new(move || {
-        let (reply, answer) = bounded(1);
-        tx.try_send(Forwarded::new(
+        let response = hand_over(
+            &tx,
+            &closing,
             vec![Command::Status { json: true }],
-            PathBuf::from("/"),
-            move |response| {
-                let _ = reply.send(response);
-            },
-        ))
-        .ok()?;
-        let response = answer.recv_timeout(HANDLER_TIMEOUT).ok()?;
+            "/".into(),
+        );
         if !response.ok {
             return None;
         }
         serde_json::from_str(&response.stdout).ok()
     })
+}
+
+/// Set once the instance has decided to quit ([`Server::refuse_pending`]), and never cleared.
+///
+/// The channel to the GUI thread stays open until the [`Server`] is dropped at the very end of the
+/// way out, after the engine has handed the default devices back — and nothing drains it in
+/// between. Every sender checks this before and after handing a command over, and a [`Forwarded`]
+/// that is dropped unanswered while it is set says [`SHUTTING_DOWN`] rather than `ok`, so a
+/// command that arrives in that window is refused, as the way out promises, instead of being
+/// dropped with a bare acknowledgement or left to wait out [`HANDLER_TIMEOUT`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Closing(Arc<AtomicBool>);
+
+impl Closing {
+    pub(crate) fn set(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Hand `commands` to the GUI thread and wait up to [`HANDLER_TIMEOUT`] for its answer, for a
+/// caller on a thread of its own: a connection on the socket, a new subscriber's status request.
+///
+/// Refused with [`SHUTTING_DOWN`] once the way out has begun ([`Closing`]). A caller that stops
+/// waiting marks the command abandoned, so the GUI thread does not carry it out later
+/// ([`Forwarded::is_abandoned`]).
+fn hand_over(
+    tx: &WakingSender<Forwarded>,
+    closing: &Closing,
+    commands: Vec<Command>,
+    cwd: PathBuf,
+) -> Response {
+    hand_over_within(tx, closing, commands, cwd, HANDLER_TIMEOUT)
+}
+
+/// [`hand_over`], waiting `timeout` for the answer.
+fn hand_over_within(
+    tx: &WakingSender<Forwarded>,
+    closing: &Closing,
+    commands: Vec<Command>,
+    cwd: PathBuf,
+    timeout: Duration,
+) -> Response {
+    if closing.is_set() {
+        return Response::failed(SHUTTING_DOWN);
+    }
+    let (reply_tx, reply_rx) = bounded(1);
+    let forwarded = Forwarded::new(commands, cwd, move |response| {
+        let _ = reply_tx.send(response);
+    })
+    .closing_with(closing.clone());
+    let abandoned = Arc::clone(&forwarded.abandoned);
+    if tx.try_send(forwarded).is_err() {
+        return Response::failed(SHUTTING_DOWN);
+    }
+    // Queued after the way out drained the channel: nothing will take it now. An answer the GUI
+    // thread gave before it began the way out is already here, and is the one to give.
+    if closing.is_set() {
+        return reply_rx
+            .try_recv()
+            .unwrap_or_else(|_| Response::failed(SHUTTING_DOWN));
+    }
+    match reply_rx.recv_timeout(timeout) {
+        Ok(response) => response,
+        Err(RecvTimeoutError::Timeout) => {
+            abandoned.store(true, Ordering::SeqCst);
+            Response::unanswered()
+        }
+        // The `Forwarded` was dropped without its `Drop` running, which can only mean the process
+        // is going away.
+        Err(RecvTimeoutError::Disconnected) => Response::failed(SHUTTING_DOWN),
+    }
 }
 
 /// The running accept loop, and the GUI thread's end of it.
@@ -472,7 +553,12 @@ impl Server {
     /// Refuse everything forwarded and not yet drained, with the answer a caller gets from an
     /// instance that is going away — for the way out, so that nobody waits out
     /// [`HANDLER_TIMEOUT`] on a GUI thread that has stopped answering.
+    ///
+    /// Sticky: from here on every caller is refused at once, on the socket and on the bus, and a
+    /// command that slips into the channel after this drain is refused when the server drops it
+    /// ([`Closing`]).
     pub fn refuse_pending(&self) {
+        self.shared.closing.set();
         for forwarded in self.rx.try_iter() {
             forwarded.reply(Response::failed(SHUTTING_DOWN));
         }
@@ -490,6 +576,7 @@ impl Server {
     pub fn control(&self) -> Control {
         Control {
             tx: self.shared.tx.clone(),
+            closing: self.shared.closing.clone(),
         }
     }
 
@@ -536,6 +623,9 @@ impl EventSink for Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // Whatever reached the channel since the way out began is answered before the channel
+        // goes, rather than discarded with the receiver.
+        self.refuse_pending();
         self.shutdown.store(true, Ordering::SeqCst);
         // The accept loop is parked inside `accept()`; connecting to ourselves wakes it so it can
         // see the flag. The connection is closed immediately and the loop discards it.
@@ -543,7 +633,9 @@ impl Drop for Server {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        // Every `fxsound --watch` sees end-of-file and exits 0.
+        // Every `fxsound --watch` sees end-of-file. One that got the `quit` event, published
+        // before the server goes (`Runtime::shutdown`), exits 0; any other — one still waiting for
+        // its status document, say — exits 1, its stream cut off.
         self.shared.broadcaster.close();
         if let Err(e) = fs::remove_file(&self.path)
             && e.kind() != io::ErrorKind::NotFound
@@ -566,6 +658,10 @@ pub struct Forwarded {
     commands: Vec<Command>,
     cwd: PathBuf,
     reply: Option<Reply>,
+    /// Set by the caller when it stops waiting for the answer ([`HANDLER_TIMEOUT`]).
+    abandoned: Arc<AtomicBool>,
+    /// The server's [`Closing`], for a command handed over through it.
+    closing: Option<Closing>,
 }
 
 /// Where a [`Forwarded`]'s answer goes: a channel back to a connection thread, or a D-Bus call's
@@ -589,7 +685,24 @@ impl Forwarded {
             commands,
             cwd,
             reply: Some(Box::new(reply)),
+            abandoned: Arc::new(AtomicBool::new(false)),
+            closing: None,
         }
+    }
+
+    /// Answer [`SHUTTING_DOWN`] instead of `ok` when dropped unanswered after `closing` is set:
+    /// then nothing carried it out, and nothing will.
+    fn closing_with(mut self, closing: Closing) -> Self {
+        self.closing = Some(closing);
+        self
+    }
+
+    /// Whether the caller has stopped waiting for the answer — it was told that FxSound did not
+    /// answer in time. Such a command is not carried out late: a keybind pressed a dozen times
+    /// while the GUI thread was busy would otherwise replay all of them at once when it is free.
+    #[must_use]
+    pub fn is_abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::SeqCst)
     }
 
     /// What the forwarding process asked for, in `applyConfig` order.
@@ -638,7 +751,12 @@ impl Forwarded {
 
 impl Drop for Forwarded {
     fn drop(&mut self) {
-        self.send(Response::ok());
+        let closing = self.closing.as_ref().is_some_and(Closing::is_set);
+        self.send(if closing {
+            Response::failed(SHUTTING_DOWN)
+        } else {
+            Response::ok()
+        });
     }
 }
 
@@ -658,6 +776,7 @@ impl std::fmt::Debug for Forwarded {
 #[derive(Clone)]
 pub struct Control {
     tx: WakingSender<Forwarded>,
+    closing: Closing,
 }
 
 impl Control {
@@ -665,7 +784,23 @@ impl Control {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn from_sender(tx: crossbeam_channel::Sender<Forwarded>) -> Self {
-        Self { tx: tx.into() }
+        Self {
+            tx: tx.into(),
+            closing: Closing::default(),
+        }
+    }
+
+    /// [`Control::from_sender`], with the way out begun or not as `closing` says.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_sender_closing(
+        tx: crossbeam_channel::Sender<Forwarded>,
+        closing: Closing,
+    ) -> Self {
+        Self {
+            tx: tx.into(),
+            closing,
+        }
     }
 
     /// Hand `commands` to the GUI thread and wait for its answer.
@@ -675,18 +810,32 @@ impl Control {
     /// fails as such: an instance that is going away, or a GUI thread that does not answer in
     /// time, comes back as a failed [`Response`] that says so, as `fxsound` would print it.
     pub async fn call(&self, commands: Vec<Command>) -> Response {
-        let (reply, answer) = tokio::sync::oneshot::channel();
+        // As [`hand_over`] does for the socket: once the way out has begun, nothing waits.
+        if self.closing.is_set() {
+            return Response::failed(SHUTTING_DOWN);
+        }
+        let (reply, mut answer) = tokio::sync::oneshot::channel();
         let forwarded = Forwarded::new(commands, PathBuf::from("/"), move |response| {
             let _ = reply.send(response);
-        });
+        })
+        .closing_with(self.closing.clone());
+        let abandoned = Arc::clone(&forwarded.abandoned);
         if self.tx.try_send(forwarded).is_err() {
             return Response::failed(SHUTTING_DOWN);
         }
-        match tokio::time::timeout(HANDLER_TIMEOUT, answer).await {
+        if self.closing.is_set() {
+            return answer
+                .try_recv()
+                .unwrap_or_else(|_| Response::failed(SHUTTING_DOWN));
+        }
+        match tokio::time::timeout(HANDLER_TIMEOUT, &mut answer).await {
             Ok(Ok(response)) => response,
-            // Dropped without its `Drop` running: the process is going away, as in `dispatch`.
-            Ok(Err(_)) => Response::ok(),
-            Err(_) => Response::unanswered(),
+            // Dropped without its `Drop` running: the process is going away, as in `hand_over`.
+            Ok(Err(_)) => Response::failed(SHUTTING_DOWN),
+            Err(_) => {
+                abandoned.store(true, Ordering::SeqCst);
+                Response::unanswered()
+            }
         }
     }
 }
@@ -753,10 +902,18 @@ impl Client {
     }
 }
 
+/// What `fxsound --watch` says when its stream ends without the instance's `quit` event.
+const STREAM_CUT_OFF: &str =
+    "the event stream was cut off (the reader fell behind or FxSound stopped)";
+
 /// Subscribe on `socket` and copy the stream to `out` until it ends. Returns the exit code:
 ///
-/// * `0` when the instance hung up — it quit — or when `out` stopped taking lines, which is what
-///   `fxsound --watch | head -n 1` does on purpose;
+/// * `0` when the instance hung up after its `quit` event — it quit — or when `out` stopped
+///   taking lines, which is what `fxsound --watch | head -n 1` does on purpose;
+/// * `1` with [`STREAM_CUT_OFF`] on `err` when the stream ended without that event: the instance
+///   dropped a reader that fell behind, or it died. A supervisor that restarts `--watch` until it
+///   exits 0 then keeps it running for as long as FxSound does, instead of stopping as though
+///   FxSound had quit;
 /// * `1` with `FxSound is not running` on `err` when there is nobody to subscribe to;
 /// * the refusal's own code, with its message on `err`, when the instance said no — an older
 ///   instance that has never heard of `--watch` answers that way.
@@ -799,6 +956,17 @@ pub fn watch_to(
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     let mut first = true;
+    // The server writes `quit` before it hangs up on its way out, and on no other occasion: the
+    // only end of the stream that is the instance quitting.
+    let mut quit = false;
+    let ended = |quit: bool, err: &mut dyn Write| {
+        if quit {
+            0
+        } else {
+            let _ = writeln!(err, "{STREAM_CUT_OFF}");
+            1
+        }
+    };
     loop {
         line.clear();
         let read = reader.read_line(&mut line);
@@ -809,10 +977,12 @@ pub fn watch_to(
             return 1;
         }
         match read {
-            Ok(_) if !line.ends_with('\n') => return 0,
+            // End of the stream. A line without its newline is one a write abandoned half-way,
+            // and is not printed.
+            Ok(_) if !line.ends_with('\n') => return ended(quit, err),
             Ok(_) => {}
             // The instance died with the frame half-read; the stream is over all the same.
-            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return 0,
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => return ended(quit, err),
             Err(e) => {
                 let _ = writeln!(err, "the event stream broke off: {e}");
                 return 1;
@@ -830,6 +1000,7 @@ pub fn watch_to(
             }
             return response.exit_code();
         }
+        quit = is_quit_event(&line);
         if out
             .write_all(line.as_bytes())
             .and_then(|()| out.flush())
@@ -838,6 +1009,16 @@ pub fn watch_to(
             return 0;
         }
     }
+}
+
+/// Whether `line` is the `quit` event, in either of the stream's two spellings.
+fn is_quit_event(line: &str) -> bool {
+    let line = line.trim_end();
+    let quit = AppEvent::Quit.name();
+    line == quit
+        || (line.starts_with('{')
+            && serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|event| event["event"] == quit))
 }
 
 /// Forward to a socket this process did not learn from [`Instance::acquire`] — a second profile,
@@ -969,6 +1150,8 @@ fn write_frame(mut stream: &UnixStream, frame: &impl Serialize) -> io::Result<()
 struct Shared {
     /// The way to the GUI thread, which it wakes (0.4.0 design §12).
     tx: WakingSender<Forwarded>,
+    /// Whether the way out has begun: every caller is refused from then on.
+    closing: Closing,
     status: StatusSource,
     broadcaster: Broadcaster,
     /// Connections being answered right now, against [`MAX_CONNECTIONS`].
@@ -1051,10 +1234,7 @@ fn spawn_handler(stream: UnixStream, shared: &Arc<Shared>) {
     if shared.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
         shared.connections.fetch_sub(1, Ordering::SeqCst);
         let _ = stream.set_write_timeout(Some(WATCH_WRITE_TIMEOUT));
-        refuse(
-            &stream,
-            "FxSound is answering too many callers at once; try again",
-        );
+        refuse(&stream, TOO_MANY_CALLERS);
         return;
     }
     let slot = ConnectionSlot(Arc::clone(shared));
@@ -1077,20 +1257,21 @@ impl Drop for ConnectionSlot {
 }
 
 fn handle_connection(stream: UnixStream, shared: &Shared) {
-    if let Err(e) = stream
-        .set_read_timeout(Some(REQUEST_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(REQUEST_TIMEOUT)))
-    {
+    if let Err(e) = stream.set_write_timeout(Some(REQUEST_TIMEOUT)) {
         log::warn!("could not arm the control socket timeouts: {e}");
         return;
     }
-    let request = match read_request(&stream) {
+    let request = match read_request(&stream, REQUEST_TIMEOUT) {
         Ok(request) => request,
         Err(e) => {
             refuse(&stream, e);
             return;
         }
     };
+    if shared.closing.is_set() {
+        refuse(&stream, SHUTTING_DOWN);
+        return;
+    }
     if request.watch {
         match watch_flags(&request) {
             Ok((json, meters)) => {
@@ -1102,7 +1283,7 @@ fn handle_connection(stream: UnixStream, shared: &Shared) {
         }
         return;
     }
-    answer(&stream, &dispatch(request, &shared.tx));
+    answer(&stream, &dispatch(request, &shared.tx, &shared.closing));
 }
 
 fn answer(stream: &UnixStream, response: &Response) {
@@ -1115,12 +1296,25 @@ fn refuse(stream: &UnixStream, why: impl Into<String>) {
     answer(stream, &Response::failed(why));
 }
 
-fn read_request(stream: &UnixStream) -> Result<Request, String> {
+/// Read one request line, all of it within `within`.
+///
+/// The deadline is for the whole line, not for each read: a socket's receive timeout restarts
+/// with every byte, so a caller trickling one byte every few seconds would otherwise hold its
+/// connection — one of [`MAX_CONNECTIONS`] — for as long as [`MAX_REQUEST_BYTES`] takes at that
+/// pace, which is days.
+fn read_request(stream: &UnixStream, within: Duration) -> Result<Request, String> {
     let mut line = Vec::new();
+    let reader = Deadline {
+        stream,
+        until: Instant::now() + within,
+    };
     // One byte past the cap, so that a line of exactly the cap still has room for its newline.
-    BufReader::new(Read::take(stream, MAX_REQUEST_BYTES as u64 + 1))
+    BufReader::new(Read::take(reader, MAX_REQUEST_BYTES as u64 + 1))
         .read_until(b'\n', &mut line)
-        .map_err(|e| format!("could not read the request: {e}"))?;
+        .map_err(|e| match e.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => REQUEST_TOO_SLOW.to_owned(),
+            _ => format!("could not read the request: {e}"),
+        })?;
     if line.len() > MAX_REQUEST_BYTES && line.last() != Some(&b'\n') {
         return Err(format!(
             "the request is longer than {} KiB and was not read",
@@ -1136,6 +1330,24 @@ fn read_request(stream: &UnixStream) -> Result<Request, String> {
         ));
     }
     Ok(request)
+}
+
+/// A stream read against one deadline: each read waits at most for what is left of it.
+struct Deadline<'a> {
+    stream: &'a UnixStream,
+    until: Instant,
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        let mut stream = self.stream;
+        stream.read(buf)
+    }
 }
 
 /// A watch request's `--json` and `--meters`, from the same parser every other request goes
@@ -1157,35 +1369,12 @@ fn watch_flags(request: &Request) -> Result<(bool, bool), Response> {
 /// Parsing happens *here*, on the primary, so that the forwarding process gets the same error text
 /// it would have got had it parsed the line itself — which is the whole reason the frame carries
 /// argv rather than a pre-parsed command list.
-fn dispatch(request: Request, tx: &WakingSender<Forwarded>) -> Response {
+fn dispatch(request: Request, tx: &WakingSender<Forwarded>, closing: &Closing) -> Response {
     let cli = match Cli::try_parse_from(&request.argv) {
         Ok(cli) => cli,
         Err(e) => return Response::failed(e.render().to_string()),
     };
-
-    let (reply_tx, reply_rx) = bounded(1);
-    let forwarded = Forwarded::new(
-        cli.commands(),
-        PathBuf::from(request.cwd),
-        move |response| {
-            let _ = reply_tx.send(response);
-        },
-    );
-
-    match tx.try_send(forwarded) {
-        Ok(()) => {}
-        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-            return Response::failed(SHUTTING_DOWN);
-        }
-    }
-
-    match reply_rx.recv_timeout(HANDLER_TIMEOUT) {
-        Ok(response) => response,
-        Err(RecvTimeoutError::Timeout) => Response::unanswered(),
-        // The handler dropped the `Forwarded` without answering and without the `Drop` impl
-        // running, which can only mean the process is going away.
-        Err(RecvTimeoutError::Disconnected) => Response::ok(),
-    }
+    hand_over(tx, closing, cli.commands(), PathBuf::from(request.cwd))
 }
 
 // =============================================================================================
@@ -2561,5 +2750,249 @@ mod tests {
             connections(&server) == 0
         });
         a_keybind_gets_through(&server);
+    }
+
+    // ---- the way out, the deadline and the stream's end (C15) --------------------------------
+
+    fn primary(dir: &Path) -> Server {
+        let Instance::Primary(listener) = Instance::acquire_in(dir).expect("acquire") else {
+            panic!("expected to be primary");
+        };
+        listener.serve().expect("serve")
+    }
+
+    #[test]
+    fn a_command_line_forwarded_after_the_way_out_began_is_refused_at_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let server = primary(dir.path());
+        server.refuse_pending();
+        let started = Instant::now();
+        let response = forward_to(
+            server.path(),
+            &argv(&["--preset", "Rock"]),
+            Path::new("/"),
+            REPLY_TIMEOUT,
+        )
+        .expect("an answer");
+        assert!(!response.ok, "never a bare acknowledgement");
+        assert_eq!(response.stderr, SHUTTING_DOWN);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            server.try_recv().is_none(),
+            "nothing reached the GUI thread"
+        );
+    }
+
+    #[test]
+    fn a_command_line_still_queued_when_the_server_goes_is_refused_not_acknowledged() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let server = primary(dir.path());
+        let socket = server.path().to_owned();
+        let caller = thread::spawn(move || {
+            forward_to(
+                &socket,
+                &argv(&["--status", "--json"]),
+                Path::new("/"),
+                REPLY_TIMEOUT,
+            )
+        });
+        wait_until("the command is queued", || server.arrivals().len() == 1);
+        // The way out with nothing draining the channel after it began: the GUI thread is busy
+        // handing the default devices back, and then the server is dropped.
+        drop(server);
+        let response = caller.join().expect("the caller").expect("an answer");
+        assert!(!response.ok);
+        assert_eq!(response.stderr, SHUTTING_DOWN);
+    }
+
+    #[test]
+    fn a_forwarded_command_dropped_unanswered_during_the_way_out_says_so() {
+        let closing = Closing::default();
+        let answer = |closing: &Closing| {
+            let (tx, rx) = bounded(1);
+            drop(
+                Forwarded::new(Vec::new(), PathBuf::from("/"), move |response| {
+                    let _ = tx.send(response);
+                })
+                .closing_with(closing.clone()),
+            );
+            rx.recv().expect("an answer")
+        };
+        assert!(answer(&closing).ok, "dropped by a handler: acknowledged");
+        closing.set();
+        let response = answer(&closing);
+        assert!(!response.ok, "dropped with the channel: nothing ran it");
+        assert_eq!(response.stderr, SHUTTING_DOWN);
+    }
+
+    #[test]
+    fn the_control_channel_refuses_at_once_once_the_way_out_began() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let server = primary(dir.path());
+        let control = server.control();
+        server.refuse_pending();
+        let started = Instant::now();
+        let response = block_on(control.call(vec![Command::Status { json: true }]));
+        assert!(!response.ok);
+        assert_eq!(response.stderr, SHUTTING_DOWN);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(server.try_recv().is_none());
+    }
+
+    #[test]
+    fn a_command_whose_caller_stopped_waiting_is_marked_so_and_one_answered_is_not() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let tx: WakingSender<Forwarded> = tx.into();
+        let closing = Closing::default();
+        let response = hand_over_within(
+            &tx,
+            &closing,
+            vec![Command::Status { json: true }],
+            PathBuf::from("/"),
+            Duration::from_millis(20),
+        );
+        assert!(response.is_unanswered());
+        let late = rx.try_recv().expect("still queued");
+        assert!(late.is_abandoned(), "the GUI thread will not run it late");
+
+        let gui = thread::spawn(move || {
+            let forwarded = rx.recv().expect("a command");
+            assert!(!forwarded.is_abandoned());
+            forwarded.respond("done");
+        });
+        let response = hand_over_within(
+            &tx,
+            &closing,
+            vec![Command::Status { json: true }],
+            PathBuf::from("/"),
+            REPLY_TIMEOUT,
+        );
+        gui.join().expect("the GUI thread");
+        assert_eq!(response.stdout, "done");
+    }
+
+    #[test]
+    fn a_request_trickled_a_byte_at_a_time_is_cut_off_at_one_deadline_for_the_whole_line() {
+        let (ours, theirs) = UnixStream::pair().expect("pair");
+        let trickle = thread::spawn(move || {
+            let mut theirs = theirs;
+            // A byte every 20 ms, each well inside any per-read timeout, and never a newline.
+            for _ in 0..100 {
+                if theirs.write_all(b"{").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        let error = read_request(&ours, Duration::from_millis(200)).expect_err("cut off");
+        let took = started.elapsed();
+        assert_eq!(error, REQUEST_TOO_SLOW);
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        drop(ours);
+        trickle.join().expect("the trickle");
+    }
+
+    #[test]
+    fn a_whole_request_inside_the_deadline_is_read() {
+        let (ours, mut theirs) = UnixStream::pair().expect("pair");
+        write_frame(
+            &theirs,
+            &Request {
+                v: PROTOCOL_VERSION,
+                argv: argv(&["--next-preset"]),
+                ..Request::default()
+            },
+        )
+        .expect("write");
+        theirs.flush().expect("flush");
+        let request = read_request(&ours, Duration::from_secs(1)).expect("read");
+        assert_eq!(request.argv, argv(&["--next-preset"]));
+    }
+
+    #[test]
+    fn the_quit_event_is_told_apart_in_both_spellings() {
+        assert!(is_quit_event("quit\n"));
+        assert!(is_quit_event(&(AppEvent::Quit.to_json(5) + "\n")));
+        assert!(!is_quit_event("power on=false\n"));
+        assert!(!is_quit_event(
+            r#"{"v":1,"event":"power","ts":5,"on":true}"#
+        ));
+        assert!(!is_quit_event("quitting\n"));
+    }
+
+    /// A stand-in instance on `socket` that reads one request and writes `stream` before it
+    /// hangs up.
+    fn instance_that_writes(socket: &Path, stream: &'static str) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).expect("bind");
+        thread::spawn(move || {
+            let (connection, _) = listener.accept().expect("accept");
+            let mut line = String::new();
+            BufReader::new(&connection)
+                .read_line(&mut line)
+                .expect("the request");
+            (&connection).write_all(stream.as_bytes()).expect("write");
+        })
+    }
+
+    fn watch(socket: &Path) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = watch_to(
+            socket,
+            &argv(&["--watch"]),
+            Path::new("/"),
+            false,
+            &mut out,
+            &mut err,
+        );
+        (
+            code,
+            String::from_utf8(out).expect("utf-8"),
+            String::from_utf8(err).expect("utf-8"),
+        )
+    }
+
+    #[test]
+    fn a_watch_stream_cut_off_without_quit_exits_one_and_says_so() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join(SOCKET_NAME);
+        // A reader that fell behind: the last write stopped half-way through a line.
+        let instance = instance_that_writes(&socket, "status power=true\npower on=fal");
+        let (code, out, err) = watch(&socket);
+        instance.join().expect("the instance");
+        assert_eq!(code, 1);
+        assert_eq!(out, "status power=true\n", "the half line is not printed");
+        assert!(err.contains("cut off"), "{err}");
+    }
+
+    #[test]
+    fn a_watch_stream_that_ends_after_quit_exits_zero_quietly() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join(SOCKET_NAME);
+        let instance = instance_that_writes(
+            &socket,
+            "{\"v\":1,\"event\":\"status\",\"ts\":1}\n{\"v\":1,\"event\":\"quit\",\"ts\":2}\n",
+        );
+        let (code, _out, err) = watch(&socket);
+        instance.join().expect("the instance");
+        assert_eq!(code, 0, "{err}");
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn a_watcher_dropped_by_a_server_that_goes_without_quit_is_not_told_it_quit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let server = serve_with(dir.path(), json!({"power": true}));
+        let socket = server.path().to_path_buf();
+        let client = thread::spawn(move || watch(&socket));
+        wait_until("the watcher has its status", || {
+            server.shared.broadcaster.active_count() == 1
+        });
+        server.publish(&AppEvent::Power { on: false });
+        drop(server);
+        let (code, out, err) = client.join().expect("client thread");
+        assert_eq!(code, 1);
+        assert_eq!(out, "status power=true\npower on=false\n");
+        assert!(err.contains("cut off"), "{err}");
     }
 }

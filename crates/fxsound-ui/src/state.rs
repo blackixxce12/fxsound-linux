@@ -6,6 +6,7 @@
 //! an action into a real effect — writing a preset, retuning the engine, switching a device — so
 //! the whole UI crate stays free of audio and file-system dependencies and can be tested headless.
 
+use fxsound_core::i18n::tr;
 use fxsound_core::{
     AudioDevice, DenoiseLevel, DeviceDirection, Effect, EqBand, SpectrumFrame, ThemeMode, ViewMode,
 };
@@ -22,6 +23,36 @@ pub struct PresetEntry {
     pub factory: bool,
     /// `true` when the user has unsaved changes; drawn as a trailing `*`.
     pub modified: bool,
+}
+
+/// Why echo cancellation, asked for, is not running — as far as the interface says it. The
+/// engine's own words, a module path and an OS error among them, stay in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoCancelTrouble {
+    /// The canceller could not be loaded: PipeWire's echo-cancel module or its WebRTC library is
+    /// missing, or refused.
+    NotLoaded,
+    /// It was running and went away by itself.
+    Stopped,
+    /// It waits for the speakers it takes the echo of.
+    WaitingForSpeakers,
+    /// Something this version cannot name. Said as `unavailable` alone.
+    Other,
+}
+
+impl EchoCancelTrouble {
+    /// The short reason shown after `unavailable`, translated; `None` for [`Self::Other`].
+    #[must_use]
+    pub fn reason(self) -> Option<String> {
+        match self {
+            Self::Other => None,
+            named => Some(tr(match named {
+                Self::NotLoaded => "the echo canceller could not be loaded",
+                Self::Stopped => "the echo canceller stopped",
+                Self::WaitingForSpeakers | Self::Other => "waiting for the speakers",
+            })),
+        }
+    }
 }
 
 /// Everything the views draw.
@@ -45,6 +76,13 @@ pub struct UiState {
     /// The input lane's device, as an index into `devices`; `None` while the lane is detached —
     /// which is the default: the microphone lane only comes up when someone picks a microphone.
     pub selected_input: Option<usize>,
+    /// Per lane, the name of the device a lane that is **on** is attached to, or on its way to,
+    /// while `devices` does not list it — a Bluetooth headset between its two profiles, the
+    /// moments before the first device list. The combo, the tray and the strip show the lane on
+    /// that device rather than `Off`, which means switched off and nothing else. `None` whenever
+    /// the lane has a selection, and for a lane that is off.
+    pub unlisted_output: Option<String>,
+    pub unlisted_input: Option<String>,
     /// The **edit direction**: which lane the preset picker, the equalizer, the level controls and
     /// the meters address. Both lanes can run at once; this only says which one the window edits.
     ///
@@ -129,6 +167,9 @@ pub struct UiState {
     /// Whether the echo canceller is actually loaded: asked-for-but-not-running is a third state
     /// here too (a system without the WebRTC module).
     pub echo_cancel_running: bool,
+    /// Why the engine says the echo canceller is not running, when it says anything: `None` is
+    /// no complaint, which is also the canceller simply not needed yet.
+    pub echo_cancel_trouble: Option<EchoCancelTrouble>,
     /// The suppression level in force, with the global override already applied.
     pub denoise_level: DenoiseLevel,
 
@@ -164,6 +205,8 @@ impl Default for UiState {
             devices: Vec::new(),
             selected_output: None,
             selected_input: None,
+            unlisted_output: None,
+            unlisted_input: None,
             direction: DeviceDirection::Output,
             output_active: false,
             input_active: false,
@@ -195,6 +238,7 @@ impl Default for UiState {
             dereverb_on: false,
             echo_cancel_on: false,
             echo_cancel_running: false,
+            echo_cancel_trouble: None,
             denoise_level: DenoiseLevel::default(),
             notification: None,
             notice_clock: None,
@@ -257,22 +301,44 @@ impl UiState {
         self.device_for(self.direction)
     }
 
-    /// Whether the output lane has a device.
+    /// The name of the device `direction`'s lane is on while the list does not carry it
+    /// ([`UiState::unlisted_output`]).
+    #[must_use]
+    pub fn unlisted(&self, direction: DeviceDirection) -> Option<&str> {
+        match direction {
+            DeviceDirection::Output => self.unlisted_output.as_deref(),
+            DeviceDirection::Input => self.unlisted_input.as_deref(),
+        }
+    }
+
+    /// Record the device one lane is on while the list does not carry it, or `None`.
+    pub fn set_unlisted(&mut self, direction: DeviceDirection, name: Option<String>) {
+        match direction {
+            DeviceDirection::Output => self.unlisted_output = name,
+            DeviceDirection::Input => self.unlisted_input = name,
+        }
+    }
+
+    /// Whether the output lane has a device, listed or not.
     #[must_use]
     pub const fn output_enabled(&self) -> bool {
-        self.selected_output.is_some()
+        self.selected_output.is_some() || self.unlisted_output.is_some()
     }
 
-    /// Whether the input lane has a device — i.e. whether a microphone is being processed at all.
+    /// Whether the input lane has a device, listed or not — i.e. whether the microphone lane is
+    /// on at all.
     #[must_use]
     pub const fn input_enabled(&self) -> bool {
-        self.selected_input.is_some()
+        self.selected_input.is_some() || self.unlisted_input.is_some()
     }
 
-    /// Whether one lane has a device.
+    /// Whether one lane has a device, listed or not.
     #[must_use]
     pub const fn lane_enabled(&self, direction: DeviceDirection) -> bool {
-        self.selection(direction).is_some()
+        match direction {
+            DeviceDirection::Output => self.output_enabled(),
+            DeviceDirection::Input => self.input_enabled(),
+        }
     }
 
     /// Put up a notice and start its clock now.

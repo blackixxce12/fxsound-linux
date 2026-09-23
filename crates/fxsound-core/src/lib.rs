@@ -11,12 +11,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod apps;
 pub mod atomic;
 pub mod i18n;
 pub mod messages;
 pub mod settings;
 
-pub use messages::{AudioToUi, TargetVolume, UiToAudio};
+pub use apps::{AppKey, AppPreset, AppRule, AppRules, MAX_ROUTES_PER_LANE};
+pub use messages::{AppRoute, AppStream, AudioToUi, RouteParams, TargetVolume, UiToAudio};
 pub use settings::{Settings, ThemeMode, ViewMode};
 
 /// The five user-facing effects, in the order the GUI lays them out.

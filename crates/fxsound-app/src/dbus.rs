@@ -39,8 +39,14 @@
 //! prints for it, not a bus error. `ListPresets` and `ListDevices` answer with the parts of the
 //! `--status --json` document that list the presets and the devices (review items U14 and the
 //! D-Bus additions, the prerequisites of an MCP server). The bus starts FxSound for a call when it
-//! is not running: `org.fxsound.FxSound.service` in `/usr/share/dbus-1/services/` hands the start
-//! to `fxsound.service`.
+//! is not running — any call, a property read included, unless the caller sets `NO_AUTO_START`
+//! (`busctl --auto-start=no`), which the manual tells pollers to: `org.fxsound.FxSound.service` in
+//! `/usr/share/dbus-1/services/` hands the start to `fxsound.service`, whose `--activated` exits
+//! quietly when an instance still starting up turns out to hold the lock already.
+//!
+//! At most [`ipc::MAX_CONNECTIONS`] calls are in flight at once, the control socket's own limit;
+//! past it a call is refused with [`ipc::TOO_MANY_CALLERS`]. A call whose caller was answered
+//! `Failed` for want of an answer in time is not carried out late ([`ipc::Forwarded::is_abandoned`]).
 //!
 //! `Preset`, `GetPreset` and `Direction` are about the edit direction, the lane the window shows,
 //! as `--status`'s `preset:` is. `Output` and `Input` are the lanes' devices by description, as
@@ -662,9 +668,20 @@ struct Service {
 impl Service {
     /// Carry `call` out on the GUI thread and return what it printed.
     async fn run(&self, call: Call) -> Result<String, MethodError> {
-        let _busy = self.in_flight.enter();
         let commands = call.commands().map_err(fdo::Error::InvalidArgs)?;
-        answer(self.control.call(commands).await)
+        answer(self.call(commands).await)
+    }
+
+    /// Hand `commands` to the GUI thread and wait for the answer, as one of at most
+    /// [`ipc::MAX_CONNECTIONS`] calls in flight — the socket's own limit. zbus answers every call
+    /// on a task of its own, so without it a caller that does not wait for its replies, or a GUI
+    /// thread that stalls for a few seconds, piles up tasks and queued commands without end; past
+    /// it a call is refused with [`ipc::TOO_MANY_CALLERS`], as a keybind past the socket's limit is.
+    async fn call(&self, commands: Vec<Command>) -> Response {
+        let Some(_busy) = self.in_flight.try_enter() else {
+            return Response::failed(ipc::TOO_MANY_CALLERS);
+        };
+        self.control.call(commands).await
     }
 
     /// [`Service::run`], for a method that returns nothing.
@@ -779,9 +796,8 @@ impl Service {
     /// `--hide`.
     #[zbus(out_args("ok", "stdout", "stderr"))]
     async fn apply(&self, argv: Vec<String>) -> Result<(bool, String, String), MethodError> {
-        let _busy = self.in_flight.enter();
         let response = match apply_commands(&argv) {
-            Ok(commands) => self.control.call(commands).await,
+            Ok(commands) => self.call(commands).await,
             Err(response) => response,
         };
         applied(response)
@@ -881,9 +897,14 @@ struct InFlight {
 struct Busy(Arc<InFlight>);
 
 impl InFlight {
-    fn enter(self: &Arc<Self>) -> Busy {
-        self.count.fetch_add(1, Ordering::SeqCst);
-        Busy(Arc::clone(self))
+    /// One more call in flight, or `None` when [`ipc::MAX_CONNECTIONS`] are already.
+    fn try_enter(self: &Arc<Self>) -> Option<Busy> {
+        self.count
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < ipc::MAX_CONNECTIONS).then_some(count + 1)
+            })
+            .ok()?;
+        Some(Busy(Arc::clone(self)))
     }
 
     /// Until no call is in flight.
@@ -2455,6 +2476,55 @@ mod tests {
             "{}",
             response.stderr
         );
+    }
+
+    #[test]
+    fn past_the_sockets_own_limit_a_call_is_refused_rather_than_queued() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Forwarded>();
+        let service = Service {
+            control: Control::from_sender(tx),
+            properties: Arc::default(),
+            in_flight: Arc::default(),
+        };
+        let held: Vec<_> = (0..ipc::MAX_CONNECTIONS)
+            .map(|_| service.in_flight.try_enter().expect("a place"))
+            .collect();
+        let started = Instant::now();
+        let response = runtime().block_on(service.call(vec![Command::Status { json: true }]));
+        assert!(started.elapsed() < Duration::from_secs(1), "not held");
+        assert!(!response.ok);
+        assert_eq!(response.stderr, ipc::TOO_MANY_CALLERS);
+        assert!(rx.try_recv().is_err(), "nothing was queued to run later");
+        assert!(
+            matches!(answer(response), Err(MethodError::Refused(text)) if text == ipc::TOO_MANY_CALLERS),
+            "a refusal on the bus"
+        );
+
+        // A place frees up, and the next call is carried out.
+        drop(held);
+        let gui = thread::spawn(move || rx.recv().expect("a command").respond("{}"));
+        let response = runtime().block_on(service.call(vec![Command::Status { json: true }]));
+        gui.join().expect("the GUI thread");
+        assert!(response.ok);
+        assert_eq!(service.in_flight.count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_call_arriving_once_the_way_out_began_is_refused_at_once() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Forwarded>();
+        let closing = ipc::Closing::default();
+        closing.set();
+        let started = Instant::now();
+        let response =
+            runtime().block_on(Control::from_sender_closing(tx, closing).call(vec![Command::Quit]));
+        assert!(!response.ok);
+        assert!(
+            response.stderr.contains("shutting down"),
+            "{}",
+            response.stderr
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(rx.try_recv().is_err());
     }
 
     // ---- hosting ------------------------------------------------------------------------------

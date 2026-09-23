@@ -59,11 +59,19 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod apps;
+mod sleep;
+mod volume;
+
 /// How long to wait for anything the server has to do.
 pub(crate) const PATIENCE: Duration = Duration::from_secs(10);
 
 /// Our nodes as the server lists them: each name with its `object.serial`.
 type OurNodes = Vec<(&'static str, u64)>;
+
+/// The clock of [`PrivateGraph::clocked_recorder`]: a null sink the engine does not take for a
+/// device, with a real device's driver priority.
+pub(crate) const CLOCK: &str = "t_clock";
 
 /// Set to `1` where every check here must run: `.github/workflows/ci.yml` sets it, because it
 /// installs the daemon, the `pw-*` tools and the `audiotestsrc` plugin for these tests, and there a
@@ -348,7 +356,7 @@ impl PrivateGraph {
     }
 
     /// The id of the node called `name`, for `pw-cli`, which addresses objects by number.
-    fn node_id(&self, name: &str) -> Option<u64> {
+    pub(crate) fn node_id(&self, name: &str) -> Option<u64> {
         let objects = self.dump()?;
         Self::node_object(&objects, name)?["id"].as_u64()
     }
@@ -532,6 +540,78 @@ impl PrivateGraph {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Start an application recording from the node called `from`: `pw-record` as a stream called
+    /// `name`, given the input ports a session manager would give it and linked from `from`'s
+    /// outputs, as everything on this graph is linked. It writes what it hears to a file of its own
+    /// as raw interleaved stereo `f32` ([`Recorder::peak_since`]). `None` when it never appeared or
+    /// could not be linked.
+    pub(crate) fn record_from(&self, from: &str, name: &str) -> Option<Recorder> {
+        let file = self.dir.join(format!("{name}.raw"));
+        let props = format!("{{ node.name = {name} }}");
+        let child = Command::new("pw-record")
+            .arg("--remote")
+            .arg(self.socket())
+            .args(["--target", "0", "-P", &props, "--raw", "--format", "f32"])
+            .args(["--rate", "48000", "--channels", "2"])
+            .arg(&file)
+            .env("XDG_RUNTIME_DIR", self.dir.join("run"))
+            .env("PIPEWIRE_REMOTE", self.socket())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let recorder = Recorder {
+            child,
+            name: name.to_owned(),
+            file,
+        };
+        let deadline = Instant::now() + PATIENCE;
+        while self.node_id(name).is_none() {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.configure_ports(name, "Input", &["FL", "FR"])?;
+        self.link_nodes(from, name).then_some(recorder)
+    }
+
+    /// [`Self::record_from`], for a recorder that runs on a clock of its own before it records
+    /// anything of ours: a null sink — which the engine does not take for a device — with a real
+    /// device's driver priority, whose monitor the recorder records from the start. Whatever the
+    /// test links into the recorder after that is driven by the clock, as a real device drives
+    /// what an application records, and not by the test's tone.
+    ///
+    /// That matters wherever a group the tone is linked into stops and starts again, which is
+    /// every time an application stops and starts recording from FxSound (Input). Driving such a
+    /// group on a machine busy with other work, `audiotestsrc` was seen to run out of buffers
+    /// (`spa.audiotestsrc: make_buffer(): out of buffers`, in the daemon's log) and stop the cycle
+    /// for good — about one start in five with four test runs side by side, with the nodes all
+    /// saying `running` — where a null sink driving the same group, as here, never did in thirty.
+    /// A real microphone's driver is the null sink's kind, not the tone's.
+    pub(crate) fn clocked_recorder(&self, name: &str) -> Option<Recorder> {
+        self.add_clock()?;
+        self.record_from(CLOCK, name)
+    }
+
+    /// Add the clock of [`Self::clocked_recorder`], once, with its monitor ports: linked into a
+    /// stream, it drives whatever that stream records. `None` when it never appeared.
+    pub(crate) fn add_clock(&self) -> Option<()> {
+        if self.node_id(CLOCK).is_some() {
+            return Some(());
+        }
+        self.add_adapter(
+            CLOCK,
+            &format!(
+                "factory.name = support.null-audio-sink node.name = {CLOCK} \
+                 node.description = \"Test Clock\" media.class = Audio/Sink/Internal \
+                 priority.driver = 1010 audio.channels = 2 audio.position = [ FL FR ]"
+            ),
+        )?;
+        self.configure_monitored_ports(CLOCK, &["FL", "FR"])
     }
 
     /// Add a source that plays a steady tone: PipeWire's `audiotestsrc` behind an adapter, which
@@ -813,6 +893,80 @@ impl PrivateGraph {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+/// An application recording from the graph ([`PrivateGraph::record_from`]). Dropped, it stops, and
+/// its links go with it.
+pub(crate) struct Recorder {
+    child: Child,
+    /// Its `node.name`, to link and unlink it by.
+    pub(crate) name: String,
+    file: std::path::PathBuf,
+}
+
+impl Recorder {
+    /// How many bytes it has written so far: a mark to read what it hears from on.
+    pub(crate) fn written(&self) -> usize {
+        std::fs::metadata(&self.file).map_or(0, |meta| meta.len() as usize)
+    }
+
+    /// The loudest sample it has written from byte `from` of its file on, and how many samples
+    /// that was.
+    pub(crate) fn peak_since(&self, from: usize) -> (f32, usize) {
+        let bytes = std::fs::read(&self.file).unwrap_or_default();
+        // From the first whole sample at or after the mark: the file may end part-way through one.
+        let start = from.div_ceil(4) * 4;
+        let (words, _) = bytes.get(start..).unwrap_or_default().as_chunks::<4>();
+        let peak = words
+            .iter()
+            .map(|word| f32::from_le_bytes(*word).abs())
+            .fold(0.0_f32, f32::max);
+        (peak, words.len())
+    }
+
+    /// Whether it hears something from byte `from` of its file on — a sample louder than −20 dBFS
+    /// — within the patience.
+    pub(crate) fn hears_since(&self, from: usize) -> bool {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let (peak, written) = self.peak_since(from);
+            if peak > 0.1 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                println!(
+                    "{} heard nothing louder than {peak} in {written} samples",
+                    self.name
+                );
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait until it has written at least `samples` more from byte `from` on, and say how loud they
+    /// were at the loudest. `None` when it never did.
+    pub(crate) fn heard_since(&self, from: usize, samples: usize) -> Option<f32> {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let (peak, written) = self.peak_since(from);
+            if written >= samples {
+                return Some(peak);
+            }
+            if Instant::now() >= deadline {
+                println!("{} wrote {written} samples, not {samples}", self.name);
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -1847,7 +2001,7 @@ fn a_tone_driven_through_each_lane_reaches_that_lane_and_no_other() {
     let Some(graph) = PrivateGraph::start("flow") else {
         return;
     };
-    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link", "pw-record"]
         .into_iter()
         .find(|tool| !installed(tool))
     {
@@ -1892,6 +2046,7 @@ fn a_tone_driven_through_each_lane_reaches_that_lane_and_no_other() {
         ("t_tone", "Output", &["MONO"][..]),
         ("t_stereo", "Input", &["FL", "FR"][..]),
         (CAPTURE_NODE_NAME, "Input", &["MONO"][..]),
+        (SOURCE_NODE_NAME, "Output", &["FL", "FR"][..]),
         (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
         (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
     ] {
@@ -1901,8 +2056,13 @@ fn a_tone_driven_through_each_lane_reaches_that_lane_and_no_other() {
         );
     }
 
-    // The microphone alone.
+    // The microphone alone — and something recording from FxSound (Input), which is what runs
+    // the input lane's passive capture stream (U19).
     assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
+    let recording = graph
+        .clocked_recorder("t_recorder")
+        .expect("a recorder for FxSound (Input)");
+    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
     let heard = meters_until(&mut handle, DeviceDirection::Input, |m| m.input_peak > 0.1);
     assert!(
         heard.is_some(),
@@ -2361,7 +2521,7 @@ fn a_microphone_being_captured_does_not_keep_the_speakers_awake() {
     let Some(graph) = PrivateGraph::start("micawake") else {
         return;
     };
-    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link", "pw-record"]
         .into_iter()
         .find(|tool| !installed(tool))
     {
@@ -2406,6 +2566,7 @@ fn a_microphone_being_captured_does_not_keep_the_speakers_awake() {
         ("t_tone", "Output", &["MONO"][..]),
         ("t_stereo", "Input", &["FL", "FR"][..]),
         (CAPTURE_NODE_NAME, "Input", &["MONO"][..]),
+        (SOURCE_NODE_NAME, "Output", &["FL", "FR"][..]),
         (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
         (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
     ] {
@@ -2416,11 +2577,15 @@ fn a_microphone_being_captured_does_not_keep_the_speakers_awake() {
     }
     assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
     assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
+    let recording = graph
+        .clocked_recorder("t_recorder")
+        .expect("a recorder for FxSound (Input)");
+    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
 
-    // The microphone lane runs — that is what it is for — and the speakers' lane, with nothing
-    // playing into its sink, does not. With one link-group for all four nodes the capture stream
-    // made the other pair runnable with it, and the speakers never slept while the microphone
-    // lane was on.
+    // The microphone lane runs while something records from it — that is what it is for — and
+    // the speakers' lane, with nothing playing into its sink, does not. With one link-group for
+    // all four nodes the capture stream made the other pair runnable with it, and the speakers
+    // never slept while the microphone lane was on.
     assert_eq!(
         graph.runs_until(CAPTURE_NODE_NAME, true).map(drop),
         Ok(()),
@@ -2541,7 +2706,7 @@ fn echo_cancellation_puts_the_canceller_in_front_of_the_microphone_and_takes_it_
     // rebuilt to record from the canceller's source, and the speakers' pair left alone.
     let during = graph
         .nodes_until(|nodes| {
-            nodes.len() == OUR_NODE_NAMES.len()
+            nodes.len() == LANE_NODE_NAMES.len() + AEC_NODE_NAMES.len()
                 && serial_of(nodes, CAPTURE_NODE_NAME) != serial_of(&before, CAPTURE_NODE_NAME)
         })
         .expect("pw-dump answered a moment ago")
@@ -2698,35 +2863,37 @@ fn a_canceller_that_cannot_be_loaded_is_reported_and_the_microphone_is_recorded_
     handle.shutdown();
 }
 
-#[test]
-fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
+/// Start an engine with both lanes on `graph` — the output lane on the stereo speakers, the input
+/// lane on a tone called `t_tone` — switch echo cancellation on, and wire the result as a session
+/// manager would: the playback stream to the speakers, the microphone and the speakers' monitor
+/// into the canceller, and the canceller into the capture stream. Nothing records from FxSound
+/// (Input) yet. `None`, having said why, when the canceller, a tool or the tone is missing; `what`
+/// names the check that then goes undone.
+fn engine_with_the_canceller_wired(
+    graph: &PrivateGraph,
+    what: &str,
+) -> Option<(EngineHandle, Transcript)> {
     if let Some(missing) = canceller_missing() {
-        skip(&format!(
-            "{missing}, so the idle after echo cancellation was not checked"
-        ));
-        return;
+        skip(&format!("{missing}, so {what} was not checked"));
+        return None;
     }
-    let Some(graph) = PrivateGraph::start("aecidle") else {
-        return;
-    };
-    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link", "pw-record"]
         .into_iter()
         .find(|tool| !installed(tool))
     {
         skip(&format!(
-            "{missing} is not available, so the idle after echo cancellation was not checked"
+            "{missing} is not available, so {what} was not checked"
         ));
-        return;
+        return None;
     }
     if graph.add_tone("t_tone").is_none() {
-        skip(concat!(
-            "the tone never appeared (is audiotestsrc installed?), ",
-            "so the idle after echo cancellation was not checked"
+        skip(&format!(
+            "the tone never appeared (is audiotestsrc installed?), so {what} was not checked"
         ));
-        return;
+        return None;
     }
     let mut said = Transcript::default();
-    let handle = engine_with_both_lanes(&graph, aec::NULL_LIBRARY, "t_tone", &mut said);
+    let handle = engine_with_both_lanes(graph, aec::NULL_LIBRARY, "t_tone", &mut said);
     let mark = said.0.len();
     handle.send(UiToAudio::SetEchoCancel(true));
     assert!(heard_echo_cancel(
@@ -2741,9 +2908,6 @@ fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
         Some(Ok(())),
         "the capture stream should have moved onto the canceller"
     );
-
-    // Wire it all as a session manager would: the playback stream to the speakers, the microphone
-    // and the speakers' monitor into the canceller, and the canceller into the capture stream.
     for (node, direction, positions) in [
         ("t_tone", "Output", &["MONO"][..]),
         (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
@@ -2752,6 +2916,7 @@ fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
         (AEC_MONITOR_NODE_NAME, "Input", &["FL", "FR"][..]),
         (AEC_SOURCE_NODE_NAME, "Output", &["FL", "FR"][..]),
         (CAPTURE_NODE_NAME, "Input", &["FL", "FR"][..]),
+        (SOURCE_NODE_NAME, "Output", &["FL", "FR"][..]),
     ] {
         assert!(
             graph.configure_ports(node, direction, positions).is_some(),
@@ -2768,6 +2933,38 @@ fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
     assert!(graph.link_nodes("t_tone", AEC_CAPTURE_NODE_NAME));
     assert!(graph.link_nodes("t_stereo", AEC_MONITOR_NODE_NAME));
     assert!(graph.link_nodes(AEC_SOURCE_NODE_NAME, CAPTURE_NODE_NAME));
+    Some((handle, said))
+}
+
+/// Everything echo cancellation can keep running: the microphone, the canceller's capture stream
+/// and source (its monitor stream is in the same `node.group`, and has no state of its own to
+/// watch), the input lane's pair, the speakers the canceller listens to, and the output pair.
+const AWAKE_WITH_THE_CANCELLER: [&str; 8] = [
+    "t_tone",
+    AEC_CAPTURE_NODE_NAME,
+    AEC_SOURCE_NODE_NAME,
+    CAPTURE_NODE_NAME,
+    SOURCE_NODE_NAME,
+    "t_stereo",
+    OUTPUT_NODE_NAME,
+    SINK_NODE_NAME,
+];
+
+#[test]
+fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
+    let Some(graph) = PrivateGraph::start("aecidle") else {
+        return;
+    };
+    let Some((handle, mut said)) =
+        engine_with_the_canceller_wired(&graph, "the idle after echo cancellation")
+    else {
+        return;
+    };
+    // Something records from FxSound (Input): the passive capture stream runs only then (U19).
+    let recording = graph
+        .clocked_recorder("t_recorder")
+        .expect("a recorder for FxSound (Input)");
+    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
     assert_eq!(
         graph.runs_until(CAPTURE_NODE_NAME, true).map(drop),
         Ok(()),
@@ -2812,7 +3009,16 @@ fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
             .is_some(),
         "the rebuilt capture stream was not given ports"
     );
+    assert!(
+        graph
+            .configure_ports(SOURCE_NODE_NAME, "Output", &["FL", "FR"])
+            .is_some(),
+        "the rebuilt source was not given ports"
+    );
     assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
+    // The pair was rebuilt whole, so the recorder is linked to the new source as a session manager
+    // would link it.
+    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
     assert_eq!(
         graph.runs_until(CAPTURE_NODE_NAME, true).map(drop),
         Ok(()),
@@ -2836,6 +3042,79 @@ fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    handle.shutdown();
+}
+
+/// Echo cancellation used to cost the idle outright (`docs/0.4.0-design.md` §7): the capture stream
+/// was an ordinary stream, so its link to the canceller's source ran the canceller, and through the
+/// canceller's `node.group` its monitor stream, the speakers it records and the output pair — for
+/// as long as the microphone lane was on. Now the capture stream is passive (U19), and so are the
+/// canceller's capture and monitor streams (PipeWire's module makes them so), so nothing in that
+/// chain holds any of it: it all runs while something records from FxSound (Input), and sleeps
+/// with the canceller still loaded when the recording stops.
+#[test]
+fn echo_cancellation_holds_nothing_awake_while_nothing_records_from_fxsound_input() {
+    let Some(graph) = PrivateGraph::start("aecsleep") else {
+        return;
+    };
+    let Some((handle, _said)) =
+        engine_with_the_canceller_wired(&graph, "the idle under echo cancellation")
+    else {
+        return;
+    };
+    assert_eq!(
+        graph.node_prop(CAPTURE_NODE_NAME, "node.passive"),
+        Some(Some("true".to_owned())),
+        "the capture stream should be passive on a server that runs a link-group together"
+    );
+    // An application that will record from FxSound (Input), running already on its own clock.
+    let recorder = graph
+        .clocked_recorder("t_recorder")
+        .expect("a recorder for FxSound (Input)");
+
+    // The canceller wired in front of the microphone and listening to the speakers, and nobody
+    // recording: nothing runs, the speakers included.
+    assert_eq!(
+        sleep::none_runs_for_a_while(&graph, &AWAKE_WITH_THE_CANCELLER),
+        Ok(()),
+        "echo cancellation held the graph awake with nothing recording from FxSound (Input)"
+    );
+
+    // A recording runs all of it, as a call would.
+    let before = graph.our_nodes().expect("pw-dump answered a moment ago");
+    let from = recorder.written();
+    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recorder.name));
+    for node in AWAKE_WITH_THE_CANCELLER {
+        assert_eq!(
+            graph.runs_until(node, true).map(drop),
+            Ok(()),
+            "{node} should run while something records from FxSound (Input) through the canceller"
+        );
+    }
+    assert!(
+        recorder.hears_since(from),
+        "the recorder was not handed the microphone through the canceller"
+    );
+
+    // It stops, and all of it sleeps again with echo cancellation still on.
+    assert!(graph.unlink_nodes(SOURCE_NODE_NAME, &recorder.name));
+    for node in AWAKE_WITH_THE_CANCELLER {
+        assert_eq!(
+            graph.runs_until(node, false).map(drop),
+            Ok(()),
+            "{node} should stop once nothing records from FxSound (Input)"
+        );
+    }
+    assert_eq!(
+        sleep::none_runs_for_a_while(&graph, &AWAKE_WITH_THE_CANCELLER),
+        Ok(()),
+        "echo cancellation woke the graph again with nothing recording"
+    );
+    assert_eq!(
+        graph.our_nodes(),
+        Some(before),
+        "sleeping and waking is the server's business: neither the canceller nor a pair was rebuilt"
+    );
     handle.shutdown();
 }
 
@@ -3258,6 +3537,145 @@ fn a_headset_between_profiles_keeps_the_output_lane_and_its_sink_is_linked_again
 }
 
 #[test]
+fn a_headset_back_from_a_profile_switch_takes_nothing_from_the_speakers_the_user_picked() {
+    // The headset is ranked above the speakers, but the user picked the speakers: the lane is on
+    // them, not on the headset, and holds no wait for it.
+    let belongs = |card: &CardHolder| format!("device.id = {}", card.id);
+    let Some((graph, card, handle, mut said)) = engine_on_a_headset("notnew", &belongs) else {
+        return;
+    };
+    handle.send(rank(DeviceDirection::Output, &[HEADSET, "t_stereo"]));
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_stereo".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    said.settle(&handle);
+    let from = said.0.len();
+
+    // Something records from its microphone: the headset switches profile, its sink goes while
+    // its card stays, and comes back under the same name after the rules have run without it.
+    assert!(graph.remove_node(HEADSET).is_some(), "the sink never went");
+    std::thread::sleep(3 * crate::engine::SUPERVISOR_PERIOD);
+    assert!(
+        graph.add_card_sink(HEADSET, &belongs(&card)).is_some(),
+        "the headset's sink never came back on its card"
+    );
+    said.settle(&handle);
+    said.settle(&handle);
+    assert_eq!(
+        output_moves_since(&said, from),
+        [],
+        "a sink back from a profile switch is no device just plugged in, ranked first or not"
+    );
+    drop(card);
+    handle.shutdown();
+}
+
+#[test]
+fn a_sink_its_card_brings_back_under_another_name_ends_the_wait_at_once() {
+    let belongs = |card: &CardHolder| format!("device.id = {}", card.id);
+    let Some((graph, card, handle, mut said)) = engine_on_a_headset("rename", &belongs) else {
+        return;
+    };
+    const RENAMED: &str = "t_headset_renamed";
+    // A card switched to another profile whose sink has another name: the old one never returns.
+    assert!(graph.remove_node(HEADSET).is_some(), "the sink never went");
+    assert!(
+        graph.add_card_sink(RENAMED, &belongs(&card)).is_some(),
+        "the renamed sink never appeared on the card"
+    );
+    let renamed_at = Instant::now();
+    assert!(
+        said.attached(&handle, DeviceDirection::Output, Some(RENAMED)),
+        "the output lane never went to the renamed sink"
+    );
+    let waited = renamed_at.elapsed();
+    assert!(
+        waited < crate::engine::RETURN_WAIT,
+        "the lane sat on an unlinked stream for {waited:?}, waiting for a name that never returns"
+    );
+    drop(card);
+    handle.shutdown();
+}
+
+#[test]
+fn a_ranking_handed_over_at_start_makes_the_first_choice_of_output() {
+    let Some(graph) = PrivateGraph::start("rankstart") else {
+        return;
+    };
+    if !installed("pw-cli") {
+        skip("pw-cli is not available, so rankstart cannot run");
+        return;
+    }
+    assert!(
+        graph.add_device("t_low", DeviceDirection::Output).is_some(),
+        "t_low never appeared"
+    );
+    let handle = AudioEngine::start_for_tests(
+        Some(&graph.remote()),
+        StartOptions {
+            output_priority: DevicePriority {
+                names: vec!["t_low".to_owned(), "t_stereo".to_owned()],
+                new_devices_first: false,
+            },
+            ..StartOptions::default()
+        },
+        None,
+    )
+    .expect("the engine should start");
+    let mut said = Transcript::default();
+    assert!(
+        said.attached(&handle, DeviceDirection::Output, Some("t_low")),
+        "the first output is the ranking's first, not the graph's"
+    );
+    said.settle(&handle);
+    assert_eq!(
+        said.attachments(DeviceDirection::Output),
+        [Some("t_low".to_owned())],
+        "and it was the first choice, not a move after one made without the ranking"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn a_device_plugged_in_takes_the_lane_while_the_app_puts_new_devices_first() {
+    let Some(graph) = PrivateGraph::start("newfirst") else {
+        return;
+    };
+    if !installed("pw-cli") {
+        skip("pw-cli is not available, so newfirst cannot run");
+        return;
+    }
+    let handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    // Every output there is, ranked, as the app's list has them: a device the list does not name
+    // is one it has not seen yet, and goes first.
+    handle.send(UiToAudio::SetDevicePriority {
+        direction: DeviceDirection::Output,
+        names: vec!["t_stereo".to_owned(), "t_71".to_owned()],
+        new_devices_first: true,
+    });
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_stereo".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    said.settle(&handle);
+    // Plugged in: the rules run on it before the app has put it at the top of its list.
+    assert!(
+        graph.add_device("t_dac", DeviceDirection::Output).is_some(),
+        "t_dac never appeared"
+    );
+    assert!(
+        said.attached(&handle, DeviceDirection::Output, Some("t_dac")),
+        "a device plugged in goes first, as the app is about to rank it"
+    );
+    handle.shutdown();
+}
+
+#[test]
 fn a_headset_that_goes_for_good_is_given_up_once_the_lane_has_waited_for_it() {
     // Tied to its card by its Bluetooth address alone: the other way the engine asks.
     let Some((graph, card, handle, mut said)) = engine_on_a_headset("gone", &|_| {
@@ -3612,6 +4030,7 @@ fn rank(direction: DeviceDirection, names: &[&str]) -> UiToAudio {
     UiToAudio::SetDevicePriority {
         direction,
         names: names.iter().map(|&name| name.to_owned()).collect(),
+        new_devices_first: false,
     }
 }
 

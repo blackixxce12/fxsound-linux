@@ -256,8 +256,12 @@ pub struct DeviceMenu {
     pub titles: Vec<(usize, DeviceDirection)>,
     /// The one rule the combo draws.
     pub separator: Option<usize>,
-    /// The row the closed box shows; `None` draws the `Off` placeholder.
+    /// The row the closed box shows; `None` draws the `Off` placeholder, unless `unlisted` says
+    /// otherwise.
     pub selected: Option<usize>,
+    /// With no row selected, the device the lane is on while the list does not carry it
+    /// ([`UiState::unlisted`]): the closed box shows its name, not `Off`.
+    pub unlisted: Option<String>,
 }
 
 impl DeviceMenu {
@@ -272,6 +276,7 @@ impl DeviceMenu {
             menu.separator = Some(first_device);
         }
         menu.selected = menu.row_of(state.selection(direction));
+        menu.note_unlisted(state, direction);
         menu
     }
 
@@ -293,7 +298,14 @@ impl DeviceMenu {
             menu.push_devices(state, direction);
         }
         menu.selected = menu.row_of(state.selection(state.direction));
+        menu.note_unlisted(state, state.direction);
         menu
+    }
+
+    fn note_unlisted(&mut self, state: &UiState, direction: DeviceDirection) {
+        if self.selected.is_none() {
+            self.unlisted = state.unlisted(direction).map(str::to_owned);
+        }
     }
 
     fn push_off(&mut self, direction: DeviceDirection) {
@@ -370,6 +382,7 @@ impl DeviceMenu {
         let placeholder = tr("Off");
         let (box_response, picked) = FxComboBox::new(&self.labels, self.selected)
             .placeholder(&placeholder)
+            .current(self.unlisted.as_deref())
             .separator_before(self.separator)
             .headers(&headers)
             .accent(accent)
@@ -791,6 +804,39 @@ mod tests {
             None,
             "a detached lane shows the placeholder"
         );
+    }
+
+    #[test]
+    fn a_lane_on_a_device_the_list_does_not_carry_shows_that_device_and_not_off() {
+        // A Bluetooth headset between its profiles: the lane is on, the list lacks the device.
+        let state = UiState {
+            selected_output: None,
+            unlisted_output: Some("WH-1000XM4".to_owned()),
+            ..lanes()
+        };
+        let output = DeviceMenu::lane(&state, DeviceDirection::Output);
+        assert_eq!(output.selected, None, "no row is that device");
+        assert_eq!(output.unlisted.as_deref(), Some("WH-1000XM4"));
+        assert_eq!(
+            DeviceMenu::both(&state).unlisted.as_deref(),
+            Some("WH-1000XM4")
+        );
+        let input = DeviceMenu::lane(&state, DeviceDirection::Input);
+        assert_eq!(input.unlisted, None, "the microphone lane is off");
+
+        // Drawn as a device is, not as the dimmed Off.
+        let mut harness = testing::Harness::new(fxsound_core::ThemeMode::Dark);
+        let shapes = harness.settle(&state);
+        let painted = testing::texts(&shapes);
+        let (_, _, colour) = painted
+            .iter()
+            .find(|(text, _, _)| text == "WH-1000XM4")
+            .expect("the device's name in the box");
+        let (_, _, speakers_colour) = testing::texts(&harness.settle(&lanes()))
+            .into_iter()
+            .find(|(text, _, _)| text == "Headphones")
+            .expect("a listed device in the box");
+        assert_eq!(*colour, speakers_colour);
     }
 
     #[test]

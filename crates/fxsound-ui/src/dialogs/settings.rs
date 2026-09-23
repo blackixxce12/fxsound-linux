@@ -51,6 +51,7 @@ use super::{
     normal_font, small_font, title_font,
 };
 use crate::assets::{AssetCache, FxImage, rasterise};
+use crate::state::EchoCancelTrouble;
 use crate::theme::{FxColor, Palette};
 use crate::widgets::FxComboBox;
 use crate::widgets::icon_button::IconButton;
@@ -588,11 +589,13 @@ pub struct SettingsState {
     /// `~/.config/autostart/fxsound.desktop` with `Hidden=false`
     /// (`docs/spec/06-dialogs.md` §9.6). The app layer reads the file and fills this in.
     pub launch_on_startup: bool,
-    /// Whether PipeWire's echo canceller is actually loaded, and the engine's reason when it is
-    /// not — live state rather than a setting, so the app layer refreshes both while the window
-    /// is open. `settings.echo_cancel` is what the user asked for; these are what they got.
+    /// Whether PipeWire's echo canceller is actually loaded, why not when the engine says, and
+    /// whether the microphone lane is delivering — live state rather than settings, so the app
+    /// layer refreshes them while the window is open. `settings.echo_cancel` is what the user
+    /// asked for; these are what they got.
     pub echo_cancel_running: bool,
-    pub echo_cancel_detail: String,
+    pub echo_cancel_trouble: Option<EchoCancelTrouble>,
+    pub input_processing: bool,
     /// Whether a microphone is selected. Calibration measures one, so without it the button is
     /// disabled rather than opening a wizard with nothing to listen to (0.4.0 design §8).
     pub has_microphone: bool,
@@ -618,7 +621,8 @@ impl SettingsState {
             version: String::new(),
             launch_on_startup: false,
             echo_cancel_running: false,
-            echo_cancel_detail: String::new(),
+            echo_cancel_trouble: None,
+            input_processing: false,
             has_microphone: false,
         }
     }
@@ -629,20 +633,24 @@ impl SettingsState {
         format!("v{}", self.version)
     }
 
-    /// The line under "Echo cancellation", or `None` when there is nothing to say: it was asked
-    /// for and is not running. The engine's reason follows the word when it gave one — the same
-    /// honesty rule the readout strip keeps (0.4.0 design §7).
+    /// The line under "Echo cancellation", or `None` when there is nothing to say. It says
+    /// `unavailable` only for a fault: the engine gave a reason, which follows the word, short and
+    /// translated — or the microphone lane is delivering and the canceller still is not there.
+    /// Ticked with no microphone, or with one that is not delivering yet, the canceller is simply
+    /// not needed yet, and nothing is wrong (the same honesty rule the readout strip keeps, 0.4.0
+    /// design §7).
     #[must_use]
     pub fn echo_cancel_status(&self) -> Option<String> {
         if !self.settings.echo_cancel || self.echo_cancel_running {
             return None;
         }
-        let detail = self.echo_cancel_detail.trim();
-        Some(if detail.is_empty() {
-            tr("unavailable")
-        } else {
-            format!("{} · {detail}", tr("unavailable"))
-        })
+        match self.echo_cancel_trouble {
+            Some(trouble) => Some(match trouble.reason() {
+                Some(reason) => format!("{} · {reason}", tr("unavailable")),
+                None => tr("unavailable"),
+            }),
+            None => self.input_processing.then(|| tr("unavailable")),
+        }
     }
 
     /// The last calibration, as the pane prints it: `Floor −48 dB · Speech −19 dB · 2026-09-23`.
@@ -689,9 +697,12 @@ pub enum SettingsAction {
     MoveDeviceDown(usize),
     /// Forget a device that is no longer present (`:262-272`).
     RemoveDevice(usize),
-    /// Bind a preset to a device. If the row is the *current* output the app also applies the
-    /// preset live (`FxOutputPreference.cpp:63-75`).
-    SetDevicePreset { device: usize, preset: usize },
+    /// Bind a preset to a device, by the name the combo showed. If the row is the *current*
+    /// output the app also applies the preset live (`FxOutputPreference.cpp:63-75`).
+    ///
+    /// A name rather than an index into [`SettingsState::presets`], so that a store that changed
+    /// under the open pane — a save or delete from the command line — cannot bind another preset.
+    SetDevicePreset { device: usize, preset: String },
     /// `prioritize_new_output` — a newly seen device goes to the top of the list rather than the
     /// bottom (`DeviceConfig.cpp:57`, `:78-85`).
     SetPrioritizeNewOutput(bool),
@@ -1429,10 +1440,10 @@ fn device_row(
             assets,
             id.with("preset"),
         );
-    if let Some(preset) = picked {
+    if let Some(preset) = picked.and_then(|picked| state.presets.get(picked)) {
         response.push(SettingsAction::SetDevicePreset {
             device: index,
-            preset,
+            preset: preset.clone(),
         });
     }
 
@@ -3388,16 +3399,43 @@ mod tests {
     #[test]
     fn the_echo_line_speaks_only_when_asked_for_and_not_running() {
         let mut state = microphone_state();
+        state.input_processing = true;
         assert_eq!(state.echo_cancel_status(), None, "not asked for");
         state.settings.echo_cancel = true;
         state.echo_cancel_running = true;
         assert_eq!(state.echo_cancel_status(), None, "running");
         state.echo_cancel_running = false;
-        assert_eq!(state.echo_cancel_status().as_deref(), Some("unavailable"));
-        state.echo_cancel_detail = "  libspa-aec-webrtc not found ".to_owned();
         assert_eq!(
             state.echo_cancel_status().as_deref(),
-            Some("unavailable · libspa-aec-webrtc not found")
+            Some("unavailable"),
+            "the microphone delivers and the canceller is not there"
+        );
+        state.echo_cancel_trouble = Some(EchoCancelTrouble::NotLoaded);
+        assert_eq!(
+            state.echo_cancel_status().as_deref(),
+            Some("unavailable · the echo canceller could not be loaded")
+        );
+        state.echo_cancel_trouble = Some(EchoCancelTrouble::Other);
+        assert_eq!(
+            state.echo_cancel_status().as_deref(),
+            Some("unavailable"),
+            "a reason this version cannot name is not printed"
+        );
+    }
+
+    #[test]
+    fn echo_cancellation_ticked_before_it_is_needed_is_not_called_unavailable() {
+        // Microphone lane off, or on and not delivering yet: the canceller is only loaded once
+        // the lane has its pair, and not having it then is nothing wrong.
+        let mut state = microphone_state();
+        state.settings.echo_cancel = true;
+        state.input_processing = false;
+        assert_eq!(state.echo_cancel_status(), None);
+        // A reason the engine gave still counts without a microphone.
+        state.echo_cancel_trouble = Some(EchoCancelTrouble::WaitingForSpeakers);
+        assert_eq!(
+            state.echo_cancel_status().as_deref(),
+            Some("unavailable · waiting for the speakers")
         );
     }
 
@@ -3533,7 +3571,7 @@ mod tests {
         let outer = Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE);
         let mut calibrated = microphone_state();
         calibrated.settings.echo_cancel = true;
-        calibrated.echo_cancel_detail = "x".repeat(400);
+        calibrated.echo_cancel_trouble = Some(EchoCancelTrouble::NotLoaded);
         calibrated.settings.calibration =
             Some(fxsound_core::settings::CalibrationRecord::default());
         calibrated.settings.noise_suppression = NoiseSuppressionOverride::Strong;

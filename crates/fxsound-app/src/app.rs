@@ -490,6 +490,10 @@ pub struct App {
     /// What each lane is attached to, as the engine last said ([`AudioToUi::Attached`]); `None`
     /// while the lane has no nodes. Outputs first.
     attached: [Option<String>; 2],
+    /// Per lane, whether the engine has said what the lane is attached to since start-up — any
+    /// [`AudioToUi::Attached`]. Until it has, an enabled lane is shown on the device the settings
+    /// file names ([`App::unlisted_device`]).
+    attachment_heard: [bool; 2],
     /// The device each lane was asked to attach to and the engine has not answered about yet —
     /// the user's pick, or the saved device announced at start-up. Outputs first. Shown in the
     /// lane's combo in place of what the lane is attached to (see [`lane_selection`]), because it
@@ -572,7 +576,7 @@ pub struct App {
     /// The device ranking each lane's engine was last given ([`UiToAudio::SetDevicePriority`]),
     /// outputs first, so that a ranking goes out when it changes rather than with every device
     /// list (see [`crate::priority`]).
-    priority_sent: [Option<Vec<String>>; 2],
+    priority_sent: [Option<UiToAudio>; 2],
     /// The system is asleep, or about to be: logind said `PrepareForSleep(true)` and has not said
     /// `false` since (U13, [`App::system_sleeping`]). Both lanes' snapshots carry it as `mute`.
     sleeping: bool,
@@ -642,6 +646,7 @@ impl App {
             devices_seen: false,
             audio_status: [fxsound_core::AudioStatus::default(); 2],
             attached: [None, None],
+            attachment_heard: [false, false],
             requested_device: [None, None],
             preset_device: DeviceDirection::ALL.map(|lane| {
                 Some(settings.device_name(lane))
@@ -684,9 +689,12 @@ impl App {
             app.send(message);
         }
         app.priority_sent =
-            DeviceDirection::ALL.map(|lane| Some(priority::ranking(&app.settings, lane)));
+            DeviceDirection::ALL.map(|lane| Some(device_priority(&app.settings, lane)));
 
         app.adopt_saved_presets();
+        // Each enabled lane shows the device the settings file names until the first device list
+        // and the engine's word arrive, rather than `Off`, which it is not.
+        app.place_lane_selections();
         app.notifications_armed = true;
         // Start-up is where the stream starts from, not news: a subscriber's first line is the
         // status document, which already says all of it.
@@ -899,6 +907,7 @@ impl App {
                     && node_name != self.preset_device[slot]
                     && node_name != requested;
                 self.attached[slot].clone_from(&node_name);
+                self.attachment_heard[slot] = true;
                 if node_name.is_some() {
                     self.preset_device[slot].clone_from(&node_name);
                 }
@@ -914,7 +923,11 @@ impl App {
                     set_lane_active(&mut self.state, direction, false);
                     self.note_audio(direction);
                 }
-                self.raise_notice(format!("{} {reason}", tr("Audio disconnected:")));
+                // The reason is the engine's log line in English ("restart requested" for a core
+                // error or a restart), so it goes to the log and the window says only what
+                // happened, in the user's language — as for an `AudioToUi::Error`.
+                log::info!("audio disconnected, shown to the user: {reason}");
+                self.raise_notice(tr("Audio disconnected"));
                 // `"Output Disconnected"` (`FxController.cpp:1170`).
                 self.notify(Message::output_disconnected());
             }
@@ -928,7 +941,10 @@ impl App {
                 {
                     self.show_lane_selections();
                 }
-                self.raise_notice(message);
+                // The engine's text is a log line in English; the window says it in a sentence
+                // of the user's language.
+                log::info!("audio engine error shown to the user: {message}");
+                self.raise_notice(engine_error_notice(&message));
             }
             // Something that works but that the user should know — one Bluetooth headset on both
             // lanes, which drops its music to call quality (U9). Already translated.
@@ -937,6 +953,9 @@ impl App {
             }
             AudioToUi::EchoCancel { running, detail } => {
                 self.state.echo_cancel_running = running;
+                // The window says why in a few translated words; the engine's own text, a module
+                // path and an OS error among them, is in its log and on the event stream.
+                self.state.echo_cancel_trouble = echo_cancel_trouble(&detail);
                 self.echo_cancel_detail = detail;
                 self.note_echo_cancel();
             }
@@ -963,6 +982,9 @@ impl App {
                         .get_or_insert_with(|| Instant::now() + VOLUME_SAVE_DELAY);
                 }
             }
+            // Application streams (per-application presets): the engine reports them, but the
+            // Applications list that reads them is not in this crate yet.
+            AudioToUi::AppStreams(_) => {}
         }
     }
 
@@ -1009,16 +1031,16 @@ impl App {
         messages
     }
 
-    /// The rankings the engine has not been given yet ([`priority::ranking`]), each lane's once
-    /// per change.
+    /// The rankings the engine has not been given yet ([`device_priority`]), each lane's once per
+    /// change — of the list, or of where a device the list does not name yet goes.
     fn device_priority_messages(&mut self) -> Vec<UiToAudio> {
         let mut messages = Vec::new();
         for direction in DeviceDirection::ALL {
-            let names = priority::ranking(&self.settings, direction);
+            let message = device_priority(&self.settings, direction);
             let sent = &mut self.priority_sent[lane_index(direction)];
-            if sent.as_ref() != Some(&names) {
-                *sent = Some(names.clone());
-                messages.push(UiToAudio::SetDevicePriority { direction, names });
+            if sent.as_ref() != Some(&message) {
+                *sent = Some(message.clone());
+                messages.push(message);
             }
         }
         messages
@@ -1091,7 +1113,41 @@ impl App {
                 self.requested_device[lane_index(direction)].as_deref(),
             );
             self.state.set_selection(direction, selection);
+            let unlisted = selection
+                .is_none()
+                .then(|| self.unlisted_device(direction))
+                .flatten();
+            self.state.set_unlisted(direction, unlisted);
         }
+    }
+
+    /// The name to show for `direction`'s lane when it is on and the list does not carry its
+    /// device: the device it is attached to, or else the one it was asked for, or else — until
+    /// the engine has said anything about the lane — the one the settings file names. `None` for
+    /// a lane that is off, and for one the engine has said is attached to nothing: that is `Off`.
+    ///
+    /// Without it an enabled lane whose device is missing from the list for a moment — a
+    /// Bluetooth headset between its two profiles, which the engine rides out on the same
+    /// device, or the moments before the first list — would look exactly like a lane the user
+    /// switched off, in the combo, the tray and the readout strip alike.
+    fn unlisted_device(&self, direction: DeviceDirection) -> Option<String> {
+        if !self.settings.lane_enabled(direction) {
+            return None;
+        }
+        let slot = lane_index(direction);
+        let saved = self.settings.device_name(direction);
+        let node = self.attached[slot]
+            .as_deref()
+            .or(self.requested_device[slot].as_deref())
+            .or_else(|| (!self.attachment_heard[slot] && !saved.is_empty()).then_some(saved))?;
+        // The name the priority list learnt when the device was last listed.
+        Some(
+            self.settings
+                .device_configs
+                .iter()
+                .find(|config| config.direction == direction && config.device_id == node)
+                .map_or_else(|| node.to_owned(), |config| config.device_name.clone()),
+        )
     }
 
     /// Record that `lane` has been asked to attach to `node_name`, so its combo can show the
@@ -1268,11 +1324,14 @@ impl App {
             }
             UiAction::DismissNotice => self.state.dismiss_notification(),
 
-            UiAction::SetEffect(effect, value) => {
-                self.state.effects[effect as usize] = value.clamp(0.0, scale::SLIDER_MAX);
-                self.mark_preset_modified();
-                self.sync_params_from_state();
-            }
+            // The five effects, the balance and the volume leveller are the music chain's alone,
+            // so they go to the speakers whichever lane the window shows: a command line or a
+            // D-Bus call made while the microphone is edited sets what the speakers run, marks
+            // the music preset, and leaves the voice preset alone (see `set_music_control`).
+            UiAction::SetEffect(effect, value) => self.set_music_control(|app| {
+                app.state.effects[effect as usize] = value.clamp(0.0, scale::SLIDER_MAX);
+                app.mark_preset_modified();
+            }),
             UiAction::SetBandGain(band, gain_db) => {
                 if let Some(slot) = self.state.eq_bands.get_mut(band) {
                     slot.boost_db =
@@ -1298,12 +1357,16 @@ impl App {
             }
             UiAction::SetFilterQ(q) => {
                 self.state.filter_q = q.clamp(1.0, 3.0);
-                // The four level settings are the music chain's. On a microphone the same controls
-                // are the voice preset's, and writing them here would hand the speakers a voice's
-                // numbers the next time they are edited.
-                if self.state.direction == DeviceDirection::Output {
-                    self.settings.filter_q = self.state.filter_q;
-                    self.settings_dirty = true;
+                match self.state.direction {
+                    // On the speakers the width is a setting over every `.fac`, as the original's.
+                    DeviceDirection::Output => {
+                        self.settings.filter_q = self.state.filter_q;
+                        self.settings_dirty = true;
+                    }
+                    // On a voice it is the preset's own equalizer width, which a save writes into
+                    // the preset's `[eq]`: an edit to the preset, as the makeup gain is. Written
+                    // into the settings it would hand the speakers a voice's number.
+                    DeviceDirection::Input => self.mark_preset_modified(),
                 }
                 self.sync_params_from_state();
             }
@@ -1323,22 +1386,16 @@ impl App {
                 }
                 self.sync_params_from_state();
             }
-            UiAction::SetBalance(db) => {
-                self.state.balance_db = db.clamp(-20.0, 20.0);
-                if self.state.direction == DeviceDirection::Output {
-                    self.settings.balance = self.state.balance_db;
-                    self.settings_dirty = true;
-                }
-                self.sync_params_from_state();
-            }
-            UiAction::SetVolumeLeveling(amount) => {
-                self.state.volume_leveling = amount.clamp(0.0, 4.0);
-                if self.state.direction == DeviceDirection::Output {
-                    self.settings.volume_leveling = self.state.volume_leveling;
-                    self.settings_dirty = true;
-                }
-                self.sync_params_from_state();
-            }
+            UiAction::SetBalance(db) => self.set_music_control(|app| {
+                app.state.balance_db = db.clamp(-20.0, 20.0);
+                app.settings.balance = app.state.balance_db;
+                app.settings_dirty = true;
+            }),
+            UiAction::SetVolumeLeveling(amount) => self.set_music_control(|app| {
+                app.state.volume_leveling = amount.clamp(0.0, 4.0);
+                app.settings.volume_leveling = app.state.volume_leveling;
+                app.settings_dirty = true;
+            }),
 
             // These are window-level concerns the shell deals with; the controller only records
             // them so a headless test can assert they were emitted.
@@ -1621,7 +1678,7 @@ impl App {
     /// voice lane leaking into the music store, and can overwrite the autosave of a music preset
     /// that shares the name.
     fn lane_snapshot(&self, lane: DeviceDirection) -> Option<(LanePreset, bool)> {
-        let (entry, effects, eq_bands, eq_on, gain_db) = if lane == self.state.direction {
+        let (entry, effects, eq_bands, eq_on, gain_db, filter_q) = if lane == self.state.direction {
             let state = &self.state;
             (
                 state.preset()?,
@@ -1629,6 +1686,7 @@ impl App {
                 state.eq_bands.as_slice(),
                 state.eq_on,
                 state.master_gain_db,
+                state.filter_q,
             )
         } else {
             let controls = self.lane_controls[lane_index(lane)].as_ref()?;
@@ -1641,6 +1699,7 @@ impl App {
                 controls.eq_bands.as_slice(),
                 controls.eq_on,
                 controls.master_gain_db,
+                controls.filter_q,
             )
         };
         let name = entry.name.clone();
@@ -1649,7 +1708,7 @@ impl App {
                 LanePreset::Music(self.music_preset_from(name, effects, eq_bands, eq_on))
             }
             DeviceDirection::Input => {
-                LanePreset::Voice(self.voice_preset_from(name, eq_bands, eq_on, gain_db)?)
+                LanePreset::Voice(self.voice_preset_from(name, eq_bands, eq_on, gain_db, filter_q)?)
             }
         };
         Some((preset, entry.modified))
@@ -1679,7 +1738,8 @@ impl App {
     /// A voice lane's controls written over the voice preset they were loaded from, under `name`.
     ///
     /// Only what the window can move on a voice is written: the equalizer — its switch, its
-    /// ladder and its curve — and the output gain, which is the chain's makeup. Everything else
+    /// ladder, its curve and its filter width — and the output gain, which is the chain's makeup.
+    /// Everything else
     /// is the preset's and is kept as loaded: the high-pass, the gate, compressor and de-esser
     /// tables, the denoiser, the de-reverb and the chain. In particular a noise-suppression level
     /// pinned in Settings is a setting over every preset, not part of this one, so it is never
@@ -1692,12 +1752,14 @@ impl App {
         eq_bands: &[EqBand],
         eq_on: bool,
         makeup_db: f32,
+        filter_q: f32,
     ) -> Option<InputPreset> {
         let mut preset = self.loaded_voice.clone()?;
         preset.name = name;
         preset.eq.centers_hz = eq_bands.iter().map(|band| band.center_hz).collect();
         preset.eq.gains_db = eq_bands.iter().map(|band| band.boost_db).collect();
         preset.eq.enabled = eq_on;
+        preset.eq.q = filter_q;
         preset.makeup_db = makeup_db;
         Some(preset)
     }
@@ -1821,6 +1883,10 @@ impl App {
         match self.store_mut(self.state.direction).delete(&name) {
             Ok(()) => {
                 self.refresh_preset_list();
+                // The old index is the neighbour that slid into the deleted slot now. Left
+                // selected, the pick below would take it for the current preset and, were it
+                // modified, stash the deleted preset's controls under the neighbour's name.
+                self.state.selected_preset = None;
                 // The device's own preset, as the original does (upstream 7f160b6); else the
                 // neighbour, so the list does not jump back to its top.
                 let next = self
@@ -1878,24 +1944,25 @@ impl App {
     /// ([`App::set_band_count`]) — since it is the preset's, not a default.
     ///
     /// Each value goes where its own control sends it: on the speakers the levels are settings
-    /// over every preset; on a microphone the gain is the voice preset's makeup, so moving it is
-    /// an edit to the preset.
+    /// over every preset; on a microphone the gain is the voice preset's makeup and the width its
+    /// equalizer's, so moving either is an edit to the preset. The microphone's face has no
+    /// balance or leveller — those are the speakers' — so it leaves them alone.
     fn restore_defaults(&mut self) {
         self.set_band_count(fxsound_core::eq::DEFAULT_BANDS);
-        let makeup_moved = self.state.master_gain_db != 0.0;
+        let voice_moved = self.state.master_gain_db != 0.0 || self.state.filter_q != 1.0;
         self.state.filter_q = 1.0;
         self.state.master_gain_db = 0.0;
-        self.state.balance_db = 0.0;
-        self.state.volume_leveling = 0.0;
         match self.state.direction {
             DeviceDirection::Output => {
+                self.state.balance_db = 0.0;
+                self.state.volume_leveling = 0.0;
                 self.settings.filter_q = 1.0;
                 self.settings.master_gain = 0.0;
                 self.settings.balance = 0.0;
                 self.settings.volume_leveling = 0.0;
                 self.settings_dirty = true;
             }
-            DeviceDirection::Input if makeup_moved => self.mark_preset_modified(),
+            DeviceDirection::Input if voice_moved => self.mark_preset_modified(),
             DeviceDirection::Input => {}
         }
         self.sync_params_from_state();
@@ -2002,6 +2069,7 @@ impl App {
         // The pick, shown at once — and the device a preset picked below is remembered against,
         // whatever the combo ends up showing (see the end of this function).
         self.state.set_selection(direction, Some(index));
+        self.state.set_unlisted(direction, None);
         if self.state.power {
             self.note_lane_devices();
         }
@@ -2074,7 +2142,12 @@ impl App {
     /// is not touched, whichever of the two the window is editing. With both lanes off FxSound
     /// processes nothing, which is what the two `Off` rows say.
     fn detach_lane(&mut self, direction: DeviceDirection) {
+        // `Off` is the later word on the lane, wherever it was chosen — the window's list as the
+        // tray's and the command line's: a device the lane was still waiting for the list with
+        // must not switch it back on when the list comes.
+        self.cancel_pending_device(direction);
         self.state.set_selection(direction, None);
+        self.state.set_unlisted(direction, None);
         self.requested_device[lane_index(direction)] = None;
         set_lane_active(&mut self.state, direction, false);
         self.note_lane_devices();
@@ -2147,6 +2220,7 @@ impl App {
             }
             None => self.enter_lane_for_the_first_time(direction),
         }
+        self.mirror_music_controls();
     }
 
     /// Do `act` with `lane`'s controls in the window, whichever lane the window is editing, and
@@ -2165,6 +2239,37 @@ impl App {
         act(self);
         self.show_lane(edit);
         self.notifications_armed = armed;
+    }
+
+    /// Move one of the controls only the music chain has — the five effects, the balance, the
+    /// volume leveller — and publish it: `act` sets it on the speakers' lane, whichever lane the
+    /// window is editing.
+    ///
+    /// A voice chain has none of them, so on a microphone they are inert, and a value set while
+    /// the microphone is edited — from the command line or D-Bus; the window greys them there —
+    /// belongs to the speakers. Written into the microphone's controls it would change nothing
+    /// that runs, read back from `--status` as though it had, mark the voice preset modified
+    /// over an identical file, and be gone the next time the speakers are shown. The window's
+    /// greyed copies follow ([`App::show_lane`]).
+    fn set_music_control(&mut self, act: impl FnOnce(&mut Self)) {
+        self.in_lane(DeviceDirection::Output, |app| {
+            act(app);
+            app.sync_params_from_state();
+        });
+    }
+
+    /// While the microphone is edited, show the speakers' effects, balance and volume leveller in
+    /// the window's greyed copies of them, so that what the window and `--status` show for the
+    /// music-only controls is what the speakers run, not a stale copy the voice chain never reads.
+    fn mirror_music_controls(&mut self) {
+        if self.state.direction != DeviceDirection::Input {
+            return;
+        }
+        if let Some(music) = &self.lane_controls[lane_index(DeviceDirection::Output)] {
+            self.state.effects = music.effects;
+            self.state.balance_db = music.balance_db;
+            self.state.volume_leveling = music.volume_leveling;
+        }
     }
 
     /// Show a lane the window has not edited yet this session.
@@ -2531,6 +2636,7 @@ impl App {
             devices_seen: false,
             audio_status: [fxsound_core::AudioStatus::default(); 2],
             attached: [None, None],
+            attachment_heard: [false, false],
             requested_device: [None, None],
             preset_device: [None, None],
             volume_save_due: None,
@@ -2824,6 +2930,7 @@ impl App {
                 .iter()
                 .map(|d| crate::tray::TrayDevice {
                     name: d.description.clone(),
+                    node_name: d.name.clone(),
                     direction: d.direction,
                 })
                 .collect(),
@@ -2852,6 +2959,7 @@ impl App {
                 .collect(),
             selected_preset,
             device: self.state.selection(lane),
+            unlisted: self.state.unlisted(lane).map(str::to_owned),
         }
     }
 
@@ -2873,11 +2981,25 @@ impl App {
             // A pick in the tray is the later word on its lane, as a later command line's is: a
             // `--output` still waiting for the device list must not take the lane back when the
             // list comes.
-            TrayCommand::SelectDevice(index) => {
-                if let Some(direction) = self.state.devices.get(index).map(|d| d.direction) {
-                    self.cancel_pending_device(direction);
-                }
-                self.handle(&[UiAction::SelectDevice(index)]);
+            //
+            // The device is found again by name in the list as it is now, not by the row the
+            // menu was drawn with: a list that changed in between would have the row point at
+            // another device, perhaps of the other lane. One that has gone does nothing.
+            TrayCommand::SelectDevice {
+                direction,
+                node_name,
+            } => {
+                let Some(index) = self
+                    .state
+                    .devices
+                    .iter()
+                    .position(|d| d.direction == direction && d.name == node_name)
+                else {
+                    log::info!("{node_name} is no longer listed; the tray's pick did nothing");
+                    return;
+                };
+                self.cancel_pending_device(direction);
+                self.handle(&[UiAction::select(direction, index)]);
             }
             TrayCommand::Detach(direction) => {
                 self.cancel_pending_device(direction);
@@ -3140,6 +3262,24 @@ impl App {
     /// every file whose name is already taken (case-insensitively) is skipped and the rest are
     /// copied into the lane's user preset directory.
     pub fn import_presets(&mut self, folder: &Path) -> Option<ImportSummary> {
+        self.import_presets_into(self.state.direction, folder)
+    }
+
+    /// [`App::import_presets`] into `lane`'s store, whichever lane the window is editing: the
+    /// Import window's, for the lane it was opened on ([`ImportState::lane`]).
+    pub fn import_presets_into(
+        &mut self,
+        lane: DeviceDirection,
+        folder: &Path,
+    ) -> Option<ImportSummary> {
+        let mut summary = None;
+        self.in_lane(lane, |app| {
+            summary = app.import_into_the_edited_lane(folder)
+        });
+        summary
+    }
+
+    fn import_into_the_edited_lane(&mut self, folder: &Path) -> Option<ImportSummary> {
         let lane = self.state.direction;
         let extension = self.store(lane).extension();
         let mut files: Vec<PathBuf> = match std::fs::read_dir(folder) {
@@ -3201,7 +3341,7 @@ impl App {
                 let Some(folder) = state.folder.clone() else {
                     return false;
                 };
-                match self.import_presets(&folder) {
+                match self.import_presets_into(state.lane, &folder) {
                     Some(summary) => state.summary = Some(summary),
                     None => {
                         state.notice =
@@ -3255,9 +3395,9 @@ impl App {
                     .into_iter()
                     .map(str::to_owned)
                     .collect();
-                let collisions = self.export_collisions(&names);
+                let collisions = self.export_collisions(state.lane, &names);
                 if collisions.is_empty() {
-                    let written = self.export_presets(&names);
+                    let written = self.export_presets(state.lane, &names);
                     state.finished = Some(written > 0);
                 } else {
                     state.collisions = collisions;
@@ -3279,7 +3419,7 @@ impl App {
                 let written = if names.is_empty() {
                     0
                 } else {
-                    self.export_presets(&names)
+                    self.export_presets(state.lane, &names)
                 };
                 state.finished = Some(written > 0);
                 false
@@ -3302,11 +3442,12 @@ impl App {
         }
     }
 
-    /// The presets among `names` whose file already exists in the export directory — the file the
-    /// edit direction's store will write, asked of the store, so the question comes up for exactly
-    /// the files an export would replace.
-    fn export_collisions(&self, names: &[String]) -> Vec<String> {
-        let store = self.store(self.state.direction);
+    /// The presets among `names` whose file already exists in the export directory — the file
+    /// `lane`'s store will write, asked of the store, so the question comes up for exactly the
+    /// files an export would replace. The lane is the Export window's ([`ExportState::lane`]),
+    /// not the edit direction, which may have moved while the window was open.
+    fn export_collisions(&self, lane: DeviceDirection, names: &[String]) -> Vec<String> {
+        let store = self.store(lane);
         names
             .iter()
             .filter(|name| {
@@ -3318,17 +3459,16 @@ impl App {
             .collect()
     }
 
-    /// Write `names`, from the edit direction's store, into the export directory — each as last
-    /// saved. Returns how many files were written, which is what `FxController::exportPresets()`
-    /// reduces to a `bool`.
-    fn export_presets(&mut self, names: &[String]) -> usize {
+    /// Write `names`, from `lane`'s store, into the export directory — each as last saved.
+    /// Returns how many files were written, which is what `FxController::exportPresets()` reduces
+    /// to a `bool`.
+    fn export_presets(&mut self, lane: DeviceDirection, names: &[String]) -> usize {
         if let Err(err) = std::fs::create_dir_all(&self.export_dir) {
             log::warn!("could not create {}: {err}", self.export_dir.display());
             self.raise_notice(tr("Could not create the export folder"));
             return 0;
         }
         let mut written = 0;
-        let lane = self.state.direction;
         for name in names {
             match self.store(lane).export(name, &self.export_dir) {
                 Ok(_) => written += 1,
@@ -3443,12 +3583,7 @@ fn startup_messages(settings: &Settings) -> Vec<UiToAudio> {
         },
         UiToAudio::SeedTargetVolumes(settings.device_volumes.clone()),
     ];
-    messages.extend(
-        DeviceDirection::ALL.map(|direction| UiToAudio::SetDevicePriority {
-            direction,
-            names: priority::ranking(settings, direction),
-        }),
-    );
+    messages.extend(DeviceDirection::ALL.map(|direction| device_priority(settings, direction)));
     if !settings.power {
         messages.extend(default_claims(false));
     }
@@ -3459,6 +3594,17 @@ fn startup_messages(settings: &Settings) -> Vec<UiToAudio> {
         messages.push(UiToAudio::SetEchoCancel(true));
     }
     messages
+}
+
+/// `direction`'s ranking as the engine takes it ([`priority::ranking`]), with where a device the
+/// ranking does not name yet goes: first with *Prioritize new output devices* ticked, last
+/// without — the engine decides on an arrival before the list that ranks the newcomer reaches it.
+fn device_priority(settings: &Settings, direction: DeviceDirection) -> UiToAudio {
+    UiToAudio::SetDevicePriority {
+        direction,
+        names: priority::ranking(settings, direction),
+        new_devices_first: settings.prioritize_new_output,
+    }
 }
 
 /// Both lanes' claim on the session default, taken (`want`) or handed back — what the power switch
@@ -3556,6 +3702,56 @@ fn set_lane_active(state: &mut UiState, direction: DeviceDirection, processing: 
         DeviceDirection::Output => state.output_active = processing,
         DeviceDirection::Input => state.input_active = processing,
     }
+}
+
+/// What the window says for an engine error: a sentence in the user's language for each
+/// [`fxsound_audio::AudioError`], recognised by the text the engine sends, which is that error's
+/// English `Display` — a log line, lower-case, and in English whatever the language.
+///
+/// A text this version does not recognise gets a general sentence rather than itself: it is
+/// logged, and never shown as it came.
+fn engine_error_notice(message: &str) -> String {
+    use fxsound_audio::AudioError;
+    let is = |error: AudioError| message == error.to_string();
+    let unavailable = AudioError::PipewireUnavailable(String::new()).to_string();
+    tr(if is(AudioError::NoOutputDevices) {
+        "No playback devices are present"
+    } else if is(AudioError::NoInputDevices) {
+        "No microphones are present"
+    } else if is(AudioError::DeviceNotPresent) {
+        "The selected device is not present"
+    } else if is(AudioError::DeviceUnavailable) {
+        "The audio device is unavailable"
+    } else if message.starts_with(unavailable.trim_end()) {
+        "PipeWire is not available"
+    } else if is(AudioError::PipewireDisconnected) {
+        "The connection to PipeWire was lost"
+    } else if is(AudioError::FormatNegotiation) {
+        "The audio format could not be agreed with PipeWire"
+    } else {
+        "The audio engine reported an error"
+    })
+}
+
+/// Why the engine says echo cancellation is not running, from the detail it sends: `None` for
+/// none, which is also the canceller not being needed yet. Recognised by the texts the engine's
+/// canceller supervisor writes (`fxsound-audio`, `aec.rs`); anything else is a reason the window
+/// cannot name and does not print.
+fn echo_cancel_trouble(detail: &str) -> Option<fxsound_ui::state::EchoCancelTrouble> {
+    use fxsound_ui::state::EchoCancelTrouble;
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return None;
+    }
+    Some(if detail.starts_with("could not load") {
+        EchoCancelTrouble::NotLoaded
+    } else if detail.contains("stopped unexpectedly") {
+        EchoCancelTrouble::Stopped
+    } else if detail == "waiting for the speakers" {
+        EchoCancelTrouble::WaitingForSpeakers
+    } else {
+        EchoCancelTrouble::Other
+    })
 }
 
 /// Which device a lane's combo shows.
@@ -3707,28 +3903,34 @@ impl App {
         let mut state = SettingsState::new(self.settings.clone());
         state.version = env!("CARGO_PKG_VERSION").to_owned();
         state.launch_on_startup = autostart_enabled();
-        // The rows' preset combos offer the speakers' presets, whichever lane the window edits:
-        // the list is the Output Device Preference.
-        state.presets = self
-            .presets
+        state.devices = self.device_rows(DeviceDirection::Output);
+        state.microphones = self.device_rows(DeviceDirection::Input);
+        self.refresh_settings_state(&mut state);
+        state
+    }
+
+    /// The names the Output Device Preference rows' preset combos offer: the speakers' presets,
+    /// whichever lane the window edits, in the store's order — the order a row's preset index
+    /// ([`App::device_rows`]) counts in.
+    fn device_preset_names(&self) -> Vec<String> {
+        self.presets
             .entries()
             .iter()
             .map(|p| p.name.clone())
-            .collect();
-        // The reset button is enabled iff there is something to lose
-        // (`FxSettingsDialog.cpp:210-220`), on either lane, since the reset covers both.
-        state.can_reset_presets = DeviceDirection::ALL.into_iter().any(|lane| {
+            .collect()
+    }
+
+    /// Whether Settings ▸ Reset Presets has something to lose (`FxSettingsDialog.cpp:210-220`), on
+    /// either lane, since the reset covers both.
+    fn can_reset_presets(&self) -> bool {
+        DeviceDirection::ALL.into_iter().any(|lane| {
             self.lane_preset(lane).is_some_and(|(_, modified)| modified)
                 || self
                     .store(lane)
                     .entries()
                     .iter()
                     .any(|p| p.source != fxsound_preset::PresetSource::Factory || p.modified)
-        });
-        state.devices = self.device_rows(DeviceDirection::Output);
-        state.microphones = self.device_rows(DeviceDirection::Input);
-        self.refresh_settings_state(&mut state);
-        state
+        })
     }
 
     /// One direction's priority list as the Settings pane draws it, most preferred first: the
@@ -3828,7 +4030,14 @@ impl App {
         }
         for lane in DeviceDirection::ALL {
             self.in_lane(lane, |app| {
-                app.refresh_preset_list_keeping_selection();
+                // Rebuilt without the unsaved-changes marker the selection carried: every stash
+                // is gone, so nothing is unsaved any more, and a selection still marked would make
+                // the pick below stash the dropped edits all over again — under the preset they
+                // were dropped from, or under the one the device brings back.
+                let selected = app.state.preset().map(|p| p.name.clone());
+                app.refresh_preset_list();
+                app.state.selected_preset =
+                    selected.and_then(|name| app.state.presets.iter().position(|p| p.name == name));
                 if let Some(index) = app.device_preset_index().or(app.state.selected_preset) {
                     app.select_preset(index);
                 }
@@ -3901,6 +4110,10 @@ impl App {
                 self.settings.prioritize_new_output = *on;
                 state.settings.prioritize_new_output = *on;
                 self.persist_settings();
+                // The engine places a newcomer by it before the app's list can: told at once.
+                for message in self.device_priority_messages() {
+                    self.send(message);
+                }
             }
             // Upstream issue #629: the priority list stops choosing the device, and the system's
             // default does, as the Windows rules have it. The list itself is kept.
@@ -3977,8 +4190,14 @@ impl App {
                 self.swap_device_config(state, DeviceDirection::Input, *row, row + 1);
             }
             A::SetDevicePreset { device, preset } => {
-                // A name from the speakers' store, the list the combo offers.
-                let name = self.presets.entries().get(*preset).map(|p| p.name.clone());
+                // By the name the row showed, and only one the speakers' store still has: an
+                // index would be counted in the list as it was drawn, not as it is now.
+                let name = self
+                    .presets
+                    .entries()
+                    .iter()
+                    .find(|p| p.name == *preset)
+                    .map(|p| p.name.clone());
                 if let (Some(index), Some(name)) =
                     (self.config_index(DeviceDirection::Output, *device), name)
                 {
@@ -4107,15 +4326,21 @@ impl App {
     /// every frame the pane is open; everything else in the pane's working copy changes only
     /// through [`App::handle_settings`].
     pub fn refresh_settings_state(&self, state: &mut SettingsState) {
+        // Before the rows: a row's preset is an index into this list, counted in the live
+        // store's order, and a save, rename or delete from the command line or D-Bus while the
+        // pane is open moves the names under it. A stale list would show a row one name and bind
+        // another to it.
+        let names = self.device_preset_names();
+        if state.presets != names {
+            state.presets = names;
+        }
+        state.can_reset_presets = self.can_reset_presets();
         self.refresh_device_rows(state);
         state.echo_cancel_running = self.state.echo_cancel_running;
         // The one microphone setting the command line and D-Bus can change under an open pane.
         state.settings.noise_suppression = self.settings.noise_suppression;
-        if state.echo_cancel_detail != self.echo_cancel_detail {
-            state
-                .echo_cancel_detail
-                .clone_from(&self.echo_cancel_detail);
-        }
+        state.echo_cancel_trouble = self.state.echo_cancel_trouble;
+        state.input_processing = self.state.input_active;
         state.has_microphone = self.microphone_description().is_some();
         // A calibration applied while the pane is open is the pane's last-calibration line.
         if state.settings.calibration != self.settings.calibration {
@@ -4714,18 +4939,32 @@ mod tests {
     }
 
     #[test]
-    fn restoring_defaults_on_a_voice_with_only_its_width_moved_is_no_edit_to_it() {
-        // `Quiet` has no makeup and ten bands; the filter width is not written into a voice
-        // preset, so putting it back changes nothing a save would keep.
+    fn restoring_defaults_on_a_voice_at_its_defaults_is_no_edit_to_it() {
+        // `Quiet` has no makeup, ten bands and the default width: nothing to put back.
         let (mut app, _engine, _dir) = restoring_on_the_microphone("Quiet");
         let before = speakers_settings(&app);
-        app.handle(&[UiAction::SetFilterQ(2.5)]);
-        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
         app.handle(&[UiAction::RestoreDefaults]);
         assert_eq!(app.input_params().filter_q, 1.0);
         assert_eq!(app.input_params().makeup_db, 0.0);
         assert_eq!(app.input_params().num_bands, 10);
         assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+        assert_eq!(speakers_settings(&app), before);
+    }
+
+    #[test]
+    fn a_voices_width_is_an_edit_to_its_preset_that_restoring_defaults_puts_back() {
+        let (mut app, _engine, _dir) = restoring_on_the_microphone("Quiet");
+        let before = speakers_settings(&app);
+        app.handle(&[UiAction::SetFilterQ(2.5)]);
+        assert_eq!(app.input_params().filter_q, 2.5, "the voice chain runs it");
+        assert_eq!(
+            app.lane_preset(IN),
+            Some(("Quiet", true)),
+            "and the preset says it is modified, so Save is offered"
+        );
+        app.handle(&[UiAction::RestoreDefaults]);
+        assert_eq!(app.input_params().filter_q, 1.0);
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", true)));
         assert_eq!(speakers_settings(&app), before);
     }
 
@@ -4813,6 +5052,7 @@ mod tests {
                 centers_hz: fxsound_core::eq::DEFAULT_CENTERS_HZ.to_vec(),
                 gains_db: vec![0.0; 10],
                 enabled: true,
+                q: 1.0,
             },
             makeup_db: 0.0,
             ceiling_db: -3.0,
@@ -4946,6 +5186,7 @@ mod tests {
                     centers_hz: fxsound_core::eq::DEFAULT_CENTERS_HZ.to_vec(),
                     gains_db: vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0],
                     enabled: true,
+                    q: 1.0,
                 },
                 makeup_db: 4.0,
                 ceiling_db: -3.0,
@@ -5525,7 +5766,7 @@ mod tests {
     }
 
     #[test]
-    fn the_level_settings_belong_to_the_music_chain() {
+    fn on_a_microphone_the_gain_and_width_are_the_voices_and_balance_and_leveller_the_speakers() {
         let mut app = lanes();
         app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
         app.handle(&[
@@ -5536,13 +5777,19 @@ mod tests {
         ]);
         assert_eq!(app.settings.master_gain, 0.0);
         assert_eq!(app.settings.filter_q, 1.0);
-        assert_eq!(app.settings.balance, 0.0);
-        assert_eq!(app.settings.volume_leveling, 0.0);
         assert_eq!(
             app.input_params().makeup_db,
             9.0,
             "it is the voice's makeup"
         );
+        assert_eq!(app.input_params().filter_q, 3.0, "and the voice's width");
+        // The voice chain has no balance and no leveller: they are the speakers', whichever lane
+        // the window shows.
+        assert_eq!(app.settings.balance, 4.0);
+        assert_eq!(app.settings.volume_leveling, 2.0);
+        assert_eq!(app.params().balance, 4.0);
+        assert_eq!(app.params().volume_leveling_db, 2.0);
+        assert_eq!(app.state.direction, DeviceDirection::Input);
     }
 
     #[test]
@@ -6481,19 +6728,94 @@ mod tests {
         app.receive(AudioToUi::Disconnected {
             reason: "gone".to_owned(),
         });
-        assert!(
-            app.state
-                .notification
-                .as_deref()
-                .is_some_and(|text| text.ends_with("gone")),
-            "{:?}",
-            app.state.notification
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some("Audio disconnected")
         );
         app.receive(AudioToUi::Error {
             direction: Some(DeviceDirection::Input),
-            message: "no microphone".to_owned(),
+            message: fxsound_audio::AudioError::NoInputDevices.to_string(),
         });
-        assert_eq!(app.state.notification.as_deref(), Some("no microphone"));
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some("No microphones are present")
+        );
+    }
+
+    #[test]
+    fn a_disconnect_is_shown_in_the_interfaces_words_never_with_the_engines_reason() {
+        // The reasons the engine gives (`disconnect` in `fxsound-audio`'s engine): log lines in
+        // English, which the window would otherwise show in every language.
+        for reason in ["restart requested", "the server went away", ""] {
+            let mut app = headless();
+            app.receive(AudioToUi::Disconnected {
+                reason: reason.to_owned(),
+            });
+            assert_eq!(
+                app.state.notification.as_deref(),
+                Some(tr("Audio disconnected").as_str()),
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_disconnect_notice_is_translated_in_every_language() {
+        for language in i18n::LANGUAGES
+            .iter()
+            .filter(|language| language.code != "en")
+        {
+            let table = i18n::Catalogue::for_language(language);
+            let shown = table
+                .get("Audio disconnected")
+                .unwrap_or_else(|| panic!("{} has no translation", language.code));
+            assert_ne!(shown, "Audio disconnected", "{}", language.code);
+            assert!(
+                !shown.trim_end().ends_with([':', '：']),
+                "{}: {shown:?} is a whole notice, not a label for a reason",
+                language.code
+            );
+        }
+    }
+
+    #[test]
+    fn every_engine_error_is_shown_as_a_sentence_of_the_interface_never_as_the_engines_log_line() {
+        use fxsound_audio::AudioError;
+        let cases = [
+            (
+                AudioError::NoOutputDevices,
+                "No playback devices are present",
+            ),
+            (AudioError::NoInputDevices, "No microphones are present"),
+            (
+                AudioError::DeviceNotPresent,
+                "The selected device is not present",
+            ),
+            (
+                AudioError::DeviceUnavailable,
+                "The audio device is unavailable",
+            ),
+            (
+                AudioError::PipewireUnavailable("connection refused (os error 111)".to_owned()),
+                "PipeWire is not available",
+            ),
+            (
+                AudioError::PipewireDisconnected,
+                "The connection to PipeWire was lost",
+            ),
+            (
+                AudioError::FormatNegotiation,
+                "The audio format could not be agreed with PipeWire",
+            ),
+        ];
+        for (error, shown) in cases {
+            assert_eq!(engine_error_notice(&error.to_string()), shown, "{error:?}");
+        }
+        assert_eq!(
+            engine_error_notice("something a later engine says"),
+            "The audio engine reported an error",
+            "an unknown text is not shown as it came"
+        );
     }
 
     #[test]
@@ -7023,9 +7345,18 @@ mod tests {
         assert!(app.settings().echo_cancel);
         assert!(pane.settings.echo_cancel);
         assert!(app.state.echo_cancel_on, "the strip knows it was asked for");
-        // Nothing has confirmed it: with no audio thread there is nobody to load the module.
+        // Nothing has confirmed it: with no audio thread there is nobody to load the module. With
+        // no microphone delivering, the canceller is not needed yet, and that is no fault.
         assert!(!app.state.echo_cancel_running);
-        assert_eq!(pane.echo_cancel_status().as_deref(), Some("unavailable"));
+        assert_eq!(pane.echo_cancel_status(), None);
+        app.state.input_active = true;
+        app.refresh_settings_state(&mut pane);
+        assert_eq!(
+            pane.echo_cancel_status().as_deref(),
+            Some("unavailable"),
+            "a microphone delivers and the canceller is not there"
+        );
+        app.state.input_active = false;
 
         app.handle_settings(&SettingsAction::SetEchoCancel(false), &mut pane);
         assert!(!app.settings().echo_cancel);
@@ -7085,10 +7416,12 @@ mod tests {
                 UiToAudio::SetDevicePriority {
                     direction: DeviceDirection::Output,
                     names: Vec::new(),
+                    new_devices_first: false,
                 },
                 UiToAudio::SetDevicePriority {
                     direction: DeviceDirection::Input,
                     names: Vec::new(),
+                    new_devices_first: false,
                 },
                 UiToAudio::SetEchoCancel(true),
             ]
@@ -7112,11 +7445,15 @@ mod tests {
         let mut pane = app.settings_state();
         pane.settings.echo_cancel = true;
         app.state.echo_cancel_running = false;
-        app.echo_cancel_detail = "no libspa-aec-webrtc".to_owned();
+        app.state.echo_cancel_trouble = echo_cancel_trouble(
+            "could not load libpipewire-module-echo-cancel with aec/libspa-aec-webrtc: \
+             No such file or directory",
+        );
         app.refresh_settings_state(&mut pane);
         assert_eq!(
             pane.echo_cancel_status().as_deref(),
-            Some("unavailable · no libspa-aec-webrtc")
+            Some("unavailable · the echo canceller could not be loaded"),
+            "a short reason, never the module path or the OS error"
         );
         app.state.echo_cancel_running = true;
         app.refresh_settings_state(&mut pane);
@@ -7306,6 +7643,7 @@ mod tests {
         let volume = TargetVolume {
             direction: OUT,
             target: HEADPHONES.to_owned(),
+            port: String::new(),
             channel_volumes: vec![0.5, 0.5],
             mute: false,
         };
@@ -7326,10 +7664,12 @@ mod tests {
                 UiToAudio::SetDevicePriority {
                     direction: OUT,
                     names: Vec::new(),
+                    new_devices_first: false,
                 },
                 UiToAudio::SetDevicePriority {
                     direction: IN,
                     names: Vec::new(),
+                    new_devices_first: false,
                 },
             ]
         );
@@ -7663,7 +8003,7 @@ mod tests {
         );
         assert_eq!(
             app.state.notification.as_deref(),
-            Some("audio device is unavailable")
+            Some("The audio device is unavailable")
         );
     }
 
@@ -7804,6 +8144,7 @@ mod tests {
         let volume = |level: f32| TargetVolume {
             direction: OUT,
             target: HEADPHONES.to_owned(),
+            port: String::new(),
             channel_volumes: vec![level, level],
             mute: false,
         };
@@ -7811,7 +8152,7 @@ mod tests {
         engine.feed(AudioToUi::TargetVolume(volume(0.4)));
         app.poll_audio();
         assert_eq!(
-            app.settings.target_volume(OUT, HEADPHONES),
+            app.settings.target_volume(OUT, HEADPHONES, ""),
             Some(&volume(0.4))
         );
         assert!(
@@ -7825,7 +8166,7 @@ mod tests {
         engine.feed(AudioToUi::TargetVolume(volume(0.2)));
         app.poll_audio();
         assert_eq!(
-            app.settings.target_volume(OUT, HEADPHONES),
+            app.settings.target_volume(OUT, HEADPHONES, ""),
             Some(&volume(0.2))
         );
         assert_eq!(app.volume_save_due, Some(due));
@@ -7859,6 +8200,7 @@ mod tests {
         let volume = TargetVolume {
             direction: OUT,
             target: HEADPHONES.to_owned(),
+            port: String::new(),
             channel_volumes: vec![0.3, 0.3],
             mute: false,
         };
@@ -7868,7 +8210,10 @@ mod tests {
         app.handle_settings(&SettingsAction::MoveDeviceDown(0), &mut pane);
         app.handle_settings(&SettingsAction::SetFollowSystemDefault(true), &mut pane);
         app.refresh_settings_state(&mut pane);
-        assert_eq!(app.settings.target_volume(OUT, HEADPHONES), Some(&volume));
+        assert_eq!(
+            app.settings.target_volume(OUT, HEADPHONES, ""),
+            Some(&volume)
+        );
         assert!(
             startup_messages(&app.settings).contains(&UiToAudio::SeedTargetVolumes(vec![volume]))
         );
@@ -8022,13 +8367,18 @@ mod tests {
         assert_eq!(engine.take_sent(), [UiToAudio::SetEchoCancel(true)]);
         engine.feed(AudioToUi::EchoCancel {
             running: false,
-            detail: "no libspa-aec-webrtc".to_owned(),
+            detail: "the echo canceller stopped unexpectedly".to_owned(),
         });
         app.poll_audio();
         app.refresh_settings_state(&mut pane);
         assert_eq!(
             pane.echo_cancel_status().as_deref(),
-            Some("unavailable · no libspa-aec-webrtc")
+            Some("unavailable · the echo canceller stopped")
+        );
+        assert_eq!(
+            app.echo_cancel_detail(),
+            "the echo canceller stopped unexpectedly",
+            "the engine's own words stay for the event stream"
         );
         app.handle_settings(&SettingsAction::SetEchoCancel(false), &mut pane);
         assert_eq!(engine.take_sent(), [UiToAudio::SetEchoCancel(false)]);
@@ -8448,6 +8798,7 @@ mod tests {
         fxsound_preset::save(&rock, &incoming.join("Rock.fac")).unwrap();
 
         let mut state = ImportState {
+            lane: IN,
             folder: Some(incoming.clone()),
             ..ImportState::default()
         };
@@ -8484,6 +8835,7 @@ mod tests {
         assert!(entry(&app, "Mine").modified);
 
         let mut state = ExportState {
+            lane: IN,
             presets: app.state.presets.iter().map(|p| p.name.clone()).collect(),
             selected: [at(&app, "Loud"), at(&app, "Mine")].into_iter().collect(),
             ..ExportState::default()
@@ -8500,6 +8852,7 @@ mod tests {
 
         // A second export asks about exactly the voice files that are there.
         let mut again = ExportState {
+            lane: IN,
             presets: state.presets.clone(),
             selected: state.selected.clone(),
             ..ExportState::default()
@@ -8636,7 +8989,7 @@ mod tests {
         app.handle_settings(
             &SettingsAction::SetDevicePreset {
                 device: 0,
-                preset: 1,
+                preset: "Beta".to_owned(),
             },
             &mut pane,
         );
@@ -9407,14 +9760,13 @@ mod tests {
         // playing only remembers.
         let mut app = speakers_on_alpha("settings-row");
         let mut pane = app.settings_state();
-        let alpha = app.presets.index_of("Alpha").expect("Alpha");
         let beta = app.presets.index_of("Beta").expect("Beta");
 
         let headphones = row_of(&pane, "alsa_output.headphones");
         app.handle_settings(
             &SettingsAction::SetDevicePreset {
                 device: headphones,
-                preset: alpha,
+                preset: "Alpha".to_owned(),
             },
             &mut pane,
         );
@@ -9429,7 +9781,7 @@ mod tests {
         app.handle_settings(
             &SettingsAction::SetDevicePreset {
                 device: speakers,
-                preset: beta,
+                preset: "Beta".to_owned(),
             },
             &mut pane,
         );
@@ -9448,11 +9800,10 @@ mod tests {
         let _voices = with_voice_presets(&mut app);
         app.handle(&[UiAction::SetEditDirection(IN)]);
         let mut pane = app.settings_state();
-        let beta = app.presets.index_of("Beta").expect("Beta");
         app.handle_settings(
             &SettingsAction::SetDevicePreset {
                 device: row_of(&pane, "alsa_output.speakers"),
-                preset: beta,
+                preset: "Beta".to_owned(),
             },
             &mut pane,
         );
@@ -10063,6 +10414,7 @@ mod tests {
         app.autosave_lane_preset(&edited);
 
         let mut state = ExportState {
+            lane: IN,
             presets: vec!["Loud".into()],
             selected: [0].into_iter().collect(),
             ..ExportState::default()
@@ -10081,9 +10433,9 @@ mod tests {
     fn rankings(sent: &[UiToAudio]) -> Vec<(DeviceDirection, Vec<String>)> {
         sent.iter()
             .filter_map(|message| match message {
-                UiToAudio::SetDevicePriority { direction, names } => {
-                    Some((*direction, names.clone()))
-                }
+                UiToAudio::SetDevicePriority {
+                    direction, names, ..
+                } => Some((*direction, names.clone())),
                 _ => None,
             })
             .collect()
@@ -10184,6 +10536,7 @@ mod tests {
             [UiToAudio::SetDevicePriority {
                 direction: OUT,
                 names: owned(&[SPEAKERS, HEADPHONES]),
+                new_devices_first: false,
             }]
         );
         assert_eq!(selected(&app, OUT), Some(HEADPHONES));
@@ -10226,6 +10579,43 @@ mod tests {
     }
 
     #[test]
+    fn ticking_prioritize_new_devices_tells_the_engine_where_a_newcomer_goes_at_once() {
+        // The engine places a device it has not been told about before the app's list can rank
+        // it, so where a newcomer goes travels with every ranking and again when it changes.
+        let (mut app, engine, _dir) = listed_with(saved_settings(OUT), HEADPHONES);
+        let _ = engine.take_sent();
+        let mut pane = app.settings_state();
+        app.handle_settings(&SettingsAction::SetPrioritizeNewOutput(true), &mut pane);
+        let sent = engine.take_sent();
+        let firsts: Vec<_> = sent
+            .iter()
+            .filter_map(|message| match message {
+                UiToAudio::SetDevicePriority {
+                    direction,
+                    new_devices_first,
+                    ..
+                } => Some((*direction, *new_devices_first)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(firsts, [(OUT, true), (IN, true)]);
+        app.handle_settings(&SettingsAction::SetPrioritizeNewOutput(true), &mut pane);
+        assert!(
+            engine.take_sent().is_empty(),
+            "the same setting again changes nothing"
+        );
+        let mut settings = saved_settings(OUT);
+        settings.prioritize_new_output = true;
+        assert!(startup_messages(&settings).iter().any(|message| matches!(
+            message,
+            UiToAudio::SetDevicePriority {
+                new_devices_first: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn with_new_devices_prioritised_a_newcomer_goes_to_the_top_and_takes_its_lane() {
         let mut settings = saved_settings(OUT);
         settings.prioritize_new_output = true;
@@ -10243,6 +10633,7 @@ mod tests {
                 UiToAudio::SetDevicePriority {
                     direction: OUT,
                     names: owned(&[DOCK, HEADPHONES, SPEAKERS]),
+                    new_devices_first: true,
                 },
                 select(DOCK, OUT),
             ]
@@ -10348,6 +10739,7 @@ mod tests {
             [UiToAudio::SetDevicePriority {
                 direction: IN,
                 names: owned(&["alsa_input.webcam", MIC]),
+                new_devices_first: false,
             }]
         );
         assert_eq!(
@@ -10751,9 +11143,10 @@ mod tests {
         let (mut app, _engine, _dir) = both_lanes_attached();
         app.select_device_when_listed("usb-headset-not-yet-listed", OUT);
         app.select_device_when_listed("usb-mic-not-yet-listed", IN);
-        app.handle_tray(crate::tray::TrayCommand::SelectDevice(device_at(
-            &app, SPEAKERS,
-        )));
+        app.handle_tray(crate::tray::TrayCommand::SelectDevice {
+            direction: OUT,
+            node_name: SPEAKERS.to_owned(),
+        });
         assert_eq!(app.pending_device(OUT), None, "the tray's pick stands");
         assert_eq!(
             app.pending_device(IN),
@@ -10820,5 +11213,406 @@ mod tests {
         assert!(app.audio_notifications().is_none());
         app.poll_audio();
         assert!(!app.meters_moved());
+    }
+
+    // ---- what the review of the window and the controller found (C15) -----------------------
+
+    #[test]
+    fn the_music_only_controls_set_on_the_microphone_reach_the_speakers_and_nothing_else() {
+        let (mut app, engine, _dir) = started_with(saved_settings(IN));
+        assert_eq!(app.state.direction, IN);
+        let voice = engine.input_params().expect("published");
+        let outcome = crate::commands::run(
+            &mut app,
+            &[
+                crate::cli::Command::Effects(vec![(Effect::Bass, 10.0)]),
+                crate::cli::Command::Balance(6.0),
+                crate::cli::Command::VolumeLeveling(2.0),
+            ],
+        );
+        assert!(!outcome.failed);
+        assert_eq!(
+            app.state.direction, IN,
+            "the window stays on the microphone"
+        );
+        assert_eq!(
+            app.lane_preset(IN),
+            Some(("Loud", false)),
+            "nothing of the voice preset moved"
+        );
+        assert_eq!(
+            app.lane_preset(OUT),
+            Some(("Beta", true)),
+            "the music's did"
+        );
+        let music = engine.params().expect("published");
+        assert_eq!(
+            music.effect(Effect::Bass),
+            scale::slider_to_value_for(Effect::Bass, 10.0),
+            "the speakers run it"
+        );
+        assert_eq!(music.balance, 6.0);
+        assert_eq!(music.volume_leveling_db, 2.0);
+        assert_eq!(app.settings.balance, 6.0);
+        assert_eq!(app.settings.volume_leveling, 2.0);
+        assert_eq!(engine.input_params().expect("published"), voice);
+
+        // What `--status` reads back is what runs.
+        let status: serde_json::Value =
+            serde_json::from_str(&crate::commands::status_json(&app)).expect("json");
+        assert_eq!(status["effects"]["bass"].as_f64(), Some(10.0));
+        assert_eq!(status["balance_db"].as_i64(), Some(6));
+
+        // And the speakers show it when they are looked at: nothing was lost.
+        app.handle(&[UiAction::SetEditDirection(OUT)]);
+        assert_eq!(app.state.effect(Effect::Bass), 10.0);
+        assert_eq!(app.state.balance_db, 6.0);
+        assert_eq!(app.state.volume_leveling, 2.0);
+    }
+
+    #[test]
+    fn restoring_defaults_on_the_microphone_leaves_the_speakers_balance_and_leveller_alone() {
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        app.handle(&[UiAction::SetBalance(4.0), UiAction::SetVolumeLeveling(1.5)]);
+        app.handle(&[UiAction::SetEditDirection(IN), UiAction::RestoreDefaults]);
+        assert_eq!(app.settings.balance, 4.0);
+        assert_eq!(app.settings.volume_leveling, 1.5);
+        assert_eq!(engine.params().expect("published").balance, 4.0);
+        assert_eq!(
+            app.state.balance_db, 4.0,
+            "the greyed copy shows the speakers'"
+        );
+    }
+
+    #[test]
+    fn reset_presets_does_not_stash_the_edits_it_has_just_dropped() {
+        let (mut app, _dir) = with_store();
+        add_user_preset(&mut app, "A");
+        add_user_preset(&mut app, "B");
+        pick(&mut app, "B");
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 8.0)]);
+        pick(&mut app, "A");
+        pick(&mut app, "B");
+        assert!(
+            app.state.preset().is_some_and(|p| p.modified),
+            "B from its stash"
+        );
+        // The device in use remembers A, as after a cold start's `--preset B`.
+        app.state.devices = vec![device("alsa_output.speakers", OUT, true)];
+        app.state.selected_output = Some(0);
+        app.settings
+            .remember_device_preset("alsa_output.speakers", "Speakers", "A", "", OUT);
+
+        let mut pane = app.settings_state();
+        app.handle_settings(&SettingsAction::ResetPresets, &mut pane);
+
+        let (_, from_autosave) = app.presets.load("B").expect("B");
+        assert!(!from_autosave, "B's stash was dropped and stays dropped");
+        assert!(app.state.presets.iter().all(|p| !p.modified));
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("A"));
+    }
+
+    #[test]
+    fn deleting_a_preset_never_stashes_its_controls_under_the_neighbours_name() {
+        let (mut app, _dir) = with_store();
+        for name in ["D", "N", "P"] {
+            add_user_preset(&mut app, name);
+        }
+        pick(&mut app, "N");
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 8.0)]);
+        pick(&mut app, "D");
+        let stashed = |app: &App| {
+            let (preset, from_autosave) = app.presets.load("N").expect("N");
+            assert!(from_autosave, "N keeps its stash");
+            preset.effect(Effect::Bass)
+        };
+        let before = stashed(&app);
+        assert!(before > 0.5);
+        // The device in use remembers P.
+        app.state.devices = vec![device("alsa_output.speakers", OUT, true)];
+        app.state.selected_output = Some(0);
+        app.settings
+            .remember_device_preset("alsa_output.speakers", "Speakers", "P", "", OUT);
+
+        app.handle(&[UiAction::DeletePreset]);
+
+        assert_eq!(names(&app), ["N", "P"]);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("P"));
+        assert_eq!(stashed(&app), before, "N's own edits, not D's controls");
+    }
+
+    #[test]
+    fn a_voices_filter_width_is_saved_with_it_and_comes_back_with_it() {
+        let (mut app, engine, dir) = editing_the_microphone();
+        app.handle(&[UiAction::SetFilterQ(2.5)]);
+        assert!(entry(&app, "Loud").modified, "an edit, so Save is offered");
+        assert_eq!(engine.input_params().expect("published").filter_q, 2.5);
+        app.handle(&[UiAction::SavePresetAs("Wide".into())]);
+        assert_eq!(saved_voice(&dir, "Wide.toml").eq.q, 2.5);
+
+        app.handle(&[UiAction::SelectPreset(at(&app, "Quiet"))]);
+        assert_eq!(app.state.filter_q, 1.0, "Quiet's own width");
+        app.handle(&[UiAction::SelectPreset(at(&app, "Wide"))]);
+        assert_eq!(app.state.filter_q, 2.5);
+        assert_eq!(engine.input_params().expect("published").filter_q, 2.5);
+        assert_eq!(app.settings.filter_q, 1.0, "never the speakers' setting");
+    }
+
+    #[test]
+    fn a_tray_pick_is_found_again_by_name_in_the_list_as_it_is_now() {
+        let (mut app, engine, _dir) = both_lanes_attached();
+        // The list the menu was drawn from has changed: the speakers moved up a row.
+        let mut devices = two_lane_devices();
+        devices.swap(0, 1);
+        engine.feed(AudioToUi::Devices(devices));
+        app.poll_audio();
+        let _ = engine.take_sent();
+        app.handle_tray(crate::tray::TrayCommand::SelectDevice {
+            direction: OUT,
+            node_name: SPEAKERS.to_owned(),
+        });
+        assert_eq!(selected(&app, OUT), Some(SPEAKERS));
+        assert_eq!(selected(&app, IN), Some(MIC), "the microphone untouched");
+        assert_eq!(app.state.direction, OUT);
+    }
+
+    #[test]
+    fn a_tray_pick_of_a_device_that_has_gone_does_nothing() {
+        let (mut app, engine, _dir) = both_lanes_attached();
+        app.select_device_when_listed("alsa_input.usb-mic-not-yet-listed", IN);
+        for (direction, node_name) in [(OUT, "alsa_output.hdmi"), (OUT, MIC)] {
+            app.handle_tray(crate::tray::TrayCommand::SelectDevice {
+                direction,
+                node_name: node_name.to_owned(),
+            });
+        }
+        assert_eq!(selected(&app, OUT), Some(HEADPHONES));
+        assert_eq!(selected(&app, IN), Some(MIC));
+        assert_eq!(app.state.direction, OUT, "the edit direction did not flip");
+        assert!(select_devices(&engine.take_sent()).is_empty());
+        assert!(
+            app.pending_device(IN).is_some(),
+            "nothing cancelled what the microphone waits for"
+        );
+    }
+
+    #[test]
+    fn export_writes_the_lane_the_window_was_opened_for_after_the_window_moved() {
+        let (mut app, _engine, dir) = editing_the_microphone();
+        app.export_dir = dir.path().join("export");
+        app.handle(&[UiAction::SetEditDirection(OUT)]);
+        let mut state = ExportState {
+            lane: OUT,
+            presets: app.state.presets.iter().map(|p| p.name.clone()).collect(),
+            selected: [at(&app, "Alpha"), at(&app, "Beta")].into_iter().collect(),
+            ..ExportState::default()
+        };
+        // The tray, a keybind or D-Bus moves the window to the microphone meanwhile.
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        app.handle_export(&PresetsAction::Export, &mut state);
+        assert_eq!(state.finished, Some(true));
+        let export = dir.path().join("export");
+        assert!(export.join("Alpha.fac").is_file());
+        assert!(export.join("Beta.fac").is_file());
+        assert!(!export.join("Alpha.toml").exists());
+        assert!(
+            app.state.notification.is_none(),
+            "{:?}",
+            app.state.notification
+        );
+    }
+
+    #[test]
+    fn import_goes_into_the_lane_the_window_was_opened_for_after_the_window_moved() {
+        let (mut app, _engine, dir) = editing_the_microphone();
+        let incoming = dir.path().join("incoming");
+        std::fs::create_dir_all(&incoming).unwrap();
+        let rock = Preset {
+            name: "Rock".to_owned(),
+            ..Preset::default()
+        };
+        fxsound_preset::save(&rock, &incoming.join("Rock.fac")).unwrap();
+        InputPreset {
+            name: "Podcast Mic".to_owned(),
+            ..InputPreset::default()
+        }
+        .save(&incoming.join("Podcast Mic.toml"))
+        .unwrap();
+
+        // Opened on the speakers; the window is on the microphone when Import is pressed.
+        let mut state = ImportState {
+            lane: OUT,
+            folder: Some(incoming),
+            ..ImportState::default()
+        };
+        app.handle_import(&PresetsAction::Import, &mut state);
+        assert_eq!(state.summary.expect("import ran").imported, ["Rock"]);
+        assert!(app.lane_has_preset(OUT, "Rock"));
+        assert!(!app.lane_has_preset(IN, "Podcast Mic"));
+        assert_eq!(app.state.direction, IN, "and the window stays where it is");
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Loud"));
+    }
+
+    #[test]
+    fn the_settings_pane_follows_a_store_changed_under_it_and_binds_a_row_by_name() {
+        let (mut app, _dir) = with_store();
+        for name in ["Mine", "Pop", "Rock"] {
+            add_user_preset(&mut app, name);
+        }
+        app.settings
+            .remember_device_preset("alsa_output.headphones", "Headphones", "Pop", "", OUT);
+        let mut pane = app.settings_state();
+        assert_eq!(pane.presets, ["Mine", "Pop", "Rock"]);
+
+        // A script saves a preset that sorts first while the pane is open.
+        pick(&mut app, "Mine");
+        app.handle(&[UiAction::SavePresetAs("Aaa".into())]);
+        app.refresh_settings_state(&mut pane);
+        assert_eq!(pane.presets, ["Aaa", "Mine", "Pop", "Rock"]);
+        let headphones = row_of(&pane, "alsa_output.headphones");
+        assert_eq!(
+            pane.devices[headphones].preset,
+            Some(2),
+            "Pop, where the pane's list has it now"
+        );
+
+        app.handle_settings(
+            &SettingsAction::SetDevicePreset {
+                device: headphones,
+                preset: "Rock".to_owned(),
+            },
+            &mut pane,
+        );
+        assert_eq!(
+            app.settings
+                .preset_for_device("alsa_output.headphones", OUT),
+            Some("Rock")
+        );
+        // A name the store no longer has binds nothing.
+        app.handle_settings(
+            &SettingsAction::SetDevicePreset {
+                device: headphones,
+                preset: "Gone".to_owned(),
+            },
+            &mut pane,
+        );
+        assert_eq!(
+            app.settings
+                .preset_for_device("alsa_output.headphones", OUT),
+            Some("Rock")
+        );
+    }
+
+    #[test]
+    fn off_in_the_window_drops_the_device_the_lane_was_waiting_for() {
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        app.select_device_when_listed(MIC, IN);
+        app.handle(&[UiAction::DetachInput]);
+        assert_eq!(app.pending_device(IN), None);
+
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        app.poll_audio();
+        assert!(!app.settings().lane_enabled(IN), "the lane stays off");
+        assert_eq!(selected(&app, IN), None);
+        assert_eq!(app.state.direction, OUT);
+        assert!(
+            select_devices(&engine.take_sent())
+                .iter()
+                .all(|m| !matches!(m, UiToAudio::SelectDevice { direction: IN, .. })),
+            "the microphone was not attached"
+        );
+    }
+
+    #[test]
+    fn an_enabled_lane_whose_device_is_missing_from_the_list_for_a_moment_is_not_shown_off() {
+        let (mut app, engine, _dir) = both_lanes_attached();
+        // A Bluetooth profile switch: the engine rides it out on the same device, and the list
+        // meanwhile does not carry it.
+        engine.feed(AudioToUi::Devices(
+            two_lane_devices()
+                .into_iter()
+                .filter(|d| d.name != HEADPHONES)
+                .collect(),
+        ));
+        app.poll_audio();
+        assert_eq!(app.state.selected_output, None);
+        assert_eq!(app.state.unlisted(OUT), Some(HEADPHONES));
+        assert!(app.state.output_enabled(), "not Off");
+        let tray = app.tray_state();
+        assert_eq!(
+            tray.device_line(OUT),
+            format!("{}{HEADPHONES}", tr("Output: "))
+        );
+        let status: serde_json::Value =
+            serde_json::from_str(&crate::commands::status_json(&app)).expect("json");
+        assert_eq!(status["output"]["enabled"], true);
+
+        // Back in the list: back as ever.
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        app.poll_audio();
+        assert_eq!(selected(&app, OUT), Some(HEADPHONES));
+        assert_eq!(app.state.unlisted(OUT), None);
+
+        // A lane switched off is Off, whatever it was on.
+        app.handle(&[UiAction::DetachOutput]);
+        assert_eq!(app.state.unlisted(OUT), None);
+        assert!(!app.state.output_enabled());
+    }
+
+    #[test]
+    fn before_the_first_list_an_enabled_lane_shows_the_device_the_settings_name() {
+        let mut settings = saved_settings(OUT);
+        settings.remember_device_preset(HEADPHONES, "Headphones", "Beta", "", OUT);
+        let (app, _engine, _dir) = started_with(settings);
+        assert_eq!(app.state.unlisted(OUT), Some("Headphones"));
+        assert_eq!(
+            app.state.unlisted(IN),
+            Some(MIC),
+            "no name learnt: the node's"
+        );
+    }
+
+    #[test]
+    fn a_lane_the_engine_attached_to_nothing_is_off_until_it_attaches_again() {
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        engine.feed(attached(OUT, None));
+        app.poll_audio();
+        assert_eq!(app.state.unlisted(OUT), None, "the engine's word is Off");
+        assert!(!app.state.output_enabled());
+    }
+
+    #[test]
+    fn the_echo_cancellers_reasons_are_named_short_and_its_log_line_never_shown() {
+        use fxsound_ui::state::EchoCancelTrouble as T;
+        assert_eq!(echo_cancel_trouble(""), None, "no complaint");
+        assert_eq!(
+            echo_cancel_trouble(
+                "could not load libpipewire-module-echo-cancel with aec/libspa-aec-webrtc: \
+                 No such file or directory"
+            ),
+            Some(T::NotLoaded)
+        );
+        assert_eq!(
+            echo_cancel_trouble("the echo canceller stopped unexpectedly"),
+            Some(T::Stopped)
+        );
+        assert_eq!(
+            echo_cancel_trouble("waiting for the speakers"),
+            Some(T::WaitingForSpeakers)
+        );
+        assert_eq!(echo_cancel_trouble("something new"), Some(T::Other));
+        assert_eq!(T::Other.reason(), None, "never printed as it came");
+
+        let mut app = headless();
+        app.receive(AudioToUi::EchoCancel {
+            running: false,
+            detail: "the echo canceller stopped unexpectedly".to_owned(),
+        });
+        assert_eq!(app.state.echo_cancel_trouble, Some(T::Stopped));
+        app.receive(AudioToUi::EchoCancel {
+            running: true,
+            detail: String::new(),
+        });
+        assert_eq!(app.state.echo_cancel_trouble, None);
     }
 }

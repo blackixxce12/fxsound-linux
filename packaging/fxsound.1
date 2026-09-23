@@ -85,7 +85,8 @@ Accepted names are
 .BR dynamicboost " (also " dynamic_boost ") and " bass " (also"
 .BR bassboost ", " bass_boost ).
 At most five pairs, since there are five effects. The music effects apply to
-the output lane only; a microphone uses the voice chain instead.
+the output lane only, whichever lane is being edited; a microphone uses the
+voice chain instead.
 .TP
 .BI \-\-num_bands= N
 Number of equalizer bands. Only 5, 10, 15, 20 and 31 are accepted; anything
@@ -110,11 +111,15 @@ Set band gains in dB, 0-based band indices, gain
 Equalizer filter Q,
 .RB 1.0 \(en 3.0 ,
 rounded to the nearest 0.5 \(en the step size of the equivalent slider.
+With
+.B \-\-edit=input
+it sets the voice preset's own Q, which saving the preset keeps.
 .TP
 .BI \-\-balance= DB
 Stereo balance,
 .RB \-20 \(en+20
-dB, rounded to a whole number. Positive pans right.
+dB, rounded to a whole number. Positive pans right. Output lane only,
+whichever lane is being edited.
 .TP
 .BI \-\-master_gain= DB
 Master gain,
@@ -124,8 +129,8 @@ dB, rounded to a whole number.
 .BI \-\-volume_leveling= AMOUNT
 Volume levelling amount,
 .RB 0.0 \(en 4.0 ,
-rounded to the nearest 0.5. The single-l American spelling is the Windows
-build's and is kept verbatim.
+rounded to the nearest 0.5. Output lane only, whichever lane is being edited.
+The single-l American spelling is the Windows build's and is kept verbatim.
 .TP
 .BI \-\-noise\-suppression= LEVEL
 Noise suppression for the microphone lane, as a control surface over RNNoise:
@@ -232,7 +237,15 @@ Display language, for example
 .TP
 .BR \-\-run_minimized ", " \-\-hide
 Start without showing the window, or hide the window of a running instance.
-This is what the systemd user unit and the autostart entry invoke.
+This is what the autostart entry invokes.
+.TP
+.B \-\-activated
+Start without showing the window, as
+.B \-\-hide
+does; but when FxSound is already running, exit at once with status 0 and
+forward nothing. This is what the systemd user unit and the D-Bus activation
+file invoke, so that a bus call arriving while an instance started from the
+launcher is still starting does not hide its window.
 .TP
 .B \-\-show
 Show and raise the window of the running instance.
@@ -294,7 +307,17 @@ Not the default: the line format is what existing scripts already grep.
 .TP
 .B \-\-watch
 Subscribe to the running instance and print one event per line until it
-quits or standard output is closed. The first event is
+quits or standard output is closed. The instance's last event before it quits
+is
+.BR quit ,
+and only then does
+.B \-\-watch
+exit 0; a stream that ends without it \(en the instance dropped a reader
+that fell too far behind, or it died \(en exits 1 with
+.I the event stream was cut off
+on standard error, so a loop that restarts
+.B \-\-watch
+until it succeeds keeps it running. The first event is
 .B status
 (the full
 .B \-\-status
@@ -372,7 +395,11 @@ instance refused it (an unknown preset or device name, or a factory preset to
 overwrite, for example) or could
 not be reached, there is no running instance for
 .BR \-\-status " or " \-\-watch
-to ask,
+to ask, the
+.B \-\-watch
+stream was cut off without the instance's
+.B quit
+event,
 .B \-\-self\-test
 found at least one failing check, or FxSound itself could not start.
 .TP
@@ -393,9 +420,11 @@ writes (marked
 with that build's meaning and JSON type, so a client written for either reads
 it. Keys are only ever added; a key that changed its meaning would change
 .BR schema .
-The effects, the equalizer and
+The equalizer and
 .BR preset ", " presets " and " selected_preset
-are the edit direction's: the lane the window shows.
+are the edit direction's: the lane the window shows. The effects,
+.BR balance_db " and " volume_leveling
+exist on the output lane only and are always the output lane's.
 .TP
 .B schema
 2. The 0.3.0 document had no number and is schema 1.
@@ -637,14 +666,24 @@ prints, and a preset that only gains unsaved changes sends no
 A name is empty for a lane that has no preset or no device.
 .PP
 If the name is already taken on the bus, the instance logs that and serves the
-control socket only. A call made while FxSound is not running starts it
-first, in the tray: the bus reads
+control socket only. Any call made while FxSound is not running starts it
+first, in the tray, a property read included: the bus reads
 .I /usr/share/dbus\-1/services/org.fxsound.FxSound.service
 and hands the start to the systemd user unit,
 .IR fxsound.service ,
 or runs
-.B fxsound \-\-hide
-itself where the bus has no systemd. With
+.B fxsound \-\-activated
+itself where the bus has no systemd. A started FxSound takes over the
+session's default devices, so anything that only reads or polls \(en a status
+bar module above all \(en must ask the bus not to start it, or it will bring
+FxSound back seconds after the user quit it:
+.B busctl \-\-auto\-start=no
+does, as does the message flag
+.B NO_AUTO_START
+in any other client. At most 32 calls are answered at once; past that a call
+is refused with
+.BR org.fxsound.FxSound.Error.Refused ,
+as a command line past the control socket's limit is. With
 .BR busctl (1):
 .PP
 .RS 4
@@ -653,8 +692,8 @@ busctl \-\-user call org.fxsound.FxSound /org/fxsound/FxSound \e
     org.fxsound.FxSound SetPreset s Rock
 busctl \-\-user call org.fxsound.FxSound /org/fxsound/FxSound \e
     org.fxsound.FxSound Apply as 2 \-\- \-\-preset=Rock \-\-set_effect=bass:7.5
-busctl \-\-user get\-property org.fxsound.FxSound /org/fxsound/FxSound \e
-    org.fxsound.FxSound Power
+busctl \-\-user \-\-auto\-start=no get\-property org.fxsound.FxSound \e
+    /org/fxsound/FxSound org.fxsound.FxSound Power
 busctl \-\-user monitor org.fxsound.FxSound
 .EE
 .RE

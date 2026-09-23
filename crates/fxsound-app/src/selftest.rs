@@ -1235,6 +1235,64 @@ pub(crate) mod tests {
         );
     }
 
+    /// The shell script the shipped unit's `ExecStop=` runs, with FxSound's path in it as it
+    /// ships: the line is `-/bin/sh -c '<script>'`, the `-` letting a stop with no FxSound to
+    /// reach succeed.
+    fn shipped_stop_script() -> &'static str {
+        let unit = include_str!("../../../packaging/fxsound.service");
+        let stops: Vec<&str> = unit
+            .lines()
+            .filter_map(|line| line.strip_prefix("ExecStop="))
+            .collect();
+        let [stop] = stops.as_slice() else {
+            panic!("the unit has one ExecStop, not {stops:?}");
+        };
+        stop.strip_prefix("-/bin/sh -c '")
+            .and_then(|script| script.strip_suffix('\''))
+            .unwrap_or_else(|| panic!("ExecStop is not a failure-tolerant /bin/sh -c: {stop}"))
+    }
+
+    /// Run the stop script as systemd would, with `$MAINPID` set to `main_pid` or unset, and with
+    /// FxSound replaced by an `echo` of its command line: what it prints is what it would run.
+    fn run_stop_script(main_pid: Option<&str>) -> String {
+        let script = shipped_stop_script().replace("/usr/bin/fxsound", "echo /usr/bin/fxsound");
+        let mut shell = std::process::Command::new("/bin/sh");
+        shell.arg("-c").arg(script).env_remove("MAINPID");
+        if let Some(pid) = main_pid {
+            shell.env("MAINPID", pid);
+        }
+        let output = shell.output().expect("/bin/sh runs");
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[test]
+    fn the_units_stop_leaves_alone_an_instance_its_start_found_running() {
+        // `fxsound --activated` exits 0 when FxSound runs already; systemd still runs ExecStop
+        // for that start, with $MAINPID unset, and --quit would then quit the other instance.
+        assert_eq!(run_stop_script(None), "");
+    }
+
+    #[test]
+    fn the_units_stop_quits_the_instance_it_started_while_that_runs() {
+        assert_eq!(run_stop_script(Some("4242")), "/usr/bin/fxsound --quit\n");
+    }
+
+    #[test]
+    fn no_line_of_the_shipped_unit_quits_fxsound_outside_the_guarded_stop() {
+        let unit = include_str!("../../../packaging/fxsound.service");
+        let quitting: Vec<&str> = unit
+            .lines()
+            .filter(|line| !line.starts_with('#') && line.contains("--quit"))
+            .collect();
+        assert_eq!(
+            quitting,
+            [format!("ExecStop=-/bin/sh -c '{}'", shipped_stop_script())],
+            "only the stop sends --quit, and only behind its $MAINPID test"
+        );
+        assert!(shipped_stop_script().starts_with("[ -z \"$MAINPID\" ] || "));
+    }
+
     #[test]
     fn a_preset_that_does_not_parse_fails_the_presets_and_is_named() {
         let (tmp, env) = installed();

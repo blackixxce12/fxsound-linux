@@ -401,6 +401,16 @@ impl Slot {
         }
     }
 
+    /// On, attached, and not delivering: nothing measured to say. A dash, no bar and no tip —
+    /// the last buffer's reading would be a number about a microphone that has stopped.
+    fn unmeasured(name: &str) -> Self {
+        Self {
+            text: format!("{name}  {UNMEASURED}"),
+            bar: None,
+            tip: None,
+        }
+    }
+
     /// A gain reduction: positive dB, read as a cut.
     fn reduction(name: &str, reduction_db: f32) -> Self {
         let db = reduction_db.clamp(0.0, 99.9);
@@ -445,11 +455,36 @@ fn signed_db(db: f32, decimals: usize) -> String {
 /// de-reverb have no slot of their own: each borrows the gate's or the compressor's slot while that
 /// stage is off, and otherwise goes into the Denoise slot's tip, so the strip stays at six and
 /// every stage that is on is said somewhere.
+///
+/// The telemetry is only a reading while the lane runs: the engine writes it from the process
+/// callback and leaves it as it was when the callback stops. So every slot keeps the Floor's rule —
+/// a lane that is off says `off` in all six, and one that is attached but not delivering shows a
+/// dash for each stage that is on, never the last buffer's numbers or a reason that is not the
+/// real one.
 #[must_use]
 pub fn strip_slots(state: &UiState) -> [Slot; STRIP_SLOTS] {
+    if !state.input_enabled() {
+        return [
+            Slot::off(&tr("Denoise")),
+            Slot::off(&tr("Floor")),
+            Slot::off(&tr("Voice")),
+            Slot::off(&tr("Gate")),
+            Slot::off(&tr("Compressor")),
+            Slot::off(&tr("De-esser")),
+        ];
+    }
+    let idle = !state.input_active;
+    // A stage with its three states, or a dash while nothing is measured.
+    let stage = |name: &str, on: bool, running: bool, reduction_db: f32, reason| {
+        if on && idle {
+            Slot::unmeasured(name)
+        } else {
+            Slot::stage(name, on, running, reduction_db, reason)
+        }
+    };
     let rate_reason = || Some(tr("unavailable at this rate"));
     let denoise_on = state.denoise_on && state.denoise_level != fxsound_core::DenoiseLevel::Off;
-    let mut denoise = Slot::stage(
+    let mut denoise = stage(
         &tr("Denoise"),
         denoise_on,
         state.denoise_running,
@@ -457,9 +492,7 @@ pub fn strip_slots(state: &UiState) -> [Slot; STRIP_SLOTS] {
         rate_reason(),
     );
 
-    let floor = if !state.input_enabled() {
-        Slot::off(&tr("Floor"))
-    } else if state.input_active && floor_measured(state.noise_floor_db) {
+    let floor = if !idle && floor_measured(state.noise_floor_db) {
         let db = state.noise_floor_db.max(-120.0);
         let (low, high) = FLOOR_BAR_RANGE_DB;
         Slot {
@@ -470,18 +503,15 @@ pub fn strip_slots(state: &UiState) -> [Slot; STRIP_SLOTS] {
     } else {
         // Attached and not measured: the lane is not delivering, or nothing has published a floor
         // yet. A dash, not a number and not a full bar — `0 dB` would be a lie about the room.
-        Slot {
-            text: format!("{}  {}", tr("Floor"), UNMEASURED),
-            bar: None,
-            tip: None,
-        }
+        Slot::unmeasured(&tr("Floor"))
     };
 
     // The voice probability is the denoiser's: no network, no opinion.
-    let voice = match (denoise_on, state.denoise_running) {
-        (false, _) => Slot::off(&tr("Voice")),
-        (true, false) => Slot::unavailable(&tr("Voice"), rate_reason()),
-        (true, true) => {
+    let voice = match (denoise_on, idle, state.denoise_running) {
+        (false, _, _) => Slot::off(&tr("Voice")),
+        (true, true, _) => Slot::unmeasured(&tr("Voice")),
+        (true, false, false) => Slot::unavailable(&tr("Voice"), rate_reason()),
+        (true, false, true) => {
             let p = state.voice_probability.clamp(0.0, 1.0);
             Slot {
                 text: format!("{}  {:.0} %", tr("Voice"), p * 100.0),
@@ -491,6 +521,10 @@ pub fn strip_slots(state: &UiState) -> [Slot; STRIP_SLOTS] {
         }
     };
 
+    // The canceller's state is the engine's supervisor's, not the process callback's, so it is
+    // current whether or not the lane delivers. Not running is only a fault when the engine gave a
+    // reason, or when the lane is delivering and the canceller still is not there: before that it
+    // is simply not needed yet.
     let echo = || {
         if state.echo_cancel_running {
             Slot {
@@ -498,11 +532,21 @@ pub fn strip_slots(state: &UiState) -> [Slot; STRIP_SLOTS] {
                 bar: None,
                 tip: None,
             }
+        } else if let Some(trouble) = state.echo_cancel_trouble {
+            Slot::unavailable(&tr("Echo"), trouble.reason())
+        } else if idle {
+            Slot::unmeasured(&tr("Echo"))
         } else {
             Slot::unavailable(&tr("Echo"), None)
         }
     };
-    let reverb = || Slot::reduction(&tr("Reverb"), state.dereverb_reduction_db);
+    let reverb = || {
+        if idle {
+            Slot::unmeasured(&tr("Reverb"))
+        } else {
+            Slot::reduction(&tr("Reverb"), state.dereverb_reduction_db)
+        }
+    };
     let mut unslotted = Vec::new();
 
     let gate = if !state.gate_on && state.echo_cancel_on {
@@ -511,7 +555,7 @@ pub fn strip_slots(state: &UiState) -> [Slot; STRIP_SLOTS] {
         if state.echo_cancel_on {
             unslotted.push(echo().text);
         }
-        Slot::stage(
+        stage(
             &tr("Gate"),
             state.gate_on,
             true,
@@ -525,7 +569,7 @@ pub fn strip_slots(state: &UiState) -> [Slot; STRIP_SLOTS] {
         if state.dereverb_on {
             unslotted.push(reverb().text);
         }
-        Slot::stage(
+        stage(
             &tr("Compressor"),
             state.compressor_on,
             true,
@@ -534,14 +578,14 @@ pub fn strip_slots(state: &UiState) -> [Slot; STRIP_SLOTS] {
         )
     };
 
-    let mut deesser = Slot::stage(
+    let mut deesser = stage(
         &tr("De-esser"),
         state.deesser_on,
         state.deesser_running,
         state.deesser_reduction_db,
         rate_reason(),
     );
-    if state.deesser_on && state.deesser_running && deesser_moved(state) {
+    if !idle && state.deesser_on && state.deesser_running && deesser_moved(state) {
         // The adaptive mode lowered the corner for a narrow source; say where it went.
         deesser.text = format!("{}  →{:.1} kHz", deesser.text, state.deesser_hz / 1000.0);
     }
@@ -1768,6 +1812,120 @@ mod tests {
         assert!((bar(-20.0) - 1.0).abs() < 1e-6);
         // Pinned above the top of the range, short of full scale: 0 dBFS itself is no reading.
         assert!((bar(-0.5) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_detached_microphone_says_off_in_every_slot_whatever_its_last_readings_were() {
+        // After a call the user picks Off: the telemetry is the last buffer's, and nothing clears
+        // it. With stages switched on and readings left over, every slot still says off.
+        let state = UiState {
+            selected_input: None,
+            input_active: false,
+            echo_cancel_on: true,
+            dereverb_on: true,
+            ..strip_state()
+        };
+        let slots = strip_slots(&state);
+        assert_eq!(
+            slot_texts(&state),
+            [
+                "Denoise  off",
+                "Floor  off",
+                "Voice  off",
+                "Gate  off",
+                "Compressor  off",
+                "De-esser  off",
+            ]
+        );
+        assert!(
+            slots
+                .iter()
+                .all(|slot| slot.bar.is_none() && slot.tip.is_none())
+        );
+    }
+
+    #[test]
+    fn a_first_run_with_the_microphone_off_names_no_reason_that_is_not_the_real_one() {
+        // A shipped voice preset with the denoiser and the de-esser on, nothing ever run: no
+        // "unavailable at this rate", no empty gate bar.
+        let state = UiState {
+            selected_input: None,
+            input_active: false,
+            denoise_running: false,
+            deesser_running: false,
+            voice_probability: 0.0,
+            gate_reduction_db: 0.0,
+            ..strip_state()
+        };
+        let slots = strip_slots(&state);
+        assert!(
+            slots.iter().all(|slot| slot.text.ends_with("off")),
+            "{slots:?}"
+        );
+        assert!(slots.iter().all(|slot| slot.tip.is_none()));
+    }
+
+    #[test]
+    fn an_attached_microphone_that_is_not_delivering_shows_a_dash_for_each_stage_that_is_on() {
+        let state = UiState {
+            input_active: false,
+            compressor_on: false,
+            ..strip_state()
+        };
+        let slots = strip_slots(&state);
+        assert_eq!(
+            slot_texts(&state),
+            [
+                "Denoise  —",
+                "Floor  —",
+                "Voice  —",
+                "Gate  —",
+                "Compressor  off",
+                "De-esser  —",
+            ],
+            "the last buffer's numbers are not a reading"
+        );
+        assert!(slots.iter().all(|slot| slot.bar.is_none()));
+        assert!(
+            slots.iter().all(|slot| slot.tip.is_none()),
+            "no reason to give"
+        );
+    }
+
+    #[test]
+    fn the_borrowed_echo_and_reverb_slots_keep_the_same_rules() {
+        let idle = UiState {
+            input_active: false,
+            gate_on: false,
+            compressor_on: false,
+            echo_cancel_on: true,
+            dereverb_on: true,
+            dereverb_reduction_db: 4.0,
+            ..strip_state()
+        };
+        let slots = strip_slots(&idle);
+        assert_eq!(slots[3].text, "Echo  —", "not needed yet is no fault");
+        assert_eq!(slots[4].text, "Reverb  —");
+        assert!(slots[4].bar.is_none());
+
+        // Running, the canceller is on whether or not the lane delivers.
+        let running = UiState {
+            echo_cancel_running: true,
+            ..idle.clone()
+        };
+        assert_eq!(strip_slots(&running)[3].text, "Echo  on");
+
+        // A reason from the engine is a fault whatever the lane is doing, and says why.
+        let trouble = UiState {
+            echo_cancel_trouble: Some(crate::state::EchoCancelTrouble::NotLoaded),
+            ..idle
+        };
+        let slot = &strip_slots(&trouble)[3];
+        assert_eq!(slot.text, "Echo  unavailable");
+        assert_eq!(
+            slot.tip.as_deref(),
+            Some("the echo canceller could not be loaded")
+        );
     }
 
     #[test]

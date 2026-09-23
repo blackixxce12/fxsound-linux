@@ -81,13 +81,17 @@ impl RouteList {
     }
 }
 
-/// One route of a card: what [`CardRoutes::available`] needs of a `SPA_TYPE_OBJECT_ParamRoute`,
-/// and nothing else. The name, the volumes and the rest of the object are the session manager's
-/// business.
+/// One route of a card: what [`CardRoutes::available`] and [`CardRoutes::active_port`] need of a
+/// `SPA_TYPE_OBJECT_ParamRoute`, and nothing else. The volumes and the rest of the object are the
+/// session manager's business.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Route {
     /// `SPA_PARAM_ROUTE_index`: the port's index on the card.
     pub index: u32,
+    /// `SPA_PARAM_ROUTE_name`: the port's name, such as `analog-output-headphones` — stable across
+    /// restarts, where the index need not be. What FxSound's volume is remembered under beside the
+    /// node's name (`crate::volume`, "Per target").
+    pub name: Option<String>,
     /// `SPA_PARAM_ROUTE_device`: the device of the card this port is the active one of — a node's
     /// `card.profile.device`. Only a [`RouteList::Active`] route carries it.
     pub device: Option<u32>,
@@ -118,6 +122,11 @@ impl Route {
                 .and_then(|value| u32::try_from(value).ok())
         };
         let index = int(libspa::sys::SPA_PARAM_ROUTE_index)?;
+        let name = prop(libspa::sys::SPA_PARAM_ROUTE_name)
+            .and_then(|value| value.get_string_raw().ok().flatten())
+            .and_then(|name| name.to_str().ok())
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
         let device = int(libspa::sys::SPA_PARAM_ROUTE_device);
         let available = prop(libspa::sys::SPA_PARAM_ROUTE_available)
             .and_then(|value| value.get_id().ok())
@@ -143,6 +152,7 @@ impl Route {
             .unwrap_or_default();
         Some(Self {
             index,
+            name,
             device,
             devices,
             available,
@@ -220,6 +230,22 @@ impl CardRoutes {
             .peekable();
         serving.peek().is_none() || serving.any(|route| route.available != Availability::No)
     }
+
+    /// The name of the port the card's device `profile_device` is on now: its active route's.
+    /// `None` when the card has not named one — no active route for the device yet, or one without
+    /// a name.
+    ///
+    /// Asked for the volume, not for whether anything can be heard: one sink can be the speakers
+    /// and the headphones of an HDA card, one port at a time, and the port it is on is which of the
+    /// two the user is listening to.
+    #[must_use]
+    pub fn active_port(&self, profile_device: u32) -> Option<&str> {
+        self.active
+            .routes
+            .iter()
+            .find(|route| route.device == Some(profile_device))
+            .and_then(|route| route.name.as_deref())
+    }
 }
 
 /// Whether a node can be heard, given the routes of the card it names (`None`: a card that has
@@ -234,6 +260,14 @@ pub fn node_available(card: Option<&CardRoutes>, profile_device: Option<u32>) ->
         (Some(card), Some(device)) => card.available(device),
         _ => true,
     }
+}
+
+/// The name of the port a node is on, given the routes of the card it names and its
+/// `card.profile.device` ([`CardRoutes::active_port`]). `None` for a node that names no device on
+/// a card, or whose card has not named the port.
+#[must_use]
+pub fn node_port(card: Option<&CardRoutes>, profile_device: Option<u32>) -> Option<&str> {
+    card?.active_port(profile_device?)
 }
 
 #[cfg(test)]
@@ -287,6 +321,23 @@ pub(crate) mod tests {
         devices: &[u32],
         available: u32,
     ) -> Vec<u8> {
+        named_route_pod(
+            index,
+            &format!("[Out] Port{index}"),
+            device,
+            devices,
+            available,
+        )
+    }
+
+    /// [`route_pod`], with the port named `name`.
+    pub(crate) fn named_route_pod(
+        index: u32,
+        name: &str,
+        device: Option<u32>,
+        devices: &[u32],
+        available: u32,
+    ) -> Vec<u8> {
         use libspa::sys as spa;
         let property = |key: u32, value: Value| Property {
             key,
@@ -299,10 +350,7 @@ pub(crate) mod tests {
                 spa::SPA_PARAM_ROUTE_direction,
                 Value::Id(Id(spa::SPA_DIRECTION_OUTPUT)),
             ),
-            property(
-                spa::SPA_PARAM_ROUTE_name,
-                Value::String(format!("[Out] Port{index}")),
-            ),
+            property(spa::SPA_PARAM_ROUTE_name, Value::String(name.to_owned())),
             property(
                 spa::SPA_PARAM_ROUTE_description,
                 Value::String("A port".to_owned()),
@@ -382,6 +430,8 @@ pub(crate) mod tests {
     fn route(index: u32, device: Option<u32>, devices: &[u32], available: Availability) -> Route {
         Route {
             index,
+            // What `route_pod` names every port.
+            name: Some(format!("[Out] Port{index}")),
             device,
             devices: devices.to_vec(),
             available,
@@ -665,8 +715,9 @@ pub(crate) mod tests {
                 let device = printed["device"]
                     .as_u64()
                     .and_then(|device| u32::try_from(device).ok());
-                let pod = route_pod(
+                let pod = named_route_pod(
                     index,
+                    printed["name"].as_str().expect("a route has a name"),
                     device,
                     &ints(&printed["devices"]),
                     availability_raw(printed["available"].as_str().unwrap_or("unknown")),
@@ -751,6 +802,87 @@ pub(crate) mod tests {
                 if want { "" } else { "un" }
             );
         }
+    }
+
+    #[test]
+    fn each_node_on_the_ucm_card_is_on_the_port_its_active_route_names() {
+        let cards = ucm_card_routes();
+        let ports: Vec<(String, Option<String>)> = ucm_devices()
+            .into_iter()
+            .map(|device| {
+                let port = node_port(
+                    device.card_id.and_then(|card| cards.get(&card)),
+                    device.profile_device,
+                )
+                .map(str::to_owned);
+                (device.name, port)
+            })
+            .collect();
+        for (name, port) in [
+            (SPEAKER, "[Out] Speaker"),
+            (HDMI1, "[Out] HDMI1"),
+            (DMIC, "[In] Mic1"),
+            (HEADSET_MIC, "[In] Mic2"),
+        ] {
+            assert!(
+                ports.contains(&(name.to_owned(), Some(port.to_owned()))),
+                "{name} on {port}: {ports:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_port_is_the_active_routes_name_and_nothing_else_names_one() {
+        let mut card = CardRoutes::default();
+        card.learn(
+            RouteList::All,
+            0,
+            Route {
+                name: Some("analog-output-speaker".to_owned()),
+                ..route(0, None, &[0], Availability::Unknown)
+            },
+        );
+        assert_eq!(
+            card.active_port(0),
+            None,
+            "a port that can serve the device is not the one it is on"
+        );
+        card.learn(
+            RouteList::Active,
+            0,
+            Route {
+                name: Some("analog-output-headphones".to_owned()),
+                ..route(1, Some(0), &[0], Availability::Yes)
+            },
+        );
+        assert_eq!(card.active_port(0), Some("analog-output-headphones"));
+        assert_eq!(card.active_port(1), None, "another device of the card");
+        card.learn(
+            RouteList::Active,
+            0,
+            Route {
+                name: None,
+                ..route(1, Some(0), &[0], Availability::Yes)
+            },
+        );
+        assert_eq!(
+            card.active_port(0),
+            None,
+            "a route without a name names none"
+        );
+        assert_eq!(node_port(None, Some(0)), None, "no card");
+        assert_eq!(node_port(Some(&card), None), None, "no device on it");
+    }
+
+    #[test]
+    fn a_routes_name_is_read_out_of_its_pod_and_an_empty_one_is_none() {
+        let named = named_route_pod(3, "analog-output-headphones", Some(0), &[0], YES);
+        assert_eq!(
+            parsed(&named).and_then(|route| route.name),
+            Some("analog-output-headphones".to_owned())
+        );
+        let empty = named_route_pod(3, "", Some(0), &[0], YES);
+        assert_eq!(parsed(&empty).and_then(|route| route.name), None);
     }
 
     #[test]

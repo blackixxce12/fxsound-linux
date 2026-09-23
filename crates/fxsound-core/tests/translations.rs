@@ -29,6 +29,12 @@ use fxsound_core::{
 /// The crates that draw text, relative to this one. Everything else passes strings *to* them.
 const DRAWING_CRATES: [&str; 2] = ["../fxsound-ui/src", "../fxsound-app/src"];
 
+/// Crates that draw nothing but translate text the window shows: the audio engine, whose warning
+/// about one Bluetooth headset on both lanes (`ONE_HEADSET_ON_BOTH_LANES`) is looked up on the
+/// audio thread and arrives translated. Their calls to `tr` and their string constants are read as
+/// the drawing crates' are; their string tables are node names, not keys, and are left alone.
+const TRANSLATING_CRATES: [&str; 1] = ["../fxsound-audio/src"];
+
 /// Every argument the drawing crates pass to `tr` that the scan cannot read, as written (spaces
 /// collapsed), with the strings it can carry.
 ///
@@ -433,8 +439,13 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// The drawing crates' source, file by file.
 fn drawing_sources() -> Vec<(PathBuf, String)> {
+    sources_of(&DRAWING_CRATES)
+}
+
+/// The source of `crates`, relative to this one, file by file.
+fn sources_of(crates: &[&str]) -> Vec<(PathBuf, String)> {
     let mut sources = Vec::new();
-    for crate_dir in DRAWING_CRATES {
+    for crate_dir in crates {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(crate_dir);
         assert!(
             dir.is_dir(),
@@ -462,8 +473,22 @@ struct Scan {
 }
 
 fn scan() -> Scan {
-    let sources = drawing_sources();
-    let per_file: Vec<_> = sources.iter().map(|(_, src)| constants(src)).collect();
+    let drawing = drawing_sources();
+    let drawing_files = drawing.len();
+    let mut sources = drawing;
+    sources.extend(sources_of(&TRANSLATING_CRATES));
+    let per_file: Vec<_> = sources
+        .iter()
+        .enumerate()
+        .map(|(index, (_, src))| {
+            let mut consts = constants(src);
+            if index >= drawing_files {
+                // A translating crate's tables are not interface text (see TRANSLATING_CRATES).
+                consts.retain(|_, items| items.len() == 1);
+            }
+            consts
+        })
+        .collect();
     let mut anywhere = BTreeMap::new();
     for consts in &per_file {
         for (name, items) in consts {
@@ -589,6 +614,24 @@ fn every_string_the_interface_passes_to_tr_is_translated_in_every_language() {
     let keys = interface_keys();
     let problems = untranslated(&tables(), keys.iter().map(String::as_str));
     assert_all_translated("interface strings", &problems);
+}
+
+#[test]
+fn the_audio_engines_warning_about_one_headset_on_both_lanes_is_among_the_keys_audited() {
+    // Translated on the audio thread (`fxsound-audio`, `ONE_HEADSET_ON_BOTH_LANES`) and shown by
+    // the window as it arrives: a crate that draws nothing, which the scan reads for its calls to
+    // `tr` all the same, or the warning would reach twenty-eight languages in English unnoticed.
+    let keys = scan().keys;
+    assert!(
+        keys.iter()
+            .any(|key| key
+                .starts_with("Using this headset's microphone switches it to call quality")),
+        "the scan does not see the audio crate's call to tr"
+    );
+    assert!(
+        !keys.contains("fxsound_sink"),
+        "a node name from the audio crate's tables is not a key"
+    );
 }
 
 #[test]
