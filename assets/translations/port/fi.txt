@@ -81,3 +81,5 @@ countries: fi
 "The microphone delivered no signal." = "Mikrofoni ei antanut signaalia."
 "No speech was heard. Speak closer to the microphone." = "Puhetta ei kuulunut. Puhu lähempänä mikrofonia."
 "The microphone changed during the measurement." = "Mikrofoni vaihtui mittauksen aikana."
+"Follow the system's default device" = "Seuraa järjestelmän oletuslaitetta"
+"Input Device Preference" = "Sisääntulolaitepreferenssi"

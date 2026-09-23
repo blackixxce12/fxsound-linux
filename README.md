@@ -363,8 +363,26 @@ Each of these is a considered decision, not an oversight:
   silences them.
 - **FxSound takes the session default automatically — politely.** Picking an output device makes
   `FxSound (Output)` the default sink so every application plays through it without any manual
-  routing; the previous default is remembered first and handed back on exit or when the direction
-  changes. Only `default.configured.audio.*` is ever written; `default.audio.*` stays WirePlumber's.
+  routing; the previous default is remembered first and handed back on exit or when a lane is
+  switched `Off`. Only `default.configured.audio.*` is ever written; `default.audio.*` stays
+  WirePlumber's.
+- **Power off takes FxSound out of the path; it is no longer a bypass alone.** 0.3.0 kept every
+  application playing through FxSound's nodes with the effects switched off. Now, as in the Windows
+  build since 1.2.6, power off also hands both session defaults back to the real devices, so sound
+  no longer passes through FxSound at all (no added latency, and the desktop's own device switcher
+  works), and power on takes them again. While it is off, the device lists show the system's
+  default device, which is where the sound goes; a device picked then is the one FxSound takes
+  over when the power comes back on.
+- **The device priority list can be told to step aside.** Settings ▸ Audio's list (and Settings ▸
+  Microphone's list of microphones, a port addition) picks the device as the Windows build's does:
+  every device seen joins it, at the bottom or, with *Prioritize new output devices*, at the top.
+  *Follow the system's default device*, which the Windows build does not have (its issue #629),
+  hands that choice back to the desktop's sound settings and keeps the list for later.
+- **Suspend mutes, resume starts clean, nothing waits.** FxSound listens for logind's
+  `PrepareForSleep` on the system bus: going to sleep mutes both lanes, and on resume their filters
+  are cleared before they are unmuted, as the Windows build does from its suspend notification. It
+  never holds a sleep inhibitor, as the Windows build decided too; without a system bus it simply
+  does not listen.
 - **Input mode is a different processor, not the same one pointed elsewhere.** The device list is
   split into *Output* and *Input* sections. Choosing a microphone tears the sink pair down, builds a
   capture stream feeding a virtual source, `FxSound (Input)`, which becomes the default microphone,

@@ -81,3 +81,5 @@ countries: Taiwan
 "The microphone delivered no signal." = "麥克風沒有輸出訊號。"
 "No speech was heard. Speak closer to the microphone." = "沒有聽到語音。請靠近麥克風說話。"
 "The microphone changed during the measurement." = "測量期間麥克風發生了變化。"
+"Follow the system's default device" = "跟隨系統預設裝置"
+"Input Device Preference" = "輸入裝置設定"

@@ -83,3 +83,5 @@ countries: ro
 "The microphone delivered no signal." = "Microfonul nu a furnizat niciun semnal."
 "No speech was heard. Speak closer to the microphone." = "Nu s-a auzit vorbire. Vorbiți mai aproape de microfon."
 "The microphone changed during the measurement." = "Microfonul s-a schimbat în timpul măsurării."
+"Follow the system's default device" = "Urmează dispozitivul implicit al sistemului"
+"Input Device Preference" = "Preferință dispozitiv de intrare"

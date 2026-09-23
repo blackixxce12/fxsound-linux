@@ -134,9 +134,12 @@ use pw::stream::{StreamFlags, StreamState};
 use triple_buffer::{Input, Output};
 
 use crate::aec::{self, EchoCancel, Side};
-use crate::devices::{self, BluezFacts, Card, ChannelMap, DeviceInfo, FormFactor, SelectionMemory};
+use crate::devices::{
+    self, BluezFacts, Card, ChannelMap, DeviceInfo, FormFactor, Preference, SelectionMemory,
+};
 use crate::lane_dsp::{self, ChainHandover, LaneDsp};
 use crate::per_direction::PerDirection;
+use crate::routes::{self, CardRoutes, Route, RouteList};
 use crate::{
     AEC_SOURCE_NODE_NAME, AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION,
     DEFAULT_QUANTUM_FRAMES, DEFAULT_SAMPLE_RATE, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS,
@@ -1333,6 +1336,11 @@ struct Shared {
     /// address is not in its registry global, only in its info. Belongs to the session like
     /// [`Self::node_probes`], and emptied with them.
     card_probes: std::collections::HashMap<u32, CardProbe>,
+    /// What each card has said about its ports, keyed by the card's registry global id: whether
+    /// anything is plugged in behind each of its nodes ([`DeviceInfo::available`], `crate::routes`).
+    /// Sent to the card's probe as its `param` events; belongs to the session like the probes, and
+    /// emptied with them — and a card's with the card.
+    card_routes: std::collections::HashMap<u32, CardRoutes>,
     /// The session defaults, one per direction.
     defaults: PerDirection<DefaultState>,
     /// Whether the GUI has had its chance to attach a lane from the device list, before a claim
@@ -1344,6 +1352,10 @@ struct Shared {
     /// The Windows registry slots, one set per direction, so trying a microphone never forgets
     /// which speakers the user had.
     memory: PerDirection<SelectionMemory>,
+    /// The user's ranking of each direction's devices, and whether they have just picked one
+    /// ([`UiToAudio::SetDevicePriority`], [`UiToAudio::SelectDevice`]). Kept across reconnects, like
+    /// [`Self::memory`]: it is the user's, not the server's.
+    preference: PerDirection<Preference>,
 
     needs_publish: bool,
     restart_requested: bool,
@@ -1418,10 +1430,12 @@ impl Shared {
             node_probes: std::collections::HashMap::new(),
             cards: Vec::new(),
             card_probes: std::collections::HashMap::new(),
+            card_routes: std::collections::HashMap::new(),
             defaults: PerDirection::default(),
             delivery: ListDelivery::default(),
             clock: GraphClock::default(),
             memory: PerDirection::default(),
+            preference: PerDirection::default(),
             needs_publish: false,
             restart_requested: false,
             connect_attempts: 0,
@@ -1944,17 +1958,13 @@ fn control(shared: &mut Shared, message: UiToAudio) {
                 }
             }
         }
-        // The upstream review's messages (`docs/0.4.0-upstream.md`). The API landed first, so the
-        // app and the engine could be built against it in parallel; each is acted on by its own
-        // item, and until then it is logged and otherwise ignored, which leaves the engine doing
-        // exactly what it did before the message existed.
         UiToAudio::SetDevicePriority { direction, names } => {
-            log::info!(
-                "{} device priority: {} ranked (not acted on yet, U4)",
-                direction.key(),
-                names.len()
-            );
+            set_device_priority(shared, direction, names);
         }
+        // The rest of the upstream review's messages (`docs/0.4.0-upstream.md`). The API landed
+        // first, so the app and the engine could be built against it in parallel; each is acted on
+        // by its own item, and until then it is logged and otherwise ignored, which leaves the
+        // engine doing exactly what it did before the message existed.
         UiToAudio::SeedTargetVolumes(volumes) => {
             log::info!(
                 "{} remembered per-device volumes (not acted on yet, U10)",
@@ -2081,6 +2091,8 @@ fn reconcile_echo_cancel(shared: &mut Shared, context: Option<&pw::context::Cont
 /// graph would report "no input devices" for a microphone that is merely not listed yet.
 fn select_device(shared: &mut Shared, direction: DeviceDirection, node_name: String) {
     shared.memory.get_mut(direction).user_selected = node_name;
+    // With a ranking, the pick outranks it this once ([`Preference::fresh_pick`]).
+    shared.preference.get_mut(direction).fresh_pick = true;
     let lane = shared.lanes.get_mut(direction);
     if !lane.enabled {
         log::info!("enabling the {} lane", direction.key());
@@ -2105,6 +2117,38 @@ fn select_device(shared: &mut Shared, direction: DeviceDirection, node_name: Str
     }
 }
 
+/// Take the user's ranking of a lane's devices ([`UiToAudio::SetDevicePriority`]), and let the
+/// lane's rules run on it.
+///
+/// A new ranking moves nothing by itself: the lane's device stays until a better-ranked one arrives
+/// or it goes, as dragging a row of upstream's priority list moves nothing
+/// (`FxOutputPreference.cpp:238-262`). The rules are asked all the same, because an empty ranking
+/// is "follow the system" again, and the Windows rules may well choose otherwise — the session
+/// default, most often.
+fn set_device_priority(shared: &mut Shared, direction: DeviceDirection, names: Vec<String>) {
+    // A node of ours is never a device, and an empty name names nothing.
+    let ranking: Vec<String> = names
+        .into_iter()
+        .filter(|name| !name.is_empty() && !is_ours(name))
+        .collect();
+    let preference = shared.preference.get_mut(direction);
+    if preference.ranking == ranking {
+        return;
+    }
+    if ranking.is_empty() {
+        log::info!("{} lane: following the system's default", direction.key());
+    } else {
+        log::info!(
+            "{} lane: {} devices ranked, {} first",
+            direction.key(),
+            ranking.len(),
+            ranking[0]
+        );
+    }
+    preference.ranking = ranking;
+    shared.mark_lane_for_rules(direction);
+}
+
 /// Hand a lane's default back, destroy its nodes and disable it (`docs/0.4.0-design.md` §1.3).
 ///
 /// Always answered with an [`AudioToUi::Attached`] carrying `None` — even for a lane that had no
@@ -2121,6 +2165,8 @@ fn detach_lane(shared: &mut Shared, direction: DeviceDirection) {
     lane.attempts = 0;
     lane.last_error = None;
     lane.attached = None;
+    // A pick not yet honoured is not honoured by a lane that is off.
+    shared.preference.get_mut(direction).fresh_pick = false;
     shared.notify(AudioToUi::Attached {
         direction,
         node_name: None,
@@ -2233,6 +2279,7 @@ fn connect(
     guard.node_probes.clear();
     guard.cards.clear();
     guard.card_probes.clear();
+    guard.card_routes.clear();
     guard.aec.forget_sources();
     guard.defaults = PerDirection::default();
     guard.clock = GraphClock::default();
@@ -2287,6 +2334,7 @@ fn close_session(shared: &mut Shared) {
     }
     shared.node_probes.clear();
     shared.card_probes.clear();
+    shared.card_routes.clear();
     shared.session = None;
     shared.barrier = Barrier::Registry;
     drain_recycled_dsp(shared);
@@ -2371,6 +2419,7 @@ fn disconnect(shared: &mut Shared, reason: &str) {
     shared.state = State::Disconnected;
     shared.devices.clear();
     shared.cards.clear();
+    shared.card_routes.clear();
     for (_, lane) in shared.lanes.iter_mut() {
         lane.previous_names.clear();
     }
@@ -2655,6 +2704,11 @@ fn on_global(
                                 let get = |key: &str| props.get(key);
                                 let address = devices::bluez_address(&get);
                                 on_node_address(&shared, object_id, address);
+                                on_node_profile_device(
+                                    &shared,
+                                    object_id,
+                                    devices::profile_device(&get),
+                                );
                                 // Only an info that carries the properties says anything about the
                                 // Bluetooth link; one for a state change carries none, and would
                                 // read as a node that is not Bluetooth.
@@ -2693,7 +2747,9 @@ fn on_global(
             if bluetooth {
                 adopt_bluetooth_card(&mut guard, id);
             }
-            // A Bluetooth card's address is in its info, not in the registry global.
+            // A Bluetooth card's address is in its info, not in the registry global. And what is
+            // plugged in behind each of a card's nodes is in its routes (`crate::routes`), which it
+            // sends as `param` events: all of them once subscribed, and all again on every change.
             match registry.bind::<pw::device::Device, _>(global) {
                 Ok(device) => {
                     let listener = device
@@ -2707,7 +2763,19 @@ fn on_global(
                                 }
                             }
                         })
+                        .param({
+                            let shared = Rc::clone(shared);
+                            move |_seq, param_type, index, _next, param| {
+                                let Some(list) = RouteList::of(param_type) else {
+                                    return;
+                                };
+                                if let Some(route) = param.and_then(Route::from_pod) {
+                                    on_card_route(&shared, id, list, index, route);
+                                }
+                            }
+                        })
                         .register();
+                    device.subscribe_params(&RouteList::PARAMS);
                     guard.card_probes.insert(
                         id,
                         CardProbe {
@@ -2778,6 +2846,12 @@ fn add_device(shared: &mut Shared, mut device: DeviceInfo) {
     }) {
         device.on_bluetooth_card();
     }
+    // What its card has said already decides whether it can be heard; a registry global carries no
+    // `card.profile.device`, so for one that arrives now it is the node's info that brings it.
+    device.available = routes::node_available(
+        device.card_id.and_then(|id| shared.card_routes.get(&id)),
+        device.profile_device,
+    );
     let direction = device.direction;
     shared
         .devices
@@ -2841,6 +2915,10 @@ fn remove_card(shared: &mut Shared, id: u32) -> bool {
     };
     shared.cards.remove(index);
     shared.card_probes.remove(&id);
+    // Its ports went with it. A node of it still listed — it goes in the same batch — is one no
+    // card speaks for any more, and heard like any such node.
+    shared.card_routes.remove(&id);
+    refresh_availability(shared, |device| device.card_id == Some(id));
     log::debug!("card {id} went away");
     for direction in DeviceDirection::ALL {
         let lane = shared.lanes.get_mut(direction);
@@ -3031,6 +3109,84 @@ fn on_node_address(shared: &Rc<RefCell<Shared>>, object_id: u32, address: Option
     };
     if let Some(device) = guard.devices.iter_mut().find(|d| d.object_id == object_id) {
         device.bluez_address = Some(address);
+    }
+}
+
+/// A bound node reported which device of its card it is — `card.profile.device`, which its
+/// registry global does not carry — and so which of its card's ports says whether it can be heard.
+fn on_node_profile_device(
+    shared: &Rc<RefCell<Shared>>,
+    object_id: u32,
+    profile_device: Option<u32>,
+) {
+    let Some(profile_device) = profile_device else {
+        return;
+    };
+    let Ok(mut guard) = shared.try_borrow_mut() else {
+        return;
+    };
+    let Some(device) = guard.devices.iter_mut().find(|d| d.object_id == object_id) else {
+        return;
+    };
+    if device.profile_device == Some(profile_device) {
+        return;
+    }
+    device.profile_device = Some(profile_device);
+    refresh_availability(&mut guard, |device| device.object_id == object_id);
+}
+
+/// A card reported one of its routes: keep it ([`CardRoutes::learn`]), and tell the rules of any
+/// lane whose devices on the card became heard or went silent.
+fn on_card_route(
+    shared: &Rc<RefCell<Shared>>,
+    card_id: u32,
+    list: RouteList,
+    index: u32,
+    route: Route,
+) {
+    let Ok(mut guard) = shared.try_borrow_mut() else {
+        return;
+    };
+    // Only a listed card is kept a list for: [`remove_card`] is what empties one, and it only
+    // knows the cards the registry announced.
+    if !guard.cards.iter().any(|card| card.object_id == card_id) {
+        return;
+    }
+    guard
+        .card_routes
+        .entry(card_id)
+        .or_default()
+        .learn(list, index, route);
+    refresh_availability(&mut guard, |device| device.card_id == Some(card_id));
+}
+
+/// Draw [`DeviceInfo::available`] again for the devices `which` picks, from what their cards have
+/// said ([`routes::node_available`]).
+///
+/// A device that became heard, or went silent, is news for its lane's rules: a monitor plugged in
+/// is an HDMI sink arriving — which, ranked above the lane's device, takes the lane — and one
+/// unplugged is the lane's device gone. Nothing else is: the GUI's list shows the node either way.
+fn refresh_availability(shared: &mut Shared, which: impl Fn(&DeviceInfo) -> bool) {
+    let mut changed = Vec::new();
+    for device in shared.devices.iter_mut().filter(|device| which(device)) {
+        let available = routes::node_available(
+            device.card_id.and_then(|id| shared.card_routes.get(&id)),
+            device.profile_device,
+        );
+        if device.available != available {
+            device.available = available;
+            changed.push((device.direction, device.name.clone(), available));
+        }
+    }
+    for (direction, name, available) in changed {
+        if available {
+            log::info!("{name}: something is plugged in behind it now");
+        } else {
+            log::info!(
+                "{name}: nothing is plugged in behind it; passed over while anything is heard"
+            );
+        }
+        shared.mark_lane_for_rules(direction);
     }
 }
 
@@ -3490,13 +3646,20 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
         shared.defaults.get(direction).current.as_deref(),
         &shared.lanes.get(direction).previous_names,
         shared.memory.get(direction),
+        shared.preference.get(direction),
     );
-    shared.lanes.get_mut(direction).previous_names = shared
-        .devices
-        .iter()
-        .filter(|d| d.direction == direction)
-        .map(|d| d.name.clone())
-        .collect();
+    // What the rules chose among, so that a device the next run finds among them and not here —
+    // one plugged in, or one that has become heard while another could be — is a new one to
+    // them. When nothing could be heard the silent nodes are already here, and a port that wakes
+    // is not new: it is simply the only candidate.
+    shared.lanes.get_mut(direction).previous_names =
+        devices::candidates(&shared.devices, direction, ours)
+            .into_iter()
+            .map(|d| d.name.clone())
+            .collect();
+    // The user's pick has had its run. It stays fresh only if the pair built on it fails, below,
+    // so that the retry honours it too.
+    let fresh_pick = std::mem::take(&mut shared.preference.get_mut(direction).fresh_pick);
 
     let selection = match selection {
         Ok(selection) => selection,
@@ -3604,6 +3767,9 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
             // lane would sit without a pair until the user unplugged something.
             shared.report_error(direction, error);
             shared.lanes.get_mut(direction).retry_later(Instant::now());
+            if fresh_pick && selection.target == shared.memory.get(direction).user_selected {
+                shared.preference.get_mut(direction).fresh_pick = true;
+            }
         }
     }
 }
@@ -7861,6 +8027,367 @@ mod tests {
         assert_eq!(
             PairFormat::for_target(&microphone, 44_100).rate,
             CAPTURE_RATE
+        );
+    }
+
+    // ---- U4: the priority list, and the routes that say what can be heard ---------------------
+
+    /// A UCM laptop's card (`crate::routes`' fixture has the whole of it).
+    const UCM_CARD: u32 = 46;
+    const UCM_SPEAKER: &str =
+        "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink";
+    const UCM_HDMI: &str =
+        "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__HDMI1__sink";
+    const UCM_HEADSET_MIC: &str =
+        "alsa_input.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Mic2__source";
+    const USB_DAC: &str = "alsa_output.usb-dac.analog-stereo";
+
+    fn ucm_card() -> Card {
+        Card {
+            object_id: UCM_CARD,
+            bluez_address: None,
+            bluetooth: false,
+        }
+    }
+
+    /// A node of the UCM card as its registry global announces it: its card, and not yet which of
+    /// the card's devices it is.
+    fn on_ucm_card(object_id: u32, name: &str, direction: DeviceDirection) -> DeviceInfo {
+        DeviceInfo {
+            card_id: Some(UCM_CARD),
+            ..device(object_id, name, direction)
+        }
+    }
+
+    /// The active route of card device `device`, on port `port`.
+    fn active_route(port: u32, device: u32, available: routes::Availability) -> Route {
+        Route {
+            index: port,
+            device: Some(device),
+            devices: vec![device],
+            available,
+        }
+    }
+
+    fn with_ucm_card() -> (Rc<RefCell<Shared>>, Receiver<AudioToUi>) {
+        let (shared, messages) = shared_with_messages();
+        let shared = Rc::new(RefCell::new(shared));
+        shared.borrow_mut().cards.push(ucm_card());
+        (shared, messages)
+    }
+
+    fn heard(shared: &Rc<RefCell<Shared>>, name: &str) -> bool {
+        shared
+            .borrow()
+            .devices
+            .iter()
+            .find(|device| device.name == name)
+            .expect("the device is listed")
+            .available
+    }
+
+    #[test]
+    fn a_priority_list_is_kept_for_its_own_lane_and_asks_only_that_lanes_rules() {
+        let (mut shared, _messages) = shared_with_messages();
+        shared.lanes.input.enabled = true;
+        let ranking = |names: &[&str]| UiToAudio::SetDevicePriority {
+            direction: DeviceDirection::Input,
+            names: names.iter().map(|&name| name.to_owned()).collect(),
+        };
+
+        control(
+            &mut shared,
+            ranking(&[UCM_HEADSET_MIC, "fxsound_source", "", LAPTOP_MICROPHONE]),
+        );
+        assert_eq!(
+            shared.preference.input.ranking,
+            [UCM_HEADSET_MIC, LAPTOP_MICROPHONE],
+            "our own node and an empty name are no devices to rank"
+        );
+        assert!(shared.preference.output.ranking.is_empty());
+        assert!(shared.lanes.input.needs_rules);
+        assert!(
+            !shared.lanes.output.needs_rules,
+            "the speakers' ranking did not change"
+        );
+
+        shared.lanes.input.needs_rules = false;
+        control(
+            &mut shared,
+            ranking(&[UCM_HEADSET_MIC, "fxsound_source", "", LAPTOP_MICROPHONE]),
+        );
+        assert!(
+            !shared.lanes.input.needs_rules,
+            "the same list again is nothing new"
+        );
+
+        control(&mut shared, ranking(&[]));
+        assert!(shared.preference.input.ranking.is_empty());
+        assert!(
+            shared.lanes.input.needs_rules,
+            "following the system again: the Windows rules may choose otherwise"
+        );
+    }
+
+    #[test]
+    fn a_priority_list_for_a_detached_lane_is_kept_for_when_it_is_attached() {
+        let (mut shared, _messages) = shared_with_messages();
+        control(
+            &mut shared,
+            UiToAudio::SetDevicePriority {
+                direction: DeviceDirection::Input,
+                names: vec![LAPTOP_MICROPHONE.to_owned()],
+            },
+        );
+        assert_eq!(shared.preference.input.ranking, [LAPTOP_MICROPHONE]);
+        assert!(
+            !shared.lanes.input.needs_rules,
+            "a detached lane runs no rules"
+        );
+    }
+
+    #[test]
+    fn a_pick_stays_fresh_until_a_pair_is_built_on_it_and_no_longer() {
+        let (mut shared, _messages) = shared_with_messages();
+        add_device(&mut shared, device(57, SPEAKERS, DeviceDirection::Output));
+        add_device(&mut shared, device(58, USB_DAC, DeviceDirection::Output));
+        control(
+            &mut shared,
+            UiToAudio::SetDevicePriority {
+                direction: DeviceDirection::Output,
+                names: vec![USB_DAC.to_owned(), SPEAKERS.to_owned()],
+            },
+        );
+
+        select_device(&mut shared, DeviceDirection::Output, SPEAKERS.to_owned());
+        assert!(shared.preference.output.fresh_pick);
+        // No server: the rules choose the pick over the ranking and fail to build it, and the
+        // retry must honour the pick too.
+        apply_rules(&mut shared, DeviceDirection::Output);
+        assert!(
+            shared.preference.output.fresh_pick,
+            "the pair on the pick failed; the pick waits for the retry"
+        );
+
+        // A pick nothing is plugged into loses to the ranking, and is not kept for a retry.
+        shared.devices[0].available = false;
+        apply_rules(&mut shared, DeviceDirection::Output);
+        assert!(!shared.preference.output.fresh_pick);
+
+        select_device(&mut shared, DeviceDirection::Output, USB_DAC.to_owned());
+        detach_lane(&mut shared, DeviceDirection::Output);
+        assert!(
+            !shared.preference.output.fresh_pick,
+            "a lane switched off forgets the pick it had not honoured"
+        );
+    }
+
+    #[test]
+    fn a_node_whose_port_is_unplugged_goes_silent_and_asks_its_lanes_rules() {
+        let (shared, _messages) = with_ucm_card();
+        add_device(
+            &mut shared.borrow_mut(),
+            on_ucm_card(52, UCM_HDMI, DeviceDirection::Output),
+        );
+        shared.borrow_mut().lanes.output.needs_rules = false;
+
+        on_card_route(
+            &shared,
+            UCM_CARD,
+            RouteList::Active,
+            2,
+            active_route(0, 2, routes::Availability::No),
+        );
+        assert!(
+            heard(&shared, UCM_HDMI),
+            "which of the card's devices the node is has not arrived yet"
+        );
+        assert!(!shared.borrow().lanes.output.needs_rules);
+
+        on_node_profile_device(&shared, 52, Some(2));
+        assert!(!heard(&shared, UCM_HDMI));
+        assert!(shared.borrow().lanes.output.needs_rules);
+
+        // A monitor plugged in: the card sends its list again, from the start.
+        shared.borrow_mut().lanes.output.needs_rules = false;
+        on_card_route(
+            &shared,
+            UCM_CARD,
+            RouteList::Active,
+            2,
+            active_route(0, 2, routes::Availability::Yes),
+        );
+        assert!(heard(&shared, UCM_HDMI));
+        assert!(shared.borrow().lanes.output.needs_rules);
+
+        // The same list again — a volume change on the port — changes nothing the rules read.
+        shared.borrow_mut().lanes.output.needs_rules = false;
+        on_card_route(
+            &shared,
+            UCM_CARD,
+            RouteList::Active,
+            2,
+            active_route(0, 2, routes::Availability::Yes),
+        );
+        assert!(!shared.borrow().lanes.output.needs_rules);
+    }
+
+    #[test]
+    fn a_microphone_going_silent_asks_only_the_input_lanes_rules() {
+        let (shared, _messages) = with_ucm_card();
+        {
+            let mut guard = shared.borrow_mut();
+            guard.lanes.input.enabled = true;
+            add_device(
+                &mut guard,
+                on_ucm_card(56, UCM_HEADSET_MIC, DeviceDirection::Input),
+            );
+            add_device(
+                &mut guard,
+                on_ucm_card(51, UCM_SPEAKER, DeviceDirection::Output),
+            );
+            guard.lanes.input.needs_rules = false;
+            guard.lanes.output.needs_rules = false;
+        }
+        on_node_profile_device(&shared, 56, Some(6));
+        on_node_profile_device(&shared, 51, Some(1));
+        on_card_route(
+            &shared,
+            UCM_CARD,
+            RouteList::Active,
+            1,
+            active_route(6, 1, routes::Availability::Unknown),
+        );
+        on_card_route(
+            &shared,
+            UCM_CARD,
+            RouteList::Active,
+            6,
+            active_route(5, 6, routes::Availability::No),
+        );
+        assert!(!heard(&shared, UCM_HEADSET_MIC));
+        assert!(heard(&shared, UCM_SPEAKER));
+        assert!(shared.borrow().lanes.input.needs_rules);
+        assert!(
+            !shared.borrow().lanes.output.needs_rules,
+            "nothing about the speakers changed"
+        );
+    }
+
+    #[test]
+    fn a_node_announced_after_its_cards_routes_is_silent_from_its_first_info() {
+        let (shared, _messages) = with_ucm_card();
+        on_card_route(
+            &shared,
+            UCM_CARD,
+            RouteList::Active,
+            2,
+            active_route(0, 2, routes::Availability::No),
+        );
+        // `pw-dump`'s view of the node carries its card device; the registry's does not, and the
+        // node's info brings it a moment later. Either way it is silent once both are known.
+        add_device(
+            &mut shared.borrow_mut(),
+            DeviceInfo {
+                profile_device: Some(2),
+                ..on_ucm_card(52, UCM_HDMI, DeviceDirection::Output)
+            },
+        );
+        assert!(!heard(&shared, UCM_HDMI));
+    }
+
+    #[test]
+    fn routes_from_a_card_that_is_not_listed_are_not_kept() {
+        let (shared, _messages) = shared_with_messages();
+        let shared = Rc::new(RefCell::new(shared));
+        on_card_route(
+            &shared,
+            UCM_CARD,
+            RouteList::Active,
+            2,
+            active_route(0, 2, routes::Availability::No),
+        );
+        assert!(shared.borrow().card_routes.is_empty());
+    }
+
+    #[test]
+    fn a_card_that_goes_takes_its_routes_with_it() {
+        let (shared, _messages) = with_ucm_card();
+        add_device(
+            &mut shared.borrow_mut(),
+            DeviceInfo {
+                profile_device: Some(2),
+                ..on_ucm_card(52, UCM_HDMI, DeviceDirection::Output)
+            },
+        );
+        on_card_route(
+            &shared,
+            UCM_CARD,
+            RouteList::Active,
+            2,
+            active_route(0, 2, routes::Availability::No),
+        );
+        assert!(!heard(&shared, UCM_HDMI));
+
+        assert!(remove_card(&mut shared.borrow_mut(), UCM_CARD));
+        assert!(shared.borrow().card_routes.is_empty());
+        assert!(
+            heard(&shared, UCM_HDMI),
+            "no card speaks for it any more; it goes in the same batch"
+        );
+    }
+
+    #[test]
+    fn a_lost_connection_forgets_every_cards_routes() {
+        let (shared, _messages) = with_ucm_card();
+        on_card_route(
+            &shared,
+            UCM_CARD,
+            RouteList::Active,
+            2,
+            active_route(0, 2, routes::Availability::No),
+        );
+        assert_eq!(shared.borrow().card_routes.len(), 1);
+        shared.borrow_mut().state = State::Connecting;
+        disconnect(&mut shared.borrow_mut(), "the server went away");
+        assert!(shared.borrow().card_routes.is_empty());
+    }
+
+    #[test]
+    fn the_rules_remember_as_seen_only_the_devices_they_could_choose() {
+        let (shared, _messages) = with_ucm_card();
+        {
+            let mut guard = shared.borrow_mut();
+            add_device(
+                &mut guard,
+                on_ucm_card(51, UCM_SPEAKER, DeviceDirection::Output),
+            );
+            add_device(
+                &mut guard,
+                on_ucm_card(52, UCM_HDMI, DeviceDirection::Output),
+            );
+        }
+        on_node_profile_device(&shared, 51, Some(1));
+        on_node_profile_device(&shared, 52, Some(2));
+        on_card_route(
+            &shared,
+            UCM_CARD,
+            RouteList::Active,
+            1,
+            active_route(6, 1, routes::Availability::Unknown),
+        );
+        on_card_route(
+            &shared,
+            UCM_CARD,
+            RouteList::Active,
+            2,
+            active_route(0, 2, routes::Availability::No),
+        );
+        apply_rules(&mut shared.borrow_mut(), DeviceDirection::Output);
+        assert_eq!(
+            shared.borrow().lanes.output.previous_names,
+            [UCM_SPEAKER],
+            "so that the HDMI sink, once a monitor is plugged in, arrives as a new device"
         );
     }
 }

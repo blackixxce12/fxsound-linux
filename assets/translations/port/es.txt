@@ -81,3 +81,5 @@ countries: ar co es mx
 "The microphone delivered no signal." = "El micrófono no entregó ninguna señal."
 "No speech was heard. Speak closer to the microphone." = "No se oyó ninguna voz. Hable más cerca del micrófono."
 "The microphone changed during the measurement." = "El micrófono cambió durante la medición."
+"Follow the system's default device" = "Usar el dispositivo por defecto del sistema"
+"Input Device Preference" = "Preferencia de dispositivo de entrada"

@@ -82,3 +82,5 @@ countries: ua
 "The microphone delivered no signal." = "Мікрофон не видав сигналу."
 "No speech was heard. Speak closer to the microphone." = "Мовлення не почуто. Говоріть ближче до мікрофона."
 "The microphone changed during the measurement." = "Мікрофон змінився під час вимірювання."
+"Follow the system's default device" = "Використовувати типовий пристрій системи"
+"Input Device Preference" = "Налаштування пристрою вводу"

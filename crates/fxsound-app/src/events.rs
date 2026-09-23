@@ -355,7 +355,8 @@ pub struct Published {
     presets: [Option<(String, bool)>; 2],
     /// Per lane: `node.name` and description of the device, `None` while detached.
     devices: [Option<(String, String)>; 2],
-    /// `node.name` and description of every device on offer, in list order.
+    /// `node.name` and description of every device on offer, sorted: which devices, not their
+    /// order.
     listed: Vec<(String, String)>,
     /// Per lane: state, rate and channel count.
     audio: [(LaneState, u32, u16); 2],
@@ -481,22 +482,19 @@ impl Published {
     }
 
     /// The devices on offer: a device that came, went, or was renamed changes the list, whatever
-    /// the count does.
+    /// the count does. Their order does not: the list is kept in the order of the device priority
+    /// list (U4), and moving a row in Settings offers no device that was not on offer before.
     #[must_use = "the event is what tells the stream"]
     pub(crate) fn devices(&mut self, listed: &[AudioDevice]) -> Option<AppEvent> {
-        let same = self.listed.len() == listed.len()
-            && self
-                .listed
-                .iter()
-                .zip(listed)
-                .all(|((name, text), device)| *name == device.name && *text == device.description);
-        if same {
-            return None;
-        }
-        self.listed = listed
+        let mut now: Vec<(String, String)> = listed
             .iter()
             .map(|d| (d.name.clone(), d.description.clone()))
             .collect();
+        now.sort_unstable();
+        if now == self.listed {
+            return None;
+        }
+        self.listed = now;
         Some(AppEvent::DevicesChanged {
             count: listed.len(),
         })
@@ -1475,6 +1473,12 @@ mod tests {
         let hear_all = |messages: Vec<AudioToUi>| -> Step {
             Box::new(move |app, engine| hear(app, engine, messages.clone()))
         };
+        let settings = |action: fxsound_ui::dialogs::settings::SettingsAction| -> Step {
+            Box::new(move |app, _| {
+                let mut pane = app.settings_state();
+                app.handle_settings(&action, &mut pane);
+            })
+        };
         vec![
             (
                 "the list",
@@ -1553,6 +1557,47 @@ mod tests {
                 }]),
             ),
             ("power by name", run("--power off")),
+            ("power on again", run("--power on")),
+            (
+                "new devices first",
+                settings(
+                    fxsound_ui::dialogs::settings::SettingsAction::SetPrioritizeNewOutput(true),
+                ),
+            ),
+            (
+                "a dock, ranked first and taken",
+                hear_all(vec![AudioToUi::Devices({
+                    let mut devices = listed();
+                    devices.push(device("alsa_output.dock", "Dock", OUT));
+                    devices
+                })]),
+            ),
+            (
+                "its answer",
+                hear_all(vec![attached(OUT, "alsa_output.dock")]),
+            ),
+            (
+                "ranked down",
+                settings(fxsound_ui::dialogs::settings::SettingsAction::MoveDeviceDown(0)),
+            ),
+            (
+                "the system decides",
+                settings(
+                    fxsound_ui::dialogs::settings::SettingsAction::SetFollowSystemDefault(true),
+                ),
+            ),
+            (
+                "asleep",
+                Box::new(|app: &mut App, _: &FakeEngine| app.system_sleeping(true)),
+            ),
+            (
+                "awake",
+                Box::new(|app: &mut App, _: &FakeEngine| app.system_sleeping(false)),
+            ),
+            (
+                "off, on the system's default",
+                act(vec![UiAction::TogglePower]),
+            ),
         ]
     }
 

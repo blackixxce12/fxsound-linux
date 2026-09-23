@@ -81,3 +81,5 @@ countries: cn sg
 "The microphone delivered no signal." = "麦克风没有输出信号。"
 "No speech was heard. Speak closer to the microphone." = "没有听到语音。请靠近麦克风说话。"
 "The microphone changed during the measurement." = "测量期间麦克风发生了变化。"
+"Follow the system's default device" = "跟随系统默认设备"
+"Input Device Preference" = "输入设备设置"

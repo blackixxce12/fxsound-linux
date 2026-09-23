@@ -82,3 +82,5 @@ countries: vn
 "The microphone delivered no signal." = "Micrô không cho tín hiệu."
 "No speech was heard. Speak closer to the microphone." = "Không nghe thấy lời nói. Hãy nói gần micrô hơn."
 "The microphone changed during the measurement." = "Micrô đã thay đổi trong khi đo."
+"Follow the system's default device" = "Theo thiết bị mặc định của hệ thống"
+"Input Device Preference" = "Tùy chọn thiết bị đầu vào"

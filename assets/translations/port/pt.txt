@@ -82,3 +82,5 @@ countries: pt
 "The microphone delivered no signal." = "O microfone não forneceu sinal."
 "No speech was heard. Speak closer to the microphone." = "Não se ouviu fala. Fale mais perto do microfone."
 "The microphone changed during the measurement." = "O microfone mudou durante a medição."
+"Follow the system's default device" = "Seguir o dispositivo predefinido do sistema"
+"Input Device Preference" = "Preferência do dispositivo de entrada"

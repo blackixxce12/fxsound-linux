@@ -1150,10 +1150,9 @@ mod tests {
     use crate::commands::InputMeters;
     use crate::events::LaneState;
     use crate::ipc::{Forwarded, Instance};
+    use crate::private_bus::PrivateBus;
     use clap::Parser as _;
     use fxsound_core::NoiseSuppressionOverride;
-    use std::io::{BufRead as _, BufReader};
-    use std::process::{Child, ChildStdout, Stdio};
     use std::sync::atomic::AtomicBool;
 
     // ---- the method → command mapping --------------------------------------------------------
@@ -2163,68 +2162,7 @@ mod tests {
         );
     }
 
-    // ---- a private bus --------------------------------------------------------------------------
-
-    /// A `dbus-daemon` of the tests' own, killed when dropped. Never the session's bus.
-    struct PrivateBus {
-        daemon: Child,
-        address: String,
-        /// Kept open: the daemon has nowhere to write otherwise.
-        _stdout: BufReader<ChildStdout>,
-    }
-
-    impl PrivateBus {
-        /// `None`, after saying so, where `dbus-daemon` is not installed.
-        fn start() -> Option<Self> {
-            let spawned = std::process::Command::new("dbus-daemon")
-                .args(["--session", "--print-address=1", "--nofork"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn();
-            let mut daemon = match spawned {
-                Ok(daemon) => daemon,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    eprintln!("skipping: dbus-daemon is not installed");
-                    return None;
-                }
-                Err(err) => panic!("dbus-daemon did not start: {err}"),
-            };
-            let mut stdout = BufReader::new(daemon.stdout.take().expect("piped"));
-            let mut address = String::new();
-            stdout.read_line(&mut address).expect("the bus address");
-            let address = address.trim().to_owned();
-            assert!(!address.is_empty(), "dbus-daemon printed no address");
-            Some(Self {
-                daemon,
-                address,
-                _stdout: stdout,
-            })
-        }
-
-        fn client(&self) -> zbus::blocking::Connection {
-            zbus::blocking::connection::Builder::address(self.address.as_str())
-                .expect("an address")
-                .method_timeout(Duration::from_secs(10))
-                .build()
-                .expect("a client connection to the private bus")
-        }
-
-        fn has_owner(&self, client: &zbus::blocking::Connection, name: &str) -> bool {
-            let _ = self;
-            zbus::blocking::fdo::DBusProxy::new(client)
-                .expect("the bus's own proxy")
-                .name_has_owner(name.try_into().expect("a bus name"))
-                .expect("NameHasOwner")
-        }
-    }
-
-    impl Drop for PrivateBus {
-        fn drop(&mut self) {
-            let _ = self.daemon.kill();
-            let _ = self.daemon.wait();
-        }
-    }
+    // ---- a private bus: `crate::private_bus` -------------------------------------------------
 
     /// A preset directory of the test's own with `names` in it.
     fn app_with_presets(tag: &str, names: &[&str]) -> (App, tempfile::TempDir) {

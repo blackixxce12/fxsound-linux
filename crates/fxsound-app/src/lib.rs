@@ -14,7 +14,11 @@ pub mod dbus;
 pub mod events;
 pub mod ipc;
 pub mod notify;
+mod priority;
+#[cfg(test)]
+mod private_bus;
 pub mod selftest;
+pub mod sleep;
 pub mod tray;
 
 pub use app::{App, WindowVisibility};

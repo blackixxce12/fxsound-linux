@@ -12,12 +12,14 @@
 //!
 //! Flags: `--light`, `--language=CODE`, `--wizard[=intro|silence|speech|loud|analysing|result|
 //! failed]`, `--no-microphone`, `--cannot-measure` (the wizard as a host without an input lane
-//! shows it: Start and Retry disabled), `--exit-after-paint`. Keys while it runs: `W` opens or
-//! closes the wizard, `P` steps it to its next phase, `T` flips the palette, `Esc` quits.
+//! shows it: Start and Retry disabled), `--audio` (open on the Audio pane, with its priority list
+//! and its two checkboxes), `--exit-after-paint`. Keys while it runs: `W` opens or closes the
+//! wizard, `P` steps it to its next phase, `T` flips the palette, `Esc` quits.
 
 use eframe::egui;
 use fxsound_core::settings::CalibrationRecord;
 use fxsound_core::{Settings, ThemeMode, i18n};
+use fxsound_ui::dialogs::settings::DevicePriority;
 use fxsound_ui::dialogs::{
     CalibrationAction, CalibrationDialog, CalibrationPhase, CalibrationResultView, CalibrationView,
     NavIcons, SettingsAction, SettingsDialog, SettingsState, SettingsTab, settings,
@@ -53,6 +55,9 @@ fn main() -> eframe::Result<()> {
 
     let mut state = demo_state();
     state.has_microphone = !flag("--no-microphone");
+    if flag("--audio") {
+        state.tab = SettingsTab::Audio;
+    }
     let preview = Preview {
         state,
         wizard,
@@ -98,10 +103,35 @@ fn demo_state() -> SettingsState {
         preset: format!("Calibrated — {DEVICE}"),
         device: "alsa_input.usb-fifine".to_owned(),
     });
+    let row = |id: &str, name: &str, connected, present| DevicePriority {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        preset: None,
+        connected,
+        present,
+    };
     SettingsState {
         tab: SettingsTab::Microphone,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         echo_cancel_detail: "libspa-aec-webrtc is not installed".to_owned(),
+        presets: vec!["General".to_owned(), "Music".to_owned()],
+        devices: vec![
+            row("alsa_output.headphones", "Headphones", true, true),
+            row("alsa_output.speakers", "Speakers", false, true),
+            row("alsa_output.hdmi", "LG TV", false, false),
+        ],
+        microphones: vec![
+            row("alsa_input.usb-fifine", DEVICE, true, true),
+            row("bluez_input.AC_12", "Headset", false, false),
+            row(
+                "alsa_input.pci",
+                "Built-in Audio Analogue Stereo",
+                false,
+                true,
+            ),
+            row("alsa_input.webcam", "C920 Webcam", false, true),
+            row("alsa_input.dock", "Dock Microphone", false, true),
+        ],
         ..SettingsState::new(settings)
     }
 }
@@ -158,6 +188,22 @@ impl Preview {
             SettingsAction::SetDeEsserMode(v) => settings.deesser_mode = *v,
             SettingsAction::SetDereverb(v) => settings.dereverb = *v,
             SettingsAction::SetEchoCancel(on) => settings.echo_cancel = *on,
+            SettingsAction::SetPrioritizeNewOutput(on) => settings.prioritize_new_output = *on,
+            SettingsAction::SetFollowSystemDefault(on) => settings.follow_system_default = *on,
+            SettingsAction::SelectDeviceRow(row) => self.state.selected_device = Some(*row),
+            SettingsAction::MoveDeviceUp(row) if *row > 0 => self.state.devices.swap(*row, row - 1),
+            SettingsAction::MoveDeviceDown(row) if row + 1 < self.state.devices.len() => {
+                self.state.devices.swap(*row, row + 1);
+            }
+            SettingsAction::MoveMicrophoneUp(row) if *row > 0 => {
+                self.state.microphones.swap(*row, row - 1);
+            }
+            SettingsAction::MoveMicrophoneDown(row) if row + 1 < self.state.microphones.len() => {
+                self.state.microphones.swap(*row, row + 1);
+            }
+            SettingsAction::RemoveMicrophone(row) => {
+                self.state.microphones.remove(*row);
+            }
             SettingsAction::OpenCalibration => self.wizard = Some(self.intro()),
             SettingsAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => {}

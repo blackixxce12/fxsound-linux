@@ -81,3 +81,5 @@ countries: cz
 "The microphone delivered no signal." = "Mikrofon nedodal žádný signál."
 "No speech was heard. Speak closer to the microphone." = "Nebyla slyšet žádná řeč. Mluvte blíže k mikrofonu."
 "The microphone changed during the measurement." = "Mikrofon se během měření změnil."
+"Follow the system's default device" = "Řídit se výchozím zařízením systému"
+"Input Device Preference" = "Předvolba vstupního zařízení"

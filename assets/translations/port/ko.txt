@@ -81,3 +81,5 @@ countries: kr
 "The microphone delivered no signal." = "마이크에서 신호가 들어오지 않았습니다."
 "No speech was heard. Speak closer to the microphone." = "말소리가 들리지 않았습니다. 마이크에 더 가까이 대고 말하세요."
 "The microphone changed during the measurement." = "측정 중에 마이크가 바뀌었습니다."
+"Follow the system's default device" = "시스템 기본 장치 따르기"
+"Input Device Preference" = "입력 장치 설정"

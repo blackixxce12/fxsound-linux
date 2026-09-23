@@ -81,3 +81,5 @@ countries: ja
 "The microphone delivered no signal." = "マイクから信号が届きませんでした。"
 "No speech was heard. Speak closer to the microphone." = "話し声が聞こえませんでした。マイクに近づいて話してください。"
 "The microphone changed during the measurement." = "測定中にマイクが変わりました。"
+"Follow the system's default device" = "システムの既定のデバイスに従う"
+"Input Device Preference" = "入力デバイス設定"

@@ -23,7 +23,8 @@
 //! 5. Just before that loop, start the D-Bus service (`fxsound_app::dbus`) on its own thread. It
 //!    carries its calls to the same control channel the socket uses, so they are answered by the
 //!    pump like a forwarded command line; no session bus, or its name taken, is a log line and
-//!    not a failure.
+//!    not a failure. Then the suspend watcher (`fxsound_app::sleep`), on a thread of its own too,
+//!    listening for logind on the system bus; no system bus is a log line as well.
 //!
 //! ## Two states: a window, or the tray alone
 //!
@@ -59,6 +60,7 @@ use fxsound_app::{
     events::{self, AppEvent, EventSink, TraySink},
     ipc::{self, Instance},
     selftest,
+    sleep::SleepWatch,
     tray::{self, TrayCommand, TrayHandle},
 };
 use fxsound_core::{ThemeMode, ViewMode, i18n::tr};
@@ -246,9 +248,17 @@ fn main() -> eframe::Result<()> {
     // in the log and the control socket carries on alone.
     let dbus = DbusHandle::start(server.control(), dbus::Properties::of(&app));
 
+    // Step 6: suspend and resume (U13). logind's `PrepareForSleep` reaches the pump over a
+    // channel, and the controller mutes both lanes on the way down and starts them clean on the
+    // way up. Nothing holds the suspend up (upstream PR #533).
+    let (sleep_tx, sleep_rx) = crossbeam_channel::unbounded();
+    let sleep = SleepWatch::start(sleep_tx);
+
     let mut runtime = Runtime {
         app,
         dbus: Some(dbus),
+        sleep: Some(sleep),
+        sleep_rx,
         server,
         tray,
         tray_rx,
@@ -311,6 +321,10 @@ struct Runtime {
     /// bus connection goes before the control channel its calls travel on.
     dbus: Option<DbusHandle>,
     server: ipc::Server,
+    /// The suspend watcher; dropped in [`Runtime::shutdown`], which stops it.
+    sleep: Option<SleepWatch>,
+    /// What it heard: `true` as the system goes to sleep, `false` once it is back.
+    sleep_rx: crossbeam_channel::Receiver<bool>,
     tray: Option<TrayHandle>,
     tray_rx: crossbeam_channel::Receiver<TrayCommand>,
     /// Set by the shell before it closes the window; read once `run_native` has returned.
@@ -330,6 +344,11 @@ impl Runtime {
     /// what the audio thread published, answer forwarded command lines, act on tray clicks, push
     /// the model into the tray. Returns what the window layer was asked to do.
     fn tick(&mut self) -> WindowRequest {
+        // Before the engine is polled: a resume is heard before whatever the devices coming back
+        // have to say.
+        while let Ok(sleeping) = self.sleep_rx.try_recv() {
+            self.app.system_sleeping(sleeping);
+        }
         self.app.poll_audio();
 
         let mut request = WindowRequest::default();
@@ -457,6 +476,7 @@ impl Runtime {
         if let Some(dbus) = self.dbus.take() {
             dbus.shutdown();
         }
+        drop(self.sleep.take());
         self.app.shutdown();
         if let Some(tray) = &self.tray {
             tray.shutdown();
@@ -1508,6 +1528,8 @@ mod runtime_tests {
             app: App::headless_for_tests(),
             dbus: None,
             server: listener.serve().expect("serve"),
+            sleep: None,
+            sleep_rx: crossbeam_channel::never(),
             tray: None,
             tray_rx,
             exit: WindowExit::Hidden,
@@ -1679,6 +1701,27 @@ mod runtime_tests {
             ["power on=false", "quit"]
         );
     }
+
+    #[test]
+    fn what_the_suspend_watcher_heard_reaches_the_controller_on_the_next_tick() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let (tx, rx) = crossbeam_channel::unbounded();
+        runtime.sleep_rx = rx;
+        tx.send(true).expect("the pump is listening");
+        assert!(!runtime.app.is_system_sleeping(), "not before the tick");
+        runtime.tick();
+        assert!(runtime.app.is_system_sleeping());
+        assert!(runtime.app.params().mute);
+        // Down and up again within one tick: the resume is the last word.
+        tx.send(false).expect("the pump is listening");
+        tx.send(true).expect("the pump is listening");
+        tx.send(false).expect("the pump is listening");
+        runtime.tick();
+        assert!(!runtime.app.is_system_sleeping());
+        assert!(!runtime.app.params().mute);
+        runtime.shutdown();
+    }
 }
 
 /// The zoom factor that fits `design` (points) into a surface of `surface_px` physical pixels
@@ -1748,6 +1791,8 @@ mod calibration_tests {
             app,
             dbus: None,
             server: listener.serve().expect("serve"),
+            sleep: None,
+            sleep_rx: crossbeam_channel::never(),
             tray: None,
             tray_rx,
             exit: WindowExit::Hidden,

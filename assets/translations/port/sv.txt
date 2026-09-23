@@ -82,3 +82,5 @@ countries: se
 "The microphone delivered no signal." = "Mikrofonen gav ingen signal."
 "No speech was heard. Speak closer to the microphone." = "Inget tal hördes. Tala närmare mikrofonen."
 "The microphone changed during the measurement." = "Mikrofonen byttes under mätningen."
+"Follow the system's default device" = "Följ systemets standardenhet"
+"Input Device Preference" = "Inställning för ingångsenhet"

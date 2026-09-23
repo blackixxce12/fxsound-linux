@@ -81,3 +81,5 @@ countries: th
 "The microphone delivered no signal." = "ไมโครโฟนไม่ส่งสัญญาณ"
 "No speech was heard. Speak closer to the microphone." = "ไม่ได้ยินเสียงพูด พูดใกล้ไมโครโฟนมากขึ้น"
 "The microphone changed during the measurement." = "ไมโครโฟนเปลี่ยนระหว่างการวัด"
+"Follow the system's default device" = "ใช้อุปกรณ์เริ่มต้นของระบบ"
+"Input Device Preference" = "การตั้งค่าอุปกรณ์อินพุต"

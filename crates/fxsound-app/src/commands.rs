@@ -352,7 +352,9 @@ fn run_device(app: &mut App, lane: DeviceDirection, command: &DeviceCommand) -> 
 
 /// The device `--next-output` or `--next-input` should move `lane` to: the next one of that
 /// direction, wrapping, or the first when the lane is detached; `None` when there is nowhere else
-/// to go.
+/// to go. "Next" in the order of the lane's device priority list, which is the order the list
+/// is kept in (U4, `crate::priority::sort_by_rank`), as upstream's `CMD_NEXT_OUTPUT` walks its
+/// sorted output list (`FxController.cpp:1983-2011`).
 ///
 /// Each keybind cycles its own lane and never crosses into the other: flipping the microphone
 /// from a key meant for the speakers would be a surprise no user asked for
@@ -1488,6 +1490,52 @@ mod tests {
         run(&mut a, &[Command::Output(OutputCommand::Next)]);
         assert_eq!(a.state.selected_output, Some(1));
         assert_eq!(a.state.selected_input, Some(2));
+    }
+
+    #[test]
+    fn next_output_and_next_input_walk_their_priority_lists_in_order() {
+        use fxsound_core::messages::AudioToUi;
+        use fxsound_ui::dialogs::settings::SettingsAction;
+        let mut a = app();
+        // The first list ranks each direction as the engine names it; Settings then puts the
+        // fifine output and the Ryzen microphone first.
+        a.receive(AudioToUi::Devices(mixed_devices()));
+        let mut pane = a.settings_state();
+        a.handle_settings(&SettingsAction::MoveDeviceUp(1), &mut pane);
+        a.handle_settings(&SettingsAction::MoveMicrophoneUp(1), &mut pane);
+        let names: Vec<&str> = a.state.devices.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "alsa_output.usb-fifine",
+                "alsa_output.pci",
+                "alsa_input.pci",
+                "alsa_input.usb-fifine"
+            ]
+        );
+        let output = |a: &App| {
+            a.state
+                .device_for(DeviceDirection::Output)
+                .map(|d| d.name.clone())
+        };
+        let input = |a: &App| {
+            a.state
+                .device_for(DeviceDirection::Input)
+                .map(|d| d.name.clone())
+        };
+
+        run(&mut a, &[Command::Output(OutputCommand::Next)]);
+        assert_eq!(
+            output(&a).as_deref(),
+            Some("alsa_output.usb-fifine"),
+            "the top of the list"
+        );
+        run(&mut a, &[Command::Output(OutputCommand::Next)]);
+        assert_eq!(output(&a).as_deref(), Some("alsa_output.pci"));
+        run(&mut a, &[Command::Input(InputCommand::Next)]);
+        assert_eq!(input(&a).as_deref(), Some("alsa_input.pci"));
+        run(&mut a, &[Command::Input(InputCommand::Next)]);
+        assert_eq!(input(&a).as_deref(), Some("alsa_input.usb-fifine"));
     }
 
     #[test]

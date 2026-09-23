@@ -566,6 +566,9 @@ pub struct SettingsState {
     /// The output device priority list, in priority order. Output devices only: a microphone
     /// remembers its voice preset in the same settings, but has no row here.
     pub devices: Vec<DevicePriority>,
+    /// The microphones' priority list, in priority order, for the Microphone pane. Its rows have
+    /// no preset (`preset` is `None`).
+    pub microphones: Vec<DevicePriority>,
     /// The selected row, which is what ▲/▼ and Shift+Up/Shift+Down act on.
     pub selected_device: Option<usize>,
     /// Every speakers' preset name, for the per-device preset picker.
@@ -608,6 +611,7 @@ impl SettingsState {
             settings,
             tab: SettingsTab::default(),
             devices: Vec::new(),
+            microphones: Vec::new(),
             selected_device: None,
             presets: Vec::new(),
             can_reset_presets: false,
@@ -691,6 +695,9 @@ pub enum SettingsAction {
     /// `prioritize_new_output` — a newly seen device goes to the top of the list rather than the
     /// bottom (`DeviceConfig.cpp:57`, `:78-85`).
     SetPrioritizeNewOutput(bool),
+    /// `follow_system_default` — the priority lists stop choosing the device and the system's
+    /// default does (U4, upstream issue #629). A port addition.
+    SetFollowSystemDefault(bool),
     /// The user asked to restore the factory presets.
     ///
     /// **Destructive**: this deletes every user preset file. The original does it with no
@@ -734,6 +741,12 @@ pub enum SettingsAction {
     SetEchoCancel(bool),
     /// Open the calibration wizard. Only emitted while a microphone is selected.
     OpenCalibration,
+    /// Swap this row of the Input Device Preference with the one above.
+    MoveMicrophoneUp(usize),
+    /// Swap it with the one below.
+    MoveMicrophoneDown(usize),
+    /// Forget a microphone that is no longer present.
+    RemoveMicrophone(usize),
 
     /// Close the window — the ✕ or Escape (`FxSettingsDialog.cpp:78-88`). The caller then runs
     /// the equivalent of `FxController::refreshOutputList()` (`FxMainWindow.cpp:454`).
@@ -940,6 +953,9 @@ pub const PRIORITIZE_NEW_OUTPUT: &str = "Prioritize new output devices";
 pub const RESET_PRESETS: &str = "Reset presets to factory defaults";
 /// The list's tooltip (`FxOutputPreference.cpp:316`).
 pub const PRIORITY_TOOLTIP: &str = "Use Shift+Up or Shift+Down to change the device priority";
+/// The switch under the list that hands the choice of device to the system (U4, upstream issue
+/// #629). A port addition.
+pub const FOLLOW_SYSTEM_DEFAULT: &str = "Follow the system's default device";
 
 /// `(20, 50, 220, 14)`.
 #[must_use]
@@ -973,8 +989,19 @@ pub fn prioritize_toggle_rect(pane: Rect) -> Rect {
     )
 }
 
-/// The rounded backdrop behind the heading, the list and the checkbox: each edge ten points out
-/// (`FxSettingsDialog.cpp:254-258`).
+/// `(20, 384, paneWidth - 50, 30)`: "Follow the system's default device", the port's second
+/// checkbox, ten points under the original's as the General pane spaces its own.
+#[must_use]
+pub fn follow_toggle_rect(pane: Rect) -> Rect {
+    let above = prioritize_toggle_rect(pane);
+    Rect::from_min_size(
+        pos2(above.left(), above.bottom() + 10.0),
+        vec2(above.width(), audio::TOGGLE_HEIGHT),
+    )
+}
+
+/// The rounded backdrop behind the heading, the list and the two checkboxes: each edge ten points
+/// out (`FxSettingsDialog.cpp:254-258`), grown by the port's second checkbox.
 #[must_use]
 pub fn group_rect(pane: Rect) -> Rect {
     let title = output_title_rect(pane);
@@ -985,7 +1012,7 @@ pub fn group_rect(pane: Rect) -> Rect {
         ),
         pos2(
             output_list_rect(pane).right() + audio::GROUP_MARGIN,
-            prioritize_toggle_rect(pane).bottom() + audio::GROUP_MARGIN,
+            follow_toggle_rect(pane).bottom() + audio::GROUP_MARGIN,
         ),
     )
 }
@@ -1011,13 +1038,14 @@ pub fn reset_button_size(label: &str, text_width: f32) -> Vec2 {
     vec2(width, height)
 }
 
-/// `(20, 404, …)` — thirty points below the checkbox (`FxSettingsDialog.cpp:259-260`).
+/// `(20, 444, …)` — thirty points below the last checkbox (`FxSettingsDialog.cpp:259-260`), which
+/// is the port's "Follow the system's default device"; the original's is at 404.
 #[must_use]
 pub fn reset_button_rect(pane: Rect, size: Vec2) -> Rect {
     Rect::from_min_size(
         pos2(
             pane.left() + X_MARGIN,
-            prioritize_toggle_rect(pane).bottom() + 30.0,
+            follow_toggle_rect(pane).bottom() + 30.0,
         ),
         size,
     )
@@ -1058,18 +1086,32 @@ fn audio_pane(
         response,
     );
 
+    // While the system's default decides, the list places a new device but no longer picks one,
+    // so "Prioritize" has nothing to say and is greyed out.
+    let following = state.settings.follow_system_default;
     if toggle(
         ui,
         prioritize_toggle_rect(pane),
         &tr(PRIORITIZE_NEW_OUTPUT),
         state.settings.prioritize_new_output,
-        true,
+        !following,
         palette,
         id.with("prioritize"),
     ) {
         response.push(SettingsAction::SetPrioritizeNewOutput(
             !state.settings.prioritize_new_output,
         ));
+    }
+    if toggle(
+        ui,
+        follow_toggle_rect(pane),
+        &tr(FOLLOW_SYSTEM_DEFAULT),
+        following,
+        true,
+        palette,
+        id.with("follow"),
+    ) {
+        response.push(SettingsAction::SetFollowSystemDefault(!following));
     }
 
     let reset_label = tr(RESET_PRESETS);
@@ -1145,13 +1187,15 @@ pub fn down_button_rect(row: Rect, index: usize, count: usize) -> Rect {
 /// `reduced(2)` (`FxOutputPreference.cpp:129`) — a width used as an x, which lands the button four
 /// points left of where the five-point margin implies. Corrected here: the ✕ is a margin in from
 /// the inset row's right edge, like everything else.
+///
+/// Centred in the row's own height, so the Microphone pane's compact rows use it too.
 #[must_use]
 pub fn remove_button_rect(row: Rect) -> Rect {
     let bounds = row.shrink(2.0);
     Rect::from_min_size(
         pos2(
             bounds.right() - device_row::MARGIN - device_row::BUTTON_WIDTH,
-            row.top() + (device_row::HEIGHT - device_row::BUTTON_WIDTH) / 2.0,
+            row.top() + (row.height() - device_row::BUTTON_WIDTH) / 2.0,
         ),
         Vec2::splat(device_row::BUTTON_WIDTH),
     )
@@ -1186,11 +1230,12 @@ pub fn device_name_rect(row: Rect) -> Rect {
     )
 }
 
+/// An 18-point button `x` into the row, centred in the row's height.
 fn button_square(row: Rect, x: f32) -> Rect {
     Rect::from_min_size(
         pos2(
             row.left() + x,
-            row.top() + (device_row::HEIGHT - device_row::BUTTON_WIDTH) / 2.0,
+            row.top() + (row.height() - device_row::BUTTON_WIDTH) / 2.0,
         ),
         Vec2::splat(device_row::BUTTON_WIDTH),
     )
@@ -1798,6 +1843,17 @@ pub mod microphone {
     /// Above the button, and above the last-calibration line.
     pub const GAP_BEFORE_BUTTON: f32 = 20.0;
     pub const GAP_BEFORE_RECORD: f32 = 10.0;
+    /// Above the Input Device Preference heading, as above the button.
+    pub const GAP_BEFORE_PREFERENCE: f32 = 20.0;
+    /// A row of the compact priority list: an arrow's 18 points and three either side. No preset
+    /// combo, so no need for the Audio pane's 40.
+    pub const PREFERENCE_ROW_HEIGHT: f32 = 24.0;
+    /// Rows the list shows before it scrolls.
+    pub const PREFERENCE_ROWS: usize = 4;
+    /// The rows are inset this far inside the list's rounded box on every side.
+    pub const PREFERENCE_INSET: f32 = 5.0;
+    /// Kept clear under the list, the pane's last ten points.
+    pub const BOTTOM_MARGIN: f32 = 10.0;
 }
 
 /// `"Noise suppression"`.
@@ -1812,6 +1868,9 @@ pub const DE_REVERB: &str = "De-reverb";
 pub const ECHO_CANCELLATION: &str = "Echo cancellation";
 /// The wizard's entry point (0.4.0 design §8).
 pub const CALIBRATE_MICROPHONE: &str = "Calibrate microphone…";
+/// The heading of the microphones' priority list (U4), after the Audio pane's "Output Device
+/// Preference".
+pub const INPUT_PREFERENCE_TITLE: &str = "Input Device Preference";
 /// What the last-calibration line says before the wizard has ever run.
 pub const NOT_CALIBRATED: &str = "Not calibrated yet";
 
@@ -1892,6 +1951,49 @@ pub fn calibration_record_rect(pane: Rect, button: Rect) -> Rect {
             button.bottom() + microphone::GAP_BEFORE_RECORD,
         ),
         vec2(pane.width() - X_MARGIN * 2.0, microphone::LINE_HEIGHT),
+    )
+}
+
+/// "Input Device Preference": the Microphone pane's heading for its priority list, twenty points
+/// under the last-calibration line, as wide as the Audio pane's list.
+#[must_use]
+pub fn input_preference_title_rect(pane: Rect, button: Rect) -> Rect {
+    let record = calibration_record_rect(pane, button);
+    Rect::from_min_size(
+        pos2(
+            pane.left() + X_MARGIN,
+            record.bottom() + microphone::GAP_BEFORE_PREFERENCE,
+        ),
+        vec2(output_list_rect(pane).width(), audio::LABEL_HEIGHT),
+    )
+}
+
+/// The microphones' priority list, ten points under its heading as the Audio pane's is: four
+/// compact rows tall, or whatever is left above the pane's bottom margin if that is less.
+#[must_use]
+pub fn input_preference_list_rect(pane: Rect, button: Rect) -> Rect {
+    let title = input_preference_title_rect(pane, button);
+    let top = title.bottom() + 10.0;
+    let wanted = microphone::PREFERENCE_ROWS as f32 * microphone::PREFERENCE_ROW_HEIGHT
+        + microphone::PREFERENCE_INSET * 2.0;
+    let room = (pane.bottom() - microphone::BOTTOM_MARGIN - top).max(0.0);
+    Rect::from_min_size(
+        pos2(title.left(), top),
+        vec2(title.width(), wanted.min(room)),
+    )
+}
+
+/// A compact row's device name: past both arrows, to a margin short of the ✕.
+#[must_use]
+pub fn microphone_name_rect(row: Rect) -> Rect {
+    let bounds = row.shrink(2.0);
+    let left = row.left() + device_row::MARGIN * 2.0 + device_row::BUTTON_WIDTH * 2.0;
+    Rect::from_min_max(
+        pos2(left, bounds.top()),
+        pos2(
+            remove_button_rect(row).left() - device_row::MARGIN,
+            bounds.bottom(),
+        ),
     )
 }
 
@@ -2023,6 +2125,145 @@ fn microphone_pane(
         colour,
         calibration_record_rect(pane, button),
         Align2::LEFT_CENTER,
+    );
+
+    draw_truncated(
+        ui.painter(),
+        &tr(INPUT_PREFERENCE_TITLE),
+        normal_font(),
+        palette.color(FxColor::HighlightedText),
+        input_preference_title_rect(pane, button),
+        Align2::LEFT_CENTER,
+    );
+    input_preference(
+        ui,
+        input_preference_list_rect(pane, button),
+        state,
+        palette,
+        assets,
+        id.with("microphones"),
+        response,
+    );
+}
+
+/// The microphones' priority list (U4): the Audio pane's list without its preset combos, in rows
+/// small enough for four to fit under the calibration line. ▲ and ▼ move a microphone, ✕ forgets
+/// one that is not there, and the one the input lane is on is drawn in full colour.
+#[allow(clippy::too_many_arguments)]
+fn input_preference(
+    ui: &mut Ui,
+    rect: Rect,
+    state: &SettingsState,
+    palette: Palette,
+    assets: &mut AssetCache,
+    id: Id,
+    response: &mut DialogResponse<SettingsAction>,
+) {
+    if rect.height() <= 0.0 {
+        return;
+    }
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(device_row::CORNER as u8),
+        palette.color(FxColor::WidgetBackground),
+    );
+    let list = rect.shrink(microphone::PREFERENCE_INSET);
+    let count = state.microphones.len();
+    ui.scope_builder(UiBuilder::new().max_rect(list).id_salt(id), |ui| {
+        ui.spacing_mut().item_spacing = Vec2::ZERO;
+        egui::ScrollArea::vertical()
+            .id_salt(id)
+            .max_height(list.height())
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (index, device) in state.microphones.iter().enumerate() {
+                    let (row, _) = ui.allocate_exact_size(
+                        vec2(ui.available_width(), microphone::PREFERENCE_ROW_HEIGHT),
+                        Sense::hover(),
+                    );
+                    microphone_row(ui, row, index, count, device, palette, assets, response);
+                }
+            });
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn microphone_row(
+    ui: &mut Ui,
+    row: Rect,
+    index: usize,
+    count: usize,
+    device: &DevicePriority,
+    palette: Palette,
+    assets: &mut AssetCache,
+    response: &mut DialogResponse<SettingsAction>,
+) {
+    let id = Id::new("fx_microphone_row").with(&device.id);
+    if index > 0
+        && IconButton::new(FxImage::ArrowUp)
+            .hover(FxImage::ArrowUpSelected)
+            .min_hit_size(device_row::BUTTON_WIDTH)
+            .show(
+                ui,
+                up_button_rect(row, index, count),
+                palette,
+                assets,
+                id.with("up"),
+            )
+            .clicked()
+    {
+        response.push(SettingsAction::MoveMicrophoneUp(index));
+    }
+    if index + 1 < count
+        && IconButton::new(FxImage::ArrowDown)
+            .hover(FxImage::ArrowDownSelected)
+            .min_hit_size(device_row::BUTTON_WIDTH)
+            .show(
+                ui,
+                down_button_rect(row, index, count),
+                palette,
+                assets,
+                id.with("down"),
+            )
+            .clicked()
+    {
+        response.push(SettingsAction::MoveMicrophoneDown(index));
+    }
+    if !device.present
+        && IconButton::new(FxImage::RemoveButton)
+            .min_hit_size(device_row::BUTTON_WIDTH)
+            .show(
+                ui,
+                remove_button_rect(row),
+                palette,
+                assets,
+                id.with("remove"),
+            )
+            .clicked()
+    {
+        response.push(SettingsAction::RemoveMicrophone(index));
+    }
+    let name = microphone_name_rect(row);
+    let colour = if device.connected {
+        palette.color(FxColor::DefaultText)
+    } else {
+        palette.color(FxColor::HintText)
+    };
+    draw_truncated(
+        ui.painter(),
+        &device.label(index),
+        normal_font(),
+        colour,
+        name,
+        Align2::LEFT_CENTER,
+    );
+    ui.painter().hline(
+        name.left()..=name.right(),
+        name.bottom() - 0.5,
+        Stroke::new(
+            device_row::SEPARATOR_THICKNESS,
+            palette.color(FxColor::RowOutline),
+        ),
     );
 }
 
@@ -2310,10 +2551,90 @@ mod tests {
             pos2(20.0, 344.0),
             vec2(399.0, 30.0),
         );
-        expect(group_rect(pane), pos2(10.0, 40.0), vec2(419.0, 344.0));
+        // The port's second checkbox ten points under the original's, the group grown to hold it
+        // and the reset button moved down by as much.
+        expect(
+            follow_toggle_rect(pane),
+            pos2(20.0, 384.0),
+            vec2(399.0, 30.0),
+        );
+        expect(group_rect(pane), pos2(10.0, 40.0), vec2(419.0, 384.0));
         // The reset button's row, whatever its measured width comes out as.
         let row = local(pane, reset_button_rect(pane, vec2(220.0, 24.0)));
-        assert!((row.min - pos2(20.0, 404.0)).length() < 1e-4, "{row:?}");
+        assert!((row.min - pos2(20.0, 444.0)).length() < 1e-4, "{row:?}");
+    }
+
+    #[test]
+    fn the_follow_checkbox_asks_for_the_opposite_of_what_it_shows_and_greys_prioritize() {
+        let pane = shown_pane();
+        let follow = follow_toggle_rect(pane).left_center() + vec2(9.0, 0.0);
+        let prioritize = prioritize_toggle_rect(pane).left_center() + vec2(9.0, 0.0);
+        let mut state = populated();
+        assert_eq!(
+            click_settings(&state, follow),
+            [SettingsAction::SetFollowSystemDefault(true)]
+        );
+        assert_eq!(
+            click_settings(&state, prioritize),
+            [SettingsAction::SetPrioritizeNewOutput(true)]
+        );
+        state.settings.follow_system_default = true;
+        assert_eq!(
+            click_settings(&state, follow),
+            [SettingsAction::SetFollowSystemDefault(false)]
+        );
+        // While the system decides, where a new device goes decides nothing.
+        assert!(click_settings(&state, prioritize).is_empty());
+    }
+
+    #[test]
+    fn every_languages_reset_button_stays_inside_the_audio_pane() {
+        let ctx = test_context();
+        let pane = pane_rect(content());
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            for (code, label) in every_translation(RESET_PRESETS) {
+                let width = ui
+                    .painter()
+                    .layout_no_wrap(label.clone(), normal_font(), Color32::PLACEHOLDER)
+                    .size()
+                    .x;
+                let button = reset_button_rect(pane, reset_button_size(&label, width));
+                if button.bottom() > pane.bottom() {
+                    problems.push(format!("{code}: {label:?} ends at {:.0}", button.bottom()));
+                }
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn every_language_fits_the_follow_checkbox_and_the_input_preference_heading() {
+        let ctx = test_context();
+        let pane = pane_rect(content());
+        let follow_room = follow_toggle_rect(pane).width() - TICK_BOX_SIDE - TICK_BOX_GAP;
+        let heading_room =
+            input_preference_title_rect(pane, calibrate_button_rect(pane, vec2(220.0, 24.0)))
+                .width();
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            for (key, room) in [
+                (FOLLOW_SYSTEM_DEFAULT, follow_room),
+                (INPUT_PREFERENCE_TITLE, heading_room),
+            ] {
+                for (code, text) in every_translation(key) {
+                    let used = ui
+                        .painter()
+                        .layout_no_wrap(text.clone(), normal_font(), Color32::PLACEHOLDER)
+                        .size()
+                        .x;
+                    if used > room {
+                        problems.push(format!("{code}: {text:?} is {used:.0} in {room:.0}"));
+                    }
+                }
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 
     #[test]
@@ -2750,6 +3071,14 @@ mod tests {
             ("echo status".to_owned(), echo_status_rect(pane)),
             ("calibrate".to_owned(), button),
             ("record".to_owned(), calibration_record_rect(pane, button)),
+            (
+                "preference heading".to_owned(),
+                input_preference_title_rect(pane, button),
+            ),
+            (
+                "preference list".to_owned(),
+                input_preference_list_rect(pane, button),
+            ),
         ]);
         rects
     }
@@ -2795,6 +3124,131 @@ mod tests {
         assert!(
             (record.min - pos2(20.0, 324.0)).length() < 1e-4,
             "{record:?}"
+        );
+        // The microphones' priority list: its heading twenty under the record line, the list ten
+        // under that, as wide as the Audio pane's, four compact rows tall and clear of the bottom.
+        let button = calibrate_button_rect(pane, vec2(220.0, 24.0));
+        let heading = local(pane, input_preference_title_rect(pane, button));
+        assert!(
+            (heading.min - pos2(20.0, 364.0)).length() < 1e-4,
+            "{heading:?}"
+        );
+        let list = local(pane, input_preference_list_rect(pane, button));
+        assert!((list.min - pos2(20.0, 388.0)).length() < 1e-4, "{list:?}");
+        assert!(
+            (list.size() - vec2(397.0, 106.0)).length() < 1e-4,
+            "{list:?}"
+        );
+        assert!(list.bottom() <= pane.height() - microphone::BOTTOM_MARGIN);
+    }
+
+    #[test]
+    fn a_compact_row_centres_its_buttons_and_leaves_the_name_between_them() {
+        let row = Rect::from_min_size(
+            pos2(0.0, 0.0),
+            vec2(387.0, microphone::PREFERENCE_ROW_HEIGHT),
+        );
+        for rect in [
+            up_button_rect(row, 1, 3),
+            down_button_rect(row, 1, 3),
+            remove_button_rect(row),
+        ] {
+            assert!((rect.top() - 3.0).abs() < 1e-4, "{rect:?}");
+            assert!(row.contains_rect(rect), "{rect:?}");
+        }
+        let name = microphone_name_rect(row);
+        assert!(name.left() >= down_button_rect(row, 1, 3).right());
+        assert!(name.right() <= remove_button_rect(row).left());
+        assert!(name.width() > 250.0, "{name:?}");
+    }
+
+    /// The Microphone pane with three microphones ranked, the second one gone.
+    fn ranked_microphones() -> SettingsState {
+        let row = |id: &str, name: &str, connected, present| DevicePriority {
+            id: id.into(),
+            name: name.into(),
+            preset: None,
+            connected,
+            present,
+        };
+        SettingsState {
+            microphones: vec![
+                row("alsa_input.usb", "USB Microphone", true, true),
+                row("bluez_input.AC_12", "Headset", false, false),
+                row("alsa_input.pci", "Built-in", false, true),
+            ],
+            ..microphone_state()
+        }
+    }
+
+    /// The row the Microphone pane draws at `index`, with no scrolling.
+    fn microphone_list_row(index: usize) -> Rect {
+        let pane = shown_pane();
+        let list = input_preference_list_rect(pane, calibrate_button_rect(pane, vec2(220.0, 24.0)))
+            .shrink(microphone::PREFERENCE_INSET);
+        Rect::from_min_size(
+            pos2(
+                list.left(),
+                list.top() + index as f32 * microphone::PREFERENCE_ROW_HEIGHT,
+            ),
+            vec2(list.width(), microphone::PREFERENCE_ROW_HEIGHT),
+        )
+    }
+
+    #[test]
+    fn the_arrows_of_the_microphones_list_move_that_microphone() {
+        let state = ranked_microphones();
+        let count = state.microphones.len();
+        assert_eq!(
+            click_settings(
+                &state,
+                down_button_rect(microphone_list_row(0), 0, count).center()
+            ),
+            [SettingsAction::MoveMicrophoneDown(0)]
+        );
+        assert_eq!(
+            click_settings(
+                &state,
+                up_button_rect(microphone_list_row(1), 1, count).center()
+            ),
+            [SettingsAction::MoveMicrophoneUp(1)]
+        );
+        assert_eq!(
+            click_settings(
+                &state,
+                down_button_rect(microphone_list_row(1), 1, count).center()
+            ),
+            [SettingsAction::MoveMicrophoneDown(1)]
+        );
+        assert_eq!(
+            click_settings(
+                &state,
+                up_button_rect(microphone_list_row(2), 2, count).center()
+            ),
+            [SettingsAction::MoveMicrophoneUp(2)]
+        );
+        // The name is not a control.
+        assert!(
+            click_settings(
+                &state,
+                microphone_name_rect(microphone_list_row(0)).center()
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn only_a_microphone_that_is_gone_can_be_forgotten() {
+        let state = ranked_microphones();
+        assert_eq!(
+            click_settings(&state, remove_button_rect(microphone_list_row(1)).center()),
+            [SettingsAction::RemoveMicrophone(1)]
+        );
+        assert!(
+            click_settings(&state, remove_button_rect(microphone_list_row(0)).center()).is_empty()
+        );
+        assert!(
+            click_settings(&state, remove_button_rect(microphone_list_row(2)).center()).is_empty()
         );
     }
 
@@ -3088,7 +3542,12 @@ mod tests {
             has_microphone: false,
             ..microphone_state()
         };
-        for state in [microphone_state(), calibrated, no_microphone] {
+        for state in [
+            microphone_state(),
+            calibrated,
+            no_microphone,
+            ranked_microphones(),
+        ] {
             for mode in [ThemeMode::Dark, ThemeMode::Light] {
                 frame(&ctx, |ui| {
                     let response = SettingsDialog::new(&state).show(

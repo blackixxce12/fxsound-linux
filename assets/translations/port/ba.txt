@@ -81,3 +81,5 @@ countries: ba
 "The microphone delivered no signal." = "Mikrofon nije dao nikakav signal."
 "No speech was heard. Speak closer to the microphone." = "Govor se nije čuo. Govorite bliže mikrofonu."
 "The microphone changed during the measurement." = "Mikrofon se promijenio tokom mjerenja."
+"Follow the system's default device" = "Prati zadani uređaj sistema"
+"Input Device Preference" = "Postavke ulaznog uređaja"

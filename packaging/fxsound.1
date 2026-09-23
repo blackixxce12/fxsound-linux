@@ -38,8 +38,8 @@ surround, dynamic boost and bass \(en and forwards the result to the real
 output device. A second, independent lane does the same for a microphone: it
 runs a voice chain (denoise, high-pass, downward expander, equalizer,
 de-esser, compressor, makeup gain, look-ahead limiter) and publishes a virtual
-source. Both lanes can run at once; each has a device, a preset and a power
-state of its own, and either can be detached.
+source. Both lanes can run at once; each has a device and a preset of its
+own, either can be detached, and one power switch covers both.
 .PP
 Run with no options,
 .B fxsound
@@ -70,8 +70,9 @@ process per query can use the D-Bus interface instead; see
 .SS Processing
 .TP
 .BI \-\-power= 0|1|toggle
-Turn audio processing on or off for the edit direction (see
-.BR \-\-edit ).
+Turn audio processing on or off, for both lanes. Off also hands the session's
+default output and input back to the real devices, so applications play and
+record past FxSound until it is turned on again, which takes them back.
 Any non-zero integer means on;
 .B toggle
 inverts the current state.
@@ -213,8 +214,8 @@ reads from, or detach the lane with
 A playback device named here is an error rather than a guess.
 .TP
 .BI \-\-edit= output|input
-Choose the edit direction: the lane the window shows and the preset, effect
-and power options above act on. The window's device combo and the tray menu
+Choose the edit direction: the lane the window shows and the preset and effect
+options above act on. The window's device combo and the tray menu
 change it too, as does
 .BR \-\-output " or " \-\-input
 on the same command line, which
@@ -241,7 +242,9 @@ These exist so a compositor keybinding has something to call. They have no
 Windows counterpart, where the application registers global hotkeys itself.
 .TP
 .B \-\-toggle\-power
-Toggle audio processing in the edit direction.
+Toggle audio processing, as
+.B \-\-power=toggle
+does.
 .TP
 .B \-\-toggle\-window
 Show the window if it is hidden, hide it if it is showing \(en the same toggle
@@ -254,11 +257,13 @@ Select the next preset of the edit direction, wrapping.
 Select the previous preset of the edit direction, wrapping.
 .TP
 .B \-\-next\-output
-Cycle the output lane to the next usable playback device, wrapping. Playback
-devices only: it never crosses into the microphones.
+Cycle the output lane to the next usable playback device, wrapping, in the
+order of the device priority list (Settings \(-> Audio). Playback devices only:
+it never crosses into the microphones.
 .TP
 .B \-\-next\-input
-Cycle the microphone lane to the next usable capture device, wrapping. Capture
+Cycle the microphone lane to the next usable capture device, wrapping, in the
+order of the microphones' priority list (Settings \(-> Microphone). Capture
 devices only.
 .SS Control
 .TP

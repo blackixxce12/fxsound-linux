@@ -82,3 +82,5 @@ countries: EG sa
 "The microphone delivered no signal." = "لم يُرسل الميكروفون أي إشارة."
 "No speech was heard. Speak closer to the microphone." = "لم يُسمع أي كلام. تحدّث أقرب إلى الميكروفون."
 "The microphone changed during the measurement." = "تغيّر الميكروفون أثناء القياس."
+"Follow the system's default device" = "اتباع الجهاز الافتراضي للنظام"
+"Input Device Preference" = "تفضيلات جهاز الإدخال"

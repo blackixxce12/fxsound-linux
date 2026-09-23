@@ -82,3 +82,5 @@ countries: id
 "The microphone delivered no signal." = "Mikrofon tidak memberikan sinyal."
 "No speech was heard. Speak closer to the microphone." = "Tidak ada ucapan yang terdengar. Bicaralah lebih dekat ke mikrofon."
 "The microphone changed during the measurement." = "Mikrofon berubah selama pengukuran."
+"Follow the system's default device" = "Ikuti perangkat bawaan sistem"
+"Input Device Preference" = "Preferensi perangkat masukan"
