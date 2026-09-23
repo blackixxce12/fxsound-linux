@@ -30,7 +30,7 @@
 
 use fxsound_core::{AudioDevice, DeviceDirection};
 
-use crate::{AudioError, OUR_NODE_NAMES};
+use crate::{AudioError, is_fxsound_node};
 
 /// `SND_DEVICES_MIN_NUM_CHANS` (`audiopassthru/include/sndDevices.h:190`).
 ///
@@ -706,8 +706,8 @@ pub struct DeviceInfo {
 
 impl DeviceInfo {
     /// Build a device from a node's property dictionary, or `None` if the node is neither a sink
-    /// nor a source — or is one of FxSound's own four nodes, which must never be listed as a
-    /// device to attach to, or one of WirePlumber's internal Bluetooth nodes
+    /// nor a source — or is one of FxSound's own nodes ([`is_fxsound_node`]), which must never be
+    /// listed as a device to attach to, or one of WirePlumber's internal Bluetooth nodes
     /// ([`BluezFacts::internal`]).
     ///
     /// Mirrors pass 1 of `sndDevices_GetAll.cpp:141-267`, including its fallbacks: a node with no
@@ -724,7 +724,9 @@ impl DeviceInfo {
             // (`AudioPassthruPrivate.cpp:174`).
             return None;
         }
-        if OUR_NODE_NAMES.contains(&name.as_str()) {
+        // Ours by name, a per-application route's included: a route's sink is an `Audio/Sink` like
+        // any other, and offered as a device it would let a lane play into its own route.
+        if is_fxsound_node(&name) {
             return None;
         }
         let description = get("node.description")
@@ -1857,6 +1859,10 @@ mod tests {
             // Its two capture streams, belt and braces as above.
             (crate::AEC_CAPTURE_NODE_NAME, "Audio/Source"),
             (crate::AEC_MONITOR_NODE_NAME, "Audio/Source"),
+            // A per-application route's sink and source are a sink and a source like any other:
+            // only their names keep a lane from playing into its own route, or recording from it.
+            ("fxsound_route_o1", "Audio/Sink"),
+            ("fxsound_route_i2", "Audio/Source"),
         ] {
             let props = [("media.class", class), ("node.name", name)];
             let parsed = DeviceInfo::from_props(1, &|key: &str| {

@@ -183,6 +183,16 @@
 //! [`WAKE_MUTE`] at the latest. A wake that never comes is given up after [`SLEEP_LIMIT`], so a
 //! lost signal cannot leave FxSound silent. There is no sleep inhibitor, by upstream's decision
 //! (its PR #533).
+//!
+//! # Applications
+//!
+//! Beside the devices, the registry announces every application that plays or records, and the
+//! engine keeps them for the per-application presets (`docs/0.4.0-apps.md`, `crate::app_streams`):
+//! each player's and recorder's stream, bound for the properties its registry global leaves out —
+//! its binary, its target, whether it may move — and each client, bound for what its streams do
+//! not say about themselves. FxSound's own streams are left out by name. The GUI hears the list on
+//! the supervisor's tick, whole, and only when it has changed ([`AudioToUi::AppStreams`]), so an
+//! application that starts is one message however many events announced it.
 
 use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
@@ -208,6 +218,7 @@ use pw::stream::{StreamFlags, StreamState};
 use triple_buffer::{Input, Output};
 
 use crate::aec::{self, EchoCancel, Side};
+use crate::app_streams::{self, AppStreams, StreamNode, Tracked};
 use crate::devices::{
     self, BluezFacts, Card, ChannelMap, DeviceInfo, FormFactor, Preference, SelectionMemory,
 };
@@ -220,8 +231,8 @@ use crate::{
     DEFAULT_QUANTUM_FRAMES, DEFAULT_SAMPLE_RATE, KEEP_AWAKE_NODE_NAME,
     KEEP_AWAKE_STREAM_DESCRIPTION, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS,
     ONE_HEADSET_ON_BOTH_LANES, OUR_NODE_NAMES, OUTPUT_NODE_NAME, OUTPUT_STREAM_DESCRIPTION,
-    RING_CAPACITY_FRAMES, SINK_DESCRIPTION, SINK_NODE_NAME, SOURCE_NODE_NAME, link_group, locale,
-    our_node_name,
+    RING_CAPACITY_FRAMES, SINK_DESCRIPTION, SINK_NODE_NAME, SOURCE_NODE_NAME, is_fxsound_node,
+    link_group, locale, our_node_name,
 };
 
 /// The rate the capture stream asks for, whatever the microphone runs at.
@@ -1410,6 +1421,44 @@ struct CardProbe {
     _device: pw::device::Device,
 }
 
+/// A bound application stream or client, held only to receive its `info` event
+/// ([`Shared::app_probes`]), which knows whether the server has let go of what it is bound to.
+///
+/// That is what decides when it may be dropped. Dropping a proxy the server has not removed sends
+/// the server a `destroy` for it, and a proxy whose bind failed names an object the server never
+/// made: it answers with a *core* error, "unknown resource", and a core error restarts the whole
+/// connection. And a bind fails whenever the object goes between its announcement and the bind,
+/// which a `pw-dump`, a `pactl` or a notification sound can do: they live for milliseconds. Seen
+/// on PipeWire 1.6.8 when these probes were first dropped as their global went:
+/// `graph_churn::echo_cancellation_holds_nothing_awake_while_nothing_records_from_fxsound_input`,
+/// which polls the graph with `pw-dump`, had the engine reconnect under it on every run — "no
+/// global 30 any more" on the bind, then "unknown resource 14 op:7" on the core — and
+/// `live_session` now builds the race on purpose. A bind that succeeded is removed by the server
+/// before the registry announces that its object has gone; one that failed, only with the failure,
+/// just after. So a probe whose object has gone is dropped at once if the server has removed it,
+/// and otherwise retired until it has ([`Shared::retired_probes`]).
+struct AppProbe {
+    _bound: Bound,
+    /// Set by the proxy's `removed` event: the server has removed the object — the bind's own
+    /// failure included — and dropping the proxy now sends nothing.
+    removed: Rc<Cell<bool>>,
+}
+
+/// What an [`AppProbe`] is bound to, each with its listeners declared before its proxy, for the
+/// reason [`NodeProbe`] gives.
+enum Bound {
+    Stream {
+        _info: pw::node::NodeListener,
+        _events: pw::proxy::ProxyListener,
+        _node: pw::node::Node,
+    },
+    Client {
+        _info: pw::client::ClientListener,
+        _events: pw::proxy::ProxyListener,
+        _client: pw::client::Client,
+    },
+}
+
 /// One PipeWire connection. Replaced wholesale on a reconnect.
 ///
 /// The lanes' nodes are not in here: each lane keeps its own pair. They are made on this
@@ -1769,6 +1818,21 @@ struct Shared {
     /// Sent to the card's probe as its `param` events; belongs to the session like the probes, and
     /// emptied with them — and a card's with the card.
     card_routes: std::collections::HashMap<u32, CardRoutes>,
+    /// Every application stream in the graph, both directions, with what their clients say, and
+    /// what the GUI was last told of them (`crate::app_streams`, `docs/0.4.0-apps.md`). Belongs to
+    /// the session, like the probes that feed it, and is emptied with them.
+    apps: AppStreams,
+    /// One bound proxy per application stream and per client, keyed by registry global id, kept
+    /// alive only to receive their `info` events: a stream's binary, its target and whether it may
+    /// move are not in its registry global, and a native stream's binary and a Flatpak's id are its
+    /// client's properties, only in the client's info (`crate::app_streams`, "Where an application
+    /// says who it is"). Apart from [`Self::node_probes`], which are the devices', and emptied with
+    /// them.
+    app_probes: std::collections::HashMap<u32, AppProbe>,
+    /// Probes whose object has left the registry before the server removed them: a bind that
+    /// failed because the object had already gone. Dropped once the server has removed them, on the
+    /// next supervisor tick ([`AppProbe`] says why not before), and with the session.
+    retired_probes: Vec<AppProbe>,
     /// The session defaults, one per direction.
     defaults: PerDirection<DefaultState>,
     /// Whether the GUI has had its chance to attach a lane from the device list, before a claim
@@ -1880,6 +1944,9 @@ impl Shared {
             cards: Vec::new(),
             card_probes: std::collections::HashMap::new(),
             card_routes: std::collections::HashMap::new(),
+            apps: AppStreams::default(),
+            app_probes: std::collections::HashMap::new(),
+            retired_probes: Vec::new(),
             defaults: PerDirection::default(),
             delivery: ListDelivery::default(),
             clock: GraphClock::default(),
@@ -3064,6 +3131,7 @@ fn connect(
     guard.cards.clear();
     guard.card_probes.clear();
     guard.card_routes.clear();
+    forget_app_streams(&mut guard);
     guard.aec.forget_sources();
     guard.defaults = PerDirection::default();
     guard.clock = GraphClock::default();
@@ -3171,6 +3239,7 @@ fn close_session(shared: &mut Shared) {
     shared.node_probes.clear();
     shared.card_probes.clear();
     shared.card_routes.clear();
+    forget_app_streams(shared);
     shared.session = None;
     shared.barrier = Barrier::Registry;
     drain_recycled_dsp(shared);
@@ -3281,6 +3350,7 @@ fn supervise(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) {
         drain_recycled_dsp(&mut guard);
         reconcile_input_chain(&mut guard);
         apply_idle_lane_events(&mut guard);
+        drop_removed_probes(&mut guard);
 
         // 2. A core error or an explicit Restart: the connection itself goes.
         if guard.restart_requested {
@@ -3526,6 +3596,20 @@ fn on_global(
 
     match global.type_ {
         pw::types::ObjectType::Node => {
+            // Every node of ours, by id and serial, and by name for which of them carry what
+            // FxSound plays: what an application's stream that names its target by number is
+            // found to name, and whether a recorder that does records FxSound
+            // (`crate::app_streams`).
+            let name = props.get(*pw::keys::NODE_NAME).unwrap_or_default();
+            if is_fxsound_node(name) {
+                let serial = props.get("object.serial").and_then(|s| s.parse().ok());
+                guard.apps.own_node_appeared(global.id, serial, name);
+            }
+            // An application's stream: a player or a recorder. Never a device either.
+            if let Some(stream) = StreamNode::from_props(global.id, &|key: &str| props.get(key)) {
+                track_stream(&mut guard, shared, registry, global, stream);
+                return;
+            }
             // The echo canceller's source: what makes echo cancellation *running*, and the input
             // lane's cue to record from it (`supervise`). Never a device, like the rest of ours.
             if props.get(*pw::keys::NODE_NAME) == Some(AEC_SOURCE_NODE_NAME) {
@@ -3657,6 +3741,12 @@ fn on_global(
                 Err(err) => log::debug!("could not bind card {id} to read its address: {err}"),
             }
         }
+        pw::types::ObjectType::Client => {
+            // A connection: who the applications behind its streams are, where the streams do
+            // not say it themselves (`crate::app_streams`).
+            let key = app_streams::app_key(&|key: &str| props.get(key));
+            track_client(&mut guard, shared, registry, global, key);
+        }
         pw::types::ObjectType::Metadata => {
             let name = props.get("metadata.name").unwrap_or_default();
             if name != "default" && name != "settings" {
@@ -3732,10 +3822,213 @@ fn add_device(shared: &mut Shared, mut device: DeviceInfo) {
     shared.mark_lane_for_rules(direction);
 }
 
+/// An application's stream joined the graph: note it, and bind it for the properties its registry
+/// global does not carry — its binary, its target, whether it may move (`crate::app_streams`,
+/// "Where an application says who it is"). It is reported on the tick after its info arrives.
+fn track_stream(
+    guard: &mut Shared,
+    shared: &Rc<RefCell<Shared>>,
+    registry: &pw::registry::RegistryRc,
+    global: &pw::registry::GlobalObject<&libspa::utils::dict::DictRef>,
+    stream: StreamNode,
+) {
+    let id = stream.id;
+    guard.apps.stream_appeared(stream);
+    let node = match registry.bind::<pw::node::Node, _>(global) {
+        Ok(node) => node,
+        Err(error) => {
+            log::debug!("could not bind application stream {id} to read who it is: {error}");
+            guard.apps.stream_complete_as_is(id);
+            return;
+        }
+    };
+    let info = node
+        .add_listener_local()
+        .info({
+            let shared = Rc::clone(shared);
+            move |info| {
+                // Only an info that carries the properties says anything about who the stream is;
+                // one for a state change would read as a stream that says nothing at all.
+                if !info.change_mask().contains(pw::node::NodeChangeMask::PROPS) {
+                    return;
+                }
+                if let Some(props) = info.props() {
+                    on_stream_info(&shared, id, &|key: &str| props.get(key));
+                }
+            }
+        })
+        .register();
+    let removed = Rc::new(Cell::new(false));
+    let events = probe_events(shared, pw::proxy::ProxyT::upcast_ref(&node), id, &removed);
+    keep_probe(
+        guard,
+        id,
+        AppProbe {
+            _bound: Bound::Stream {
+                _info: info,
+                _events: events,
+                _node: node,
+            },
+            removed,
+        },
+    );
+}
+
+/// An application stream's info arrived, with every property.
+fn on_stream_info<'a>(
+    shared: &Rc<RefCell<Shared>>,
+    id: u32,
+    get: &impl Fn(&str) -> Option<&'a str>,
+) {
+    let Ok(mut guard) = shared.try_borrow_mut() else {
+        return;
+    };
+    if guard.apps.stream_info(id, get)
+        && let Some(line) = guard.apps.describe(id)
+    {
+        log::debug!("{line}");
+    }
+}
+
+/// A client joined the graph: note what its registry global says about who it is — a name at most
+/// — and bind it for the rest, which only its info carries.
+fn track_client(
+    guard: &mut Shared,
+    shared: &Rc<RefCell<Shared>>,
+    registry: &pw::registry::RegistryRc,
+    global: &pw::registry::GlobalObject<&libspa::utils::dict::DictRef>,
+    key: fxsound_core::AppKey,
+) {
+    let id = global.id;
+    guard.apps.client_appeared(id, key);
+    let client = match registry.bind::<pw::client::Client, _>(global) {
+        Ok(client) => client,
+        Err(error) => {
+            log::debug!("could not bind client {id} to read who it is: {error}");
+            guard.apps.client_complete_as_is(id);
+            return;
+        }
+    };
+    let info = client
+        .add_listener_local()
+        .info({
+            let shared = Rc::clone(shared);
+            move |info| {
+                if !info
+                    .change_mask()
+                    .contains(pw::client::ClientChangeMask::PROPS)
+                {
+                    return;
+                }
+                if let Some(props) = info.props()
+                    && let Ok(mut guard) = shared.try_borrow_mut()
+                {
+                    guard.apps.client_info(id, &|key: &str| props.get(key));
+                }
+            }
+        })
+        .register();
+    let removed = Rc::new(Cell::new(false));
+    let events = probe_events(shared, pw::proxy::ProxyT::upcast_ref(&client), id, &removed);
+    keep_probe(
+        guard,
+        id,
+        AppProbe {
+            _bound: Bound::Client {
+                _info: info,
+                _events: events,
+                _client: client,
+            },
+            removed,
+        },
+    );
+}
+
+/// The proxy events an [`AppProbe`] needs: `removed`, which says it may be dropped without a word
+/// to the server, and `error`, a bind the server refused. A stream or a client whose info will
+/// never come is told as far as its registry global goes rather than waited for — unless it has
+/// gone, which is what the refusal usually means, and then there is nothing left to tell.
+fn probe_events(
+    shared: &Rc<RefCell<Shared>>,
+    proxy: &pw::proxy::Proxy,
+    id: u32,
+    removed: &Rc<Cell<bool>>,
+) -> pw::proxy::ProxyListener {
+    proxy
+        .add_listener_local()
+        .removed({
+            let removed = Rc::clone(removed);
+            move || removed.set(true)
+        })
+        .error({
+            let shared = Rc::clone(shared);
+            move |_seq, res, message| {
+                log::debug!("could not read who {id} is: {message} ({res})");
+                if let Ok(mut guard) = shared.try_borrow_mut() {
+                    guard.apps.stream_complete_as_is(id);
+                    guard.apps.client_complete_as_is(id);
+                }
+            }
+        })
+        .register()
+}
+
+/// Keep a new probe under its global's id. One already there — an id the server has handed on
+/// without the registry saying the old object went, which it does not do — is retired, not
+/// dropped.
+fn keep_probe(shared: &mut Shared, id: u32, probe: AppProbe) {
+    if let Some(old) = shared.app_probes.insert(id, probe) {
+        retire(shared, old);
+    }
+}
+
+/// The object an application stream's or a client's probe was bound to has left the registry: drop
+/// the probe, or retire it until the server has removed it ([`AppProbe`]).
+fn retire_probe(shared: &mut Shared, id: u32) {
+    if let Some(probe) = shared.app_probes.remove(&id) {
+        retire(shared, probe);
+    }
+}
+
+fn retire(shared: &mut Shared, probe: AppProbe) {
+    if !probe.removed.get() {
+        shared.retired_probes.push(probe);
+    }
+}
+
+/// Drop every retired probe the server has removed since the last tick ([`AppProbe`]).
+fn drop_removed_probes(shared: &mut Shared) {
+    shared.retired_probes.retain(|probe| !probe.removed.get());
+}
+
+/// The session is going, or a new one starting: every application stream, every client and their
+/// probes belong to the one before. The GUI hears the list is empty on the next tick, if it had
+/// been told of any. A probe dropped here may still send the server a `destroy` it answers with a
+/// core error, but on a connection that is closing, whose listener goes with it.
+fn forget_app_streams(shared: &mut Shared) {
+    shared.app_probes.clear();
+    shared.retired_probes.clear();
+    shared.apps.clear();
+}
+
 fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
     let Ok(mut guard) = shared.try_borrow_mut() else {
         return;
     };
+    // An application's stream or a client goes with its probe; a node of ours is forgotten here
+    // and may still be something below — the echo canceller's source.
+    match guard.apps.remove(id) {
+        Some(Tracked::Stream) => {
+            log::debug!("application stream {id} went");
+            retire_probe(&mut guard, id);
+            return;
+        }
+        Some(Tracked::Client) => {
+            retire_probe(&mut guard, id);
+            return;
+        }
+        Some(Tracked::Own) | None => {}
+    }
     if guard.aec.source_removed(id) {
         log::debug!("the echo canceller's source went away ({id})");
         return;
@@ -4181,8 +4474,13 @@ fn on_metadata_property(shared: &Rc<RefCell<Shared>>, key: Option<&str>, value: 
     };
     for direction in DeviceDirection::ALL {
         if key == devices::default_key(direction) {
-            guard.defaults.get_mut(direction).current =
-                value.and_then(devices::parse_default_node_name);
+            let current = value.and_then(devices::parse_default_node_name);
+            if direction == DeviceDirection::Output {
+                // A recorder of the default sink's monitor records FxSound exactly while this is
+                // FxSound's sink (`crate::app_streams`).
+                guard.apps.default_sink_is(current.as_deref());
+            }
+            guard.defaults.get_mut(direction).current = current;
             guard.needs_publish = true;
             // A direction's default moving is news for that direction's lane and for nothing
             // else: the default sink says nothing about which microphone to hear.
@@ -6106,6 +6404,27 @@ fn publish(shared: &mut Shared) {
             shared.notify(AudioToUi::Devices(devices));
             shared.delivery.list_sent();
         }
+    }
+
+    publish_app_streams(shared);
+}
+
+/// Tell the GUI which applications play and record, when that has changed since it was last told
+/// ([`AppStreams::news`]): the whole list, at most once a tick, however many registry and info
+/// events changed it since the last.
+///
+/// Not while a session's first look at the graph is still coming in ([`Shared::ready`]). The
+/// streams that were there before FxSound connected are announced in one burst and their infos
+/// just after it, all before the barrier is passed — every bind the dump called for is answered
+/// ahead of its second `sync` — so the GUI hears of them in one list rather than in instalments.
+/// With no session at all, the list is empty, and says so once.
+fn publish_app_streams(shared: &mut Shared) {
+    if shared.session.is_some() && !shared.ready() {
+        return;
+    }
+    if let Some(streams) = shared.apps.news() {
+        log::debug!("{} application streams in the graph", streams.len());
+        shared.notify(AudioToUi::AppStreams(streams));
     }
 }
 
@@ -9234,6 +9553,168 @@ mod tests {
         assert!(shared.lanes.output.nodes.is_none());
         assert!(shared.lanes.input.nodes.is_none());
         assert!(!shared.needs_publish, "and no device list to republish");
+    }
+
+    /// An application's stream as the main loop builds it: from its registry global, then its
+    /// info, both of them `media.class`, `application.name` and `extra`.
+    fn app_stream(id: u32, class: &str, name: &str, extra: &[(&str, &str)]) -> StreamNode {
+        let mut pairs = vec![("media.class", class), ("application.name", name)];
+        pairs.extend_from_slice(extra);
+        let get = |key: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| *value)
+        };
+        let mut stream = StreamNode::from_props(id, &get).expect("an application's stream");
+        stream.learn(&get);
+        stream
+    }
+
+    /// Every application list among `messages`, in order.
+    fn app_reports(messages: &[AudioToUi]) -> Vec<Vec<fxsound_core::AppStream>> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                AudioToUi::AppStreams(streams) => Some(streams.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn application_streams_are_reported_on_the_tick_and_only_when_they_change() {
+        let (mut shared, messages) = shared_with_messages();
+        shared.apps.stream_appeared(app_stream(
+            87,
+            "Stream/Output/Audio",
+            "Battlefield 6",
+            &[("application.process.binary", "bf6.exe")],
+        ));
+        shared
+            .apps
+            .stream_appeared(app_stream(91, "Stream/Input/Audio", "Discord", &[]));
+        assert!(
+            drained(&messages).is_empty(),
+            "nothing is said between ticks"
+        );
+
+        publish(&mut shared);
+        let reports = app_reports(&drained(&messages));
+        assert_eq!(reports.len(), 1, "two streams, one report");
+        let listed: Vec<(u32, DeviceDirection, &str, &str)> = reports[0]
+            .iter()
+            .map(|stream| {
+                (
+                    stream.id,
+                    stream.direction,
+                    stream.app.binary.as_str(),
+                    stream.app.name.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (87, DeviceDirection::Output, "bf6.exe", "Battlefield 6"),
+                (91, DeviceDirection::Input, "", "Discord"),
+            ]
+        );
+        assert!(reports[0].iter().all(|stream| stream.route.is_none()));
+
+        publish(&mut shared);
+        assert!(
+            app_reports(&drained(&messages)).is_empty(),
+            "the same list is not sent twice"
+        );
+
+        assert_eq!(shared.apps.remove(87), Some(Tracked::Stream));
+        publish(&mut shared);
+        let reports = app_reports(&drained(&messages));
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0]
+                .iter()
+                .map(|stream| stream.id)
+                .collect::<Vec<_>>(),
+            vec![91]
+        );
+    }
+
+    #[test]
+    fn a_lost_connection_empties_the_application_list_and_says_so_once() {
+        let (mut shared, messages) = shared_with_messages();
+        shared.state = State::Connecting;
+        shared
+            .apps
+            .stream_appeared(app_stream(87, "Stream/Output/Audio", "mpv", &[]));
+        publish(&mut shared);
+        assert_eq!(app_reports(&drained(&messages)).len(), 1);
+
+        disconnect(&mut shared, "the server went away");
+        publish(&mut shared);
+        assert_eq!(
+            app_reports(&drained(&messages)),
+            vec![Vec::new()],
+            "no stream of a server that is gone is running"
+        );
+        publish(&mut shared);
+        assert!(app_reports(&drained(&messages)).is_empty());
+    }
+
+    #[test]
+    fn fxsounds_sink_becoming_the_default_lists_the_recorders_of_the_default_monitor() {
+        let (shared, messages) = shared_with_messages();
+        let shared = Rc::new(RefCell::new(shared));
+        shared.borrow_mut().apps.stream_appeared(app_stream(
+            95,
+            "Stream/Input/Audio",
+            "OBS",
+            &[("stream.capture.sink", "true")],
+        ));
+        publish(&mut shared.borrow_mut());
+        assert!(
+            app_reports(&drained(&messages)).is_empty(),
+            "it records the speakers' monitor, not FxSound"
+        );
+
+        on_metadata_property(
+            &shared,
+            Some(devices::default_key(DeviceDirection::Output)),
+            Some(r#"{"name":"fxsound_sink"}"#),
+        );
+        publish(&mut shared.borrow_mut());
+        let reports = app_reports(&drained(&messages));
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].len(), 1);
+        assert_eq!(reports[0][0].app.name, "OBS");
+        assert_eq!(reports[0][0].direction, DeviceDirection::Input);
+        {
+            let guard = shared.borrow();
+            let obs = guard.apps.stream(95).expect("tracked");
+            assert_eq!(
+                guard.apps.pin(obs),
+                Some(app_streams::Pin::Monitor),
+                "listed, and never moved onto a microphone's route"
+            );
+        }
+
+        // The default source says nothing about a sink's monitor.
+        on_metadata_property(
+            &shared,
+            Some(devices::default_key(DeviceDirection::Input)),
+            Some(r#"{"name":"fxsound_source"}"#),
+        );
+        publish(&mut shared.borrow_mut());
+        assert!(app_reports(&drained(&messages)).is_empty());
+
+        on_metadata_property(
+            &shared,
+            Some(devices::default_key(DeviceDirection::Output)),
+            Some(r#"{"name":"alsa_output.pci"}"#),
+        );
+        publish(&mut shared.borrow_mut());
+        assert_eq!(app_reports(&drained(&messages)), vec![Vec::new()]);
     }
 
     #[test]

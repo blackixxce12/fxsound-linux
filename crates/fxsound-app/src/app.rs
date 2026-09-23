@@ -288,8 +288,8 @@ impl App {
                 // Per-device volume (U10) and warnings: the engine sends neither yet, and what the
                 // window does with them is Phase C part 2's.
                 AudioToUi::TargetVolume(_) | AudioToUi::Warning { .. } => {}
-                // Application streams (per-application presets): the engine does not report them
-                // yet, and the Applications list that reads them is not in this crate yet.
+                // Application streams (per-application presets): the engine reports them, but the
+                // Applications list that reads them is not in this crate yet.
                 AudioToUi::AppStreams(_) => {}
             }
         }

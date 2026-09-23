@@ -164,6 +164,7 @@
 #![deny(unsafe_code)]
 
 mod aec;
+mod app_streams;
 pub mod devices;
 pub mod engine;
 mod lane_dsp;
@@ -269,6 +270,34 @@ pub const OUR_NODE_NAMES: [&str; 8] = [
     AEC_SOURCE_NODE_NAME,
     KEEP_AWAKE_NODE_NAME,
 ];
+
+/// What the `node.name` of every node of a per-application route starts with
+/// (`docs/0.4.0-apps.md`): `fxsound_route_o<N>` and `fxsound_route_o<N>_play` in front of the
+/// speakers, `fxsound_route_i<N>_capture` and `fxsound_route_i<N>` behind the microphone.
+///
+/// A prefix rather than a list, because how many routes there are is the user's rules' business,
+/// and every one of them is FxSound's as much as the lanes' own pairs are ([`is_fxsound_node`]).
+pub const ROUTE_NODE_PREFIX: &str = "fxsound_route_";
+
+/// What the `node.name` of every node of the echo canceller starts with ([`AEC_NODE_NAMES`]).
+///
+/// The three names are listed too; the prefix is what [`is_fxsound_node`] matches, so a node the
+/// module adds in some later version, named the way the others are, is ours from its first day.
+pub const AEC_NODE_PREFIX: &str = "fxsound_aec_";
+
+/// Whether the node called `node_name` is one of FxSound's own: a lane's pair, the node that
+/// keeps the microphone awake ([`OUR_NODE_NAMES`]), the echo canceller's ([`AEC_NODE_PREFIX`]),
+/// or a per-application route's ([`ROUTE_NODE_PREFIX`]).
+///
+/// None of them is a device to attach to, and none is an application's stream: an application
+/// list that offered FxSound's own playback stream a preset would offer to run FxSound through
+/// itself.
+#[must_use]
+pub fn is_fxsound_node(node_name: &str) -> bool {
+    OUR_NODE_NAMES.contains(&node_name)
+        || node_name.starts_with(ROUTE_NODE_PREFIX)
+        || node_name.starts_with(AEC_NODE_PREFIX)
+}
 
 /// The `node.link-group` of the output lane's two nodes. **Mandatory**; see the module docs.
 ///
@@ -1032,6 +1061,42 @@ mod tests {
                 assert!(q.is_power_of_two(), "{ms}ms @ {rate}Hz gave {q}");
                 assert!((256..=MAX_QUANTUM_FRAMES as u32).contains(&q));
             }
+        }
+    }
+
+    #[test]
+    fn every_node_fxsound_makes_is_its_own_and_nobody_elses_is() {
+        for name in OUR_NODE_NAMES {
+            assert!(is_fxsound_node(name), "{name}");
+        }
+        // A per-application route's four kinds of node, whatever its number.
+        for name in [
+            "fxsound_route_o1",
+            "fxsound_route_o1_play",
+            "fxsound_route_i4_capture",
+            "fxsound_route_i4",
+            "fxsound_route_o17",
+        ] {
+            assert!(is_fxsound_node(name), "{name}");
+        }
+        // The canceller's, by its prefix, including one it does not make today.
+        assert!(is_fxsound_node("fxsound_aec_reference"));
+        assert_eq!(AEC_NODE_PREFIX, "fxsound_aec_");
+        assert_eq!(ROUTE_NODE_PREFIX, "fxsound_route_");
+        for name in AEC_NODE_NAMES {
+            assert!(name.starts_with(AEC_NODE_PREFIX), "{name}");
+        }
+        // Somebody else's, even with our word in it.
+        for name in [
+            "",
+            "fxsound",
+            "fxsound_sink_2",
+            "fxsound_router",
+            "my_fxsound_route_o1",
+            "alsa_output.pci-0000_00_1f.3.analog-stereo",
+            "Firefox",
+        ] {
+            assert!(!is_fxsound_node(name), "{name:?}");
         }
     }
 

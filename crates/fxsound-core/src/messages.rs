@@ -669,13 +669,33 @@ impl TargetVolume {
     }
 }
 
-/// One application's stream, as the engine sees it in the graph (`docs/0.4.0-apps.md`).
+/// One application's stream, as the engine sees it in the graph (`docs/0.4.0-apps.md`,
+/// "Identifying an application").
 ///
-/// Every client stream that is not FxSound's own and not the echo canceller's: a player's
-/// playback stream, a recorder's capture stream. Reported in full ([`AudioToUi::AppStreams`]),
-/// which is what the Applications list shows as running and what the app matches its rules
-/// against. Plain data with serde, so the command line's `--list-apps --json` and D-Bus's
-/// `ListApps` can hand it on as it is.
+/// A player's playback stream or a recorder's capture stream: a node whose media class is exactly
+/// `Stream/Output/Audio` or `Stream/Input/Audio`, and that is not FxSound's own — not a lane's,
+/// not a route's, not the echo canceller's. Of those, three kinds are not reported:
+///
+/// - a stream the engine has not finished reading: its own info, or its client's, has not arrived.
+///   Both follow within milliseconds, and the stream is reported then, once, under its whole key
+///   rather than first under a key that is about to change.
+/// - a stream that says nothing about who it is — no binary, no name, no Flatpak id, its own or its
+///   client's. The list could not name it, and no rule could match it.
+/// - a recorder of what a sink plays that does not record FxSound: a visualiser on the speakers'
+///   monitor records no microphone, and nothing of FxSound's either. One that does record FxSound
+///   is reported, as a recorder: one with `stream.capture.sink` that names one of FxSound's nodes
+///   as its target, or names none while FxSound's sink is the default sink; and one without the
+///   flag whose target is a node of FxSound's output lane the session manager links it to —
+///   FxSound's sink or a playback route's, named by `object.serial` or node id, whose monitor it
+///   records, or FxSound's playback stream or a route's, named any way.
+///
+/// A reported stream is not necessarily one the engine may move: one that says `node.dont-move`,
+/// one whose own properties name a target that is not FxSound's, and a recorder of FxSound are
+/// never moved onto a route, and stay on their lane with no [`route`](Self::route).
+///
+/// Reported in full ([`AudioToUi::AppStreams`]), which is what the Applications list shows as
+/// running and what the app matches its rules against. Plain data with serde, so the command
+/// line's `--list-apps --json` and D-Bus's `ListApps` can hand it on as it is.
 #[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppStream {
@@ -913,8 +933,9 @@ pub enum AudioToUi {
         message: String,
     },
     /// Every application stream in the graph, both directions, whenever the set or a stream's
-    /// route changes (`docs/0.4.0-apps.md`). The full list each time, so the Applications list is
-    /// always what the graph holds and never an accumulation of changes.
+    /// route changes (`docs/0.4.0-apps.md`; [`AppStream`] says which streams count). The full
+    /// list each time, so the Applications list is always what the graph holds and never an
+    /// accumulation of changes.
     AppStreams(Vec<AppStream>),
 }
 

@@ -59,6 +59,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod apps;
 mod sleep;
 mod volume;
 
@@ -355,7 +356,7 @@ impl PrivateGraph {
     }
 
     /// The id of the node called `name`, for `pw-cli`, which addresses objects by number.
-    fn node_id(&self, name: &str) -> Option<u64> {
+    pub(crate) fn node_id(&self, name: &str) -> Option<u64> {
         let objects = self.dump()?;
         Self::node_object(&objects, name)?["id"].as_u64()
     }
