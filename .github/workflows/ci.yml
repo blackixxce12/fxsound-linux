@@ -41,12 +41,21 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev libclang-dev pipewire dbus
+            pkg-config libpipewire-0.3-dev libclang-dev \
+            pipewire pipewire-bin libspa-0.2-modules dbus
           # `pipewire` itself is the daemon, and it is here for the graph-churn tests: each one
           # starts a private server with its own socket and synthetic devices. Without the binary
           # those tests print that they are skipping and pass, which is the right behaviour for a
-          # contributor's laptop and the wrong one for CI. `dbus` is there for the same reason:
-          # the D-Bus service's tests start a `dbus-daemon` of their own, never the session's.
+          # contributor's laptop and the wrong one for CI — so the test steps below set
+          # FXSOUND_REQUIRE_PIPEWIRE_TOOLS, which turns every such skip into a failure.
+          # `pipewire-bin` is where Ubuntu ships pw-dump, pw-metadata, pw-cli and pw-link (and the
+          # daemon binary itself), which the same tests use to see our nodes and defaults from
+          # outside the engine and to wire a tone through both lanes; `libspa-0.2-modules` has the
+          # `audiotestsrc` plugin that tone comes from. Both already arrive as dependencies of
+          # `pipewire`; they are named because the tests now fail without them, and the list here
+          # is where to look first when one does. `dbus` is there for the same reason as
+          # `pipewire`: the D-Bus service's tests start a `dbus-daemon` of their own, never the
+          # session's.
 
       # rust-toolchain.toml pins 1.98.1 and asks for rustfmt and clippy, so rustup installs
       # exactly what the developers use rather than whatever the runner image happens to ship.
@@ -65,18 +74,28 @@ jobs:
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      # The runner sets no XDG_RUNTIME_DIR, no session bus and no PipeWire daemon. Nothing in the
-      # suite needs any of them — every test is a unit test that stops at the crate boundary — and
-      # the one that used to depend on the session's runtime directory now takes it as an argument
-      # rather than reading it. If this step ever fails for want of a daemon, the fix is to make
-      # that test take its dependency as a parameter too, not to start a daemon here.
+      # The runner sets no XDG_RUNTIME_DIR, no session bus and no session PipeWire, and nothing in
+      # the suite may reach for any of them: a test that needs the user's session is a test that
+      # would take a developer's default device away mid-run. The graph-churn tests in
+      # fxsound-audio still talk to a real server — each starts its own private pipewire, with its
+      # own runtime directory and socket, from the packages installed above, and kills it when it
+      # is done. So never start a daemon in this step; if a test fails for want of one, it should
+      # start its own the way those do.
+      #
+      # FXSOUND_REQUIRE_PIPEWIRE_TOOLS=1 makes every place those tests would print SKIPPED fail
+      # instead. The harness hides a passing test's output, so here a skip would be invisible, and
+      # with everything installed a skip means something that should work did not.
       - name: Tests
         run: cargo test --workspace
+        env:
+          FXSOUND_REQUIRE_PIPEWIRE_TOOLS: "1"
 
       # Release as well: the DSP is full of arithmetic whose rounding differs between opt-levels,
       # and `panic = "abort"` only applies to the release profile.
       - name: Tests, release profile
         run: cargo test --release --workspace
+        env:
+          FXSOUND_REQUIRE_PIPEWIRE_TOOLS: "1"
 
       - name: Build
         run: cargo build --release --bin fxsound

@@ -27,9 +27,13 @@
 //! [`DenoiseState::analyse`] and [`DenoiseState::synthesise`], the two halves of
 //! [`DenoiseState::process_frame`] with the band gains exposed between them; and [`Stft`], the
 //! library's transform pair without the network, for applying one set of gains to another
-//! channel. Nothing the original computed was changed: `process_frame` is held to the original
-//! arithmetic sample for sample by a test. `README.md` lists every change file by file, with what
-//! was dropped and the one `unsafe` block that stays.
+//! channel. One thing was replaced: the FFT is planned by each state when it is built
+//! ([`Spectrum`] and `src/fft.rs`) rather than through `easyfft`'s per-thread cache on the first
+//! frame, so that nothing a state does after its constructor allocates — its first frame on a
+//! real-time thread included. Nothing the original computed was changed: `process_frame` is held
+//! to the original arithmetic sample for sample by a test, and the new transforms to `easyfft`'s
+//! bit for bit. `README.md` lists every change file by file, with what was dropped and the one
+//! `unsafe` block that stays.
 
 use once_cell::sync::OnceCell;
 
@@ -39,12 +43,15 @@ mod util;
 
 mod denoise;
 mod features;
+// fxsound: the transform pair each state plans for itself, in place of `easyfft`'s per-thread cache.
+mod fft;
 mod pitch;
 mod rnn;
 mod stft;
 
 pub use denoise::{Analysis, DenoiseState};
 pub use features::DenoiseFeatures;
+pub use fft::Spectrum;
 pub use rnn::RnnModel;
 pub use stft::Stft;
 
@@ -72,7 +79,8 @@ pub const EBAND_5MS: [usize; 22] = [
     // 0  200 400 600 800  1k 1.2 1.4 1.6  2k 2.4 2.8 3.2  4k 4.8 5.6 6.8  8k 9.6 12k 15.6 20k*/
     0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 34, 40, 48, 60, 78, 100,
 ];
-type Complex = easyfft::num_complex::Complex32;
+// fxsound: `realfft`'s re-export of the same `num_complex` type `easyfft` re-exported.
+type Complex = realfft::num_complex::Complex32;
 
 /// Computes the correlation between two frequency-domain signals, and aggregates the correlation
 /// into bands.

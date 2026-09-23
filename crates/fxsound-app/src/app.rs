@@ -16,7 +16,7 @@
 use fxsound_audio::EngineHandle;
 use fxsound_core::{
     AudioDevice, DeviceDirection, Effect, EqBand, Preset, Settings, ThemeMode, ViewMode,
-    messages::{AudioToUi, DspEvent, DspParams, InputDspParams, UiToAudio},
+    messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio},
     scale,
 };
 use fxsound_preset::PresetStore;
@@ -230,8 +230,12 @@ pub struct App {
     /// finished enumerating. Until this is true, "no device is called that" and "no device list
     /// yet" are the same observation, and they call for opposite answers.
     devices_seen: bool,
-    /// The last thing the audio thread said about itself, for `--status`.
-    audio_status: fxsound_core::AudioStatus,
+    /// The last thing the audio thread said about each lane, outputs first (see
+    /// [`lane_index`]), for `--status` and `--watch`.
+    audio_status: [fxsound_core::AudioStatus; 2],
+    /// What each lane is attached to, as the engine last said ([`AudioToUi::Attached`]); `None`
+    /// while the lane has no nodes. Outputs first.
+    attached: [Option<String>; 2],
     /// A `--output` or `--input` that arrived before the list did, waiting for it — at most one
     /// per lane, so `--output X --input Y` at login waits for both.
     pending_devices: Vec<PendingDevice>,
@@ -252,14 +256,10 @@ pub struct App {
     /// Where Export Presets writes. A field rather than a constant so the tests can point it at
     /// a scratch directory instead of the user's documents.
     export_dir: PathBuf,
-    /// The device selection last handed to the engine, so the saved choice goes out once per
-    /// appearance of that device rather than on every device list (see
+    /// The device selection last handed to the engine for each lane, outputs first, so a saved
+    /// choice goes out once per appearance of that device rather than on every device list (see
     /// [`saved_device_to_announce`]).
-    announced_device: Option<(String, DeviceDirection)>,
-    /// The lane the user last picked a device for this session, which is the lane the single-lane
-    /// engine serves. Kept apart from the edit direction, which only says what the window shows
-    /// (see [`lane_to_announce`]). Not saved: after a restart the lanes' enabled flags decide.
-    last_picked_lane: Option<DeviceDirection>,
+    announced_device: [Option<String>; 2],
     /// The desktop-notification worker (`docs/spec/06-dialogs.md` §6.6).
     notifier: Notifier,
     /// Toasts are held back until construction is over: adopting the saved preset at start-up
@@ -302,7 +302,8 @@ impl App {
             input_chain: fxsound_preset::input::DEFAULT_CHAIN.to_owned(),
             input_presets: Vec::new(),
             devices_seen: false,
-            audio_status: fxsound_core::AudioStatus::default(),
+            audio_status: [fxsound_core::AudioStatus::default(); 2],
+            attached: [None, None],
             pending_devices: Vec::new(),
             settings,
             presets,
@@ -312,8 +313,7 @@ impl App {
             settings_dirty: false,
             persist: true,
             export_dir: default_export_dir(),
-            announced_device: None,
-            last_picked_lane: None,
+            announced_device: [None, None],
             notifier,
             notifications_armed: false,
             tray_tip_shown: false,
@@ -336,14 +336,14 @@ impl App {
 
     /// Bring **both** lanes up on the presets the settings file remembers for them.
     ///
-    /// Both, not only the one the window was last editing: which lane the engine serves is not the
-    /// edit direction (see [`lane_to_announce`]), so a restart that loaded only the edit
-    /// direction's preset left the speakers flat — every effect at zero — for anyone whose window
-    /// was last on the microphone, and a microphone handed to the engine by switching the speakers
-    /// off ran unvoiced. The lane off screen goes first, loaded exactly the way a first visit loads
-    /// it, and is then parked; the edit direction is entered the same way, so each lane's controls
-    /// are seeded from its own chain and nothing of one reaches the other. Called while toasts are
-    /// still held back, so none of this is announced.
+    /// Both, not only the one the window was last editing: the engine runs every enabled lane,
+    /// whichever the window edits, so a restart that loaded only the edit direction's preset left
+    /// the speakers flat — every effect at zero — for anyone whose window was last on the
+    /// microphone, and a microphone running beside them unvoiced. The lane off screen goes first,
+    /// loaded exactly the way a first visit loads it, and is then parked; the edit direction is
+    /// entered the same way, so each lane's controls are seeded from its own chain and nothing of
+    /// one reaches the other. Called while toasts are still held back, so none of this is
+    /// announced.
     fn adopt_saved_presets(&mut self) {
         let edit = self.settings.device_direction;
         self.state.direction = edit.other();
@@ -373,124 +373,138 @@ impl App {
             return;
         };
 
-        let meters = engine.meters();
-        self.state.spectrum = meters.spectrum;
-        self.state.audio_active = meters.active;
-        // The rate is the device's, and the interface needs it for one thing: an equalizer band
-        // centred at or above Nyquist cannot be built, and a fader that does nothing has to say
-        // so. A 16 kHz Bluetooth capture takes the top two bands of the standard ladder with it.
-        self.state.sample_rate = meters.sample_rate;
-        self.state.gate_reduction_db = meters.gate_reduction_db;
-        self.state.deesser_running = meters.deesser_running;
-        self.state.denoise_running = meters.denoiser_running;
-        self.state.voice_probability = meters.voice_probability;
-        self.state.compressor_reduction_db = meters.compressor_reduction_db;
-        self.state.deesser_reduction_db = meters.deesser_reduction_db;
-        // Copied as it is: `0.0` is what no measurement looks like (`Meters::default()`, and the
-        // running minimum before it has come down), and the strip reads it as a dash rather than
-        // as a room at full scale.
-        self.state.noise_floor_db = meters.noise_floor_db;
-        self.state.denoise_reduction_db = meters.denoise_reduction_db;
-        self.state.dereverb_reduction_db = meters.dereverb_reduction_db;
-        self.state.deesser_hz = meters.deesser_hz;
+        // Each lane publishes its own meters: the picture is the edited lane's, the microphone's
+        // telemetry the input lane's (see [`show_meters`]).
+        let shown = engine.meters(self.state.direction);
+        let microphone = engine.meters(DeviceDirection::Input);
+        show_meters(&mut self.state, &shown, &microphone);
 
-        let mut device_lists = Vec::new();
-        while let Some(message) = engine.try_recv() {
-            match message {
-                // Taken after the loop, where the engine is no longer borrowed and the whole
-                // controller is free to look at the list.
-                AudioToUi::Devices(devices) => device_lists.push(devices),
-                // One status per lane in 0.4.0; until the second lane exists in this crate, the
-                // engine sends one and this keeps it for `--status`, and its lane's activity.
-                AudioToUi::Status { direction, status } => {
-                    match direction {
-                        DeviceDirection::Output => self.state.output_active = status.processing,
-                        DeviceDirection::Input => self.state.input_active = status.processing,
-                    }
-                    self.audio_status = status;
-                }
-                AudioToUi::Disconnected { reason } => {
-                    self.state
-                        .notify(format!("{} {reason}", tr("Audio disconnected:")));
-                    // `"Output Disconnected"` (`FxController.cpp:1170`). A field access, not
-                    // `Self::notify`, because the engine handle is still borrowed here.
-                    if self.notifications_armed {
-                        let _ = self.notifier.notify(Message::output_disconnected());
-                    }
-                }
-                AudioToUi::Error { message, .. } => {
-                    self.state.notify(message);
-                }
-                AudioToUi::EchoCancel { running, detail } => {
-                    self.state.echo_cancel_running = running;
-                    self.echo_cancel_detail = detail;
-                }
-                // What a lane is really attached to. The selection shown is still the user's
-                // choice from the settings: the single-lane engine this crate runs against today
-                // reports its one lane moving between directions, which is not a lane going away.
-                // The two-lane controller reads this instead.
-                AudioToUi::Attached { .. } => {}
-                AudioToUi::RememberedDefault {
-                    direction,
-                    node_name,
-                } => {
-                    // Straight to the settings file. The audio thread's own copy dies with the
-                    // process, and the three ways a process dies without warning — SIGKILL, the
-                    // OOM killer, a power cut — are exactly the ones that leave the session
-                    // default naming a node that is gone.
-                    if self.settings.remembered_default(direction) != node_name {
-                        self.settings.set_remembered_default(direction, &node_name);
-                        self.settings_dirty = true;
-                    }
-                }
-            }
+        // Drained first and acted on after, in arrival order, once the engine is no longer
+        // borrowed: a device list and a pick call back into the whole controller.
+        let messages: Vec<AudioToUi> = std::iter::from_fn(|| engine.try_recv()).collect();
+        for message in messages {
+            self.receive(message);
         }
 
-        // In arrival order, so a device that vanished in one list and came back in the next is
-        // announced afresh.
-        for devices in device_lists {
-            if let Some(message) = self.adopt_device_list(devices)
-                && let Some(engine) = &self.engine
-            {
-                engine.send(message);
-            }
-        }
-
-        // Outside the loop, where the engine is no longer borrowed: selecting a device calls back
-        // into the whole controller.
+        // After the lists: selecting a device calls back into the whole controller.
         if self.devices_seen && !self.pending_devices.is_empty() {
             self.apply_pending_device();
         }
     }
 
-    /// Take a device list from the engine, and say what, if anything, the engine has to be told.
-    ///
-    /// Each lane keeps the user's choice across a rescan when the device is still there, and
-    /// otherwise falls back to whatever the server calls the default. A detached lane shows
-    /// nothing: that is what `Off` means.
-    fn adopt_device_list(&mut self, devices: Vec<AudioDevice>) -> Option<UiToAudio> {
-        self.devices_seen = true;
-        for direction in [DeviceDirection::Output, DeviceDirection::Input] {
-            self.state.set_selection(
+    /// Act on one thing the audio thread said. Crate-visible so the tests of what follows from a
+    /// message — `--watch`'s events among them — can say it without an engine.
+    pub(crate) fn receive(&mut self, message: AudioToUi) {
+        match message {
+            // In arrival order, so a device that vanished in one list and came back in the next
+            // is announced afresh.
+            AudioToUi::Devices(devices) => {
+                for message in self.adopt_device_list(devices) {
+                    self.send(message);
+                }
+            }
+            // Each lane says how it is doing on its own, so a lane's activity is never the other
+            // lane's left over: `--status`, `--watch` and the strip's Floor slot read it.
+            AudioToUi::Status { direction, status } => {
+                set_lane_active(&mut self.state, direction, status.processing);
+                self.audio_status[lane_index(direction)] = status;
+            }
+            // What a lane is really attached to, which is what the lane's combo shows (see
+            // [`lane_selection`]). A lane with no nodes processes nothing, whatever its last status
+            // said; the status that says so follows on the engine's next tick.
+            AudioToUi::Attached {
                 direction,
-                lane_selection(&self.settings, &devices, direction),
-            );
+                node_name,
+            } => {
+                if node_name.is_none() {
+                    set_lane_active(&mut self.state, direction, false);
+                }
+                self.attached[lane_index(direction)] = node_name;
+                self.show_lane_selections();
+            }
+            AudioToUi::Disconnected { reason } => {
+                self.state
+                    .notify(format!("{} {reason}", tr("Audio disconnected:")));
+                // `"Output Disconnected"` (`FxController.cpp:1170`).
+                self.notify(Message::output_disconnected());
+            }
+            AudioToUi::Error { message, .. } => {
+                self.state.notify(message);
+            }
+            AudioToUi::EchoCancel { running, detail } => {
+                self.state.echo_cancel_running = running;
+                self.echo_cancel_detail = detail;
+            }
+            AudioToUi::RememberedDefault {
+                direction,
+                node_name,
+            } => {
+                // Straight to the settings file. The audio thread's own copy dies with the
+                // process, and the three ways a process dies without warning — SIGKILL, the OOM
+                // killer, a power cut — are exactly the ones that leave the session default
+                // naming a node that is gone.
+                if self.settings.remembered_default(direction) != node_name {
+                    self.settings.set_remembered_default(direction, &node_name);
+                    self.settings_dirty = true;
+                }
+            }
+            // Per-device volume (U10) and warnings (U9): what the application does with them
+            // arrives with those items.
+            AudioToUi::TargetVolume(_) | AudioToUi::Warning { .. } => {}
         }
-        self.state.devices = devices;
-        self.saved_device_for_engine()
     }
 
-    /// The engine starts in the output direction and picks by the device rules alone; the saved
-    /// choice — and with it a saved microphone — reaches it from here, the first time that device
-    /// is listed, for the lane [`lane_to_announce`] names.
-    fn saved_device_for_engine(&mut self) -> Option<UiToAudio> {
-        let direction = lane_to_announce(&self.settings, self.last_picked_lane)?;
-        saved_device_to_announce(
-            &self.settings,
-            direction,
-            &self.state.devices,
-            &mut self.announced_device,
-        )
+    /// Hand a control-plane request to the engine, when there is one.
+    fn send(&self, message: UiToAudio) {
+        if let Some(engine) = &self.engine {
+            engine.send(message);
+        }
+    }
+
+    /// Take a device list from the engine, and say what, if anything, the engine has to be told.
+    ///
+    /// Each lane shows what the engine says it is attached to, else keeps the user's choice across
+    /// a rescan when the device is still there, and otherwise falls back to whatever the server
+    /// calls the default. A detached lane shows nothing: that is what `Off` means.
+    fn adopt_device_list(&mut self, devices: Vec<AudioDevice>) -> Vec<UiToAudio> {
+        self.devices_seen = true;
+        self.state.devices = devices;
+        self.show_lane_selections();
+        self.saved_devices_for_engine()
+    }
+
+    /// Point each lane's combo at the device it is on (see [`lane_selection`]).
+    fn show_lane_selections(&mut self) {
+        for direction in DeviceDirection::ALL {
+            let selection = lane_selection(
+                &self.settings,
+                &self.state.devices,
+                direction,
+                self.attached[lane_index(direction)].as_deref(),
+            );
+            self.state.set_selection(direction, selection);
+        }
+    }
+
+    /// The engine starts with the output lane enabled and attached by the device rules alone, and
+    /// the input lane detached; each enabled lane's saved choice reaches it from here, the first
+    /// time that device is listed (see [`saved_device_to_announce`]). Outputs first.
+    ///
+    /// Never the edit direction: that says which chain the window shows, and looking at the other
+    /// lane's list must not change what the engine runs (0.4.0 design, §1.1) — least of all
+    /// attach a lane the user switched off.
+    fn saved_devices_for_engine(&mut self) -> Vec<UiToAudio> {
+        DeviceDirection::ALL
+            .into_iter()
+            .filter_map(|direction| {
+                saved_device_to_announce(
+                    &self.settings,
+                    &self.state.devices,
+                    direction,
+                    &mut self.announced_device[lane_index(direction)],
+                )
+            })
+            .collect()
     }
 
     /// Act on everything the views reported this frame.
@@ -526,10 +540,13 @@ impl App {
                 // equalizer or the leveller. That also makes the power button the one recovery a
                 // user with broken-sounding audio will reach for first, so it has to be the one
                 // that actually clears the history. Both the tray and `--power` route here.
+                // Power is one switch over both chains, so both lanes are reset.
                 if self.state.power
                     && let Some(engine) = &self.engine
                 {
-                    engine.send_event(DspEvent::ResetFilterState);
+                    for direction in DeviceDirection::ALL {
+                        engine.send_event(direction, DspEvent::ResetFilterState);
+                    }
                 }
             }
             UiAction::ToggleView => {
@@ -762,7 +779,7 @@ impl App {
                 .set_preset_for_direction(DeviceDirection::Input, &name);
             self.settings_dirty = true;
             if let Some(engine) = &self.engine {
-                engine.send_event(DspEvent::ResetFilterState);
+                engine.send_event(DeviceDirection::Input, DspEvent::ResetFilterState);
             }
             return;
         }
@@ -792,9 +809,10 @@ impl App {
                 self.settings
                     .set_preset_for_direction(DeviceDirection::Output, &name);
                 self.settings_dirty = true;
-                // A new band layout means the old filter history is meaningless.
+                // A new band layout means the old filter history is meaningless. A `.fac` preset
+                // is the music chain's.
                 if let Some(engine) = &self.engine {
-                    engine.send_event(DspEvent::ResetFilterState);
+                    engine.send_event(DeviceDirection::Output, DspEvent::ResetFilterState);
                 }
             }
             Err(err) => {
@@ -962,8 +980,10 @@ impl App {
         self.settings_dirty = true;
         self.mark_preset_modified();
         self.sync_params_from_state();
+        // The new ladder is the edited chain's; the other lane keeps its own curve until it is
+        // edited, so only this lane's filter history is stale.
         if let Some(engine) = &self.engine {
-            engine.send_event(DspEvent::ResetFilterState);
+            engine.send_event(self.state.direction, DspEvent::ResetFilterState);
         }
     }
 
@@ -1081,9 +1101,11 @@ impl App {
 
         self.state.set_selection(direction, Some(index));
         self.settings.set_device_name(direction, &name);
+        // Picking a device switches its lane on, and says nothing about the other lane: the
+        // engine runs both, and choosing speakers leaves the microphone as it was. Recorded so
+        // the next start attaches it again.
         self.settings.set_lane_enabled(direction, true);
         self.settings_dirty = true;
-        self.last_picked_lane = Some(direction);
         // The interface follows the device immediately rather than waiting for the next device
         // list: picking a microphone is exactly the moment the five effect sliders stop meaning
         // anything, and a frame of them still looking live is a frame of lying.
@@ -1093,7 +1115,7 @@ impl App {
                 node_name: name.clone(),
                 direction,
             });
-            self.announced_device = Some((name.clone(), direction));
+            self.announced_device[lane_index(direction)] = Some(name.clone());
         }
 
         // A device the user has used before brings its preset back with it. Only a *remembered*
@@ -1131,38 +1153,20 @@ impl App {
 
     /// Detach a lane: hand its default back, stop processing it, remember that it is off.
     ///
-    /// The engine this crate runs against today has one lane and ignores `DetachLane`. So that
-    /// switching off the lane it serves still does something, it is then sent the other lane's
-    /// saved device when that lane is enabled — which is where the two-lane engine would be
-    /// running anyway. With both lanes off it keeps what it had until the two-lane engine lands.
+    /// The engine tears the lane's nodes down and answers with `Attached { None }`; the other lane
+    /// is not touched, whichever of the two the window is editing. With both lanes off FxSound
+    /// processes nothing, which is what the two `Off` rows say.
     fn detach_lane(&mut self, direction: DeviceDirection) {
         self.state.set_selection(direction, None);
-        match direction {
-            DeviceDirection::Output => self.state.output_active = false,
-            DeviceDirection::Input => self.state.input_active = false,
-        }
+        set_lane_active(&mut self.state, direction, false);
         self.settings.set_lane_enabled(direction, false);
         self.settings_dirty = true;
         if let Some(engine) = &self.engine {
             engine.send(UiToAudio::DetachLane(direction));
         }
-        // Picking the same device again has to reach the engine again.
-        if self
-            .announced_device
-            .as_ref()
-            .is_some_and(|(_, announced)| *announced == direction)
-        {
-            self.announced_device = None;
-        }
-        if self.last_picked_lane == Some(direction) {
-            self.last_picked_lane = None;
-        }
-        if self.engine.is_some()
-            && let Some(message) = self.saved_device_for_engine()
-            && let Some(engine) = &self.engine
-        {
-            engine.send(message);
-        }
+        // Picking the same device again, or the saved one reappearing once the lane is back on,
+        // has to reach the engine again.
+        self.announced_device[lane_index(direction)] = None;
     }
 
     /// Make `direction` the lane the window edits. Returns whether it changed.
@@ -1264,8 +1268,8 @@ impl App {
 
     /// The same controls, mapped onto the microphone chain.
     ///
-    /// Both snapshots are published every time, whichever direction the engine is in: they are
-    /// state, so the audio thread always reads a current one and a direction switch needs no
+    /// Both snapshots are published every time, whichever lanes the engine is running: they are
+    /// state, so the audio thread always reads a current one and attaching a lane needs no
     /// handshake.
     ///
     /// **Who owns what.** Three controls mean the same thing on a voice as on music and are
@@ -1351,11 +1355,24 @@ impl App {
         self.save_settings_if_dirty();
     }
 
-    /// What the audio thread last said about itself — the negotiated format, and how the ring
-    /// between the two nodes is coping.
+    /// What the audio thread last said about the lane the window is editing — the negotiated
+    /// format, and how the ring between that lane's two nodes is coping.
     #[must_use]
     pub const fn audio_status(&self) -> &fxsound_core::AudioStatus {
-        &self.audio_status
+        self.audio_status_for(self.state.direction)
+    }
+
+    /// What the audio thread last said about one lane.
+    #[must_use]
+    pub const fn audio_status_for(&self, direction: DeviceDirection) -> &fxsound_core::AudioStatus {
+        &self.audio_status[lane_index(direction)]
+    }
+
+    /// The `node.name` a lane is attached to, as the engine last reported it; `None` while the
+    /// lane has no nodes — detached, reconnecting, or not attached yet.
+    #[must_use]
+    pub fn attached(&self, direction: DeviceDirection) -> Option<&str> {
+        self.attached[lane_index(direction)].as_deref()
     }
 
     /// Whether a device list has ever arrived.
@@ -1518,7 +1535,8 @@ impl App {
             input_chain: fxsound_preset::input::DEFAULT_CHAIN.to_owned(),
             input_presets: Vec::new(),
             devices_seen: false,
-            audio_status: fxsound_core::AudioStatus::default(),
+            audio_status: [fxsound_core::AudioStatus::default(); 2],
+            attached: [None, None],
             pending_devices: Vec::new(),
             settings: Settings::default(),
             presets: PresetStore::with_dirs(
@@ -1531,8 +1549,7 @@ impl App {
             settings_dirty: false,
             persist: false,
             export_dir: std::env::temp_dir().join("fxsound-app-test-export"),
-            announced_device: None,
-            last_picked_lane: None,
+            announced_device: [None, None],
             notifier: Notifier::new(true),
             notifications_armed: true,
             tray_tip_shown: false,
@@ -1977,6 +1994,12 @@ fn unvoiced_input_params() -> InputDspParams {
 ///
 /// - What a previous run displaced, first: if that run was killed while holding the default, the
 ///   metadata still names a node that is gone and only this can point it back at a real device.
+/// - The speakers' lane, when it was left off. The engine starts with the output lane enabled —
+///   FxSound in front of the speakers is the Windows behaviour — so `output_enabled = false` has
+///   to be said before the device rules attach it, or the speakers would be processed after
+///   every restart while the combo said `Off`. The input lane starts detached and needs no word:
+///   an enabled one is attached by its saved device the first time the list names it
+///   ([`saved_device_to_announce`]).
 /// - Echo cancellation, when it was left on. It is otherwise sent only when the checkbox is
 ///   toggled, so a saved `echo_cancel = true` came back as a pane and a strip saying it had been
 ///   asked for, while the engine was never told and `module-echo-cancel` never loaded. Off is the
@@ -1986,6 +2009,9 @@ fn startup_messages(settings: &Settings) -> Vec<UiToAudio> {
         output: settings.remembered_default_output.clone(),
         input: settings.remembered_default_input.clone(),
     }];
+    if !settings.lane_enabled(DeviceDirection::Output) {
+        messages.push(UiToAudio::DetachLane(DeviceDirection::Output));
+    }
     if settings.echo_cancel {
         messages.push(UiToAudio::SetEchoCancel(true));
     }
@@ -2020,20 +2046,70 @@ fn bands_of(centres: &[f32], boosts: &[f32]) -> Vec<EqBand> {
         .collect()
 }
 
-/// Which device a lane shows after a device list arrives: the one the settings name for it when it
-/// is listed, else the server's default of that direction; nothing at all for a detached lane.
+/// Copy what the engine's lanes measured into what the window draws.
+///
+/// The picture — the spectrum, whether anything is playing, and the rate that decides which
+/// equalizer bands can be built — is `shown`'s, the meters of the lane the window edits. The
+/// microphone's telemetry is always `microphone`'s, the input lane's: the readout strip reads it
+/// whichever lane the window shows (0.4.0 design §1.4), and one engine's meters used to hand the
+/// music chain's zeros to the strip the moment the speakers were edited.
+fn show_meters(state: &mut UiState, shown: &Meters, microphone: &Meters) {
+    state.spectrum = shown.spectrum;
+    state.audio_active = shown.active;
+    // The rate is the device's, and the interface needs it for one thing: an equalizer band
+    // centred at or above Nyquist cannot be built, and a fader that does nothing has to say so. A
+    // 16 kHz Bluetooth capture takes the top two bands of the standard ladder with it.
+    state.sample_rate = shown.sample_rate;
+
+    state.gate_reduction_db = microphone.gate_reduction_db;
+    state.deesser_running = microphone.deesser_running;
+    state.denoise_running = microphone.denoiser_running;
+    state.voice_probability = microphone.voice_probability;
+    state.compressor_reduction_db = microphone.compressor_reduction_db;
+    state.deesser_reduction_db = microphone.deesser_reduction_db;
+    // Copied as it is: `0.0` is what no measurement looks like (`Meters::default()`, and the
+    // running minimum before it has come down), and the strip reads it as a dash rather than as a
+    // room at full scale.
+    state.noise_floor_db = microphone.noise_floor_db;
+    state.denoise_reduction_db = microphone.denoise_reduction_db;
+    state.dereverb_reduction_db = microphone.dereverb_reduction_db;
+    state.deesser_hz = microphone.deesser_hz;
+}
+
+/// Record whether a lane is processing, for the strip's Floor slot, `--status` and `--watch`.
+fn set_lane_active(state: &mut UiState, direction: DeviceDirection, processing: bool) {
+    match direction {
+        DeviceDirection::Output => state.output_active = processing,
+        DeviceDirection::Input => state.input_active = processing,
+    }
+}
+
+/// Which device a lane's combo shows.
+///
+/// Nothing at all for a lane the user switched off: that is what `Off` means. Otherwise the device
+/// the engine says the lane is attached to (`attached`, from [`AudioToUi::Attached`]), when it is
+/// listed in that direction — the engine's device rules can move a lane on their own, when the
+/// saved device is unplugged or a new one is plugged in, and the combo says where the sound is
+/// really going. While the lane has no nodes — not attached yet, reconnecting, or its device gone
+/// — it shows the device the settings name for it when that is listed, else the server's default
+/// of that direction.
 fn lane_selection(
     settings: &Settings,
     devices: &[AudioDevice],
     direction: DeviceDirection,
+    attached: Option<&str>,
 ) -> Option<usize> {
     if !settings.lane_enabled(direction) {
         return None;
     }
-    let wanted = settings.device_name(direction);
-    devices
-        .iter()
-        .position(|d| d.name == wanted && d.direction == direction)
+    let listed = |name: &str| {
+        devices
+            .iter()
+            .position(|d| d.name == name && d.direction == direction)
+    };
+    attached
+        .and_then(listed)
+        .or_else(|| listed(settings.device_name(direction)))
         .or_else(|| {
             devices
                 .iter()
@@ -2041,81 +2117,53 @@ fn lane_selection(
         })
 }
 
-/// Which lane the saved device choice is announced for, while the engine has one lane to give.
-///
-/// The lane the user last picked a device for this session, while it is still enabled; else the
-/// output lane when it is enabled — the engine starts there, and running it is the Windows
-/// behaviour; else the input lane when it is enabled; else none, and the engine's own device
-/// rules are left alone.
-///
-/// Never the edit direction. That says which chain the window shows, and looking at the other
-/// lane's list must not change what the engine runs (0.4.0 design, §1.1) — least of all attach a
-/// lane the user switched off. The 0.3.0 meaning of `device_direction` ("the live lane") is not
-/// read here either: the loader has already turned it into `input_enabled`, after which it cannot
-/// be told from a 0.4.0 edit direction, so on this single-lane engine a user who left 0.3.0 on a
-/// microphone comes back to the speakers until they pick the microphone again. The two-lane
-/// engine attaches every enabled lane, and this choice goes away with it.
-fn lane_to_announce(
-    settings: &Settings,
-    last_picked: Option<DeviceDirection>,
-) -> Option<DeviceDirection> {
-    last_picked
-        .filter(|&direction| settings.lane_enabled(direction))
-        .or_else(|| {
-            [DeviceDirection::Output, DeviceDirection::Input]
-                .into_iter()
-                .find(|&direction| settings.lane_enabled(direction))
-        })
-}
-
-/// The saved device of `direction`, when it is time to send it to the engine.
+/// A lane's saved device selection, when it is time to send it to the engine.
 ///
 /// The port of `FxController::init` step 5 (`docs/spec/05-controller-model.md` §9.2): once the
 /// device list is known, a device named by the saved `output_device_name` is adopted and
-/// `setOutput` forces it. Here the engine starts in the output direction and runs the device rules
-/// on its own, so the saved choice — `settings.device_name(direction)` — is handed to it the first
-/// time that device is listed; rule 2 of `choose_device` yields to it
-/// (`docs/spec/12-audio-io.md` §28.5), and a saved microphone brings the engine round to the
-/// source direction. A detached lane is never announced.
+/// `setOutput` forces it. Here the engine starts with the output lane enabled and runs the device
+/// rules on its own, so each lane's saved choice — `settings.device_name(direction)` — is handed
+/// to it the first time that device is listed; rule 2 of `choose_device` yields to it
+/// (`docs/spec/12-audio-io.md` §28.5). A lane the settings say is off
+/// ([`Settings::lane_enabled`]) is not announced at all: a saved microphone switches the input
+/// lane on beside the speakers only when it was on when FxSound last ran, and a speakers' lane
+/// left off was detached at start-up ([`startup_messages`]) and stays so.
 ///
-/// `announced` is what was last sent. A device list that merely changed *around* the saved device
-/// sends nothing again; a device that vanished and came back is announced afresh, which the
-/// engine's own rules make a no-op when it is already attached to it. An empty saved name never
-/// matches a node, so nothing is sent on a first run.
+/// `announced` is what was last sent for this lane. A device list that merely changed *around*
+/// the saved device sends nothing again; a device that vanished and came back is announced afresh,
+/// which the engine's own rules make a no-op when the lane is already attached to it. An empty
+/// saved name never matches a node, so nothing is sent on a first run.
 fn saved_device_to_announce(
     settings: &Settings,
-    direction: DeviceDirection,
     devices: &[AudioDevice],
-    announced: &mut Option<(String, DeviceDirection)>,
+    direction: DeviceDirection,
+    announced: &mut Option<String>,
 ) -> Option<UiToAudio> {
-    let forget = |announced: &mut Option<(String, DeviceDirection)>| {
-        if announced.as_ref().is_some_and(|(_, dir)| *dir == direction) {
-            *announced = None;
-        }
-    };
-    if !settings.lane_enabled(direction) {
-        forget(announced);
-        return None;
-    }
     let wanted = settings.device_name(direction);
-    if !devices
+    let listed = devices
         .iter()
-        .any(|d| d.name == wanted && d.direction == direction)
-    {
-        forget(announced);
+        .any(|d| d.name == wanted && d.direction == direction);
+    if !listed || !settings.lane_enabled(direction) {
+        *announced = None;
         return None;
     }
-    if announced
-        .as_ref()
-        .is_some_and(|(name, dir)| name == wanted && *dir == direction)
-    {
+    if announced.as_deref() == Some(wanted) {
         return None;
     }
-    *announced = Some((wanted.to_owned(), direction));
+    *announced = Some(wanted.to_owned());
     Some(UiToAudio::SelectDevice {
         node_name: wanted.to_owned(),
         direction,
     })
+}
+
+/// Where a lane's entry sits in the `[_; 2]` tables the controller keeps per direction: outputs
+/// first, the order of [`DeviceDirection::ALL`].
+const fn lane_index(direction: DeviceDirection) -> usize {
+    match direction {
+        DeviceDirection::Output => 0,
+        DeviceDirection::Input => 1,
+    }
 }
 
 /// `~/Documents/FxSound/Presets/Export`, falling back to the home directory when the XDG user
@@ -3172,31 +3220,101 @@ mod tests {
         settings.set_lane_enabled(DeviceDirection::Input, false);
         settings.set_device_name(DeviceDirection::Input, "alsa_input.webcam");
         assert_eq!(
-            lane_selection(&settings, &devices, DeviceDirection::Output),
+            lane_selection(&settings, &devices, DeviceDirection::Output, None),
             Some(0),
             "no saved output: the server's default"
         );
         assert_eq!(
-            lane_selection(&settings, &devices, DeviceDirection::Input),
+            lane_selection(&settings, &devices, DeviceDirection::Input, None),
             None,
             "a detached lane stays off"
         );
         settings.set_lane_enabled(DeviceDirection::Input, true);
         assert_eq!(
-            lane_selection(&settings, &devices, DeviceDirection::Input),
+            lane_selection(&settings, &devices, DeviceDirection::Input, None),
             Some(2),
             "the saved microphone, not the default one"
         );
         settings.set_device_name(DeviceDirection::Input, "unplugged");
         assert_eq!(
-            lane_selection(&settings, &devices, DeviceDirection::Input),
+            lane_selection(&settings, &devices, DeviceDirection::Input, None),
             Some(1),
             "a missing device falls back to the default of its own direction"
         );
         settings.set_lane_enabled(DeviceDirection::Output, false);
         assert_eq!(
-            lane_selection(&settings, &devices, DeviceDirection::Output),
+            lane_selection(&settings, &devices, DeviceDirection::Output, None),
             None
+        );
+    }
+
+    #[test]
+    fn a_lane_shows_the_device_the_engine_attached_it_to() {
+        let devices = vec![
+            device("alsa_output.speakers", DeviceDirection::Output, true),
+            device("bluez_output.headphones", DeviceDirection::Output, false),
+            device("alsa_input.mic", DeviceDirection::Input, true),
+        ];
+        let mut settings = Settings::default();
+        settings.set_device_name(DeviceDirection::Output, "alsa_output.speakers");
+        // The engine's rules moved the speakers' lane to the headphones: the combo says where the
+        // sound really goes, not only where the user last sent it.
+        assert_eq!(
+            lane_selection(
+                &settings,
+                &devices,
+                DeviceDirection::Output,
+                Some("bluez_output.headphones")
+            ),
+            Some(1)
+        );
+        // A name the list does not carry in the lane's direction is not shown; the saved choice is.
+        for stale in ["gone", "alsa_input.mic"] {
+            assert_eq!(
+                lane_selection(&settings, &devices, DeviceDirection::Output, Some(stale)),
+                Some(0),
+                "{stale}"
+            );
+        }
+        // And a lane the user switched off stays `Off` whatever the engine last said.
+        settings.set_lane_enabled(DeviceDirection::Output, false);
+        assert_eq!(
+            lane_selection(
+                &settings,
+                &devices,
+                DeviceDirection::Output,
+                Some("bluez_output.headphones")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_attachment_moves_the_combo_and_a_rescan_keeps_it_there() {
+        let mut app = lanes();
+        app.settings
+            .set_device_name(DeviceDirection::Input, "alsa_input.mic");
+        app.settings.set_lane_enabled(DeviceDirection::Input, true);
+        app.receive(AudioToUi::Devices(app.state.devices.clone()));
+        assert_eq!(app.state.selected_output, Some(0));
+
+        app.receive(AudioToUi::Attached {
+            direction: DeviceDirection::Output,
+            node_name: Some("alsa_output.headphones".to_owned()),
+        });
+        assert_eq!(app.state.selected_output, Some(1));
+        assert_eq!(
+            app.attached(DeviceDirection::Output),
+            Some("alsa_output.headphones")
+        );
+
+        // A rescan keeps showing where the lane is, not the saved choice it moved away from.
+        app.adopt_device_list(app.state.devices.clone());
+        assert_eq!(app.state.selected_output, Some(1));
+        assert_eq!(
+            app.state.selected_input,
+            Some(2),
+            "the other lane is its own"
         );
     }
 
@@ -3502,7 +3620,7 @@ mod tests {
 
     #[test]
     fn a_restart_editing_the_microphone_still_loads_the_speakers_saved_preset() {
-        // The engine serves the speakers whenever they are on, whatever the window last edited:
+        // The engine runs the speakers whenever their lane is on, whatever the window last edited:
         // loading only the edit direction's preset left them flat after this restart.
         let app = restarted("edit-input", DeviceDirection::Input);
         assert!(
@@ -3521,8 +3639,8 @@ mod tests {
 
     #[test]
     fn a_restart_editing_the_speakers_still_loads_the_microphones_saved_preset() {
-        // Switching the speakers off hands the single-lane engine the microphone, which has to be
-        // running its own preset by then, not the unvoiced chain.
+        // The engine runs the microphone beside the speakers whenever its lane is on, so it has to
+        // be running its own preset from the start, not the unvoiced chain.
         let app = restarted("edit-output", DeviceDirection::Output);
         assert_eq!(
             app.input_params().highpass_hz,
@@ -3766,38 +3884,39 @@ mod tests {
     #[test]
     fn the_saved_device_is_announced_once_each_time_it_appears() {
         let mut settings = Settings::default();
-        settings.set_device_name(IN, "alsa_input.usb-fifine");
-        settings.set_lane_enabled(IN, true);
+        settings.set_device_name(DeviceDirection::Input, "alsa_input.usb-fifine");
+        settings.set_lane_enabled(DeviceDirection::Input, true);
         let without = vec![device("alsa_output.pci", DeviceDirection::Output, true)];
         let with = vec![
             device("alsa_output.pci", DeviceDirection::Output, true),
             device("alsa_input.usb-fifine", DeviceDirection::Input, false),
         ];
         let mut announced = None;
+        let input = DeviceDirection::Input;
 
         // Not listed yet: nothing to say.
         assert_eq!(
-            saved_device_to_announce(&settings, IN, &without, &mut announced),
+            saved_device_to_announce(&settings, &without, input, &mut announced),
             None
         );
         // Listed: announced exactly once…
         assert_eq!(
-            saved_device_to_announce(&settings, IN, &with, &mut announced),
+            saved_device_to_announce(&settings, &with, input, &mut announced),
             Some(UiToAudio::SelectDevice {
                 node_name: "alsa_input.usb-fifine".to_owned(),
                 direction: DeviceDirection::Input,
             })
         );
         assert_eq!(
-            saved_device_to_announce(&settings, IN, &with, &mut announced),
+            saved_device_to_announce(&settings, &with, input, &mut announced),
             None
         );
         // …and once more after it was unplugged and came back.
         assert_eq!(
-            saved_device_to_announce(&settings, IN, &without, &mut announced),
+            saved_device_to_announce(&settings, &without, input, &mut announced),
             None
         );
-        assert!(saved_device_to_announce(&settings, IN, &with, &mut announced).is_some());
+        assert!(saved_device_to_announce(&settings, &with, input, &mut announced).is_some());
     }
 
     #[test]
@@ -3808,7 +3927,7 @@ mod tests {
         let devices = vec![device("fifine", DeviceDirection::Output, true)];
         let mut announced = None;
         assert_eq!(
-            saved_device_to_announce(&settings, DeviceDirection::Input, &devices, &mut announced),
+            saved_device_to_announce(&settings, &devices, DeviceDirection::Input, &mut announced),
             None
         );
         assert!(announced.is_none());
@@ -3818,23 +3937,86 @@ mod tests {
     fn with_no_saved_device_nothing_is_announced() {
         let settings = Settings::default();
         let devices = vec![device("alsa_output.pci", DeviceDirection::Output, true)];
-        let mut announced = None;
+        for direction in DeviceDirection::ALL {
+            let mut announced = None;
+            assert_eq!(
+                saved_device_to_announce(&settings, &devices, direction, &mut announced),
+                None
+            );
+        }
+    }
+
+    /// The engine runs both lanes, so a start-up with both lanes on in the settings file brings
+    /// both saved devices back — the speakers and the microphone, not one or the other.
+    #[test]
+    fn both_lanes_saved_devices_are_announced_when_both_lanes_were_on() {
+        let mut settings = Settings::default();
+        settings.set_device_name(DeviceDirection::Output, "alsa_output.pci");
+        settings.set_device_name(DeviceDirection::Input, "alsa_input.usb-fifine");
+        settings.set_lane_enabled(DeviceDirection::Input, true);
+        // The window was last editing the speakers; that says nothing about the microphone's lane.
+        settings.set_edit_direction(DeviceDirection::Output);
+        let devices = vec![
+            device("alsa_output.pci", DeviceDirection::Output, true),
+            device("alsa_input.usb-fifine", DeviceDirection::Input, false),
+        ];
+
+        let mut announced = [None, None];
+        let sent: Vec<UiToAudio> = DeviceDirection::ALL
+            .into_iter()
+            .filter_map(|direction| {
+                saved_device_to_announce(
+                    &settings,
+                    &devices,
+                    direction,
+                    &mut announced[lane_index(direction)],
+                )
+            })
+            .collect();
         assert_eq!(
-            saved_device_to_announce(&settings, DeviceDirection::Output, &devices, &mut announced),
-            None
+            sent,
+            [
+                UiToAudio::SelectDevice {
+                    node_name: "alsa_output.pci".to_owned(),
+                    direction: DeviceDirection::Output,
+                },
+                UiToAudio::SelectDevice {
+                    node_name: "alsa_input.usb-fifine".to_owned(),
+                    direction: DeviceDirection::Input,
+                },
+            ]
         );
     }
 
-    // ---- which lane the engine is told about -----------------------------------------------
+    #[test]
+    fn a_saved_microphone_is_not_announced_while_its_lane_is_off() {
+        let mut settings = Settings::default();
+        settings.set_device_name(DeviceDirection::Input, "alsa_input.usb-fifine");
+        settings.set_lane_enabled(DeviceDirection::Input, false);
+        let devices = vec![device(
+            "alsa_input.usb-fifine",
+            DeviceDirection::Input,
+            true,
+        )];
+        let mut announced = None;
+        assert_eq!(
+            saved_device_to_announce(&settings, &devices, DeviceDirection::Input, &mut announced),
+            None,
+            "a detached lane stays detached across a restart"
+        );
+        assert!(announced.is_none());
+    }
+
+    // ---- what the engine is told about each lane ------------------------------------------
 
     const OUT: DeviceDirection = DeviceDirection::Output;
     const IN: DeviceDirection = DeviceDirection::Input;
 
-    fn select(name: &str, direction: DeviceDirection) -> Option<UiToAudio> {
-        Some(UiToAudio::SelectDevice {
+    fn select(name: &str, direction: DeviceDirection) -> UiToAudio {
+        UiToAudio::SelectDevice {
             node_name: name.to_owned(),
             direction,
-        })
+        }
     }
 
     fn both_devices() -> Vec<AudioDevice> {
@@ -3862,14 +4044,14 @@ mod tests {
         // Start-up: the speakers the settings name go to the engine, once.
         assert_eq!(
             app.adopt_device_list(both_devices()),
-            select("alsa_output.pci", OUT)
+            [select("alsa_output.pci", OUT)]
         );
         // Opening the other lane's list to look at it is a SetEditDirection and nothing more…
         app.handle(&[UiAction::SetEditDirection(IN)]);
         assert_eq!(app.settings.device_direction, IN);
         // …so the rescan that follows has nothing to tell the engine.
-        assert_eq!(app.adopt_device_list(both_devices()), None);
-        assert_eq!(app.adopt_device_list(both_devices()), None);
+        assert_eq!(app.adopt_device_list(both_devices()), []);
+        assert_eq!(app.adopt_device_list(both_devices()), []);
         assert_eq!(
             app.state.selected_input, None,
             "the microphone still shows Off"
@@ -3883,33 +4065,36 @@ mod tests {
         let mut app = app_remembering(false, IN);
         assert_eq!(
             app.adopt_device_list(both_devices()),
-            select("alsa_output.pci", OUT)
+            [select("alsa_output.pci", OUT)]
         );
         // With no speaker remembered either, the engine is left to its own device rules.
         let mut app = app_remembering(false, IN);
         app.settings.set_device_name(OUT, "");
-        assert_eq!(app.adopt_device_list(both_devices()), None);
+        assert_eq!(app.adopt_device_list(both_devices()), []);
     }
 
     #[test]
-    fn a_restart_with_both_lanes_on_announces_the_speakers_whatever_the_window_edited() {
+    fn a_restart_with_both_lanes_on_announces_both_saved_devices_whatever_the_window_edited() {
         for edit in [OUT, IN] {
             let mut app = app_remembering(true, edit);
             assert_eq!(
                 app.adopt_device_list(both_devices()),
-                select("alsa_output.pci", OUT),
+                [
+                    select("alsa_output.pci", OUT),
+                    select("alsa_input.usb-fifine", IN)
+                ],
                 "editing {edit:?}"
             );
         }
     }
 
     #[test]
-    fn with_the_speakers_switched_off_the_enabled_microphone_is_announced() {
+    fn with_the_speakers_switched_off_only_the_microphone_is_announced() {
         let mut app = app_remembering(true, OUT);
         app.settings.set_lane_enabled(OUT, false);
         assert_eq!(
             app.adopt_device_list(both_devices()),
-            select("alsa_input.usb-fifine", IN)
+            [select("alsa_input.usb-fifine", IN)]
         );
     }
 
@@ -3917,64 +4102,95 @@ mod tests {
     fn with_both_lanes_off_nothing_is_announced() {
         let mut app = app_remembering(false, IN);
         app.settings.set_lane_enabled(OUT, false);
-        assert_eq!(app.adopt_device_list(both_devices()), None);
+        assert_eq!(app.adopt_device_list(both_devices()), []);
     }
 
     #[test]
-    fn the_lane_last_picked_stays_the_one_announced_while_the_window_looks_elsewhere() {
+    fn a_start_with_the_speakers_switched_off_detaches_their_lane_before_anything_else() {
+        let mut settings = Settings::default();
+        assert!(
+            !startup_messages(&settings).contains(&UiToAudio::DetachLane(OUT)),
+            "the engine starts with the speakers' lane on, and a fresh install keeps it"
+        );
+        settings.set_lane_enabled(OUT, false);
+        let messages = startup_messages(&settings);
+        assert!(messages.contains(&UiToAudio::DetachLane(OUT)));
+        assert!(
+            !messages.contains(&UiToAudio::DetachLane(IN)),
+            "the input lane starts detached and needs no word"
+        );
+        assert!(
+            matches!(messages[0], UiToAudio::SeedRememberedDefaults { .. }),
+            "what a killed run displaced still goes first"
+        );
+    }
+
+    #[test]
+    fn each_lane_is_announced_once_wherever_the_window_looks() {
         let mut app = app_remembering(true, OUT);
         app.state.devices = both_devices();
         app.handle(&[UiAction::SelectDevice(1)]);
-        assert_eq!(app.last_picked_lane, Some(IN));
         app.handle(&[UiAction::SetEditDirection(OUT)]);
         assert_eq!(app.settings.device_direction, OUT);
-        // Headless, so the pick itself sent nothing; the list after it names the microphone, the
-        // lane that was picked — never the speakers the window has moved to.
+        // Headless, so the pick itself sent nothing; the list after it names each enabled lane's
+        // device once, the lane the window moved away from included.
         assert_eq!(
             app.adopt_device_list(both_devices()),
-            select("alsa_input.usb-fifine", IN)
+            [
+                select("alsa_output.pci", OUT),
+                select("alsa_input.usb-fifine", IN)
+            ]
         );
-        assert_eq!(app.adopt_device_list(both_devices()), None);
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        assert_eq!(app.adopt_device_list(both_devices()), []);
     }
 
     #[test]
-    fn a_device_list_that_changes_around_the_served_lane_sends_nothing_again() {
+    fn a_device_list_that_changes_around_the_saved_devices_sends_nothing_again() {
         let mut app = app_remembering(true, IN);
-        assert!(app.adopt_device_list(both_devices()).is_some());
+        assert_eq!(app.adopt_device_list(both_devices()).len(), 2);
         let mut more = both_devices();
         more.push(device("bluez_output.headset", OUT, false));
-        assert_eq!(app.adopt_device_list(more), None);
+        assert_eq!(app.adopt_device_list(more), []);
     }
 
     #[test]
-    fn switching_off_the_microphone_the_engine_serves_hands_it_back_to_the_speakers() {
+    fn switching_off_the_microphone_hands_nothing_to_the_speakers() {
         let mut app = app_remembering(true, OUT);
         app.state.devices = both_devices();
         app.handle(&[UiAction::SelectDevice(1)]);
         // What a send would have recorded, since a headless app has no engine to send to.
-        app.announced_device = Some(("alsa_input.usb-fifine".to_owned(), IN));
+        app.announced_device = [
+            Some("alsa_output.pci".to_owned()),
+            Some("alsa_input.usb-fifine".to_owned()),
+        ];
 
         app.handle(&[UiAction::DetachInput]);
 
-        assert_eq!(app.last_picked_lane, None);
         assert!(!app.settings.lane_enabled(IN));
         assert_eq!(
-            app.saved_device_for_engine(),
-            select("alsa_output.pci", OUT)
+            app.announced_device,
+            [Some("alsa_output.pci".to_owned()), None],
+            "the speakers' record is untouched"
         );
+        // The engine runs the speakers' lane already; there is nothing to move it to.
+        assert_eq!(app.saved_devices_for_engine(), []);
     }
 
     #[test]
-    fn switching_off_a_lane_the_engine_does_not_serve_leaves_the_served_one_alone() {
-        let mut app = app_remembering(true, IN);
+    fn a_lane_switched_back_on_is_announced_again() {
+        let mut app = app_remembering(true, OUT);
         app.state.devices = both_devices();
-        app.handle(&[UiAction::SelectDevice(0)]);
-        app.announced_device = Some(("alsa_output.pci".to_owned(), OUT));
-
+        app.announced_device = [
+            Some("alsa_output.pci".to_owned()),
+            Some("alsa_input.usb-fifine".to_owned()),
+        ];
         app.handle(&[UiAction::DetachInput]);
-
-        assert_eq!(app.last_picked_lane, Some(OUT));
-        assert_eq!(app.saved_device_for_engine(), None);
+        app.settings.set_lane_enabled(IN, true);
+        assert_eq!(
+            app.saved_devices_for_engine(),
+            [select("alsa_input.usb-fifine", IN)]
+        );
     }
 
     #[test]
@@ -3982,41 +4198,12 @@ mod tests {
         let mut settings = Settings::default();
         settings.set_device_name(IN, "alsa_input.usb-fifine");
         settings.set_lane_enabled(IN, false);
-        let mut announced = Some(("alsa_input.usb-fifine".to_owned(), IN));
+        let mut announced = Some("alsa_input.usb-fifine".to_owned());
         assert_eq!(
-            saved_device_to_announce(&settings, IN, &both_devices(), &mut announced),
+            saved_device_to_announce(&settings, &both_devices(), IN, &mut announced),
             None
         );
         assert_eq!(announced, None);
-        // …and a detached lane says nothing about the other lane's record.
-        let mut announced = Some(("alsa_output.pci".to_owned(), OUT));
-        assert_eq!(
-            saved_device_to_announce(&settings, IN, &both_devices(), &mut announced),
-            None
-        );
-        assert!(announced.is_some());
-    }
-
-    #[test]
-    fn the_lane_to_announce_never_follows_the_edit_direction() {
-        let mut settings = Settings::default();
-        settings.set_lane_enabled(IN, false);
-        for edit in [OUT, IN] {
-            settings.set_edit_direction(edit);
-            assert_eq!(lane_to_announce(&settings, None), Some(OUT));
-            assert_eq!(
-                lane_to_announce(&settings, Some(IN)),
-                Some(OUT),
-                "IN is off"
-            );
-        }
-        settings.set_lane_enabled(IN, true);
-        assert_eq!(lane_to_announce(&settings, Some(IN)), Some(IN));
-        settings.set_lane_enabled(OUT, false);
-        assert_eq!(lane_to_announce(&settings, None), Some(IN));
-        assert_eq!(lane_to_announce(&settings, Some(OUT)), Some(IN));
-        settings.set_lane_enabled(IN, false);
-        assert_eq!(lane_to_announce(&settings, Some(IN)), None);
     }
 
     #[test]
@@ -4034,7 +4221,161 @@ mod tests {
         assert_eq!(app.settings.device_direction, DeviceDirection::Input);
         // No engine in a headless app, so nothing was sent and nothing is on record; the
         // announcement bookkeeping only follows an actual send.
-        assert!(app.announced_device.is_none());
+        assert_eq!(app.announced_device, [None, None]);
+    }
+
+    #[test]
+    fn picking_a_microphone_switches_its_lane_on_and_leaves_the_speakers_lane_alone() {
+        let mut app = headless();
+        app.settings.set_lane_enabled(DeviceDirection::Input, false);
+        app.state.devices = vec![
+            device("alsa_output.pci", DeviceDirection::Output, true),
+            device("alsa_input.usb-fifine", DeviceDirection::Input, false),
+        ];
+
+        app.handle(&[UiAction::SelectDevice(1)]);
+        assert!(
+            app.settings.lane_enabled(DeviceDirection::Input),
+            "the next start brings the microphone back"
+        );
+        assert!(app.settings.lane_enabled(DeviceDirection::Output));
+
+        // And picking speakers afterwards says nothing about the microphone.
+        app.handle(&[UiAction::SelectDevice(0)]);
+        assert!(app.settings.lane_enabled(DeviceDirection::Input));
+        assert_eq!(
+            app.settings.device_name(DeviceDirection::Input),
+            "alsa_input.usb-fifine"
+        );
+    }
+
+    #[test]
+    fn a_status_says_whether_its_own_lane_is_active_and_nothing_about_the_other() {
+        let mut app = headless();
+        app.state.output_active = true;
+        let status = fxsound_core::AudioStatus {
+            processing: true,
+            sample_rate: 16_000,
+            channels: 1,
+            ..fxsound_core::AudioStatus::default()
+        };
+        app.receive(AudioToUi::Status {
+            direction: DeviceDirection::Input,
+            status,
+        });
+        assert!(app.state.input_active);
+        assert!(app.state.output_active, "the speakers said nothing");
+        assert_eq!(app.audio_status_for(DeviceDirection::Input), &status);
+        assert_eq!(
+            app.audio_status_for(DeviceDirection::Output),
+            &fxsound_core::AudioStatus::default()
+        );
+
+        app.receive(AudioToUi::Status {
+            direction: DeviceDirection::Output,
+            status: fxsound_core::AudioStatus {
+                processing: false,
+                ..status
+            },
+        });
+        assert!(!app.state.output_active);
+        assert!(app.state.input_active);
+    }
+
+    #[test]
+    fn a_lane_that_loses_its_nodes_stops_being_active_at_once() {
+        let mut app = lanes();
+        app.state.output_active = true;
+        app.state.input_active = true;
+        app.receive(AudioToUi::Attached {
+            direction: DeviceDirection::Input,
+            node_name: None,
+        });
+        assert!(!app.state.input_active);
+        assert!(app.state.output_active, "the other lane is its own");
+        assert_eq!(app.attached(DeviceDirection::Input), None);
+    }
+
+    #[test]
+    fn the_picture_is_the_edited_lanes_and_the_microphone_telemetry_the_input_lanes() {
+        let music = Meters {
+            active: true,
+            sample_rate: 48_000,
+            gate_reduction_db: 0.0,
+            noise_floor_db: 0.0,
+            ..Meters::default()
+        };
+        let mut voice = Meters {
+            active: false,
+            sample_rate: 16_000,
+            gate_reduction_db: 7.5,
+            noise_floor_db: -52.0,
+            voice_probability: 0.9,
+            denoise_reduction_db: 11.0,
+            ..Meters::default()
+        };
+        voice.spectrum[0] = 0.5;
+
+        // Editing the speakers: the analyser and the band limit are the music chain's, and the
+        // strip still reads the microphone.
+        let mut state = UiState::default();
+        show_meters(&mut state, &music, &voice);
+        assert!(state.audio_active);
+        assert_eq!(state.sample_rate, 48_000);
+        assert_eq!(state.spectrum, music.spectrum);
+        assert_eq!(state.gate_reduction_db, 7.5);
+        assert_eq!(state.noise_floor_db, -52.0);
+        assert_eq!(state.voice_probability, 0.9);
+        assert_eq!(state.denoise_reduction_db, 11.0);
+
+        // Editing the microphone: both are the voice chain's.
+        show_meters(&mut state, &voice, &voice);
+        assert!(!state.audio_active);
+        assert_eq!(state.sample_rate, 16_000);
+        assert_eq!(state.spectrum, voice.spectrum);
+        assert_eq!(state.gate_reduction_db, 7.5);
+    }
+
+    #[test]
+    fn an_engine_error_and_a_disconnect_are_shown_as_notices() {
+        let mut app = headless();
+        app.receive(AudioToUi::Disconnected {
+            reason: "gone".to_owned(),
+        });
+        assert!(
+            app.state
+                .notification
+                .as_deref()
+                .is_some_and(|text| text.ends_with("gone")),
+            "{:?}",
+            app.state.notification
+        );
+        app.receive(AudioToUi::Error {
+            direction: Some(DeviceDirection::Input),
+            message: "no microphone".to_owned(),
+        });
+        assert_eq!(app.state.notification.as_deref(), Some("no microphone"));
+    }
+
+    #[test]
+    fn the_status_shown_is_the_edited_lanes_and_each_lane_keeps_its_own() {
+        let mut app = headless();
+        app.audio_status[lane_index(DeviceDirection::Output)].channels = 8;
+        app.audio_status[lane_index(DeviceDirection::Input)].sample_rate = 16_000;
+        app.attached[lane_index(DeviceDirection::Input)] = Some("alsa_input.usb-fifine".to_owned());
+
+        app.state.direction = DeviceDirection::Output;
+        assert_eq!(app.audio_status().channels, 8);
+        app.state.direction = DeviceDirection::Input;
+        assert_eq!(app.audio_status().sample_rate, 16_000);
+        assert_eq!(app.audio_status().channels, 2, "not the output lane's");
+
+        assert_eq!(app.audio_status_for(DeviceDirection::Output).channels, 8);
+        assert_eq!(
+            app.attached(DeviceDirection::Input),
+            Some("alsa_input.usb-fifine")
+        );
+        assert_eq!(app.attached(DeviceDirection::Output), None);
     }
 
     // ---- presets on disk: rename, import, export -------------------------------------------

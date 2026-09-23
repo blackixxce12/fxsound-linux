@@ -15,7 +15,16 @@ fxsound-dsp = { workspace = true }
 # Features are additive on top of the workspace pin, so the version stays workspace-owned.
 pipewire = { workspace = true, features = ["v0_3_65"] }
 libspa = { workspace = true, features = ["v0_3_65"] }
+# `pipewire` 0.10.1 wraps no `pw_context_load_module`, and the echo canceller is a module
+# (`src/aec.rs`, `docs/0.4.0-design.md` §7). The same version `pipewire` itself links, so the
+# pointers its safe types hand out are the pointers these bindings take.
+pipewire-sys = { workspace = true }
 crossbeam-channel = { workspace = true }
 triple_buffer = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Only `graph_churn`'s tests use it, to read the format one of our nodes holds out of `pw-dump`'s
+# JSON rather than out of a status the engine is right not to send.
+serde_json = { workspace = true }

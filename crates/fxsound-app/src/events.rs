@@ -379,8 +379,9 @@ impl Snapshot {
                 });
             }
 
-            // One engine status for now; the two-lane controller keeps one per lane.
-            let status = app.audio_status();
+            // Each lane's own format: a 16 kHz headset microphone beside 48 kHz speakers reports
+            // two different rates.
+            let status = app.audio_status_for(direction);
             let active = match direction {
                 DeviceDirection::Output => state.output_active,
                 DeviceDirection::Input => state.input_active,
@@ -780,5 +781,30 @@ mod tests {
         let snapshot = Snapshot::of(&app);
         assert_eq!(snapshot.audio[0].0, LaneState::Unavailable);
         assert_eq!(snapshot.audio[1].0, LaneState::Unavailable);
+    }
+
+    #[test]
+    fn each_lane_reports_its_own_format() {
+        let mut app = App::headless_for_tests();
+        let mut snapshot = Snapshot::of(&app);
+        // A 16 kHz headset microphone beside speakers that have not said anything new.
+        app.receive(fxsound_core::AudioToUi::Status {
+            direction: DeviceDirection::Input,
+            status: fxsound_core::AudioStatus {
+                sample_rate: 16_000,
+                channels: 1,
+                ..fxsound_core::AudioStatus::default()
+            },
+        });
+        assert_eq!(
+            changes(&mut snapshot, &app),
+            [AppEvent::AudioState {
+                direction: DeviceDirection::Input,
+                state: LaneState::Unavailable,
+                sample_rate: 16_000,
+                channels: 1,
+            }],
+            "the speakers' lane kept its own format, so it has nothing to report"
+        );
     }
 }

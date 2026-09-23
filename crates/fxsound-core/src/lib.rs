@@ -16,7 +16,7 @@ pub mod i18n;
 pub mod messages;
 pub mod settings;
 
-pub use messages::{AudioToUi, UiToAudio};
+pub use messages::{AudioToUi, TargetVolume, UiToAudio};
 pub use settings::{Settings, ThemeMode, ViewMode};
 
 /// The five user-facing effects, in the order the GUI lays them out.
@@ -315,6 +315,19 @@ pub mod limits {
     pub const DENOISE_VOICE_PRESERVATION: std::ops::RangeInclusive<f32> = 0.0..=1.0;
     /// The wet/dry mix; `1` is fully denoised. A fraction.
     pub const DENOISE_WET_DRY: std::ops::RangeInclusive<f32> = 0.0..=1.0;
+
+    // ---- per-target volume ----
+
+    /// One remembered `channelVolumes` entry of FxSound's own node, as the linear amplitude
+    /// PipeWire's `Props` carry. The top is +12 dB: a little above the +11 dB pavucontrol's
+    /// slider stops at, so whatever a mixer's slider can set survives. A larger number — `pactl`
+    /// can ask for one, and so can a hand edit — is clamped rather than replayed as it is,
+    /// because it lands on the node the user is listening through.
+    pub const TARGET_VOLUME: std::ops::RangeInclusive<f32> = 0.0..=4.0;
+    /// The most channels a remembered volume keeps: `SPA_AUDIO_MAX_CHANNELS`, the most a `Props`
+    /// object can carry. Past it an entry is a hand edit, and the tail goes rather than the whole
+    /// entry.
+    pub const TARGET_VOLUME_CHANNELS: usize = 64;
 
     /// Clamp into `range`, and substitute `fallback` for a value that is not a number at all.
     ///

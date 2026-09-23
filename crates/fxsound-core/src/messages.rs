@@ -14,6 +14,8 @@
 //! Device switching, preset file IO and anything else that can block happens on the control
 //! thread and uses [`UiToAudio`] / [`AudioToUi`], which may allocate freely.
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     AudioDevice, AudioStatus, DeEsserMode, DenoiseChannelMode, DenoiseControl, DenoiseLevel,
     DereverbLevel, Detection, DeviceDirection, Effect, EqBand, NUM_SPECTRUM_BARS, SpectrumFrame,
@@ -28,6 +30,14 @@ use crate::{
 pub struct DspParams {
     /// Master bypass. When `false` the engine passes audio through untouched.
     pub power: bool,
+    /// Hand the device silence, whatever `power` says. Set while the system sleeps (U13), so the
+    /// last buffers before suspend and the first after resume — stale filter state, a limiter
+    /// that last saw a different world — never reach the speakers.
+    ///
+    /// Silence *after* the chain rather than a bypass: the filters, the leveller and the
+    /// spectrum keep running on what comes in, so unmuting joins a chain that is already in step
+    /// with the programme instead of one that starts from whatever it held when the mute began.
+    pub mute: bool,
     /// The five effect knobs on the engine's `0.0..=1.0` scale, indexed by `Effect as usize`.
     pub effects: [f32; Effect::COUNT],
     /// Whether the graphic equalizer contributes.
@@ -144,6 +154,8 @@ impl DspParams {
             limits::VOLUME_LEVELING,
             default.volume_leveling_db,
         );
+        // `power`, `eq_on` and `mute` are left as they are: a `bool` has no value that means
+        // nothing, and a sleeping system's mute must survive the trip to the audio thread.
     }
 }
 
@@ -155,6 +167,7 @@ impl Default for DspParams {
         }
         Self {
             power: true,
+            mute: false,
             effects: [0.0; Effect::COUNT],
             eq_on: true,
             num_bands: eq::DEFAULT_BANDS as u8,
@@ -182,6 +195,11 @@ impl Default for DspParams {
 pub struct InputDspParams {
     /// Master bypass. When `false` the chain passes audio through untouched.
     pub power: bool,
+    /// Hand whoever records from FxSound (Input) silence, whatever `power` says. The same flag
+    /// as [`DspParams::mute`], for the same reason — the system is going to sleep — and applied
+    /// the same way, after the chain, so the gate, the denoiser and the calibration counters keep
+    /// following the microphone.
+    pub mute: bool,
 
     /// High-pass corner in Hz, and its order — `0` for off, `2` or `4`.
     pub highpass_hz: f32,
@@ -382,7 +400,8 @@ impl InputDspParams {
 
         // The control surface falls back to the *level's* row rather than to the default
         // snapshot's: a corrupt override on a Strong preset should leave a Strong preset, not a
-        // Medium one. The enums cannot be corrupt — a `Copy` enum has no invalid value.
+        // Medium one. The enums cannot be corrupt — a `Copy` enum has no invalid value, and
+        // neither can the switches, `mute` among them.
         self.denoise_control.sanitise(self.denoise_level.control());
     }
 }
@@ -396,6 +415,7 @@ impl Default for InputDspParams {
         }
         Self {
             power: true,
+            mute: false,
             highpass_hz: 80.0,
             highpass_order: 2,
             rnnoise: false,
@@ -561,6 +581,61 @@ impl Default for Meters {
     }
 }
 
+/// The volume of FxSound's own virtual node while it was attached to one real device (U10).
+///
+/// FxSound (Output) is one node whatever it renders to, so a mixer shows one slider for it, and
+/// WirePlumber restores one volume for it: a level set for headphones was the level the laptop
+/// speakers got after an unplug — upstream's #615, and a hearing-safety bug rather than a
+/// preference. Remembering the node's volume *per target* is what lets a new pair come up at the
+/// level the user last chose for that device. The real device's own volume is never touched.
+///
+/// Travels both ways — reported by the engine as [`AudioToUi::TargetVolume`] when the node's
+/// `Props` change, seeded back with [`UiToAudio::SeedTargetVolumes`] at start-up — and is kept in
+/// the settings file (`Settings::device_volumes`), which is why it is plain data with serde.
+/// Every field defaults, so a hand edit that leaves an entry short costs that field and not the
+/// whole file.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TargetVolume {
+    /// Which lane's node: `fxsound_sink` for output, `fxsound_source` for input.
+    pub direction: DeviceDirection,
+    /// `node.name` of the real device the lane was attached to.
+    pub target: String,
+    /// `channelVolumes` of FxSound's node, linear amplitude, one per channel in its own order.
+    pub channel_volumes: Vec<f32>,
+    /// The node's `mute`.
+    pub mute: bool,
+}
+
+impl TargetVolume {
+    /// The entry as it may be replayed onto a node, or `None` when it cannot be.
+    ///
+    /// A volume that is not a number, or is below zero, carries no level anyone set, and replaying
+    /// it — or a clamped reading of it — onto the node the user is listening through would be a
+    /// guess about their hearing; the entry goes, and the target is treated as one never seen,
+    /// which is the never-raise path. A finite volume above
+    /// [`limits::TARGET_VOLUME`](crate::limits::TARGET_VOLUME) is a level someone meant, too
+    /// loud, and is clamped. An entry with no target can match no node and goes too.
+    #[must_use]
+    pub fn sanitised(mut self) -> Option<Self> {
+        use crate::limits::{TARGET_VOLUME, TARGET_VOLUME_CHANNELS};
+
+        if self.target.is_empty()
+            || self
+                .channel_volumes
+                .iter()
+                .any(|volume| !volume.is_finite() || *volume < 0.0)
+        {
+            return None;
+        }
+        self.channel_volumes.truncate(TARGET_VOLUME_CHANNELS);
+        for volume in &mut self.channel_volumes {
+            *volume = volume.clamp(*TARGET_VOLUME.start(), *TARGET_VOLUME.end());
+        }
+        Some(self)
+    }
+}
+
 /// Control-thread requests. These may allocate and may block; they never reach the RT thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiToAudio {
@@ -607,6 +682,29 @@ pub enum UiToAudio {
     /// build does not know falls back to `"voice"` on the audio side, and says so, rather than
     /// refusing a preset written for a later version.
     SetInputChain(String),
+    /// The user's ranking of real devices for one lane, as `node.name`s, most preferred first
+    /// (U4). The device rules let a newly present device take the lane only when it is ranked
+    /// above the current one, and fall back down the list when the current one goes; unranked
+    /// devices come after every ranked one.
+    ///
+    /// Empty means "follow the system": no ranking, the session default decides — the app's
+    /// `follow_system_default` switch, and upstream's issue #629.
+    SetDevicePriority {
+        direction: DeviceDirection,
+        names: Vec<String>,
+    },
+    /// Every remembered per-target volume, from the settings file, sent once at start-up (U10).
+    /// The engine replays the matching one onto its own node when it attaches a lane to that
+    /// target. A later seed replaces the whole memory.
+    SeedTargetVolumes(Vec<TargetVolume>),
+    /// logind's `PrepareForSleep`: `true` when the system is about to sleep, `false` when it has
+    /// resumed (U13). The engine defers its device rules across the gap, since Bluetooth devices
+    /// come back under new ids; the mute itself travels in the parameter snapshots.
+    SystemSleeping(bool),
+    /// Hold the microphone open while `true`, even with nobody recording from FxSound (Input):
+    /// the calibration wizard and the microphone meters need a signal that the passive capture
+    /// stream would otherwise not have (U9, U19).
+    KeepInputAwake(bool),
 }
 
 /// Control-thread notifications for the GUI.
@@ -647,6 +745,18 @@ pub enum AudioToUi {
     /// when it is not, why: the load error verbatim, so a missing `libspa-aec-webrtc` reads as
     /// `Echo  unavailable` in the strip rather than as a stage that silently did nothing.
     EchoCancel { running: bool, detail: String },
+    /// The volume of FxSound's own node changed while attached to this target (U10). The app
+    /// persists it in `Settings::device_volumes`, replacing the entry for the same direction and
+    /// target, so the next pair built for that device starts where the user left it.
+    TargetVolume(TargetVolume),
+    /// Something that works but that the user should know, in already-translated text: one
+    /// Bluetooth headset as the target of both lanes, which drops its music to call quality (U9).
+    /// Not an [`AudioToUi::Error`], because nothing failed. `direction` names the lane it
+    /// concerns, or `None` for both.
+    Warning {
+        direction: Option<DeviceDirection>,
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -901,6 +1011,225 @@ mod tests {
             params.sanitise();
             assert_eq!(params.highpass_order, built, "order {asked}");
         }
+    }
+
+    #[test]
+    fn neither_snapshot_starts_muted() {
+        // A fresh start is never asleep, and a snapshot from before the field existed must not
+        // silence anything.
+        assert!(!DspParams::default().mute);
+        assert!(!InputDspParams::default().mute);
+    }
+
+    #[test]
+    fn sanitising_keeps_a_sleeping_systems_mute() {
+        // The mute reaches the audio thread through `sanitise`, like every other field; a
+        // sanitiser that rebuilt the snapshot from defaults would wake the speakers mid-suspend.
+        let mut output = DspParams {
+            mute: true,
+            master_gain_db: f32::NAN,
+            ..DspParams::default()
+        };
+        output.sanitise();
+        assert!(output.mute);
+        assert_eq!(output.master_gain_db, DspParams::default().master_gain_db);
+
+        let mut input = InputDspParams {
+            mute: true,
+            ceiling_db: f32::NAN,
+            ..InputDspParams::default()
+        };
+        input.sanitise();
+        assert!(input.mute);
+        assert_eq!(input.ceiling_db, InputDspParams::default().ceiling_db);
+
+        // And the other way: sanitising never mutes.
+        let mut awake = DspParams::default();
+        awake.sanitise();
+        assert!(!awake.mute);
+        let mut awake = InputDspParams::default();
+        awake.sanitise();
+        assert!(!awake.mute);
+    }
+
+    #[test]
+    fn a_mute_is_a_change_of_snapshot() {
+        // The engines skip a snapshot equal to the one they applied; a mute that compared equal
+        // would never reach the lane.
+        let muted = DspParams {
+            mute: true,
+            ..DspParams::default()
+        };
+        assert_ne!(muted, DspParams::default());
+        let muted = InputDspParams {
+            mute: true,
+            ..InputDspParams::default()
+        };
+        assert_ne!(muted, InputDspParams::default());
+    }
+
+    fn headphones(volumes: &[f32]) -> TargetVolume {
+        TargetVolume {
+            direction: DeviceDirection::Output,
+            target: "alsa_output.usb-headphones".to_owned(),
+            channel_volumes: volumes.to_vec(),
+            mute: false,
+        }
+    }
+
+    #[test]
+    fn a_remembered_volume_inside_the_range_survives_sanitising_untouched() {
+        let entry = TargetVolume {
+            mute: true,
+            ..headphones(&[0.0, 0.25, 1.0, 4.0])
+        };
+        assert_eq!(entry.clone().sanitised(), Some(entry));
+        // No channels at all is still a remembered mute.
+        let bare = TargetVolume {
+            mute: true,
+            ..headphones(&[])
+        };
+        assert_eq!(bare.clone().sanitised(), Some(bare));
+    }
+
+    #[test]
+    fn a_remembered_volume_that_is_not_a_number_drops_the_entry() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(headphones(&[0.5, bad]).sanitised(), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_negative_remembered_volume_drops_the_entry_rather_than_reading_as_silence() {
+        // Clamping −0.5 to 0 would replay a mute nobody set; dropping it makes the device one
+        // never seen, which is the never-raise path.
+        assert_eq!(headphones(&[-0.5, 0.5]).sanitised(), None);
+    }
+
+    #[test]
+    fn a_remembered_volume_above_twelve_decibels_is_clamped_not_dropped() {
+        let loud = headphones(&[9.0, 4.5]).sanitised().expect("kept");
+        assert_eq!(loud.channel_volumes, [4.0, 4.0]);
+        assert_eq!(*crate::limits::TARGET_VOLUME.end(), 4.0);
+    }
+
+    #[test]
+    fn a_remembered_volume_without_a_target_is_dropped() {
+        let nameless = TargetVolume {
+            target: String::new(),
+            ..headphones(&[0.5, 0.5])
+        };
+        assert_eq!(nameless.sanitised(), None);
+    }
+
+    #[test]
+    fn a_remembered_volume_keeps_no_more_channels_than_a_props_can_carry() {
+        let wide = headphones(&[0.5; 200]).sanitised().expect("kept");
+        assert_eq!(
+            wide.channel_volumes.len(),
+            crate::limits::TARGET_VOLUME_CHANNELS
+        );
+    }
+
+    #[test]
+    fn a_target_volume_round_trips_through_toml_under_the_designed_keys() {
+        let entry = TargetVolume {
+            direction: DeviceDirection::Input,
+            target: "alsa_input.usb-fifine".to_owned(),
+            channel_volumes: vec![0.5, 0.75],
+            mute: true,
+        };
+        let text = toml::to_string(&entry).expect("serialise");
+        for line in [
+            "direction = \"input\"",
+            "target = \"alsa_input.usb-fifine\"",
+            "channel_volumes = [0.5, 0.75]",
+            "mute = true",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in:\n{text}");
+        }
+        let back: TargetVolume = toml::from_str(&text).expect("parse");
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn a_short_target_volume_entry_fills_in_its_missing_fields() {
+        // A hand edit that leaves out a key costs that key, not the settings file around it.
+        let parsed: TargetVolume = toml::from_str("target = \"alsa_output.pci\"\n").expect("parse");
+        assert_eq!(
+            parsed,
+            TargetVolume {
+                direction: DeviceDirection::Output,
+                target: "alsa_output.pci".to_owned(),
+                channel_volumes: Vec::new(),
+                mute: false,
+            }
+        );
+    }
+
+    #[test]
+    fn the_upstream_review_messages_carry_their_lane_and_compare_by_value() {
+        let priority = UiToAudio::SetDevicePriority {
+            direction: DeviceDirection::Output,
+            names: vec!["alsa_output.usb".to_owned(), "alsa_output.pci".to_owned()],
+        };
+        assert_eq!(priority.clone(), priority);
+        assert_ne!(
+            priority,
+            UiToAudio::SetDevicePriority {
+                direction: DeviceDirection::Input,
+                names: vec!["alsa_output.usb".to_owned(), "alsa_output.pci".to_owned()],
+            },
+            "one ranking per lane"
+        );
+        // An empty ranking is a message of its own: follow the system.
+        let follow = UiToAudio::SetDevicePriority {
+            direction: DeviceDirection::Output,
+            names: Vec::new(),
+        };
+        assert_ne!(follow, priority);
+
+        let seed = UiToAudio::SeedTargetVolumes(vec![headphones(&[0.5, 0.5])]);
+        assert_eq!(seed.clone(), seed);
+        assert_ne!(
+            UiToAudio::SystemSleeping(true),
+            UiToAudio::SystemSleeping(false)
+        );
+        assert_ne!(
+            UiToAudio::KeepInputAwake(true),
+            UiToAudio::KeepInputAwake(false)
+        );
+
+        let report = AudioToUi::TargetVolume(headphones(&[0.3, 0.3]));
+        assert!(matches!(
+            &report,
+            AudioToUi::TargetVolume(TargetVolume {
+                direction: DeviceDirection::Output,
+                ..
+            })
+        ));
+        let warning = AudioToUi::Warning {
+            direction: None,
+            message: "call quality".to_owned(),
+        };
+        assert!(matches!(
+            warning,
+            AudioToUi::Warning {
+                direction: None,
+                ..
+            }
+        ));
+        assert_ne!(report, warning, "a warning is not a volume report");
+        // The same shape as an error, with the same text: still not one, so the window can show
+        // a warning without the red of a failure.
+        assert_ne!(
+            warning,
+            AudioToUi::Error {
+                direction: None,
+                message: "call quality".to_owned(),
+            },
+            "a warning is not an error, even with the same text"
+        );
     }
 
     #[test]

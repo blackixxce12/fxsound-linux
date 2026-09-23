@@ -1,5 +1,6 @@
-//! The FxSound audio backend for Linux: a PipeWire virtual sink — or, behind a microphone, a
-//! PipeWire virtual source — with the DSP engine in its process callback.
+//! The FxSound audio backend for Linux: a PipeWire virtual sink in front of the speakers and a
+//! PipeWire virtual source behind the microphone, each with its own DSP chain in its process
+//! callback, running side by side.
 //!
 //! # What this replaces
 //!
@@ -13,13 +14,16 @@
 //!
 //! # Topology
 //!
-//! Two nodes, joined by `node.link-group = "fxsound"` — the design `docs/spec/12-audio-io.md` §18
-//! chose (Option A) and §19.1 draws. FxSound runs in exactly one **direction** at a time
-//! ([`fxsound_core::DeviceDirection`]); the two directions are mirror images of each other, and
-//! the two process callbacks and the ring between them are the same code in both:
+//! One pair of nodes per **lane** — one lane per [`fxsound_core::DeviceDirection`] — the two nodes
+//! of a pair sharing a `node.link-group` of their own ([`link_group`]): the design
+//! `docs/spec/12-audio-io.md` §18 chose (Option A), §19.1 draws, and §29 extends to two lanes.
+//! Either lane can be enabled or detached on its own, and both pairs can exist at once
+//! (`docs/0.4.0-design.md` §1). The two lanes are mirror images of each other, and the two process
+//! callbacks and the ring between them are the same code in both — each lane has its own ring,
+//! its own chain and its own paths to the GUI:
 //!
 //! ```text
-//!  OUTPUT (the Windows behaviour):
+//!  OUTPUT LANE (the Windows behaviour; enabled at start):
 //!
 //!  apps ──► fxsound_sink    (Audio/Sink, Direction::Input)    process(): DSP in place ──┐
 //!                                                                                       │ ring
@@ -28,7 +32,7 @@
 //!                ▼  target.object = <chosen sink's node.name>
 //!           alsa_output.…   (the user's real speakers)
 //!
-//!  INPUT (Linux only, `docs/spec/12-audio-io.md` §28):
+//!  INPUT LANE (Linux only, `docs/spec/12-audio-io.md` §28; enabled when a microphone is picked):
 //!
 //!           alsa_input.…    (the user's real microphone)
 //!                │
@@ -46,27 +50,55 @@
 //! `audiopassthru/`. Nodes owned by our own client connection disappear the instant the socket
 //! closes.
 //!
-//! The `node.link-group` is not decoration: it is how WirePlumber learns the two nodes are one
-//! logical device and refuses to link `fxsound_output` back into `fxsound_sink` — or, in the other
-//! direction, `fxsound_capture` into `fxsound_source` — which is otherwise exactly what happens the
+//! The `node.link-group` is not decoration: it is how WirePlumber learns our nodes are one
+//! logical device and refuses to link `fxsound_output` back into `fxsound_sink` — or, in the input
+//! lane, `fxsound_capture` into `fxsound_source` — which is otherwise exactly what happens the
 //! moment our node becomes the default.
 //!
-//! Switching direction tears the active pair down and builds the other one, so the system only
-//! ever sees *one* FxSound device: "FxSound (Output)" under its sinks, or "FxSound (Input)" under
-//! its sources, with the word in the system language ([`locale`]).
+//! It is not only WirePlumber's business, either. Since 0.3.68 the PipeWire server schedules the
+//! members of a link-group together: a node made runnable by a link of its own makes every other
+//! member runnable too (`run_nodes` in `src/pipewire/context.c`). That is what lets the output
+//! lane's playback stream sleep while nothing plays into the sink (see `engine`, "Idle"), and it is
+//! why each lane has a group **of its own** — `fxsound` for the speakers, `fxsound-input` for the
+//! microphone (`docs/spec/12-audio-io.md` §29.2). WirePlumber would be content either way: each
+//! stream still shares a group with its own virtual node, which is all its refusal needs, and no
+//! link either lane needs ever joins two of our own nodes. The server is not. With one group, a
+//! capture stream fed by a microphone — which runs for as long as the input lane is enabled —
+//! made the speakers' pair runnable with it, and the speakers never went idle again while the
+//! microphone lane was on.
+//!
+//! With both lanes enabled the system sees *two* FxSound devices: "FxSound (Output)" under its
+//! sinks and "FxSound (Input)" under its sources, each with the word in the system language
+//! ([`locale`]). Detaching a lane takes only its own device away.
+//!
+//! # Echo cancellation
+//!
+//! Off by default, and on request the input lane records through PipeWire's own canceller rather
+//! than from the microphone directly (`docs/0.4.0-design.md` §7). The canceller is
+//! `libpipewire-module-echo-cancel`, loaded into this crate's PipeWire context (`aec`): it hears
+//! the microphone and the monitor of the speakers the output lane plays to, and its
+//! `fxsound_aec_source` takes the microphone's place in front of `fxsound_capture`. The three nodes
+//! it makes are FxSound's as much as the lanes' four are — named by us, in a link-group of their
+//! own ([`AEC_LINK_GROUP`]), never offered as devices — and they come and go with the microphone
+//! lane: loaded once it has a pair, reloaded when its microphone or the speakers change, unloaded
+//! when echo cancellation is switched off, when the lane is detached, and before the connection
+//! or the thread ends.
 //!
 //! # Threads
 //!
 //! Nothing in `pipewire` or `libspa` is `Send`, so the whole PipeWire side lives on one thread
 //! that this crate spawns and owns. The GUI keeps an [`EngineHandle`], which is `Send` and talks
-//! over four channels chosen for what each one carries:
+//! over paths chosen for what each one carries. Every path that reaches a chain is **per lane** —
+//! the output lane's music chain and the input lane's voice chain each have their own — so an
+//! event meant for the microphone can never be consumed by the music chain, and the two chains'
+//! meters can never overwrite each other:
 //!
-//! | Direction | Carries | Mechanism | Why |
-//! | --- | --- | --- | --- |
-//! | GUI → DSP | [`DspParams`] snapshots | [`triple_buffer`] | Wait-free on both ends, no lock, no allocation. A coalesced intermediate snapshot is harmless: the next one supersedes it. |
-//! | GUI → DSP | [`DspEvent`] one-shots | bounded `crossbeam_channel` | Must not be coalesced. Pre-allocated array channel; `try_recv` never allocates and never parks. |
-//! | DSP → GUI | [`Meters`] | [`triple_buffer`] | Same reasoning, other way round. |
-//! | GUI ↔ control | [`UiToAudio`] / [`AudioToUi`] | `pipewire::channel` / `crossbeam_channel` | May allocate and block; never touched from the process callback. |
+//! | Direction | Carries | Mechanism | Per lane | Why |
+//! | --- | --- | --- | --- | --- |
+//! | GUI → DSP | [`DspParams`] / [`InputDspParams`] snapshots | [`triple_buffer`] | one per chain: [`EngineHandle::set_params`], [`EngineHandle::set_input_params`] | Wait-free on both ends, no lock, no allocation. A coalesced intermediate snapshot is harmless: the next one supersedes it. |
+//! | GUI → DSP | [`DspEvent`] one-shots | bounded `crossbeam_channel` | one per lane: [`EngineHandle::send_event`] | Must not be coalesced. Pre-allocated array channel; `try_recv` never allocates and never parks. |
+//! | DSP → GUI | [`Meters`] | [`triple_buffer`] | one per lane: [`EngineHandle::meters`] | Same reasoning, other way round. |
+//! | GUI ↔ control | [`UiToAudio`] / [`AudioToUi`] | `pipewire::channel` / `crossbeam_channel` | shared; messages name their lane | May allocate and block; never touched from the process callback. |
 //!
 //! The process callback itself allocates nothing, locks nothing and cannot panic: every buffer it
 //! needs is sized once in [`AudioEngine::start`] for the worst case in §24 of the spec (2048
@@ -75,16 +107,17 @@
 //!
 //! # The session default
 //!
-//! Once its pair of nodes is up, FxSound **does** make itself the session default for its
-//! direction — `default.configured.audio.sink = fxsound_sink`, or
-//! `default.configured.audio.source = fxsound_source` — because that is the whole point: the user
-//! picks *their* speakers or *their* microphone in FxSound and every application follows without
-//! being re-routed by hand, exactly as the Windows driver does. It does so politely, per
-//! `docs/spec/12-audio-io.md` §21: the default that was there before is remembered first and
-//! handed back — on exit, on every direction switch, and whenever the nodes go away for good —
-//! **before** the nodes are destroyed, so there is never a window in which the default names a
-//! node that no longer exists. Only the `configured` key is ever written; `default.audio.*` is
-//! WirePlumber's. A caller can opt out with [`UiToAudio::SetAsDefault`] with `want: false`.
+//! Once a lane's pair of nodes is up, FxSound **does** make itself the session default for that
+//! lane's direction — `default.configured.audio.sink = fxsound_sink` for the output lane,
+//! `default.configured.audio.source = fxsound_source` for the input lane — because that is the
+//! whole point: the user picks *their* speakers or *their* microphone in FxSound and every
+//! application follows without being re-routed by hand, exactly as the Windows driver does. Each
+//! lane holds its own claim. It does so politely, per `docs/spec/12-audio-io.md` §21: the default
+//! that was there before is remembered first and handed back — on exit (both lanes'), when a lane
+//! is detached (that lane's), and whenever a lane's nodes go away for good — **before** the nodes
+//! are destroyed, so there is never a window in which a default names a node that no longer
+//! exists. Only the `configured` keys are ever written; `default.audio.*` is WirePlumber's. A
+//! caller can opt out, lane by lane, with [`UiToAudio::SetAsDefault`] with `want: false`.
 //!
 //! # What it deliberately does not do
 //!
@@ -102,20 +135,38 @@
 //!   WirePlumber that has never been told a default picks real hardware, not us; the default is
 //!   taken only through the explicit metadata write above, which is also the only thing that can
 //!   be handed back.
-//! * **It never runs in both directions at once.** One pair of nodes, one default, one signal.
+//! * **It never feeds one lane from the other.** The two lanes share nothing, not even a
+//!   link-group: each has its own group, its own ring, its own chain, its own counters and its own
+//!   claim on a default, so the music chain cannot reach the microphone's signal or the other way
+//!   round, the microphone running cannot keep the speakers awake, and one lane failing leaves the
+//!   other playing. Echo cancellation is the one bridge, and only while it is on: the canceller
+//!   hears what the speakers play in order to take its echo out of the microphone — nothing of it
+//!   reaches a recording — and it hears that on the microphone's clock, so the speakers and the
+//!   output pair run for as long as it does (`docs/0.4.0-design.md` §7).
 //!
 //! [`DspParams`]: fxsound_core::messages::DspParams
+//! [`InputDspParams`]: fxsound_core::messages::InputDspParams
 //! [`DspEvent`]: fxsound_core::messages::DspEvent
 //! [`Meters`]: fxsound_core::messages::Meters
 //! [`UiToAudio`]: fxsound_core::messages::UiToAudio
 //! [`AudioToUi`]: fxsound_core::messages::AudioToUi
 //! [`UiToAudio::SetAsDefault`]: fxsound_core::messages::UiToAudio::SetAsDefault
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`, for exactly one reason: the echo canceller. PipeWire's canceller is a
+// module (`libpipewire-module-echo-cancel`, `docs/0.4.0-design.md` §7), and `pipewire` 0.10.1 has
+// no binding for loading one — no `pw_context_load_module`, no `pw_impl_module` at all. So `aec`
+// calls the C functions through `pipewire-sys`, and those three functions, and nothing else in
+// the crate, carry an `#[allow(unsafe_code)]` — each `unsafe` block with the reason it is sound
+// beside it. Everything else here, the process callbacks above all, stays as safe as `forbid`
+// made it, and a new `unsafe` anywhere else still fails the build.
+#![deny(unsafe_code)]
 
+mod aec;
 pub mod devices;
 pub mod engine;
+mod lane_dsp;
 pub mod locale;
+mod per_direction;
 
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -124,6 +175,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError};
 use fxsound_core::DeviceDirection;
 use fxsound_core::messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio};
 use triple_buffer::{Input, Output, TripleBuffer};
+
+use crate::per_direction::PerDirection;
 
 pub use devices::{
     BLUEZ_HEADSET_RATE, ChannelMap, DeviceInfo, FormFactor, MAX_CHANNELS, MAX_SAMPLE_RATE,
@@ -151,17 +204,75 @@ pub const CAPTURE_NODE_NAME: &str = "fxsound_capture";
 /// [`SINK_NODE_NAME`].
 pub const SOURCE_NODE_NAME: &str = "fxsound_source";
 
-/// Every node this crate ever creates. None of them is a device FxSound could attach to, so
-/// [`DeviceInfo::from_props`] drops them by name whatever their `media.class` says.
-pub const OUR_NODE_NAMES: [&str; 4] = [
+/// `node.name` of the echo canceller's capture stream: the one that hears the microphone
+/// (`docs/0.4.0-design.md` §7).
+pub const AEC_CAPTURE_NODE_NAME: &str = "fxsound_aec_capture";
+
+/// `node.name` of the echo canceller's monitor stream: the one that hears what the speakers play,
+/// the echo it takes out of the microphone.
+pub const AEC_MONITOR_NODE_NAME: &str = "fxsound_aec_monitor";
+
+/// `node.name` of the echo canceller's source: the microphone with the echo taken out, and what the
+/// input lane's capture stream records from while echo cancellation runs.
+pub const AEC_SOURCE_NODE_NAME: &str = "fxsound_aec_source";
+
+/// The four nodes of the two lanes' pairs, in lane order: the output lane's, then the input lane's.
+pub const LANE_NODE_NAMES: [&str; 4] = [
     SINK_NODE_NAME,
     OUTPUT_NODE_NAME,
     CAPTURE_NODE_NAME,
     SOURCE_NODE_NAME,
 ];
 
-/// The `node.link-group` all our nodes carry. **Mandatory**; see the module docs.
+/// The three nodes the echo canceller's module makes while echo cancellation runs.
+pub const AEC_NODE_NAMES: [&str; 3] = [
+    AEC_CAPTURE_NODE_NAME,
+    AEC_MONITOR_NODE_NAME,
+    AEC_SOURCE_NODE_NAME,
+];
+
+/// Every node this crate ever creates, or has PipeWire create for it: [`LANE_NODE_NAMES`], then
+/// [`AEC_NODE_NAMES`]. None of them is a device FxSound could attach to, so
+/// [`DeviceInfo::from_props`] drops them by name whatever their `media.class` says. The canceller's
+/// source is an `Audio/Source` like any microphone, and offered as one it would let the input lane
+/// capture from its own canceller.
+pub const OUR_NODE_NAMES: [&str; 7] = [
+    SINK_NODE_NAME,
+    OUTPUT_NODE_NAME,
+    CAPTURE_NODE_NAME,
+    SOURCE_NODE_NAME,
+    AEC_CAPTURE_NODE_NAME,
+    AEC_MONITOR_NODE_NAME,
+    AEC_SOURCE_NODE_NAME,
+];
+
+/// The `node.link-group` of the output lane's two nodes. **Mandatory**; see the module docs.
+///
+/// The same string 0.3.0 gave its one pair, so the speakers' pair looks to anything outside the
+/// process exactly as it always has.
 pub const LINK_GROUP: &str = "fxsound";
+
+/// The `node.link-group` of the input lane's two nodes: a group of their own, not the output
+/// lane's, because the server runs a group's members together (module docs).
+pub const INPUT_LINK_GROUP: &str = "fxsound-input";
+
+/// The `node.link-group` of the echo canceller's three streams: a group of their own, neither
+/// lane's (`docs/0.4.0-design.md` §7, and `aec` for the reasoning).
+///
+/// Not the input lane's, because the input lane's capture stream links to the canceller's source,
+/// and WirePlumber refuses a link between two nodes of one group. Not the output lane's, because
+/// the server runs a group together, and the canceller's capture stream — which runs whenever the
+/// microphone does — would keep the speakers' pair running with it.
+pub const AEC_LINK_GROUP: &str = "fxsound-aec";
+
+/// The `node.link-group` of a lane's pair.
+#[must_use]
+pub const fn link_group(direction: DeviceDirection) -> &'static str {
+    match direction {
+        DeviceDirection::Output => LINK_GROUP,
+        DeviceDirection::Input => INPUT_LINK_GROUP,
+    }
+}
 
 /// The product name every description starts with, and the `media.name` of the two streams.
 ///
@@ -289,13 +400,14 @@ impl AudioEngine {
     /// device selection, creating the two nodes, taking the session default — happens in the
     /// background and is reported through [`EngineHandle::try_recv`].
     ///
-    /// The engine starts in the output direction. It attaches to the device the port of
-    /// `sndDevicesImplementDeviceRules` picks ([`devices::choose_device`]) and, as soon as the
-    /// nodes are up, makes `fxsound_sink` the configured default sink — remembering the previous
-    /// default so it can be handed back (`docs/spec/12-audio-io.md` §21). Send
-    /// [`UiToAudio::SelectDevice`] to attach to a specific device, or to a microphone, which
-    /// switches the engine into the input direction; send [`UiToAudio::SetAsDefault`] with `want: false`
-    /// to keep the default where it is.
+    /// The engine starts with the output lane enabled and the input lane detached. The output lane
+    /// attaches to the device the port of `sndDevicesImplementDeviceRules` picks
+    /// ([`devices::choose_device`]) and, as soon as its nodes are up, makes `fxsound_sink` the
+    /// configured default sink — remembering the previous default so it can be handed back
+    /// (`docs/spec/12-audio-io.md` §21). Send [`UiToAudio::SelectDevice`] to attach a lane to a
+    /// specific device — a microphone enables the input lane beside the output lane, never instead
+    /// of it — [`UiToAudio::DetachLane`] to switch a lane off, and [`UiToAudio::SetAsDefault`]
+    /// with `want: false` to keep a lane's default where it is.
     ///
     /// # Errors
     /// [`AudioError::PipewireUnavailable`] if there is no PipeWire session to connect to, or if
@@ -304,8 +416,9 @@ impl AudioEngine {
     /// [`AudioToUi`].
     ///
     /// [`UiToAudio::SelectDevice`]: fxsound_core::messages::UiToAudio::SelectDevice
+    /// [`UiToAudio::DetachLane`]: fxsound_core::messages::UiToAudio::DetachLane
     pub fn start() -> Result<EngineHandle, AudioError> {
-        Self::start_with(None, None)
+        Self::start_with(None, None, aec::WEBRTC_LIBRARY)
     }
 
     /// [`AudioEngine::start`], naming the language the virtual nodes are described in.
@@ -314,7 +427,7 @@ impl AudioEngine {
     /// so `FxSound (Вывод)` in the sound settings matches a Russian FxSound window even when the
     /// desktop locale says otherwise. `None` (plain [`AudioEngine::start`]) reads the locale.
     pub fn start_with_language(language: &str) -> Result<EngineHandle, AudioError> {
-        Self::start_with(None, Some(language))
+        Self::start_with(None, Some(language), aec::WEBRTC_LIBRARY)
     }
 
     /// [`AudioEngine::start`], against a named PipeWire socket rather than the session default.
@@ -325,12 +438,26 @@ impl AudioEngine {
     /// node in the user's live graph.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn start_with_remote(remote: Option<&str>) -> Result<EngineHandle, AudioError> {
-        Self::start_with(remote, None)
+        Self::start_with(remote, None, aec::WEBRTC_LIBRARY)
+    }
+
+    /// [`Self::start_with_remote`], with the echo canceller running `library` rather than WebRTC.
+    ///
+    /// For the tests: `aec/libspa-aec-null` passes the microphone through untouched, which is all a
+    /// test of where the canceller's nodes go needs, and a library that does not exist is how a
+    /// test makes the load fail the way a missing `libspa-aec-webrtc` would.
+    #[cfg(test)]
+    pub(crate) fn start_with_canceller(
+        remote: Option<&str>,
+        library: &'static str,
+    ) -> Result<EngineHandle, AudioError> {
+        Self::start_with(remote, None, library)
     }
 
     fn start_with(
         remote: Option<&str>,
         language: Option<&str>,
+        aec_library: &'static str,
     ) -> Result<EngineHandle, AudioError> {
         // Whether the *socket* exists is left to `pw_context_connect`, which resolves
         // `remote.name` itself and reports the failure precisely. What has to be checked first is
@@ -339,45 +466,15 @@ impl AudioEngine {
         // (`docs/spec/12-audio-io.md` §22).
         engine::preflight(std::env::var_os("XDG_RUNTIME_DIR").as_deref())?;
 
-        let (params_in, params_out) = TripleBuffer::new(&DspParams::default()).split();
-        let (input_params_in, input_params_out) =
-            TripleBuffer::new(&InputDspParams::default()).split();
-        let (meters_in, meters_out) = TripleBuffer::new(&Meters::default()).split();
-        let (events_tx, events_rx) = crossbeam_channel::bounded(EVENT_QUEUE_LEN);
-        let (ui_tx, ui_rx) = crossbeam_channel::unbounded();
-        let (control_tx, control_rx) = pipewire::channel::channel();
-        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
-
-        let config = engine::Config {
-            remote: remote.map(str::to_owned),
-            language: language.map(str::to_owned),
-            control: control_rx,
-            notify: ui_tx,
-            params: params_out,
-            input_params: input_params_out,
-            meters: meters_in,
-            events: events_rx,
-            ready: ready_tx,
-        };
+        let (mut handle, mut config, ready) = EngineHandle::wire(remote, language);
+        config.aec_library = aec_library;
         let join = std::thread::Builder::new()
             .name("fxsound-audio".to_owned())
             .spawn(move || engine::run(config))
             .map_err(|e| AudioError::PipewireUnavailable(e.to_string()))?;
+        handle.engine.join = Some(join);
 
-        let engine = AudioEngine {
-            control: control_tx,
-            join: Some(join),
-        };
-        let handle = EngineHandle {
-            engine,
-            params: params_in,
-            input_params: input_params_in,
-            meters: meters_out,
-            events: events_tx,
-            notifications: ui_rx,
-        };
-
-        match ready_rx.recv_timeout(START_TIMEOUT) {
+        match ready.recv_timeout(START_TIMEOUT) {
             // Connected, or still trying — either way the caller gets a working handle.
             Ok(Ok(())) | Err(RecvTimeoutError::Timeout) => Ok(handle),
             Ok(Err(error)) => {
@@ -431,8 +528,10 @@ pub struct EngineHandle {
     engine: AudioEngine,
     params: Input<DspParams>,
     input_params: Input<InputDspParams>,
-    meters: Output<Meters>,
-    events: Sender<DspEvent>,
+    /// Each lane's meters, through a buffer of its own.
+    meters: PerDirection<Output<Meters>>,
+    /// Each lane's event queue.
+    events: PerDirection<Sender<DspEvent>>,
     notifications: Receiver<AudioToUi>,
 }
 
@@ -446,6 +545,54 @@ impl std::fmt::Debug for EngineHandle {
 }
 
 impl EngineHandle {
+    /// Every path between the GUI and the audio thread, both ends, with no thread yet: the handle
+    /// (its engine not yet joined to anything), the thread's [`engine::Config`], and the receiver
+    /// the thread reports its first connection attempt on.
+    ///
+    /// The one place the two sides are paired, so a lane's meters buffer and event queue are
+    /// created together with the lane's ends of them and cannot be crossed over. Also the seam the
+    /// tests use to drive both lanes' DSP through a real handle without a server.
+    fn wire(
+        remote: Option<&str>,
+        language: Option<&str>,
+    ) -> (Self, engine::Config, Receiver<Result<(), AudioError>>) {
+        let (params_in, params_out) = TripleBuffer::new(&DspParams::default()).split();
+        let (input_params_in, input_params_out) =
+            TripleBuffer::new(&InputDspParams::default()).split();
+        let (meters_in, meters_out) =
+            PerDirection::from_fn(|_| TripleBuffer::new(&Meters::default()).split()).unzip();
+        let (events_tx, events_rx) =
+            PerDirection::from_fn(|_| crossbeam_channel::bounded(EVENT_QUEUE_LEN)).unzip();
+        let (ui_tx, ui_rx) = crossbeam_channel::unbounded();
+        let (control_tx, control_rx) = pipewire::channel::channel();
+        let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
+
+        let config = engine::Config {
+            remote: remote.map(str::to_owned),
+            language: language.map(str::to_owned),
+            control: control_rx,
+            notify: ui_tx,
+            params: params_out,
+            input_params: input_params_out,
+            meters: meters_in,
+            events: events_rx,
+            ready: ready_tx,
+            aec_library: aec::WEBRTC_LIBRARY,
+        };
+        let handle = Self {
+            engine: AudioEngine {
+                control: control_tx,
+                join: None,
+            },
+            params: params_in,
+            input_params: input_params_in,
+            meters: meters_out,
+            events: events_tx,
+            notifications: ui_rx,
+        };
+        (handle, config, ready_rx)
+    }
+
     /// Publish a new parameter snapshot.
     ///
     /// Wait-free: [`triple_buffer::Input::write`] is a move into a spare buffer plus one atomic
@@ -469,37 +616,51 @@ impl EngineHandle {
     /// equalizer — publishing both through one struct would mean every music preset carried a gate
     /// threshold, and the audio thread would have to know which half of its parameters to ignore.
     ///
-    /// Publishing while the engine is in the other direction is harmless and deliberate: the
-    /// snapshot is state, so whichever one the audio thread is reading is always current, and a
-    /// direction switch needs no handshake.
+    /// Publishing while the input lane has no nodes is harmless and deliberate: the snapshot is
+    /// state, so the voice chain reads a current one the moment the lane is attached, and
+    /// attaching needs no handshake.
     pub fn set_input_params(&mut self, mut params: InputDspParams) {
         params.sanitise();
         self.input_params.write(params);
     }
 
-    /// Fire a one-shot event: filter reset, spectrum reset, processed-time reset.
+    /// Fire a one-shot event at one lane's chain: filter reset, spectrum reset, processed-time
+    /// reset, capture-statistics reset.
+    ///
+    /// The lane is named here rather than in the event because each lane has its own queue, read
+    /// by its own chain and by nothing else: a reset meant for the microphone cannot clear the
+    /// music chain's history, whichever lanes are running. An event for a lane with no nodes is
+    /// applied on the audio thread's main loop, so it is neither lost nor left waiting.
     ///
     /// Unlike a parameter snapshot these must not be coalesced, so they go through a bounded
     /// queue. If the queue is full — which needs 64 unconsumed events, i.e. an audio thread that
     /// is not running — the event is dropped and logged rather than blocking the GUI.
-    pub fn send_event(&self, event: DspEvent) {
-        match self.events.try_send(event) {
+    pub fn send_event(&self, direction: DeviceDirection, event: DspEvent) {
+        match self.events.get(direction).try_send(event) {
             Ok(()) => {}
             Err(TrySendError::Full(event)) => {
-                log::warn!("dropping {event:?}: the audio thread is not draining its event queue");
+                log::warn!(
+                    "dropping {event:?} for the {} lane: the audio thread is not draining its \
+                     event queue",
+                    direction.key()
+                );
             }
             Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
-    /// The most recent meters the audio thread published.
+    /// The most recent meters the lane's chain published.
+    ///
+    /// Each lane publishes through a buffer of its own, so the music chain's spectrum and the
+    /// voice chain's gate reduction never overwrite each other. A lane that is not running keeps
+    /// the last meters it published — [`Meters::default`] until it has run at all.
     ///
     /// Never blocks and never waits: one atomic swap. Returns the last published value again when
     /// nothing new has arrived, so a GUI that polls faster than the audio callback just redraws
     /// the same frame.
     #[must_use]
-    pub fn meters(&mut self) -> Meters {
-        *self.meters.read()
+    pub fn meters(&mut self, direction: DeviceDirection) -> Meters {
+        *self.meters.get_mut(direction).read()
     }
 
     /// Send a control-plane request. Non-blocking; wakes the PipeWire loop.
@@ -517,9 +678,9 @@ impl EngineHandle {
 
     /// Stop the engine and wait for the PipeWire thread to finish tearing down.
     ///
-    /// Tearing down in order matters: if FxSound holds the session default — sink or source — it
-    /// is handed back to a real device *before* the nodes are destroyed, so there is never a
-    /// window in which the default points at a node that no longer exists
+    /// Tearing down in order matters: every session default FxSound holds — the sink, the source,
+    /// or both — is handed back to a real device *before* the nodes are destroyed, so there is
+    /// never a window in which a default points at a node that no longer exists
     /// (`docs/spec/12-audio-io.md` §21.5). The hand-back is confirmed by a server round trip
     /// before the socket closes — libpipewire does not flush on disconnect — so this returns only
     /// once `default.configured.audio.*` really has been rewritten, or after a short bounded wait
@@ -554,9 +715,27 @@ mod tests {
         fn param_channel_is_a_triple_buffer(handle: &mut EngineHandle) {
             let _: &mut Input<DspParams> = &mut handle.params;
             let _: &mut Input<InputDspParams> = &mut handle.input_params;
-            let _: &mut Output<Meters> = &mut handle.meters;
+            // Both lanes, not just the one a single-lane engine used to have: each lane's meters
+            // come back through a triple buffer of its own, and each lane's events go out through
+            // a sender of its own.
+            for direction in DeviceDirection::ALL {
+                let _: &mut Output<Meters> = handle.meters.get_mut(direction);
+                let _: &Sender<DspEvent> = handle.events.get(direction);
+            }
         }
         let _ = param_channel_is_a_triple_buffer;
+
+        // A bounded channel of non-zero capacity is crossbeam's array flavour: pre-allocated,
+        // and `try_recv` on the audio thread never allocates and never parks. Checked per lane.
+        let (handle, _config, _ready) = EngineHandle::wire(None, None);
+        for (direction, events) in handle.events.iter() {
+            assert_eq!(
+                events.capacity(),
+                Some(EVENT_QUEUE_LEN),
+                "the {} lane's event queue must be a bounded array channel",
+                direction.key()
+            );
+        }
 
         // A payload that owns heap memory would make the audio thread's `write`/`read` drop an
         // allocation. `Copy` rules that out for good. The microphone chain's snapshot is held to
@@ -595,6 +774,114 @@ mod tests {
         assert!(seen <= 9_999);
     }
 
+    /// A handle wired to both lanes' DSP, as `engine::run` builds it, with no thread and no
+    /// server: the GUI's ends and the audio thread's ends of the same paths.
+    fn wired_lanes() -> (EngineHandle, PerDirection<lane_dsp::LaneDsp>) {
+        let (handle, config, _ready) = EngineHandle::wire(None, None);
+        let (lanes, _handover) = lane_dsp::build(
+            config.params,
+            config.input_params,
+            config.meters,
+            config.events,
+        );
+        (handle, lanes)
+    }
+
+    /// Run a block of a steady tone through a lane, so its counters have something to reset.
+    fn run_a_block(dsp: &mut lane_dsp::LaneDsp) {
+        let block: Vec<u8> = (0..512 * 2)
+            .flat_map(|i| (0.25 * ((i / 2) as f32 * 0.05).sin()).to_le_bytes())
+            .collect();
+        dsp.refresh();
+        dsp.process_bytes(&block, 2)
+            .expect("a quantum of stereo fits the scratch");
+    }
+
+    #[test]
+    fn an_event_sent_to_one_lane_is_never_consumed_by_the_other_lanes_engine() {
+        let (handle, mut lanes) = wired_lanes();
+        for (_, dsp) in lanes.iter_mut() {
+            dsp.set_format(48_000.0, 2);
+            run_a_block(dsp);
+            assert!(dsp.meters().processed_samples > 0);
+        }
+
+        // A reset for the microphone. The music chain runs first and must leave it where it is.
+        handle.send_event(DeviceDirection::Input, DspEvent::ResetProcessedTime);
+        lanes.output.refresh();
+        assert!(
+            lanes.output.meters().processed_samples > 0,
+            "the music chain consumed an event addressed to the voice chain"
+        );
+        lanes.input.refresh();
+        assert_eq!(
+            lanes.input.meters().processed_samples,
+            0,
+            "the voice chain never received its own event"
+        );
+
+        // And the other way round.
+        run_a_block(&mut lanes.input);
+        handle.send_event(DeviceDirection::Output, DspEvent::ResetProcessedTime);
+        lanes.input.refresh();
+        assert!(
+            lanes.input.meters().processed_samples > 0,
+            "the voice chain consumed an event addressed to the music chain"
+        );
+        lanes.output.refresh();
+        assert_eq!(lanes.output.meters().processed_samples, 0);
+    }
+
+    #[test]
+    fn an_event_that_fills_one_lanes_queue_leaves_the_other_lanes_queue_empty() {
+        let (handle, config, _ready) = EngineHandle::wire(None, None);
+        for _ in 0..EVENT_QUEUE_LEN {
+            handle.send_event(DeviceDirection::Output, DspEvent::ResetFilterState);
+        }
+        assert!(config.events.output.is_full());
+        assert!(
+            config.events.input.is_empty(),
+            "the voice chain's queue has room for its own events whatever the music chain's holds"
+        );
+        // Full is dropped and logged, never blocking the GUI, and still never spills over.
+        handle.send_event(DeviceDirection::Output, DspEvent::ResetFilterState);
+        assert!(config.events.input.is_empty());
+        handle.send_event(DeviceDirection::Input, DspEvent::ResetCaptureStats);
+        assert_eq!(config.events.input.len(), 1);
+    }
+
+    #[test]
+    fn each_lanes_meters_are_published_through_its_own_buffer_and_do_not_overwrite_the_others() {
+        let (mut handle, mut lanes) = wired_lanes();
+        assert_eq!(handle.meters(DeviceDirection::Output), Meters::default());
+        assert_eq!(handle.meters(DeviceDirection::Input), Meters::default());
+
+        // Two rates no default could be mistaken for, one per lane.
+        lanes.output.set_format(44_100.0, 2);
+        lanes.input.set_format(96_000.0, 2);
+        lanes.output.publish_meters();
+        assert_eq!(handle.meters(DeviceDirection::Output).sample_rate, 44_100);
+        assert_eq!(
+            handle.meters(DeviceDirection::Input),
+            Meters::default(),
+            "the music chain's meters reached the voice chain's buffer"
+        );
+
+        lanes.input.publish_meters();
+        assert_eq!(handle.meters(DeviceDirection::Input).sample_rate, 96_000);
+        assert_eq!(
+            handle.meters(DeviceDirection::Output).sample_rate,
+            44_100,
+            "the voice chain's meters overwrote the music chain's"
+        );
+
+        // A lane that publishes again moves only its own reading.
+        lanes.output.set_format(48_000.0, 2);
+        lanes.output.publish_meters();
+        assert_eq!(handle.meters(DeviceDirection::Output).sample_rate, 48_000);
+        assert_eq!(handle.meters(DeviceDirection::Input).sample_rate, 96_000);
+    }
+
     #[test]
     fn the_buffer_length_setting_maps_onto_power_of_two_quanta() {
         // The Windows range, `sndDevices.h:200-201`.
@@ -622,8 +909,24 @@ mod tests {
         assert_eq!(CAPTURE_NODE_NAME, "fxsound_capture");
         assert_eq!(SOURCE_NODE_NAME, "fxsound_source");
         assert_eq!(LINK_GROUP, "fxsound");
+        assert_eq!(link_group(DeviceDirection::Output), LINK_GROUP);
+        assert_eq!(link_group(DeviceDirection::Input), INPUT_LINK_GROUP);
+        assert_ne!(
+            LINK_GROUP, INPUT_LINK_GROUP,
+            "one group for both lanes keeps the speakers running for as long as the microphone is"
+        );
         assert_eq!(our_node_name(DeviceDirection::Output), SINK_NODE_NAME);
         assert_eq!(our_node_name(DeviceDirection::Input), SOURCE_NODE_NAME);
+        // The echo canceller's three, which are ours as much as the lanes' four: never a device.
+        assert_eq!(AEC_CAPTURE_NODE_NAME, "fxsound_aec_capture");
+        assert_eq!(AEC_MONITOR_NODE_NAME, "fxsound_aec_monitor");
+        assert_eq!(AEC_SOURCE_NODE_NAME, "fxsound_aec_source");
+        assert_eq!(AEC_LINK_GROUP, "fxsound-aec");
+        assert_eq!(
+            OUR_NODE_NAMES.to_vec(),
+            [LANE_NODE_NAMES.as_slice(), AEC_NODE_NAMES.as_slice()].concat(),
+            "every node of ours is either a lane's or the canceller's"
+        );
         // Names are matched by string and written into metadata: ASCII, no spaces, all distinct.
         for name in OUR_NODE_NAMES {
             assert!(name.is_ascii() && !name.contains(' '), "{name}");

@@ -14,8 +14,14 @@ description = "RNNoise as a pure-Rust port (vendored nnnoiseless 0.5.2), with an
 bench = false
 
 [dependencies]
-# The same two dependencies nnnoiseless 0.5.2 had with its default features off. `easyfft` is the
-# FFT the port was written against (its planner is thread-local, which is the one first-use
-# allocation the denoiser documents); `once_cell` holds the window and DCT tables.
-easyfft = "0.4.1"
+# nnnoiseless 0.5.2 depended on `easyfft` and `once_cell`. `easyfft` is gone from the library: it
+# planned the FFT and kept its buffers in a per-thread cache, so the first frame denoised on the
+# audio thread allocated there. `realfft`, which `easyfft` wraps, is used directly instead, with
+# each state planning its own transforms when it is built (`src/fft.rs`). `once_cell` still holds
+# the window and DCT tables, which every constructor now builds before real time starts.
+realfft = { workspace = true }
 once_cell = "1.9.0"
+
+[dev-dependencies]
+# Only so that a test can hold `src/fft.rs` to the transform upstream computed, bit for bit.
+easyfft = "0.4.1"
