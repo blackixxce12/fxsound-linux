@@ -1019,6 +1019,23 @@ quantisation: KERNOISE_QUANTIZE_16 + KERNOISE_DITHER_SHAPED       Play32.c:414-4
 32-bit float. Port only if you can confirm it is actually applied; for a float Linux
 pipeline it should be dropped.
 
+**Where the port departs from it** (0.4.0 audit of copied Windows defects; each changes the sound;
+`docs/spec/10-dsp-effects.md` §8.9 and `crates/fxsound-dsp/src/effects/dynamic_boost.rs` have the
+detail):
+
+* **#6** — the anti-pumping floor is `min(1.06, gain_boost)`, so slider 0 never lifts loud
+  material by +0.5 dB; at every boosted setting it is unchanged.
+* **#7** — the detector is `(L² + R²)/2` of the front pair (channels 0 and 1; `M²` for mono), not
+  `in_L²`. Centred material gives the identical estimate.
+* **#8** — the envelope is clamped to its ramp's peak after `env += delta`, so it no longer
+  overshoots (a 50 Hz sine at 2× the ceiling: 2.26 → 2.00).
+* **R1** — the envelope holds the loudest leaving sample of the last ~20 ms before
+  `release_time_beta` applies (a limited 40 Hz sine: 15.6 % → 0 % THD+N).
+* **R2** — one envelope, from the loudest channel, for every channel.
+
+The limiter is `crates/fxsound-dsp/src/input/limiter.rs`, shared with the microphone chain, whose
+limiter takes #8, the hold and the linking as well.
+
 ### 9.5 Ambience → Lex reverb
 
 Mapping (`dfxpComm.cpp:571-679`, qnt `dfxpQnt.cpp:144-151`):

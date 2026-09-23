@@ -9,15 +9,17 @@
 //! Three stages, all driven from one pass over the block:
 //!
 //! ```text
-//!  in[0] ──► level += (in[0]² − level)·filt_gain      0.1 Hz one-pole, τ ≈ 1.59 s, f64
+//!  in[0], in[1] ──► level += ((in[0]² + in[1]²)/2 − level)·filt_gain   0.1 Hz one-pole, τ ≈ 1.59 s, f64
 //!              │
 //!              ├─► rms = sqrt(level)
-//!              │      if gain_boost·rms > 0.32 { gain = max(0.32/rms, 1.06) } else { gain_boost }
+//!              │      if gain_boost·rms > 0.32 { gain = max(0.32/rms, min(1.06, gain_boost)) }
+//!              │      else { gain_boost }
 //!              ▼
-//!  in[ch] ──► delay line, max_delay frames ──► env follower ──► ×(max_output/env) when env > ceiling
-//!             write: gain·max_output·in[ch]     linear attack ramp over max_delay frames,
-//!             read : the frame from max_delay    exponential release β (τ ≈ 10.18 ms)
-//!                    frames ago
+//!  in[ch] ──► delay line, max_delay frames ──► one env follower ──► ×(max_output/env) when env > ceiling
+//!             write: gain·max_output·in[ch]     for every channel, on the loudest of them:
+//!             read : the frame from max_delay   linear attack ramp over max_delay frames, stopping
+//!                    frames ago                 at its peak; hold 20 ms; exponential release β
+//!                                               (τ ≈ 10.18 ms)
 //! ```
 //!
 //! Two properties fall out of that and are what the tests pin down:
@@ -39,14 +41,34 @@
 //! nearly 6 dB at maximum — and Bass from clipping the output, so switching it off with the other
 //! effects would make the chain *less* safe, not more transparent.
 //!
-//! Two consequences the port keeps deliberately, because removing either changes what FxSound
-//! sounds like:
+//! One consequence the port keeps deliberately, because removing it changes what FxSound sounds
+//! like: whenever the master power is on, everything passes through `×0.966051` = **−0.3 dBFS**
+//! (`Maxi32.c:297`, `Play32.c:411`), even with every slider at zero.
 //!
-//! * Whenever the master power is on, everything passes through `×0.966051` = **−0.3 dBFS**
-//!   (`Maxi32.c:297`, `Play32.c:411`), even with every slider at zero.
-//! * Material loud enough to trip the auto-gain back-off gets **at least ×1.06** (+0.5 dB), even
-//!   at slider 0, because of the anti-pumping clamp at `Maxi32.c:288-289`. Quiet material at
-//!   slider 0 really is −0.3 dB; loud material at slider 0 is +0.2 dB and limited.
+//! # Where this departs from `Maxi32.c`
+//!
+//! Five changes, each a defect of the original that the 0.4.0 audit of what the port copied found
+//! audible, and each one a reason FxSound for Linux no longer sounds exactly like Windows here:
+//!
+//! * **#6 — slider 0 boosts nothing.** The anti-pumping floor at `Maxi32.c:288-289` stops the
+//!   back-off at ×1.06 (+0.5 dB) whatever the slider says, so at slider 0 — Flat, and stored values
+//!   1 to 4 — material louder than −10 dBFS RMS, which is most modern masters, was lifted by half
+//!   a decibel into the limiter, and stepped there as the level crossed the threshold. The floor
+//!   is now the smaller of 1.06 and the static boost: it still keeps a real boost from pumping,
+//!   and where there is no boost there is nothing to floor. Loud material at slider 0 is −0.3 dB,
+//!   the same as quiet material.
+//! * **#7 — the level is the front pair's.** The estimator heard the left channel alone
+//!   (`Maxi32.c:258-259`); it hears the mean square of left and right now. See
+//!   [`detector_power`].
+//! * **R2 — one envelope for every channel**, **#8 — the attack stops at its peak**, and **R1 —
+//!   a 20 ms hold before the release**: all three live in the limiter this effect drives, and are
+//!   described there ([`crate::input::limiter`]). Together they keep a one-sided peak from
+//!   shifting the stereo image by up to 5.6 dB, take off the reduction the attack's overshoot
+//!   added to every bass note and kick the limiter catches (a decibel on a steady 50 Hz sine at
+//!   twice the ceiling; on a kick it depends on the kick), and take the limiter's own distortion
+//!   of a limited bass line from 15.6 % THD+N (40 Hz, 3 dB into it) to nothing. What they cost:
+//!   a lone transient keeps the level down about 20 ms longer, and a kick-heavy mix at slider 10
+//!   comes out a little less dense (0.6 dB quieter on the synthetic one).
 //!
 //! # What is not ported
 //!
@@ -87,7 +109,8 @@ pub const MAX_LOOK_AHEAD_FRAMES: usize = 144;
 const TARGET_LEVEL: Real = 0.32;
 
 /// The anti-pumping floor from `Maxi32.c:288-289` ("11/4/04 Modifications to help fix volume
-/// pumping"). Once the back-off engages it may not reduce the boost below +0.5 dB.
+/// pumping"). Once the back-off engages it may not reduce the boost below +0.5 dB — nor, since
+/// audit #6, below the static boost when that is smaller, so it never adds a boost of its own.
 const MIN_BACKOFF_GAIN: Real = 1.06;
 
 /// `MAXIMIZE_LEVEL_FILT_CUTOFF` (`c_max.h:57`) — the level estimator's corner, in Hz.
@@ -118,6 +141,17 @@ const BOOST_MAX_SCALE: Real = 0.7;
 
 /// `DSP_PLAY_MAX_RELEASE_TIME_BETA_MIDI` (`c_play.h:66`) — the release time is fixed, not exposed.
 const RELEASE_TIME_MIDI: f64 = 85.0;
+
+/// How long the limiter holds a peak before its release starts — a departure from the original,
+/// which has no hold (audit R1).
+///
+/// The release above is 10 ms, shorter than the gap between two peaks of any bass note, so the
+/// original's gain rose and fell inside every half-cycle of a limited bass line: 15.6 % THD+N on a
+/// 40 Hz sine 3 dB into the limiter, 9.5 % at 80 Hz, and at sliders 6 to 10 the limiter works that
+/// hard on most music. Held for 20 ms, a limited tone from 25 Hz up meets one steady gain. What it
+/// costs is recovery: a lone transient keeps the level down about 20 ms longer before the same
+/// 10 ms release begins. See [`crate::input::limiter`] for how the hold follows the program.
+pub const HOLD_MS: Real = crate::input::limiter::DEFAULT_HOLD_MS;
 
 /// `MAXIMIZE_MIN_TIME_CONST` / `MAXIMIZE_MAX_TIME_CONST` (`c_max.h:38-39`), the ends of the
 /// exponential release-time table built at `dfxpQnt.cpp:409-416`.
@@ -193,14 +227,16 @@ impl DynamicBoost {
 
     /// The current level estimate as an RMS, `sqrt(s->level)`.
     ///
-    /// Tracks the left channel only, with a ~1.59 s time constant. Useful for a UI meter that
-    /// wants to show why the boost is backing off; it is the same number the loop uses.
+    /// Tracks the front pair's power (see [`detector_power`]) with a ~1.59 s time constant.
+    /// Useful for a UI meter that wants to show why the boost is backing off; it is the same
+    /// number the loop uses.
     #[must_use]
     pub fn level_rms(&self) -> Real {
         self.level.sqrt() as Real
     }
 
-    /// The peak envelope for one channel, or 0.0 for a channel this instance does not track.
+    /// The peak envelope for one channel, or 0.0 for a channel this instance does not track. Every
+    /// channel it tracks reads the same envelope: the limiter is linked.
     ///
     /// Gain reduction in dB is `20·log10(MAX_OUTPUT / env)` while `env > MAX_OUTPUT`, and zero
     /// otherwise.
@@ -257,19 +293,16 @@ impl DynamicBoost {
         self.limiter.set_sample_rate(self.sample_rate);
         self.limiter.set_lookahead_ms(LOOK_AHEAD_SECONDS * 1000.0);
         self.limiter.set_ceiling(MAX_OUTPUT);
+        self.limiter.set_hold_ms(HOLD_MS);
         self.limiter.set_release_beta(self.release_time_beta);
     }
 
     /// One sample of the level estimator plus the auto-gain back-off (`Maxi32.c:258-294`).
     ///
-    /// `input` is the **left** channel only, which is the original's documented asymmetry: a
-    /// hard-left-panned loud track drives the gain for every channel. See the note on
-    /// [`Effect::process`].
+    /// `in_sqr` is the frame's detector power, [`detector_power`]: the mean square of the front
+    /// pair, where the original took the left channel alone.
     #[inline]
-    fn update_gain(&mut self, input: Real) -> Real {
-        // `float in_sqr = in1 * in1;` — squared in f32 and only then widened, so a −190 dBFS
-        // input squares to zero here exactly as it does in the original.
-        let in_sqr: Real = input * input;
+    fn update_gain(&mut self, in_sqr: Real) -> Real {
         // `level` is a one-pole recursion with no upper bound, and the floor below is a `<`
         // comparison — false for both NaN and `+inf`, so either value latches for the rest of the
         // session. With NaN the back-off never engages again; with `+inf` it pins the gain at
@@ -295,14 +328,42 @@ impl DynamicBoost {
             // `rms` is necessarily above `TARGET_LEVEL / gain_boost` to get here, so it is far
             // from zero and this division is safe.
             let backed_off = TARGET_LEVEL / rms;
-            if backed_off < MIN_BACKOFF_GAIN {
-                MIN_BACKOFF_GAIN
+            // Audit #6: the floor is there so that removing a boost does not pump, and it may not
+            // itself become one. Below +0.5 dB of static boost — slider 0, and stored values 1 to
+            // 4 — there is nothing to remove, so the floor is the static boost: the original's
+            // flat 1.06 lifted loud material by half a decibel at a setting that promises none,
+            // and stepped there the moment the level crossed −10 dBFS RMS.
+            let floor = MIN_BACKOFF_GAIN.min(self.gain_boost);
+            if backed_off < floor {
+                floor
             } else {
                 backed_off
             }
         } else {
             self.gain_boost
         }
+    }
+}
+
+/// What the level estimator hears of one frame: `(L² + R²) / 2` of the front pair, `M²` for mono.
+///
+/// Audit #7. The original listens to the left channel only (`Maxi32.c:258-259`, *"Use just left
+/// input for level estimate"*), so a mix that is quiet on the left and loud on the right got the
+/// full +11.6 dB at slider 10 and left the right channel sitting 5.5 dB deep in the limiter,
+/// and on 5.1 the front-left speaker alone set the gain for the room. The mean of the two squares
+/// is the pair's power, and for centred material — `L = R` — it is `L²` to the last bit (the sum
+/// doubles exactly and the halving is exact), so everything the original got right it still
+/// does. On 5.1 and 7.1 the front pair is channels 0 and 1 in every layout PipeWire hands over;
+/// the centre, the LFE and the surrounds do not steer the music's level, as they did not before.
+///
+/// Squared in f32 and only then widened, as `float in_sqr = in1 * in1;` was, so a −190 dBFS
+/// input squares to zero here exactly as it does in the original.
+#[inline]
+fn detector_power(frame: &[Real]) -> Real {
+    match frame {
+        [left, right, ..] => (left * left + right * right) * 0.5,
+        [mono] => mono * mono,
+        [] => 0.0,
     }
 }
 
@@ -392,22 +453,22 @@ impl Effect for DynamicBoost {
 
     /// `Maxi32.c:237-482`, one frame at a time, in place.
     ///
-    /// Channels are independent apart from the auto-gain, which the original derives from the left
-    /// channel alone (`Maxi32.c:258-259`) and applies to both. This port keeps that: channel 0
-    /// drives the estimator, every channel gets its own delay line and envelope. On a stream with
-    /// more than [`MAX_CHANNELS`] channels the extra channels are passed through untouched rather
-    /// than panicking — the original never sees one, since its host splits multichannel streams
-    /// into per-pair instances (spec §2).
+    /// Nothing here is per channel any more but the delay lines. The front pair drives the level
+    /// estimator and the one gain it produces goes to every channel; the loudest channel drives the
+    /// one envelope and the one limiting gain it produces goes to every channel. The original ran
+    /// an envelope per channel from a left-only estimate (audit #7 and R2). On a stream with more
+    /// than [`MAX_CHANNELS`] channels the extra channels are passed through untouched rather than
+    /// panicking — the original never sees one, since its host splits multichannel streams into
+    /// per-pair instances (spec §2).
     fn process(&mut self, buffer: &mut [Real], channels: usize) {
         if channels == 0 || buffer.is_empty() {
             return;
         }
 
         for frame in buffer.chunks_exact_mut(channels) {
-            let input = frame.first().copied().unwrap_or(0.0);
             // The auto-gain, and the permanent ceiling, folded into one multiply before the frame
             // reaches the delay line — exactly where `Maxi32.c:296-301` applies them.
-            let boost = self.update_gain(input) * MAX_OUTPUT;
+            let boost = self.update_gain(detector_power(frame)) * MAX_OUTPUT;
             // Only as far as the limiter reaches. A channel past `MAX_CHANNELS` has no delay
             // line and no envelope, so boosting it would hand it an unlimited gain — it passes
             // through untouched instead, which is what the original's per-pair host guarantees and
@@ -703,11 +764,33 @@ mod tests {
                 .all(|s| s.abs() <= MAX_OUTPUT + 1e-6),
             "a frame inside the step exceeded the ceiling"
         );
-        // After the envelope settles the wall is flat at exactly the ceiling.
+        // Changed on purpose: audit report R1. This used to check that the output settles flat on
+        // the ceiling *here*, at slider 10, where the auto-gain is still backing the step off at
+        // the end of the buffer — by 1.3 dB over its last 20 ms. The original's 10 ms release
+        // chased that falling level down onto the ceiling; the hold keeps the envelope on the
+        // loudest sample of the last 20 ms instead, so while the level ahead of the limiter falls
+        // the output sits under the ceiling by as much as it fell. Bounded by that, and pinned:
         let settled = &buffer[buffer.len() - 200..];
         for s in settled {
             assert!(
-                (s.abs() - MAX_OUTPUT).abs() < 1e-4,
+                s.abs() <= MAX_OUTPUT + 1e-6 && s.abs() > MAX_OUTPUT * 0.84,
+                "settled output {s} is further under the ceiling than the hold explains"
+            );
+        }
+
+        // The flat wall itself, where the gain ahead of the limiter stands still: at slider 0 it
+        // is exactly 1.0, so a step 5.1 dB over the ceiling settles on it to the last bit or so.
+        let mut still = DynamicBoost::new(FS);
+        still.set_amount(0.0);
+        let mut buffer = vec![0.0; frames * 2];
+        for frame in buffer.as_chunks_mut::<2>().0.iter_mut().skip(1_000) {
+            frame[0] = 1.8;
+            frame[1] = -1.8;
+        }
+        still.process(&mut buffer, 2);
+        for s in &buffer[buffer.len() - 200..] {
+            assert!(
+                (s.abs() - MAX_OUTPUT).abs() < 1e-6,
                 "settled output {s} is not sitting on the ceiling"
             );
         }
@@ -784,7 +867,12 @@ mod tests {
         // overshoot at maximum.
         let mut burst = vec![4.0; 64 * 2];
         boost.process(&mut burst, 2);
-        let mut flush = vec![0.0; 256 * 2];
+        // Changed on purpose: audit report R1. The flush used to be 256 frames, enough for the
+        // burst to leave the delay line; the release now starts only once it has also left the
+        // hold window (at most nine eighths of `HOLD_MS`), so the flush outlasts both. The time
+        // constant measured after it is the original's, unchanged.
+        let hold_frames = (HOLD_MS * FS / 1_000.0) as usize * 9 / 8;
+        let mut flush = vec![0.0; (boost.latency_frames() + hold_frames + 16) * 2];
         boost.process(&mut flush, 2);
 
         let start = boost.envelope(0);
@@ -862,10 +950,15 @@ mod tests {
 
     #[test]
     fn the_back_off_never_goes_below_the_anti_pumping_floor() {
-        // At slider 0 a loud input would mathematically want 0.32/0.7 = 0.457, i.e. attenuation.
-        // `Maxi32.c:288-289` refuses to go under 1.06, so loud material at slider 0 is boosted.
+        // A loud input would mathematically want 0.32/0.7 = 0.457, i.e. attenuation.
+        // `Maxi32.c:288-289` refuses to go under 1.06, so a boost being backed off stops at +0.5 dB.
+        //
+        // Changed on purpose: audit report #6. This ran at slider 0, where the floor used to lift
+        // loud material by half a decibel over a static boost of nothing; there the floor is now
+        // the static boost (see the test below). It runs at slider 10 instead, which is what the
+        // floor was written for — a real boost being taken away — and whose answer is unchanged.
         let mut boost = DynamicBoost::new(FS);
-        boost.set_amount(0.0);
+        boost.set_amount(1.0);
         let mut block = vec![0.7; (FS * 10.0) as usize * 2];
         boost.process(&mut block, 2);
 
@@ -885,31 +978,296 @@ mod tests {
     }
 
     #[test]
-    fn the_level_estimate_follows_the_left_channel_only() {
-        // The documented asymmetry (`Maxi32.c:258-259`). Silence on the left, full scale on the
-        // right: the estimator must stay at zero, so the right channel keeps the full static
-        // boost and is held down by the peak limiter alone.
+    fn loud_material_at_slider_zero_is_not_boosted() {
+        // Audit #6. The report's scenario: slider 0, a track louder than −10 dBFS RMS. The
+        // original's anti-pumping floor took the gain from 1.0 to 1.06 as soon as the level
+        // crossed 0.32, so the output was 0.7·1.06·0.966 = +0.2 dB against the input, and into the
+        // limiter sooner than anything else at slider 0. Now it is the permanent −0.3 dB and no
+        // more, the same as quiet material.
+        let mut boost = DynamicBoost::new(FS);
+        boost.set_amount(0.0);
+        let mut block = vec![0.7; (FS * 10.0) as usize * 2];
+        boost.process(&mut block, 2);
+        assert!(
+            boost.gain_boost() * boost.level_rms() > TARGET_LEVEL,
+            "the back-off should have engaged"
+        );
+        let want = 0.7 * MAX_OUTPUT;
+        for s in &block[block.len() - 200..] {
+            assert!((s - want).abs() < 1e-6, "got {s}, expected {want}");
+        }
+        let gain_db = 20.0 * (block[block.len() - 1] / 0.7).log10();
+        assert!((gain_db + 0.3).abs() < 1e-3, "{gain_db} dB, was +0.2 dB");
+
+        // Stored values 1 to 4 have a static boost under 1.06 as well, and the same floor used to
+        // lift them to it. Each now gets its own boost and nothing more.
+        for midi in 1..=4_u8 {
+            let mut boost = DynamicBoost::new(FS);
+            boost.set_amount(fxsound_core::scale::midi_to_value(midi));
+            assert!(boost.gain_boost() < MIN_BACKOFF_GAIN, "stored {midi}");
+            let mut block = vec![0.7; (FS * 10.0) as usize * 2];
+            boost.process(&mut block, 2);
+            let want = 0.7 * boost.gain_boost() * MAX_OUTPUT;
+            let got = block[block.len() - 1];
+            assert!(
+                (got - want).abs() < 1e-6,
+                "stored {midi}: {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mix_loud_only_on_the_right_is_backed_off_like_any_other() {
+        // Changed on purpose: audit report #7. This replaces
+        // `the_level_estimate_follows_the_left_channel_only`, which pinned the original's
+        // left-only estimator (`Maxi32.c:258-259`): with a silent left and a 0.5 sine on the
+        // right, `level_rms` had to read exactly zero, so the right channel kept the full static
+        // boost and the peak limiter alone held it down. That was the defect, not a design: the
+        // estimator now hears (L² + R²)/2, and this test measures the result instead.
+        //
+        // Audit #7, the report's scenario: a quiet left channel and a loud right one at slider 10.
+        // The original heard the left alone, gave the whole mix the full +11.6 dB, and the right
+        // channel sat 5.5 dB deep in the limiter (the left came out at +11.3 dB). The estimator
+        // now hears the pair: (0.05²/2 + 0.5²/2)/2 is an RMS of 0.2512, so the boost backs off to
+        // 0.32/0.2512 = +2.1 dB and the right channel peaks at 0.617 — nowhere near the limiter.
         let mut boost = DynamicBoost::new(FS);
         boost.set_amount(1.0);
 
-        let frames = (FS * 2.0) as usize;
+        let frames = (FS * 10.0) as usize;
+        let w_left = std::f32::consts::TAU * 440.0 / FS;
+        let w_right = std::f32::consts::TAU * 660.0 / FS;
         let mut buffer = vec![0.0; frames * 2];
         for (n, frame) in buffer.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-            frame[0] = 0.0;
-            frame[1] = 0.5 * (0.05 * n as Real).sin();
+            frame[0] = 0.05 * (w_left * n as Real).sin();
+            frame[1] = 0.5 * (w_right * n as Real).sin();
         }
         boost.process(&mut buffer, 2);
 
-        assert_eq!(
-            boost.level_rms(),
-            0.0,
-            "a silent left channel must read zero"
+        let pair_rms = ((0.05_f32 * 0.05 / 2.0 + 0.5 * 0.5 / 2.0) / 2.0).sqrt();
+        assert!(
+            (boost.level_rms() - pair_rms).abs() / pair_rms < 0.01,
+            "the estimator reads {}, the pair's RMS is {pair_rms}",
+            boost.level_rms()
         );
-        let right: Vec<Real> = buffer.as_chunks::<2>().0.iter().map(|f| f[1]).collect();
-        assert!(peak(&right) <= MAX_OUTPUT + 1e-6);
-        // 0.5·3.8019·0.966051 = 1.836 asked for, so the limiter must be doing real work.
-        assert!(boost.envelope(1) > MAX_OUTPUT, "{}", boost.envelope(1));
-        assert!(boost.envelope(0) < 1e-20, "{}", boost.envelope(0));
+        let tail = &buffer.as_chunks::<2>().0[frames - FS as usize..];
+        let right: Vec<Real> = tail.iter().map(|f| f[1]).collect();
+        let left: Vec<Real> = tail.iter().map(|f| f[0]).collect();
+        assert!(peak(&right) < 0.63, "the right peaks at {}", peak(&right));
+        assert!(
+            boost.envelope(1) <= MAX_OUTPUT,
+            "the limiter is still working: {}",
+            boost.envelope(1)
+        );
+        let left_gain_db = 20.0 * (rms(&left) / (0.05 / std::f32::consts::SQRT_2)).log10();
+        assert!(
+            (left_gain_db - 1.82).abs() < 0.1,
+            "the left channel got {left_gain_db} dB, was +11.3 dB"
+        );
+    }
+
+    #[test]
+    fn a_centred_mix_is_processed_bit_for_bit_as_its_mono_channel_was() {
+        // What #7 must not change: with `L = R` the pair's mean square is `L²` exactly, and the
+        // linked limiter sees one channel's worth of peak, so a centred stereo stream comes out of
+        // this effect bit for bit as the same signal in mono — which is what the left-only
+        // original did with it too.
+        let frames = 96_000;
+        let mono: Vec<Real> = (0..frames)
+            .map(|n| {
+                let t = n as Real / FS;
+                0.6 * (std::f32::consts::TAU * 55.0 * t).sin()
+                    + 0.3 * (std::f32::consts::TAU * 1_210.0 * t).sin() * (t * 3.0).sin().abs()
+            })
+            .collect();
+        let mut single = DynamicBoost::new(FS);
+        single.set_amount(1.0);
+        let mut mono_out = mono.clone();
+        single.process(&mut mono_out, 1);
+
+        let mut pair = DynamicBoost::new(FS);
+        pair.set_amount(1.0);
+        let mut stereo: Vec<Real> = mono.iter().flat_map(|&s| [s, s]).collect();
+        pair.process(&mut stereo, 2);
+
+        assert_eq!(single.level_rms(), pair.level_rms());
+        for (n, (frame, want)) in stereo.as_chunks::<2>().0.iter().zip(&mono_out).enumerate() {
+            assert_eq!(frame[0], *want, "frame {n}, left");
+            assert_eq!(frame[1], *want, "frame {n}, right");
+        }
+    }
+
+    #[test]
+    fn on_surround_the_front_pair_sets_the_level() {
+        // Audit #7 on 5.1: the original's estimate was the front-left speaker's alone. It is the
+        // front pair's now, and the centre and the LFE — however loud — steer nothing, exactly as
+        // before; the same pair in plain stereo reads the same number. Ten seconds, so the
+        // 1.59 s estimator has converged.
+        let frames = (FS * 10.0) as usize;
+        let w = std::f32::consts::TAU * 220.0 / FS;
+        let run = |channels: usize| {
+            let mut boost = DynamicBoost::new(FS);
+            boost.set_amount(1.0);
+            let mut buffer = vec![0.0; frames * channels];
+            for (n, frame) in buffer.chunks_exact_mut(channels).enumerate() {
+                let s = (w * n as Real).sin();
+                frame[0] = 0.05 * s;
+                frame[1] = 0.5 * s;
+                for loud in frame.iter_mut().skip(2).take(2) {
+                    *loud = 0.9 * s;
+                }
+            }
+            boost.process(&mut buffer, channels);
+            boost.level_rms()
+        };
+        let stereo = run(2);
+        let surround = run(6);
+        assert_eq!(stereo, surround, "the centre or the LFE moved the level");
+        let pair_rms = ((0.05_f32 * 0.05 / 2.0 + 0.5 * 0.5 / 2.0) / 2.0).sqrt();
+        assert!((surround - pair_rms).abs() / pair_rms < 0.02, "{surround}");
+    }
+
+    #[test]
+    fn a_peak_on_one_side_turns_both_sides_down_together() {
+        // Audit R2, the report's scenario: a 200 ms peak on the right only, 5.6 dB over the
+        // ceiling. The original limited the right channel alone, so for those 200 ms the image
+        // lurched 5.6 dB to the left. Now both channels get the one gain: the ratio between them
+        // leaves exactly as it arrived, and the left comes down with the right.
+        let mut boost = DynamicBoost::new(FS);
+        boost.set_amount(0.0);
+        let frames = (FS * 1.0) as usize;
+        let burst = (FS * 0.5) as usize..(FS * 0.7) as usize;
+        let w = std::f32::consts::TAU * 1_000.0 / FS;
+        let input: Vec<[Real; 2]> = (0..frames)
+            .map(|n| {
+                let s = (w * n as Real).sin();
+                let right = if burst.contains(&n) { 1.9 } else { 0.5 };
+                [0.5 * s, right * s]
+            })
+            .collect();
+        let mut buffer: Vec<Real> = input.iter().flatten().copied().collect();
+        boost.process(&mut buffer, 2);
+
+        let delay = boost.latency_frames();
+        let mut deepest_left_db: Real = 0.0;
+        for (n, out) in buffer.as_chunks::<2>().0.iter().enumerate().skip(delay) {
+            let [left_in, right_in] = input[n - delay];
+            if left_in.abs() < 0.1 {
+                continue;
+            }
+            let ratio_in = right_in / left_in;
+            let ratio_out = out[1] / out[0];
+            assert!(
+                (ratio_out - ratio_in).abs() <= ratio_in.abs() * 1e-5,
+                "frame {n}: right/left left as {ratio_out}, arrived as {ratio_in}"
+            );
+            deepest_left_db = deepest_left_db.min(20.0 * (out[0] / (left_in * MAX_OUTPUT)).log10());
+        }
+        assert!(
+            deepest_left_db < -5.0,
+            "the left should have come down with the right: {deepest_left_db} dB"
+        );
+    }
+
+    #[test]
+    fn a_limited_bass_note_comes_out_without_the_releases_distortion() {
+        // Audit R1, the report's measurement: a sine 3 dB into the limiter. The original's 10 ms
+        // release let go between every two peaks and caught the next one, which is distortion:
+        // 19.9 % THD+N at 25 Hz, 15.6 % at 40 Hz, 9.5 % at 80 Hz, 0.58 % at 1 kHz. Held for
+        // 20 ms, a limited tone from 25 Hz up meets one steady gain.
+        for (hz, was) in [(25.0, 19.9), (40.0, 15.6), (80.0, 9.5), (1_000.0, 0.58)] {
+            let mut boost = DynamicBoost::new(FS);
+            boost.set_amount(0.0);
+            let frames = (FS * 3.0) as usize;
+            let amplitude = 10.0_f32.powf(3.0 / 20.0);
+            let mut buffer = sine(frames, 2, amplitude, hz as Real);
+            boost.process(&mut buffer, 2);
+            let left: Vec<Real> = buffer
+                .iter()
+                .step_by(2)
+                .skip(frames - FS as usize)
+                .copied()
+                .collect();
+            assert!(
+                (peak(&left) - MAX_OUTPUT).abs() < 1e-4,
+                "{hz} Hz: the limiter should be holding it on the ceiling"
+            );
+            let distortion = crate::input::limiter::thd_n(&left, hz, FS) * 100.0;
+            assert!(
+                distortion < 0.05,
+                "{hz} Hz: THD+N {distortion} %, was {was} %"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lone_transient_is_held_for_the_hold_time_then_released_as_before() {
+        // The price of R1, pinned so it cannot grow unnoticed. A 5 ms burst 10 dB over the
+        // ceiling on a quiet bed: the original let go the frame the burst had left and was fully
+        // off 11.5 ms later. Now the reduction stands for the hold, then falls at the original's
+        // 10 ms rate: fully off about 33 ms after the burst has left.
+        let mut boost = DynamicBoost::new(FS);
+        boost.set_amount(0.0);
+        let frames = (FS * 1.0) as usize;
+        let start = (FS * 0.5) as usize;
+        let burst = (FS * 0.005) as usize;
+        let mut buffer = sine(frames, 2, 0.2, 1_000.0);
+        let w = std::f32::consts::TAU * 3_000.0 / FS;
+        for (n, frame) in buffer
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .enumerate()
+            .skip(start)
+            .take(burst)
+        {
+            let s = 3.0 * (w * n as Real).sin();
+            frame[0] += s;
+            frame[1] += s;
+        }
+        let loudest = buffer
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+            .fold((0, 0.0), |(at, most), (n, f)| {
+                if f[0].abs() > most {
+                    (n, f[0].abs())
+                } else {
+                    (at, most)
+                }
+            })
+            .0;
+        let mut envelope = Vec::with_capacity(frames);
+        for frame in buffer.chunks_mut(2) {
+            boost.process(frame, 2);
+            envelope.push(boost.envelope(0));
+        }
+        let gone = start + burst + boost.latency_frames();
+        let peak_env = envelope[start..].iter().fold(0.0_f32, |m, e| m.max(*e));
+        assert!(
+            peak_env > MAX_OUTPUT * 3.0,
+            "the burst should be ~10 dB over: {peak_env}"
+        );
+
+        let ms = |frames: usize| frames as Real / FS * 1_000.0;
+        // The hold runs from the frame the loudest sample left the delay line.
+        let loudest_left = loudest + boost.latency_frames();
+        let held_until = (loudest_left..frames)
+            .find(|&n| envelope[n] < peak_env)
+            .expect("the envelope never let go");
+        let off_at = (gone..frames)
+            .find(|&n| envelope[n] <= MAX_OUTPUT)
+            .expect("the limiter never let go");
+        assert!(
+            ms(held_until - loudest_left) >= HOLD_MS,
+            "held for {} ms after the loudest sample left, was 0",
+            ms(held_until - loudest_left)
+        );
+        assert!(
+            (25.0..40.0).contains(&ms(off_at - gone)),
+            "fully off {} ms after the burst left, was 11.5",
+            ms(off_at - gone)
+        );
     }
 
     #[test]

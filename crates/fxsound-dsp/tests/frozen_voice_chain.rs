@@ -158,6 +158,17 @@ struct Fixture {
 
 /// Captured from the 0.3.0 implementation. Do not regenerate these from the current code without
 /// saying why in the commit: the point of the test is that they *cannot* be regenerated.
+///
+/// Changed on purpose, once: 0.4.0's audit of the Windows defects the port copied (#8, R1, R2)
+/// changed the limiter every chain ends in, which the Windows code and 0.3.0 shared. The windows
+/// marked below — the two loudest of each fixture that reaches the ceiling, and nothing else — were
+/// re-measured, and each keeps the 0.3.0 number beside it. The peaks now meet the ceiling instead
+/// of stopping up to 0.1 dB short of it (#8: the attack no longer overshoots); their RMS is up to
+/// 0.11 dB lower on mono (R1: the envelope holds 20 ms before it releases), 0.14 dB on the stereo
+/// fixture's right side (R1 plus R2); and the quieter right side of the stereo fixture comes down
+/// with the left, 0.35 to 0.38 dB more at its peak (R2: one gain for both sides, so the image
+/// stays where it was). Every other window of every fixture is still the 0.3.0 number, which is
+/// what shows the rest of the chain unchanged.
 const FROZEN: &[Fixture] = &[
     Fixture {
         name: "clean voice, 48 kHz, mono",
@@ -166,12 +177,12 @@ const FROZEN: &[Fixture] = &[
         set: 0,
         channel: 0,
         want: &[
-            (0.22250324, 0.70666546),
+            (0.21975054, 0.70794576), // changed on purpose: audit #8, R1 (limiter); 0.3.0 gave (0.22250324, 0.70666546)
             (0.08682354, 0.40037364),
             (0.10651136, 0.43284184),
             (0.18100421, 0.48907238),
             (0.0055342237, 0.017606888),
-            (0.22146547, 0.7067135),
+            (0.21927753, 0.7079458), // changed on purpose: audit #8, R1 (limiter); 0.3.0 gave (0.22146547, 0.7067135)
             (0.08675135, 0.39879978),
             (0.10648105, 0.43276837),
             (0.18094262, 0.49259058),
@@ -204,12 +215,12 @@ const FROZEN: &[Fixture] = &[
         set: 0,
         channel: 1,
         want: &[
-            (0.16179076, 0.5382504),
+            (0.15914705, 0.51526994), // changed on purpose: audit #8, R1, R2 (limiter); 0.3.0 gave (0.16179076, 0.5382504)
             (0.06466748, 0.30144593),
             (0.07601237, 0.30959177),
             (0.13073455, 0.35177583),
             (0.0045247185, 0.015093633),
-            (0.16174579, 0.5423881),
+            (0.1593197, 0.5208686), // changed on purpose: audit #8, R1, R2 (limiter); 0.3.0 gave (0.16174579, 0.5423881)
             (0.064677045, 0.30052653),
             (0.07605441, 0.30904055),
             (0.13074411, 0.35276315),
@@ -242,12 +253,12 @@ const FROZEN: &[Fixture] = &[
         set: 0,
         channel: 0,
         want: &[
-            (0.22314739, 0.69966376),
+            (0.22273462, 0.70794576), // changed on purpose: audit #8, R1 (limiter); 0.3.0 gave (0.22314739, 0.69966376)
             (0.08697265, 0.39720392),
             (0.10646302, 0.43307436),
             (0.1808926, 0.48611856),
             (0.0054854816, 0.01493543),
-            (0.2218455, 0.6995022),
+            (0.22160925, 0.70794576), // changed on purpose: audit #8, R1 (limiter); 0.3.0 gave (0.2218455, 0.6995022)
             (0.08676658, 0.3984363),
             (0.10647797, 0.4345128),
             (0.1809831, 0.48753074),

@@ -142,12 +142,12 @@ impl Stage {
             StageKind::DeEsser => Self::DeEsser(Box::new(DeEsser::new(sample_rate))),
             StageKind::Compressor => Self::Compressor(Box::new(Compressor::new(sample_rate))),
             StageKind::Makeup => Self::Makeup(Box::default()),
-            StageKind::Limiter => Self::Limiter(Box::new(LookaheadLimiter::new(
-                sample_rate,
-                1.0,
-                LOOKAHEAD_MS,
-                LIMITER_RELEASE_MS,
-            ))),
+            StageKind::Limiter => {
+                let mut limiter =
+                    LookaheadLimiter::new(sample_rate, 1.0, LOOKAHEAD_MS, LIMITER_RELEASE_MS);
+                limiter.set_hold_ms(LIMITER_HOLD_MS);
+                Self::Limiter(Box::new(limiter))
+            }
         }
     }
 
@@ -171,6 +171,15 @@ impl Stage {
 /// transient does, short enough that nobody is talking over themselves.
 const LOOKAHEAD_MS: Real = 1.0;
 const LIMITER_RELEASE_MS: Real = 80.0;
+/// The same hold as Dynamic Boost's (0.4.0 audit R1, decided for the microphone too).
+///
+/// An 80 ms release was already gentler than Dynamic Boost's 10 ms, but it still let the gain
+/// breathe between the peaks of a loud vowel: 1.1 % THD+N on a 100 Hz tone 3 dB into the limiter,
+/// 0.36 % at 200 Hz — the fundamentals of a speaking voice. Held, both are zero. What it costs is
+/// twenty milliseconds more before the release starts after a plosive, on top of the eighty the
+/// release itself takes, and about a tenth of a decibel on the loudest syllables of the frozen
+/// 0.3.0 fixture; neither is anything a listener on a call can find.
+const LIMITER_HOLD_MS: Real = crate::input::limiter::DEFAULT_HOLD_MS;
 
 /// Every method forwards to the variant. A macro rather than nine hand-written matches, so a
 /// new stage is one line here and cannot be forgotten in one of the forwards.

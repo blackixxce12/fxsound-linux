@@ -360,7 +360,7 @@ mod tests {
     use super::*;
     use crate::biquad::MAX_CHANNELS;
     use crate::input::detector::{db_to_linear, linear_to_db};
-    use fxsound_core::{DenoiseLevel, DereverbLevel};
+    use fxsound_core::{DenoiseChannelMode, DenoiseLevel, DereverbLevel};
 
     const FS: Real = 48_000.0;
 
@@ -431,6 +431,171 @@ mod tests {
                 "{makeup_db} dB of makeup let {peak} out"
             );
         }
+    }
+
+    #[test]
+    fn the_microphone_limiter_holds_a_loud_vowel_steady() {
+        // Audit R1, decided for the microphone: its limiter gets Dynamic Boost's hold. An 80 ms
+        // release already let the gain breathe less than Dynamic Boost's 10 ms did, but it still
+        // breathed between the crests of a voice's fundamental: a tone 3 dB into the −3 dBFS
+        // limiter came out with 1.13 % THD+N at 100 Hz and 0.36 % at 200 Hz. Held, neither
+        // breathes at all.
+        for (hz, was) in [(100.0, 1.13), (200.0, 0.36)] {
+            let mut chain = bare(FS);
+            let mut block = tone(hz, db_to_linear(0.0), 3 * FS as usize);
+            chain.process(&mut block, 1);
+            let tail = &block[2 * FS as usize..];
+            let peak = tail.iter().fold(0.0_f32, |a, b| a.max(b.abs()));
+            assert!(
+                (linear_to_db(peak) + 3.0).abs() < 0.01,
+                "{hz} Hz should sit on the ceiling: {} dB",
+                linear_to_db(peak)
+            );
+            let distortion = crate::input::limiter::thd_n(tail, f64::from(hz), FS) * 100.0;
+            assert!(
+                distortion < 0.05,
+                "{hz} Hz: THD+N {distortion} %, was {was} %"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stereo_microphone_keeps_its_image_through_the_limiter_with_independent_denoising() {
+        // Audit R2, decided for the microphone with this test: its limiter is linked too.
+        //
+        // A talker nearer the left capsule of a stereo microphone, the right 3 dB down, each side
+        // with its own hiss, and the denoiser in its Independent mode — one network per side, so
+        // the two sides are already allowed to disagree. The limiter must not add to that. The
+        // same chain is run with the ceiling out of reach and with it 12 dB down; linked, the
+        // balance between the sides in every 10 ms is what it was with the limiter idle. Two
+        // independent limiters on the same signal — the original's way, and 0.3.0's — take the
+        // loud side down further than the quiet one, and the talker drifts to the right on every
+        // loud syllable.
+        let frames = 2 * FS as usize;
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut signal = Vec::with_capacity(frames * 2);
+        for n in 0..frames {
+            let t = n as Real / FS;
+            let f = 140.0;
+            let body = (t * std::f32::consts::TAU * f).sin() * 0.6
+                + (t * std::f32::consts::TAU * f * 2.0).sin() * 0.3
+                + (t * std::f32::consts::TAU * f * 5.0).sin() * 0.2;
+            let syllable = (t * 4.0).fract();
+            let envelope = if syllable < 0.55 {
+                (syllable / 0.55 * std::f32::consts::PI).sin()
+            } else {
+                0.0
+            };
+            let voice = body * envelope * 0.35;
+            for weight in [1.0, db_to_linear(-3.0)] {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let hiss = ((state >> 40) as Real / 8_388_608.0 - 1.0) * 0.003;
+                signal.push(voice * weight + hiss);
+            }
+        }
+        let run = |ceiling_db: Real| {
+            let mut chain = bare(FS);
+            chain.set_denoise_enabled(true);
+            {
+                let denoiser = chain.denoiser_mut().expect("denoiser");
+                denoiser.set_level(DenoiseLevel::Medium);
+                denoiser.set_control(DenoiseLevel::Medium.control());
+                denoiser.set_channels(DenoiseChannelMode::Independent);
+            }
+            chain.set_makeup_db(6.0);
+            chain.set_ceiling_db(ceiling_db);
+            let mut out = signal.clone();
+            chain.process(&mut out, 2);
+            assert!(
+                chain.denoiser().is_some_and(Denoiser::is_active),
+                "the denoiser should be running"
+            );
+            out
+        };
+        let open = run(0.0);
+        let limited = run(-12.0);
+
+        // What two independent limiters would have made of it: the open run is the signal as it
+        // reaches the limiter, delayed, and nothing in it reaches 0 dBFS.
+        assert!(
+            open.iter().all(|s| s.abs() < 1.0),
+            "the open run was limited"
+        );
+        let mut sides = [
+            Stage::build(StageKind::Limiter, FS),
+            Stage::build(StageKind::Limiter, FS),
+        ];
+        let mut independent = open.clone();
+        for (side, stage) in sides.iter_mut().enumerate() {
+            let Stage::Limiter(limiter) = stage else {
+                unreachable!("a limiter stage is a limiter");
+            };
+            limiter.set_ceiling_db(-12.0);
+            let mut one: Vec<Real> = open.iter().skip(side).step_by(2).copied().collect();
+            limiter.process(&mut one, 1);
+            for (frame, s) in independent.as_chunks_mut::<2>().0.iter_mut().zip(one) {
+                frame[side] = s;
+            }
+        }
+        let extra = sides
+            .iter()
+            .map(|stage| stage.latency_frames())
+            .max()
+            .unwrap_or(0);
+
+        // Balance (left over right, in dB) and level of each 10 ms window.
+        let window = (FS * 0.01) as usize;
+        let measure = |buffer: &[Real], skip: usize| -> Vec<(Real, Real)> {
+            buffer.as_chunks::<2>().0[skip..]
+                .chunks_exact(window)
+                .map(|frames| {
+                    let power = |side: usize| {
+                        frames.iter().map(|f| f[side] * f[side]).sum::<Real>() / window as Real
+                    };
+                    let (left, right) = (power(0), power(1));
+                    (10.0 * (left / right).log10(), 10.0 * left.log10())
+                })
+                .collect()
+        };
+        let reference = measure(&open, 0);
+        let linked = measure(&limited, 0);
+        let unlinked = measure(&independent, extra);
+        let reference_late = measure(&open[..open.len() - extra * 2], 0);
+
+        let mut deepest: Real = 0.0;
+        let mut linked_drift: Real = 0.0;
+        let mut unlinked_drift: Real = 0.0;
+        for (w, (&(balance, level), &(linked_balance, linked_level))) in
+            reference.iter().zip(&linked).enumerate()
+        {
+            if level < -40.0 {
+                continue;
+            }
+            deepest = deepest.max(level - linked_level);
+            linked_drift = linked_drift.max((linked_balance - balance).abs());
+            if let (Some(&(late_balance, _)), Some(&(unlinked_balance, _))) =
+                (reference_late.get(w), unlinked.get(w))
+            {
+                unlinked_drift = unlinked_drift.max((unlinked_balance - late_balance).abs());
+            }
+        }
+        // Measured: 7.3 dB of limiting at the deepest; the balance moved 0.03 dB linked (the gain
+        // is the same on both sides every frame; what is left is the gain changing inside a
+        // window over two sides that are not the same signal) and 3.1 dB with two limiters.
+        assert!(
+            deepest > 6.0,
+            "the limiter hardly worked: {deepest} dB at most"
+        );
+        assert!(
+            linked_drift < 0.05,
+            "the linked limiter moved the balance by {linked_drift} dB"
+        );
+        assert!(
+            unlinked_drift > 2.0,
+            "independent limiters should have moved it: {unlinked_drift} dB"
+        );
     }
 
     #[test]

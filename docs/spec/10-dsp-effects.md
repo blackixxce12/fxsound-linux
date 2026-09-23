@@ -1287,8 +1287,10 @@ if (result > s->target_level) {
 * The estimator is a mean-square, so `sqrt_level` is an **RMS**, not a peak.
 * Only the left channel feeds it (`Maxi32.c:258-259`). Hard-panned right-channel
   content is invisible to the auto-gain. Reproduce or fix deliberately.
+  **Port: fixed** (0.4.0 audit #7) — see §8.9.
 * The `1.06` floor (`Maxi32.c:287-289`, commented "11/4/04 Modifications to help
   fix volume pumping") means the auto-gain never backs off below +0.5 dB.
+  **Port: never above the static boost** (0.4.0 audit #6) — see §8.9.
 
 Level filter design (`Maxi32.c:119-137`), same `filtDesignSimple1rstLowPass`
 form as §4.5 with `MAXIMIZE_LEVEL_FILT_CUTOFF = 0.1` Hz (`c_max.h:57`):
@@ -1536,6 +1538,41 @@ impl Maximizer {
     }
 }
 ```
+
+### 8.9 Where the port departs from it (0.4.0 audit)
+
+The audit of Windows defects the port had copied found five here, and all five are fixed. Each
+makes FxSound for Linux sound different from Windows; the detail and the measurements are in
+`crates/fxsound-dsp/src/effects/dynamic_boost.rs` and `crates/fxsound-dsp/src/input/limiter.rs`.
+The limiter changes (#8, R1, R2) are in the one limiter the microphone chain shares, which takes
+all three (its hold and its linking were decided with tests of their own).
+
+* **#6 — the anti-pumping floor is `min(1.06, gain_boost)`.** At slider 0 (and stored values 1–4)
+  the flat `1.06` lifted material louder than −10 dBFS RMS by 0.5 dB — +0.2 dB against the input
+  where quiet material gets −0.3 dB — and stepped there as the level crossed the threshold. Now
+  loud material at slider 0 is −0.3 dB like everything else. At every boosted setting the floor
+  is unchanged.
+* **#7 — the level estimator hears `(L² + R²)/2` of the front pair** (channels 0 and 1; `M²` for
+  mono). A mix quiet on the left and loud on the right used to get the full +11.6 dB at slider 10
+  with the right channel 5.5 dB into the limiter; it now backs off like any other. For centred
+  material the two estimates are bit-identical. On 5.1/7.1 the centre, LFE and surrounds still do
+  not steer the level.
+* **#8 — the attack ramp is clamped to its peak.** After `env += delta` the envelope is clamped to
+  `max(max_abs, held)` (`held` ≥ `|dly_out|`, below), so a slope kept steep from an earlier
+  retarget cannot carry it past the peak it aims at. A 50 Hz sine at twice the ceiling drove the
+  original's envelope to 2.26 (1.06 dB of needless reduction); now 2.00. What a kick saves
+  depends on the kick's shape, so no single figure is quoted for it.
+* **R1 — a 20 ms hold before the release.** In release mode the envelope is
+  `max(env·beta + bias, held)`, where `held` is the loudest `|dly_out|` of roughly the last 20 ms
+  (a running maximum kept in eight segments, so the window is 20–22.5 ms). The 10 ms release used
+  to let go between the crests of a limited bass note: 15.6 % THD+N at 40 Hz and 9.5 % at 80 Hz,
+  3 dB into the limiter. Held, a steady tone from 25 Hz up has none (20 Hz: 0.7 %). A lone
+  transient now keeps the level down for the hold, then releases at the original 10 ms rate (fully
+  off 33 ms after it has left, from 11.5), and a synthetic kick-and-hats mix at slider 10 comes
+  out 0.6 dB quieter (0.9 dB against #8 alone).
+* **R2 — one envelope for every channel.** The envelope follows the loudest channel and one gain
+  goes to all of them, so a peak on one side (Surround 10, hard panning) no longer shifts the image
+  by up to 5.6 dB. Each channel keeps its own delay line.
 
 ---
 
@@ -1884,6 +1921,7 @@ record it.
 5. **Maximizer level estimate uses the left channel only** (`Maxi32.c:258-259`).
    Recommend: use `max(|L|,|R|)²` or `(L²+R²)/2` and document the change; the
    current behaviour mis-tracks hard-panned material.
+   **Done in 0.4.0** (audit #7): `(L²+R²)/2` of the front pair, §8.9.
 6. **`s->level` must be `f64`.** (§8.2) Using `f32` with a pole of 0.99998575
    silently freezes the estimator.
 7. **The reverb has no modulation in this build.** (§1.2) If you re-enable it
