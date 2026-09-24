@@ -117,13 +117,13 @@ A prebuilt tarball is attached to each [release](https://github.com/blackixxce12
 check it against the release's `SHA256SUMS` before unpacking. It is this same script's output, built
 on Debian 12's glibc so the binary runs on anything newer, and it carries the same `install.sh`. The
 archive is a prefix in miniature: `bin/fxsound`, `lib/systemd/user/fxsound.service`,
-`share/applications/`, `share/icons/hicolor/` (the app icon and the tray's three status icons),
-`share/fxsound/presets/`, `share/man/man1/fxsound.1`, `share/metainfo/` and
-`share/doc/fxsound-linux/` (README, CHANGELOG, LICENSE, the Hyprland rules and the autostart
-entry). `install.sh` copies all of that into the prefix and rewrites the unit's `ExecStart` and
-`ExecStop` to `<prefix>/bin/fxsound`; it warns if the prefix is anything other than `/usr` or
-`/usr/local`, because those are the only two the binary searches for presets. On an older
-distribution than Debian 12, build from source instead.
+`share/dbus-1/services/` (D-Bus activation), `share/applications/`, `share/icons/hicolor/` (the
+app icon and the tray's three status icons), `share/fxsound/presets/`, `share/man/man1/fxsound.1`,
+`share/metainfo/` and `share/doc/fxsound-linux/` (README, CHANGELOG, LICENSE, the Hyprland rules
+and the autostart entry). `install.sh` copies all of that into the prefix and rewrites the unit's
+`ExecStart` and `ExecStop`, and the activation file's `Exec`, to `<prefix>/bin/fxsound`; it warns
+if the prefix is anything other than `/usr` or `/usr/local`, because those are the only two the
+binary searches for presets. On an older distribution than Debian 12, build from source instead.
 
 ### What lands where
 
@@ -134,6 +134,7 @@ distribution than Debian 12, build from source instead.
 | `/usr/share/fxsound/presets/Input/` | the 13 voice presets, in TOML |
 | `/usr/share/applications/com.fxsound.FxSound.desktop` | the launcher entry |
 | `/usr/lib/systemd/user/fxsound.service` | `systemctl --user enable --now fxsound` |
+| `/usr/share/dbus-1/services/org.fxsound.FxSound.service` | starts FxSound, through that unit, for a D-Bus call |
 | `/usr/share/icons/hicolor/*/apps/fxsound.png` | the icon |
 | `/usr/share/doc/fxsound-linux/` | the Hyprland rules and the autostart entry |
 
@@ -255,7 +256,7 @@ mic ─► RNNoise ─► high-pass ─► gate ─► 10-band EQ ─► de-esse
 | RNNoise | Recurrent-network denoiser. Off unless the preset asks. ~44 dB off a desk microphone's hum-under-hiss; on undifferentiated white noise, ~1 dB — it separates speech from noise, and white noise gives it nothing to separate |
 | High-pass | Butterworth, 2nd or 4th order. Desk rumble and plosives sit ten to twenty dB above the voice below 150 Hz; left in, they hold the gate open through every pause |
 | Gate | Downward expander with a threshold, a ratio, a floor, hold, and peak or RMS detection — it turns the room down rather than switching it off |
-| Equalizer | Ten bands, the same graphic EQ the output chain uses |
+| Equalizer | The same graphic EQ the output chain uses, ten bands unless you pick five to 31 |
 | De-esser | Split-band, fourth-order Linkwitz–Riley crossover, acting only on the high band |
 | Compressor | Threshold, ratio, soft knee, attack, release, peak or RMS detection |
 | Makeup | Applied after everything that measures, so a preset's thresholds mean what they say |
@@ -299,7 +300,8 @@ does not follow you back to your speakers. The reasoning behind every number in 
 While a microphone is selected the window says so rather than pretending: the five effect sliders are
 drawn disabled with the reason underneath, the chain's stages read out along the bottom of the panel,
 and an equalizer band the device's sample rate cannot carry is struck through instead of left looking
-live.
+live. Turned over, the effect column shows only what the voice chain has: the band count, the filter
+width, and the preset's makeup gain in the master gain's place.
 
 ## Presets
 
@@ -314,6 +316,16 @@ directions between this port and the Windows build.
 | Your presets | `~/.local/share/fxsound/presets/` |
 | Unsaved edits | `~/.local/share/fxsound/presets/AutoSave/` |
 | Settings | `~/.config/fxsound/settings.toml` |
+
+The flip button at the top of the effect column turns it over to the equalizer's own controls, as in
+the original since 1.2.12: the band count, the master gain, the volume leveling, the filter width,
+the balance and Restore Defaults. Each slider has the original's range and step, and a right-click
+puts it back to its default.
+
+A preset lands on your band count, as in the original since 1.2.11: pick a ten-band preset while on
+31 bands and its curve is fitted onto the 31, and changing the band count carries the curve over
+instead of flattening it. Restore Defaults puts back ten bands and the neutral levels, and keeps the
+curve. Export writes a preset as last saved, never its unsaved edits.
 
 The settings file keeps the original's key names so it can be diffed against the Windows
 `FxSound.settings`. Settings and presets are written durably — temporary file, fsync, rename — so an
@@ -332,6 +344,11 @@ Each of these is a considered decision, not an oversight:
 - **Q multiplier no longer resets the band layout.** Changing the filter width in the original
   silently discards preset-supplied band frequencies and resets the sample rate to 44100 until the
   next buffer. That is a bug; this port only redesigns the coefficients.
+- **Preset commands work with the power off.** The original's command line ignores `--preset`,
+  `--save_preset` and the rest while processing is off. Here they run either way, and are refused
+  exactly where the hamburger menu greys the item out — an overwrite or rename of a factory
+  preset, a rename with unsaved changes, a name already taken, the user-preset limit — with the
+  reason on stderr, exit status 1, and `org.fxsound.FxSound.Error.Refused` on D-Bus.
 - **Global hotkeys live in the compositor.** See above.
 - **Window position is not restored.** Wayland gives a client no way to place its own toplevel. The
   setting is still written so it survives a move back to X11.
@@ -342,10 +359,10 @@ Each of these is a considered decision, not an oversight:
   the package, and Settings ▸ Help keeps only the version and a **Changelog** that opens the
   bundled `CHANGELOG.md` in-app instead of the upstream website. "Always On Top" is also absent:
   winit ignores window levels on Wayland, and a control that does nothing is worse than none.
-- **Translated, from the original's own tables.** The 28 JUCE `LocalisedStrings` files embedded in
-  the Windows binary (`assets/translations/`, extracted from its `BinaryData.cpp`; Hungarian was
-  declared but never shipped) are embedded here and looked up by the same English keys the C++
-  passes to `TRANS`. The language follows the desktop session (`LC_ALL`/`LC_MESSAGES`/`LANG`)
+- **Translated, from the original's own tables.** The 29 JUCE `LocalisedStrings` files embedded in
+  the Windows binary (`assets/translations/`, extracted from its `BinaryData.cpp` as of 1.2.16.0,
+  which added Bulgarian; Hungarian was declared but never shipped) are embedded here and looked up
+  by the same English keys the C++ passes to `TRANS`. The language follows the desktop session (`LC_ALL`/`LC_MESSAGES`/`LANG`)
   unless one is picked in Settings ▸ General or with `--language <code>` (`--language system`
   returns to following the desktop). Strings this port added are in
   `assets/translations/port/`. Right-to-left scripts render left-to-right — egui has no bidi.
@@ -354,8 +371,37 @@ Each of these is a considered decision, not an oversight:
   silences them.
 - **FxSound takes the session default automatically — politely.** Picking an output device makes
   `FxSound (Output)` the default sink so every application plays through it without any manual
-  routing; the previous default is remembered first and handed back on exit or when the direction
-  changes. Only `default.configured.audio.*` is ever written; `default.audio.*` stays WirePlumber's.
+  routing; the previous default is remembered first and handed back on exit or when a lane is
+  switched `Off`. Only `default.configured.audio.*` is ever written; `default.audio.*` stays
+  WirePlumber's.
+- **Power off takes FxSound out of the path; it is no longer a bypass alone.** 0.3.0 kept every
+  application playing through FxSound's nodes with the effects switched off. Now, as in the Windows
+  build since 1.2.6, power off also hands both session defaults back to the real devices, so sound
+  no longer passes through FxSound at all (no added latency, and the desktop's own device switcher
+  works), and power on takes them again. While it is off, the device lists show the system's
+  default device, which is where the sound goes; a device picked then is the one FxSound takes
+  over when the power comes back on.
+- **The device priority list can be told to step aside.** Settings ▸ Audio's list (and Settings ▸
+  Microphone's list of microphones, a port addition) picks the device as the Windows build's does:
+  every device seen joins it, at the bottom or, with *Prioritize new output devices*, at the top.
+  *Follow the system's default device*, which the Windows build does not have (its issue #629),
+  hands that choice back to the desktop's sound settings and keeps the list for later.
+- **Mono outputs are accepted.** The Windows build refuses an output with fewer than two channels,
+  a workaround for a Windows driver (`sndDevices.h:32-39`). Here a Bluetooth headset in its
+  hands-free (call) profile or a mono USB headset is an output like any other, and PipeWire mixes
+  FxSound's stereo down for it. And a device plugged in at the moment another goes — a USB DAC
+  swapped for another, a headset changing profile — is noticed as a new device, which the Windows
+  build misses (its open PR #532).
+- **A Bluetooth microphone wakes only when something records.** FxSound holds a microphone open
+  only while an application records from `FxSound (Input)`, the calibration wizard runs, or the Pro
+  view shows the microphone's meters, so a headset is not switched to its call profile — mono,
+  16 kHz — just because its microphone is picked. The picker says so on hover, and using one
+  headset for both lanes says what it costs.
+- **Suspend mutes, resume starts clean, nothing waits.** FxSound listens for logind's
+  `PrepareForSleep` on the system bus: going to sleep mutes both lanes, and on resume their filters
+  are cleared before they are unmuted, as the Windows build does from its suspend notification. It
+  never holds a sleep inhibitor, as the Windows build decided too; without a system bus it simply
+  does not listen.
 - **Input mode is a different processor, not the same one pointed elsewhere.** The device list is
   split into *Output* and *Input* sections. Choosing a microphone tears the sink pair down, builds a
   capture stream feeding a virtual source, `FxSound (Input)`, which becomes the default microphone,

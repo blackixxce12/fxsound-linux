@@ -1324,12 +1324,17 @@ dependencies = [
  "ksni",
  "log",
  "notify-rust",
+ "resvg",
  "rfd",
  "serde",
  "serde_json",
  "signal-hook",
  "tempfile",
+ "tiny-skia",
  "tokio",
+ "toml",
+ "usvg",
+ "zbus",
 ]
 
 [[package]]

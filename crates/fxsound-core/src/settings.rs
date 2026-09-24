@@ -255,7 +255,9 @@ pub struct Settings {
     /// its own toplevel, so the compositor decides and these are only written, never applied.
     pub window_x: i32,
     pub window_y: i32,
-    /// Requested by the app through `ViewportCommand::WindowLevel`; Hyprland honours it.
+    /// Kept so the key survives a round trip through this port. Nothing sets or applies it: winit's
+    /// Wayland backend ignores window levels, so neither the hamburger menu nor the tray offers
+    /// Always On Top.
     pub always_on_top: bool,
     /// Start with no window, tray only.
     pub run_minimized: bool,
@@ -694,12 +696,17 @@ impl Settings {
     ///
     /// Keyed on the direction as well as the name: the two lanes' presets come from different
     /// stores, so a memory of the output lane's `General` must never answer for a microphone.
+    ///
+    /// An entry with an empty preset remembers none: the device priority list adds every device
+    /// it sees, whether or not a preset was ever used with it (upstream `DeviceConfig.cpp:78-85`,
+    /// read back with `preset.isNotEmpty()` at `FxController.cpp:1126`).
     #[must_use]
     pub fn preset_for_device(&self, node_name: &str, direction: DeviceDirection) -> Option<&str> {
         self.device_configs
             .iter()
             .find(|c| c.device_id == node_name && c.direction == direction)
             .map(|c| c.preset.as_str())
+            .filter(|preset| !preset.is_empty())
     }
 
     /// Remember which preset was in use for a device.
@@ -937,6 +944,34 @@ mod tests {
         assert_eq!(
             s.preset_for_device("dock", DeviceDirection::Input),
             Some("Headset")
+        );
+    }
+
+    #[test]
+    fn a_device_the_priority_list_knows_without_a_preset_remembers_none() {
+        let mut s = Settings::default();
+        s.device_configs.push(DeviceConfig {
+            device_id: "alsa_output.hdmi".to_owned(),
+            direction: DeviceDirection::Output,
+            device_name: "HDMI".to_owned(),
+            ..DeviceConfig::default()
+        });
+        assert_eq!(
+            s.preset_for_device("alsa_output.hdmi", DeviceDirection::Output),
+            None
+        );
+        // Once a preset is used with it, it remembers that one, in the same entry.
+        s.remember_device_preset(
+            "alsa_output.hdmi",
+            "HDMI",
+            "Rock",
+            "",
+            DeviceDirection::Output,
+        );
+        assert_eq!(s.device_configs.len(), 1);
+        assert_eq!(
+            s.preset_for_device("alsa_output.hdmi", DeviceDirection::Output),
+            Some("Rock")
         );
     }
 

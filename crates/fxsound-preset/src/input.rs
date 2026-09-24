@@ -203,6 +203,39 @@ pub struct DeEsser {
 pub struct Equalizer {
     pub centers_hz: Vec<f32>,
     pub gains_db: Vec<f32>,
+    /// Whether the equalizer runs. On when unsaid, and unwritten when on, on the same doctrine as
+    /// the tables: the window's EQ switch works on a voice as on music, and a voice preset saved
+    /// with it off has to come back off rather than silently on again. A 0.3.0 binary ignores the
+    /// key and runs the curve.
+    #[serde(default = "equalizer_on", skip_serializing_if = "is_on")]
+    pub enabled: bool,
+    /// The filters' Q — the window's Filter Q row on a microphone, 1.0 to 3.0. The default, 1.0,
+    /// when unsaid, and unwritten when 1.0, on the same doctrine as `enabled`: every file
+    /// written before the row existed means what it meant, and a voice preset saved with another
+    /// width comes back with it rather than silently at the default. A 0.3.0 binary ignores the
+    /// key.
+    #[serde(default = "default_q", skip_serializing_if = "is_default_q")]
+    pub q: f32,
+}
+
+const fn equalizer_on() -> bool {
+    true
+}
+
+/// By reference because that is how `skip_serializing_if` hands the field over.
+const fn is_on(enabled: &bool) -> bool {
+    *enabled
+}
+
+/// The Q a voice preset's equalizer runs at when its file does not say: [`InputDspParams`]'s
+/// default, and what every voice preset ran at before the key existed.
+const fn default_q() -> f32 {
+    1.0
+}
+
+/// By reference, as [`is_on`].
+fn is_default_q(q: &f32) -> bool {
+    *q == default_q()
 }
 
 /// What went wrong reading or writing a voice preset.
@@ -284,6 +317,8 @@ impl Default for InputPreset {
             eq: Equalizer {
                 centers_hz: eq::DEFAULT_CENTERS_HZ.to_vec(),
                 gains_db: vec![0.0, 0.0, -1.0, -1.5, -0.5, 0.0, 1.5, 0.0, 0.0, 0.0],
+                enabled: true,
+                q: default_q(),
             },
             makeup_db: 6.0,
             ceiling_db: -3.0,
@@ -478,7 +513,8 @@ impl InputPreset {
             vad_gate: self.vad_gate,
             compressor_on: self.compressor.is_some(),
             deesser_on: self.deesser.is_some(),
-            eq_on: true,
+            eq_on: self.eq.enabled,
+            filter_q: self.eq.q,
             ..InputDspParams::default()
         };
 
@@ -868,6 +904,57 @@ mod tests {
         assert!(text.contains("chain = \"broadcast\""), "{text}");
         assert!(text.contains("vad_gate = true"), "{text}");
         assert!(CHAIN_NAMES.contains(&DEFAULT_CHAIN));
+    }
+
+    #[test]
+    fn an_equalizer_switched_off_is_saved_off_and_one_left_on_is_unwritten() {
+        // The window's EQ switch works on a voice as on music, so a voice preset saved with it
+        // off has to come back off. On is the state every file before the key meant.
+        let unsaid = parse(&minimal(""));
+        assert!(unsaid.eq.enabled);
+        assert!(unsaid.to_params().eq_on);
+        let text = toml::to_string_pretty(&unsaid).expect("serialise");
+        assert!(!text.contains("enabled"), "on is unwritten:\n{text}");
+
+        let mut off = unsaid;
+        off.eq.enabled = false;
+        assert!(!off.to_params().eq_on);
+        let dir = tempdir("eq-off");
+        let path = dir.join("Off.toml");
+        off.save(&path).expect("write");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("enabled = false"), "{text}");
+        let back = InputPreset::load(&path).expect("load");
+        assert_eq!(back, off);
+        assert!(!back.to_params().eq_on);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_equalizers_q_is_saved_with_the_preset_and_the_default_is_unwritten() {
+        // The window's Filter Q row on a microphone is the voice preset's own: what it runs, what
+        // the window shows and what is on disk have to be the same number.
+        let unsaid = parse(&minimal(""));
+        assert_eq!(
+            unsaid.eq.q, 1.0,
+            "every file before the key meant the default"
+        );
+        assert_eq!(unsaid.to_params().filter_q, 1.0);
+        let text = toml::to_string_pretty(&unsaid).expect("serialise");
+        assert!(!text.contains("q ="), "the default is unwritten:\n{text}");
+
+        let mut wide = unsaid;
+        wide.eq.q = 2.5;
+        assert_eq!(wide.to_params().filter_q, 2.5);
+        let dir = tempdir("eq-q");
+        let path = dir.join("Wide.toml");
+        wide.save(&path).expect("write");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        assert!(text.contains("q = 2.5"), "{text}");
+        let back = InputPreset::load(&path).expect("load");
+        assert_eq!(back, wide);
+        assert_eq!(back.to_params().filter_q, 2.5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

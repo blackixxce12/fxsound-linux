@@ -34,12 +34,28 @@ ksni = { workspace = true, features = ["blocking"] }
 notify-rust = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# `--self-test` parses the settings file itself: `Settings::load` moves a file it cannot parse
+# aside, and a self-test must not write anything.
+toml = { workspace = true }
 dirs = { workspace = true }
 log = { workspace = true }
-# Not called from our code: this is the runtime ksni's tray service and its blocking facade run
-# on. Declaring it makes the flavour explicit and greppable instead of inheriting ksni's own
-# `features = ["rt", "macros"]` (`docs/api/linux-desktop-crates.md` §1).
-tokio = { workspace = true }
+# Two runtimes, never one: ksni's tray service runs on a private current-thread runtime of its own
+# (`docs/api/linux-desktop-crates.md` §1), and the D-Bus service (`src/dbus.rs`) builds another
+# on its `fxsound-dbus` thread. `net` and `time` are that runtime's drivers — zbus's socket is a
+# tokio `UnixStream` there, and a method call waits for the GUI thread under a timeout — and
+# `sync` is the oneshot the answer comes back on. zbus asks for all three itself; naming them
+# here keeps the build from depending on that.
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+# The D-Bus service. Already in the tree through ksni and notify-rust, with `tokio` and `async-io`
+# both on; `tokio` is named so the service does not depend on that unification, and
+# `blocking-api` for `zbus::blocking`, which nothing else enables (the tests call the service
+# through a blocking proxy).
+zbus = { workspace = true, features = ["tokio", "blocking-api"] }
+# The tray's status icons, rasterised once at start-up for hosts that do not look them up by name
+# in the icon theme (0.4.0 design §11). The same three the UI crate draws its artwork with.
+resvg = { workspace = true }
+usvg = { workspace = true }
+tiny-skia = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

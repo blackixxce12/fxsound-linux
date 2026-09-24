@@ -185,6 +185,8 @@ Requires:       libglvnd-egl
 # pure Rust and speaks to the bus socket directly, so they need no library here.) Without it rfd
 # falls back to shelling out to zenity, which Fedora does not install by default either.
 Requires:       dbus-libs
+# Owns /usr/share/dbus-1/services, where the D-Bus activation file goes.
+Requires:       dbus-common
 # Not libfontconfig.so — nothing links or dlopens it. This is for /etc/fonts, which the pure-Rust
 # fontconfig-parser under fontdb reads to find the faces the SVG icons and labels are drawn with.
 Requires:       fontconfig
@@ -274,6 +276,11 @@ install -Dpm0644 packaging/fxsound.desktop \
 install -Dpm0644 packaging/fxsound.service \
     %{buildroot}%{_userunitdir}/fxsound.service
 
+# D-Bus activation: a call to org.fxsound.FxSound starts FxSound through that unit
+# (SystemdService=fxsound.service).
+install -Dpm0644 packaging/org.fxsound.FxSound.service \
+    %{buildroot}%{_datadir}/dbus-1/services/org.fxsound.FxSound.service
+
 # 256x256 and 32x32 respectively; both verified against the files, not assumed from the names.
 install -Dpm0644 assets/images/fxsound_large.png \
     %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/fxsound.png
@@ -343,6 +350,7 @@ appstreamcli validate --no-net %{buildroot}%{_metainfodir}/com.fxsound.FxSound.m
 %{_mandir}/man1/fxsound.1*
 %{_metainfodir}/com.fxsound.FxSound.metainfo.xml
 %{_userunitdir}/fxsound.service
+%{_datadir}/dbus-1/services/org.fxsound.FxSound.service
 
 
 %changelog

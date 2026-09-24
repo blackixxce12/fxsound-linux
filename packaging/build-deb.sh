@@ -354,6 +354,10 @@ install -D -m 0644 "$REPO/packaging/fxsound.desktop" \
     "$DATA/usr/share/applications/com.fxsound.FxSound.desktop"
 install -D -m 0644 "$REPO/packaging/fxsound.service" \
     "$DATA/usr/lib/systemd/user/fxsound.service"
+# D-Bus activation: a call to org.fxsound.FxSound starts FxSound through that
+# unit (SystemdService=fxsound.service).
+install -D -m 0644 "$REPO/packaging/org.fxsound.FxSound.service" \
+    "$DATA/usr/share/dbus-1/services/org.fxsound.FxSound.service"
 install -D -m 0644 "$REPO/assets/images/fxsound_large.png" \
     "$DATA/usr/share/icons/hicolor/256x256/apps/fxsound.png"
 install -D -m 0644 "$REPO/assets/images/fxsound.png" \

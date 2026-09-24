@@ -33,7 +33,7 @@
 //! the value the DSP will see.
 
 use clap::Parser;
-use fxsound_core::{Effect, ViewMode, eq};
+use fxsound_core::{DeviceDirection, Effect, NoiseSuppressionOverride, ViewMode, eq};
 
 /// The reserved-character set, the length cap and the sanitiser a preset name goes through
 /// before it is used (`FxController::sanitizePresetName`, `fxsound/Source/GUI/FxController.cpp:378`).
@@ -78,7 +78,14 @@ pub const MAX_EFFECT_PAIRS: usize = Effect::COUNT;
     about = "System-wide audio enhancement: EQ, ambience, surround, bass and dynamic boost",
     long_about = "Run with no options to start FxSound, or to raise the window of an instance \
                   that is already running. Any option given while an instance is running is \
-                  forwarded to it over the control socket in $XDG_RUNTIME_DIR/fxsound."
+                  forwarded to it over the control socket in $XDG_RUNTIME_DIR/fxsound.",
+    // The four reports `--json` can reshape. A group rather than four `requires`, because clap
+    // reads a list of `requires` as "all of them".
+    group(
+        clap::ArgGroup::new("report")
+            .args(["status", "watch", "self_test", "list_apps"])
+            .multiple(true)
+    )
 )]
 pub struct Cli {
     /// Turn audio processing on or off. Any non-zero integer means on.
@@ -123,15 +130,33 @@ pub struct Cli {
     #[arg(long = "delete_preset", alias = "delete-preset")]
     pub delete_preset: bool,
 
-    /// Select the device by its exact name: a playback device, or a microphone.
+    /// Select the playback device the output lane renders to, by its exact name, or `off` to
+    /// detach the lane.
     ///
     /// `--output=<device>` — `docs/COMMAND_LINE_OPTIONS.md:24`, `FxController.cpp:254-257`,
     /// `:451-462`. On Windows this is the WASAPI friendly name; here it is the PipeWire
     /// `node.description`, with `node.name` accepted too since that is what settings persist.
-    /// Naming a capture device switches FxSound into its input mode
-    /// (`docs/spec/12-audio-io.md` §28) — the option keeps its Windows spelling regardless.
-    #[arg(long = "output", value_name = "DEVICE")]
+    /// `off` is a Linux addition (0.4.0 design §1.4). In 0.3.0 naming a capture device here
+    /// switched FxSound into its input mode; a microphone named here is still selected, for the
+    /// input lane, with a note on stderr that `--input` is the option for it now.
+    #[arg(long = "output", value_name = "DEVICE|off")]
     pub output: Option<String>,
+
+    /// Select the microphone the input lane reads from, by its exact name, or `off` to detach the
+    /// lane.
+    ///
+    /// Linux addition (0.4.0 design §1.4): the input lane runs beside the output lane, so it has
+    /// an option of its own. Matched like `--output`: `node.name` first, then the description.
+    #[arg(long = "input", value_name = "DEVICE|off")]
+    pub input: Option<String>,
+
+    /// Which lane the window edits and the preset, effect and level options act on.
+    ///
+    /// Linux addition (0.4.0 design §1.1): a GUI concern only; the engine has no notion of it.
+    /// Picking a device with `--output` or `--input` changes it too, and an `--edit` on the same
+    /// line wins over that.
+    #[arg(long = "edit", value_name = "output|input", value_parser = parse_direction)]
+    pub edit: Option<DeviceDirection>,
 
     /// Switch the window between the Lite (1) and Pro (2) layouts.
     ///
@@ -192,6 +217,45 @@ pub struct Cli {
     )]
     pub volume_leveling: Option<f32>,
 
+    /// Noise suppression for the microphone: `off`, `light`, `medium`, `strong`, or `preset` to
+    /// follow the voice preset.
+    ///
+    /// Linux addition (0.4.0 design §2 & 3): the Settings pane's global override, which wins over
+    /// every voice preset until it is set back to `preset`. `mild` is accepted for `light`,
+    /// because that is what the window calls it.
+    #[arg(
+        long = "noise-suppression",
+        alias = "noise_suppression",
+        value_name = "LEVEL",
+        value_parser = parse_noise_suppression
+    )]
+    pub noise_suppression: Option<NoiseSuppressionOverride>,
+
+    /// Give an application a playback preset of its own, `APP=PRESET`, or `APP=default` to have
+    /// it follow the output lane's preset again. May be given more than once.
+    ///
+    /// Linux addition (per-application presets, `docs/0.4.0-apps.md`). `APP` is a remembered
+    /// application's Flatpak id, program or name, in any case (`--list-apps` shows them); one
+    /// FxSound has not seen gets a rule for the Flatpak id, name or program `APP` looks like
+    /// (`crate::app::unseen_key`). `PRESET` is an output preset's exact name; `default` and
+    /// `follow` are the lane's.
+    #[arg(
+        long = "app-preset",
+        alias = "app_preset",
+        value_name = "APP=PRESET",
+        value_parser = parse_app_rule
+    )]
+    pub app_preset: Vec<AppRuleArg>,
+
+    /// The same for what an application records: a voice preset of its own, or `default`.
+    #[arg(
+        long = "app-input-preset",
+        alias = "app_input_preset",
+        value_name = "APP=PRESET",
+        value_parser = parse_app_rule
+    )]
+    pub app_input_preset: Vec<AppRuleArg>,
+
     /// Band centre frequencies, `band:hz[,band:hz...]`, band index 0-based.
     ///
     /// `--set_band_freq=<…>` — `docs/COMMAND_LINE_OPTIONS.md:32`, `FxController.cpp:536-553`.
@@ -241,13 +305,43 @@ pub struct Cli {
     #[arg(long = "status")]
     pub status: bool,
 
-    /// Print `--status` as a single JSON object rather than as lines.
+    /// Print the `--status`, `--watch`, `--self-test` or `--list-apps` report as JSON rather
+    /// than as lines.
     ///
-    /// Ignored unless `--status` is given, and deliberately not the default: the line format is
-    /// what every existing script greps, and changing it under them would be a breaking change to
-    /// buy a format they did not ask for.
-    #[arg(long = "json", requires = "status")]
+    /// Deliberately not the default: the line format is what every existing script greps, and
+    /// changing it under them would be a breaking change to buy a format they did not ask for.
+    /// Given without any of the four it is an error, not a no-op.
+    #[arg(long = "json", requires = "report")]
     pub json: bool,
+
+    /// Print the applications FxSound remembers — the ones playing or recording now first — with
+    /// the preset each has of its own and the one it runs through now, and exit.
+    ///
+    /// Linux addition (per-application presets, `docs/0.4.0-apps.md`). A question like
+    /// `--status`: every other option on the line is ignored and the window is left alone. With
+    /// no FxSound running it answers from the store, `apps.toml`, in which nothing is running.
+    #[arg(long = "list-apps", alias = "list_apps")]
+    pub list_apps: bool,
+
+    /// Subscribe to the running instance and print one event per line until it quits.
+    ///
+    /// Linux addition (0.4.0 design §10). The first event is the full `--status` document. Like
+    /// `--status`, every other option on the line is ignored and the window is left alone.
+    #[arg(long = "watch")]
+    pub watch: bool,
+
+    /// With `--watch`, also stream the microphone's meters, at most four times a second.
+    #[arg(long = "meters", requires = "watch")]
+    pub meters: bool,
+
+    /// Check the installation and exit: presets, settings, both processing chains offline, the
+    /// installed files, and whether PipeWire and a session bus are there to be used.
+    ///
+    /// Linux addition (0.4.0 design §13). It runs in this process before the single-instance
+    /// lock is taken, so it works beside a running FxSound and in a bare container, and it
+    /// never forwards anything. Every other option on the line is ignored.
+    #[arg(long = "self-test", alias = "self_test")]
+    pub self_test: bool,
 
     /// Start without showing the window, or hide the window of a running instance.
     ///
@@ -260,6 +354,16 @@ pub struct Cli {
         visible_alias = "hide"
     )]
     pub run_minimized: bool,
+
+    /// How the D-Bus activation file and the systemd user unit start FxSound: as `--hide`, except
+    /// that when FxSound is already running this process exits at once and forwards nothing.
+    ///
+    /// Linux addition. The bus starts FxSound for a call to a name nobody owns yet, and an
+    /// instance started from the launcher only owns it once its audio engine is up: a status
+    /// bar's poll landing in between used to start `fxsound --hide`, which found the lock taken,
+    /// forwarded `--hide` and hid the window that had just been opened.
+    #[arg(long = "activated")]
+    pub activated: bool,
 
     /// Show and raise the window of the running instance.
     ///
@@ -290,11 +394,14 @@ pub struct Cli {
     #[arg(long = "prev-preset", aliases = ["prev_preset", "previous-preset", "previous_preset"])]
     pub prev_preset: bool,
 
-    /// Cycle to the next usable device of the current direction — the next playback device, or
-    /// the next microphone while FxSound sits behind one; never from one direction into the
-    /// other. Compositor stand-in for `CMD_NEXT_OUTPUT`, Ctrl+Shift+W (`Settings.cpp:38`).
+    /// Cycle the output lane to the next playback device, wrapping; never into the microphones.
+    /// Compositor stand-in for `CMD_NEXT_OUTPUT`, Ctrl+Shift+W (`Settings.cpp:38`).
     #[arg(long = "next-output", alias = "next_output")]
     pub next_output: bool,
+
+    /// Cycle the input lane to the next microphone, wrapping. The input lane's `--next-output`.
+    #[arg(long = "next-input", alias = "next_input")]
+    pub next_input: bool,
 
     /// Quit the running instance, autosaving a modified preset first.
     ///
@@ -325,6 +432,52 @@ pub struct BandPairs(pub Vec<(usize, f32)>);
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectPairs(pub Vec<(Effect, f32)>);
 
+/// One `APP=PRESET` of `--app-preset` or `--app-input-preset`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppRuleArg {
+    /// The application, as the user wrote it (trimmed): a Flatpak id, a program or a name.
+    pub app: String,
+    /// What it is to run through.
+    pub preset: AppPresetChoice,
+}
+
+/// What an application runs through in one direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppPresetChoice {
+    /// The lane's own preset, whatever it is: `default`, `follow`, or nothing after the `=`.
+    Follow,
+    /// A preset of its own, by the exact name the lane's preset list has.
+    Preset(String),
+}
+
+impl AppPresetChoice {
+    /// Read a preset argument: `default`, `follow` (in any case) or nothing is
+    /// [`AppPresetChoice::Follow`], anything else the preset of that name. No shipped preset is
+    /// called either word; a user preset that is has to be renamed to be given to an application.
+    /// D-Bus's `SetAppPreset` reads its argument with it too.
+    #[must_use]
+    pub fn parse(preset: &str) -> Self {
+        let preset = preset.trim();
+        let follows = preset.is_empty()
+            || preset.eq_ignore_ascii_case("default")
+            || preset.eq_ignore_ascii_case("follow");
+        if follows {
+            Self::Follow
+        } else {
+            Self::Preset(preset.to_owned())
+        }
+    }
+
+    /// The preset's name, `None` to follow the lane: what [`crate::App::set_app_preset`] takes.
+    #[must_use]
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Follow => None,
+            Self::Preset(name) => Some(name),
+        }
+    }
+}
+
 /// One thing to do to the application, in the order `applyConfig` does it.
 ///
 /// This is what crosses the single-instance socket (as re-parsed argv — see [`crate::ipc`]) and
@@ -337,9 +490,41 @@ pub enum Command {
         /// One JSON object rather than one line per item.
         json: bool,
     },
+    /// Subscribe to the event stream and do nothing else (0.4.0 design §10).
+    Watch {
+        /// One JSON object per event rather than `event key=value` lines.
+        json: bool,
+        /// Stream the microphone's meters too.
+        meters: bool,
+    },
+    /// Check the installation and do nothing else (0.4.0 design §13). `main` runs it before the
+    /// single-instance lock; it reaches [`crate::commands::run`] only if a running instance is
+    /// handed one directly.
+    SelfTest {
+        /// One JSON document rather than one line per check.
+        json: bool,
+    },
+    /// List the remembered applications and do nothing else (`docs/0.4.0-apps.md`). With no
+    /// instance running `main` answers it from the store before the engine starts.
+    ListApps {
+        /// One JSON object rather than one line per application.
+        json: bool,
+    },
     Power(PowerCommand),
     Preset(PresetCommand),
     Output(OutputCommand),
+    Input(InputCommand),
+    /// The lane the window edits and the preset and level commands act on.
+    EditDirection(DeviceDirection),
+    /// The microphone's global noise-suppression override.
+    NoiseSuppression(NoiseSuppressionOverride),
+    /// The preset an application runs through in one direction (`--app-preset`,
+    /// `--app-input-preset`). `app` is the text the user named it by; the store resolves it.
+    AppPreset {
+        direction: DeviceDirection,
+        app: String,
+        preset: AppPresetChoice,
+    },
     NumBands(u32),
     VolumeLeveling(f32),
     Balance(f32),
@@ -386,11 +571,21 @@ pub enum PresetCommand {
     Previous,
 }
 
+/// What to do to one lane's device. The same three for both lanes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutputCommand {
+pub enum DeviceCommand {
+    /// Attach the lane to the device with this `node.name` or description.
     Select(String),
+    /// Cycle to the lane's next device, wrapping.
     Next,
+    /// Detach the lane: `--output off`, `--input off`.
+    Detach,
 }
+
+/// `--output` and `--next-output`.
+pub type OutputCommand = DeviceCommand;
+/// `--input` and `--next-input`.
+pub type InputCommand = DeviceCommand;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowCommand {
@@ -425,24 +620,66 @@ impl Cli {
     /// Two orderings in there are load-bearing and are reproduced exactly:
     ///
     /// * `--status` returns immediately, so nothing else on the line runs and the window is *not*
-    ///   raised (`:348-352`).
+    ///   raised (`:348-352`). `--self-test`, `--list-apps` and `--watch` are questions of the same
+    ///   kind and do the same; with more than one on a line, `--self-test` wins, then `--status`,
+    ///   then `--list-apps`: a question answered once wins over a stream.
     /// * the band and effect lists come *after* `--num_bands`, so
     ///   `--num_bands=31 --set_band_gain="30:6"` works in a single invocation (`:558`).
+    ///
+    /// One is deliberately not: the devices come *before* the preset, where `applyConfig` selects
+    /// the preset first (`:395` before `:451`). With a lane per direction, a device is how a line
+    /// says which lane it means — `--input=Headset --preset='Gaming Headset'` has to find the
+    /// preset in the microphone's list — and a device brings back the preset remembered for it,
+    /// which in the original order silently replaced the preset the same line had just asked for.
+    /// `--edit` sits between the two, so that it wins over the lane a device picked. The
+    /// applications' presets come right after the preset, so a preset `--save_preset` makes is
+    /// one `--app-preset` on the same line can give.
     #[must_use]
     pub fn commands(&self) -> Vec<Command> {
+        if self.self_test {
+            return vec![Command::SelfTest { json: self.json }];
+        }
         if self.status {
             return vec![Command::Status { json: self.json }];
+        }
+        if self.list_apps {
+            return vec![Command::ListApps { json: self.json }];
+        }
+        if self.watch {
+            return vec![Command::Watch {
+                json: self.json,
+                meters: self.meters,
+            }];
         }
 
         let mut commands = Vec::new();
         if let Some(power) = self.power_command() {
             commands.push(Command::Power(power));
         }
+        if let Some(output) = self.output_command() {
+            commands.push(Command::Output(output));
+        }
+        if let Some(input) = self.input_command() {
+            commands.push(Command::Input(input));
+        }
+        if let Some(direction) = self.edit {
+            commands.push(Command::EditDirection(direction));
+        }
         if let Some(preset) = self.preset_command() {
             commands.push(Command::Preset(preset));
         }
-        if let Some(output) = self.output_command() {
-            commands.push(Command::Output(output));
+        for (direction, rules) in [
+            (DeviceDirection::Output, &self.app_preset),
+            (DeviceDirection::Input, &self.app_input_preset),
+        ] {
+            commands.extend(rules.iter().map(|rule| Command::AppPreset {
+                direction,
+                app: rule.app.clone(),
+                preset: rule.preset.clone(),
+            }));
+        }
+        if let Some(choice) = self.noise_suppression {
+            commands.push(Command::NoiseSuppression(choice));
         }
         if let Some(bands) = self.num_bands {
             commands.push(Command::NumBands(bands));
@@ -483,6 +720,19 @@ impl Cli {
         commands
     }
 
+    /// [`Cli::commands`] as D-Bus `Apply` hands them over: without the window raise a typed
+    /// command line gets for nothing (0.4.0 design §9, and `Cli::window_command`). A bus call
+    /// comes from a keybind or a status bar, as every other method's does; `--show`,
+    /// `--toggle-window` and `--hide` on the line still do what they say.
+    #[must_use]
+    pub fn commands_without_implicit_raise(&self) -> Vec<Command> {
+        let mut commands = self.commands();
+        if !self.show && self.window_command() == Some(WindowCommand::Show) {
+            commands.retain(|command| *command != Command::Window(WindowCommand::Show));
+        }
+        commands
+    }
+
     /// The subset of [`Cli::commands`] a *cold start* honours — the C column of
     /// `docs/spec/07-startup-tray.md` §4.2, i.e. what `initConfig` reads (`:225-234`).
     ///
@@ -501,6 +751,13 @@ impl Cli {
     #[must_use]
     pub const fn is_status(&self) -> bool {
         self.status
+    }
+
+    /// `true` when this invocation is a question — `--status`, `--watch`, `--self-test` or
+    /// `--list-apps` — rather than something to do, so the window is left alone.
+    #[must_use]
+    pub const fn is_query(&self) -> bool {
+        self.status || self.watch || self.self_test || self.list_apps
     }
 
     fn power_command(&self) -> Option<PowerCommand> {
@@ -544,13 +801,11 @@ impl Cli {
     }
 
     fn output_command(&self) -> Option<OutputCommand> {
-        if let Some(name) = &self.output {
-            (!name.is_empty()).then(|| OutputCommand::Select(name.clone()))
-        } else if self.next_output {
-            Some(OutputCommand::Next)
-        } else {
-            None
-        }
+        device_command(self.output.as_deref(), self.next_output)
+    }
+
+    fn input_command(&self) -> Option<InputCommand> {
+        device_command(self.input.as_deref(), self.next_input)
     }
 
     /// Step 11 of `applyConfig` (`FxController.cpp:523-531`) — and the one place this port
@@ -564,9 +819,9 @@ impl Cli {
     /// invocation made *only* of compositor stand-ins leaves the window alone; add any of the
     /// original's options, or none at all, and the original's raise-the-window behaviour applies.
     fn window_command(&self) -> Option<WindowCommand> {
-        if self.status {
+        if self.is_query() {
             None
-        } else if self.run_minimized {
+        } else if self.run_minimized || self.activated {
             Some(WindowCommand::Hide)
         } else if self.toggle_window {
             Some(WindowCommand::Toggle)
@@ -579,15 +834,26 @@ impl Cli {
         }
     }
 
-    /// `true` when the line carries at least one compositor stand-in and nothing the original's
-    /// `applyConfig` would have recognised.
+    /// `true` when the line carries at least one compositor stand-in and nothing that raises the
+    /// window.
+    ///
+    /// The stand-ins are the five hotkeys' replacements plus the 0.4.0 options shaped like them:
+    /// `--next-input`, the input lane's `--next-output`; `--noise-suppression`, a setting a
+    /// keybinding flips without wanting the window; and `--app-preset` and `--app-input-preset`,
+    /// which a script or a game's launcher sets for an application the window does not show.
+    /// `--input` and `--edit` raise it, as `--output` always has: both are about what the window
+    /// is showing.
     fn is_hotkey_substitute_only(&self) -> bool {
         let substitutes = self.toggle_power
             || self.next_preset
             || self.prev_preset
             || self.next_output
+            || self.next_input
+            || self.noise_suppression.is_some()
+            || !self.app_preset.is_empty()
+            || !self.app_input_preset.is_empty()
             || self.quit;
-        substitutes && !self.has_original_option()
+        substitutes && !self.has_original_option() && self.input.is_none() && self.edit.is_none()
     }
 
     /// Every option in `docs/COMMAND_LINE_OPTIONS.md`'s table, i.e. everything the Windows build
@@ -641,15 +907,73 @@ impl Command {
             | Self::View(_)
             | Self::Language(_) => true,
             Self::Preset(preset) => matches!(preset, PresetCommand::Select(_)),
-            Self::Output(output) => matches!(output, OutputCommand::Select(_)),
+            // `--output` is on §4.3's list, `--input` is its twin, and `off` is a choice of
+            // device like any other. Cycling is a hotkey's, and a cold start has no hotkeys.
+            Self::Output(device) | Self::Input(device) => {
+                matches!(device, DeviceCommand::Select(_) | DeviceCommand::Detach)
+            }
+            // Settings a start-up line may well carry, like `--view` and `--balance`. An
+            // application's preset is one too, and like `--preset` it is chosen once the preset
+            // lists are read, so a name neither list has is still refused, on stderr.
+            Self::EditDirection(_) | Self::NoiseSuppression(_) | Self::AppPreset { .. } => true,
             Self::Window(window) => matches!(window, WindowCommand::Hide),
+            // Questions for a running instance, which a cold start proves there is not; `main`
+            // answers all four before the engine starts — `--list-apps` from the store.
             Self::Status { .. }
+            | Self::Watch { .. }
+            | Self::SelfTest { .. }
+            | Self::ListApps { .. }
             | Self::BandFrequencies(_)
             | Self::BandGains(_)
             | Self::Effects(_)
             | Self::Quit => false,
         }
     }
+}
+
+/// `--output`/`--input` and their `--next-*`: a name wins over cycling, as it always has for
+/// `--output`, and an empty name is no command at all, as `applyConfig` treats an empty
+/// `--output`. D-Bus's `SetOutput` and `SetInput` read their argument with it too.
+pub(crate) fn device_command(name: Option<&str>, next: bool) -> Option<DeviceCommand> {
+    match name {
+        Some(name) if name.trim().eq_ignore_ascii_case("off") => Some(DeviceCommand::Detach),
+        Some(name) => (!name.is_empty()).then(|| DeviceCommand::Select(name.to_owned())),
+        None => next.then_some(DeviceCommand::Next),
+    }
+}
+
+/// `--edit`'s value; D-Bus's `SetEditDirection` reads its argument with it too (`crate::dbus`).
+pub(crate) fn parse_direction(value: &str) -> Result<DeviceDirection, String> {
+    DeviceDirection::from_key(&value.trim().to_ascii_lowercase())
+        .ok_or_else(|| format!("expected output or input, got `{value}`"))
+}
+
+/// `--app-preset`'s and `--app-input-preset`'s value: `APP=PRESET`, split at the first `=` — a
+/// preset's name may hold one, a program's or a Flatpak id's never does. `APP` cannot be empty;
+/// `PRESET` is read by [`AppPresetChoice::parse`].
+fn parse_app_rule(value: &str) -> Result<AppRuleArg, String> {
+    let (app, preset) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected APP=PRESET, got `{value}`"))?;
+    let app = app.trim();
+    if app.is_empty() {
+        return Err(format!(
+            "expected APP=PRESET with an application before the `=`, got `{value}`"
+        ));
+    }
+    Ok(AppRuleArg {
+        app: app.to_owned(),
+        preset: AppPresetChoice::parse(preset),
+    })
+}
+
+/// `--noise-suppression`'s value; D-Bus's `SetNoiseSuppression` reads its argument with it too.
+pub(crate) fn parse_noise_suppression(value: &str) -> Result<NoiseSuppressionOverride, String> {
+    let key = value.trim().to_ascii_lowercase();
+    // The window says "Mild"; the key says `light` (see `DenoiseLevel::label`).
+    let key = if key == "mild" { "light" } else { key.as_str() };
+    NoiseSuppressionOverride::from_key(key)
+        .ok_or_else(|| format!("expected preset, off, light, medium or strong, got `{value}`"))
 }
 
 fn parse_power(value: &str) -> Result<PowerArg, String> {
@@ -1208,6 +1532,20 @@ mod tests {
     }
 
     #[test]
+    fn an_activated_start_is_a_hidden_start() {
+        // What the D-Bus activation file and the user unit run: hidden, as `--hide`, and the
+        // hiding is honoured at a cold start. As a second process it forwards nothing at all,
+        // which `main` decides before anything is forwarded.
+        let cli = parse(&["--activated"]);
+        assert!(cli.activated);
+        assert!(!cli.run_minimized);
+        assert_eq!(
+            cli.cold_start_commands(),
+            [Command::Window(WindowCommand::Hide)]
+        );
+    }
+
+    #[test]
     fn a_compositor_hotkey_alone_leaves_the_window_where_it_is() {
         for hotkey in [
             "--toggle-power",
@@ -1304,5 +1642,490 @@ mod tests {
         // `--quit` with no instance to quit is decided in `main` before the engine starts; it
         // must not slip through here and start one.
         assert!(parse(&["--quit"]).cold_start_commands().is_empty());
+    }
+
+    #[test]
+    fn input_names_a_microphone_and_off_detaches_either_lane() {
+        assert_eq!(
+            parse(&["--input=alsa_input.usb-fifine"]).commands(),
+            vec![
+                Command::Input(DeviceCommand::Select("alsa_input.usb-fifine".to_owned())),
+                Command::Window(WindowCommand::Show),
+            ]
+        );
+        for off in ["off", "OFF", "Off"] {
+            assert!(
+                parse(&[&format!("--input={off}")])
+                    .commands()
+                    .contains(&Command::Input(DeviceCommand::Detach)),
+                "--input={off}"
+            );
+            assert!(
+                parse(&["--output", off])
+                    .commands()
+                    .contains(&Command::Output(DeviceCommand::Detach)),
+                "--output {off}"
+            );
+        }
+        // An empty name is no command, for `--input` as for `--output`.
+        assert!(
+            parse(&["--input="])
+                .commands()
+                .iter()
+                .all(|c| !matches!(c, Command::Input(_)))
+        );
+    }
+
+    #[test]
+    fn next_input_cycles_the_input_lane_and_a_name_wins_over_it() {
+        assert_eq!(
+            parse(&["--next-input"]).commands(),
+            vec![Command::Input(DeviceCommand::Next)]
+        );
+        assert_eq!(
+            parse(&["--next_input"]).commands(),
+            vec![Command::Input(DeviceCommand::Next)]
+        );
+        let both = parse(&["--next-input", "--input=Mic"]).commands();
+        assert!(both.contains(&Command::Input(DeviceCommand::Select("Mic".to_owned()))));
+        assert!(!both.contains(&Command::Input(DeviceCommand::Next)));
+        // The two lanes' keybinds are independent.
+        assert_eq!(
+            parse(&["--next-output", "--next-input"]).commands(),
+            vec![
+                Command::Output(DeviceCommand::Next),
+                Command::Input(DeviceCommand::Next),
+            ]
+        );
+    }
+
+    #[test]
+    fn edit_takes_output_or_input_in_any_case() {
+        assert_eq!(parse(&["--edit=input"]).edit, Some(DeviceDirection::Input));
+        assert_eq!(
+            parse(&["--edit", "Output"]).edit,
+            Some(DeviceDirection::Output)
+        );
+        assert!(error(&["--edit=mic"]).contains("expected output or input"));
+        assert!(
+            parse(&["--edit=input"])
+                .commands()
+                .contains(&Command::EditDirection(DeviceDirection::Input))
+        );
+    }
+
+    #[test]
+    fn noise_suppression_takes_the_five_settings_keys_and_the_window_s_word_for_light() {
+        for (value, expected) in [
+            ("preset", NoiseSuppressionOverride::Preset),
+            ("off", NoiseSuppressionOverride::Off),
+            ("light", NoiseSuppressionOverride::Light),
+            ("mild", NoiseSuppressionOverride::Light),
+            ("medium", NoiseSuppressionOverride::Medium),
+            ("Strong", NoiseSuppressionOverride::Strong),
+        ] {
+            assert_eq!(
+                parse(&[&format!("--noise-suppression={value}")]).noise_suppression,
+                Some(expected),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            parse(&["--noise_suppression", "off"]).noise_suppression,
+            Some(NoiseSuppressionOverride::Off)
+        );
+        assert!(
+            error(&["--noise-suppression=max"])
+                .contains("expected preset, off, light, medium or strong")
+        );
+        assert_eq!(
+            parse(&["--noise-suppression=strong"]).commands(),
+            vec![Command::NoiseSuppression(NoiseSuppressionOverride::Strong)]
+        );
+    }
+
+    #[test]
+    fn json_goes_with_status_watch_or_self_test_and_is_an_error_alone() {
+        // CI runs `fxsound --self-test --json` on every package; 0.3.0 tied `--json` to
+        // `--status` and would have refused it.
+        assert_eq!(
+            parse(&["--self-test", "--json"]).commands(),
+            vec![Command::SelfTest { json: true }]
+        );
+        assert_eq!(
+            parse(&["--status", "--json"]).commands(),
+            vec![Command::Status { json: true }]
+        );
+        assert_eq!(
+            parse(&["--watch", "--json"]).commands(),
+            vec![Command::Watch {
+                json: true,
+                meters: false
+            }]
+        );
+        let alone = error(&["--json"]);
+        assert!(
+            alone.contains("--status") || alone.contains("--self-test"),
+            "{alone}"
+        );
+        assert!(!error(&["--json", "--power=1"]).is_empty());
+    }
+
+    #[test]
+    fn meters_goes_with_watch_only() {
+        assert_eq!(
+            parse(&["--watch", "--meters"]).commands(),
+            vec![Command::Watch {
+                json: false,
+                meters: true
+            }]
+        );
+        assert!(error(&["--meters"]).contains("--watch"));
+        assert!(error(&["--status", "--meters"]).contains("--watch"));
+    }
+
+    #[test]
+    fn self_test_status_and_watch_each_answer_alone_and_never_raise_the_window() {
+        for (args, expected) in [
+            (
+                &["--self-test", "--power=1", "--show"][..],
+                Command::SelfTest { json: false },
+            ),
+            (
+                &["--status", "--input=Mic", "--next-input"][..],
+                Command::Status { json: false },
+            ),
+            (
+                &["--watch", "--preset=Rock", "--edit=input"][..],
+                Command::Watch {
+                    json: false,
+                    meters: false,
+                },
+            ),
+            // One question per line: the self-test first, it never contacts an instance.
+            (
+                &["--status", "--watch", "--self-test"][..],
+                Command::SelfTest { json: false },
+            ),
+            (
+                &["--watch", "--status"][..],
+                Command::Status { json: false },
+            ),
+        ] {
+            let cli = parse(args);
+            assert!(cli.is_query(), "{args:?}");
+            assert_eq!(cli.commands(), vec![expected], "{args:?}");
+            assert!(cli.window_command().is_none(), "{args:?}");
+        }
+        assert!(!parse(&["--power=1"]).is_query());
+    }
+
+    #[test]
+    fn self_test_has_a_hidden_underscore_spelling() {
+        assert!(parse(&["--self_test"]).self_test);
+    }
+
+    #[test]
+    fn devices_come_before_the_preset_and_edit_sits_between() {
+        // A device says which lane the line means, so the preset is looked up after it; an
+        // explicit `--edit` wins over the lane a device picked.
+        let commands = parse(&[
+            "--preset=Noisy Room",
+            "--noise-suppression=strong",
+            "--edit=input",
+            "--input=Mic",
+            "--output=Speakers",
+            "--power=1",
+            "--num_bands=15",
+        ])
+        .commands();
+        assert_eq!(
+            commands,
+            vec![
+                Command::Power(PowerCommand::On),
+                Command::Output(DeviceCommand::Select("Speakers".to_owned())),
+                Command::Input(DeviceCommand::Select("Mic".to_owned())),
+                Command::EditDirection(DeviceDirection::Input),
+                Command::Preset(PresetCommand::Select("Noisy Room".to_owned())),
+                Command::NoiseSuppression(NoiseSuppressionOverride::Strong),
+                Command::NumBands(15),
+                Command::Window(WindowCommand::Show),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_new_hotkey_shaped_options_leave_the_window_alone_and_the_device_ones_raise_it() {
+        for hotkey in [
+            &["--next-input"][..],
+            &["--noise-suppression=off"][..],
+            &[
+                "--next-input",
+                "--next-output",
+                "--noise-suppression=strong",
+            ][..],
+        ] {
+            let commands = parse(hotkey).commands();
+            assert!(
+                !commands.iter().any(|c| matches!(c, Command::Window(_))),
+                "{hotkey:?} must not raise the window: {commands:?}"
+            );
+        }
+        for raising in [
+            &["--input=Mic"][..],
+            &["--edit=input"][..],
+            &["--output=off"][..],
+            &["--next-input", "--input=Mic"][..],
+            &["--noise-suppression=off", "--edit=input"][..],
+        ] {
+            assert!(
+                parse(raising)
+                    .commands()
+                    .contains(&Command::Window(WindowCommand::Show)),
+                "{raising:?} should raise the window"
+            );
+        }
+    }
+
+    #[test]
+    fn cold_start_honours_the_lane_options_but_not_cycling_or_questions() {
+        let cli = parse(&[
+            "--input=Mic",
+            "--output=off",
+            "--edit=input",
+            "--noise-suppression=light",
+        ]);
+        assert_eq!(
+            cli.cold_start_commands(),
+            vec![
+                Command::Output(DeviceCommand::Detach),
+                Command::Input(DeviceCommand::Select("Mic".to_owned())),
+                Command::EditDirection(DeviceDirection::Input),
+                Command::NoiseSuppression(NoiseSuppressionOverride::Light),
+            ]
+        );
+        assert!(
+            parse(&["--input=off"]).cold_start_commands()
+                == vec![Command::Input(DeviceCommand::Detach)]
+        );
+        for args in [
+            &["--next-input"][..],
+            &["--next-output"][..],
+            &["--watch"][..],
+            &["--watch", "--meters", "--json"][..],
+            &["--self-test"][..],
+        ] {
+            assert!(
+                parse(args).cold_start_commands().is_empty(),
+                "{args:?} is not a cold-start option"
+            );
+        }
+    }
+
+    // ---- per-application presets ---------------------------------------------------------------
+
+    fn app_preset(direction: DeviceDirection, app: &str, preset: Option<&str>) -> Command {
+        Command::AppPreset {
+            direction,
+            app: app.to_owned(),
+            preset: preset.map_or(AppPresetChoice::Follow, |name| {
+                AppPresetChoice::Preset(name.to_owned())
+            }),
+        }
+    }
+
+    #[test]
+    fn app_preset_takes_app_equals_preset_and_each_option_may_be_given_more_than_once() {
+        let commands = parse(&[
+            "--app-input-preset=com.discordapp.Discord=Headset",
+            "--app-preset",
+            "bf6.exe=Gaming",
+            "--app-preset=Brave=Volume Boost",
+        ])
+        .commands();
+        assert_eq!(
+            commands,
+            vec![
+                app_preset(DeviceDirection::Output, "bf6.exe", Some("Gaming")),
+                app_preset(DeviceDirection::Output, "Brave", Some("Volume Boost")),
+                app_preset(
+                    DeviceDirection::Input,
+                    "com.discordapp.Discord",
+                    Some("Headset")
+                ),
+            ],
+            "the output lane's in the order given, then the input lane's, and no window"
+        );
+    }
+
+    #[test]
+    fn default_follow_and_nothing_after_the_equals_sign_follow_the_lane() {
+        for value in [
+            "bf6.exe=default",
+            "bf6.exe=Default",
+            "bf6.exe=FOLLOW",
+            "bf6.exe=",
+            "bf6.exe=  default ",
+        ] {
+            assert_eq!(
+                parse(&["--app-preset", value]).app_preset,
+                vec![AppRuleArg {
+                    app: "bf6.exe".to_owned(),
+                    preset: AppPresetChoice::Follow,
+                }],
+                "{value}"
+            );
+        }
+        assert_eq!(
+            AppPresetChoice::parse("Defaults"),
+            AppPresetChoice::Preset("Defaults".to_owned()),
+            "only the whole word"
+        );
+        assert_eq!(AppPresetChoice::Follow.name(), None);
+        assert_eq!(
+            AppPresetChoice::Preset("Gaming".to_owned()).name(),
+            Some("Gaming")
+        );
+    }
+
+    #[test]
+    fn the_application_is_everything_before_the_first_equals_sign_trimmed() {
+        assert_eq!(
+            parse(&["--app-input-preset= Battlefield 6 = Bass=Max "]).app_input_preset,
+            vec![AppRuleArg {
+                app: "Battlefield 6".to_owned(),
+                preset: AppPresetChoice::Preset("Bass=Max".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_app_rule_without_an_equals_sign_or_an_application_is_an_error() {
+        assert!(error(&["--app-preset=Gaming"]).contains("expected APP=PRESET"));
+        assert!(error(&["--app-preset", "=Gaming"]).contains("an application before the `=`"));
+        assert!(error(&["--app-input-preset", "  =Headset"]).contains("APP=PRESET"));
+        assert!(error(&["--app-preset"]).contains("APP=PRESET"));
+    }
+
+    #[test]
+    fn the_app_options_have_hidden_underscore_spellings() {
+        let cli = parse(&[
+            "--app_preset=brave=Music",
+            "--app_input_preset=discord=Headset",
+            "--list_apps",
+        ]);
+        assert_eq!(cli.app_preset.len(), 1);
+        assert_eq!(cli.app_input_preset.len(), 1);
+        assert!(cli.list_apps);
+    }
+
+    #[test]
+    fn an_app_preset_leaves_the_window_alone_unless_the_line_says_otherwise() {
+        for quiet in [
+            &["--app-preset=bf6.exe=Gaming"][..],
+            &["--app-input-preset=discord=default"][..],
+            &[
+                "--app-preset=bf6.exe=Gaming",
+                "--next-preset",
+                "--toggle-power",
+            ][..],
+        ] {
+            let cli = parse(quiet);
+            assert!(!cli.is_query(), "{quiet:?} is something to do");
+            assert!(
+                !cli.commands()
+                    .iter()
+                    .any(|command| matches!(command, Command::Window(_))),
+                "{quiet:?} must not raise the window"
+            );
+        }
+        for (line, window) in [
+            (
+                &["--app-preset=bf6.exe=Gaming", "--preset=Rock"][..],
+                WindowCommand::Show,
+            ),
+            (
+                &["--app-preset=bf6.exe=Gaming", "--show"][..],
+                WindowCommand::Show,
+            ),
+            (
+                &["--app-preset=bf6.exe=Gaming", "--hide"][..],
+                WindowCommand::Hide,
+            ),
+        ] {
+            assert!(
+                parse(line).commands().contains(&Command::Window(window)),
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_app_preset_comes_after_the_preset_so_a_preset_saved_on_the_line_can_be_given() {
+        let commands = parse(&[
+            "--app-preset=bf6.exe=Night",
+            "--save_preset=Night",
+            "--edit=output",
+        ])
+        .commands();
+        assert_eq!(
+            commands,
+            vec![
+                Command::EditDirection(DeviceDirection::Output),
+                Command::Preset(PresetCommand::SaveAs("Night".to_owned())),
+                app_preset(DeviceDirection::Output, "bf6.exe", Some("Night")),
+                Command::Window(WindowCommand::Show),
+            ]
+        );
+    }
+
+    #[test]
+    fn list_apps_answers_alone_takes_json_and_never_raises_the_window() {
+        for (args, expected) in [
+            (&["--list-apps"][..], Command::ListApps { json: false }),
+            (
+                &[
+                    "--list-apps",
+                    "--json",
+                    "--app-preset=bf6.exe=Gaming",
+                    "--show",
+                ][..],
+                Command::ListApps { json: true },
+            ),
+            // A question answered once wins over the stream; `--status` over this one.
+            (
+                &["--watch", "--list-apps"][..],
+                Command::ListApps { json: false },
+            ),
+            (
+                &["--list-apps", "--status", "--json"][..],
+                Command::Status { json: true },
+            ),
+        ] {
+            let cli = parse(args);
+            assert!(cli.is_query(), "{args:?}");
+            assert_eq!(cli.commands(), vec![expected], "{args:?}");
+            assert!(cli.window_command().is_none(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn cold_start_honours_an_app_preset_and_leaves_list_apps_to_main() {
+        assert_eq!(
+            parse(&[
+                "--app-preset=bf6.exe=Gaming",
+                "--app-input-preset=discord=default"
+            ])
+            .cold_start_commands(),
+            vec![
+                app_preset(DeviceDirection::Output, "bf6.exe", Some("Gaming")),
+                app_preset(DeviceDirection::Input, "discord", None),
+            ]
+        );
+        assert!(
+            parse(&["--list-apps", "--json"])
+                .cold_start_commands()
+                .is_empty()
+        );
     }
 }

@@ -30,6 +30,10 @@ fxsound \- system-wide audio enhancement for PipeWire
 .B fxsound
 .B \-\-self\-test
 .RB [ \-\-json ]
+.br
+.B fxsound
+.B \-\-list\-apps
+.RB [ \-\-json ]
 .SH DESCRIPTION
 .B fxsound
 presents itself to PipeWire as a virtual sink, processes everything
@@ -38,8 +42,10 @@ surround, dynamic boost and bass \(en and forwards the result to the real
 output device. A second, independent lane does the same for a microphone: it
 runs a voice chain (denoise, high-pass, downward expander, equalizer,
 de-esser, compressor, makeup gain, look-ahead limiter) and publishes a virtual
-source. Both lanes can run at once; each has a device, a preset and a power
-state of its own, and either can be detached.
+source. Both lanes can run at once; each has a device and a preset of its
+own, either can be detached, and one power switch covers both. An application
+can have a preset of its own on either lane: FxSound runs that preset for it
+alone, beside the lane's, and remembers the choice.
 .PP
 Run with no options,
 .B fxsound
@@ -52,8 +58,13 @@ both as a startup option and as a way to drive an instance that is already
 running.
 .PP
 The exceptions are
-.BR \-\-status " and " \-\-watch ,
-which print and exit without raising anything, and
+.BR \-\-status ", " \-\-watch " and " \-\-list\-apps ,
+which print and exit without raising anything, the options a script or a
+keybinding runs (see
+.B Shortcut targets
+and
+.BR Applications ),
+which leave the window where it is, and
 .BR \-\-self\-test ,
 which never contacts a running instance at all.
 .PP
@@ -70,8 +81,9 @@ process per query can use the D-Bus interface instead; see
 .SS Processing
 .TP
 .BI \-\-power= 0|1|toggle
-Turn audio processing on or off for the edit direction (see
-.BR \-\-edit ).
+Turn audio processing on or off, for both lanes. Off also hands the session's
+default output and input back to the real devices, so applications play and
+record past FxSound until it is turned on again, which takes them back.
 Any non-zero integer means on;
 .B toggle
 inverts the current state.
@@ -84,11 +96,18 @@ Accepted names are
 .BR dynamicboost " (also " dynamic_boost ") and " bass " (also"
 .BR bassboost ", " bass_boost ).
 At most five pairs, since there are five effects. The music effects apply to
-the output lane only; a microphone uses the voice chain instead.
+the output lane only, whichever lane is being edited; a microphone uses the
+voice chain instead.
 .TP
 .BI \-\-num_bands= N
 Number of equalizer bands. Only 5, 10, 15, 20 and 31 are accepted; anything
-else is an error rather than a silent fallback.
+else is an error rather than a silent fallback. The curve is carried over to
+the new count by position rather than reset, and every output preset is then
+fitted onto this count: a ten-band preset picked on 31 bands stays on 31.
+With
+.B \-\-edit=input
+it sets the voice preset's band count, and the speakers' setting is left as it
+is.
 .TP
 .BI \-\-set_band_freq= BAND:HZ[,BAND:HZ...]
 Move band centre frequencies. Band indices are 0-based. The outer bound is
@@ -103,11 +122,15 @@ Set band gains in dB, 0-based band indices, gain
 Equalizer filter Q,
 .RB 1.0 \(en 3.0 ,
 rounded to the nearest 0.5 \(en the step size of the equivalent slider.
+With
+.B \-\-edit=input
+it sets the voice preset's own Q, which saving the preset keeps.
 .TP
 .BI \-\-balance= DB
 Stereo balance,
 .RB \-20 \(en+20
-dB, rounded to a whole number. Positive pans right.
+dB, rounded to a whole number. Positive pans right. Output lane only,
+whichever lane is being edited.
 .TP
 .BI \-\-master_gain= DB
 Master gain,
@@ -117,12 +140,12 @@ dB, rounded to a whole number.
 .BI \-\-volume_leveling= AMOUNT
 Volume levelling amount,
 .RB 0.0 \(en 4.0 ,
-rounded to the nearest 0.5. The single-l American spelling is the Windows
-build's and is kept verbatim.
+rounded to the nearest 0.5. Output lane only, whichever lane is being edited.
+The single-l American spelling is the Windows build's and is kept verbatim.
 .TP
 .BI \-\-noise\-suppression= LEVEL
 Noise suppression for the microphone lane, as a control surface over RNNoise:
-.BR off ", " light ", " medium " or " strong ,
+.BR off ", " light " (also " mild ", as the window calls it), " medium " or " strong ,
 or
 .B preset
 to follow whatever the selected voice preset asks for, which is the default.
@@ -136,22 +159,35 @@ Select a preset by its exact, case-sensitive name, in the edit direction's
 list: a
 .I .fac
 preset for the output lane, a voice preset for the input lane. An unknown name
-is an error, not a silent no-op.
+is an error, not a silent no-op; a name only the other lane has is refused with
+a note saying which
+.B \-\-edit
+reaches it. A device named on the same command line is selected first, so
+.B \-\-input=...\& \-\-preset=...
+finds the preset in the microphone's list.
 .TP
 .BI \-\-save_preset= NAME
-Save the current modified settings as a new user preset.
+Save the current modified settings as a new user preset. Refused with nothing
+modified, with a name a preset already has (in any case), and at the
+user-preset limit.
 .TP
 .B \-\-overwrite_preset
-Overwrite the selected user preset with its unsaved changes.
+Overwrite the selected user preset with its unsaved changes. A factory preset
+is refused: save its changes as a new preset instead.
 .TP
 .B \-\-undo_preset
 Discard the selected preset's unsaved changes.
 .TP
 .BI \-\-rename_preset= NAME
-Rename the selected user preset.
+Rename the selected user preset. A factory preset, one with unsaved changes
+(save or undo them first) and a name already taken are refused.
 .TP
 .B \-\-delete_preset
-Delete the selected user preset.
+Delete the selected user preset. A factory preset is refused.
+.PP
+Each of these is refused exactly where the window's menu greys its item out,
+with the reason on standard error, except that they also run while processing
+is off.
 .PP
 A preset name becomes a
 .I .fac
@@ -171,22 +207,37 @@ name is the PipeWire
 .I node.name
 is accepted too, because that is what the settings file persists.
 .B off
-detaches the lane: the virtual sink stays published and nothing is rendered
-until a device is chosen again. Picking a device also makes that lane the edit
-direction. For compatibility with 0.3.0, naming a microphone here is treated as
+detaches the lane: FxSound hands the session default back and removes that
+lane's nodes until a device is chosen again. Picking a device also makes that
+lane the edit direction. For compatibility with 0.3.0, naming a microphone here is treated as
 .B \-\-input
 with a note on standard error.
+A name that matches no device is an error, except before PipeWire has listed
+the devices, as at login: then the name is held, the lane becomes the edit
+direction at once, and the device is selected when the list arrives, keeping a
+preset picked for it in the meantime.
+A later
+.BR \-\-output ,
+.B off
+or
+.B \-\-next\-output
+replaces a held name.
 .TP
 .BI \-\-input= DEVICE|off
 The same for the microphone lane: select the capture device the voice chain
 reads from, or detach the lane with
 .BR off .
+A playback device named here is an error rather than a guess.
 .TP
 .BI \-\-edit= output|input
-Choose the edit direction: the lane the window shows and the preset, effect
-and power options above act on. The window's device combo and the tray menu
-change it too. Without this option a forwarded command line acts on whichever
-direction the instance is already editing.
+Choose the edit direction: the lane the window shows and the preset and effect
+options above act on. The window's device combo and the tray menu
+change it too, as does
+.BR \-\-output " or " \-\-input
+on the same command line, which
+.B \-\-edit
+overrides. Without either, a forwarded command line acts on whichever direction
+the instance is already editing.
 .TP
 .BI \-\-view= 1|2
 Switch the window between the Lite (1) and Pro (2) layouts.
@@ -197,17 +248,104 @@ Display language, for example
 .TP
 .BR \-\-run_minimized ", " \-\-hide
 Start without showing the window, or hide the window of a running instance.
-This is what the systemd user unit and the autostart entry invoke.
+This is what the autostart entry invokes.
+.TP
+.B \-\-activated
+Start without showing the window, as
+.B \-\-hide
+does; but when FxSound is already running, exit at once with status 0 and
+forward nothing. This is what the systemd user unit and the D-Bus activation
+file invoke, so that a bus call arriving while an instance started from the
+launcher is still starting does not hide its window.
 .TP
 .B \-\-show
 Show and raise the window of the running instance.
+.SS Applications
+.PP
+Every application that plays or records through FxSound is remembered, and
+each can have a preset of its own per lane: a game on
+.IR Gaming ,
+a browser on
+.IR "Volume Boost" ,
+a voice chat's microphone on
+.IR Headset ,
+all at once. FxSound moves the application's streams onto nodes of their own
+on the lane's device that run that preset, as
+.BR pavucontrol (1)
+moves a stream, and moves them back when the preset is taken away; the rest
+of the session keeps the lane's preset. At most four presets of one lane run
+this way at a time. Settings \(-> Applications offers the same choices. None
+of these options raises the window.
+.TP
+.BI \-\-app\-preset= APP=PRESET
+Give an application a playback preset of its own.
+.I APP
+is a remembered application's Flatpak id, program or name, in any case, as
+.B \-\-list\-apps
+shows them: the first of the three that any remembered application has
+decides, and every application it names gets the preset, so
+.B firefox
+reaches both a native and a Flatpak Firefox. One playing or recording now is
+reached by its own as well, even while a rule written for another install
+covers it. One that FxSound has not seen gets a rule for what
+.I APP
+looks like, which applies from the first time it plays: a Flatpak id for
+three or more parts between dots, such as
+.BR com.discordapp.Discord ;
+the name an application gives itself for text with a space, such as
+.BR "Battlefield 6" ;
+a program for anything else, such as
+.B bf6.exe
+or
+.BR firefox .
+A note on standard error says which, as a misspelt name would be new too.
+Given as FxSound starts, such a name waits up to three seconds for FxSound to
+hear which applications play and record, so one already playing is reached
+by its own name.
+.I PRESET
+is an output preset's exact name, or
+.BR default " (also " follow ,
+in any case, or nothing after the
+.BR = )
+to have the application follow the output lane's preset again. A preset the
+output lane does not have is an error. May be given more than once.
+.TP
+.BI \-\-app\-input\-preset= APP=PRESET
+The same for what an application records, with a voice preset.
+.TP
+.B \-\-list\-apps
+Print the applications FxSound remembers and exit: the ones playing or
+recording now first, then the rest, the most recently heard first. One line
+per application of
+.I key=value
+pairs, spelled as
+.B \-\-watch
+spells them:
+.BR name " (the one the window shows), " binary ", " flatpak ", " running ,
+.BR output_preset " and " input_preset
+(empty while the application follows the lane),
+.BR routed.output " and " routed.input
+(the preset FxSound runs it through now, empty on the lane's own). With
+.BR \-\-json ,
+one object:
+.B schema
+and
+.BR apps ,
+described under
+.BR "STATUS DOCUMENT" .
+With no FxSound running, the list is read from the store,
+.IR ~/.config/fxsound/apps.toml ,
+nothing in it running, and nothing is started. Every other option on the
+same command line is ignored.
 .SS Shortcut targets
 .PP
 These exist so a compositor keybinding has something to call. They have no
 Windows counterpart, where the application registers global hotkeys itself.
 .TP
 .B \-\-toggle\-power
-Toggle audio processing in the edit direction.
+Toggle audio processing, as
+.B \-\-power=toggle
+does.
 .TP
 .B \-\-toggle\-window
 Show the window if it is hidden, hide it if it is showing \(en the same toggle
@@ -220,11 +358,14 @@ Select the next preset of the edit direction, wrapping.
 Select the previous preset of the edit direction, wrapping.
 .TP
 .B \-\-next\-output
-Cycle the output lane to the next usable playback device, wrapping. Playback
-devices only: it never crosses into the microphones.
+Cycle the output lane to the next usable playback device, wrapping, in the
+order of the device priority list (Settings \(-> Audio). Playback devices only:
+it never crosses into the microphones.
 .TP
 .B \-\-next\-input
-Cycle the microphone lane to the next usable capture device, wrapping.
+Cycle the microphone lane to the next usable capture device, wrapping, in the
+order of the microphones' priority list (Settings \(-> Microphone). Capture
+devices only.
 .SS Control
 .TP
 .B \-\-status
@@ -232,33 +373,54 @@ Print the running instance's state on standard output and exit, one
 .I key: value
 line per item: the version, whether processing is on, then
 .BR output ", " input ", " output_preset ", " input_preset " and " direction
-(the edit direction), followed by an
-.B input:
-block with the voice chain's telemetry. Every other option on the same
-command line is ignored.
+(the edit direction), the lines 0.3.0 printed, and last
+.BR noise_suppression ", " echo_cancel
+and the voice chain's telemetry as
+.B input_
+lines. Every other option on the same command line is ignored.
 .TP
 .B \-\-json
 Print the
-.BR \-\-status ", " \-\-watch " or " \-\-self\-test
+.BR \-\-status ", " \-\-watch ", " \-\-self\-test " or " \-\-list\-apps
 report as JSON instead of as lines: one object for
 .B \-\-status
-(with
-.BR output " and " input
-objects and an
-.B input_meters
-block), one object per line for the other two. Not the default: the line
-format is what existing scripts already grep.
+(schema 2, described under
+.BR "STATUS DOCUMENT" ),
+for
+.B \-\-self\-test
+.RB ( version ", " checks ", " ok )
+and for
+.B \-\-list\-apps
+.RB ( schema " and " apps ),
+one object per line for
+.BR \-\-watch .
+Not the default: the line format is what existing scripts already grep.
 .TP
 .B \-\-watch
 Subscribe to the running instance and print one event per line until it
-quits or standard output is closed. The first event is
+quits or standard output is closed. The instance's last event before it quits
+is
+.BR quit ,
+and only then does
+.B \-\-watch
+exit 0; a stream that ends without it \(en the instance dropped a reader
+that fell too far behind, or it died \(en exits 1 with
+.I the event stream was cut off
+on standard error, so a loop that restarts
+.B \-\-watch
+until it succeeds keeps it running. The first event is
 .B status
 (the full
 .B \-\-status
 document); after that
 .BR power ", " preset_changed ", " device_changed ", " devices_changed ", "
-.BR audio_state ", " direction ", " notice ", " window " and " quit
-as they happen. Plain output is
+.BR audio_state ", " direction ", " notice ", " echo_cancel ", " calibrated ", "
+.BR app_routed ", " window " and " quit
+as they happen;
+.B app_routed
+says where an application's streams went
+.RB ( app ", " binary ", " flatpak ", " direction ", " preset ,
+the preset being empty once they are back on the lane's own chain). Plain output is
 .I event key=value ...
 per line; with
 .B \-\-json
@@ -282,11 +444,19 @@ Check the installation and exit: the version; that the factory
 presets and the voice presets are found under the install prefix and parse;
 that the settings file parses; an offline run of both processing chains with
 RNNoise instantiated; that the desktop entry, the icons (application and
-status), the systemd unit and this manual page are present; that the runtime
-directory can be created. PipeWire and the session bus are reported as
+status), the systemd unit, the D-Bus activation file, this manual page and the
+AppStream metainfo are present, and that the unit and the activation file
+start this binary; that the runtime directory can be created. Run from a source tree,
+the install-only files are reported as
+.BR skip .
+PipeWire and the session bus are reported as
 .B skip
 rather than as failures when there is none, so the test is meaningful in a
-container with no session. It runs before the single-instance lock is taken,
+container with no session; when they are there, it only checks that something
+answers on their sockets. It writes nothing, not even a broken settings file
+aside. One
+.I name: ok|skip|fail detail
+line per check. It runs before the single-instance lock is taken,
 so it works beside a running FxSound and never forwards anything to it. The
 exit status is 0 if and only if every check that was not skipped passed.
 .TP
@@ -315,15 +485,182 @@ it, not that the effect is audible yet. For
 every check that ran passed.
 .TP
 .B 1
+The command failed and standard error or the report says why: the running
+instance refused it (an unknown preset or device name, or a factory preset to
+overwrite, for example) or could
+not be reached, there is no running instance for
+.BR \-\-status " or " \-\-watch
+to ask, the
+.B \-\-watch
+stream was cut off without the instance's
+.B quit
+event,
 .B \-\-self\-test
-found at least one failing check; the report says which.
+found at least one failing check,
+.B \-\-list\-apps
+with no FxSound running found a store it could not read, or FxSound itself
+could not start.
 .TP
 .B 2
 The command line could not be parsed \(en an unknown option, or a value outside
 its range.
-.PP
-Any other non-zero status is a failure to start or a failure to reach a running
-instance.
+.SH STATUS DOCUMENT
+.B \-\-status \-\-json
+prints one JSON object. D-Bus
+.B GetStatus
+answers with the same object and
+.B \-\-watch
+opens with it. It carries every key 0.3.0 printed, with the same meaning,
+and every key the Windows build's
+.B \-\-status
+writes (marked
+.IR upstream ),
+with that build's meaning and JSON type, so a client written for either reads
+it. Keys are only ever added; a key that changed its meaning would change
+.BR schema .
+The equalizer and
+.BR preset ", " presets " and " selected_preset
+are the edit direction's: the lane the window shows. The effects,
+.BR balance_db " and " volume_leveling
+exist on the output lane only and are always the output lane's.
+.TP
+.B schema
+2. The 0.3.0 document had no number and is schema 1.
+.TP
+.BR version ", " power
+.RI ( upstream )
+The version, and whether processing is on.
+.TP
+.BR audio ", " preset ", " device ", " direction ", " edit_direction ", " view ", " theme
+The edit direction's lane
+.RB ( processing ", " idle " or " unavailable ),
+its preset with
+.B *
+for unsaved changes, its device by description, the edit direction
+.RB ( output " or " input ,
+under both names), and the window's view and theme.
+.TP
+.B effects
+.BR fidelity ", " ambience ", " surround ", " dynamic_boost " and " bass
+on their 0\(en10 scale, and
+.RI ( upstream )
+.BR clarity " and " dynamicboost ,
+the same values as
+.BR fidelity " and " dynamic_boost .
+Exact: a whole value is written as an integer, as 0.3.0 wrote every one, and
+any other with its fraction.
+.TP
+.BR master_gain_db ", " balance_db ", " volume_leveling ", " filter_q ", " eq
+The gain stage, and
+.BR eq :
+.BR enabled ", " bands " and " max_bands .
+.TP
+.BR format ", " ring
+The negotiated
+.BR sample_rate " and " channels ,
+and the ring between the two audio nodes since its stream was built:
+.BR dropped_frames ", " underrun_frames ", " resyncs " and " format_mismatches .
+.TP
+.BR output ", " input
+One object per lane:
+.BR enabled ", " device ", " node_name ", " preset " (without " * "), " modified
+and
+.BR active ;
+.B input
+adds
+.BR noise_suppression " and " denoise_level .
+A detached lane has
+.B null
+for its device.
+.TP
+.BR input_meters ", " echo_cancel
+The microphone's telemetry
+.RB ( voice_probability ", " noise_floor_db ,
+.B null
+until measured, the
+.B _reduction_db
+of the denoiser, gate, compressor and de-esser, and whether the denoiser and
+the de-esser are running), and the echo canceller's
+.BR on " and " running .
+.TP
+.B presets
+.RI ( upstream )
+.B built_in
+and
+.BR user_defined :
+arrays of
+.BR name " and " modified ,
+in the order the preset list shows them.
+.BR output_presets " and " input_presets
+are the same for each lane, whichever the window shows.
+.TP
+.B selected_preset
+.RI ( upstream )
+The preset by the name
+.B \-\-preset
+takes, or
+.B null
+while the lane has none.
+.TP
+.BR output_devices ", " input_devices
+Arrays of names: the description of each device PipeWire has now, in the
+order of
+.BR output_device_list " and " input_device_list .
+.B output_devices
+is
+.IR upstream .
+.TP
+.BR output_device_list ", " input_device_list
+Arrays of
+.BR node_name ", " description " and " present :
+every device the lane's priority list knows, in its order, then any it has
+not learnt yet;
+.B present
+is whether PipeWire has it now, and a device that is not keeps the
+description it was last seen with.
+.TP
+.BR selected_output ", " selected_input
+Each lane's device by description, or
+.B null
+while the lane is detached.
+.B selected_output
+is
+.IR upstream .
+.TP
+.B equalizer
+.RI ( upstream )
+.BR num_bands ", " master_gain " (dB), " volume_leveling ", " filter_q ,
+.BR balance " (dB) and " bands :
+an array of
+.BR index ", " frequency " (Hz), " gain " (dB), " min_frequency " and " max_frequency ,
+the range the band's frequency can be tuned over, which the Windows build
+leaves out.
+.TP
+.B apps
+Every application FxSound remembers, in the order
+.B \-\-list\-apps
+prints them: an array of
+.B name
+(the one the window shows, which
+.B \-\-app\-preset
+takes back),
+.B binary
+and
+.B flatpak
+(empty when PipeWire did not say),
+.B running
+(playing or recording now),
+.BR output_preset " and " input_preset
+(the preset of its own for each lane, as chosen, or
+.B null
+while it follows the lane) and
+.BR routed :
+an object of
+.BR output " and " input ,
+the preset FxSound has moved its streams onto in each lane, or
+.B null
+while they run through the lane's own chain \(en it follows the lane, it is
+not playing or recording there, or its preset could not be run.
 .SH D\-BUS
 A running instance also serves an interface on the session bus, for status
 bars, compositor scripts and anything else that would rather hold a connection
@@ -347,40 +684,162 @@ Methods:
 .PP
 .RS 4
 .EX
-TogglePower() \(-> b        SetPower(b)
+TogglePower() \(-> b          SetPower(b)
 NextPreset()               PrevPreset()
 SetPreset(s)               GetPreset() \(-> s
 SetOutput(s)               SetInput(s)
 NextOutput()               NextInput()
 SetNoiseSuppression(s)     SetEditDirection(s)
-GetStatus() \(-> s          (the \-\-status \-\-json document)
+GetStatus() \(-> s            (the \-\-status \-\-json document)
 Show()                     Hide()
 ToggleWindow()             Quit()
+Apply(as argv) \(-> (b ok, s stdout, s stderr)
+ListPresets() \(-> s          ListDevices() \(-> s
+SetAppPreset(s app, s direction, s preset)
+ListApps() \(-> s
 .EE
 .RE
+.PP
+Each method does what the matching option does \(en
+.B TogglePower
+is
+.BR \-\-toggle\-power ,
+.B SetPreset
+is
+.BR \-\-preset ,
+.B SetEditDirection
+is
+.B \-\-edit
+\(en with the same words for its argument:
+.B SetOutput
+and
+.B SetInput
+take a
+.B node.name
+or a description, or
+.B off
+to detach the lane;
+.B SetEditDirection
+takes
+.BR output " or " input .
+.B SetAppPreset
+is
+.BR \-\-app\-preset " and " \-\-app\-input\-preset :
+the application as they take it, the direction as
+.B SetEditDirection
+takes it, and the preset by name, or
+.BR default ", " follow
+or the empty string to have the application follow the lane again.
+Unlike a typed command line, no method raises the window but
+.BR Show " and " ToggleWindow .
+A command the running instance refuses fails with
+.B org.fxsound.FxSound.Error.Refused
+and the message
+.B fxsound
+would print; an argument the option would not take either, with
+.BR org.freedesktop.DBus.Error.InvalidArgs ;
+a command it did not answer within four seconds, with
+.BR org.freedesktop.DBus.Error.Failed .
+.PP
+.B Apply
+runs a whole command line and answers with what
+.B fxsound
+given it would: whether it succeeded, and what it printed on standard output
+and on standard error.
+.I argv
+holds the options without the program name; a leading
+.B fxsound
+is taken too. A line that does not parse, or that the instance refuses,
+answers
+.B false
+with the reason rather than failing the call, and only no answer within four
+seconds fails it. Like the other methods, it leaves the window alone unless
+the line says
+.BR \-\-show ", " \-\-toggle\-window " or " \-\-hide .
+.B ListPresets
+answers with the
+.BR schema ", " edit_direction ", " selected_preset ", " presets ", "
+.BR output_presets " and " input_presets
+of the status document, and
+.B ListDevices
+with its
+.BR schema ", " selected_output ", " selected_input ", "
+.BR output_device_list " and " input_device_list ,
+each as one JSON object.
+.B ListApps
+answers with what
+.B \-\-list\-apps \-\-json
+prints: the
+.BR schema " and " apps
+of the status document.
 .PP
 Properties:
 .BR Version " (s, constant), " Power " (b), " Preset " (s), "
 .BR Output " (s), " Input " (s) and " Direction " (s)."
+.B Preset
+is the edit direction's preset, without the
+.B *
+for unsaved changes;
+.B Output
+and
+.B Input
+are the lanes' devices by description, empty while a lane is detached;
+.B Direction
+is the edit direction.
 .PP
 Signals:
 .BR PowerChanged (b),
 .BR PresetChanged (s\ direction,\ s\ name),
 .BR DeviceChanged (s\ direction,\ s\ node_name,\ s\ description),
-.BR AudioStateChanged (s\ json)
+.BR AudioStateChanged (s\ json),
+.BR Notice (s\ message)
 and
-.BR Notice (s\ message).
+.BR AppRouted (s\ app,\ s\ direction,\ s\ preset).
+They follow the
+.B \-\-watch
+events
+.BR power ", " preset_changed ", " device_changed ", " audio_state ", " notice
+and
+.BR app_routed ;
+.B AppRouted
+names the application as the window does, and its preset is empty once its
+streams are back on the lane's own chain;
+.B AudioStateChanged
+carries the line
+.B \-\-watch \-\-json
+prints, and a preset that only gains unsaved changes sends no
+.BR PresetChanged .
+A name is empty for a lane that has no preset or no device.
 .PP
 If the name is already taken on the bus, the instance logs that and serves the
-control socket only. With
+control socket only. Any call made while FxSound is not running starts it
+first, in the tray, a property read included: the bus reads
+.I /usr/share/dbus\-1/services/org.fxsound.FxSound.service
+and hands the start to the systemd user unit,
+.IR fxsound.service ,
+or runs
+.B fxsound \-\-activated
+itself where the bus has no systemd. A started FxSound takes over the
+session's default devices, so anything that only reads or polls \(en a status
+bar module above all \(en must ask the bus not to start it, or it will bring
+FxSound back seconds after the user quit it:
+.B busctl \-\-auto\-start=no
+does, as does the message flag
+.B NO_AUTO_START
+in any other client. At most 32 calls are answered at once; past that a call
+is refused with
+.BR org.fxsound.FxSound.Error.Refused ,
+as a command line past the control socket's limit is. With
 .BR busctl (1):
 .PP
 .RS 4
 .EX
 busctl \-\-user call org.fxsound.FxSound /org/fxsound/FxSound \e
     org.fxsound.FxSound SetPreset s Rock
-busctl \-\-user get\-property org.fxsound.FxSound /org/fxsound/FxSound \e
-    org.fxsound.FxSound Power
+busctl \-\-user call org.fxsound.FxSound /org/fxsound/FxSound \e
+    org.fxsound.FxSound Apply as 2 \-\- \-\-preset=Rock \-\-set_effect=bass:7.5
+busctl \-\-user \-\-auto\-start=no get\-property org.fxsound.FxSound \e
+    /org/fxsound/FxSound org.fxsound.FxSound Power
 busctl \-\-user monitor org.fxsound.FxSound
 .EE
 .RE
@@ -446,6 +905,12 @@ Imported and user-saved presets; voice presets under
 Settings. A corrupt file is never fatal: the defaults are used and the audio
 still comes up.
 .TP
+.I ~/.config/fxsound/apps.toml
+The applications FxSound remembers, at most 500, and the preset each has of
+its own. One that does not load is moved aside to
+.I apps.toml.bad
+when FxSound starts, and the list starts empty.
+.TP
 .I $XDG_RUNTIME_DIR/fxsound/instance.lock
 Holds the running instance's pid under an exclusive
 .BR flock (2).
@@ -460,8 +925,15 @@ A systemd user unit, installed but not enabled. See
 .B NOTES
 below.
 .TP
+.I /usr/share/dbus\-1/services/org.fxsound.FxSound.service
+Starts FxSound, through that unit, when a D-Bus call arrives for it and it is
+not running. See
+.BR D\-BUS .
+.TP
 .I /usr/share/icons/hicolor/scalable/status/com.fxsound.FxSound\-{off,on,processing}.svg
 The tray icon's three states, looked up by name by the StatusNotifier host.
+The binary carries the same three and offers them as pixmaps too, for a host
+that does not look icons up in the theme.
 .SH EXAMPLES
 Mute the processing from a compositor keybinding, in Hyprland:
 .PP
@@ -501,6 +973,18 @@ Point the microphone lane at a headset and quieten a fan:
 .EX
 fxsound \-\-input='Jabra Evolve2' \-\-preset='Gaming Headset' \e
     \-\-noise\-suppression=strong
+.EE
+.RE
+.PP
+Give a game and a browser presets of their own, and a voice chat's
+microphone a voice preset \(en by program, by program and by Flatpak id, even
+before any of them has run \(en then check what runs where:
+.PP
+.RS 4
+.EX
+fxsound \-\-app\-preset='bf6.exe=Gaming' \-\-app\-preset='brave=Volume Boost' \e
+    \-\-app\-input\-preset='com.discordapp.Discord=Headset'
+fxsound \-\-list\-apps
 .EE
 .RE
 .PP

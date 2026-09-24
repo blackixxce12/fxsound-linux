@@ -294,6 +294,15 @@ Reset button auto-sizing (`GUI/FxSettingsDialog.cpp:289-315`):
 counts `\n` in the translated label, up to **3** lines; height = `24 × lineCount`;
 width = `min(bestWidthForHeight(24 × lines), 315)` clamped up to at least `220`.
 
+**Port addition (0.4.0, upstream review U4).** A second checkbox, "Follow the system's default
+device" (`follow_system_default`; upstream issue #629), sits at `(20, 384, 399, 30)`, ten points
+under the first. The group backdrop grows to `(10, 40, 419, 384)` and the reset button moves to
+`(20, 444, W, 24·lines)`; every translation's reset button still ends inside the pane. While the
+new checkbox is ticked the priority list stops choosing the device and "Prioritize new output
+devices" is greyed out. The port's Microphone pane carries the microphones' own list, "Input
+Device Preference", twenty points under its last-calibration line: the same ▲ ▼ ✕ rows in 24-point
+height, without preset combos, four rows before it scrolls.
+
 #### Settings exposed by the Audio pane
 
 | Control | String id | Type | Default | Range | Persistence key | Source |

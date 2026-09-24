@@ -9,10 +9,20 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/fxsound --hide
+# The name the instance owns on the session bus, and the one packaging/org.fxsound.FxSound.service
+# activates this unit for. Type stays simple: without a session bus FxSound runs socket-only, and
+# a unit of Type=dbus would call that a failed start.
+BusName=org.fxsound.FxSound
+# --activated starts hidden as --hide does, and exits without forwarding anything when FxSound is
+# running already: a bus activation that lands while a launcher-started instance is still starting
+# must not hide the window that instance just opened.
+ExecStart=/usr/bin/fxsound --activated
 # Hands the session default back before exiting; SIGTERM does the same, so this is belt and
-# braces for a stop that arrives while the window is being recreated.
-ExecStop=-/usr/bin/fxsound --quit
+# braces for a stop that arrives while the window is being recreated. Guarded: systemd runs the
+# stop commands after every successful start, also when the main process has exited on its own,
+# and then leaves $MAINPID unset. That is what an --activated start does when FxSound runs already
+# (from a launcher, say), and an unguarded --quit would reach and quit that instance instead.
+ExecStop=-/bin/sh -c '[ -z "$MAINPID" ] || exec /usr/bin/fxsound --quit'
 Restart=on-failure
 RestartSec=3
 Slice=session.slice

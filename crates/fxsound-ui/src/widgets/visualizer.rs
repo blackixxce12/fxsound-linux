@@ -31,7 +31,11 @@
 //!    between two frames. Here the level envelope releases with [`RELEASE_TAU_SECS`], so the bars
 //!    fall away over about a second and reach the same flat line. The end state is identical; only
 //!    the transition differs.
-//! 3. **A hold-and-release envelope in front of the history.** The original has no GUI-side
+//! 3. **No frames once it has settled.** The original drops to a 10 fps timer while idle
+//!    (`FxVisualizer.cpp:95`), redrawing a flat line ten times a second for as long as nothing
+//!    plays. Here a settled strip asks for nothing ([`VisualizerAnimation::repaint_interval`]):
+//!    the window's pump notices the sound coming back (0.4.0 design §12).
+//! 4. **A hold-and-release envelope in front of the history.** The original has no GUI-side
 //!    smoothing or peak hold whatsoever (`docs/spec/04-equalizer-visualizer.md` §B4); all temporal
 //!    shaping is the DSP's one-pole mean-square smoother. [`hold_release`] adds an envelope with an
 //!    *instant* attack and a release equal to that same smoother's own decay — τ = 0.2 s on the
@@ -106,9 +110,6 @@ pub const ALPHA_IDLE: f32 = 0.75;
 
 /// How often the history ripples, in seconds (`FxVisualizer.cpp:58`: `1.0 / 30.0`).
 pub const FRAME_INTERVAL_SECS: f32 = 1.0 / 30.0;
-
-/// Repaint interval once the meter has settled (`FxVisualizer.cpp:95`: `setFramesPerSecond(10)`).
-pub const IDLE_INTERVAL_SECS: f32 = 0.1;
 
 /// Release time constant of the level envelope, in seconds.
 ///
@@ -186,6 +187,19 @@ impl VisualizerAnimation {
     #[must_use]
     pub fn is_settled(&self) -> bool {
         self.level.iter().all(|&l| l == 0.0) && self.bars().iter().all(|&b| b == 0.0)
+    }
+
+    /// When the strip wants its next frame: [`FRAME_INTERVAL_SECS`] while anything in it is still
+    /// moving — the original's 30 fps (`FxVisualizer.cpp:78`) — and never once it has settled.
+    ///
+    /// The original keeps a 10 fps timer running while idle (`:95`), which redraws a flat line
+    /// ten times a second for as long as nothing plays. Nothing here needs it: sound coming back
+    /// reaches the window through its pump, which wakes for the engine's news and looks at the
+    /// meters at least once a second (0.4.0 design §12), and the first frame with sound in it
+    /// unsettles the strip again.
+    #[must_use]
+    pub fn repaint_interval(&self) -> Option<Duration> {
+        (!self.is_settled()).then(|| Duration::from_secs_f32(FRAME_INTERVAL_SECS))
     }
 
     /// Fold one frame of elapsed time into the animation.
@@ -268,15 +282,11 @@ impl<'a> VisualizerWidget<'a> {
             self.animation.bars(),
         );
 
-        // 33.3 ms while anything is still moving, 100 ms once it has settled — the original's two
-        // frame rates (`FxVisualizer.cpp:78,95`), expressed as a deadline instead of a timer.
-        let interval = if audio_active || !self.animation.is_settled() {
-            FRAME_INTERVAL_SECS
-        } else {
-            IDLE_INTERVAL_SECS
-        };
-        ui.ctx()
-            .request_repaint_after(Duration::from_secs_f32(interval));
+        // 33.3 ms while anything is still moving, as a deadline instead of a timer; nothing once
+        // it has settled (see `repaint_interval`).
+        if let Some(interval) = self.animation.repaint_interval() {
+            ui.ctx().request_repaint_after(interval);
+        }
     }
 }
 
@@ -825,6 +835,29 @@ mod tests {
         assert!(animation.is_settled());
         assert!(animation.bars().iter().all(|&b| b == 0.0));
         assert!(animation.bars().iter().all(|&b| bar_height(b) == 1.0));
+    }
+
+    #[test]
+    fn the_strip_asks_for_thirty_frames_a_second_while_it_moves_and_none_once_it_has_settled() {
+        let mut animation = VisualizerAnimation::new();
+        assert_eq!(
+            animation.repaint_interval(),
+            None,
+            "a flat line is not redrawn ten times a second, as the original's idle timer did"
+        );
+        animation.advance(&frame(0.6), true, FRAME_INTERVAL_SECS);
+        assert_eq!(
+            animation.repaint_interval(),
+            Some(Duration::from_secs_f32(FRAME_INTERVAL_SECS))
+        );
+        // The sound stops: the bars fall away at the same pace, and then nothing more is asked.
+        let mut frames = 0;
+        while animation.repaint_interval().is_some() {
+            animation.advance(&frame(0.0), false, FRAME_INTERVAL_SECS);
+            frames += 1;
+            assert!(frames < 90, "the strip never settled");
+        }
+        assert!(animation.is_settled());
     }
 
     #[test]

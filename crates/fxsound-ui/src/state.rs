@@ -6,9 +6,14 @@
 //! an action into a real effect — writing a preset, retuning the engine, switching a device — so
 //! the whole UI crate stays free of audio and file-system dependencies and can be tested headless.
 
+use fxsound_core::i18n::tr;
 use fxsound_core::{
-    AudioDevice, DeviceDirection, Effect, EqBand, SpectrumFrame, ThemeMode, ViewMode,
+    AudioDevice, DenoiseLevel, DeviceDirection, Effect, EqBand, SpectrumFrame, ThemeMode, ViewMode,
 };
+use std::time::{Duration, Instant};
+
+/// How long a notice stays on screen before the application clears it (0.4.0 design, §11).
+pub const NOTICE_LIFETIME: Duration = Duration::from_secs(4);
 
 /// One preset as the combo box needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +23,48 @@ pub struct PresetEntry {
     pub factory: bool,
     /// `true` when the user has unsaved changes; drawn as a trailing `*`.
     pub modified: bool,
+}
+
+/// An application the engine runs through a preset of its own (`docs/0.4.0-apps.md`): what the
+/// Pro window's preset list says on hover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedApp {
+    /// The lane whose route the application's streams are on.
+    pub direction: DeviceDirection,
+    /// The application's name as the Applications pane shows it.
+    pub name: String,
+    /// The preset its route runs.
+    pub preset: String,
+}
+
+/// Why echo cancellation, asked for, is not running — as far as the interface says it. The
+/// engine's own words, a module path and an OS error among them, stay in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoCancelTrouble {
+    /// The canceller could not be loaded: PipeWire's echo-cancel module or its WebRTC library is
+    /// missing, or refused.
+    NotLoaded,
+    /// It was running and went away by itself.
+    Stopped,
+    /// It waits for the speakers it takes the echo of.
+    WaitingForSpeakers,
+    /// Something this version cannot name. Said as `unavailable` alone.
+    Other,
+}
+
+impl EchoCancelTrouble {
+    /// The short reason shown after `unavailable`, translated; `None` for [`Self::Other`].
+    #[must_use]
+    pub fn reason(self) -> Option<String> {
+        match self {
+            Self::Other => None,
+            named => Some(tr(match named {
+                Self::NotLoaded => "the echo canceller could not be loaded",
+                Self::Stopped => "the echo canceller stopped",
+                Self::WaitingForSpeakers | Self::Other => "waiting for the speakers",
+            })),
+        }
+    }
 }
 
 /// Everything the views draw.
@@ -33,15 +80,33 @@ pub struct UiState {
     /// Index into `presets`, or `None` when the list is empty.
     pub selected_preset: Option<usize>,
 
-    // ---- device ----------------------------------------------------------------------------
+    // ---- devices: two lanes ------------------------------------------------------------------
+    /// Every device the engine listed: all outputs first, then all inputs.
     pub devices: Vec<AudioDevice>,
-    pub selected_device: Option<usize>,
-    /// Which chain the engine is running, which follows the selected device.
+    /// The output lane's device, as an index into `devices`; `None` while the lane is detached.
+    pub selected_output: Option<usize>,
+    /// The input lane's device, as an index into `devices`; `None` while the lane is detached —
+    /// which is the default: the microphone lane only comes up when someone picks a microphone.
+    pub selected_input: Option<usize>,
+    /// Per lane, the name of the device a lane that is **on** is attached to, or on its way to,
+    /// while `devices` does not list it — a Bluetooth headset between its two profiles, the
+    /// moments before the first device list. The combo, the tray and the strip show the lane on
+    /// that device rather than `Off`, which means switched off and nothing else. `None` whenever
+    /// the lane has a selection, and for a lane that is off.
+    pub unlisted_output: Option<String>,
+    pub unlisted_input: Option<String>,
+    /// The **edit direction**: which lane the preset picker, the equalizer, the level controls and
+    /// the meters address. Both lanes can run at once; this only says which one the window edits.
     ///
-    /// The original had no such thing — it only ever sat in front of a playback endpoint — so
-    /// everything drawn differently because of this is drawn *only* in the input direction, where
-    /// there is no layout to be faithful to.
+    /// Every field in this struct that describes *a* chain — `presets`, `selected_preset`,
+    /// `effects`, the equalizer, the levels, `spectrum`, `audio_active`, `sample_rate` — holds this
+    /// direction's copy. The original had no such thing — it only ever sat in front of a playback
+    /// endpoint — so everything drawn differently because of this is drawn *only* in the input
+    /// direction, where there is no layout to be faithful to.
     pub direction: DeviceDirection,
+    /// Whether each lane is actually moving audio right now.
+    pub output_active: bool,
+    pub input_active: bool,
 
     // ---- effects ---------------------------------------------------------------------------
     /// The five knobs on the GUI's own `0..=10` scale, indexed by `Effect as usize`.
@@ -71,8 +136,10 @@ pub struct UiState {
     /// the band is bypassed. A bypassed band that still *looks* live is a control that silently
     /// does nothing, which is the one thing this port keeps refusing to ship.
     pub sample_rate: u32,
-    /// Gain reduction of the three microphone stages, in dB, as positive numbers. Zero in the
-    /// output direction, which has none of them.
+    /// Gain reduction of the three microphone stages, in dB, as positive numbers.
+    ///
+    /// This field and everything down to `denoise_level` is the **input lane's** telemetry
+    /// whichever lane is being edited: the output chain has none of these stages.
     pub gate_reduction_db: f32,
     pub compressor_reduction_db: f32,
     pub deesser_reduction_db: f32,
@@ -97,12 +164,51 @@ pub struct UiState {
     pub denoise_running: bool,
     /// The denoiser's voice probability for the last frame, `0.0..=1.0`.
     pub voice_probability: f32,
+    /// The microphone's running noise floor, measured before the chain, in dBFS.
+    pub noise_floor_db: f32,
+    /// What the denoiser and the de-reverb take away, as positive dB.
+    pub denoise_reduction_db: f32,
+    pub dereverb_reduction_db: f32,
+    /// The corner the de-esser actually built, and the one the preset asked for. They differ when
+    /// the adaptive mode lowered the corner for a narrow source; zero means "not known".
+    pub deesser_hz: f32,
+    pub deesser_requested_hz: f32,
+    /// The de-reverb stage and echo cancellation, asked for or not.
+    pub dereverb_on: bool,
+    pub echo_cancel_on: bool,
+    /// Whether the echo canceller is actually loaded: asked-for-but-not-running is a third state
+    /// here too (a system without the WebRTC module).
+    pub echo_cancel_running: bool,
+    /// Why the engine says the echo canceller is not running, when it says anything: `None` is
+    /// no complaint, which is also the canceller simply not needed yet.
+    pub echo_cancel_trouble: Option<EchoCancelTrouble>,
+    /// The suppression level in force, with the global override already applied.
+    pub denoise_level: DenoiseLevel,
 
     // ---- chrome ----------------------------------------------------------------------------
-    /// Transient message shown in the notification strip, with the frame count left to live.
+    /// A transient message: drawn as a bubble in the Pro window and as a strip in the Lite one.
+    ///
+    /// A plain `String` rather than a struct carrying its own deadline, so that the views and the
+    /// pixel tests can build a state with a notice up in one literal. The clock lives beside it in
+    /// [`UiState::notice_clock`], and [`UiState::expire_notification`] — which the application
+    /// calls once per poll — clears the notice [`NOTICE_LIFETIME`] after its clock started. The
+    /// views only draw it; they never time it.
+    ///
+    /// **Raise a notice with [`UiState::notify`]**, which sets both and restarts the clock. A text
+    /// written straight into this field is stamped on the first poll that sees it, which is enough
+    /// for a literal, but the clock is keyed on the text: the same notice raised again while it is
+    /// still up would keep the old clock and vanish early.
     pub notification: Option<String>,
+    /// The notice last stamped and when. Stamped by the application, never by a view; a text that
+    /// differs from `notification` is a new notice whose clock has not started yet.
+    pub notice_clock: Option<(String, Instant)>,
     /// Suppresses every tooltip, matching the `hide_help_tooltips` setting.
     pub hide_tooltips: bool,
+
+    // ---- per-application presets -------------------------------------------------------------
+    /// Every application the engine has moved onto a route of its own, both lanes, in the order
+    /// it reported them. The preset list's tooltip lists the edit direction's.
+    pub routed_apps: Vec<RoutedApp>,
 }
 
 impl Default for UiState {
@@ -114,8 +220,13 @@ impl Default for UiState {
             presets: Vec::new(),
             selected_preset: None,
             devices: Vec::new(),
-            selected_device: None,
+            selected_output: None,
+            selected_input: None,
+            unlisted_output: None,
+            unlisted_input: None,
             direction: DeviceDirection::Output,
+            output_active: false,
+            input_active: false,
             effects: [0.0; Effect::COUNT],
             eq_on: true,
             eq_bands: fxsound_core::eq::default_bands(),
@@ -136,8 +247,20 @@ impl Default for UiState {
             deesser_running: false,
             denoise_running: false,
             voice_probability: 0.0,
+            noise_floor_db: -100.0,
+            denoise_reduction_db: 0.0,
+            dereverb_reduction_db: 0.0,
+            deesser_hz: 0.0,
+            deesser_requested_hz: 0.0,
+            dereverb_on: false,
+            echo_cancel_on: false,
+            echo_cancel_running: false,
+            echo_cancel_trouble: None,
+            denoise_level: DenoiseLevel::default(),
             notification: None,
+            notice_clock: None,
             hide_tooltips: false,
+            routed_apps: Vec::new(),
         }
     }
 }
@@ -159,10 +282,124 @@ impl UiState {
         }
     }
 
-    /// The selected output device, if any.
+    /// One lane's device, as an index into `devices`; `None` while that lane is detached.
+    #[must_use]
+    pub const fn selection(&self, direction: DeviceDirection) -> Option<usize> {
+        match direction {
+            DeviceDirection::Output => self.selected_output,
+            DeviceDirection::Input => self.selected_input,
+        }
+    }
+
+    /// Record one lane's device, leaving the other lane's alone.
+    pub fn set_selection(&mut self, direction: DeviceDirection, index: Option<usize>) {
+        match direction {
+            DeviceDirection::Output => self.selected_output = index,
+            DeviceDirection::Input => self.selected_input = index,
+        }
+    }
+
+    /// The edit direction's device index — the one selection 0.3.0 had, now derived.
+    #[must_use]
+    pub const fn selected_device(&self) -> Option<usize> {
+        self.selection(self.direction)
+    }
+
+    /// One lane's device, if that lane is attached and the index is still in the list.
+    #[must_use]
+    pub fn device_for(&self, direction: DeviceDirection) -> Option<&AudioDevice> {
+        self.selection(direction)
+            .and_then(|i| self.devices.get(i))
+            .filter(|device| device.direction == direction)
+    }
+
+    /// The edit direction's device, if any.
     #[must_use]
     pub fn device(&self) -> Option<&AudioDevice> {
-        self.selected_device.and_then(|i| self.devices.get(i))
+        self.device_for(self.direction)
+    }
+
+    /// The name of the device `direction`'s lane is on while the list does not carry it
+    /// ([`UiState::unlisted_output`]).
+    #[must_use]
+    pub fn unlisted(&self, direction: DeviceDirection) -> Option<&str> {
+        match direction {
+            DeviceDirection::Output => self.unlisted_output.as_deref(),
+            DeviceDirection::Input => self.unlisted_input.as_deref(),
+        }
+    }
+
+    /// Record the device one lane is on while the list does not carry it, or `None`.
+    pub fn set_unlisted(&mut self, direction: DeviceDirection, name: Option<String>) {
+        match direction {
+            DeviceDirection::Output => self.unlisted_output = name,
+            DeviceDirection::Input => self.unlisted_input = name,
+        }
+    }
+
+    /// Whether the output lane has a device, listed or not.
+    #[must_use]
+    pub const fn output_enabled(&self) -> bool {
+        self.selected_output.is_some() || self.unlisted_output.is_some()
+    }
+
+    /// Whether the input lane has a device, listed or not — i.e. whether the microphone lane is
+    /// on at all.
+    #[must_use]
+    pub const fn input_enabled(&self) -> bool {
+        self.selected_input.is_some() || self.unlisted_input.is_some()
+    }
+
+    /// Whether one lane has a device, listed or not.
+    #[must_use]
+    pub const fn lane_enabled(&self, direction: DeviceDirection) -> bool {
+        match direction {
+            DeviceDirection::Output => self.output_enabled(),
+            DeviceDirection::Input => self.input_enabled(),
+        }
+    }
+
+    /// Put up a notice and start its clock now.
+    ///
+    /// The one way the application raises a notice. The clock restarts even when the same text is
+    /// already up: a refusal clicked again three seconds after the first is a new notice, and gets
+    /// its full four seconds.
+    pub fn notify(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.notice_clock = Some((text.clone(), Instant::now()));
+        self.notification = Some(text);
+    }
+
+    /// Take the notice down.
+    pub fn dismiss_notification(&mut self) {
+        self.notification = None;
+        self.notice_clock = None;
+    }
+
+    /// Start the clock of a notice seen for the first time, and clear one that has been up for
+    /// [`NOTICE_LIFETIME`]. Returns `true` when it cleared one.
+    ///
+    /// A notice written straight into `notification` is stamped here, on the first poll that sees
+    /// it; one that replaces a notice still on screen gets a clock of its own rather than the
+    /// remainder of the old one's.
+    pub fn expire_notification(&mut self, now: Instant) -> bool {
+        let Some(text) = &self.notification else {
+            self.notice_clock = None;
+            return false;
+        };
+        match &self.notice_clock {
+            Some((seen, since)) if seen == text => {
+                if now.saturating_duration_since(*since) >= NOTICE_LIFETIME {
+                    self.dismiss_notification();
+                    return true;
+                }
+                false
+            }
+            _ => {
+                self.notice_clock = Some((text.clone(), now));
+                false
+            }
+        }
     }
 
     /// One effect on the GUI's `0..=10` scale.
@@ -261,8 +498,24 @@ pub enum UiAction {
     /// Delete the selected preset.
     DeletePreset,
 
-    /// Select an output device by index.
+    /// Select a device by index into `UiState::devices`, whichever direction it is.
+    ///
+    /// Kept for the tray and the command line, which name a device rather than a lane: the
+    /// application resolves it by the device's own direction to [`UiAction::SelectOutput`] or
+    /// [`UiAction::SelectInput`]. The window uses those two directly.
     SelectDevice(usize),
+    /// Attach the output lane to this device (an index into `UiState::devices`).
+    SelectOutput(usize),
+    /// Attach the input lane to this device (an index into `UiState::devices`).
+    SelectInput(usize),
+    /// Detach the output lane: hand the default back and stop processing playback.
+    DetachOutput,
+    /// Detach the input lane: stop processing the microphone.
+    DetachInput,
+    /// Make this lane the one the window edits. Changes nothing the engine does.
+    SetEditDirection(DeviceDirection),
+    /// Take the notice down before its time is up.
+    DismissNotice,
 
     /// Move one effect knob, on the GUI's `0..=10` scale.
     SetEffect(Effect, f32),
@@ -293,6 +546,26 @@ pub enum UiAction {
     Close,
     /// Start dragging the frameless window.
     DragWindow,
+}
+
+impl UiAction {
+    /// Attach `direction`'s lane to device `index`.
+    #[must_use]
+    pub const fn select(direction: DeviceDirection, index: usize) -> Self {
+        match direction {
+            DeviceDirection::Output => Self::SelectOutput(index),
+            DeviceDirection::Input => Self::SelectInput(index),
+        }
+    }
+
+    /// Detach `direction`'s lane.
+    #[must_use]
+    pub const fn detach(direction: DeviceDirection) -> Self {
+        match direction {
+            DeviceDirection::Output => Self::DetachOutput,
+            DeviceDirection::Input => Self::DetachInput,
+        }
+    }
 }
 
 /// What a view returns after one frame.
@@ -417,6 +690,183 @@ mod tests {
         state.effects[Effect::Bass as usize] = 7.0;
         assert_eq!(state.effect(Effect::Bass), 7.0);
         assert_eq!(state.effect(Effect::Fidelity), 0.0);
+    }
+
+    fn device(name: &str, direction: DeviceDirection) -> AudioDevice {
+        AudioDevice {
+            id: 0,
+            name: name.to_owned(),
+            description: name.to_owned(),
+            is_default: false,
+            direction,
+            form_factor: String::new(),
+        }
+    }
+
+    fn two_lanes() -> UiState {
+        UiState {
+            devices: vec![
+                device("speakers", DeviceDirection::Output),
+                device("headphones", DeviceDirection::Output),
+                device("microphone", DeviceDirection::Input),
+            ],
+            selected_output: Some(1),
+            selected_input: Some(2),
+            ..UiState::default()
+        }
+    }
+
+    #[test]
+    fn a_fresh_state_has_both_lanes_detached_and_edits_the_output() {
+        let state = UiState::default();
+        assert_eq!(state.selected_output, None);
+        assert_eq!(state.selected_input, None);
+        assert!(!state.output_enabled());
+        assert!(!state.input_enabled());
+        assert_eq!(state.direction, DeviceDirection::Output);
+        assert!(state.notification.is_none() && state.notice_clock.is_none());
+    }
+
+    #[test]
+    fn each_lane_keeps_its_own_device() {
+        let state = two_lanes();
+        assert_eq!(
+            state
+                .device_for(DeviceDirection::Output)
+                .map(|d| d.name.as_str()),
+            Some("headphones")
+        );
+        assert_eq!(
+            state
+                .device_for(DeviceDirection::Input)
+                .map(|d| d.name.as_str()),
+            Some("microphone")
+        );
+        assert!(state.output_enabled() && state.input_enabled());
+        assert!(state.lane_enabled(DeviceDirection::Output));
+        assert!(state.lane_enabled(DeviceDirection::Input));
+    }
+
+    #[test]
+    fn the_selected_device_is_the_edit_directions() {
+        let mut state = two_lanes();
+        assert_eq!(state.selected_device(), Some(1));
+        assert_eq!(state.device().map(|d| d.name.as_str()), Some("headphones"));
+        state.direction = DeviceDirection::Input;
+        assert_eq!(state.selected_device(), Some(2));
+        assert_eq!(state.device().map(|d| d.name.as_str()), Some("microphone"));
+    }
+
+    #[test]
+    fn detaching_one_lane_leaves_the_other_alone() {
+        let mut state = two_lanes();
+        state.set_selection(DeviceDirection::Input, None);
+        assert!(!state.input_enabled());
+        assert_eq!(state.selected_output, Some(1));
+        state.set_selection(DeviceDirection::Output, None);
+        assert!(!state.output_enabled());
+        assert_eq!(state.selection(DeviceDirection::Output), None);
+    }
+
+    #[test]
+    fn an_index_of_the_wrong_direction_is_not_a_lanes_device() {
+        // A stale index after the list changed under it must not make a speaker the microphone.
+        let state = UiState {
+            selected_input: Some(0),
+            ..two_lanes()
+        };
+        assert!(state.device_for(DeviceDirection::Input).is_none());
+        let state = UiState {
+            selected_output: Some(9),
+            ..two_lanes()
+        };
+        assert!(state.device_for(DeviceDirection::Output).is_none());
+    }
+
+    #[test]
+    fn the_select_and_detach_constructors_name_the_right_lane() {
+        assert_eq!(
+            UiAction::select(DeviceDirection::Output, 3),
+            UiAction::SelectOutput(3)
+        );
+        assert_eq!(
+            UiAction::select(DeviceDirection::Input, 4),
+            UiAction::SelectInput(4)
+        );
+        assert_eq!(
+            UiAction::detach(DeviceDirection::Output),
+            UiAction::DetachOutput
+        );
+        assert_eq!(
+            UiAction::detach(DeviceDirection::Input),
+            UiAction::DetachInput
+        );
+    }
+
+    #[test]
+    fn a_notice_written_directly_is_stamped_on_first_sight_and_cleared_four_seconds_later() {
+        let mut state = UiState {
+            notification: Some("Preset: Rock".to_owned()),
+            ..UiState::default()
+        };
+        let start = Instant::now();
+        assert!(!state.expire_notification(start));
+        assert!(
+            state.notice_clock.is_some(),
+            "the first poll starts the clock"
+        );
+        assert!(!state.expire_notification(start + Duration::from_millis(3_900)));
+        assert!(state.notification.is_some());
+        assert!(state.expire_notification(start + NOTICE_LIFETIME));
+        assert!(state.notification.is_none());
+        assert!(state.notice_clock.is_none());
+    }
+
+    #[test]
+    fn a_notice_that_replaces_another_gets_a_clock_of_its_own() {
+        let mut state = UiState::default();
+        let start = Instant::now();
+        state.notification = Some("first".to_owned());
+        state.expire_notification(start);
+        state.notification = Some("second".to_owned());
+        // Nearly four seconds after the first: the second has only just appeared.
+        let later = start + Duration::from_millis(3_900);
+        assert!(!state.expire_notification(later));
+        assert!(!state.expire_notification(later + Duration::from_millis(3_000)));
+        assert_eq!(state.notification.as_deref(), Some("second"));
+        assert!(state.expire_notification(later + NOTICE_LIFETIME));
+    }
+
+    #[test]
+    fn notifying_the_same_text_again_restarts_its_clock() {
+        let mut state = UiState::default();
+        let first = Instant::now()
+            .checked_sub(Duration::from_millis(3_500))
+            .expect("the clock has run for a few seconds");
+        state.notification = Some("Factory presets cannot be deleted".to_owned());
+        state.notice_clock = Some(("Factory presets cannot be deleted".to_owned(), first));
+        state.notify("Factory presets cannot be deleted");
+        // The first notice's four seconds are up; the second's are not.
+        assert!(!state.expire_notification(first + NOTICE_LIFETIME));
+        assert!(state.notification.is_some());
+        assert!(state.expire_notification(Instant::now() + NOTICE_LIFETIME));
+    }
+
+    #[test]
+    fn notify_starts_the_clock_and_dismiss_stops_it() {
+        let mut state = UiState::default();
+        state.notify("Saved");
+        assert_eq!(state.notification.as_deref(), Some("Saved"));
+        assert_eq!(
+            state.notice_clock.as_ref().map(|c| c.0.as_str()),
+            Some("Saved")
+        );
+        state.dismiss_notification();
+        assert!(state.notification.is_none() && state.notice_clock.is_none());
+        // No notice, no clock: a poll with nothing up leaves nothing behind.
+        state.notice_clock = Some(("stale".to_owned(), Instant::now()));
+        assert!(!state.expire_notification(Instant::now()));
+        assert!(state.notice_clock.is_none());
     }
 
     #[test]

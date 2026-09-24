@@ -94,6 +94,9 @@ package() {
   # package rather than failing with "Unit not found".
   install -Dm644 "packaging/fxsound.service" \
     "${pkgdir}/usr/lib/systemd/user/fxsound.service"
+  # D-Bus activation: a call to org.fxsound.FxSound starts FxSound through that unit.
+  install -Dm644 "packaging/org.fxsound.FxSound.service" \
+    "${pkgdir}/usr/share/dbus-1/services/org.fxsound.FxSound.service"
   install -Dm644 "assets/images/fxsound_large.png" \
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fxsound.png"
   install -Dm644 "assets/images/fxsound.png" \

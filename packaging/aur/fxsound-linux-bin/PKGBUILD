@@ -52,6 +52,9 @@ package() {
     "${pkgdir}/usr/share/applications/com.fxsound.FxSound.desktop"
   install -Dm644 "lib/systemd/user/fxsound.service" \
     "${pkgdir}/usr/lib/systemd/user/fxsound.service"
+  # D-Bus activation: a call to org.fxsound.FxSound starts FxSound through that unit.
+  install -Dm644 "share/dbus-1/services/org.fxsound.FxSound.service" \
+    "${pkgdir}/usr/share/dbus-1/services/org.fxsound.FxSound.service"
   install -Dm644 "share/icons/hicolor/256x256/apps/fxsound.png" \
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fxsound.png"
   install -Dm644 "share/icons/hicolor/32x32/apps/fxsound.png" \

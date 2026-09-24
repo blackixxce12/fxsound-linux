@@ -44,16 +44,15 @@
 //!   (`docs/spec/04-equalizer-visualizer.md` §A15); [`UiState::eq_on`] drives the desaturated
 //!   painting the original reserves for the power state, while interaction still follows power
 //!   alone so a bypassed curve stays editable.
-//! * **The side controls are opt-in.** The band-count combo, the filter-width slider and the
-//!   restore-defaults button live in `FxAudioControls`, not here
-//!   (`docs/spec/03-controls.md` §5.1). [`EqualizerWidget::with_controls`] draws them at their
-//!   original offsets when the caller hands over that column; without it this widget renders only
-//!   what `FxEqualizer` itself renders.
+//!
+//! The band-count combo, the filter width, the level sliders and Restore Defaults are not drawn
+//! here: in the original they are `FxEqualizerControl`, the back face of the effect column
+//! (`docs/spec/03-controls.md` §5), and so they are here — [`crate::views::equalizer_controls`].
+//! This widget renders only what `FxEqualizer` itself renders.
 
 use crate::assets::{AssetCache, FxImage};
 use crate::state::{UiAction, UiResponse, UiState};
 use crate::theme::{self, FxColor, Palette};
-use crate::widgets::slider::FxSlider;
 use egui::{
     Align2, Color32, CornerRadius, Id, Mesh, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2,
 };
@@ -639,7 +638,6 @@ impl EqInteraction {
 pub struct EqualizerWidget<'a> {
     state: &'a UiState,
     interaction: &'a mut EqInteraction,
-    controls: Option<Rect>,
     db_scale: bool,
 }
 
@@ -649,22 +647,8 @@ impl<'a> EqualizerWidget<'a> {
         Self {
             state,
             interaction,
-            controls: None,
             db_scale: false,
         }
-    }
-
-    /// Also draw the band-count combo, the filter-width slider, the EQ bypass and the
-    /// restore-defaults button into `rect`.
-    ///
-    /// In the original these belong to `FxEqualizerControl`, the back face of the 168 × 257 column
-    /// to the left of the panel (`docs/spec/03-controls.md` §5.1), and their offsets here are that
-    /// layout's. Pass [`EqualizerWidget::controls_rect`] to put them exactly where Windows does.
-    /// Leave it unset when a separate audio-controls view already owns that column.
-    #[must_use]
-    pub fn with_controls(mut self, rect: Rect) -> Self {
-        self.controls = Some(rect);
-        self
     }
 
     /// Draw horizontal guides and captions at −12, −6, 0, +6 and +12 dB.
@@ -674,16 +658,6 @@ impl<'a> EqualizerWidget<'a> {
     pub fn with_db_scale(mut self, show: bool) -> Self {
         self.db_scale = show;
         self
-    }
-
-    /// The sibling column the side controls belong in: 168 points wide, ending 16 points left of
-    /// the panel (`FxProView.cpp:97-98`).
-    #[must_use]
-    pub fn controls_rect(panel: Rect) -> Rect {
-        Rect::from_min_size(
-            pos2(panel.left() - 16.0 - 168.0, panel.top()),
-            vec2(168.0, PANEL_SIZE.y),
-        )
     }
 
     /// Render one frame and collect what the user did.
@@ -698,7 +672,6 @@ impl<'a> EqualizerWidget<'a> {
         let Self {
             state,
             interaction,
-            controls,
             db_scale,
         } = self;
 
@@ -827,10 +800,6 @@ impl<'a> EqualizerWidget<'a> {
                 interaction,
                 response,
             );
-        }
-
-        if let Some(controls_rect) = controls {
-            side_controls(ui, assets, palette, controls_rect, state, response);
         }
     }
 }
@@ -1220,246 +1189,6 @@ fn draw_image(
             Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
             Color32::WHITE,
         );
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
-// The side controls (FxEqualizerControl, docs/spec/03-controls.md §5)
-// ---------------------------------------------------------------------------------------------
-
-/// Offsets inside the 168 × 257 column (`FxAudioControls.cpp:430-460`).
-pub mod controls {
-    use egui::{Rect, Vec2, vec2};
-
-    pub const X_MARGIN: f32 = 8.0;
-    pub const COMBO_SIZE: Vec2 = vec2(152.0, 20.0);
-    pub const SLIDER_SIZE: Vec2 = vec2(160.0, 18.0);
-    pub const CAPTION_HEIGHT: f32 = 14.0;
-    pub const BUTTON_SIZE: Vec2 = vec2(18.0, 18.0);
-
-    /// The band-count combo (`FxAudioControls.cpp:436`).
-    #[must_use]
-    pub fn band_combo(panel: Rect) -> Rect {
-        Rect::from_min_size(panel.min + vec2(X_MARGIN, 28.0), COMBO_SIZE)
-    }
-
-    /// The "Filter Q" caption (`FxAudioControls.cpp:447`).
-    #[must_use]
-    pub fn filter_q_caption(panel: Rect) -> Rect {
-        Rect::from_min_size(panel.min + vec2(16.0, 138.0), vec2(160.0, CAPTION_HEIGHT))
-    }
-
-    /// The filter-width slider (`FxAudioControls.cpp:448`).
-    #[must_use]
-    pub fn filter_q_slider(panel: Rect) -> Rect {
-        Rect::from_min_size(panel.min + vec2(X_MARGIN, 153.0), SLIDER_SIZE)
-    }
-
-    /// The restore-defaults button (`FxAudioControls.cpp:459`).
-    #[must_use]
-    pub fn restore_defaults(panel: Rect) -> Rect {
-        Rect::from_min_size(panel.min + vec2(X_MARGIN, 234.0), BUTTON_SIZE)
-    }
-
-    /// The EQ bypass switch. Not in the original — it occupies the strip the flip button shares
-    /// (`docs/spec/04-equalizer-visualizer.md` §A15 recommends adding one).
-    #[must_use]
-    pub fn bypass(panel: Rect) -> Rect {
-        Rect::from_min_size(panel.min + vec2(X_MARGIN, 5.0), vec2(36.0, 18.0))
-    }
-
-    /// The caption next to the bypass switch.
-    #[must_use]
-    pub fn bypass_caption(panel: Rect) -> Rect {
-        Rect::from_min_size(panel.min + vec2(50.0, 5.0), vec2(80.0, 18.0))
-    }
-
-    /// The label shown for a band count (`FxAudioControls.cpp:301`).
-    #[must_use]
-    pub fn band_count_label(count: usize) -> String {
-        format!("{count} Bands")
-    }
-}
-
-fn side_controls(
-    ui: &mut Ui,
-    assets: &mut AssetCache,
-    palette: Palette,
-    rect: Rect,
-    state: &UiState,
-    response: &mut UiResponse,
-) {
-    let enabled = state.controls_enabled();
-    let text_colour = palette.color(FxColor::DefaultText);
-
-    // --- EQ bypass ---------------------------------------------------------------------------
-    let bypass_rect = controls::bypass(rect);
-    let bypass_response = ui.interact(
-        bypass_rect,
-        Id::new("fx_eq_bypass"),
-        if enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
-    if bypass_response.clicked() {
-        response.push(UiAction::SetEqEnabled(!state.eq_on));
-    }
-    {
-        let painter = ui.painter();
-        let track = if state.eq_on {
-            palette.color(FxColor::SliderTrack)
-        } else {
-            palette.color_alpha(FxColor::SliderTrack, 0.2)
-        };
-        let track = if enabled { track } else { desaturate(track) };
-        painter.rect_filled(
-            bypass_rect,
-            CornerRadius::same((bypass_rect.height() / 2.0) as u8),
-            track,
-        );
-        let knob_x = if state.eq_on {
-            bypass_rect.right() - bypass_rect.height() / 2.0
-        } else {
-            bypass_rect.left() + bypass_rect.height() / 2.0
-        };
-        let knob_colour = if state.eq_on {
-            palette.color(FxColor::ControlBackground)
-        } else {
-            text_colour
-        };
-        painter.circle_filled(
-            pos2(knob_x, bypass_rect.center().y),
-            bypass_rect.height() / 2.0 - 2.0,
-            knob_colour,
-        );
-        painter.text(
-            controls::bypass_caption(rect).left_center(),
-            Align2::LEFT_CENTER,
-            "EQ",
-            theme::semibold(12.0),
-            text_colour,
-        );
-    }
-
-    // --- band count --------------------------------------------------------------------------
-    let combo_rect = controls::band_combo(rect);
-    let combo_response = ui.interact(
-        combo_rect,
-        Id::new("fx_eq_band_combo"),
-        if enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
-    {
-        let painter = ui.painter();
-        painter.rect_filled(
-            combo_rect,
-            // `height / 5` (`FxTheme.cpp:138`).
-            CornerRadius::same((combo_rect.height() / 5.0) as u8),
-            palette.color(FxColor::ComboBoxBackground),
-        );
-        painter.text(
-            combo_rect.left_center() + vec2(5.0, 0.0),
-            Align2::LEFT_CENTER,
-            controls::band_count_label(state.eq_bands.len()),
-            theme::semibold(14.0),
-            text_colour,
-        );
-    }
-    let arrow_rect = Rect::from_center_size(
-        pos2(combo_rect.right() - 26.0, combo_rect.center().y),
-        Vec2::splat(12.0),
-    );
-    let arrow = if combo_response.hovered() {
-        FxImage::DropDownArrowHover
-    } else {
-        FxImage::DropDownArrow
-    };
-    {
-        let painter = ui.painter().clone();
-        draw_image(&painter, ui, assets, arrow, palette.mode(), arrow_rect);
-    }
-    if combo_response.clicked() {
-        egui::Popup::toggle_id(ui.ctx(), egui::Popup::default_response_id(&combo_response));
-    }
-    egui::Popup::from_response(&combo_response)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
-        .show(|ui| {
-            for count in BAND_COUNTS {
-                let selected = count == state.eq_bands.len();
-                if ui
-                    .selectable_label(selected, controls::band_count_label(count))
-                    .clicked()
-                {
-                    response.push(UiAction::SetBandCount(count));
-                }
-            }
-        });
-
-    // --- filter width ------------------------------------------------------------------------
-    ui.painter().text(
-        controls::filter_q_caption(rect).left_top(),
-        Align2::LEFT_TOP,
-        tr("Filter Q"),
-        theme::semibold(controls::CAPTION_HEIGHT),
-        text_colour,
-    );
-    let mut filter_q = state.filter_q;
-    // 1 … 3 in halves, right-click back to 1 (`FxAudioControls.cpp:347-348`, `:271`).
-    let slider = FxSlider::new(&mut filter_q, 1.0, 3.0, 0.5)
-        .default_value(1.0)
-        .reset_on_secondary_click(true)
-        .enabled(enabled);
-    slider.show(
-        ui,
-        controls::filter_q_slider(rect),
-        palette,
-        assets,
-        "fx_eq_filter_q",
-    );
-    if filter_q != state.filter_q {
-        response.push(UiAction::SetFilterQ(filter_q));
-    }
-
-    // --- restore defaults --------------------------------------------------------------------
-    let reset_rect = controls::restore_defaults(rect);
-    let reset_response = ui.interact(
-        reset_rect,
-        Id::new("fx_eq_restore_defaults"),
-        if enabled {
-            Sense::click()
-        } else {
-            Sense::hover()
-        },
-    );
-    let reset_image = if reset_response.hovered() {
-        FxImage::RestoreDefaultsButtonHover
-    } else {
-        FxImage::RestoreDefaultsButton
-    };
-    {
-        let painter = ui.painter().clone();
-        draw_image(
-            &painter,
-            ui,
-            assets,
-            reset_image,
-            palette.mode(),
-            reset_rect,
-        );
-    }
-    if reset_response.hovered() && enabled {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    if reset_response.clicked() {
-        response.push(UiAction::RestoreDefaults);
-    }
-    if !state.hide_tooltips {
-        let _ = reset_response.on_hover_text(tr("Restore Defaults"));
     }
 }
 
@@ -1942,46 +1671,6 @@ mod tests {
     fn desaturation_keeps_the_alpha() {
         let translucent = Color32::from_rgba_premultiplied(0x74, 0x28, 0x34, 0x55);
         assert_eq!(desaturate(translucent).a(), 0x55);
-    }
-
-    #[test]
-    fn the_side_controls_land_on_the_original_offsets() {
-        // docs/spec/03-controls.md §5.1, resolved against a column at the origin.
-        let panel = Rect::from_min_size(pos2(0.0, 0.0), vec2(168.0, 257.0));
-        assert_eq!(
-            controls::band_combo(panel),
-            Rect::from_min_size(pos2(8.0, 28.0), vec2(152.0, 20.0))
-        );
-        assert_eq!(
-            controls::filter_q_caption(panel),
-            Rect::from_min_size(pos2(16.0, 138.0), vec2(160.0, 14.0))
-        );
-        assert_eq!(
-            controls::filter_q_slider(panel),
-            Rect::from_min_size(pos2(8.0, 153.0), vec2(160.0, 18.0))
-        );
-        assert_eq!(
-            controls::restore_defaults(panel),
-            Rect::from_min_size(pos2(8.0, 234.0), vec2(18.0, 18.0))
-        );
-        // The bypass switch shares the top strip with the flip button at x = 145.
-        assert!(controls::bypass(panel).right() < 145.0);
-    }
-
-    #[test]
-    fn the_controls_column_sits_where_fxproview_puts_it() {
-        // FxProView.cpp:97-98 — audio controls at x 40, equalizer 16 points to their right.
-        let panel = crate::layout::pro::equalizer();
-        assert_eq!(
-            EqualizerWidget::controls_rect(panel),
-            crate::layout::pro::audio_controls()
-        );
-    }
-
-    #[test]
-    fn the_band_count_combo_spells_its_items_like_the_original() {
-        assert_eq!(controls::band_count_label(5), "5 Bands");
-        assert_eq!(controls::band_count_label(31), "31 Bands");
     }
 
     #[test]

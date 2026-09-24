@@ -175,6 +175,14 @@ impl<F: PresetFile> Store<F> {
         &self.user_dir
     }
 
+    /// Where factory presets are looked for, in search order — what `fxsound --self-test` reads
+    /// back, so it checks the directories this store will actually use rather than a copy of the
+    /// list that could drift from it.
+    #[must_use]
+    pub fn factory_dirs(&self) -> &[PathBuf] {
+        &self.factory_dirs
+    }
+
     /// Re-scan every directory. Unreadable directories are skipped, not fatal: a missing factory
     /// directory must not stop the application from starting.
     pub fn rescan(&mut self) {
@@ -241,6 +249,20 @@ impl<F: PresetFile> Store<F> {
         let mut preset = F::load(&entry.path)?;
         preset.set_name(&entry.name);
         Ok((preset, false))
+    }
+
+    /// Load a preset as last **saved**: its own file, never its autosave.
+    ///
+    /// What an export hands on and a rename moves — both are about the file the name stands for,
+    /// and unsaved edits are not what that name says.
+    ///
+    /// # Errors
+    /// The name is not in the list, or its file cannot be read.
+    pub fn load_saved(&self, name: &str) -> Result<F, F::Error> {
+        let entry = self.find(name).ok_or_else(|| F::unknown(name))?;
+        let mut preset = F::load(&entry.path)?;
+        preset.set_name(&entry.name);
+        Ok(preset)
     }
 
     /// Path of the autosave shadow copy for a preset.
@@ -340,10 +362,15 @@ impl<F: PresetFile> Store<F> {
 
     /// Export a preset to a directory chosen by the user.
     ///
+    /// What is exported is the preset as last **saved**, never its autosave: an export is a file
+    /// someone hands on under the preset's name, and unsaved edits are not what that name says
+    /// (upstream PR #155, `FxController.cpp:1411`, which exports `preset.path`). Save first to
+    /// export the edits.
+    ///
     /// # Errors
     /// The name is unknown, leaves nothing to file it under, or the file cannot be written.
     pub fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, F::Error> {
-        let (preset, _) = self.load(name)?;
+        let preset = self.load_saved(name)?;
         let path = dir.join(Self::file_name(name)?);
         preset.save(&path)?;
         Ok(path)
@@ -365,7 +392,14 @@ impl<F: PresetFile> Store<F> {
     /// slot is then the one thing the list cannot tell apart. Stems are compared the way the
     /// filesystem compares them, exactly; the case-insensitive rule between *names* is the
     /// controller's, as the sanitiser's own note says.
-    fn file_name(name: &str) -> Result<String, F::Error> {
+    ///
+    /// Public so a caller that has to know where a preset will land — the export window, asking
+    /// about a file already there before it writes — asks the store rather than keeping a copy of
+    /// the rule that could drift from it.
+    ///
+    /// # Errors
+    /// The name leaves nothing to file it under.
+    pub fn file_name(name: &str) -> Result<String, F::Error> {
         let stem = sanitise_preset_name(name);
         if stem.is_empty() {
             return Err(F::empty_name());
@@ -788,6 +822,57 @@ mod tests {
         assert!(!store.find("Jazz").unwrap().modified);
         let (_, from_autosave) = store.load("Jazz").expect("load after clear");
         assert!(!from_autosave);
+    }
+
+    #[test]
+    fn an_export_writes_the_saved_preset_and_never_its_unsaved_edits() {
+        // Upstream PR #155: the export went through the autosave-preferring load, so a preset
+        // with unsaved edits was handed on under its name carrying edits nobody had saved.
+        let tmp = tempdir("export-saved");
+        let mut store = store_in(&tmp);
+        let (mut jazz, _) = store.load("Jazz").expect("load");
+        let saved = jazz.effect(fxsound_core::Effect::Ambience);
+        jazz.set_effect(fxsound_core::Effect::Ambience, 0.75);
+        store.autosave(&jazz).expect("autosave");
+        store.rescan();
+        assert!(store.find("Jazz").unwrap().modified);
+
+        let out = tmp.join("export");
+        std::fs::create_dir_all(&out).expect("mkdir");
+        let path = store.export("Jazz", &out).expect("export");
+        let exported = crate::load(&path).expect("parse export");
+        assert_eq!(exported.name, "Jazz");
+        assert!(
+            (exported.effect(fxsound_core::Effect::Ambience) - saved).abs() < 0.01,
+            "the saved value, not the edit"
+        );
+        assert!(
+            store.find("Jazz").unwrap().modified,
+            "and the edits are still there to save"
+        );
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            PresetStore::file_name("Jazz").ok().as_deref(),
+            "where the store says it files the name"
+        );
+    }
+
+    #[test]
+    fn loading_as_saved_reads_the_presets_file_past_its_autosave() {
+        let tmp = tempdir("load-saved");
+        let store = store_in(&tmp);
+        let (mut jazz, _) = store.load("Jazz").expect("load");
+        let saved = jazz.effect(fxsound_core::Effect::Ambience);
+        jazz.set_effect(fxsound_core::Effect::Ambience, 0.75);
+        store.autosave(&jazz).expect("autosave");
+
+        let (stashed, from_autosave) = store.load("Jazz").expect("load");
+        assert!(from_autosave);
+        assert!((stashed.effect(fxsound_core::Effect::Ambience) - 0.75).abs() < 0.01);
+        let as_saved = store.load_saved("Jazz").expect("load as saved");
+        assert_eq!(as_saved.name, "Jazz");
+        assert!((as_saved.effect(fxsound_core::Effect::Ambience) - saved).abs() < 0.01);
+        assert!(store.load_saved("Nope").is_err(), "an unknown name");
     }
 
     #[test]

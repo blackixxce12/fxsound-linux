@@ -54,9 +54,11 @@ jobs:
           # outside the engine and to wire a tone through both lanes; `libspa-0.2-modules` has the
           # `audiotestsrc` plugin that tone comes from. Both already arrive as dependencies of
           # `pipewire`; they are named because the tests now fail without them, and the list here
-          # is where to look first when one does. `libspa-0.2-bluetooth` and `dbus-daemon` are for
-          # the tests of a headset between profiles: the only card — PipeWire `Device` — a private
-          # daemon can make without hardware is Bluetooth's enumerator, on a private system bus.
+          # is where to look first when one does. `dbus-daemon` is there for the same reason as
+          # `pipewire`: the D-Bus service's tests start a `dbus-daemon` of their own, never the
+          # session's. `libspa-0.2-bluetooth` and `dbus-daemon` are also for the tests of a headset
+          # between profiles: the only card — PipeWire `Device` — a private daemon can make without
+          # hardware is Bluetooth's enumerator, on a private system bus.
 
       # rust-toolchain.toml pins 1.98.1 and asks for rustfmt and clippy, so rustup installs
       # exactly what the developers use rather than whatever the runner image happens to ship.

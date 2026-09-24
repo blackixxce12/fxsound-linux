@@ -39,6 +39,7 @@ use egui::{
     Align2, CornerRadius, Id, Key, Mesh, Rect, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder,
     Vec2, pos2, vec2,
 };
+use fxsound_core::DeviceDirection;
 use fxsound_core::i18n::tr;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -53,9 +54,11 @@ pub enum PresetsAction {
     /// Run a folder picker — `rfd::AsyncFileDialog::pick_folder()`, started from the app layer and
     /// polled, never the blocking variant (`docs/spec/06-dialogs.md` §9.3).
     ChooseImportFolder,
-    /// Import every `.fac` in [`ImportState::folder`]. If the glob comes back empty the app puts
-    /// `"Preset files not found in the selected folder."` in [`ImportState::notice`] and leaves
-    /// the window open, exactly as `FxPresetImportDialog.cpp:262-267` does.
+    /// Import every preset file of the edit direction's kind — `.fac` for the speakers, a voice
+    /// preset's `.toml` for the microphone — in [`ImportState::folder`]. If the glob comes back
+    /// empty the app puts `"Preset files not found in the selected folder."` in
+    /// [`ImportState::notice`] and leaves the window open, exactly as
+    /// `FxPresetImportDialog.cpp:262-267` does.
     Import,
     /// The notice box was acknowledged.
     DismissNotice,
@@ -79,7 +82,7 @@ pub enum PresetsAction {
 /// How to resolve every colliding file at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OverwriteChoice {
-    /// Yes: overwrite each existing `.fac`.
+    /// Yes: overwrite each existing file.
     OverwriteAll,
     /// No: keep the existing files and export only the presets that do not collide.
     SkipAll,
@@ -144,8 +147,6 @@ pub const NO_PRESETS_FOUND: &str = "Preset files not found in the selected folde
 pub const IMPORTED_LABEL: &str = "Presets successfully imported";
 /// `"Duplicate presets not imported"` (`FxPresetImportDialog.cpp:126`).
 pub const SKIPPED_LABEL: &str = "Duplicate presets not imported";
-/// The extension the import glob looks for (`FxPresetImportDialog.cpp:261`).
-pub const PRESET_EXTENSION: &str = "fac";
 
 /// What `FxController::importPresets()` reported (`FxController.cpp:1419-1458`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -177,6 +178,10 @@ impl ImportSummary {
 /// Everything the import flow remembers between frames.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportState {
+    /// The lane the window was opened for: its store is the one imported into, `.fac` files for
+    /// the speakers and voice presets for the microphone, whichever lane the window has been
+    /// moved to since — by the tray, the command line or D-Bus — when Import is pressed.
+    pub lane: DeviceDirection,
     /// The folder the app's picker came back with, or `None` while nothing is chosen.
     pub folder: Option<PathBuf>,
     /// Set once the import has run; while it is `Some` the summary window is shown instead of the
@@ -542,7 +547,7 @@ pub fn format_string(template: &str, argument: &str) -> String {
     template.replacen("%s", argument, 1)
 }
 
-/// The question to ask about `names`, which are the presets whose `.fac` already exists.
+/// The question to ask about `names`, which are the presets whose file already exists.
 #[must_use]
 pub fn overwrite_message(names: &[String]) -> String {
     match names {
@@ -554,6 +559,9 @@ pub fn overwrite_message(names: &[String]) -> String {
 /// Everything the export window remembers between frames.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExportState {
+    /// The lane the window was opened for, whose names [`ExportState::presets`] lists: its store
+    /// is the one exported from, whichever lane the window has been moved to since.
+    pub lane: DeviceDirection,
     /// Every preset, factory and user alike — the list comes straight from the model
     /// (`FxPresetExportDialog.cpp:138-141`).
     pub presets: Vec<String>,
@@ -1099,6 +1107,7 @@ mod tests {
         let ctx = test_context();
         let mut assets = AssetCache::new();
         let state = ImportState {
+            lane: DeviceDirection::Output,
             folder: Some(PathBuf::from("/home/u/Documents/presets")),
             summary: Some(ImportSummary {
                 imported: (0..12).map(|i| format!("Imported {i}")).collect(),
@@ -1126,6 +1135,7 @@ mod tests {
         let ctx = test_context();
         let mut assets = AssetCache::new();
         let state = ImportState {
+            lane: DeviceDirection::Output,
             folder: Some(PathBuf::from("/tmp/empty")),
             summary: None,
             notice: Some(NO_PRESETS_FOUND.to_owned()),
@@ -1196,6 +1206,7 @@ mod tests {
         let ctx = test_context();
         let mut assets = AssetCache::new();
         let state = ExportState {
+            lane: DeviceDirection::Output,
             presets: (0..30).map(|i| format!("Preset {i}")).collect(),
             selected: [1, 4].into_iter().collect(),
             exporting: true,

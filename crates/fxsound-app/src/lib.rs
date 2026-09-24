@@ -6,11 +6,21 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod audio_link;
+pub mod calibration;
 pub mod cli;
 pub mod commands;
+pub mod dbus;
+pub mod events;
 pub mod ipc;
 pub mod notify;
+mod priority;
+#[cfg(test)]
+mod private_bus;
+pub mod selftest;
+pub mod sleep;
 pub mod tray;
+pub mod wake;
 
 pub use app::{App, WindowVisibility};
 pub use commands::{Outcome, WindowRequest};

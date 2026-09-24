@@ -23,6 +23,13 @@
 //! and starts a drag, the wheel steps by the interval, the arrow keys step by the interval, and
 //! **double-click does nothing** — FxSound has no double-click-to-reset. Right-click resets to the
 //! default on the audio sliders and on balance, and does nothing on the five effect sliders.
+//!
+//! ## Balance
+//!
+//! `FxBalanceSlider` is the one slider that paints itself (`FxBalanceSlider.cpp:65-105`): no
+//! filled/unfilled split, but one bar whose two ends fade — the left end at `1 − t` alpha, the
+//! right at `t` — so the thumb's side of centre reads as the louder one. [`Track::Balance`] draws
+//! that bar; everything else about the slider (thumb, focus halo, gestures) is shared.
 
 use crate::assets::{AssetCache, FxImage};
 use crate::theme::{FxColor, Palette};
@@ -51,6 +58,21 @@ pub enum Fidelity {
     Corrected,
 }
 
+/// Which of the original's two track painters a slider uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Track {
+    /// `FxTheme::drawLinearSlider`: a 20 % track, filled at full alpha up to the thumb.
+    #[default]
+    Filled,
+    /// `FxBalanceSlider::paint`: one bar in a horizontal gradient from `SliderTrack` at `1 − t`
+    /// alpha on the left to `t` on the right, with no fill (`FxBalanceSlider.cpp:79-92`).
+    ///
+    /// [`Fidelity::Faithful`] keeps the original's slip: the gradient's end is given as the
+    /// track's *width*, 112, where an x was meant, so it stops eight points short of the track's
+    /// end at 120 and the last eight points are the end colour (`docs/spec/03-controls.md` §3.4).
+    Balance,
+}
+
 /// A horizontal slider drawn like FxSound's.
 pub struct FxSlider<'a> {
     value: &'a mut f32,
@@ -59,8 +81,10 @@ pub struct FxSlider<'a> {
     step: f32,
     default: f32,
     enabled: bool,
+    lit: bool,
     reset_on_secondary_click: bool,
     fidelity: Fidelity,
+    track: Track,
 }
 
 impl<'a> FxSlider<'a> {
@@ -73,8 +97,10 @@ impl<'a> FxSlider<'a> {
             step,
             default: min,
             enabled: true,
+            lit: true,
             reset_on_secondary_click: false,
             fidelity: Fidelity::default(),
+            track: Track::default(),
         }
     }
 
@@ -100,9 +126,26 @@ impl<'a> FxSlider<'a> {
         self
     }
 
+    /// Draw the slider grey while leaving it live: the control is there to be set, but what it
+    /// sets is not in the signal path right now — the level controls while the equalizer, whose
+    /// block they belong to, is switched off. The equalizer panel draws its own faders the same
+    /// way for the same reason. A disabled slider is always drawn grey.
+    #[must_use]
+    pub fn lit(mut self, lit: bool) -> Self {
+        self.lit = lit;
+        self
+    }
+
     #[must_use]
     pub fn fidelity(mut self, fidelity: Fidelity) -> Self {
         self.fidelity = fidelity;
+        self
+    }
+
+    /// Which track painter to use; [`Track::Filled`] unless this is the balance slider.
+    #[must_use]
+    pub fn track(mut self, track: Track) -> Self {
+        self.track = track;
         self
     }
 
@@ -124,8 +167,10 @@ impl<'a> FxSlider<'a> {
             step,
             default,
             enabled,
+            lit,
             reset_on_secondary_click,
             fidelity,
+            track: style,
         } = self;
 
         let id = Id::new("fx_slider").with(id_salt);
@@ -147,9 +192,16 @@ impl<'a> FxSlider<'a> {
             // loading a preset would mark it modified before the user has touched anything.
             let mut interacted = false;
 
+            // `FxAudioSlider` and `FxBalanceSlider` take the right button for themselves and never
+            // hand it to `Slider::mouseDown` (`FxAudioSlider.cpp:74-87`), so a right-click on them
+            // resets without first dragging the thumb to the pointer.
+            let resetting = reset_on_secondary_click
+                && ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+
             // Clicking the track jumps to that position and starts the drag from there, which is
             // JUCE's `snapsToMousePos` default.
-            if response.is_pointer_button_down_on()
+            if !resetting
+                && response.is_pointer_button_down_on()
                 && let Some(pointer) = response.interact_pointer_pos()
             {
                 let t = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0);
@@ -199,7 +251,17 @@ impl<'a> FxSlider<'a> {
         }
 
         paint(
-            ui, rect, track, *value, min, max, palette, assets, enabled, fidelity, &response,
+            ui,
+            rect,
+            track,
+            *value,
+            (min, max),
+            palette,
+            assets,
+            enabled && lit,
+            fidelity,
+            style,
+            &response,
         );
         response
     }
@@ -227,18 +289,40 @@ pub fn quantise(value: f32, min: f32, max: f32, step: f32) -> f32 {
     (min + steps * step).clamp(min.min(max), max.max(min))
 }
 
+/// Where the balance gradient stops: at the track's end, or — reproducing
+/// `ColourGradient::horizontal(left, x, right, width)` passing a width where an x belongs
+/// (`FxBalanceSlider.cpp:89`) — the track's width in from the slider's own left edge.
+#[must_use]
+pub fn balance_gradient_end(rect: Rect, track: Rect, fidelity: Fidelity) -> f32 {
+    match fidelity {
+        Fidelity::Faithful => rect.left() + track.width(),
+        Fidelity::Corrected => track.right(),
+    }
+}
+
+/// The balance bar's two end colours for a value at proportion `t` of the range: `SliderTrack` at
+/// `1 − t` alpha on the left and at `t` on the right (`FxBalanceSlider.cpp:79-82`), both grey while
+/// the slider is not lit (`:83-87`).
+#[must_use]
+pub fn balance_colours(palette: Palette, t: f32, lit: bool) -> (egui::Color32, egui::Color32) {
+    let t = t.clamp(0.0, 1.0);
+    let base = palette.color(FxColor::SliderTrack);
+    let base = if lit { base } else { desaturate(base) };
+    (with_alpha(base, 1.0 - t), with_alpha(base, t))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint(
     ui: &Ui,
     rect: Rect,
     track: Rect,
     value: f32,
-    min: f32,
-    max: f32,
+    (min, max): (f32, f32),
     palette: Palette,
     assets: &mut AssetCache,
-    enabled: bool,
+    lit: bool,
     fidelity: Fidelity,
+    style: Track,
     response: &Response,
 ) {
     let painter = ui.painter();
@@ -249,27 +333,58 @@ fn paint(
 
     let corner = CornerRadius::same(TRACK_CORNER_RADIUS as u8);
     let track_colour = palette.color(FxColor::SliderTrack);
-    let track_colour = if enabled {
+    let track_colour = if lit {
         track_colour
     } else {
         desaturate(track_colour)
     };
 
-    // 1. The unfilled track at 20% alpha.
-    painter.rect_filled(track, corner, with_alpha(track_colour, 0.2));
+    match style {
+        Track::Filled => {
+            // 1. The unfilled track at 20% alpha.
+            painter.rect_filled(track, corner, with_alpha(track_colour, 0.2));
 
-    // 2. The filled portion at full alpha.
-    let fill_width = match fidelity {
-        Fidelity::Faithful => thumb_x - rect.left(),
-        Fidelity::Corrected => track.width() * t,
-    };
-    if fill_width > 0.0 {
-        let fill = Rect::from_min_size(track.min, vec2(fill_width, track.height()));
-        painter.rect_filled(fill, corner, track_colour);
+            // 2. The filled portion at full alpha.
+            let fill_width = match fidelity {
+                Fidelity::Faithful => thumb_x - rect.left(),
+                Fidelity::Corrected => track.width() * t,
+            };
+            if fill_width > 0.0 {
+                let fill = Rect::from_min_size(track.min, vec2(fill_width, track.height()));
+                painter.rect_filled(fill, corner, track_colour);
+            }
+        }
+        Track::Balance => {
+            // One bar, its two ends fading against each other. A mesh, because egui fills a
+            // rectangle with one colour; the 5.6 corner on a 3 point bar is a 1.5 point rounding
+            // that a gradient mesh leaves square.
+            let (left, right) = balance_colours(palette, t, lit);
+            let end = balance_gradient_end(rect, track, fidelity).min(track.right());
+            let mut mesh = egui::Mesh::default();
+            let mut quad = |from: f32, to: f32, a: egui::Color32, b: egui::Color32| {
+                let base = mesh.vertices.len() as u32;
+                for (x, y, colour) in [
+                    (from, track.top(), a),
+                    (to, track.top(), b),
+                    (to, track.bottom(), b),
+                    (from, track.bottom(), a),
+                ] {
+                    mesh.colored_vertex(pos2(x, y), colour);
+                }
+                mesh.add_triangle(base, base + 1, base + 2);
+                mesh.add_triangle(base, base + 2, base + 3);
+            };
+            quad(track.left(), end, left, right);
+            if end < track.right() {
+                // Past a gradient's end point JUCE paints its end colour.
+                quad(end, track.right(), right, right);
+            }
+            painter.add(egui::Shape::mesh(mesh));
+        }
     }
 
     // 3. The thumb.
-    let thumb_image = if enabled {
+    let thumb_image = if lit {
         FxImage::SliderThumb
     } else {
         FxImage::SliderThumbBW
@@ -459,6 +574,44 @@ mod tests {
             (grey.r(), grey.g(), grey.b()),
             (expected, expected, expected)
         );
+    }
+
+    #[test]
+    fn the_balance_bar_fades_its_two_ends_against_each_other() {
+        // FxBalanceSlider.cpp:79-82: left at 1 - t, right at t, over -20..+20.
+        let palette = Palette::new(ThemeMode::Dark);
+        for (t, left, right) in [(0.0, 255, 0), (0.5, 128, 128), (1.0, 0, 255)] {
+            let (l, r) = balance_colours(palette, t, true);
+            assert_eq!((l.a(), r.a()), (left, right), "t = {t}");
+        }
+        let track = palette.color(FxColor::SliderTrack);
+        let (hard_left, _) = balance_colours(palette, 0.0, true);
+        assert_eq!(
+            (hard_left.r(), hard_left.g(), hard_left.b()),
+            (track.r(), track.g(), track.b())
+        );
+    }
+
+    #[test]
+    fn an_unlit_balance_bar_is_grey_at_the_same_alphas() {
+        let palette = Palette::new(ThemeMode::Light);
+        let (lit_left, lit_right) = balance_colours(palette, 0.25, true);
+        let (left, right) = balance_colours(palette, 0.25, false);
+        assert_eq!((left.a(), right.a()), (lit_left.a(), lit_right.a()));
+        assert!(left.r() == left.g() && left.g() == left.b(), "{left:?}");
+    }
+
+    #[test]
+    fn the_faithful_balance_gradient_stops_eight_points_short_of_the_track() {
+        // docs/spec/03-controls.md §3.4: the gradient runs from x = 8 to x = 112, not 120.
+        let rect = slider_rect();
+        let track = track_rect(rect);
+        assert_eq!(balance_gradient_end(rect, track, Fidelity::Faithful), 112.0);
+        assert_eq!(
+            balance_gradient_end(rect, track, Fidelity::Corrected),
+            120.0
+        );
+        assert_eq!(track.right() - 112.0, 8.0);
     }
 
     #[test]

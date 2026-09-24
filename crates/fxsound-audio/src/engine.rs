@@ -1817,9 +1817,9 @@ struct Shared {
     /// ([`close_session`]) and again as the next one is made ([`connect`]), so a probe on a dead
     /// core is never kept, let alone kept beside a new one for the same device.
     node_probes: std::collections::HashMap<u32, NodeProbe>,
-    /// Every card the registry reports — PipeWire's `Device` objects — keyed by registry global
-    /// id: what a lane asks, when its target node goes, to tell a card between profiles from a
-    /// device that has gone ([`Hold`]).
+    /// Every card the registry reports — PipeWire's `Device` objects — each carrying its registry
+    /// global id ([`Card::object_id`], searched for rather than keyed): what a lane asks, when its
+    /// target node goes, to tell a card between profiles from a device that has gone ([`Hold`]).
     cards: Vec<Card>,
     /// One bound proxy per card, kept alive only to receive its `info` event. A Bluetooth card's
     /// address is not in its registry global, only in its info. Belongs to the session like
@@ -3675,9 +3675,10 @@ fn on_global(
                                 let Some(props) = info.props() else {
                                     return;
                                 };
-                                // Read the two values out here rather than handing the dictionary
-                                // on: its lifetime is the callback's, and the handler wants to
-                                // hold a mutable borrow of `Shared` across the update.
+                                // Read the channels, their positions and the Bluetooth address
+                                // out here rather than handing the dictionary on: its lifetime is
+                                // the callback's, and the handler wants to hold a mutable borrow
+                                // of `Shared` across the update.
                                 let channels = props
                                     .get("audio.channels")
                                     .and_then(|value| value.parse::<u32>().ok())
