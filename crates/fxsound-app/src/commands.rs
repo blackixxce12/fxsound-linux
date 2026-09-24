@@ -163,6 +163,12 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
 
         Command::Output(device) => return run_device(app, DeviceDirection::Output, device),
         Command::Input(device) => return run_device(app, DeviceDirection::Input, device),
+        Command::ForgetDevice(name) => {
+            return match app.forget_device(name) {
+                Ok(_) => Outcome::default(),
+                Err(refusal) => Outcome::refused(refusal.to_string()),
+            };
+        }
         Command::EditDirection(direction) => {
             app.handle(&[UiAction::SetEditDirection(*direction)]);
         }
@@ -208,32 +214,31 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
             };
         }
 
-        // The original drops the whole list when it is longer than the live band count
-        // (`FxController.cpp:536-553`) rather than applying a prefix, so that a command line
-        // written for a 31-band layout cannot half-apply to a 10-band one.
+        // A list that names a band the equalizer does not have is refused whole, with the bands
+        // named (0.4.0 audit #51), so that a command line written for a 31-band layout cannot
+        // half-apply to a 10-band one. The original counts the pairs, not the indices
+        // (`FxController.cpp:536-572`): a list with more pairs than bands was dropped without a
+        // word, and one with fewer set what it could and passed the rest to a setter that ignores
+        // them, also without a word.
         Command::BandFrequencies(pairs) => {
-            if pairs
-                .iter()
-                .all(|(band, _)| *band < app.state.eq_bands.len())
-            {
-                let actions: Vec<_> = pairs
-                    .iter()
-                    .map(|(band, hz)| UiAction::SetBandFrequency(*band, *hz))
-                    .collect();
-                app.handle(&actions);
+            if let Err(refusal) = bands_exist(app, "--set_band_freq", pairs) {
+                return refusal;
             }
+            let actions: Vec<_> = pairs
+                .iter()
+                .map(|(band, hz)| UiAction::SetBandFrequency(*band, *hz))
+                .collect();
+            app.handle(&actions);
         }
         Command::BandGains(pairs) => {
-            if pairs
-                .iter()
-                .all(|(band, _)| *band < app.state.eq_bands.len())
-            {
-                let actions: Vec<_> = pairs
-                    .iter()
-                    .map(|(band, db)| UiAction::SetBandGain(*band, *db))
-                    .collect();
-                app.handle(&actions);
+            if let Err(refusal) = bands_exist(app, "--set_band_gain", pairs) {
+                return refusal;
             }
+            let actions: Vec<_> = pairs
+                .iter()
+                .map(|(band, db)| UiAction::SetBandGain(*band, *db))
+                .collect();
+            app.handle(&actions);
         }
         Command::Effects(pairs) => {
             let actions: Vec<_> = pairs
@@ -249,6 +254,33 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
     }
 
     outcome
+}
+
+/// `Ok` when every band `pairs` names is one the edit direction's equalizer has now; otherwise the
+/// refusal `option` fails with, naming each band that is not there and the ones that are.
+fn bands_exist(app: &App, option: &str, pairs: &[(usize, f32)]) -> Result<(), Outcome> {
+    let count = app.state.eq_bands.len();
+    let mut missing: Vec<usize> = pairs
+        .iter()
+        .map(|(band, _)| *band)
+        .filter(|band| *band >= count)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort_unstable();
+    missing.dedup();
+    let named = missing
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let bands = if missing.len() == 1 { "band" } else { "bands" };
+    Err(Outcome::refused(format!(
+        "{option}: the equalizer has {count} bands, 0 to {last}, so there is no {bands} {named}; \
+         nothing on the list was changed (--num_bands on the same line sets the count first)",
+        last = count.saturating_sub(1),
+    )))
 }
 
 /// How a device name on the command line resolved against the device list.
@@ -656,10 +688,18 @@ pub const NOT_RUNNING: &str = "FxSound is not running";
 ///   opposite of what was asked: [`NOT_RUNNING`], and a failure.
 /// * `--quit` has nothing to stop: [`NOT_RUNNING`] too, but what was asked for is true already,
 ///   so not a failure. The rest of that line is not carried out.
+/// * `--forget-device` alone is done to the settings file at `settings`
+///   ([`forget_in_the_settings_file`]), and nothing starts: the script or keybind that ran it
+///   hears whether it worked and goes on, rather than becoming FxSound. Beside options that
+///   start FxSound it is done the same way before they do (`main`), so it is not here.
 ///
 /// `--self-test` is not here: `main` answers it before it tries the lock at all.
 #[must_use]
-pub fn answer_without_an_instance(commands: &[Command], store: &Path) -> Option<Outcome> {
+pub fn answer_without_an_instance(
+    commands: &[Command],
+    store: &Path,
+    settings: &Path,
+) -> Option<Outcome> {
     match commands {
         [Command::ListApps { json }] => Some(store_listing(store, *json)),
         [Command::Status { .. } | Command::Watch { .. }] => Some(Outcome::refused(NOT_RUNNING)),
@@ -667,8 +707,93 @@ pub fn answer_without_an_instance(commands: &[Command], store: &Path) -> Option<
             stderr: NOT_RUNNING.to_owned(),
             ..Outcome::default()
         }),
+        [_, ..]
+            if commands
+                .iter()
+                .all(|command| matches!(command, Command::ForgetDevice(_))) =>
+        {
+            Some(forget_in_the_settings_file(commands, settings))
+        }
         _ => None,
     }
+}
+
+/// Every `--forget-device` in `commands`, done to the settings file at `path` with no FxSound
+/// running (0.4.0 audit #34): what [`App::forget_device`] does, less its two waits.
+///
+/// A running FxSound refuses a device that is plugged in, since it would learn it again at once,
+/// and refuses every name until PipeWire has listed the devices. With none running, nothing is
+/// attached to any device and nothing will learn one until FxSound starts, which is then a start
+/// like the first one for that device: so every entry counts as unplugged, and the name is
+/// forgotten from the file at once ([`crate::app::forget_device_in`]). A name neither priority
+/// list has is refused as the instance refuses it.
+///
+/// Called only while `main` holds the instance lock, so no FxSound writes the file meanwhile. A
+/// file that does not load is reported and left where it is, as [`store_listing`] leaves the
+/// store; a missing file knows no device. The file is written only when something was forgotten.
+#[must_use]
+pub fn forget_in_the_settings_file(commands: &[Command], path: &Path) -> Outcome {
+    let names: Vec<&str> = commands
+        .iter()
+        .filter_map(|command| match command {
+            Command::ForgetDevice(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if names.is_empty() {
+        return Outcome::default();
+    }
+    let mut settings = match std::fs::read_to_string(path) {
+        Ok(text) => match toml::from_str::<fxsound_core::Settings>(&text) {
+            Ok(mut settings) => {
+                settings.sanitise();
+                settings
+            }
+            Err(err) => {
+                return Outcome::refused(format!("{} does not load: {err}", path.display()));
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => fxsound_core::Settings::default(),
+        Err(err) => return Outcome::refused(format!("{}: {err}", path.display())),
+    };
+    let mut refusals = Vec::new();
+    let mut forgot = false;
+    for name in names {
+        match crate::app::forget_device_in(&mut settings, name, |_| false) {
+            Ok(_) => forgot = true,
+            Err(refusal) => refusals.push(refusal.to_string()),
+        }
+    }
+    if forgot && let Err(err) = settings.save_to(path) {
+        refusals.push(format!("{}: {err}", path.display()));
+    }
+    if refusals.is_empty() {
+        Outcome::default()
+    } else {
+        Outcome::refused(refusals.join("\n"))
+    }
+}
+
+/// How long a running FxSound holds a forwarded line with a `--forget-device` in it for
+/// PipeWire's first device list ([`waits_for_the_device_list`]): long enough for a PipeWire that
+/// answers at all, and a second short of [`crate::ipc::HANDLER_TIMEOUT`], so the caller still
+/// hears the refusal rather than its own timeout when none comes.
+pub const DEVICE_LIST_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether `commands` should wait for the device list before `app` runs them: a
+/// `--forget-device` (or D-Bus `ForgetDevice`) that reaches an instance so young that PipeWire has
+/// not listed the devices yet — a call that started FxSound through the bus
+/// (`--activated`), or a script that runs `fxsound --forget-device` right after `fxsound &`.
+/// [`App::forget_device`] can only refuse it then; held until the list is in, for at most
+/// [`DEVICE_LIST_WAIT`], it does what it says. Without an engine no list will come, and the line
+/// runs, and is refused, at once.
+#[must_use]
+pub fn waits_for_the_device_list(app: &App, commands: &[Command]) -> bool {
+    !app.has_seen_devices()
+        && app.has_audio()
+        && commands
+            .iter()
+            .any(|command| matches!(command, Command::ForgetDevice(_)))
 }
 
 /// The shape of [`StatusDocument`], as its `schema` key says it. 0.3.0's document had no number
@@ -1384,14 +1509,48 @@ mod tests {
     }
 
     #[test]
-    fn a_band_list_longer_than_the_layout_is_dropped_whole() {
+    fn a_band_list_naming_a_band_the_equalizer_lacks_is_refused_whole_with_the_bands_named() {
+        // 0.4.0 audit #51: `--set_band_gain=3:4,12:2` on ten bands changed nothing and said
+        // nothing.
         let mut a = app();
         assert_eq!(a.state.eq_bands.len(), 10);
-        run(&mut a, &[Command::BandGains(vec![(0, 6.0), (30, 6.0)])]);
+        let outcome = run(
+            &mut a,
+            &[Command::BandGains(vec![(3, 4.0), (12, 2.0), (30, 6.0)])],
+        );
+        assert!(outcome.failed, "a script has to be able to tell");
+        assert!(
+            outcome.stderr.contains("--set_band_gain")
+                && outcome.stderr.contains("no bands 12, 30")
+                && outcome.stderr.contains("0 to 9"),
+            "{}",
+            outcome.stderr
+        );
         assert!(
             a.state.eq_bands.iter().all(|b| b.boost_db == 0.0),
-            "band 30 does not exist, so the whole list must be refused"
+            "nothing on the list is set, band 3 included"
         );
+        let centre = a.state.eq_bands[0].center_hz;
+        let outcome = run(
+            &mut a,
+            &[Command::BandFrequencies(vec![(0, 50.0), (10, 900.0)])],
+        );
+        assert!(outcome.failed);
+        assert!(
+            outcome.stderr.contains("--set_band_freq") && outcome.stderr.contains("no band 10"),
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(a.state.eq_bands[0].center_hz, centre);
+        // A list the equalizer has every band of goes through, and says nothing.
+        let outcome = run(&mut a, &[Command::BandGains(vec![(3, 4.0), (9, -2.0)])]);
+        assert!(
+            !outcome.failed && outcome.stderr.is_empty(),
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(a.state.eq_bands[3].boost_db, 4.0);
+        assert_eq!(a.state.eq_bands[9].boost_db, -2.0);
 
         // The same list applies once the layout is big enough, and --num_bands comes first.
         run(
@@ -1404,6 +1563,53 @@ mod tests {
         assert_eq!(a.state.eq_bands.len(), 31);
         assert_eq!(a.state.eq_bands[0].boost_db, 6.0);
         assert_eq!(a.state.eq_bands[30].boost_db, 6.0);
+    }
+
+    #[test]
+    fn a_forget_device_waits_for_the_first_device_list_only_where_one_will_come() {
+        // No engine: no list will come, and the line is refused at once.
+        assert!(!waits_for_the_device_list(
+            &app(),
+            &[Command::ForgetDevice("Old Dock".to_owned())]
+        ));
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let engine = crate::audio_link::FakeEngine::new();
+        let mut a = App::start_for_tests(
+            fxsound_core::Settings::default(),
+            fxsound_preset::PresetStore::with_dirs(Vec::new(), dir.path().join("presets")),
+            fxsound_preset::InputPresetStore::with_dirs(Vec::new(), dir.path().join("input")),
+            &engine,
+        );
+        let forget = [
+            Command::Power(PowerCommand::On),
+            Command::ForgetDevice("Old Dock".to_owned()),
+        ];
+        assert!(
+            waits_for_the_device_list(&a, &forget),
+            "the whole line waits"
+        );
+        assert!(
+            !waits_for_the_device_list(&a, &[Command::Power(PowerCommand::On)]),
+            "a line without it does not"
+        );
+        engine.feed(fxsound_core::messages::AudioToUi::Devices(Vec::new()));
+        a.poll_audio();
+        assert!(!waits_for_the_device_list(&a, &forget), "the list is in");
+    }
+
+    #[test]
+    fn forget_device_fails_the_line_with_the_reason_when_it_forgets_nothing() {
+        // Before the first device list nothing is known to be unplugged (0.4.0 audit #34).
+        let mut a = app();
+        let outcome = run(&mut a, &[Command::ForgetDevice("Old Dock".to_owned())]);
+        assert!(outcome.failed);
+        assert!(
+            outcome
+                .stderr
+                .contains("has not listed the audio devices yet"),
+            "{}",
+            outcome.stderr
+        );
     }
 
     #[test]
@@ -3990,7 +4196,200 @@ mod tests {
         let cli =
             crate::cli::Cli::try_parse_from(std::iter::once("fxsound").chain(args.iter().copied()))
                 .expect("parses");
-        answer_without_an_instance(&cli.commands(), store)
+        answer_without_an_instance(
+            &cli.commands(),
+            store,
+            Path::new("/nonexistent/settings.toml"),
+        )
+    }
+
+    /// [`without_an_instance`] for a line about devices: the settings file is `settings`.
+    fn forget_without_an_instance(args: &[&str], settings: &Path) -> Option<Outcome> {
+        let cli =
+            crate::cli::Cli::try_parse_from(std::iter::once("fxsound").chain(args.iter().copied()))
+                .expect("parses");
+        answer_without_an_instance(
+            &cli.commands(),
+            Path::new("/nonexistent/apps.toml"),
+            settings,
+        )
+    }
+
+    /// A settings file at `path` that remembers the laptop's speakers and a dock with a sink and
+    /// a source under one description.
+    fn settings_with_a_dock(path: &Path) -> fxsound_core::Settings {
+        let mut settings = fxsound_core::Settings::default();
+        settings.remember_device_preset("alsa_output.speakers", "Speakers", "Music", "", OUT);
+        settings.remember_device_preset("alsa_output.dock", "USB Dock", "Gaming", "", OUT);
+        settings.remember_device_preset("alsa_input.dock", "USB Dock", "Loud", "", IN);
+        settings.save_to(path).expect("write the settings");
+        settings
+    }
+
+    fn remembered(path: &Path) -> Vec<(String, DeviceDirection)> {
+        fxsound_core::Settings::load_from(path)
+            .device_configs
+            .iter()
+            .map(|config| (config.device_id.clone(), config.direction))
+            .collect()
+    }
+
+    #[test]
+    fn forget_device_with_no_fxsound_running_forgets_from_the_settings_file_and_starts_nothing() {
+        // 0.4.0 finisher F8: at a cold start `--forget-device` used to be run by the new instance
+        // before PipeWire had listed a device, refused, and the script's process stayed on as
+        // FxSound. Now it is answered from the file, with an exit status, and nothing starts.
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("settings.toml");
+        settings_with_a_dock(&path);
+
+        let answer = forget_without_an_instance(&["--forget-device=alsa_output.dock"], &path)
+            .expect("answered, nothing started");
+        assert!(!answer.failed, "{}", answer.stderr);
+        assert!(answer.stderr.is_empty(), "{}", answer.stderr);
+        assert!(answer.stdout.is_empty());
+        assert!(answer.window.is_empty());
+        assert_eq!(
+            remembered(&path),
+            [
+                ("alsa_output.speakers".to_owned(), OUT),
+                ("alsa_input.dock".to_owned(), IN),
+            ],
+            "by node.name: that entry alone"
+        );
+    }
+
+    #[test]
+    fn forget_device_by_description_with_no_fxsound_running_forgets_both_lanes_entries() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("settings.toml");
+        settings_with_a_dock(&path);
+        let answer = forget_without_an_instance(&["--forget-device", "USB Dock"], &path)
+            .expect("answered, nothing started");
+        assert!(!answer.failed, "{}", answer.stderr);
+        assert_eq!(
+            remembered(&path),
+            [("alsa_output.speakers".to_owned(), OUT)]
+        );
+        let settings = fxsound_core::Settings::load_from(&path);
+        assert_eq!(
+            settings.preset_for_device("alsa_output.speakers", OUT),
+            Some("Music"),
+            "the rest of the file is as it was"
+        );
+    }
+
+    #[test]
+    fn with_no_fxsound_running_every_device_counts_as_unplugged() {
+        // Nothing is attached to the speakers while FxSound is not running, and the next start
+        // learns them as a first start would: the running instance's "unplug it first" has no
+        // reason here.
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("settings.toml");
+        settings_with_a_dock(&path);
+        let answer = forget_without_an_instance(&["--forget-device=Speakers"], &path)
+            .expect("answered, nothing started");
+        assert!(!answer.failed, "{}", answer.stderr);
+        assert!(
+            !remembered(&path)
+                .iter()
+                .any(|(id, _)| id == "alsa_output.speakers")
+        );
+    }
+
+    #[test]
+    fn forget_device_with_no_fxsound_running_refuses_a_name_neither_list_has_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("settings.toml");
+        settings_with_a_dock(&path);
+        let before = std::fs::read_to_string(&path).expect("read");
+        let answer = forget_without_an_instance(&["--forget-device=Nothing Like It"], &path)
+            .expect("answered, nothing started");
+        assert!(answer.failed);
+        assert!(
+            answer
+                .stderr
+                .contains("neither device priority list has a device called"),
+            "{}",
+            answer.stderr
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+    }
+
+    #[test]
+    fn forget_device_with_no_settings_file_is_refused_and_creates_none() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("settings.toml");
+        let answer = forget_without_an_instance(&["--forget-device=USB Dock"], &path)
+            .expect("answered, nothing started");
+        assert!(answer.failed);
+        assert!(!path.exists(), "a refusal creates nothing");
+    }
+
+    #[test]
+    fn forget_device_leaves_a_settings_file_that_does_not_load_where_it_is() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, "power = \"yes\"\n[[device_configs\n").expect("write");
+        let answer = forget_without_an_instance(&["--forget-device=USB Dock"], &path)
+            .expect("answered, nothing started");
+        assert!(answer.failed);
+        assert!(answer.stderr.contains("does not load"), "{}", answer.stderr);
+        assert!(path.exists(), "left where it is");
+        assert!(
+            !fxsound_core::Settings::bad_path(&path).exists(),
+            "not moved aside"
+        );
+    }
+
+    #[test]
+    fn forget_device_beside_options_that_start_fxsound_starts_it_and_is_done_to_the_file_first() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("settings.toml");
+        settings_with_a_dock(&path);
+        let args = ["--forget-device=USB Dock", "--power=on"];
+        assert!(
+            forget_without_an_instance(&args, &path).is_none(),
+            "FxSound starts"
+        );
+        let cli = crate::cli::Cli::try_parse_from(std::iter::once("fxsound").chain(args))
+            .expect("parses");
+        // What `main` does before it reads the settings.
+        let forgotten = forget_in_the_settings_file(&cli.commands(), &path);
+        assert!(!forgotten.failed, "{}", forgotten.stderr);
+        assert_eq!(
+            remembered(&path),
+            [("alsa_output.speakers".to_owned(), OUT)]
+        );
+        assert!(
+            !cli.cold_start_commands()
+                .iter()
+                .any(|command| matches!(command, Command::ForgetDevice(_))),
+            "and step 4 does not run it again"
+        );
+    }
+
+    #[test]
+    fn a_line_without_forget_device_leaves_the_settings_file_alone() {
+        let path = Path::new("/nonexistent/settings.toml");
+        let outcome = forget_in_the_settings_file(&[Command::Power(PowerCommand::On)], path);
+        assert!(!outcome.failed);
+        assert!(outcome.stderr.is_empty());
+    }
+
+    #[test]
+    fn quit_beside_forget_device_without_an_instance_says_not_running_and_forgets_nothing() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("settings.toml");
+        settings_with_a_dock(&path);
+        let answer = forget_without_an_instance(&["--quit", "--forget-device=USB Dock"], &path)
+            .expect("answered, nothing started");
+        assert_eq!(answer.stderr, NOT_RUNNING);
+        assert_eq!(
+            remembered(&path).len(),
+            3,
+            "the rest of the line is not carried out"
+        );
     }
 
     #[test]

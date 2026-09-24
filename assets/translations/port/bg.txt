@@ -116,3 +116,4 @@ countries: bg
 "Effects" = "Ефекти"
 "Right-click to reset" = "Щракнете с десния бутон за нулиране"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+плъзгане, за да чуете само тази лента"
+"Recording Device Select" = "Избор на устройство за запис"

@@ -117,3 +117,4 @@ countries: vn
 "Effects" = "Hiệu ứng"
 "Right-click to reset" = "Nhấp chuột phải để đặt lại"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+kéo để chỉ nghe dải này"
+"Recording Device Select" = "Chọn thiết bị đầu vào"

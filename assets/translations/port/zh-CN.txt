@@ -116,3 +116,4 @@ countries: cn sg
 "Effects" = "音效"
 "Right-click to reset" = "右键单击以重置"
 "Ctrl+Alt+drag to hear this band alone" = "按住 Ctrl+Alt 拖动以单独试听此频段"
+"Recording Device Select" = "录音设备选择"

@@ -116,3 +116,4 @@ countries: th
 "Effects" = "เอฟเฟกต์"
 "Right-click to reset" = "คลิกขวาเพื่อรีเซ็ต"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+ลากเพื่อฟังเฉพาะย่านนี้"
+"Recording Device Select" = "เลือกอุปกรณ์บันทึกเสียง"

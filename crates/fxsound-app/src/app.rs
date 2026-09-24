@@ -3184,11 +3184,121 @@ pub enum WindowVisibility {
     Hidden,
 }
 
+/// Why `--forget-device` (and D-Bus `ForgetDevice`) forgot nothing ([`App::forget_device`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgetRefusal {
+    /// PipeWire has not listed the devices yet, so whether the device is connected is not known.
+    NotListedYet { name: String },
+    /// Neither priority list has a device of that `node.name` or description.
+    Unknown { name: String },
+    /// Every device of that name is connected, and FxSound would learn it again at once.
+    Connected { name: String },
+}
+
+impl std::fmt::Display for ForgetRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotListedYet { name } => write!(
+                f,
+                "FxSound has not listed the audio devices yet, so it cannot tell whether {name:?} \
+                 is connected; try again in a moment"
+            ),
+            Self::Unknown { name } => write!(
+                f,
+                "neither device priority list has a device called {name:?} (--status lists them \
+                 under output_device_list and input_device_list)"
+            ),
+            Self::Connected { name } => write!(
+                f,
+                "{name:?} is connected, and FxSound would learn it again at once; unplug it first"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ForgetRefusal {}
+
+/// The forgetting half of [`App::forget_device`], on `settings` alone: the entries of either lane
+/// whose `node.name` is `name`, or, when none has it, whose description is, less those `connected`
+/// says are plugged in now. Returns the descriptions forgotten (the `node.name` of an entry that
+/// has none), in the lists' order.
+///
+/// Also what a `--forget-device` does with no FxSound running
+/// ([`crate::commands::forget_in_the_settings_file`]): nothing is attached to any device then, so
+/// `connected` is never true there.
+///
+/// # Errors
+///
+/// [`ForgetRefusal::Unknown`] or [`ForgetRefusal::Connected`], and `settings` is not changed.
+pub fn forget_device_in(
+    settings: &mut Settings,
+    name: &str,
+    connected: impl Fn(&fxsound_core::settings::DeviceConfig) -> bool,
+) -> Result<Vec<String>, ForgetRefusal> {
+    let named = |by_id: bool| -> Vec<usize> {
+        settings
+            .device_configs
+            .iter()
+            .enumerate()
+            .filter(|(_, config)| {
+                if by_id {
+                    config.device_id == name
+                } else {
+                    config.device_name == name
+                }
+            })
+            .map(|(index, _)| index)
+            .collect()
+    };
+    let mut matches = named(true);
+    if matches.is_empty() {
+        matches = named(false);
+    }
+    if matches.is_empty() {
+        return Err(ForgetRefusal::Unknown {
+            name: name.to_owned(),
+        });
+    }
+    matches.retain(|&index| !connected(&settings.device_configs[index]));
+    if matches.is_empty() {
+        return Err(ForgetRefusal::Connected {
+            name: name.to_owned(),
+        });
+    }
+    let mut forgotten = Vec::with_capacity(matches.len());
+    for index in matches.into_iter().rev() {
+        let config = settings.device_configs.remove(index);
+        forgotten.push(if config.device_name.is_empty() {
+            config.device_id
+        } else {
+            config.device_name
+        });
+    }
+    forgotten.reverse();
+    Ok(forgotten)
+}
+
 impl App {
     /// The saved "start minimised" preference.
     #[must_use]
     pub const fn settings_run_minimized(&self) -> bool {
         self.settings.run_minimized
+    }
+
+    /// Remember whether the window was hidden to the tray, for the next start
+    /// (`settings.run_minimized`): `hideMainWindow` writes `true` and `showMainWindow` writes
+    /// `false` (`FxController.cpp:911-934`), so FxSound quit with its window in the tray starts in
+    /// the tray (`docs/spec/07-startup-tray.md` §7.1). 0.3.0 read the key and never wrote it
+    /// (0.4.0 audit #35).
+    ///
+    /// The shell says `true` only for a hide into a tray icon that is there. The setting promises
+    /// a start with "no window, tray only", and a session with no tray to start in — GNOME without
+    /// its AppIndicator extension — would start FxSound with nothing on screen at all.
+    pub fn remember_window_hidden(&mut self, hidden: bool) {
+        if self.settings.run_minimized != hidden {
+            self.settings.run_minimized = hidden;
+            self.persist_settings();
+        }
     }
 
     /// A fresh mirror of the model for the tray to draw its menu and tooltip from: both lanes,
@@ -3202,7 +3312,6 @@ impl App {
             // of them (`docs/spec/05-controller-model.md`). Not the lane's `audio_state`, which
             // stays `processing` while a paused stream keeps the device running on silence.
             processing: self.state.audio_active,
-            power_enabled: true,
             theme: self.state.theme,
             output: self.tray_lane(DeviceDirection::Output),
             input: self.tray_lane(DeviceDirection::Input),
@@ -4506,9 +4615,11 @@ impl App {
     /// `--language <code>` from the command line: an explicit pick, or `system`/`default` to
     /// follow the desktop again (`FxController.cpp:269-278` only knew codes).
     pub fn set_language(&mut self, code: &str) {
+        // `--language` hands over a table's own code already (`crate::cli`); the ISO spelling or
+        // a locale is read into one here too, so no route saves a code nothing can show.
         let choice = match code.trim().to_ascii_lowercase().as_str() {
             "system" | "default" | "" => None,
-            _ => Some(code.trim()),
+            _ => Some(i18n::canonical_code(code).unwrap_or_else(|| code.trim())),
         };
         self.settings.choose_language(choice);
         i18n::set_language(self.settings.effective_language());
@@ -4528,6 +4639,14 @@ impl App {
     /// (`FxController.cpp:1933`); the window's own power button says nothing.
     pub fn notify_power(&self) {
         self.notify(Message::power_toggled(self.state.power));
+    }
+
+    /// Whether the window has hidden once in this process, and [`App::notify_hidden_to_tray`] has
+    /// had its one say — for the shell's tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn tray_tip_shown(&self) -> bool {
+        self.tray_tip_shown
     }
 
     /// The "FxSound in system tray" tip, once per process, the first time the window hides
@@ -4781,6 +4900,42 @@ impl App {
             self.settings.device_configs.remove(index);
             self.device_configs_changed(state);
         }
+    }
+
+    /// `--forget-device` and D-Bus `ForgetDevice` (0.4.0 audit #34): what the ✕ beside a row of
+    /// Settings ▸ Audio's and Settings ▸ Microphone's priority lists does, by name — the entries of
+    /// either lane with that `node.name`, or, when none has it, that description, whose devices
+    /// PipeWire does not have now. Their rank and the preset remembered for them go with them.
+    /// Returns the descriptions forgotten.
+    ///
+    /// A connected device is refused rather than forgotten, as the ✕ is not drawn for one: the
+    /// next device list would add it back at the bottom, having lost its preset for nothing. So is
+    /// every name before the first device list, when nothing is known to be connected — which a
+    /// caller rarely meets: the pump holds a forwarded line with a `--forget-device` in it until
+    /// that list is in (`main`'s `Runtime`, [`crate::commands::waits_for_the_device_list`]), and
+    /// with no FxSound running `main` forgets the name from the settings file instead
+    /// ([`crate::commands::forget_in_the_settings_file`]). An open
+    /// Settings pane shows the list as it is now on its next frame
+    /// ([`App::refresh_settings_state`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ForgetRefusal`], and nothing is changed.
+    pub fn forget_device(&mut self, name: &str) -> Result<Vec<String>, ForgetRefusal> {
+        if !self.has_seen_devices() {
+            return Err(ForgetRefusal::NotListedYet {
+                name: name.to_owned(),
+            });
+        }
+        let devices = &self.state.devices;
+        let forgotten = forget_device_in(&mut self.settings, name, |config| {
+            devices
+                .iter()
+                .any(|d| d.direction == config.direction && d.name == config.device_id)
+        })?;
+        self.persist_settings();
+        self.device_priority_changed();
+        Ok(forgotten)
     }
 
     fn persist_settings(&mut self) {
@@ -10147,6 +10302,91 @@ mod tests {
         assert_eq!(ids(&pane), [HEADPHONES]);
         assert_eq!(app.settings.preset_for_device(SPEAKERS, OUT), None);
         assert_eq!(app.settings.preset_for_device(MIC, IN), Some("Quiet"));
+    }
+
+    #[test]
+    fn forget_device_drops_a_device_that_is_gone_and_refuses_one_that_is_there() {
+        // 0.4.0 audit #34: `--forget-device` and D-Bus `ForgetDevice` do what the ✕ beside a row
+        // of the priority list does, for a device that is not connected.
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        assert!(matches!(
+            app.forget_device(SPEAKERS),
+            Err(ForgetRefusal::NotListedYet { .. })
+        ));
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        app.poll_audio();
+        // A dock that was plugged in once, with a sink and a source under one description.
+        let dock = |app: &mut App| {
+            app.settings
+                .remember_device_preset("alsa_output.dock", "USB Dock", "Alpha", "", OUT);
+            app.settings
+                .remember_device_preset("alsa_input.dock", "USB Dock", "Loud", "", IN);
+        };
+        dock(&mut app);
+        let known = app.settings.device_configs.len();
+
+        let refused = app.forget_device(SPEAKERS).expect_err("connected");
+        assert!(matches!(refused, ForgetRefusal::Connected { .. }));
+        assert!(refused.to_string().contains("unplug it first"), "{refused}");
+        assert!(matches!(
+            app.forget_device("Nothing Like It"),
+            Err(ForgetRefusal::Unknown { .. })
+        ));
+        assert_eq!(
+            app.settings.device_configs.len(),
+            known,
+            "a refusal forgets nothing"
+        );
+
+        // By `node.name`: that entry alone.
+        assert_eq!(
+            app.forget_device("alsa_output.dock"),
+            Ok(vec!["USB Dock".to_owned()])
+        );
+        assert_eq!(
+            app.settings.preset_for_device("alsa_output.dock", OUT),
+            None
+        );
+        assert_eq!(
+            app.settings.preset_for_device("alsa_input.dock", IN),
+            Some("Loud")
+        );
+        // By description: every entry of either lane with it.
+        dock(&mut app);
+        assert_eq!(
+            app.forget_device("USB Dock"),
+            Ok(vec!["USB Dock".to_owned(), "USB Dock".to_owned()])
+        );
+        assert!(
+            app.settings
+                .device_configs
+                .iter()
+                .all(|config| !config.device_id.ends_with(".dock"))
+        );
+        for connected in [SPEAKERS, HEADPHONES, MIC] {
+            assert!(
+                app.settings
+                    .device_configs
+                    .iter()
+                    .any(|config| config.device_id == connected),
+                "{connected} is still ranked"
+            );
+        }
+        // And an open Settings pane shows the list as it is now.
+        let pane = app.settings_state();
+        assert!(pane.devices.iter().all(|row| row.present));
+    }
+
+    #[test]
+    fn the_window_hidden_to_the_tray_is_remembered_for_the_next_start() {
+        // 0.4.0 audit #35: `run_minimized` was read at start and never written, so "quit with the
+        // window in the tray, start in the tray" (`FxController.cpp:911-934`) never happened.
+        let (mut app, _engine, _dir) = started_with(saved_settings(OUT));
+        assert!(!app.settings_run_minimized());
+        app.remember_window_hidden(true);
+        assert!(app.settings_run_minimized());
+        app.remember_window_hidden(false);
+        assert!(!app.settings_run_minimized());
     }
 
     #[test]

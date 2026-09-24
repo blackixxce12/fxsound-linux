@@ -5,10 +5,14 @@
 //! `$XDG_CONFIG_HOME/fxsound/settings.toml` (default `~/.config/fxsound/settings.toml`) so the
 //! schema stays greppable against the original C++ and a user's settings are recognisable.
 //!
-//! Three keys change meaning on Linux and say so in their doc comments: the hotkey commands
-//! (a Wayland client cannot grab global shortcuts), `automatic_updates` (this fork is installed by
-//! a package manager and never phones home) and the window position keys (Wayland gives a client
-//! no way to place its own toplevel).
+//! The Windows keys nothing here reads are not written (0.4.0 audit #35): the five hotkey chords
+//! and the `hotkeys` switch (a Wayland client cannot grab global shortcuts; the compositor binds
+//! them to the command line), `window_x`/`window_y` (Wayland gives a client no way to place its own
+//! toplevel), `always_on_top` (winit ignores window levels there), `automatic_updates` and
+//! `last_update_time` (this fork never contacts the network), and `device_configs_version`. A file
+//! that still has them, as every file 0.3.0 wrote does, loads as before: a key the struct does not
+//! know is skipped, and the next save leaves it out. `run_minimized`, which 0.3.0 read and never
+//! wrote, is written again whenever the window hides to the tray or shows.
 //!
 //! A file that does not parse is moved aside as `settings.toml.bad` and the defaults are used —
 //! never overwritten in place, so a hand edit that went wrong can still be read back by the
@@ -116,35 +120,6 @@ impl CalibrationRecord {
     }
 }
 
-/// Keyboard shortcuts.
-///
-/// On Windows these are Win32 `RegisterHotKey` codes. A Wayland client cannot register a global
-/// shortcut, so here they are human-readable accelerator strings that the app only *displays*;
-/// the binding itself lives in the compositor and reaches the running instance through the
-/// control socket (see `packaging/hyprland.conf.example`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Hotkeys {
-    pub cmd_on_off: String,
-    pub cmd_open_close: String,
-    pub cmd_next_preset: String,
-    pub cmd_previous_preset: String,
-    pub cmd_change_output: String,
-}
-
-impl Default for Hotkeys {
-    fn default() -> Self {
-        // The same chords the Windows build ships, decoded from its Win32 hotkey codes.
-        Self {
-            cmd_on_off: "Ctrl+Shift+Q".into(),
-            cmd_open_close: "Ctrl+Shift+E".into(),
-            cmd_next_preset: "Ctrl+Shift+A".into(),
-            cmd_previous_preset: "Ctrl+Shift+Z".into(),
-            cmd_change_output: "Ctrl+Shift+W".into(),
-        }
-    }
-}
-
 /// The whole settings file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -200,8 +175,6 @@ pub struct Settings {
     pub output_enabled: bool,
     /// Remembered devices and their presets, in both directions.
     pub device_configs: Vec<DeviceConfig>,
-    /// Schema version of `device_configs`.
-    pub device_configs_version: u32,
     /// Switch to a newly appeared output device automatically.
     pub prioritize_new_output: bool,
     /// Ignore the device priority list and let the session default decide (U4, upstream #629).
@@ -256,15 +229,10 @@ pub struct Settings {
     // ---- window ----------------------------------------------------------------------------
     pub view: ViewMode,
     pub theme_mode: ThemeMode,
-    /// Kept for compatibility and for the X11 fallback. Under Wayland a client cannot position
-    /// its own toplevel, so the compositor decides and these are only written, never applied.
-    pub window_x: i32,
-    pub window_y: i32,
-    /// Kept so the key survives a round trip through this port. Nothing sets or applies it: winit's
-    /// Wayland backend ignores window levels, so neither the hamburger menu nor the tray offers
-    /// Always On Top.
-    pub always_on_top: bool,
-    /// Start with no window, tray only.
+    /// Start with no window, tray only: whether the window was hidden to the tray when FxSound
+    /// last ran (`FxController.cpp:911-934`, `docs/spec/07-startup-tray.md` §7.1). Written when the
+    /// window shows and when it hides into a tray icon that is on screen; `--hide` and `--show`
+    /// override it for one start.
     pub run_minimized: bool,
 
     // ---- ui --------------------------------------------------------------------------------
@@ -276,18 +244,8 @@ pub struct Settings {
     pub language_follows_system: bool,
     pub hide_help_tooltips: bool,
     pub hide_notifications: bool,
-    /// Whether the shortcut rows in Settings are shown as active.
-    pub hotkeys: bool,
-    #[serde(flatten)]
-    pub hotkey_bindings: Hotkeys,
     /// How many presets the user may save, from 10 to 1000 ([`USER_PRESET_LIMITS`]).
     pub max_user_presets: u32,
-
-    // ---- housekeeping ----------------------------------------------------------------------
-    /// Present so the Settings pane matches the original. This fork never contacts the network;
-    /// the toggle is inert and the Help pane says so.
-    pub automatic_updates: bool,
-    pub last_update_time: i64,
 }
 
 impl Default for Settings {
@@ -305,7 +263,6 @@ impl Default for Settings {
             input_enabled: None,
             output_enabled: true,
             device_configs: Vec::new(),
-            device_configs_version: 2,
             prioritize_new_output: false,
             follow_system_default: false,
             device_volumes: Vec::new(),
@@ -327,21 +284,13 @@ impl Default for Settings {
 
             view: ViewMode::Pro,
             theme_mode: ThemeMode::Dark,
-            window_x: 0,
-            window_y: 0,
-            always_on_top: false,
             run_minimized: false,
 
             language: "en".into(),
             language_follows_system: true,
             hide_help_tooltips: false,
             hide_notifications: false,
-            hotkeys: true,
-            hotkey_bindings: Hotkeys::default(),
             max_user_presets: 120,
-
-            automatic_updates: false,
-            last_update_time: 0,
         }
     }
 }
@@ -492,6 +441,13 @@ impl Settings {
         // the microphone while still editing its chain, and is believed.
         if self.input_enabled.is_none() {
             self.input_enabled = Some(self.device_direction == DeviceDirection::Input);
+        }
+
+        // A language written the ISO way or as a locale (`uk`, `ru_RU.UTF-8`) is kept as the table's
+        // own code, the one the switch and `--status` show (0.4.0 audit #28). One with no table is
+        // left as written: `effective_language` shows the system's language for it.
+        if let Some(code) = crate::i18n::canonical_code(&self.language) {
+            code.clone_into(&mut self.language);
         }
 
         // Informational, and dropped rather than clamped when corrupt: see `CalibrationRecord`.
@@ -770,6 +726,75 @@ mod tests {
     fn an_empty_file_yields_defaults() {
         let parsed: Settings = toml::from_str("").expect("parse empty");
         assert_eq!(parsed, Settings::default());
+    }
+
+    #[test]
+    fn the_windows_keys_nothing_reads_still_load_and_are_not_written_back() {
+        // 0.4.0 audit #35: every file 0.3.0 wrote carries these, and a hand edit of `window_x` or
+        // `always_on_top` did nothing. They load as before, and the next save leaves them out.
+        let dead = [
+            "device_configs_version = 2",
+            "window_x = 120",
+            "window_y = -40",
+            "always_on_top = true",
+            "hotkeys = false",
+            "cmd_on_off = \"Ctrl+Shift+Q\"",
+            "cmd_open_close = \"Ctrl+Shift+E\"",
+            "cmd_next_preset = \"Ctrl+Shift+A\"",
+            "cmd_previous_preset = \"Ctrl+Shift+Z\"",
+            "cmd_change_output = \"Ctrl+Shift+W\"",
+            "automatic_updates = true",
+            "last_update_time = 1700000000",
+        ];
+        let text = format!(
+            "power = false\nrun_minimized = true\n{}\noutput_preset = \"Rock\"\n",
+            dead.join("\n")
+        );
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, &text).expect("write");
+        let loaded = Settings::load_from(&path);
+        assert!(!Settings::bad_path(&path).exists(), "the file loaded");
+        assert!(!loaded.power);
+        assert!(loaded.run_minimized);
+        assert_eq!(loaded.output_preset, "Rock");
+
+        loaded.save_to(&path).expect("save");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        for line in dead {
+            let key = line.split(' ').next().expect("a key");
+            assert!(
+                !written.lines().any(|l| l.starts_with(&format!("{key} "))),
+                "{key} is written back:\n{written}"
+            );
+        }
+        assert!(written.contains("run_minimized = true"), "{written}");
+        assert_eq!(Settings::load_from(&path), loaded);
+    }
+
+    #[test]
+    fn a_language_written_the_iso_way_is_kept_as_the_tables_code() {
+        // 0.4.0 audit #28: `uk` found no table and showed the system's language.
+        for (written, kept) in [
+            ("uk", "ua"),
+            ("bs", "ba"),
+            ("ru_RU.UTF-8", "ru"),
+            ("zh-cn", "zh-CN"),
+        ] {
+            let mut settings: Settings = toml::from_str(&format!(
+                "language = \"{written}\"\nlanguage_follows_system = false\n"
+            ))
+            .expect("parse");
+            settings.sanitise();
+            assert_eq!(settings.language, kept, "{written}");
+            assert_eq!(settings.effective_language(), kept, "{written}");
+        }
+        let mut unknown: Settings = toml::from_str("language = \"hu\"\n").expect("parse");
+        unknown.sanitise();
+        assert_eq!(
+            unknown.language, "hu",
+            "a code with no table is left as written"
+        );
     }
 
     #[test]

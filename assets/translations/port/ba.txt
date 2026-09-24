@@ -116,3 +116,4 @@ countries: ba
 "Effects" = "Efekti"
 "Right-click to reset" = "Desni klik za resetovanje"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+prevlačenje za slušanje samo ovog opsega"
+"Recording Device Select" = "Odabir uređaja za snimanje"

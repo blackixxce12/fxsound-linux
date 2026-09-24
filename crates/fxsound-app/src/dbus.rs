@@ -15,7 +15,7 @@
 //!            SetNoiseSuppression(s), SetEditDirection(s), GetStatus() → s, Show(), Hide(),
 //!            ToggleWindow(), Quit(), Apply(as argv) → (b ok, s stdout, s stderr),
 //!            ListPresets() → s, ListDevices() → s,
-//!            SetAppPreset(s app, s direction, s preset), ListApps() → s
+//!            SetAppPreset(s app, s direction, s preset), ListApps() → s, ForgetDevice(s)
 //! properties Version (s, const), Power (b), Preset (s), Output (s), Input (s), Direction (s)
 //! signals    PowerChanged(b), PresetChanged(s direction, s name),
 //!            DeviceChanged(s direction, s node_name, s description), AudioStateChanged(s json),
@@ -41,7 +41,9 @@
 //! `--status --json` document that list the presets and the devices (review items U14 and the
 //! D-Bus additions, the prerequisites of an MCP server). `SetAppPreset` and `ListApps` are
 //! `--app-preset` / `--app-input-preset` and `--list-apps --json` (per-application presets,
-//! `docs/0.4.0-apps.md`), and `AppRouted` is the `app_routed` event. The bus starts FxSound for
+//! `docs/0.4.0-apps.md`), and `AppRouted` is the `app_routed` event. `ForgetDevice` is
+//! `--forget-device` (0.4.0 audit #34); an instance the call has just started holds it until
+//! PipeWire has listed the devices (`commands::waits_for_the_device_list`). The bus starts FxSound for
 //! a call when it is not running — any call, a property read included, unless the caller sets
 //! `NO_AUTO_START` (`busctl --auto-start=no`), which the manual tells pollers to:
 //! `org.fxsound.FxSound.service` in `/usr/share/dbus-1/services/` hands the start to
@@ -159,6 +161,8 @@ pub enum Call {
         preset: String,
     },
     ListApps,
+    /// A device to drop from its lane's priority list, by `node.name` or description.
+    ForgetDevice(String),
 }
 
 impl Call {
@@ -188,6 +192,7 @@ impl Call {
             Self::ListDevices => "ListDevices",
             Self::SetAppPreset { .. } => "SetAppPreset",
             Self::ListApps => "ListApps",
+            Self::ForgetDevice(_) => "ForgetDevice",
         }
     }
 
@@ -258,6 +263,12 @@ impl Call {
                 }]
             }
             Self::ListApps => vec![Command::ListApps { json: true }],
+            Self::ForgetDevice(device) => {
+                if device.trim().is_empty() {
+                    return Err("a device name cannot be empty".to_owned());
+                }
+                vec![Command::ForgetDevice(device.clone())]
+            }
         })
     }
 }
@@ -790,6 +801,13 @@ impl Service {
     /// `off`, as `--input` does.
     async fn set_input(&self, device: &str) -> Result<(), MethodError> {
         self.run_quietly(Call::SetInput(device.to_owned())).await
+    }
+
+    /// Drop a device that is not connected from its lane's priority list, and the preset
+    /// remembered for it, by `node.name` or description, as `--forget-device` does.
+    async fn forget_device(&self, device: &str) -> Result<(), MethodError> {
+        self.run_quietly(Call::ForgetDevice(device.to_owned()))
+            .await
     }
 
     /// Move the output lane to the next playback device, wrapping, as `--next-output` does.
@@ -1507,6 +1525,16 @@ mod tests {
             let why = call.commands().unwrap_err();
             assert!(why.contains("off"), "{why}");
         }
+        let why = Call::ForgetDevice(" ".to_owned()).commands().unwrap_err();
+        assert!(why.contains("cannot be empty"), "{why}");
+    }
+
+    #[test]
+    fn forget_device_is_forget_device() {
+        assert_eq!(
+            commands(Call::ForgetDevice("Old Dock".to_owned())),
+            cli(&["--forget-device", "Old Dock"])
+        );
     }
 
     #[test]
@@ -1648,6 +1676,7 @@ mod tests {
             Call::ListDevices,
             set_app_preset("bf6.exe", "output", "Gaming"),
             Call::ListApps,
+            Call::ForgetDevice("Old Dock".to_owned()),
         ]
     }
 
@@ -1673,7 +1702,7 @@ mod tests {
         let mut members: Vec<_> = every_call().iter().map(Call::member).collect();
         members.sort_unstable();
         members.dedup();
-        assert_eq!(members.len(), 22);
+        assert_eq!(members.len(), 23);
     }
 
     fn argv(args: &[&str]) -> Vec<String> {
@@ -1687,11 +1716,16 @@ mod tests {
             "Rock",
             "--set_effect=bass:7.5",
             "--num_bands=31",
+            "--view=2",
         ];
         assert_eq!(commands(Call::Apply(argv(&line))), cli_without_raise(&line));
-        // `--preset` alone raises a typed line's window; a bus call's is left where it is.
+        // `--view` raises a typed line's window, and so does a line with no options at all; a
+        // bus call's is left where it is.
         assert!(cli(&line).contains(&Command::Window(WindowCommand::Show)));
+        assert!(cli(&[]).contains(&Command::Window(WindowCommand::Show)));
         assert_eq!(commands(Call::Apply(Vec::new())), Vec::<Command>::new());
+        // `--preset` alone raises neither since 0.4.0 audit R11.
+        assert!(!cli(&line[..2]).contains(&Command::Window(WindowCommand::Show)));
     }
 
     #[test]
@@ -2442,7 +2476,7 @@ mod tests {
     #[test]
     fn every_method_is_served_with_its_documented_signature() {
         let xml = introspection();
-        let signatures: [(&str, &[&str]); 22] = [
+        let signatures: [(&str, &[&str]); 23] = [
             ("TogglePower", &[r#"type="b" direction="out""#]),
             ("SetPower", &[r#"type="b" direction="in""#]),
             ("NextPreset", &[]),
@@ -2480,6 +2514,7 @@ mod tests {
                 ],
             ),
             ("ListApps", &[r#"type="s" direction="out""#]),
+            ("ForgetDevice", &[r#"type="s" direction="in""#]),
         ];
         for (member, args) in signatures {
             let method = element(&xml, "method", member);
@@ -2492,7 +2527,7 @@ mod tests {
                 assert!(method.contains(arg), "{member} has no {arg}: {method}");
             }
         }
-        assert_eq!(xml.matches("<method ").count(), 22, "{xml}");
+        assert_eq!(xml.matches("<method ").count(), 23, "{xml}");
         for call in every_call() {
             element(&xml, "method", call.member());
         }

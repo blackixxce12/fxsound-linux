@@ -117,3 +117,4 @@ countries: id
 "Effects" = "Efek"
 "Right-click to reset" = "Klik kanan untuk mengatur ulang"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+seret untuk mendengar pita ini saja"
+"Recording Device Select" = "Pilihan Perangkat Perekaman"

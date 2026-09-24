@@ -117,3 +117,4 @@ countries: EG sa
 "Effects" = "المؤثرات"
 "Right-click to reset" = "انقر بزر الماوس الأيمن لإعادة التعيين"
 "Ctrl+Alt+drag to hear this band alone" = "اسحب مع Ctrl+Alt لسماع هذا النطاق وحده"
+"Recording Device Select" = "تحديد جهاز التسجيل"

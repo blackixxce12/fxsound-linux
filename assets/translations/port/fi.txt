@@ -116,3 +116,4 @@ countries: fi
 "Effects" = "Efektit"
 "Right-click to reset" = "Palauta hiiren oikealla painikkeella"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+veto: kuuntele vain tätä kaistaa"
+"Recording Device Select" = "Tallennuslaitteen valinta"

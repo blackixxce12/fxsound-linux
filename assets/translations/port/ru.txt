@@ -117,3 +117,4 @@ countries: ru
 "Effects" = "Эффекты"
 "Right-click to reset" = "Правый щелчок — сброс"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+перетаскивание — слушать только эту полосу"
+"Recording Device Select" = "Выбрать устройство ввода"

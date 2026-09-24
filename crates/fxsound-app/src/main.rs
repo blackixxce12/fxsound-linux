@@ -41,8 +41,15 @@
 //!
 //! ## Two states: a window, or the tray alone
 //!
-//! The original hides to the tray on ✕, on the minimise button and on the compositor's close
-//! request, and quits only from the tray's Exit (`docs/spec/01-window-layout.md` §7). On Wayland
+//! The original hides to the tray on ✕ and on the compositor's close request, and quits only from
+//! the tray's Exit (`docs/spec/01-window-layout.md` §7); its minimise button minimises
+//! (`ShowWindow(SW_MINIMIZE)`, `FxMainWindow.cpp:579-585`). Here the minimise button hides to the
+//! tray too while a tray icon is there to come back from — a Wayland compositor such as Hyprland
+//! or sway has no minimised state to put a window in — and minimises the window as the original
+//! does when there is none (0.4.0 audit #43), so that it cannot vanish on a GNOME session without
+//! the AppIndicator extension. ✕ hides either way: FxSound processes the whole session's sound,
+//! and a close that quit would stop it; with no tray the one-time notice says how to get the
+//! window back (`fxsound --show`, or launching FxSound again). On Wayland
 //! a client cannot unmap and later remap its toplevel through winit —
 //! `Window::set_visible` is a no-op there
 //! (`winit-0.30.13/src/platform_impl/linux/wayland/window/mod.rs:253`) — so "hidden" cannot be a
@@ -187,12 +194,15 @@ fn main() -> eframe::Result<()> {
     // one (`docs/spec/00-architecture.md` §4.7): say so and leave before step 3 claims the
     // session default sink — starting FxSound to answer would be the opposite of what was asked.
     // `--list-apps` is answered from the store on disk instead, which is the way to look up a
-    // name for `--app-preset` before FxSound runs. Which of them a line is, the same `commands()`
-    // decides that a running instance runs, so `--watch --list-apps` lists here as it does there
+    // name for `--app-preset` before FxSound runs, and a `--forget-device` on its own is done to
+    // the settings file, so the script that ran it gets its exit status rather than becoming
+    // FxSound. Which of them a line is, the same `commands()` decides that a running instance
+    // runs, so `--watch --list-apps` lists here as it does there
     // (`commands::answer_without_an_instance`). Dropping `server` unlinks the socket again.
     if let Some(answer) = commands::answer_without_an_instance(
         &cli.commands(),
         &fxsound_core::AppRules::config_path(),
+        &fxsound_core::Settings::config_path(),
     ) {
         drop(server);
         if !answer.stdout.is_empty() {
@@ -202,6 +212,18 @@ fn main() -> eframe::Result<()> {
             eprintln!("{}", answer.stderr);
         }
         std::process::exit(i32::from(answer.failed));
+    }
+
+    // A `--forget-device` beside options that start FxSound: done to the settings file before
+    // they are read, as it is on a line of its own above. At a cold start there is no device list
+    // to wait for yet, and nothing is attached to the device it names (0.4.0 audit #34), so
+    // `Command::honoured_at_cold_start` leaves it out of step 4. Reported, and the start goes on.
+    let forgotten = commands::forget_in_the_settings_file(
+        &cli.commands(),
+        &fxsound_core::Settings::config_path(),
+    );
+    if !forgotten.stderr.is_empty() {
+        eprintln!("{}", forgotten.stderr);
     }
 
     // The UI language, decided before anything is drawn or named: the desktop's unless the
@@ -239,8 +261,10 @@ fn main() -> eframe::Result<()> {
         eprintln!("{}", cold.stderr);
     }
     // `--hide` and the saved "start minimised" preference start in the tray-only state; there is
-    // no such thing as a hidden window here (see the module docs).
-    let mut visibility = if cold.window.hide || app.settings_run_minimized() {
+    // no such thing as a hidden window here (see the module docs). An explicit `--show` overrides
+    // the preference, as `--hide` overrides it the other way (`Cli::cold_start_commands`).
+    let mut visibility = if cold.window.hide || (app.settings_run_minimized() && !cold.window.show)
+    {
         WindowVisibility::Hidden
     } else {
         WindowVisibility::Shown
@@ -313,6 +337,7 @@ fn main() -> eframe::Result<()> {
         waker,
         signals,
         panes: Panes::default(),
+        waiting_for_devices: Vec::new(),
     };
 
     loop {
@@ -374,7 +399,10 @@ struct Runtime {
     sleep_rx: crossbeam_channel::Receiver<bool>,
     tray: Option<TrayHandle>,
     tray_rx: crossbeam_channel::Receiver<TrayCommand>,
-    /// Set by the shell before it closes the window; read once `run_native` has returned.
+    /// Why the window went, read once `run_native` has returned: [`WindowExit::Hidden`] from the
+    /// start of each run ([`Runtime::run_window`]), [`WindowExit::Quit`] once the shell has been
+    /// asked to quit. The compositor's close request never reaches the shell, and leaves it at
+    /// `Hidden`.
     exit: WindowExit,
     /// The tray's Settings item was chosen and no window has acted on it yet. Set from
     /// [`Runtime::tick`], cleared by the shell that opens the pane — possibly a shell that does
@@ -392,6 +420,9 @@ struct Runtime {
     signals: Option<signal_hook::iterator::Handle>,
     /// What the last window showed that the next one shows again.
     panes: Panes,
+    /// Forwarded lines held for PipeWire's first device list, each with the moment it stops
+    /// waiting ([`commands::waits_for_the_device_list`]), in the order they arrived.
+    waiting_for_devices: Vec<(ipc::Forwarded, Instant)>,
 }
 
 impl Runtime {
@@ -414,12 +445,29 @@ impl Runtime {
             }
             request.quit = true;
         }
-        // Commands forwarded by a second invocation — the compositor keybind path.
-        for forwarded in self.server.drain() {
+        // Commands forwarded by a second invocation — the compositor keybind path — after those
+        // still waiting for the device list, which the poll above may just have brought.
+        let now = Instant::now();
+        let arrived = self
+            .server
+            .drain()
+            .into_iter()
+            .map(|forwarded| (forwarded, now + commands::DEVICE_LIST_WAIT));
+        let lines: Vec<_> = std::mem::take(&mut self.waiting_for_devices)
+            .into_iter()
+            .chain(arrived)
+            .collect();
+        for (forwarded, until) in lines {
             // Its caller was told FxSound did not answer in time and has gone: carried out now,
             // a burst of them held up by a busy GUI thread would all land at once.
             if forwarded.is_abandoned() {
                 log::info!("not running a command whose caller stopped waiting for it");
+                continue;
+            }
+            // A `--forget-device` for an instance PipeWire has not listed the devices to yet: the
+            // whole line waits for the list, or until `until`, and is refused only then.
+            if now < until && commands::waits_for_the_device_list(&self.app, forwarded.commands()) {
+                self.waiting_for_devices.push((forwarded, until));
                 continue;
             }
             let outcome = commands::run(&mut self.app, forwarded.commands());
@@ -483,6 +531,8 @@ impl Runtime {
 
         self.announce(&AppEvent::Window { visible: true });
         self.app.set_window_shown(true);
+        // `showMainWindow` writes `run_minimized = false` (`FxController.cpp:933`).
+        self.app.remember_window_hidden(false);
         let runtime = &mut *self;
         let run = eframe::run_native(
             "FxSound",
@@ -503,14 +553,37 @@ impl Runtime {
         // The meters went with the window, and let go of the microphone they held.
         self.app.set_window_shown(false);
         run?;
+        let tray_visible = self.tray_visible();
+        Ok(self.window_closed(tray_visible))
+    }
+
+    /// What happens once a window has gone, whatever closed it. Returns why it went.
+    ///
+    /// Every close but a quit is a hide to the tray — ✕, the minimise button, `--hide`,
+    /// `--toggle-window`, the tray's left click, and the compositor's close request (Hyprland's
+    /// `killactive`, Alt+F4 elsewhere), which closes the window without asking the shell — so
+    /// what a hide leaves behind is done here, once, for all of them: the one-time tray tip
+    /// ([`App::notify_hidden_to_tray`]), `run_minimized` for the next start as `hideMainWindow`
+    /// writes it (`FxController.cpp:917`, 0.4.0 audit #35) — `true` only for a hide into a tray
+    /// icon that is there, since a start in the tray is what the setting promises
+    /// ([`App::remember_window_hidden`]) — and the `window visible=false` event. A quit is
+    /// announced by [`Runtime::shutdown`], as `quit`, and leaves the setting as the window found
+    /// it: a window still showing when FxSound was told to quit.
+    fn window_closed(&mut self, tray_visible: bool) -> WindowExit {
         // The wizard is a pane of the window that just went: a run it was in the middle of stops,
         // and the microphone is let go rather than held for a window that is not there.
         self.app.cancel_calibration();
-        // A quit is announced by `shutdown`, as `quit`.
         if self.exit == WindowExit::Hidden {
+            self.app.notify_hidden_to_tray(tray_visible);
+            self.app.remember_window_hidden(tray_visible);
             self.announce(&AppEvent::Window { visible: false });
         }
-        Ok(self.exit)
+        self.exit
+    }
+
+    /// Whether a tray icon is on screen to bring the window back from ([`TrayHandle::is_visible`]).
+    fn tray_visible(&self) -> bool {
+        self.tray.as_ref().is_some_and(TrayHandle::is_visible)
     }
 
     /// The tray-only state: pump until something asks for the window or for the exit, blocking
@@ -543,6 +616,16 @@ impl Runtime {
         }
         if let Some(due) = self.app.next_deadline() {
             interval = interval.min(due.saturating_duration_since(now));
+        }
+        // A line held for the device list is refused when its wait is over, not at the keepalive
+        // after; the list itself wakes the pump through the audio channel.
+        if let Some(until) = self
+            .waiting_for_devices
+            .iter()
+            .map(|(_, until)| *until)
+            .min()
+        {
+            interval = interval.min(until.saturating_duration_since(now));
         }
         interval
     }
@@ -579,6 +662,8 @@ impl Runtime {
         self.publish_events();
         self.announce(&AppEvent::Quit);
         self.server.refuse_pending();
+        // Answered "shutting down" as they go, like the lines `refuse_pending` just refused.
+        self.waiting_for_devices.clear();
         if let Some(dbus) = self.dbus.take() {
             dbus.shutdown();
         }
@@ -870,20 +955,26 @@ impl<'a> Shell<'a> {
         if request.show {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         } else if request.hide || request.toggle {
-            self.hide(ctx);
+            Self::hide(ctx);
         }
     }
 
     /// Hide to the tray: destroy the window and let `run_native` return with
-    /// [`WindowExit::Hidden`], which is what [`Runtime::exit`] already says.
-    fn hide(&mut self, ctx: &egui::Context) {
-        let tray_visible = self
-            .rt
-            .tray
-            .as_ref()
-            .is_some_and(crate::tray::TrayHandle::is_visible);
-        self.rt.app.notify_hidden_to_tray(tray_visible);
+    /// [`WindowExit::Hidden`], which is what [`Runtime::exit`] already says. The tray tip and the
+    /// `run_minimized` a hide leaves behind are [`Runtime::window_closed`]'s, which the
+    /// compositor's close request reaches too.
+    fn hide(ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// The title bar's minimise button: [`minimise_action`] for the tray there is now.
+    fn minimise(&self, ctx: &egui::Context) {
+        match minimise_action(self.rt.tray_visible()) {
+            MinimiseAction::HideToTray => Self::hide(ctx),
+            MinimiseAction::Minimise => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true))
+            }
+        }
     }
 
     /// Resize the viewport when the user flips between Pro and Lite, or opens a pane.
@@ -1561,10 +1652,12 @@ impl eframe::App for Shell<'_> {
 
         for action in &response.actions {
             match action {
-                // The original's close and minimise buttons both hide to the tray rather than
-                // quitting (`FxMainWindow.cpp:579-585`, `:613-616`); Exit in the tray menu is the
-                // only way out.
-                UiAction::Close | UiAction::Minimise => self.hide(&ctx),
+                // The original's close button hides to the tray rather than quitting
+                // (`FxMainWindow.cpp:608-616`); Exit in the tray menu is the only way out. Its
+                // minimise button minimises (`:579-585`); here it hides to the tray while there is
+                // one and minimises while there is not (0.4.0 audit #43, see `minimise_action`).
+                UiAction::Close => Self::hide(&ctx),
+                UiAction::Minimise => self.minimise(&ctx),
                 UiAction::DragWindow => ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag),
                 UiAction::OpenSettings => self.open_settings(),
                 // A pane owns the window while it is open, as the original's modal dialogs do.
@@ -1611,6 +1704,29 @@ impl Drop for Shell<'_> {
             folder_picker: self.folder_picker.take(),
             changelog: self.changelog,
         };
+    }
+}
+
+/// What the title bar's minimise button does ([`minimise_action`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MinimiseAction {
+    /// Destroy the window and go on in the tray, as ✕ does.
+    HideToTray,
+    /// Ask the compositor to minimise the window (`xdg_toplevel.set_minimized`), as the original's
+    /// `ShowWindow(SW_MINIMIZE)` does (`FxMainWindow.cpp:579-585`).
+    Minimise,
+}
+
+/// The minimise button's action (0.4.0 audit #43): into the tray while a tray icon is on screen,
+/// since Hyprland, sway and the other tiling compositors ignore a minimise request and would leave
+/// the window where it is; a real minimise while none is, where hiding would leave nothing on
+/// screen to come back through — the port hid the window on GNOME without AppIndicator, and the
+/// user saw FxSound vanish with only `fxsound --show` to bring it back.
+const fn minimise_action(tray_visible: bool) -> MinimiseAction {
+    if tray_visible {
+        MinimiseAction::HideToTray
+    } else {
+        MinimiseAction::Minimise
     }
 }
 
@@ -2011,6 +2127,7 @@ mod runtime_tests {
             waker: Waker::new(),
             signals: None,
             panes: Panes::default(),
+            waiting_for_devices: Vec::new(),
         }
     }
 
@@ -2158,6 +2275,95 @@ mod runtime_tests {
 
         runtime.announce(&AppEvent::Window { visible: false });
         assert_eq!(next_line(&mut runtime, &lines), "window visible=false");
+    }
+
+    /// A runtime whose window is on screen, as [`Runtime::run_window`] leaves it while
+    /// `run_native` runs: `exit` back at `Hidden`, and `run_minimized` written `false` as
+    /// `showMainWindow` writes it.
+    fn with_a_window_up(runtime: &mut Runtime) {
+        runtime.exit = WindowExit::Hidden;
+        runtime.app.remember_window_hidden(false);
+    }
+
+    #[test]
+    fn a_window_the_compositor_closed_with_a_tray_on_screen_starts_in_the_tray_next_time() {
+        // 0.4.0 audit #35, the path the shell never sees: `killactive` (Super+Q) or Alt+F4 closes
+        // the window without a frame of the shell's, so nothing but the start of the run has set
+        // `exit` when `run_native` returns.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let (lines, _watcher) = watch(runtime.server.path(), &["--watch"]);
+        next_line(&mut runtime, &lines);
+        with_a_window_up(&mut runtime);
+
+        assert_eq!(runtime.window_closed(true), WindowExit::Hidden);
+        assert!(
+            runtime.app.settings_run_minimized(),
+            "quit from the tray now, FxSound starts in the tray"
+        );
+        assert!(
+            runtime.app.tray_tip_shown(),
+            "and the one-time tip was shown"
+        );
+        assert_eq!(next_line(&mut runtime, &lines), "window visible=false");
+    }
+
+    #[test]
+    fn a_window_the_compositor_closed_with_no_tray_icon_is_not_remembered_as_hidden() {
+        // GNOME without an AppIndicator extension: a start "in the tray" would be a start with
+        // nothing on screen at all. The notice that names `fxsound --show` still goes out.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        assert!(
+            !runtime.tray_visible(),
+            "a runtime with no tray has no icon on screen"
+        );
+        with_a_window_up(&mut runtime);
+
+        assert_eq!(runtime.window_closed(false), WindowExit::Hidden);
+        assert!(!runtime.app.settings_run_minimized());
+        assert!(runtime.app.tray_tip_shown(), "the no-tray notice was shown");
+    }
+
+    #[test]
+    fn a_window_closed_for_a_quit_leaves_the_start_up_preference_as_the_window_found_it() {
+        // The window was showing when FxSound was told to quit, so the next start shows it; and a
+        // quit is no hide, so no tray tip and no `window visible=false` either.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let (lines, _watcher) = watch(runtime.server.path(), &["--watch"]);
+        next_line(&mut runtime, &lines);
+        with_a_window_up(&mut runtime);
+        runtime.exit = WindowExit::Quit;
+
+        assert_eq!(runtime.window_closed(true), WindowExit::Quit);
+        assert!(!runtime.app.settings_run_minimized());
+        assert!(!runtime.app.tray_tip_shown());
+        assert_eq!(quiet_ticks(&mut runtime, &lines, 5), Vec::<String>::new());
+    }
+
+    #[test]
+    fn every_way_the_shell_hides_leaves_the_bookkeeping_to_the_close_that_follows() {
+        // ✕, minimise into the tray, `--hide`, `--toggle-window` and the tray's left click only
+        // close the window; what a hide leaves behind is `window_closed`'s, done once for them
+        // and for the compositor's close request alike.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        with_a_window_up(&mut runtime);
+        {
+            let mut shell = Shell::new(&mut runtime, ThemeMode::Dark);
+            let ctx = egui::Context::default();
+            shell.apply_window_request(
+                &ctx,
+                WindowRequest {
+                    hide: true,
+                    ..WindowRequest::default()
+                },
+            );
+            assert_eq!(shell.rt.exit, WindowExit::Hidden, "a hide, not a quit");
+        }
+        assert_eq!(runtime.window_closed(true), WindowExit::Hidden);
+        assert!(runtime.app.settings_run_minimized());
     }
 
     #[test]
@@ -2456,6 +2662,7 @@ mod calibration_tests {
             waker: Waker::new(),
             signals: None,
             panes: Panes::default(),
+            waiting_for_devices: Vec::new(),
         }
     }
 
@@ -2636,6 +2843,19 @@ mod pacing_tests {
 }
 
 #[cfg(test)]
+mod minimise_tests {
+    use super::*;
+
+    #[test]
+    fn minimise_hides_to_the_tray_only_while_a_tray_icon_is_there() {
+        // 0.4.0 audit #43: with no tray the window used to vanish, and only `fxsound --show` could
+        // bring it back; the original minimises (`FxMainWindow.cpp:579-585`).
+        assert_eq!(minimise_action(true), MinimiseAction::HideToTray);
+        assert_eq!(minimise_action(false), MinimiseAction::Minimise);
+    }
+}
+
+#[cfg(test)]
 mod zoom_tests {
     use super::*;
 
@@ -2792,6 +3012,7 @@ mod confirmation_tests {
             waker: Waker::new(),
             signals: None,
             panes: Panes::default(),
+            waiting_for_devices: Vec::new(),
         }
     }
 
@@ -2943,5 +3164,205 @@ mod name_editor_tests {
         assert!(!editor.still_applies(Output, false, true));
         let rename = NameEditor::new(EditorPurpose::Rename, Output);
         assert!(!rename.still_applies(Output, true, false));
+    }
+}
+
+#[cfg(test)]
+mod forget_device_tests {
+    //! A `--forget-device` (or D-Bus `ForgetDevice`, which travels the same channel) that reaches
+    //! an instance PipeWire has not listed the devices to yet: bus activation starts FxSound for
+    //! the call, and a script may run it right after `fxsound &` (0.4.0 audit #34, finisher F8).
+    use super::*;
+    use fxsound_app::audio_link::FakeEngine;
+    use fxsound_core::messages::AudioToUi;
+    use fxsound_core::{AudioDevice, DeviceDirection, Settings};
+    use fxsound_preset::{InputPresetStore, PresetStore};
+    use std::path::Path;
+    use std::thread::JoinHandle;
+
+    /// A pump whose engine has not listed a device yet, and whose settings remember the laptop's
+    /// speakers and a dock that is not plugged in.
+    fn young_runtime(dir: &Path) -> (Runtime, FakeEngine) {
+        let Instance::Primary(listener) = Instance::acquire_in(dir).expect("acquire") else {
+            panic!("expected to be primary");
+        };
+        let engine = FakeEngine::new();
+        let mut settings = Settings::default();
+        settings.remember_device_preset(
+            "alsa_output.speakers",
+            "Speakers",
+            "",
+            "",
+            DeviceDirection::Output,
+        );
+        settings.remember_device_preset(
+            "alsa_output.dock",
+            "USB Dock",
+            "",
+            "",
+            DeviceDirection::Output,
+        );
+        let presets = PresetStore::with_dirs(Vec::new(), dir.join("presets"));
+        let voices = InputPresetStore::with_dirs(Vec::new(), dir.join("presets").join("Input"));
+        let app = App::start_for_tests(settings, presets, voices, &engine);
+        let (_tray_tx, tray_rx) = crossbeam_channel::unbounded();
+        let runtime = Runtime {
+            app,
+            dbus: None,
+            server: listener.serve().expect("serve"),
+            sleep: None,
+            sleep_rx: crossbeam_channel::never(),
+            tray: None,
+            tray_rx,
+            exit: WindowExit::Hidden,
+            settings_requested: false,
+            terminate: Arc::new(AtomicBool::new(false)),
+            terminating: false,
+            waker: Waker::new(),
+            signals: None,
+            panes: Panes::default(),
+            waiting_for_devices: Vec::new(),
+        };
+        (runtime, engine)
+    }
+
+    fn speakers() -> AudioDevice {
+        AudioDevice {
+            id: 3,
+            name: "alsa_output.speakers".to_owned(),
+            description: "Speakers".to_owned(),
+            is_default: true,
+            direction: DeviceDirection::Output,
+            form_factor: "speaker".to_owned(),
+        }
+    }
+
+    /// `fxsound <args>` forwarded to `runtime`, on a thread: its answer.
+    fn forward(runtime: &Runtime, args: &[&str]) -> JoinHandle<std::io::Result<ipc::Response>> {
+        let socket = runtime.server.path().to_path_buf();
+        let argv: Vec<String> = std::iter::once("fxsound")
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect();
+        std::thread::spawn(move || {
+            ipc::forward_to(&socket, &argv, Path::new("/"), Duration::from_secs(5))
+        })
+    }
+
+    /// Tick until the forwarded line is waiting for the device list.
+    fn until_it_waits(runtime: &mut Runtime) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.waiting_for_devices.is_empty() {
+            assert!(Instant::now() < deadline, "the line never arrived");
+            runtime.wait(Duration::from_millis(50));
+            runtime.tick();
+        }
+    }
+
+    #[test]
+    fn forget_device_before_the_first_device_list_waits_for_it_and_then_forgets() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut runtime, engine) = young_runtime(dir.path());
+        let client = forward(&runtime, &["--forget-device=USB Dock"]);
+        until_it_waits(&mut runtime);
+        runtime.tick();
+        assert!(!client.is_finished(), "held, not refused");
+
+        engine.feed(AudioToUi::Devices(vec![speakers()]));
+        runtime.tick();
+        assert!(runtime.waiting_for_devices.is_empty());
+        let answer = client.join().expect("client").expect("answered");
+        assert!(answer.ok, "{}", answer.stderr);
+        assert!(answer.stderr.is_empty(), "{}", answer.stderr);
+
+        // Forgotten: asked again, the name is one neither list has.
+        let again = forward(&runtime, &["--forget-device=USB Dock"]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !again.is_finished() {
+            assert!(Instant::now() < deadline, "never answered");
+            runtime.wait(Duration::from_millis(50));
+            runtime.tick();
+        }
+        let answer = again.join().expect("client").expect("answered");
+        assert!(!answer.ok);
+        assert!(
+            answer
+                .stderr
+                .contains("neither device priority list has a device called"),
+            "{}",
+            answer.stderr
+        );
+    }
+
+    #[test]
+    fn a_connected_device_is_still_refused_once_the_list_is_in() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut runtime, engine) = young_runtime(dir.path());
+        let client = forward(&runtime, &["--forget-device=Speakers"]);
+        until_it_waits(&mut runtime);
+        engine.feed(AudioToUi::Devices(vec![speakers()]));
+        runtime.tick();
+        let answer = client.join().expect("client").expect("answered");
+        assert!(!answer.ok);
+        assert!(
+            answer.stderr.contains("unplug it first"),
+            "{}",
+            answer.stderr
+        );
+    }
+
+    #[test]
+    fn with_no_device_list_in_time_the_line_is_refused_before_the_caller_gives_up() {
+        const { assert!(commands::DEVICE_LIST_WAIT.as_millis() < ipc::HANDLER_TIMEOUT.as_millis()) };
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut runtime, _engine) = young_runtime(dir.path());
+        let client = forward(&runtime, &["--forget-device=USB Dock"]);
+        until_it_waits(&mut runtime);
+
+        // The pump wakes for the end of the wait rather than at the keepalive after it.
+        let soon = Instant::now() + Duration::from_millis(100);
+        runtime.waiting_for_devices[0].1 = soon;
+        assert!(runtime.pump_interval(Instant::now()) <= Duration::from_millis(100));
+
+        runtime.waiting_for_devices[0].1 = Instant::now();
+        runtime.tick();
+        assert!(runtime.waiting_for_devices.is_empty());
+        let answer = client.join().expect("client").expect("answered");
+        assert!(!answer.ok);
+        assert!(
+            answer
+                .stderr
+                .contains("has not listed the audio devices yet"),
+            "{}",
+            answer.stderr
+        );
+    }
+
+    #[test]
+    fn a_line_without_forget_device_does_not_wait_for_the_device_list() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut runtime, _engine) = young_runtime(dir.path());
+        let client = forward(&runtime, &["--power=off"]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !client.is_finished() {
+            assert!(Instant::now() < deadline, "never answered");
+            runtime.wait(Duration::from_millis(50));
+            runtime.tick();
+            assert!(runtime.waiting_for_devices.is_empty());
+        }
+        assert!(client.join().expect("client").expect("answered").ok);
+        assert!(!runtime.app.state.power);
+    }
+
+    #[test]
+    fn a_line_waiting_for_the_device_list_hears_that_fxsound_is_shutting_down() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut runtime, _engine) = young_runtime(dir.path());
+        let client = forward(&runtime, &["--forget-device=USB Dock"]);
+        until_it_waits(&mut runtime);
+        runtime.shutdown();
+        let answer = client.join().expect("client").expect("answered");
+        assert!(!answer.ok);
+        assert!(answer.stderr.contains("shutting down"), "{}", answer.stderr);
     }
 }

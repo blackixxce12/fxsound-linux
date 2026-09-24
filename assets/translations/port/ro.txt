@@ -118,3 +118,4 @@ countries: ro
 "Effects" = "Efecte"
 "Right-click to reset" = "Clic dreapta pentru resetare"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+tragere pentru a asculta doar această bandă"
+"Recording Device Select" = "Selectare dispozitiv de înregistrare"

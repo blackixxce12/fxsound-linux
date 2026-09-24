@@ -116,3 +116,4 @@ countries: ja
 "Effects" = "エフェクト"
 "Right-click to reset" = "右クリックでリセット"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+ドラッグでこの帯域だけを聴く"
+"Recording Device Select" = "録音デバイスの選択"

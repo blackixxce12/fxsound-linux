@@ -49,24 +49,34 @@ alone, beside the lane's, and remembers the choice.
 .PP
 Run with no options,
 .B fxsound
-starts and shows its window. If an instance is already running, the second
+starts and shows its window, unless it was last quit with its window hidden to
+the tray (see
+.BR \-\-run_minimized ).
+If an instance is already running, the second
 process does not start a second instance: it forwards its command line to the
 first over a control socket in
-.IR $XDG_RUNTIME_DIR/fxsound ,
-raises that instance's window and exits. Every option below therefore works
-both as a startup option and as a way to drive an instance that is already
-running.
+.I $XDG_RUNTIME_DIR/fxsound
+and exits. Every option below therefore works both as a startup option and as
+a way to drive an instance that is already running.
 .PP
-The exceptions are
-.BR \-\-status ", " \-\-watch " and " \-\-list\-apps ,
-which print and exit without raising anything, the options a script or a
-keybinding runs (see
-.B Shortcut targets
+Only what asks for the window brings it up: a command line with no options, as
+a launcher runs it,
+.B \-\-show
 and
-.BR Applications ),
-which leave the window where it is, and
-.BR \-\-self\-test ,
-which never contacts a running instance at all.
+.BR \-\-view .
+Every option that sets something \(en a preset, the power, a device, an effect,
+a band, a level, the language \(en does it without raising the window, so a
+keybinding that runs
+.B fxsound \-\-preset=Gaming
+leaves the game in front; add
+.B \-\-show
+to have the window too. The Windows build raises its window for every option
+but
+.BR \-\-status .
+.BR \-\-status ", " \-\-watch " and " \-\-list\-apps
+print and exit without touching the window, and
+.B \-\-self\-test
+never contacts a running instance at all.
 .PP
 This forwarding is what makes keyboard shortcuts possible. A Wayland client
 cannot grab global shortcuts, by design, so the compositor owns the binding and
@@ -121,6 +131,15 @@ neighbours and is enforced by the running instance.
 .BI \-\-set_band_gain= BAND:DB[,BAND:DB...]
 Set band gains in dB, 0-based band indices, gain
 .RB \-12 \(en+12 .
+.PP
+A band list that names a band the equalizer does not have is refused whole:
+nothing on it is set, and the command fails with the bands that are not there
+on standard error, as
+.B \-\-set_band_gain=3:4,12:2
+does on ten bands. A
+.B \-\-num_bands
+on the same command line sets the count first. The Windows build drops such a
+list, or sets what it can of it, without a word.
 .TP
 .BI \-\-filter_q= Q
 Equalizer filter Q,
@@ -157,6 +176,14 @@ The setting outlives the preset: pick a level here and every voice preset runs
 at it until it is set back to
 .BR preset .
 .SS Presets
+One of these per command line, and of
+.B \-\-next\-preset
+and
+.BR \-\-prev\-preset :
+a second one is an error (exit status 2) that names both, where the Windows
+build took the first and dropped the rest without a word. So is an empty name,
+and a new name that has nothing left once the characters a preset name cannot
+hold are taken out (see below).
 .TP
 .BI \-\-preset= NAME
 Select a preset by its exact, case-sensitive name, in the edit direction's
@@ -249,6 +276,28 @@ reads from, or detach the lane with
 .BR off .
 A playback device named here is an error rather than a guess.
 .TP
+.BI \-\-forget\-device= DEVICE
+Forget a device that is not connected: drop it from its lane's device priority
+list (Settings \(-> Audio, Settings \(-> Microphone), and the preset remembered
+for it, as the \(mu beside its row there does. By
+.I node.name
+\(en that entry alone \(en or by description, which forgets every entry of
+either lane that has it, a dock's speakers and microphone alike.
+.B \-\-status \-\-json
+lists the entries under
+.BR output_device_list " and " input_device_list ,
+with whether each is
+.BR present .
+A device that is connected is refused, since FxSound would learn it again at
+once. An FxSound that has only just started (the bus may have started it for
+.BR ForgetDevice )
+holds the command for up to three seconds until PipeWire has listed the
+devices, and refuses it only if no list comes.
+With no FxSound running, the device is forgotten from the settings file and
+nothing starts, and the exit status says whether it was: nothing is attached
+to any device then, so none counts as connected. Beside options that start
+FxSound, it is done the same way before they are.
+.TP
 .BI \-\-edit= output|input
 Choose the edit direction: the lane the window shows and the preset and effect
 options above act on. The window's device combo and the tray menu
@@ -260,15 +309,28 @@ overrides. Without either, a forwarded command line acts on whichever direction
 the instance is already editing.
 .TP
 .BI \-\-view= 1|2
-Switch the window between the Lite (1) and Pro (2) layouts.
+Switch the window between the Lite (1) and Pro (2) layouts, and show it.
 .TP
-.BI \-\-language= CODE
-Display language, for example
-.BR en ", " ru ", " fr .
+.BI \-\-language= CODE|system
+Display language:
+.B system
+to follow the desktop session (the default), or one of
+.BR ar ", " ba ", " bg ", " cs ", " de ", " en ", " es ", " fa ", " fi ", "
+.BR fr ", " hr ", " id ", " it ", " ja ", " ko ", " nl ", " no ", " pl ", "
+.BR pt ", " pt\-br ", " ro ", " ru ", " sl ", " sv ", " th ", " tr ", " ua ", "
+.BR vi ", " zh\-CN " and " zh\-TW ,
+in any case. The ISO codes the Windows build spells otherwise are taken too
+.RB ( uk " for " ua ", " bs " for " ba ", " nb " and " nn " for " no ),
+and so is a locale such as
+.BR ru_RU.UTF\-8 .
+A language FxSound has no translation for is an error, not a setting that
+quietly shows another language.
 .TP
 .BR \-\-run_minimized ", " \-\-hide
 Start without showing the window, or hide the window of a running instance.
-This is what the autostart entry invokes.
+This is what the autostart entry invokes. Without either, a start shows the
+window unless FxSound was last quit with its window hidden to the tray, as the
+Windows build does.
 .TP
 .B \-\-activated
 Start without showing the window, as
@@ -279,7 +341,8 @@ file invoke, so that a bus call arriving while an instance started from the
 launcher is still starting does not hide its window.
 .TP
 .B \-\-show
-Show and raise the window of the running instance.
+Show and raise the window of the running instance, or, starting FxSound, show
+the window even though it was in the tray when FxSound was last quit.
 .SS Applications
 .PP
 Every application that plays or records through FxSound is remembered, and
@@ -506,8 +569,9 @@ every check that ran passed.
 .TP
 .B 1
 The command failed and standard error or the report says why: the running
-instance refused it (an unknown preset or device name, or a factory preset to
-overwrite, for example) or could
+instance refused it (an unknown preset or device name, a factory preset to
+overwrite, a band the equalizer does not have, or a device to forget that is
+connected, for example) or could
 not be reached, there is no running instance for
 .BR \-\-status " or " \-\-watch
 to ask, the
@@ -518,12 +582,14 @@ event,
 .B \-\-self\-test
 found at least one failing check,
 .B \-\-list\-apps
-with no FxSound running found a store it could not read, or FxSound itself
-could not start.
+with no FxSound running found a store it could not read,
+.B \-\-forget\-device
+on its own with no FxSound running found no such device or a settings file it
+could not read or write, or FxSound itself could not start.
 .TP
 .B 2
-The command line could not be parsed \(en an unknown option, or a value outside
-its range.
+The command line could not be parsed \(en an unknown option, a value outside
+its range, an unknown language, two preset options, or an empty preset name.
 .SH STATUS DOCUMENT
 .B \-\-status \-\-json
 prints one JSON object. D-Bus
@@ -718,7 +784,7 @@ ToggleWindow()             Quit()
 Apply(as argv) \(-> (b ok, s stdout, s stderr)
 ListPresets() \(-> s          ListDevices() \(-> s
 SetAppPreset(s app, s direction, s preset)
-ListApps() \(-> s
+ListApps() \(-> s             ForgetDevice(s)
 .EE
 .RE
 .PP
@@ -743,7 +809,10 @@ or a description, or
 to detach the lane;
 .B SetEditDirection
 takes
-.BR output " or " input .
+.BR output " or " input ;
+.B ForgetDevice
+is
+.BR \-\-forget\-device .
 .B SetAppPreset
 is
 .BR \-\-app\-preset " and " \-\-app\-input\-preset :
@@ -925,7 +994,9 @@ Imported and user-saved presets; voice presets under
 .TP
 .I ~/.config/fxsound/settings.toml
 Settings. A corrupt file is never fatal: the defaults are used and the audio
-still comes up.
+still comes up. The Windows keys FxSound does not use \(en the hotkey chords,
+the window position, always-on-top and the update check \(en are read from an
+older file without complaint and not written back.
 .TP
 .I ~/.config/fxsound/apps.toml
 The applications FxSound remembers, at most 500, and the preset each has of
@@ -957,15 +1028,35 @@ The tray icon's three states, looked up by name by the StatusNotifier host.
 The binary carries the same three and offers them as pixmaps too, for a host
 that does not look icons up in the theme.
 .SH EXAMPLES
-Mute the processing from a compositor keybinding, in Hyprland:
+Bind the shortcut targets in the compositor, here on Super+Alt, which few
+desktops and no applications use \(en in Hyprland:
 .PP
 .RS 4
 .EX
-bind = CTRL SHIFT, Q, exec, fxsound \-\-toggle\-power
-bind = CTRL SHIFT, E, exec, fxsound \-\-toggle\-window
-bind = CTRL SHIFT, A, exec, fxsound \-\-next\-preset
+bind = SUPER ALT, P, exec, fxsound \-\-toggle\-power
+bind = SUPER ALT, W, exec, fxsound \-\-toggle\-window
+bind = SUPER ALT, bracketright, exec, fxsound \-\-next\-preset
+bind = SUPER ALT, bracketleft, exec, fxsound \-\-prev\-preset
+bind = SUPER ALT, O, exec, fxsound \-\-next\-output
 .EE
 .RE
+.PP
+and in sway:
+.PP
+.RS 4
+.EX
+bindsym $mod+Mod1+p exec fxsound \-\-toggle\-power
+bindsym $mod+Mod1+w exec fxsound \-\-toggle\-window
+bindsym $mod+Mod1+bracketright exec fxsound \-\-next\-preset
+bindsym $mod+Mod1+bracketleft exec fxsound \-\-prev\-preset
+bindsym $mod+Mod1+o exec fxsound \-\-next\-output
+.EE
+.RE
+.PP
+A compositor binding takes its chord from every application, so leave the
+Windows build's own chords alone: Ctrl+Shift+Q, its power toggle, is how
+Chromium quits, and Ctrl+Shift+E, Ctrl+Shift+A, Ctrl+Shift+Z and Ctrl+Shift+W
+mean something in browsers and editors too.
 .PP
 A worked set of these, with the window rules, is installed at
 .IR /usr/share/doc/fxsound\-linux/hyprland.conf.example
@@ -1026,6 +1117,23 @@ fxsound \-\-self\-test \-\-json
 .EE
 .RE
 .SH NOTES
+The window's close button, like the compositor's close request, hides the
+window and keeps processing: the tray's
+.BR Exit " and " \-\-quit
+are the ways out. With a tray icon on screen the minimise button hides the
+window into the tray as well; without one \(en GNOME without an AppIndicator
+extension \(en it minimises the window, as the Windows build's does, so that
+the window cannot vanish with nothing left to bring it back. Where a window was
+hidden with no tray icon,
+.B fxsound \-\-show
+or launching FxSound again brings it back. The tray menu lists the playback
+devices under
+.B Playback Device Select
+and the microphones under
+.BR "Recording Device Select" ,
+a long name shortened in its middle so that the part that tells two devices of
+one card apart stays.
+.PP
 The systemd user unit is installed but deliberately not enabled. The desktop
 entry already starts FxSound when you launch it, and an enabled user unit on
 top of that puts two processes in a race for the control socket; the loser

@@ -944,21 +944,25 @@ fn the_level_labels_do_not_borrow_the_theme_switchs_word() {
 fn a_placeholder_dropped_by_a_translation_is_reported() {
     // The check `untranslated` makes, on a table built by hand, so that a real table passing it
     // means something.
+    // An empty translation is no translation, as JUCE reads one (0.4.0 audit #50); one of spaces
+    // alone is kept, and is nothing to read.
     let table = Catalogue::parse(
         "xx",
-        "\"Could not load %s\" = \"Konnte nicht laden\"\n\"Fine %s\" = \"Gut %s\"\n\"Empty\" = \"\"\n",
+        "\"Could not load %s\" = \"Konnte nicht laden\"\n\"Fine %s\" = \"Gut %s\"\n\
+         \"Blank\" = \"  \"\n\"Empty\" = \"\"\n",
     );
     let problems = untranslated(
         &[table],
-        ["Could not load %s", "Fine %s", "Empty", "Absent"],
+        ["Could not load %s", "Fine %s", "Blank", "Empty", "Absent"],
     );
-    assert_eq!(problems.len(), 3, "{problems:?}");
+    assert_eq!(problems.len(), 4, "{problems:?}");
     assert!(problems[0].contains("loses a placeholder"), "{problems:?}");
     assert!(
         problems[1].contains("translated as nothing"),
         "{problems:?}"
     );
     assert!(problems[2].contains("has no translation"), "{problems:?}");
+    assert!(problems[3].contains("has no translation"), "{problems:?}");
 }
 
 #[test]

@@ -116,3 +116,4 @@ countries: ar co es mx
 "Effects" = "Efectos"
 "Right-click to reset" = "Clic derecho para restablecer"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+arrastrar para oír solo esta banda"
+"Recording Device Select" = "Seleccionar dispositivo de grabación"

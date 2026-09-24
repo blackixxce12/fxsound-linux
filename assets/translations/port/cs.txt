@@ -116,3 +116,4 @@ countries: cz
 "Effects" = "Efekty"
 "Right-click to reset" = "Pravým kliknutím obnovíte výchozí hodnotu"
 "Ctrl+Alt+drag to hear this band alone" = "Tažením s Ctrl+Alt uslyšíte jen toto pásmo"
+"Recording Device Select" = "Výběr nahrávacího zařízení"

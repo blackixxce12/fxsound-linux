@@ -118,3 +118,4 @@ countries: sl
 "Effects" = "Učinki"
 "Right-click to reset" = "Desni klik za ponastavitev"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+vlečenje za poslušanje samo tega pasu"
+"Recording Device Select" = "Izbira naprave za snemanje"

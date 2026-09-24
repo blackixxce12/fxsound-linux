@@ -116,3 +116,4 @@ countries: kr
 "Effects" = "효과"
 "Right-click to reset" = "오른쪽 클릭으로 초기화"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+드래그로 이 대역만 듣기"
+"Recording Device Select" = "녹음 장치 선택"

@@ -1591,7 +1591,7 @@ pub(crate) fn unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{PowerCommand, PresetCommand, WindowCommand};
+    use crate::cli::{PowerCommand, PresetCommand};
     use fxsound_core::DeviceDirection;
     use serde_json::{Value, json};
 
@@ -1653,8 +1653,8 @@ mod tests {
             [
                 Command::Power(PowerCommand::On),
                 Command::Preset(PresetCommand::Select("Bass Booster".to_owned())),
-                Command::Window(WindowCommand::Show),
-            ]
+            ],
+            "state-setting options raise nothing (0.4.0 audit R11)"
         );
         assert_eq!(forwarded.cwd(), Path::new("/tmp"));
         drop(forwarded); // the implicit acknowledgement

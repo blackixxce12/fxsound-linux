@@ -435,33 +435,6 @@ impl HotkeyCommand {
         }
     }
 
-    /// The settings key (`FxController.h:54-58`), unchanged by the port so the file stays
-    /// greppable against the C++.
-    #[must_use]
-    pub const fn settings_key(self) -> &'static str {
-        match self {
-            Self::OnOff => "cmd_on_off",
-            Self::OpenClose => "cmd_open_close",
-            Self::NextPreset => "cmd_next_preset",
-            Self::PreviousPreset => "cmd_previous_preset",
-            Self::ChangeOutput => "cmd_change_output",
-        }
-    }
-
-    /// The chord the Windows build ships, decoded from its Win32 hotkey code
-    /// (`Utils/Settings/Settings.cpp:34-38`) — see [`fxsound_core::settings::Hotkeys`].
-    #[must_use]
-    pub fn binding(self, settings: &Settings) -> &str {
-        let hotkeys = &settings.hotkey_bindings;
-        match self {
-            Self::OnOff => &hotkeys.cmd_on_off,
-            Self::OpenClose => &hotkeys.cmd_open_close,
-            Self::NextPreset => &hotkeys.cmd_next_preset,
-            Self::PreviousPreset => &hotkeys.cmd_previous_preset,
-            Self::ChangeOutput => &hotkeys.cmd_change_output,
-        }
-    }
-
     /// What a compositor keybinding should actually run.
     ///
     /// These are the flags `packaging/hyprland.conf.example` binds; each one reaches the running
@@ -495,8 +468,9 @@ pub const HOTKEY_TITLE: &str = "Keyboard shortcuts";
 /// One position of the language switch.
 ///
 /// The Windows build's `FxLanguage` cycles through its 30 codes; this port puts the desktop
-/// session's language first — the position a fresh install is in — and then the same list,
-/// minus Hungarian, which the Windows binary never actually shipped a table for.
+/// session's language first — the position a fresh install is in — and then the same languages,
+/// minus Hungarian, which the Windows binary never actually shipped a table for: English, then the
+/// rest in the order of their own names ([`i18n::LANGUAGES`], 0.4.0 audit #28).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanguageChoice {
     /// Follow the desktop session (`Settings::language_follows_system`).
@@ -518,15 +492,15 @@ impl LanguageChoice {
             .collect()
     }
 
-    /// The position the settings are in right now. An explicit code with no table falls back to
+    /// The position the settings are in right now. An explicit code is read as
+    /// [`i18n::canonical_code`] reads it (`uk` is Ukrainian's `ua`); one with no table falls back to
     /// the system entry, which is also what [`i18n::resolve`] does with it.
     #[must_use]
     pub fn current(settings: &Settings) -> Self {
         if settings.language_follows_system {
             return Self::System;
         }
-        i18n::language(&settings.language)
-            .map_or(Self::System, |language| Self::Code(language.code))
+        i18n::canonical_code(&settings.language).map_or(Self::System, Self::Code)
     }
 
     /// What the switch shows: the native name, untranslated, as `getLanguageName` returns it
@@ -1556,7 +1530,7 @@ pub mod general {
     pub const LANGUAGE_Y: f32 = 50.0;
     /// `FxLanguage`'s own size (`FxLanguage.cpp:40-48`).
     /// The original's switch is 180 wide (`FxLanguage.h:31`); this port's first entry names the
-    /// language it resolves to ("System language · русский"), which needs the room.
+    /// language it resolves to ("System language · Русский"), which needs the room.
     pub const LANGUAGE_WIDTH: f32 = 300.0;
     pub const LANGUAGE_HEIGHT: f32 = 30.0;
     /// `TOGGLE_BUTTON_HEIGHT`.
@@ -1749,13 +1723,7 @@ fn general_pane(
     );
 
     for (index, command) in HotkeyCommand::ALL.into_iter().enumerate() {
-        hotkey_row(
-            ui,
-            hotkey_row_rect(pane, index),
-            command,
-            &state.settings,
-            palette,
-        );
+        hotkey_row(ui, hotkey_row_rect(pane, index), command, palette);
     }
 
     if link(
@@ -1778,15 +1746,8 @@ fn general_pane(
 /// field with a rounded two-point border that thickens on focus and accepts a chord
 /// (`FxHotkeyLabel.cpp:56-222`). None of that is drawn here: the field cannot accept a binding on
 /// Wayland, and a bordered box that takes focus and then refuses to do anything is worse than no
-/// box at all. What is left is three columns of text — the command, the chord the Windows build
-/// ships, and the command line to bind.
-fn hotkey_row(
-    ui: &mut Ui,
-    rect: Rect,
-    command: HotkeyCommand,
-    settings: &Settings,
-    palette: Palette,
-) {
+/// box at all. What is left is two columns of text — the command and the command line to bind.
+fn hotkey_row(ui: &mut Ui, rect: Rect, command: HotkeyCommand, palette: Palette) {
     let name = Rect::from_min_size(rect.min, vec2(general::HOTKEY_NAME_WIDTH, rect.height()));
     draw_truncated(
         ui.painter(),
@@ -1797,9 +1758,9 @@ fn hotkey_row(
         Align2::LEFT_CENTER,
     );
 
-    // The Windows chord (`command.binding(settings)`) is not shown: it is not what runs the
-    // command here, and the room is better spent on the translated name and the command line.
-    let _ = settings;
+    // The Windows chord is not shown, and since 0.4.0 not kept in the settings either (audit #35):
+    // it is not what runs the command here, and the compositor's own binding is the user's to
+    // choose (`packaging/hyprland.conf.example` suggests some).
     let line = Rect::from_min_max(
         pos2(name.right() + general::HOTKEY_GUTTER, rect.top()),
         rect.max,
@@ -3262,21 +3223,15 @@ mod tests {
     #[test]
     fn the_five_hotkey_commands_are_the_originals_five_in_order() {
         let expected = [
-            ("Turn FxSound On/Off", "cmd_on_off", "Ctrl+Shift+Q"),
-            ("Open/Close FxSound", "cmd_open_close", "Ctrl+Shift+E"),
-            ("Use Next Preset", "cmd_next_preset", "Ctrl+Shift+A"),
-            ("Use Previous Preset", "cmd_previous_preset", "Ctrl+Shift+Z"),
-            (
-                "Change Playback Device",
-                "cmd_change_output",
-                "Ctrl+Shift+W",
-            ),
+            ("Turn FxSound On/Off", "fxsound --toggle-power"),
+            ("Open/Close FxSound", "fxsound --toggle-window"),
+            ("Use Next Preset", "fxsound --next-preset"),
+            ("Use Previous Preset", "fxsound --prev-preset"),
+            ("Change Playback Device", "fxsound --next-output"),
         ];
-        let settings = Settings::default();
-        for (command, (label, key, chord)) in HotkeyCommand::ALL.into_iter().zip(expected) {
+        for (command, (label, line)) in HotkeyCommand::ALL.into_iter().zip(expected) {
             assert_eq!(command.label(), label);
-            assert_eq!(command.settings_key(), key);
-            assert_eq!(command.binding(&settings), chord);
+            assert_eq!(command.command_line(), line);
             // Every row names a command a compositor can actually run.
             assert!(
                 command.command_line().starts_with("fxsound --"),
@@ -3293,26 +3248,23 @@ mod tests {
         assert_eq!(all[0], LanguageChoice::System);
         assert_eq!(all.len(), 1 + i18n::LANGUAGES.len());
         assert_eq!(all[1], LanguageChoice::Code("en"));
-        assert_eq!(all[all.len() - 1], LanguageChoice::Code("zh-TW"));
+        assert_eq!(all[2], LanguageChoice::Code("id"), "Bahasa Indonesia");
+        assert_eq!(all[all.len() - 1], LanguageChoice::Code("ko"), "한국어");
         // No Hungarian: the Windows binary declares it but never shipped its table.
         assert!(!all.contains(&LanguageChoice::Code("hu")));
     }
 
     #[test]
     fn the_language_switch_wraps_in_both_directions() {
-        assert_eq!(
-            LanguageChoice::System.step(-1),
-            LanguageChoice::Code("zh-TW")
-        );
-        assert_eq!(
-            LanguageChoice::Code("zh-TW").step(1),
-            LanguageChoice::System
-        );
+        assert_eq!(LanguageChoice::System.step(-1), LanguageChoice::Code("ko"));
+        assert_eq!(LanguageChoice::Code("ko").step(1), LanguageChoice::System);
         assert_eq!(LanguageChoice::System.step(1), LanguageChoice::Code("en"));
         assert_eq!(
             LanguageChoice::Code("en").step(1),
-            LanguageChoice::Code("ar")
+            LanguageChoice::Code("id")
         );
+        // Russian, 21 presses away on Windows, is 9 back from the system entry.
+        assert_eq!(LanguageChoice::System.step(-9), LanguageChoice::Code("ru"));
     }
 
     #[test]
@@ -3329,15 +3281,19 @@ mod tests {
         // An explicit code without a table (an old settings file, say) is the system entry.
         settings.choose_language(Some("hu"));
         assert_eq!(LanguageChoice::current(&settings), LanguageChoice::System);
+        // The ISO spelling of one with a table is that table (0.4.0 audit #28).
+        settings.choose_language(Some("uk"));
+        assert_eq!(
+            LanguageChoice::current(&settings),
+            LanguageChoice::Code("ua")
+        );
     }
 
     #[test]
     fn the_switch_shows_native_names_and_names_the_system_language() {
         assert_eq!(LanguageChoice::Code("pt").label(), "Português");
-        assert_eq!(
-            LanguageChoice::Code("pt-br").label(),
-            "português brasileiro"
-        );
+        assert_eq!(LanguageChoice::Code("pt-br").label(), "Português (Brasil)");
+        assert_eq!(LanguageChoice::Code("tr").label(), "Türkçe");
         let system = LanguageChoice::System.label();
         assert!(
             system.contains(i18n::native_name(i18n::system_language())),
@@ -3385,7 +3341,7 @@ mod tests {
         assert_eq!(settings.language, "en");
         assert!(settings.language_follows_system);
         assert_eq!(settings.max_user_presets, 120);
-        assert_eq!(settings.device_configs_version, 2);
+        assert!(!settings.run_minimized);
     }
 
     #[test]

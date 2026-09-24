@@ -119,3 +119,4 @@ countries: fr
 "Effects" = "Effets"
 "Right-click to reset" = "Clic droit pour réinitialiser"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+glisser pour n'écouter que cette bande"
+"Recording Device Select" = "Sélection du périphérique d'enregistrement"

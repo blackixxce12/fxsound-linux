@@ -38,11 +38,16 @@ windowrule {
 # Global hotkeys ----------------------------------------------------------
 # A Wayland client cannot grab global shortcuts the way the Windows build does.
 # Bind them in the compositor instead; each one is forwarded over FxSound's
-# control socket to the running instance. The bind syntax has not changed.
-bind = CTRL SHIFT, F,   exec, fxsound --next-preset
-bind = CTRL SHIFT, D,   exec, fxsound --prev-preset
-bind = CTRL SHIFT, P,   exec, fxsound --toggle-power
-bind = CTRL SHIFT, O,   exec, fxsound --toggle-window
+# control socket to the running instance, and none of them raises the window
+# (only --toggle-window, --show and --view do). The bind syntax has not changed.
+# Super+Alt because few desktops and no applications use it: a compositor bind
+# takes its keys from every application, and the Windows build's own chords
+# collide - Ctrl+Shift+Q, its power toggle, is how Chromium quits.
+bind = SUPER ALT, P,            exec, fxsound --toggle-power
+bind = SUPER ALT, W,            exec, fxsound --toggle-window
+bind = SUPER ALT, bracketright, exec, fxsound --next-preset
+bind = SUPER ALT, bracketleft,  exec, fxsound --prev-preset
+bind = SUPER ALT, O,            exec, fxsound --next-output
 
 # hyprland.lua (Hyprland 0.55 and newer) ----------------------------------
 # The same rule and binds for the Lua config. The backslashes are doubled
@@ -52,7 +57,8 @@ bind = CTRL SHIFT, O,   exec, fxsound --toggle-window
 #       match = { class = "^(com\\.fxsound\\.FxSound)$" },
 #       float = true, border_size = 0, rounding = 8, no_shadow = true,
 #   })
-#   hl.bind("CTRL + SHIFT + F", hl.dsp.exec_cmd("fxsound --next-preset"))
-#   hl.bind("CTRL + SHIFT + D", hl.dsp.exec_cmd("fxsound --prev-preset"))
-#   hl.bind("CTRL + SHIFT + P", hl.dsp.exec_cmd("fxsound --toggle-power"))
-#   hl.bind("CTRL + SHIFT + O", hl.dsp.exec_cmd("fxsound --toggle-window"))
+#   hl.bind("SUPER + ALT + P", hl.dsp.exec_cmd("fxsound --toggle-power"))
+#   hl.bind("SUPER + ALT + W", hl.dsp.exec_cmd("fxsound --toggle-window"))
+#   hl.bind("SUPER + ALT + bracketright", hl.dsp.exec_cmd("fxsound --next-preset"))
+#   hl.bind("SUPER + ALT + bracketleft", hl.dsp.exec_cmd("fxsound --prev-preset"))
+#   hl.bind("SUPER + ALT + O", hl.dsp.exec_cmd("fxsound --next-output"))

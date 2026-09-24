@@ -118,3 +118,4 @@ countries: ir
 "Effects" = "افکت‌ها"
 "Right-click to reset" = "برای بازنشانی کلیک راست کنید"
 "Ctrl+Alt+drag to hear this band alone" = "برای شنیدن تنها این باند، با Ctrl+Alt بکشید"
+"Recording Device Select" = "انتخاب دستگاه ضبط"

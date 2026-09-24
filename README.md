@@ -163,12 +163,16 @@ to `border_size = 0`; the file passes `Hyprland --verify-config` on 0.56.2. The 
 old `windowrulev2` lines as comments for 0.52 and older, and the `hl.window_rule` / `hl.bind`
 spelling for the Lua config that Hyprland prefers over `hyprland.conf` from 0.55 on.
 
-Closing the window never quits. The ✕ button, the minimise button and the compositor's own close
-request (`killactive`, usually bound to `Super+Q`) all hide the window while the audio keeps
-processing; the app lives on in the system tray, and the tray's **Open** or `fxsound --show` bring
-the window back. **Exit** in the tray menu or `fxsound --quit` are the only ways out. This is what
-the Windows build does too — with the difference that a Wayland client cannot unmap its own
-toplevel, so "hide" here really destroys the window and recreates it on demand.
+Closing the window never quits. The ✕ button and the compositor's own close request (`killactive`,
+usually bound to `Super+Q`) hide the window while the audio keeps processing; the app lives on in
+the system tray, and the tray's **Open** or `fxsound --show` bring the window back. **Exit** in the
+tray menu or `fxsound --quit` are the only ways out. This is what the Windows build does too — with
+the difference that a Wayland client cannot unmap its own toplevel, so "hide" here really destroys
+the window and recreates it on demand. The minimise button hides the window into the tray as well
+while a tray icon is there to come back from (Hyprland and sway have no minimised state to put it
+in); on a desktop with no tray, such as GNOME without an AppIndicator extension, it minimises the
+window as the Windows build does, instead of making it vanish. FxSound quit with its window in the
+tray starts in the tray next time, unless it is started with `--show`.
 
 Fullscreen (Hyprland's `fullscreen` dispatcher, Super+F in many configurations) and maximised
 windows scale the fixed design up to fit the monitor and centre it; the app never draws into a
@@ -177,12 +181,19 @@ corner of an oversized surface.
 Global shortcuts are the one feature that cannot work the way it does on Windows. A Wayland client
 is not allowed to grab keys it does not have focus for — that is a deliberate security property of
 the protocol, not a gap. The same file binds them in the compositor instead, which reaches the
-running instance through its control socket:
+running instance through its control socket. It uses Super+Alt, which few desktops and no
+applications use, because a compositor binding takes its keys from every application — the Windows
+build's own Ctrl+Shift+Q is how Chromium quits:
 
 ```conf
-bind = CTRL SHIFT, F, exec, fxsound --next-preset
-bind = CTRL SHIFT, P, exec, fxsound --toggle-power
+bind = SUPER ALT, P,            exec, fxsound --toggle-power
+bind = SUPER ALT, bracketright, exec, fxsound --next-preset
 ```
+
+In sway the same is `bindsym $mod+Mod1+p exec fxsound --toggle-power`. None of these raises the
+window: on the command line only `--show`, `--view` and a bare `fxsound` do, and every option that
+sets something — `--preset=Gaming` from a keybind included — does it without pulling the window over
+what you are doing.
 
 ## How the audio path works
 
@@ -373,8 +384,9 @@ interrupted save cannot truncate what was there.
 
 Each of these is a considered decision, not an oversight:
 
-- **No update check and no telemetry.** The `automatic_updates` toggle exists so the Settings window
-  matches, but nothing contacts the network. Updates come from your package manager.
+- **No update check and no telemetry.** Nothing contacts the network; updates come from your package
+  manager. The Windows keys for the update check, the hotkey chords, the window position and
+  always-on-top are read from an older `settings.toml` without complaint and no longer written back.
 - **Deterministic preset ordering.** The original lists presets in filesystem-glob order, which is
   arbitrary. This port sorts factory presets numerically and the rest by name.
 - **Frame-rate-independent visualizer decay.** The original decays its bars once per timer tick;
@@ -389,8 +401,21 @@ Each of these is a considered decision, not an oversight:
   factory preset, a rename with unsaved changes, a name already taken, the user-preset limit —
   with the reason on stderr, exit status 1, and `org.fxsound.FxSound.Error.Refused` on D-Bus.
 - **Global hotkeys live in the compositor.** See above.
-- **Window position is not restored.** Wayland gives a client no way to place its own toplevel. The
-  setting is still written so it survives a move back to X11.
+- **Window position is not restored.** Wayland gives a client no way to place its own toplevel, so
+  the compositor places the window.
+- **The command line raises the window only when asked to.** On Windows every option but `--status`
+  shows and raises the window; here only `--show`, `--view` and `fxsound` with no options do, so a
+  keybind or a script sets a preset, the power or an effect without the window jumping in front.
+- **The command line says what it will not do.** Two preset options on one line (`--save_preset=A
+  --preset=B`, which Windows reads as `--preset=B` alone), a new preset name that is nothing once the
+  characters a `.fac` name cannot hold are gone, and a `--language` FxSound has no translation for
+  are parse errors; a band list naming a band the equalizer does not have (`--set_band_gain=12:2` on
+  ten bands) is refused whole with the band named. Windows ignores all of them without a word.
+  `--language` also takes the ISO codes Windows spells its own way (`uk`, `bs`, `nb`) and locales.
+- **Two device menus in the tray.** The playback devices are under *Playback Device Select* and the
+  microphones under *Recording Device Select*, and a long device name is shortened in its middle,
+  where Windows cut every name after 30 characters and PipeWire's names of one card's outputs all
+  looked alike.
 - **No Donate button, no update check, no bonus-preset download, no Help center.** The heart in
   the title bar and the Donate items in the menu and the tray are gone: this fork is not the
   upstream developers' product and must not solicit money for them. "Check for updates" and the
@@ -401,9 +426,12 @@ Each of these is a considered decision, not an oversight:
 - **Translated, from the original's own tables.** The 29 JUCE `LocalisedStrings` files embedded in
   the Windows binary (`assets/translations/`, extracted from its `BinaryData.cpp` as of 1.2.16.0,
   which added Bulgarian; Hungarian was declared but never shipped) are embedded here and looked up
-  by the same English keys the C++ passes to `TRANS`. The language follows the desktop session (`LC_ALL`/`LC_MESSAGES`/`LANG`)
+  by the same English keys the C++ passes to `TRANS`, read as JUCE reads them, so the lines the
+  Windows tables leave unclosed translate here as they do there. The language follows the desktop session (`LC_ALL`/`LC_MESSAGES`/`LANG`)
   unless one is picked in Settings ▸ General or with `--language <code>` (`--language system`
-  returns to following the desktop). Strings this port added are in
+  returns to following the desktop). The switch lists English and then every language by its own
+  name, in alphabetical order, where Windows used an order of its own and called three of them by
+  the wrong word (Turkish "Türk", Thai "แบบไทย", Czech "Česky"). Strings this port added are in
   `assets/translations/port/`. Right-to-left scripts render left-to-right — egui has no bidi.
 - **Desktop notifications** for preset, output and power changes, the way the original's tray
   balloons announce them, through `org.freedesktop.Notifications`; *Hide notifications* in Settings
@@ -424,7 +452,10 @@ Each of these is a considered decision, not an oversight:
   Microphone's list of microphones, a port addition) picks the device as the Windows build's does:
   every device seen joins it, at the bottom or, with *Prioritize new output devices*, at the top.
   *Follow the system's default device*, which the Windows build does not have (its issue #629),
-  hands that choice back to the desktop's sound settings and keeps the list for later.
+  hands that choice back to the desktop's sound settings and keeps the list for later. A device that
+  is not connected has a ✕ beside it that forgets it and the preset it remembers, and
+  `fxsound --forget-device=NAME` (D-Bus `ForgetDevice`) does the same from a script. With no
+  FxSound running it forgets the name from the settings file and exits, without starting FxSound.
 - **Mono outputs are accepted.** The Windows build refuses an output with fewer than two channels,
   a workaround for a Windows driver (`sndDevices.h:32-39`). Here a Bluetooth headset in its
   hands-free (call) profile or a mono USB headset is an output like any other, and PipeWire mixes

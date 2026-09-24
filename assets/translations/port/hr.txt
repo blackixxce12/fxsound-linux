@@ -119,3 +119,4 @@ countries: HR
 "Effects" = "Efekti"
 "Right-click to reset" = "Desni klik za vraćanje na zadano"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+povlačenje za slušanje samo ovog pojasa"
+"Recording Device Select" = "Odabir uređaja za snimanje"

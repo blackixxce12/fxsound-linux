@@ -117,3 +117,4 @@ countries: se
 "Effects" = "Effekter"
 "Right-click to reset" = "Högerklicka för att återställa"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+dra för att bara höra det här bandet"
+"Recording Device Select" = "Val av inspelningsenhet"

@@ -117,3 +117,4 @@ countries: pl
 "Effects" = "Efekty"
 "Right-click to reset" = "Kliknij prawym przyciskiem, aby zresetować"
 "Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+przeciągnij, aby słyszeć tylko to pasmo"
+"Recording Device Select" = "Wybierz urządzenie do nagrywania"

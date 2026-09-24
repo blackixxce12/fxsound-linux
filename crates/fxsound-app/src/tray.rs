@@ -3,8 +3,8 @@
 //! Port of `FxSystemTrayView` (`fxsound/Source/GUI/FxSystemTrayView.cpp`, 477 lines): the icon's
 //! four states (`:90-111`), the tooltip (`:78-84`), the left-click toggle (`:446-455`) and the
 //! whole context menu (`showContextMenu`, `:216-330`) — for two lanes (0.4.0 design §1.4): a
-//! preset submenu per direction, a device group per direction with an `Off` row that detaches the
-//! lane, and a tooltip with a line per lane.
+//! preset submenu per direction, a device submenu per direction with an `Off` row that detaches
+//! the lane, and a tooltip with a line per lane.
 //!
 //! # Why `ksni` and not an X11 tray
 //!
@@ -28,13 +28,21 @@
 //!    playing is not an alert — it would blink for as long as music runs. `Status::Passive` is
 //!    worse still: it asks panels to *hide* the item, and with the window hidden the tray is the
 //!    only way back into the app.
-//! 3. **The devices are always a submenu, grouped by direction.** Windows inlines them behind a
+//! 3. **The devices are always a submenu, one per direction.** Windows inlines them behind a
 //!    section header when there are five or fewer (`:339-348`); DBusMenu has no section header,
-//!    and the special case only existed because a Win32 menu is cheap to build (§5.8). Each lane
-//!    has a radio group under a disabled header row — "Output" and "Input", the nearest thing
-//!    DBusMenu has to a section header — that starts with `Off`, as each of the window's two
-//!    combos does. Every device is selectable: a mono output is a valid target (upstream review
-//!    U7), so the original's greying of devices with fewer than two channels (`:356-359`) is gone.
+//!    and the special case only existed because a Win32 menu is cheap to build (§5.8). The
+//!    playback devices keep the original's `Playback Device Select ▸`; the microphones have a
+//!    `Recording Device Select ▸` of their own beside it (0.4.0 audit #32), where 0.4.0's first
+//!    cut listed them under the playback item, where nobody looks for a microphone. Each submenu
+//!    is a radio group that starts with `Off`, as each of the window's two combos does. Every
+//!    device is selectable: a mono output is a valid target (upstream review U7), so the
+//!    original's greying of devices with fewer than two channels (`:356-359`) is gone.
+//! 6. **Longer device names, cut in the middle.** Windows cuts a name after 30 characters
+//!    (`getTruncatedText`, `:422-432`), and PipeWire's descriptions share their first thirty
+//!    characters more often than not — "Family 17h/19h/1ah HD Audio Controller Analog Stereo" and
+//!    "… Digital Stereo" both read "Family 17h/19h/1ah HD Audio...". Here a name keeps up to
+//!    [`MENU_LABEL_MAX`] characters and loses its middle beyond that, where the card's name ends
+//!    and before the profile or the port that tells two of its devices apart (0.4.0 audit #31).
 //! 4. **Two preset submenus.** One per lane, each listing that lane's presets — the music presets
 //!    and the voice presets — so the microphone's can be changed from the tray without the
 //!    window, and without making the microphone the lane the window edits.
@@ -89,9 +97,11 @@ const SVG_PROCESSING: &[u8] =
 /// so a host picks one that needs no scaling rather than blurring one that does.
 pub const PIXMAP_SIZES: [u32; 6] = [16, 22, 24, 32, 48, 64];
 
-/// Device names longer than this are elided, from `getTruncatedText(name, 30)`
-/// (`FxSystemTrayView.cpp:353`, implementation at `:422-432`).
-pub const MENU_LABEL_MAX: usize = 30;
+/// Device names longer than this many characters lose their middle to an ellipsis (0.4.0 audit #31,
+/// departure 6 in the module docs). The original's `getTruncatedText(name, 30)`
+/// (`FxSystemTrayView.cpp:353`, `:422-432`) cut the end off at 30, which is where PipeWire's
+/// descriptions start to differ.
+pub const MENU_LABEL_MAX: usize = 60;
 
 /// Which of the three icons the item is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -259,10 +269,6 @@ pub struct TrayState {
     pub power: bool,
     /// `FxController::audio_process_on_`.
     pub processing: bool,
-    /// Whether the Turn On/Off item is usable. Windows disables it in a remote session
-    /// (`FxSystemTrayView.cpp:303`); `docs/spec/05-controller-model.md` §18.6 recommends dropping
-    /// that concept on Linux, so this defaults to `true` and is kept only as the hook.
-    pub power_enabled: bool,
     pub theme: ThemeMode,
     /// The speakers' lane.
     pub output: TrayLane,
@@ -280,7 +286,6 @@ impl Default for TrayState {
             // `Settings.cpp:31` ships `power = 1`, so the tray starts the way a fresh install does.
             power: true,
             processing: false,
-            power_enabled: true,
             theme: ThemeMode::default(),
             output: TrayLane::default(),
             input: TrayLane::default(),
@@ -548,44 +553,25 @@ impl FxTray {
         )
     }
 
-    /// `Playback Device Select ▸` (`FxSystemTrayView.cpp:339-381`), always a submenu here.
-    ///
-    /// A disabled `"Output"` header and the output lane's radio group, a separator, a disabled
-    /// `"Input"` header and the input lane's group — each half present only when its direction has
-    /// devices. Each group starts with `Off`, ticked while the lane is detached. Radio state is
-    /// per group in DBusMenu, so the two lanes' ticks are independent, as the lanes are.
-    fn device_menu(&self) -> Option<MenuItem<Self>> {
-        if self.state.devices.is_empty() {
-            return None;
-        }
-        let mut submenu: Vec<MenuItem<Self>> = Vec::new();
-        for direction in DeviceDirection::ALL {
-            let Some(group) = self.device_group(direction) else {
-                continue;
-            };
-            if !submenu.is_empty() {
-                submenu.push(MenuItem::Separator);
-            }
-            submenu.push(
-                StandardItem {
-                    label: tr(direction.label()),
-                    // A header, not a command: DBusMenu has no section header, and a disabled
-                    // row is how every SNI host draws one.
-                    enabled: false,
-                    ..Default::default()
-                }
-                .into(),
-            );
-            submenu.push(group);
-        }
-        Some(
-            SubMenu {
-                label: tr("Playback Device Select"),
-                submenu,
-                ..Default::default()
-            }
-            .into(),
-        )
+    /// The two lanes' device submenus, `Playback Device Select ▸` (`FxSystemTrayView.cpp:339-381`,
+    /// always a submenu here) and `Recording Device Select ▸` (0.4.0 audit #32), each present only
+    /// when its direction has devices. Radio state is per group in DBusMenu, so the two lanes'
+    /// ticks are independent, as the lanes are.
+    fn device_menus(&self) -> Vec<MenuItem<Self>> {
+        DeviceDirection::ALL
+            .into_iter()
+            .filter_map(|direction| {
+                let group = self.device_group(direction)?;
+                Some(
+                    SubMenu {
+                        label: device_menu_label(direction),
+                        submenu: vec![group],
+                        ..Default::default()
+                    }
+                    .into(),
+                )
+            })
+            .collect()
     }
 
     /// One lane's radio group — `Off`, then its direction's devices — or `None` when the direction
@@ -748,13 +734,14 @@ impl Tray for FxTray {
             }
             .into(),
             StandardItem {
-                // `power ? "Turn Off" : "Turn On"` (`:300-303`).
+                // `power ? "Turn Off" : "Turn On"` (`:300-303`). Windows greys it out in a remote
+                // session (`:302`); Linux has no such lock (`docs/spec/05-controller-model.md`
+                // §18.6), so it is always usable.
                 label: if self.state.power {
                     tr("Turn Off")
                 } else {
                     tr("Turn On")
                 },
-                enabled: self.state.power_enabled,
                 activate: Box::new(|tray: &mut Self| {
                     tray.send(TrayCommand::SetPower(!tray.state.power));
                 }),
@@ -764,10 +751,11 @@ impl Tray for FxTray {
         ];
 
         menu.extend(self.preset_menus());
-        if let Some(devices) = self.device_menu() {
+        let devices = self.device_menus();
+        if !devices.is_empty() {
             // The separator that wraps the device section on Windows (`:344-347`, `:380`).
             menu.push(MenuItem::Separator);
-            menu.push(devices);
+            menu.extend(devices);
             menu.push(MenuItem::Separator);
         }
 
@@ -902,6 +890,15 @@ fn preset_menu_label(direction: DeviceDirection) -> String {
     }
 }
 
+/// A lane's device submenu, by its direction: the original's playback item, and its twin for the
+/// microphones.
+fn device_menu_label(direction: DeviceDirection) -> String {
+    match direction {
+        DeviceDirection::Output => tr("Playback Device Select"),
+        DeviceDirection::Input => tr("Recording Device Select"),
+    }
+}
+
 /// `"<name> *"` for a preset with unsaved changes (`FxSystemTrayView.cpp:231`).
 fn preset_label(preset: &TrayPreset) -> String {
     if preset.modified {
@@ -911,15 +908,20 @@ fn preset_label(preset: &TrayPreset) -> String {
     }
 }
 
-/// `getTruncatedText(text, 30)` (`FxSystemTrayView.cpp:422-432`): a name longer than the limit
-/// loses `(len - 30) + 3` characters and gains `"..."`, so the result is exactly 30 characters.
+/// A device name as its row shows it: whole up to [`MENU_LABEL_MAX`] characters, and beyond that
+/// its first and last characters around a `…`, [`MENU_LABEL_MAX`] in all — so the start that
+/// names the card and the end that names the profile or the port both stay (0.4.0 audit #31). The
+/// original's `getTruncatedText(text, 30)` (`FxSystemTrayView.cpp:422-432`) kept the first 27 and
+/// `"..."`.
 fn truncate_label(text: &str) -> String {
-    if text.chars().count() <= MENU_LABEL_MAX {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= MENU_LABEL_MAX {
         return text.to_owned();
     }
-    let mut label: String = text.chars().take(MENU_LABEL_MAX - 3).collect();
-    label.push_str("...");
-    label
+    let kept = MENU_LABEL_MAX - 1;
+    let head: String = chars[..kept / 2].iter().collect();
+    let tail: String = chars[chars.len() - (kept - kept / 2)..].iter().collect();
+    format!("{}…{}", head.trim_end(), tail.trim_start())
 }
 
 #[cfg(test)]
@@ -1066,6 +1068,7 @@ mod tests {
                 "Input Presets",
                 "---",
                 "Playback Device Select",
+                "Recording Device Select",
                 "---",
                 "Settings",
                 "Theme",
@@ -1107,6 +1110,7 @@ mod tests {
         assert!(off.contains(&tr("Input Presets")), "{off:?}");
         assert_eq!(off[1], "Turn On", "the item says what it will do");
         assert!(off.contains(&tr("Playback Device Select")));
+        assert!(off.contains(&tr("Recording Device Select")));
         // The same items as with the power on, but for the power item's words.
         let on = labels(&on.menu());
         assert_eq!(off.len(), on.len(), "{off:?} / {on:?}");
@@ -1123,16 +1127,20 @@ mod tests {
     }
 
     #[test]
-    fn the_power_item_can_be_disabled_the_way_a_remote_session_disables_it() {
-        let (tray, _rx) = with_state(TrayState {
-            power_enabled: false,
-            ..populated()
-        });
-        let menu = tray.menu();
-        let MenuItem::Standard(power) = &menu[1] else {
-            panic!("the second item is Turn On/Off");
-        };
-        assert!(!power.enabled);
+    fn the_power_item_is_always_usable_as_linux_has_no_remote_session_lock() {
+        // Windows greys it out in a remote session (`FxSystemTrayView.cpp:302`); the field that
+        // carried that hook here never did anything (0.4.0 audit #36).
+        for power in [true, false] {
+            let (tray, _rx) = with_state(TrayState {
+                power,
+                ..populated()
+            });
+            let menu = tray.menu();
+            let MenuItem::Standard(item) = &menu[1] else {
+                panic!("the second item is Turn On/Off");
+            };
+            assert!(item.enabled);
+        }
     }
 
     #[test]
@@ -1224,31 +1232,29 @@ mod tests {
         );
     }
 
+    /// The one radio group of a lane's device submenu.
+    fn devices_of(menu: &[MenuItem<FxTray>], direction: DeviceDirection) -> &RadioGroup<FxTray> {
+        let submenu = submenu_of(menu, &device_menu_label(direction));
+        assert_eq!(
+            labels(submenu),
+            vec!["<radio>"],
+            "one group and nothing else"
+        );
+        radio_groups(submenu)[0]
+    }
+
     #[test]
-    fn each_lane_has_a_device_group_that_starts_with_off() {
+    fn each_lane_has_a_device_submenu_of_its_own_that_starts_with_off() {
+        // 0.4.0 audit #32: the microphones were listed under "Playback Device Select".
         let (tray, _rx) = with_state(both_lanes());
         let menu = tray.menu();
-        let devices = submenu_of(&menu, "Playback Device Select");
-        assert_eq!(
-            labels(devices),
-            vec!["Output", "<radio>", "---", "Input", "<radio>"],
-            "header, group, separator, header, group"
-        );
-        for header in [&devices[0], &devices[3]] {
-            let MenuItem::Standard(header) = header else {
-                panic!("headers are StandardItems");
-            };
-            assert!(!header.enabled, "a header is not clickable");
-        }
-
-        let groups = radio_groups(devices);
-        let (outputs, inputs) = (groups[0], groups[1]);
+        let (outputs, inputs) = (devices_of(&menu, OUT), devices_of(&menu, IN));
         assert_eq!(
             options(outputs),
             vec![
                 "Off",
                 "Built-in Audio Analogue Stereo",
-                "HDMI / DisplayPort 3 Output...",
+                "HDMI / DisplayPort 3 Output That Goes On Forever",
                 "Mono Headset",
             ]
         );
@@ -1256,10 +1262,10 @@ mod tests {
             options(inputs),
             vec![
                 "Off",
-                "fifine Microphone Analogue ...",
-                "Ryzen HD Audio Controller A...",
+                "fifine Microphone Analogue Stereo",
+                "Ryzen HD Audio Controller Analogue Stereo",
             ],
-            "truncated to 30 characters like every other row"
+            "whole, being shorter than the limit"
         );
         assert_eq!(outputs.selected, 1, "the speakers");
         assert_eq!(inputs.selected, 1, "and, beside them, the microphone");
@@ -1270,19 +1276,39 @@ mod tests {
     }
 
     #[test]
+    fn the_recording_submenu_is_translated_in_every_language() {
+        for language in &fxsound_core::i18n::LANGUAGES[1..] {
+            let table = fxsound_core::i18n::Catalogue::for_language(language);
+            for key in ["Playback Device Select", "Recording Device Select"] {
+                assert!(
+                    table.get(key).is_some_and(|v| !v.is_empty()),
+                    "{}: {key}",
+                    language.code
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_lane_that_is_off_ticks_its_off_row() {
         let (tray, _rx) = with_state(populated());
         let menu = tray.menu();
-        let groups = radio_groups(submenu_of(&menu, "Playback Device Select"));
-        assert_eq!(groups[0].selected, 1);
-        assert_eq!(groups[1].selected, 0, "the microphone lane is off");
+        assert_eq!(devices_of(&menu, OUT).selected, 1);
+        assert_eq!(
+            devices_of(&menu, IN).selected,
+            0,
+            "the microphone lane is off"
+        );
 
         let mut state = populated();
         state.output.device = None;
         let (tray, _rx) = with_state(state);
         let menu = tray.menu();
-        let groups = radio_groups(submenu_of(&menu, "Playback Device Select"));
-        assert_eq!(groups[0].selected, 0, "and so, now, is the speakers' lane");
+        assert_eq!(
+            devices_of(&menu, OUT).selected,
+            0,
+            "and so, now, is the speakers' lane"
+        );
     }
 
     #[test]
@@ -1296,9 +1322,9 @@ mod tests {
         );
         let (tray, _rx) = with_state(state);
         let menu = tray.menu();
-        let groups = radio_groups(submenu_of(&menu, "Playback Device Select"));
+        let outputs = devices_of(&menu, OUT);
         assert!(
-            groups[0].selected >= groups[0].options.len(),
+            outputs.selected >= outputs.options.len(),
             "neither Off nor another device is ticked"
         );
     }
@@ -1309,33 +1335,33 @@ mod tests {
         state.output.device = Some(3);
         let (tray, _rx) = with_state(state);
         let menu = tray.menu();
-        let groups = radio_groups(submenu_of(&menu, "Playback Device Select"));
-        assert!(groups[0].selected >= groups[0].options.len());
+        let outputs = devices_of(&menu, OUT);
+        assert!(outputs.selected >= outputs.options.len());
     }
 
     #[test]
     fn picking_a_device_reports_its_node_name_and_lane_and_off_detaches_the_lane() {
         let (mut tray, rx) = with_state(both_lanes());
         let menu = tray.menu();
-        let groups = radio_groups(submenu_of(&menu, "Playback Device Select"));
-        (groups[1].select)(&mut tray, 2);
+        let (outputs, inputs) = (devices_of(&menu, OUT), devices_of(&menu, IN));
+        (inputs.select)(&mut tray, 2);
         assert_eq!(
             rx.try_recv(),
             Ok(pick("Ryzen HD Audio Controller Analogue Stereo", IN)),
             "the second input, by name: not the fifth row of a list that may have moved"
         );
-        (groups[0].select)(&mut tray, 3);
+        (outputs.select)(&mut tray, 3);
         assert_eq!(rx.try_recv(), Ok(pick("Mono Headset", OUT)));
-        (groups[1].select)(&mut tray, 0);
+        (inputs.select)(&mut tray, 0);
         assert_eq!(rx.try_recv(), Ok(TrayCommand::Detach(IN)));
-        (groups[0].select)(&mut tray, 0);
+        (outputs.select)(&mut tray, 0);
         assert_eq!(rx.try_recv(), Ok(TrayCommand::Detach(OUT)));
-        (groups[1].select)(&mut tray, 7);
+        (inputs.select)(&mut tray, 7);
         assert!(rx.try_recv().is_err(), "a row past the group sends nothing");
     }
 
     #[test]
-    fn outputs_only_makes_a_submenu_with_just_the_output_half() {
+    fn outputs_only_makes_the_playback_submenu_alone() {
         // The usual case on a machine with no microphone.
         let (tray, _rx) = with_state(TrayState {
             devices: vec![
@@ -1353,17 +1379,16 @@ mod tests {
             ..populated()
         });
         let menu = tray.menu();
-        let devices = submenu_of(&menu, "Playback Device Select");
-        assert_eq!(
-            labels(devices),
-            vec!["Output", "<radio>"],
-            "one header, one group, no separator and no Input header"
+        assert_eq!(devices_of(&menu, OUT).selected, 1);
+        let labels = labels(&menu);
+        assert!(
+            !labels.contains(&tr("Recording Device Select")),
+            "{labels:?}"
         );
-        assert_eq!(radio_groups(devices)[0].selected, 1);
     }
 
     #[test]
-    fn inputs_only_makes_a_submenu_with_just_the_input_half() {
+    fn inputs_only_makes_the_recording_submenu_alone() {
         let (tray, _rx) = with_state(TrayState {
             devices: vec![device("Microphone", IN)],
             output: TrayLane {
@@ -1377,9 +1402,17 @@ mod tests {
             ..populated()
         });
         let menu = tray.menu();
-        let devices = submenu_of(&menu, "Playback Device Select");
-        assert_eq!(labels(devices), vec!["Input", "<radio>"]);
-        assert_eq!(radio_groups(devices)[0].selected, 1);
+        assert_eq!(devices_of(&menu, IN).selected, 1);
+        let labels = labels(&menu);
+        assert!(
+            !labels.contains(&tr("Playback Device Select")),
+            "{labels:?}"
+        );
+        assert_eq!(
+            labels.iter().filter(|label| *label == "---").count(),
+            2,
+            "the one submenu still sits between the section's separators: {labels:?}"
+        );
     }
 
     #[test]
@@ -1390,6 +1423,7 @@ mod tests {
         let (tray, _rx) = with_state(state);
         let labels = labels(&tray.menu());
         assert!(!labels.contains(&tr("Playback Device Select")));
+        assert!(!labels.contains(&tr("Recording Device Select")));
         assert!(
             !labels.contains(&"---".to_owned()),
             "and so do its separators"
@@ -1438,8 +1472,7 @@ mod tests {
         (radio_groups(theme)[0].select)(&mut tray, 1);
         assert_eq!(rx.try_recv(), Ok(TrayCommand::SetTheme(ThemeMode::Light)));
 
-        let devices = submenu_of(&menu, "Playback Device Select");
-        (radio_groups(devices)[0].select)(&mut tray, 2);
+        (devices_of(&menu, OUT).select)(&mut tray, 2);
         assert_eq!(
             rx.try_recv(),
             Ok(pick(
@@ -1625,13 +1658,39 @@ mod tests {
     }
 
     #[test]
-    fn a_short_device_name_is_left_alone_and_a_long_one_is_elided() {
+    fn a_short_device_name_is_left_alone_and_a_long_one_loses_its_middle() {
         assert_eq!(truncate_label("Speakers"), "Speakers");
-        let exactly_thirty = "a".repeat(MENU_LABEL_MAX);
-        assert_eq!(truncate_label(&exactly_thirty), exactly_thirty);
+        let at_the_limit = "a".repeat(MENU_LABEL_MAX);
+        assert_eq!(truncate_label(&at_the_limit), at_the_limit);
         let too_long = "a".repeat(MENU_LABEL_MAX + 1);
         let truncated = truncate_label(&too_long);
         assert_eq!(truncated.chars().count(), MENU_LABEL_MAX);
-        assert!(truncated.ends_with("..."));
+        assert!(truncated.contains('…') && !truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn the_devices_of_one_card_stay_told_apart() {
+        // 0.4.0 audit #31: cut at 30, both of these read "Family 17h/19h/1ah HD Audio...", and a
+        // graphics card's HDMI outputs all read alike.
+        let pairs = [
+            (
+                "Family 17h/19h/1ah HD Audio Controller Analog Stereo",
+                "Family 17h/19h/1ah HD Audio Controller Digital Stereo (IEC958)",
+            ),
+            (
+                "Navi 31 HDMI/DP Audio Controller Digital Stereo (HDMI 2) Output",
+                "Navi 31 HDMI/DP Audio Controller Digital Stereo (HDMI 3) Output",
+            ),
+        ];
+        for (a, b) in pairs {
+            let (a, b) = (truncate_label(a), truncate_label(b));
+            assert_ne!(a, b);
+            assert!(a.chars().count() <= MENU_LABEL_MAX, "{a}");
+            assert!(b.chars().count() <= MENU_LABEL_MAX, "{b}");
+        }
+        assert_eq!(
+            truncate_label("Navi 31 HDMI/DP Audio Controller Digital Stereo (HDMI 3) Output"),
+            "Navi 31 HDMI/DP Audio Control…Digital Stereo (HDMI 3) Output"
+        );
     }
 }

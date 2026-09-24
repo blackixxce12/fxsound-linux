@@ -10,7 +10,7 @@
 //! working against the port.
 //!
 //! Three deliberate departures from the original, each one prescribed by
-//! `docs/spec/07-startup-tray.md` §4.7:
+//! `docs/spec/07-startup-tray.md` §4.7, and four the 0.4.0 audit added:
 //!
 //! 1. **A space works as well as an `=`.** `docs/COMMAND_LINE_OPTIONS.md:7` says `--power 1` parses
 //!    as two unrelated arguments and the value is silently ignored. That is an artefact of JUCE
@@ -24,7 +24,29 @@
 //!    (`docs/spec/07-startup-tray.md` §2.7), so the five `RegisterHotKey` bindings become
 //!    compositor keybindings that run this CLI: `--toggle-power`, `--next-preset`,
 //!    `--prev-preset`, `--next-output` and `--toggle-window`, plus `--show`, `--hide` and
-//!    `--quit`. `packaging/hyprland.conf.example` binds four of them already.
+//!    `--quit`. `packaging/hyprland.conf.example` binds five of them, on Super+Alt: a compositor
+//!    binding takes its keys from every application, and the Windows build's own chords collide
+//!    (Ctrl+Shift+Q is how Chromium quits; 0.4.0 audit #33).
+//! 4. **Only what is about the window raises it** (0.4.0 audit R11). On Windows every forwarded
+//!    command line but `--status` shows and raises the window (`FxController.cpp:523-531`), so a
+//!    keybind that runs `fxsound --preset=Gaming` pulled the window over the game each time. Here
+//!    an option that sets something — a preset, the power, a device, an effect, a band, a level,
+//!    the language — does it silently; `--show`, `--view` and a line with no options at all raise
+//!    the window, `--toggle-window` toggles it and `--hide` hides it ([`Cli::window_command`]).
+//! 5. **One preset option per line** (audit #30). Windows takes the first of `--preset`,
+//!    `--save_preset`, `--overwrite_preset`, `--undo_preset`, `--rename_preset` and
+//!    `--delete_preset` and silently drops the rest (`FxController.cpp:393-448`); here a second one
+//!    — `--next-preset` and `--prev-preset` included — is a parse error naming both, and so is a
+//!    name that is empty, or one that has nothing left once the characters a preset name cannot
+//!    hold are taken out.
+//! 6. **A band list with a band the equalizer does not have is refused, with a message** (audit
+//!    #51): Windows drops such a list without a word when it has more pairs than bands, and sets
+//!    whatever it can otherwise; here nothing of it is set, and the command fails naming the bands
+//!    that are not there (`crate::commands`).
+//! 7. **An unknown `--language` is an error** (audit #28): Windows saves any code and shows the
+//!    language whose name it starts with, or English. The table's own codes are taken in any case,
+//!    and so are the ISO codes it spells otherwise (`uk`, `bs`, `nb`, `nn`) and locales
+//!    (`ru_RU.UTF-8`), through [`fxsound_core::i18n::canonical_code`].
 //!
 //! Rounding is *not* a departure: `--balance` and `--master_gain` round to the nearest whole
 //! number (`FxController.cpp:1803`, `:1815`) and `--filter_q` and `--volume_leveling` to the
@@ -33,7 +55,7 @@
 //! the value the DSP will see.
 
 use clap::Parser;
-use fxsound_core::{DeviceDirection, Effect, NoiseSuppressionOverride, ViewMode, eq};
+use fxsound_core::{DeviceDirection, Effect, NoiseSuppressionOverride, ViewMode, eq, i18n};
 
 /// The reserved-character set, the length cap and the sanitiser a preset name goes through
 /// before it is used (`FxController::sanitizePresetName`, `fxsound/Source/GUI/FxController.cpp:378`).
@@ -89,6 +111,23 @@ pub const MAX_EFFECT_PAIRS: usize = Effect::COUNT;
         clap::ArgGroup::new("report")
             .args(["status", "watch", "self_test", "list_apps"])
             .multiple(true)
+    ),
+    // One preset option per line (0.4.0 audit #30): the original takes the first and drops the
+    // rest without a word (`FxController.cpp:393-448`), so `--save_preset=A --preset=B` selected B
+    // and saved nothing.
+    group(
+        clap::ArgGroup::new("preset_option")
+            .args([
+                "preset",
+                "save_preset",
+                "overwrite_preset",
+                "undo_preset",
+                "rename_preset",
+                "delete_preset",
+                "next_preset",
+                "prev_preset",
+            ])
+            .multiple(false)
     )
 )]
 pub struct Cli {
@@ -98,17 +137,22 @@ pub struct Cli {
     #[arg(long = "power", value_name = "0|1|toggle", value_parser = parse_power)]
     pub power: Option<PowerArg>,
 
-    /// Select a preset by its exact, case-sensitive name.
+    /// Select a preset by its exact, case-sensitive name. One preset option per line.
     ///
     /// `--preset=<name>` — `docs/COMMAND_LINE_OPTIONS.md:18`, `FxController.cpp:249-252`, `:395-401`.
-    #[arg(long = "preset", value_name = "NAME")]
+    #[arg(long = "preset", value_name = "NAME", value_parser = parse_preset_name)]
     pub preset: Option<String>,
 
     /// Save the current settings as a new user preset, a copy when nothing is modified.
     ///
     /// `--save_preset=<name>` — `docs/COMMAND_LINE_OPTIONS.md:19`, `FxController.cpp:402-412`; the
     /// original refuses it with nothing modified (0.4.0 audit #17).
-    #[arg(long = "save_preset", alias = "save-preset", value_name = "NAME")]
+    #[arg(
+        long = "save_preset",
+        alias = "save-preset",
+        value_name = "NAME",
+        value_parser = parse_new_preset_name
+    )]
     pub save_preset: Option<String>,
 
     /// Overwrite the selected user preset with its unsaved changes.
@@ -126,7 +170,12 @@ pub struct Cli {
     /// Rename the selected user preset.
     ///
     /// `--rename_preset=<name>` — `docs/COMMAND_LINE_OPTIONS.md:22`, `FxController.cpp:428-440`.
-    #[arg(long = "rename_preset", alias = "rename-preset", value_name = "NAME")]
+    #[arg(
+        long = "rename_preset",
+        alias = "rename-preset",
+        value_name = "NAME",
+        value_parser = parse_new_preset_name
+    )]
     pub rename_preset: Option<String>,
 
     /// Delete the selected user preset.
@@ -155,6 +204,20 @@ pub struct Cli {
     #[arg(long = "input", value_name = "DEVICE|off")]
     pub input: Option<String>,
 
+    /// Forget a device that is not connected: drop it from its lane's device priority list, and
+    /// the preset remembered for it, as the ✕ beside its row in Settings does.
+    ///
+    /// Linux addition (0.4.0 audit #34). By `node.name` or description, playback devices and
+    /// microphones alike; a device that is connected is refused, since FxSound would learn it
+    /// again at once.
+    #[arg(
+        long = "forget-device",
+        alias = "forget_device",
+        value_name = "DEVICE",
+        value_parser = parse_device_name
+    )]
+    pub forget_device: Option<String>,
+
     /// Which lane the window edits and the preset, effect and level options act on.
     ///
     /// Linux addition (0.4.0 design §1.1): a GUI concern only; the engine has no notion of it.
@@ -169,10 +232,12 @@ pub struct Cli {
     #[arg(long = "view", value_name = "1|2", value_parser = parse_view)]
     pub view: Option<ViewMode>,
 
-    /// Display language, e.g. `en`, `fr`, `fi`.
+    /// Display language: a code such as `en`, `ru` or `pt-br`, or `system` to follow the desktop.
     ///
-    /// `--language=<code>` — `docs/COMMAND_LINE_OPTIONS.md:26`, `FxController.cpp:269-278`.
-    #[arg(long = "language", value_name = "CODE")]
+    /// `--language=<code>` — `docs/COMMAND_LINE_OPTIONS.md:26`, `FxController.cpp:269-278`. Held
+    /// as the table's own code, or `system`: an ISO code or a locale is read into it, and a
+    /// language with no table is an error (0.4.0 audit #28).
+    #[arg(long = "language", value_name = "CODE|system", value_parser = parse_language)]
     pub language: Option<String>,
 
     /// Number of equalizer bands: 5, 10, 15, 20 or 31.
@@ -370,11 +435,11 @@ pub struct Cli {
     #[arg(long = "activated")]
     pub activated: bool,
 
-    /// Show and raise the window of the running instance.
+    /// Show and raise the window of the running instance, or start with it showing.
     ///
     /// Linux addition (`docs/spec/07-startup-tray.md` §4.7). The original has no such option
-    /// because *every* forwarded command line except `--status` raises the window; see
-    /// `Cli::window_command`.
+    /// because *every* forwarded command line except `--status` raises the window; here only
+    /// this, `--view` and a line with no options do (0.4.0 audit R11, `Cli::window_command`).
     #[arg(long = "show")]
     pub show: bool,
 
@@ -519,6 +584,9 @@ pub enum Command {
     Preset(PresetCommand),
     Output(OutputCommand),
     Input(InputCommand),
+    /// Drop a device that is not connected from its lane's priority list (`--forget-device`), by
+    /// `node.name` or description, in either direction.
+    ForgetDevice(String),
     /// The lane the window edits and the preset and level commands act on.
     EditDirection(DeviceDirection),
     /// The microphone's global noise-suppression override.
@@ -538,10 +606,10 @@ pub enum Command {
     View(ViewMode),
     Language(String),
     Window(WindowCommand),
-    /// `(band index, Hz)` pairs. The caller must still drop the whole list when it is longer than
-    /// the current band count (`FxController.cpp:536-553`) — that count is not knowable here.
+    /// `(band index, Hz)` pairs. The caller refuses the whole list, naming the bands, when one of
+    /// them is past the live band count (0.4.0 audit #51) — that count is not knowable here.
     BandFrequencies(Vec<(usize, f32)>),
-    /// `(band index, dB)` pairs, same size guard as [`Command::BandFrequencies`].
+    /// `(band index, dB)` pairs, refused whole the same way as [`Command::BandFrequencies`].
     BandGains(Vec<(usize, f32)>),
     /// `(effect, 0..=10)` pairs.
     Effects(Vec<(Effect, f32)>),
@@ -556,10 +624,11 @@ pub enum PowerCommand {
     Toggle,
 }
 
-/// The six mutually exclusive preset commands, plus the two the compositor drives.
+/// The six preset commands, plus the two the compositor drives.
 ///
-/// `docs/COMMAND_LINE_OPTIONS.md:40`: only one is processed per invocation, in the order the
-/// `if`/`else if` chain at `FxController.cpp:395-448` tests them.
+/// One per invocation. `docs/COMMAND_LINE_OPTIONS.md:40` processes the first in the order the
+/// `if`/`else if` chain at `FxController.cpp:395-448` tests them and silently drops the rest; here
+/// the parser refuses a line with two (0.4.0 audit #30), so there is never a rest to drop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresetCommand {
     Select(String),
@@ -658,6 +727,17 @@ impl Cli {
             }];
         }
 
+        let mut commands = self.commands_before_the_window();
+        if let Some(window) = self.window_command() {
+            commands.push(Command::Window(window));
+        }
+        commands.extend(self.commands_after_the_window());
+        commands
+    }
+
+    /// What the line sets before step 11 of `applyConfig` shows the window: the power, the
+    /// devices, the preset, the levels, the view and the language, in [`Cli::commands`]' order.
+    fn commands_before_the_window(&self) -> Vec<Command> {
         let mut commands = Vec::new();
         if let Some(power) = self.power_command() {
             commands.push(Command::Power(power));
@@ -667,6 +747,9 @@ impl Cli {
         }
         if let Some(input) = self.input_command() {
             commands.push(Command::Input(input));
+        }
+        if let Some(device) = &self.forget_device {
+            commands.push(Command::ForgetDevice(device.clone()));
         }
         if let Some(direction) = self.edit {
             commands.push(Command::EditDirection(direction));
@@ -708,9 +791,13 @@ impl Cli {
         if let Some(language) = &self.language {
             commands.push(Command::Language(language.clone()));
         }
-        if let Some(window) = self.window_command() {
-            commands.push(Command::Window(window));
-        }
+        commands
+    }
+
+    /// What the line sets after the window step: the band and effect lists, which the original
+    /// applies last (`FxController.cpp:536-600`), and the quit.
+    fn commands_after_the_window(&self) -> Vec<Command> {
+        let mut commands = Vec::new();
         if let Some(pairs) = &self.set_band_freq {
             commands.push(Command::BandFrequencies(pairs.0.clone()));
         }
@@ -727,9 +814,9 @@ impl Cli {
     }
 
     /// [`Cli::commands`] as D-Bus `Apply` hands them over: without the window raise a typed
-    /// command line gets for nothing (0.4.0 design §9, and `Cli::window_command`). A bus call
-    /// comes from a keybind or a status bar, as every other method's does; `--show`,
-    /// `--toggle-window` and `--hide` on the line still do what they say.
+    /// command line gets from `--view` or from having no options at all (0.4.0 design §9, and
+    /// `Cli::window_command`). A bus call comes from a keybind or a status bar, as every other
+    /// method's does; `--show`, `--toggle-window` and `--hide` on the line still do what they say.
     #[must_use]
     pub fn commands_without_implicit_raise(&self) -> Vec<Command> {
         let mut commands = self.commands();
@@ -745,11 +832,18 @@ impl Cli {
     /// `initConfig` never sees `--status`, the preset-management commands, `--set_band_*` or
     /// `--set_effect`: at that point in startup there is no preset list, no audio and no window
     /// (`Main.cpp:67` runs it two lines before `AudioPassthru` exists).
+    ///
+    /// An explicit `--show` is kept: it is how a start overrides the remembered "start hidden"
+    /// (`run_minimized`, written again since 0.4.0 audit #35), as `--hide` overrides the other way.
+    /// The raise of a bare `fxsound` or of `--view` is not (see [`Command::honoured_at_cold_start`]).
     #[must_use]
     pub fn cold_start_commands(&self) -> Vec<Command> {
         self.commands()
             .into_iter()
-            .filter(Command::honoured_at_cold_start)
+            .filter(|command| {
+                command.honoured_at_cold_start()
+                    || (self.show && *command == Command::Window(WindowCommand::Show))
+            })
             .collect()
     }
 
@@ -776,25 +870,20 @@ impl Cli {
         }
     }
 
-    /// The `if`/`else if` chain of `FxController.cpp:395-448`: strictly the first match wins and
-    /// every other preset option on the line is silently ignored
-    /// (`docs/COMMAND_LINE_OPTIONS.md:40`).
-    ///
-    /// A name that sanitises away to nothing produces *no* command rather than falling through to
-    /// the next option, because on Windows the chain has already matched by then (`:404`, `:431`).
+    /// The one preset option on the line, if there is one: the `preset_option` group lets the
+    /// parser through with at most one (0.4.0 audit #30), and the name parsers refuse a name that
+    /// is empty or sanitises away, so every branch here that matches makes a command.
     fn preset_command(&self) -> Option<PresetCommand> {
         if let Some(name) = &self.preset {
-            (!name.is_empty()).then(|| PresetCommand::Select(name.clone()))
+            Some(PresetCommand::Select(name.clone()))
         } else if let Some(name) = &self.save_preset {
-            let name = new_preset_name(name);
-            (!name.is_empty()).then_some(PresetCommand::SaveAs(name))
+            Some(PresetCommand::SaveAs(new_preset_name(name)))
         } else if self.overwrite_preset {
             Some(PresetCommand::Overwrite)
         } else if self.undo_preset {
             Some(PresetCommand::Undo)
         } else if let Some(name) = &self.rename_preset {
-            let name = new_preset_name(name);
-            (!name.is_empty()).then_some(PresetCommand::Rename(name))
+            Some(PresetCommand::Rename(new_preset_name(name)))
         } else if self.delete_preset {
             Some(PresetCommand::Delete)
         } else if self.next_preset {
@@ -814,16 +903,19 @@ impl Cli {
         device_command(self.input.as_deref(), self.next_input)
     }
 
-    /// Step 11 of `applyConfig` (`FxController.cpp:523-531`) — and the one place this port
-    /// knowingly narrows the original's behaviour.
+    /// Step 11 of `applyConfig` (`FxController.cpp:523-531`), narrowed to the options that are
+    /// about the window (0.4.0 audit R11).
     ///
     /// On Windows that step is an `else`: *any* forwarded command line that is not `--status`
-    /// shows and raises the window, so `fxsound --power=1` pops the UI to the front. That is fine
-    /// when `--power=1` can only come from a person typing it, but on Linux the same CLI is the
-    /// replacement for the five global hotkeys (`docs/spec/07-startup-tray.md` §2.7), and a hotkey
-    /// on Windows goes through `eventCallback` (`:1923-2014`) and never raises anything. So an
-    /// invocation made *only* of compositor stand-ins leaves the window alone; add any of the
-    /// original's options, or none at all, and the original's raise-the-window behaviour applies.
+    /// shows and raises the window, so `fxsound --preset=Gaming` pops the UI to the front. On
+    /// Linux the same CLI is the replacement for the five global hotkeys
+    /// (`docs/spec/07-startup-tray.md` §2.7) and what a script or a game's launcher runs, and a
+    /// hotkey on Windows goes through `eventCallback` (`:1923-2014`) and never raises anything.
+    /// So only what asks for the window gets it: `--show`; `--view`, which switches the layout
+    /// the window shows; and a line with no options at all, which is how a desktop launcher
+    /// starts FxSound and so how a second launch brings the running one's window up. Every
+    /// option that sets something does so silently, and a question (`--status` and the like)
+    /// never touches the window.
     fn window_command(&self) -> Option<WindowCommand> {
         if self.is_query() {
             None
@@ -831,60 +923,17 @@ impl Cli {
             Some(WindowCommand::Hide)
         } else if self.toggle_window {
             Some(WindowCommand::Toggle)
-        } else if self.show {
+        } else if self.show || self.view.is_some() || self.asks_for_nothing() {
             Some(WindowCommand::Show)
-        } else if self.is_hotkey_substitute_only() {
-            None
         } else {
-            Some(WindowCommand::Show)
+            None
         }
     }
 
-    /// `true` when the line carries at least one compositor stand-in and nothing that raises the
-    /// window.
-    ///
-    /// The stand-ins are the five hotkeys' replacements plus the 0.4.0 options shaped like them:
-    /// `--next-input`, the input lane's `--next-output`; `--noise-suppression`, a setting a
-    /// keybinding flips without wanting the window; and `--app-preset` and `--app-input-preset`,
-    /// which a script or a game's launcher sets for an application the window does not show.
-    /// `--input` and `--edit` raise it, as `--output` always has: both are about what the window
-    /// is showing.
-    fn is_hotkey_substitute_only(&self) -> bool {
-        let substitutes = self.toggle_power
-            || self.next_preset
-            || self.prev_preset
-            || self.next_output
-            || self.next_input
-            || self.noise_suppression.is_some()
-            || !self.app_preset.is_empty()
-            || !self.app_input_preset.is_empty()
-            || self.quit;
-        substitutes && !self.has_original_option() && self.input.is_none() && self.edit.is_none()
-    }
-
-    /// Every option in `docs/COMMAND_LINE_OPTIONS.md`'s table, i.e. everything the Windows build
-    /// could be handed.
-    fn has_original_option(&self) -> bool {
-        self.power.is_some()
-            || self.preset.is_some()
-            || self.save_preset.is_some()
-            || self.overwrite_preset
-            || self.undo_preset
-            || self.rename_preset.is_some()
-            || self.delete_preset
-            || self.output.is_some()
-            || self.view.is_some()
-            || self.language.is_some()
-            || self.num_bands.is_some()
-            || self.balance.is_some()
-            || self.filter_q.is_some()
-            || self.master_gain.is_some()
-            || self.volume_leveling.is_some()
-            || self.set_band_freq.is_some()
-            || self.set_band_gain.is_some()
-            || self.set_effect.is_some()
-            || self.status
-            || self.run_minimized
+    /// `true` for a line with no options — `fxsound`, as a desktop entry runs it — or with none
+    /// that makes a command (`--output=`, an empty name, is none).
+    fn asks_for_nothing(&self) -> bool {
+        self.commands_before_the_window().is_empty() && self.commands_after_the_window().is_empty()
     }
 }
 
@@ -895,7 +944,8 @@ impl Command {
     /// pointedly *not* on it: a plain `fxsound` emits one (see `Cli::window_command`), and
     /// honouring it at startup would override the persisted `run_minimized` on every launch and
     /// break "quit with the window hidden, start hidden next time" (§7.1). A cold start's
-    /// visibility comes from the setting, with `--run_minimized` as the only override.
+    /// visibility comes from the setting, with `--run_minimized` and an explicit `--show` as the
+    /// overrides ([`Cli::cold_start_commands`] keeps the latter).
     ///
     /// [`Command::Quit`] is not on it either: a cold start is the proof that there is nothing
     /// to quit, and `main` says so before the audio engine starts rather than starting an
@@ -918,6 +968,10 @@ impl Command {
             Self::Output(device) | Self::Input(device) => {
                 matches!(device, DeviceCommand::Select(_) | DeviceCommand::Detach)
             }
+            // Done by `main` to the settings file before anything starts
+            // (`commands::forget_in_the_settings_file`): run in step 4, before PipeWire has
+            // listed a device, it could only be refused, and a line of its own starts nothing.
+            Self::ForgetDevice(_) => false,
             // Settings a start-up line may well carry, like `--view` and `--balance`. An
             // application's preset is one too, and like `--preset` it is chosen once the preset
             // lists are read, so a name neither list has is still refused, on stderr.
@@ -971,6 +1025,63 @@ fn parse_app_rule(value: &str) -> Result<AppRuleArg, String> {
         app: app.to_owned(),
         preset: AppPresetChoice::parse(preset),
     })
+}
+
+/// `--preset`'s value: a name, which has to be there. 0.3.0 and the original took `--preset=` as no
+/// command at all and exited 0 (`FxController.cpp:397`); D-Bus's `SetPreset` already refused it.
+fn parse_preset_name(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("a preset name cannot be empty".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+/// `--save_preset`'s and `--rename_preset`'s value, as typed: refused when nothing is left of it
+/// once [`new_preset_name`] has taken out the characters a preset name cannot hold — `::` saved
+/// nothing and said nothing before (0.4.0 audit #30). The name the command carries is sanitised
+/// again when it is built ([`Cli::commands`]), so what the parser keeps is what the user wrote.
+fn parse_new_preset_name(value: &str) -> Result<String, String> {
+    if new_preset_name(value).is_empty() {
+        let reserved: String = PRESET_NAME_RESERVED.iter().collect();
+        Err(format!(
+            "`{value}` is no preset name: nothing is left of it once the characters a preset \
+             name cannot hold ({reserved}) and the spaces around them are taken out"
+        ))
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+/// `--forget-device`'s value: a `node.name` or a description, which has to be there.
+fn parse_device_name(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("a device name cannot be empty".to_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
+/// `--language`'s value: `system` (also `default`) to follow the desktop session, or a language
+/// FxSound has a table for, as [`i18n::canonical_code`] reads one — its code in any case, the ISO
+/// code where the Windows build spells it otherwise (`uk`, `bs`, `nb`, `nn`), or a locale such as
+/// `ru_RU.UTF-8`. Comes back as the table's own code, or `system`. Anything else is an error that
+/// lists the codes: 0.3.0 saved it and showed the system's language instead (0.4.0 audit #28).
+fn parse_language(value: &str) -> Result<String, String> {
+    let text = value.trim();
+    if text.eq_ignore_ascii_case("system") || text.eq_ignore_ascii_case("default") {
+        return Ok("system".to_owned());
+    }
+    i18n::canonical_code(text)
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            let mut codes: Vec<&str> = i18n::LANGUAGES.iter().map(|l| l.code).collect();
+            codes.sort_unstable_by_key(|code| code.to_ascii_lowercase());
+            format!(
+                "FxSound has no translation for `{value}`; expected system or one of {}",
+                codes.join(", ")
+            )
+        })
 }
 
 /// `--noise-suppression`'s value; D-Bus's `SetNoiseSuppression` reads its argument with it too.
@@ -1226,12 +1337,9 @@ mod tests {
         );
         assert_eq!(
             parse(&["--output=alsa_input.usb-3142_fifine_Microphone-00.analog-stereo"]).commands(),
-            vec![
-                Command::Output(OutputCommand::Select(
-                    "alsa_input.usb-3142_fifine_Microphone-00.analog-stereo".to_owned()
-                )),
-                Command::Window(WindowCommand::Show),
-            ],
+            vec![Command::Output(OutputCommand::Select(
+                "alsa_input.usb-3142_fifine_Microphone-00.analog-stereo".to_owned()
+            ))],
             "a node.name of either direction is just a name here; the controller resolves it"
         );
         // An empty name is no command at all, as `applyConfig` treats an empty --output.
@@ -1453,8 +1561,32 @@ mod tests {
     }
 
     #[test]
-    fn the_preset_commands_are_mutually_exclusive_in_the_documented_priority_order() {
-        // `docs/COMMAND_LINE_OPTIONS.md:40` — first match wins, the rest are silently ignored.
+    fn each_preset_option_on_its_own_makes_its_command() {
+        for (args, expected) in [
+            ("--preset=Rock", PresetCommand::Select("Rock".to_owned())),
+            ("--save_preset=New", PresetCommand::SaveAs("New".to_owned())),
+            ("--overwrite_preset", PresetCommand::Overwrite),
+            ("--undo_preset", PresetCommand::Undo),
+            (
+                "--rename_preset=Other",
+                PresetCommand::Rename("Other".to_owned()),
+            ),
+            ("--delete_preset", PresetCommand::Delete),
+            ("--next-preset", PresetCommand::Next),
+            ("--prev-preset", PresetCommand::Previous),
+        ] {
+            assert_eq!(
+                parse(&[args]).commands(),
+                vec![Command::Preset(expected)],
+                "{args}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_preset_options_on_one_line_are_refused_with_both_named() {
+        // 0.4.0 audit #30: `docs/COMMAND_LINE_OPTIONS.md:40` takes the first and drops the rest in
+        // silence, so `--save_preset=A --preset=B` selected B and saved nothing.
         let all = [
             "--preset=Rock",
             "--save_preset=New",
@@ -1462,32 +1594,22 @@ mod tests {
             "--undo_preset",
             "--rename_preset=Other",
             "--delete_preset",
+            "--next-preset",
+            "--prev-preset",
         ];
-        let expected = [
-            PresetCommand::Select("Rock".to_owned()),
-            PresetCommand::SaveAs("New".to_owned()),
-            PresetCommand::Overwrite,
-            PresetCommand::Undo,
-            PresetCommand::Rename("Other".to_owned()),
-            PresetCommand::Delete,
-        ];
-        for skip in 0..all.len() {
-            let cli = parse(&all[skip..]);
-            let commands = cli.commands();
-            assert!(
-                commands.contains(&Command::Preset(expected[skip].clone())),
-                "with {:?} on the line, {:?} should win",
-                &all[skip..],
-                expected[skip]
-            );
-            assert_eq!(
-                commands
-                    .iter()
-                    .filter(|c| matches!(c, Command::Preset(_)))
-                    .count(),
-                1,
-                "exactly one preset command may survive"
-            );
+        let option = |arg: &str| arg.split('=').next().unwrap_or(arg).to_owned();
+        for (i, first) in all.iter().enumerate() {
+            for second in &all[i + 1..] {
+                let message = error(&[first, second]);
+                assert!(
+                    message.contains("cannot be used with"),
+                    "{first} {second}: {message}"
+                );
+                assert!(
+                    message.contains(&option(first)) && message.contains(&option(second)),
+                    "{first} {second}: {message}"
+                );
+            }
         }
     }
 
@@ -1525,29 +1647,48 @@ mod tests {
     }
 
     #[test]
-    fn a_name_that_sanitises_away_drops_the_whole_preset_command() {
-        // The `if`/`else if` chain has already matched by the time the name is checked
-        // (`FxController.cpp:428-440`), so it must not fall through to `--delete_preset`.
-        let commands = parse(&["--rename_preset=???", "--delete_preset"]).commands();
-        assert!(
-            !commands.iter().any(|c| matches!(c, Command::Preset(_))),
-            "got {commands:?}"
+    fn a_name_that_is_empty_or_sanitises_away_is_refused_with_a_message() {
+        // 0.4.0 audit #30: `--save_preset="::"` saved nothing and said nothing.
+        for args in [
+            "--save_preset=::",
+            "--rename_preset=???",
+            "--save_preset=  ",
+            "--rename_preset=",
+        ] {
+            let message = error(&[args]);
+            assert!(message.contains("is no preset name"), "{args}: {message}");
+        }
+        assert!(error(&["--preset="]).contains("a preset name cannot be empty"));
+        assert!(error(&["--preset", " "]).contains("a preset name cannot be empty"));
+        // What sanitises to something is kept as typed and sanitised on its way into the command.
+        let cli = parse(&["--save_preset= Mu:sic "]);
+        assert_eq!(cli.save_preset.as_deref(), Some(" Mu:sic "));
+        assert_eq!(
+            cli.commands(),
+            vec![Command::Preset(PresetCommand::SaveAs("Music".to_owned()))]
         );
     }
 
     #[test]
-    fn a_forwarded_command_line_shows_and_raises_the_window() {
-        // Step 11 of applyConfig is an `else` (`FxController.cpp:523-531`).
-        assert!(
-            parse(&["--power=1"])
-                .commands()
-                .contains(&Command::Window(WindowCommand::Show))
-        );
-        assert!(
-            parse(&[])
-                .commands()
-                .contains(&Command::Window(WindowCommand::Show))
-        );
+    fn only_show_view_and_a_line_with_no_options_raise_the_window() {
+        // 0.4.0 audit R11: step 11 of applyConfig is an `else` (`FxController.cpp:523-531`), so on
+        // Windows every option raised the window, a keybind's `--preset=Gaming` over a game too.
+        for raising in [
+            &[][..],
+            &["--show"][..],
+            &["--view=2"][..],
+            &["--view=1", "--preset=Rock"][..],
+            &["--power=1", "--show"][..],
+            // An empty name makes no command, so this line asks for nothing but the window.
+            &["--output="][..],
+        ] {
+            assert!(
+                parse(raising)
+                    .commands()
+                    .contains(&Command::Window(WindowCommand::Show)),
+                "{raising:?} should raise the window"
+            );
+        }
         assert!(
             parse(&["--run_minimized"])
                 .commands()
@@ -1558,6 +1699,50 @@ mod tests {
                 .commands()
                 .contains(&Command::Window(WindowCommand::Toggle))
         );
+    }
+
+    #[test]
+    fn every_option_that_sets_something_leaves_the_window_where_it_is() {
+        // 0.4.0 audit R11: presets, power, devices, effects, bands, levels and the language are
+        // state, and a script or a keybind sets them without wanting the window.
+        for quiet in [
+            &["--power=1"][..],
+            &["--power=toggle"][..],
+            &["--preset=Gaming"][..],
+            &["--save_preset=Mine"][..],
+            &["--overwrite_preset"][..],
+            &["--undo_preset"][..],
+            &["--rename_preset=Other"][..],
+            &["--delete_preset"][..],
+            &["--output=Speakers"][..],
+            &["--input=Mic"][..],
+            &["--output=off"][..],
+            &["--forget-device=Old Dock"][..],
+            &["--edit=input"][..],
+            &["--language=fr"][..],
+            &["--num_bands=31"][..],
+            &["--balance=3"][..],
+            &["--filter_q=2"][..],
+            &["--master_gain=-6"][..],
+            &["--volume_leveling=2"][..],
+            &["--set_band_freq=0:60"][..],
+            &["--set_band_gain=0:3"][..],
+            &["--set_effect=bass:7"][..],
+            &["--noise-suppression=strong"][..],
+            &["--app-preset=bf6.exe=Gaming"][..],
+            &[
+                "--edit=output",
+                "--preset=Rock",
+                "--set_effect=bass:7,ambience:3",
+            ][..],
+        ] {
+            let commands = parse(quiet).commands();
+            assert!(!commands.is_empty(), "{quiet:?} does something");
+            assert!(
+                !commands.iter().any(|c| matches!(c, Command::Window(_))),
+                "{quiet:?} must not touch the window: {commands:?}"
+            );
+        }
     }
 
     #[test]
@@ -1589,7 +1774,7 @@ mod tests {
                 "`{hotkey}` stands in for a global hotkey and must not raise the window: {commands:?}"
             );
         }
-        // Mixed with an option the Windows build knows, the original behaviour comes back.
+        // Mixed with an option about the window, the window comes up.
         assert!(
             parse(&["--next-preset", "--view=2"])
                 .commands()
@@ -1677,10 +1862,9 @@ mod tests {
     fn input_names_a_microphone_and_off_detaches_either_lane() {
         assert_eq!(
             parse(&["--input=alsa_input.usb-fifine"]).commands(),
-            vec![
-                Command::Input(DeviceCommand::Select("alsa_input.usb-fifine".to_owned())),
-                Command::Window(WindowCommand::Show),
-            ]
+            vec![Command::Input(DeviceCommand::Select(
+                "alsa_input.usb-fifine".to_owned()
+            ))]
         );
         for off in ["off", "OFF", "Off"] {
             assert!(
@@ -1878,14 +2062,13 @@ mod tests {
                 Command::Preset(PresetCommand::Select("Noisy Room".to_owned())),
                 Command::NoiseSuppression(NoiseSuppressionOverride::Strong),
                 Command::NumBands(15),
-                Command::Window(WindowCommand::Show),
             ]
         );
     }
 
     #[test]
-    fn the_new_hotkey_shaped_options_leave_the_window_alone_and_the_device_ones_raise_it() {
-        for hotkey in [
+    fn the_new_hotkey_shaped_options_leave_the_window_alone_and_so_do_the_device_ones() {
+        for quiet in [
             &["--next-input"][..],
             &["--noise-suppression=off"][..],
             &[
@@ -1893,27 +2076,98 @@ mod tests {
                 "--next-output",
                 "--noise-suppression=strong",
             ][..],
-        ] {
-            let commands = parse(hotkey).commands();
-            assert!(
-                !commands.iter().any(|c| matches!(c, Command::Window(_))),
-                "{hotkey:?} must not raise the window: {commands:?}"
-            );
-        }
-        for raising in [
             &["--input=Mic"][..],
             &["--edit=input"][..],
             &["--output=off"][..],
             &["--next-input", "--input=Mic"][..],
             &["--noise-suppression=off", "--edit=input"][..],
         ] {
+            let commands = parse(quiet).commands();
             assert!(
-                parse(raising)
-                    .commands()
-                    .contains(&Command::Window(WindowCommand::Show)),
-                "{raising:?} should raise the window"
+                !commands.iter().any(|c| matches!(c, Command::Window(_))),
+                "{quiet:?} must not raise the window: {commands:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_cold_start_keeps_an_explicit_show_and_drops_the_raise_of_a_bare_line() {
+        // `--show` overrides a remembered "start hidden"; a bare `fxsound`, which a desktop entry
+        // runs, and `--view` leave the choice to the setting (§7.1).
+        assert_eq!(
+            parse(&["--show"]).cold_start_commands(),
+            vec![Command::Window(WindowCommand::Show)]
+        );
+        assert!(parse(&[]).cold_start_commands().is_empty());
+        assert_eq!(
+            parse(&["--view=1"]).cold_start_commands(),
+            vec![Command::View(ViewMode::Lite)]
+        );
+        assert_eq!(
+            parse(&["--hide", "--show"]).cold_start_commands(),
+            vec![Command::Window(WindowCommand::Hide)],
+            "hiding wins, as it does for a running instance"
+        );
+    }
+
+    #[test]
+    fn language_takes_a_code_an_iso_code_a_locale_or_system() {
+        // 0.4.0 audit #28: `--language=uk` was saved, found no table, and showed the system's
+        // language without a word.
+        for (value, code) in [
+            ("fr", "fr"),
+            ("RU", "ru"),
+            ("pt-BR", "pt-br"),
+            ("zh-tw", "zh-TW"),
+            ("uk", "ua"),
+            ("bs", "ba"),
+            ("nb", "no"),
+            ("nn", "no"),
+            ("de_AT.UTF-8", "de"),
+            ("system", "system"),
+            ("Default", "system"),
+        ] {
+            assert_eq!(
+                parse(&[&format!("--language={value}")]).language.as_deref(),
+                Some(code),
+                "{value}"
+            );
+        }
+        for unknown in ["hu", "xx", "klingon", ""] {
+            let message = error(&[&format!("--language={unknown}")]);
+            assert!(
+                message.contains("no translation for") && message.contains("zh-TW"),
+                "{unknown}: {message}"
+            );
+        }
+        assert_eq!(
+            parse(&["--language=uk"]).commands(),
+            vec![Command::Language("ua".to_owned())]
+        );
+    }
+
+    #[test]
+    fn forget_device_names_a_device_and_is_left_to_main_at_a_cold_start() {
+        assert_eq!(
+            parse(&["--forget-device", "Old Dock"]).commands(),
+            vec![Command::ForgetDevice("Old Dock".to_owned())]
+        );
+        // Done to the settings file before the engine starts, not in step 4, where no device
+        // has been listed and it could only be refused.
+        assert_eq!(
+            parse(&["--forget_device=alsa_output.usb-dock"]).commands(),
+            vec![Command::ForgetDevice("alsa_output.usb-dock".to_owned())]
+        );
+        assert!(
+            parse(&["--forget_device=alsa_output.usb-dock"])
+                .cold_start_commands()
+                .is_empty()
+        );
+        assert_eq!(
+            parse(&["--forget-device=Old Dock", "--power=on"]).cold_start_commands(),
+            vec![Command::Power(PowerCommand::On)]
+        );
+        assert!(error(&["--forget-device="]).contains("a device name cannot be empty"));
     }
 
     #[test]
@@ -2070,7 +2324,7 @@ mod tests {
         }
         for (line, window) in [
             (
-                &["--app-preset=bf6.exe=Gaming", "--preset=Rock"][..],
+                &["--app-preset=bf6.exe=Gaming", "--view=2"][..],
                 WindowCommand::Show,
             ),
             (
@@ -2103,7 +2357,6 @@ mod tests {
                 Command::EditDirection(DeviceDirection::Output),
                 Command::Preset(PresetCommand::SaveAs("Night".to_owned())),
                 app_preset(DeviceDirection::Output, "bf6.exe", Some("Night")),
-                Command::Window(WindowCommand::Show),
             ]
         );
     }
