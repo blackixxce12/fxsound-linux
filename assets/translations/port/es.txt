@@ -115,3 +115,4 @@ countries: ar co es mx
 "Equalizer settings" = "Ajustes del ecualizador"
 "Effects" = "Efectos"
 "Right-click to reset" = "Clic derecho para restablecer"
+"Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+arrastrar para oír solo esta banda"

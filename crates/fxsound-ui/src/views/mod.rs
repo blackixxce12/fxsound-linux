@@ -507,6 +507,10 @@ pub(crate) mod testing {
         /// A screen taller than the window, for a test that needs a whole menu on it: the Lite
         /// window is 189 points tall, and a menu longer than that scrolls inside it.
         pub screen: Option<egui::Vec2>,
+        /// The modifier keys held from the next frame on.
+        pub modifiers: Modifiers,
+        /// The modifier keys egui was last told about.
+        held: Modifiers,
     }
 
     impl Harness {
@@ -521,6 +525,8 @@ pub(crate) mod testing {
                 assets: AssetCache::new(),
                 palette: Palette::new(mode),
                 screen: None,
+                modifiers: Modifiers::default(),
+                held: Modifiers::default(),
             }
         }
 
@@ -531,6 +537,11 @@ pub(crate) mod testing {
             events: Vec<Event>,
         ) -> (Vec<UiAction>, Vec<ClippedShape>) {
             let screen = self.screen.unwrap_or_else(|| window_size(state.view));
+            let mut events = events;
+            if self.modifiers != self.held {
+                events.insert(0, Event::ModifiersChanged(self.modifiers));
+                self.held = self.modifiers;
+            }
             let input = RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, screen)),
                 events,
@@ -543,6 +554,8 @@ pub(crate) mod testing {
                 assets,
                 palette,
                 screen: _,
+                modifiers: _,
+                held: _,
             } = self;
             let mut output = ctx.run_ui(input, |ui| {
                 actions = show(ui, state, scratch, *palette, assets).actions;
@@ -574,11 +587,12 @@ pub(crate) mod testing {
         ///
         /// egui hit-tests against the previous pass's rectangles, so a click takes three frames.
         pub fn click(&mut self, state: &UiState, pos: Pos2) -> Vec<UiAction> {
+            let modifiers = self.modifiers;
             let press = |pressed| Event::PointerButton {
                 pos,
                 button: PointerButton::Primary,
                 pressed,
-                modifiers: Modifiers::default(),
+                modifiers,
             };
             let mut actions = Vec::new();
             for events in [

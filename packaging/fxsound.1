@@ -653,8 +653,10 @@ is
 .BR balance " (dB) and " bands :
 an array of
 .BR index ", " frequency " (Hz), " gain " (dB), " min_frequency " and " max_frequency ,
-the range the band's frequency can be tuned over, which the Windows build
-leaves out.
+the range the window's wheel tunes the band's frequency over, which the
+Windows build leaves out. It is that build's wheel range, except that the first
+and last band reach half a band past the ladder's ends (46 Hz and 20 kHz on ten
+bands, where the Windows build stops at 62.5 Hz and 16 kHz).
 .TP
 .B apps
 Every application FxSound remembers, in the order

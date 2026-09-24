@@ -26,7 +26,7 @@ use fxsound_ui::{
         CalibrationAction, CalibrationView, ExportState, ImportState, ImportSummary,
         OverwriteChoice, PresetsAction,
     },
-    state::PresetEntry,
+    state::{EqSolo, PresetEntry},
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -550,6 +550,10 @@ pub struct App {
     /// When the unsaved edits are next due to be stashed in their autosaves ([`AUTOSAVE_INTERVAL`]
     /// after the first edit since the last time), or `None` while nothing has been edited since.
     autosave_due: Option<Instant>,
+    /// The equalizer band being soloed in the window and what the lane plays meanwhile, with the
+    /// lane it was started on ([`UiAction::SoloBand`]). Played, never stored: it is laid over the
+    /// snapshot on its way to the audio thread ([`App::played_params`]) and nowhere else.
+    solo: Option<(DeviceDirection, EqSolo)>,
     /// A `--output` or `--input` that arrived before the list did, waiting for it — at most one
     /// per lane, so `--output X --input Y` at login waits for both.
     pending_devices: Vec<PendingDevice>,
@@ -705,6 +709,7 @@ impl App {
             }),
             volume_save_due: None,
             autosave_due: None,
+            solo: None,
             pending_devices: Vec::new(),
             settings,
             presets,
@@ -1334,6 +1339,9 @@ impl App {
     fn handle_one(&mut self, action: UiAction) {
         match action {
             UiAction::TogglePower => {
+                // The window ends a solo when the power goes off; this ends it for a switch the
+                // window never saw, from the tray or the command line.
+                self.drop_solo();
                 self.state.power = !self.state.power;
                 self.settings.power = self.state.power;
                 self.settings_dirty = true;
@@ -1362,6 +1370,8 @@ impl App {
                 }
             }
             UiAction::ToggleView => {
+                // Lite has no equalizer to let go of a soloed band on.
+                self.end_solo();
                 self.state.view = match self.state.view {
                     ViewMode::Pro => ViewMode::Lite,
                     ViewMode::Lite => ViewMode::Pro,
@@ -1430,6 +1440,7 @@ impl App {
                     self.sync_params_from_state();
                 }
             }
+            UiAction::SoloBand(solo) => self.set_solo(solo),
             UiAction::SetEqEnabled(on) => {
                 self.state.eq_on = on;
                 self.mark_preset_modified();
@@ -1590,10 +1601,16 @@ impl App {
     /// half after each change. The music lane fits every preset onto the user's band count, so
     /// there it is a voice preset of another ladder that clears it.
     fn select_preset(&mut self, index: usize) {
-        let Some(entry) = self.state.presets.get(index) else {
+        let Some(name) = self
+            .state
+            .presets
+            .get(index)
+            .map(|entry| entry.name.clone())
+        else {
             return;
         };
-        let name = entry.name.clone();
+        // A solo was walking the old curve's bands; the new curve plays as it is.
+        self.drop_solo_on(self.state.direction);
         let lane = self.state.direction;
 
         if let Some(current) = self.state.preset()
@@ -2046,6 +2063,7 @@ impl App {
         if count == self.state.eq_bands.len() {
             return;
         }
+        self.drop_solo_on(self.state.direction);
         let new_ladder = ladder(count);
         let lane = self.state.direction;
         // Only the preset the list shows, unedited, and the one last read are the same curve: with
@@ -2119,6 +2137,102 @@ impl App {
         self.sync_params_from_state();
     }
 
+    /// Start, step or end the equalizer's solo (Ctrl+Alt+drag in the window, 0.4.0 audit R10).
+    ///
+    /// The solo is played and nothing else: the curve in [`UiState::eq_bands`], the preset's
+    /// modified mark, its autosave, `--status` and the settings file never see it. A solo that
+    /// does not fit the curve on screen — another band count — is refused, and the window's ends
+    /// with it.
+    fn set_solo(&mut self, solo: Option<EqSolo>) {
+        let asked = solo.is_some();
+        let solo = solo.filter(|solo| {
+            solo.band < self.state.eq_bands.len()
+                && solo.gains_db.len() == self.state.eq_bands.len()
+        });
+        if asked && solo.is_none() {
+            self.end_the_windows_solo();
+        }
+        let solo = solo.map(|solo| (self.state.direction, solo));
+        if solo != self.solo {
+            self.solo = solo;
+            self.sync_params_from_state();
+        }
+    }
+
+    /// Tell the window that the solo is over, whoever ended it: a solo it is still drawing ends
+    /// on its next frame ([`UiState::eq_solo_generation`]). The window's own `SoloBand(None)`
+    /// needs no telling.
+    fn end_the_windows_solo(&mut self) {
+        self.state.eq_solo_generation = self.state.eq_solo_generation.wrapping_add(1);
+    }
+
+    /// Forget the solo, for a reason of the application's own — the power, a new curve, another
+    /// lane, the window gone — and tell the window, which may still hold the button down on the
+    /// band. Whether there was one; the caller publishes.
+    fn drop_solo(&mut self) -> bool {
+        let dropped = self.solo.take().is_some();
+        if dropped {
+            self.end_the_windows_solo();
+        }
+        dropped
+    }
+
+    /// Forget a solo on `lane`, whose curve is being replaced; the caller publishes.
+    fn drop_solo_on(&mut self, lane: DeviceDirection) {
+        if self.solo.as_ref().is_some_and(|(on, _)| *on == lane) {
+            self.drop_solo();
+        }
+    }
+
+    /// End a solo the window cannot end itself: the window went away with the button still down,
+    /// or moved to the Lite view or to the other lane.
+    pub fn end_solo(&mut self) {
+        if self.drop_solo() {
+            self.sync_params_from_state();
+        }
+    }
+
+    /// The equalizer gains a lane plays: its snapshot's, with every band but the soloed one at
+    /// the solo's gain while one is soloed on that lane.
+    fn solo_gains(&self, lane: DeviceDirection, boosts: &mut [f32], live: usize) {
+        if let Some((on, solo)) = &self.solo
+            && *on == lane
+            && solo.gains_db.len() == live
+        {
+            for (band, (slot, &db)) in boosts.iter_mut().zip(&solo.gains_db).enumerate() {
+                if band != solo.band {
+                    *slot = db;
+                }
+            }
+        }
+    }
+
+    /// The speakers' snapshot as the audio thread gets it: [`App::params`] with a solo laid over.
+    #[must_use]
+    pub fn played_params(&self) -> DspParams {
+        let mut params = self.params;
+        let live = usize::from(params.num_bands).min(fxsound_core::eq::MAX_BANDS);
+        self.solo_gains(
+            DeviceDirection::Output,
+            &mut params.band_boost_db[..live],
+            live,
+        );
+        params
+    }
+
+    /// The microphone's snapshot as the audio thread gets it, a solo laid over.
+    #[must_use]
+    pub fn played_input_params(&self) -> InputDspParams {
+        let mut params = self.input_params;
+        let live = usize::from(params.num_bands).min(fxsound_core::eq::MAX_BANDS);
+        self.solo_gains(
+            DeviceDirection::Input,
+            &mut params.band_boost_db[..live],
+            live,
+        );
+        params
+    }
+
     /// Rebuild the DSP snapshot from the UI state and publish it.
     ///
     /// Called after every change rather than on a timer: publishing is wait-free, so there is no
@@ -2143,9 +2257,10 @@ impl App {
         apply_microphone_settings(&mut self.input_params, &self.input_voicing, &self.settings);
         self.reflect_input_params();
 
+        let (params, input_params) = (self.played_params(), self.played_input_params());
         if let Some(engine) = self.engine.as_mut() {
-            engine.set_params(self.params);
-            engine.set_input_params(self.input_params);
+            engine.set_params(params);
+            engine.set_input_params(input_params);
         }
         // An application's route shares what every chain of its lane shares — the power, the
         // speakers' levels and band count, the microphone settings, the sleep — so it follows
@@ -2333,6 +2448,8 @@ impl App {
             }
             return false;
         }
+        // The window's solo was on the lane it no longer shows.
+        self.end_solo();
         self.settings.set_edit_direction(direction);
         self.settings_dirty = true;
         self.show_lane(direction);
@@ -2799,6 +2916,7 @@ impl App {
             preset_device: [None, None],
             volume_save_due: None,
             autosave_due: None,
+            solo: None,
             pending_devices: Vec::new(),
             settings: Settings::default(),
             presets: PresetStore::with_dirs(
@@ -8028,6 +8146,398 @@ mod tests {
         let _ = engine.take_sent();
         let _ = engine.take_events();
         (app, engine, dir)
+    }
+
+    /// A solo of `band` with every other band at `db`, on a curve of `count` bands.
+    fn solo_of(band: usize, count: usize, db: f32) -> Option<EqSolo> {
+        Some(EqSolo {
+            band,
+            gains_db: vec![db; count],
+        })
+    }
+
+    fn played_gains(params: &DspParams) -> Vec<f32> {
+        params.bands().1.to_vec()
+    }
+
+    #[test]
+    fn a_solo_is_played_and_never_reaches_the_curve_or_the_preset() {
+        // 0.4.0 audit R10: `FxEqualizer.cpp:123-210` walks the other bands through the
+        // controller, which marks the preset modified; here the walk is only played.
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        let curve = app.state.eq_bands.clone();
+        let snapshot = *app.params();
+        let preset = app.state.preset().cloned().expect("Beta is selected");
+        assert!(!preset.modified);
+
+        app.handle(&[UiAction::SoloBand(solo_of(3, 10, -7.0))]);
+        let played = played_gains(&engine.params().expect("published"));
+        for (band, &db) in played.iter().enumerate() {
+            let wanted = if band == 3 { curve[3].boost_db } else { -7.0 };
+            assert_eq!(db, wanted, "band {band}");
+        }
+        assert_eq!(app.state.eq_bands, curve, "the curve on screen");
+        assert_eq!(
+            *app.params(),
+            snapshot,
+            "the snapshot the rest of the app reads"
+        );
+        assert_eq!(app.state.preset(), Some(&preset), "not marked modified");
+        assert!(app.autosave_due.is_none(), "nothing to stash");
+        assert!(!app.settings_dirty, "nothing to save");
+
+        // Letting go plays the curve again.
+        app.handle(&[UiAction::SoloBand(None)]);
+        assert_eq!(engine.params(), Some(snapshot));
+        assert_eq!(app.state.preset(), Some(&preset));
+    }
+
+    #[test]
+    fn moving_the_soloed_band_is_an_edit_and_is_heard_at_once() {
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        app.handle(&[
+            UiAction::SoloBand(solo_of(2, 10, -10.0)),
+            UiAction::SetBandGain(2, 6.0),
+        ]);
+        let played = played_gains(&engine.params().expect("published"));
+        assert_eq!(played[2], 6.0);
+        assert!(
+            played
+                .iter()
+                .enumerate()
+                .all(|(band, &db)| band == 2 || db == -10.0)
+        );
+        assert!(
+            app.state.preset().expect("selected").modified,
+            "a drag is an edit"
+        );
+        assert_eq!(app.state.eq_bands[2].boost_db, 6.0);
+        assert_eq!(app.state.eq_bands[0].boost_db, 0.0, "the walk is not");
+
+        app.handle(&[UiAction::SoloBand(None)]);
+        let played = played_gains(&engine.params().expect("published"));
+        assert_eq!(played[2], 6.0);
+        assert_eq!(played[0], 0.0);
+    }
+
+    #[test]
+    fn a_solo_ends_with_its_curve_its_lane_the_power_the_view_or_the_window() {
+        /// What ends it, and how.
+        type End = (&'static str, fn(&mut App));
+        let ends: [End; 7] = [
+            ("the edit direction", |app| {
+                app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
+            }),
+            ("a preset", |app| {
+                let at = app
+                    .state
+                    .presets
+                    .iter()
+                    .position(|p| p.name == "Alpha")
+                    .expect("listed");
+                app.handle(&[UiAction::SelectPreset(at)]);
+            }),
+            ("a band count", |app| {
+                app.handle(&[UiAction::SetBandCount(15)])
+            }),
+            ("the power", |app| app.handle(&[UiAction::TogglePower])),
+            ("the view", |app| app.handle(&[UiAction::ToggleView])),
+            ("the window", App::end_solo),
+            ("the window's word", |app| {
+                app.handle(&[UiAction::SoloBand(None)])
+            }),
+        ];
+        for (what, end) in ends {
+            let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+            app.handle(&[UiAction::SoloBand(solo_of(4, 10, -10.0))]);
+            let generation = app.state.eq_solo_generation;
+            end(&mut app);
+            // And the window hears of each but its own, so it lets go of a button still held.
+            assert_eq!(
+                app.state.eq_solo_generation != generation,
+                what != "the window's word",
+                "{what}"
+            );
+            // The speakers play their curve again: the snapshot's, which is the window's unless
+            // the window has moved to the microphone.
+            let played = played_gains(&engine.params().expect("published"));
+            assert_eq!(played, played_gains(app.params()), "{what}");
+            assert!(played.iter().all(|&db| db != -10.0), "{what}: {played:?}");
+            assert_eq!(engine.params(), Some(app.played_params()), "{what}");
+            assert!(app.solo.is_none(), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_solo_that_does_not_fit_the_curve_is_not_played() {
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        let before = engine.publications();
+        app.handle(&[
+            UiAction::SoloBand(solo_of(3, 15, -10.0)),
+            UiAction::SoloBand(solo_of(10, 10, -10.0)),
+        ]);
+        assert_eq!(engine.publications(), before, "nothing new to play");
+        assert!(app.solo.is_none());
+    }
+
+    #[test]
+    fn a_solo_on_the_microphone_is_played_on_the_microphone() {
+        let (mut app, engine, _dir) = started_with(saved_settings(IN));
+        let speakers = engine.params();
+        let count = app.state.eq_bands.len();
+        app.handle(&[UiAction::SoloBand(solo_of(0, count, -9.0))]);
+        let voice = engine.input_params().expect("published");
+        let (_, gains) = voice.bands();
+        assert!(gains.iter().skip(1).all(|&db| db == -9.0), "{gains:?}");
+        assert_eq!(engine.params(), speakers, "the speakers play their curve");
+        assert!(!app.state.preset().expect("Loud").modified);
+    }
+
+    /// The Pro window `main` opens, on an application, with frames driven by hand: each frame
+    /// draws the view from the application's state and hands what the user did back to it, as
+    /// `Shell::ui` does.
+    struct Window {
+        ctx: eframe::egui::Context,
+        scratch: fxsound_ui::views::ViewScratch,
+    }
+
+    impl Window {
+        const CTRL_ALT: eframe::egui::Modifiers = eframe::egui::Modifiers {
+            alt: true,
+            ctrl: true,
+            shift: false,
+            mac_cmd: false,
+            command: true,
+        };
+
+        fn new(app: &mut App) -> Self {
+            let ctx = eframe::egui::Context::default();
+            ctx.set_fonts(fxsound_ui::theme::font_definitions());
+            let mut window = Self {
+                ctx,
+                scratch: fxsound_ui::views::ViewScratch::new(),
+            };
+            window.frame(app, Vec::new());
+            window.frame(app, Vec::new());
+            window
+        }
+
+        fn frame(&mut self, app: &mut App, events: Vec<eframe::egui::Event>) {
+            use eframe::egui::{Pos2, RawInput, Rect};
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    Pos2::ZERO,
+                    fxsound_ui::views::window_size(app.state.view),
+                )),
+                events,
+                ..RawInput::default()
+            };
+            let palette = app.palette();
+            let mut actions = Vec::new();
+            self.ctx
+                .run_ui(input, |ui| {
+                    actions = fxsound_ui::views::pro::show(
+                        ui,
+                        &app.state,
+                        &mut self.scratch,
+                        palette,
+                        &mut app.assets,
+                    )
+                    .actions;
+                })
+                .drop_without_applying_deltas();
+            app.handle(&actions);
+        }
+
+        /// Ctrl+Alt and the button down on `band`'s thumb, and held there from then on.
+        fn solo(&mut self, app: &mut App, band: usize) {
+            use eframe::egui::{Event, PointerButton, pos2};
+            use fxsound_ui::widgets::equalizer::EqLayout;
+            let layout = EqLayout::new(app.state.eq_bands.len());
+            let at = fxsound_ui::layout::pro::equalizer().min
+                + pos2(
+                    layout.center_x(band),
+                    layout.gain_to_y(app.state.eq_bands[band].boost_db),
+                )
+                .to_vec2();
+            self.frame(app, vec![Event::PointerMoved(at)]);
+            self.frame(
+                app,
+                vec![
+                    Event::ModifiersChanged(Self::CTRL_ALT),
+                    Event::PointerMoved(at),
+                    Event::PointerButton {
+                        pos: at,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Self::CTRL_ALT,
+                    },
+                ],
+            );
+        }
+
+        /// What the window draws every band at.
+        fn drawn(&self) -> Vec<f32> {
+            self.scratch.eq.drawn_gains().to_vec()
+        }
+    }
+
+    /// The curve on screen, band by band.
+    fn curve_gains(app: &App) -> Vec<f32> {
+        app.state
+            .eq_bands
+            .iter()
+            .map(|band| band.boost_db)
+            .collect()
+    }
+
+    #[test]
+    fn a_preset_a_band_count_or_a_lane_from_outside_ends_a_held_solo_in_the_window_and_the_sound_alike()
+     {
+        // The verifier's finding on R10: with the button still down, a preset picked in the tray
+        // ended the solo in the application but not in the window. Once the walk had reached the
+        // floor the new curve walked to the same -10 dB everywhere, so the window sent nothing
+        // new and went on drawing a solo while the speakers played the whole new curve; before
+        // it had, the window carried the solo on over the new curve, onto the other lane even.
+        /// What comes from outside the window, and which lane the window shows after it.
+        type Outside = (&'static str, fn(&mut App), DeviceDirection);
+        let outside: [Outside; 3] = [
+            (
+                "a preset from the tray",
+                |app| {
+                    let at = app
+                        .state
+                        .presets
+                        .iter()
+                        .position(|p| p.name == "Alpha")
+                        .expect("listed");
+                    app.handle(&[UiAction::SelectPreset(at)]);
+                },
+                OUT,
+            ),
+            (
+                "a band count from the command line",
+                |app| app.handle(&[UiAction::SetBandCount(15)]),
+                OUT,
+            ),
+            (
+                "the microphone from D-Bus",
+                |app| app.handle(&[UiAction::SetEditDirection(IN)]),
+                IN,
+            ),
+        ];
+        // A few steps into the walk, and past the 22 a band at +12 dB takes to the floor.
+        for frames in [6, 50] {
+            for (what, from_outside, lane) in outside {
+                let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+                app.handle(&[
+                    UiAction::SetBandGain(0, 12.0),
+                    UiAction::SetBandGain(4, 5.0),
+                    UiAction::SetBandGain(7, -4.0),
+                ]);
+                let mut window = Window::new(&mut app);
+                window.solo(&mut app, 4);
+                for _ in 0..frames {
+                    window.frame(&mut app, Vec::new());
+                }
+                assert_eq!(window.scratch.eq.soloed_band(), Some(4), "{what}");
+                let played = played_gains(&engine.params().expect("published"));
+                assert_eq!(window.drawn(), played, "{what}: the solo as it is heard");
+                if frames == 50 {
+                    assert!(
+                        played
+                            .iter()
+                            .enumerate()
+                            .all(|(band, &db)| band == 4 || db == -10.0),
+                        "{what}: on the floor: {played:?}"
+                    );
+                }
+
+                from_outside(&mut app);
+                let loaded = curve_gains(&app);
+                for _ in 0..3 {
+                    window.frame(&mut app, Vec::new());
+                }
+                assert_eq!(
+                    curve_gains(&app),
+                    loaded,
+                    "{what} after {frames}: holding the band still is no edit to the new curve"
+                );
+                assert_eq!(
+                    window.scratch.eq.soloed_band(),
+                    None,
+                    "{what} after {frames}"
+                );
+                assert!(app.solo.is_none(), "{what} after {frames}");
+                let played = match lane {
+                    DeviceDirection::Output => played_gains(&engine.params().expect("published")),
+                    DeviceDirection::Input => {
+                        engine.input_params().expect("published").bands().1.to_vec()
+                    }
+                };
+                assert_eq!(app.state.direction, lane, "{what}");
+                assert_eq!(
+                    window.drawn(),
+                    played,
+                    "{what} after {frames}: the window draws what is heard"
+                );
+                assert_eq!(
+                    played,
+                    curve_gains(&app),
+                    "{what} after {frames}: the whole curve"
+                );
+                assert_eq!(
+                    engine.params(),
+                    Some(app.played_params()),
+                    "{what} after {frames}"
+                );
+                assert_eq!(
+                    played_gains(&engine.params().expect("published")),
+                    played_gains(app.params()),
+                    "{what} after {frames}: no solo left on the speakers"
+                );
+                if !what.starts_with("a band count") {
+                    assert!(
+                        !app.state.preset().expect("selected").modified,
+                        "{what} after {frames}: nor to its preset"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_application_tells_the_window_each_time_it_ends_a_solo_and_only_then() {
+        let (mut app, _engine, _dir) = started_with(saved_settings(OUT));
+        let at_start = app.state.eq_solo_generation;
+        app.handle(&[
+            UiAction::SoloBand(solo_of(4, 10, -10.0)),
+            UiAction::SoloBand(solo_of(4, 10, -9.0)),
+            UiAction::SoloBand(None),
+        ]);
+        assert_eq!(
+            app.state.eq_solo_generation, at_start,
+            "the window's own steps and its own letting go need no telling"
+        );
+        app.handle(&[UiAction::SelectPreset(0), UiAction::TogglePower]);
+        assert_eq!(
+            app.state.eq_solo_generation, at_start,
+            "nor does anything with no solo on"
+        );
+
+        app.handle(&[
+            UiAction::TogglePower,
+            UiAction::SoloBand(solo_of(4, 10, -10.0)),
+            UiAction::SelectPreset(1),
+        ]);
+        assert_eq!(app.state.eq_solo_generation, at_start + 1, "a preset");
+        app.handle(&[UiAction::SoloBand(solo_of(4, 15, -10.0))]);
+        assert_eq!(
+            app.state.eq_solo_generation,
+            at_start + 2,
+            "a solo the curve cannot take is refused, and the window hears so"
+        );
+        assert!(app.solo.is_none());
     }
 
     /// The engine's own words for a lane attached to `node_name`, or to nothing.

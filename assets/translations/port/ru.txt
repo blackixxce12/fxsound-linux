@@ -116,3 +116,4 @@ countries: ru
 "Equalizer settings" = "Настройки эквалайзера"
 "Effects" = "Эффекты"
 "Right-click to reset" = "Правый щелчок — сброс"
+"Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+перетаскивание — слушать только эту полосу"

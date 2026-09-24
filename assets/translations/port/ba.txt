@@ -115,3 +115,4 @@ countries: ba
 "Equalizer settings" = "Postavke ekvilajzera"
 "Effects" = "Efekti"
 "Right-click to reset" = "Desni klik za resetovanje"
+"Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+prevlačenje za slušanje samo ovog opsega"

@@ -117,3 +117,4 @@ countries: sl
 "Equalizer settings" = "Nastavitve izenačevalnika"
 "Effects" = "Učinki"
 "Right-click to reset" = "Desni klik za ponastavitev"
+"Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+vlečenje za poslušanje samo tega pasu"

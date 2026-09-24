@@ -126,8 +126,13 @@ pub fn derive_q(min_hz: f64, max_hz: f64, num_bands: usize, q_multiplier: Real) 
     q
 }
 
-/// The half-step geometric edges the GUI uses as each band's frequency slider range
+/// The half-step geometric edges the Windows GUI uses as each band's frequency slider range
 /// (`GraphicEqGet.cpp:105-168`), including the asymmetric `+1` / `+10` nudge on the low edge.
+///
+/// The Windows range, which a `.fac` for Windows is held to. The window's wheels reach half a band
+/// further at both ends of the ladder (audit report R6,
+/// [`fxsound_core::eq::band_frequency_range`]); the equalizer takes any centre from
+/// [`MIN_BAND_FREQ_HZ`] to [`MAX_BAND_FREQ_HZ`] either way.
 #[must_use]
 pub fn band_frequency_range(
     band: usize,
@@ -135,33 +140,7 @@ pub fn band_frequency_range(
     min_hz: Real,
     max_hz: Real,
 ) -> (Real, Real) {
-    if num_bands <= 1 {
-        return (min_hz, max_hz);
-    }
-    let ratio = f64::from(max_hz) / f64::from(min_hz);
-    let denominator = (num_bands * 2 - 2) as f64;
-    let one_based = band + 1;
-
-    let low = if band == 0 {
-        min_hz
-    } else {
-        let exponent = ((one_based as f64 - 1.0) * 2.0 - 1.0) / denominator;
-        let edge = (f64::from(min_hz) * ratio.powf(exponent)).round() as Real;
-        if edge < 1000.0 {
-            edge + 1.0
-        } else {
-            edge + 10.0
-        }
-    };
-
-    let high = if one_based == num_bands {
-        max_hz
-    } else {
-        let exponent = (one_based as f64 * 2.0 - 1.0) / denominator;
-        (f64::from(min_hz) * ratio.powf(exponent)).round() as Real
-    };
-
-    (low, high)
+    fxsound_core::eq::windows_band_range(band, num_bands, min_hz, max_hz)
 }
 
 /// The ladder a band count gets when nothing else supplies one: the table for the counts that have
@@ -1300,6 +1279,68 @@ mod tests {
             if band + 1 < n {
                 let (next_low, _) = eq.band_range(band + 1);
                 assert!(next_low > high, "band {band} overlaps its successor");
+            }
+        }
+    }
+
+    #[test]
+    fn the_tables_edges_are_the_ones_the_window_works_the_tuning_ranges_out_from() {
+        // `fxsound_core::eq::ladder_edges_hz` is a copy, for crates that run no engine.
+        for count in [5, 10, 15, 20, 31] {
+            let (_, low, high) = band_table(count).expect("a table count");
+            assert_eq!(
+                fxsound_core::eq::ladder_edges_hz(count),
+                Some((low, high)),
+                "{count} bands"
+            );
+        }
+        for count in [0, 1, 7, 12, 32] {
+            assert!(band_table(count).is_none());
+            assert!(fxsound_core::eq::ladder_edges_hz(count).is_none());
+        }
+    }
+
+    #[test]
+    fn an_end_band_tuned_past_the_ladders_edge_still_designs_its_peak_there() {
+        // Audit report R6: the window tunes band 1 of ten down to 46 Hz (31 Hz on five) and the
+        // last band up to 20 kHz. Every one of those designs a finite section whose peak sits on
+        // the frequency it was tuned to. (Five bands have Q 1, so the top band's bell is broad,
+        // and broader still near Nyquist: at 20 kHz and 44.1 kHz it lifts 4 kHz by 4.8 dB.)
+        for rate in [44_100.0, 48_000.0, 96_000.0] {
+            for count in [5_usize, 10] {
+                let (low, _) = fxsound_core::eq::band_frequency_range(0, count);
+                let (_, high) = fxsound_core::eq::band_frequency_range(count - 1, count);
+                for (band, hz) in [(0, low), (count - 1, high)] {
+                    let mut centres = standard_centres(count);
+                    centres[band] = hz;
+                    let mut gains = vec![0.0; count];
+                    gains[band] = 6.0;
+                    let mut eq = GraphicEq::new();
+                    eq.set_sample_rate(rate);
+                    eq.set_bands(&centres, &gains);
+                    assert_eq!(eq.center_frequencies()[band], hz, "taken as it is");
+                    let peak = eq.response_db(hz);
+                    assert!(
+                        (peak - 6.0).abs() < 0.05,
+                        "{count} bands at {rate} Hz: {hz} Hz peaks at {peak} dB"
+                    );
+                    // A band an octave in from the peak is below it, and the far end of the
+                    // spectrum is not touched.
+                    let inward = if band == 0 { hz * 2.0 } else { hz / 2.0 };
+                    assert!(eq.response_db(inward) < peak, "{hz} Hz is not the peak");
+                    let far = if band == 0 { 8000.0 } else { 100.0 };
+                    let untouched = eq.response_db(far);
+                    assert!(untouched.abs() < 0.05, "{far} Hz moved to {untouched} dB");
+
+                    let mut tone: Vec<Real> = (0..8192)
+                        .flat_map(|n| {
+                            let s = (n as Real * hz * std::f32::consts::TAU / rate).sin() * 0.25;
+                            [s, s]
+                        })
+                        .collect();
+                    eq.process(&mut tone, 2);
+                    assert!(tone.iter().all(|s| s.is_finite() && s.abs() < 1.0));
+                }
             }
         }
     }

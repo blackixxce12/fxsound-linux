@@ -121,9 +121,15 @@ impl PresetFile for Preset {
     /// A twenty-band curve on the half-octave ladder is exported on the Windows one, band for
     /// band, which is what the Windows build tunes twenty bands to; this port moves it back when
     /// it reads it ([`fxsound_core::eq::move_off_the_windows_twenty_band_ladder`]).
+    ///
+    /// Then the first and last band go back inside the ladder's edges (0.4.0 audit R6): here they
+    /// can be tuned half a band past them, where the Windows build's wheels cannot follow, so a
+    /// first band at 46 Hz is exported at 62.5 Hz. Nothing else moves, so a preset Windows made
+    /// goes back out as it came. Importing takes a file as it is, wider centres and all.
     fn exported(&self) -> Self {
         let mut preset = self.clone();
         fxsound_core::eq::move_onto_the_windows_twenty_band_ladder(&mut preset.eq_bands);
+        fxsound_core::eq::move_end_bands_back_inside_the_ladder(&mut preset.eq_bands);
         preset
     }
 }
@@ -1489,6 +1495,98 @@ mod tests {
         store.save_as(&ten, "Ten").expect("save ten");
         let path = store.export("Ten", &out).expect("export ten");
         assert_eq!(crate::load(&path).expect("load").eq_bands, ten.eq_bands);
+    }
+
+    #[test]
+    fn end_bands_tuned_past_the_windows_ranges_are_exported_inside_them() {
+        // 0.4.0 audit R6: here band 1 of ten reaches down to 46 Hz and band 10 up to 20 kHz; the
+        // Windows build's wheels stop at 62.5 Hz and 16 kHz.
+        let tmp = tempdir("export-wide-ends");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let mut wide = Preset {
+            name: "Wide".into(),
+            ..Preset::default()
+        };
+        wide.eq_bands[0] = fxsound_core::EqBand::new(46.0, 6.0);
+        wide.eq_bands[9] = fxsound_core::EqBand::new(20000.0, -3.0);
+        let saved = store.save_as(&wide, "Wide").expect("save");
+        assert_eq!(
+            crate::load(&saved).expect("load").eq_bands,
+            wide.eq_bands,
+            "the user's own file keeps where the bands were tuned"
+        );
+
+        let path = store.export("Wide", &tmp.join("out")).expect("export");
+        let exported = crate::load(&path).expect("parse the export");
+        assert_eq!(exported.eq_bands[0], fxsound_core::EqBand::new(62.5, 6.0));
+        assert_eq!(
+            exported.eq_bands[9],
+            fxsound_core::EqBand::new(16000.0, -3.0)
+        );
+        assert_eq!(
+            exported.eq_bands[1..9],
+            wide.eq_bands[1..9],
+            "the rest as it is"
+        );
+    }
+
+    #[test]
+    fn importing_keeps_a_centre_outside_the_windows_ranges() {
+        // The wider end bands are read back as they are: an import is not an export.
+        let tmp = tempdir("import-wide-ends");
+        let mut wide = Preset {
+            name: "Wide".into(),
+            ..Preset::default()
+        };
+        wide.eq_bands[0].center_hz = 46.0;
+        wide.eq_bands[9].center_hz = 20000.0;
+        let source = tmp.join("Wide.fac");
+        crate::save(&wide, &source).expect("write the source");
+
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        store.rescan();
+        let name = store.import(&source).expect("import");
+        let entry = store.find(&name).expect("listed");
+        assert_eq!(
+            crate::load(&entry.path).expect("load").eq_bands,
+            wide.eq_bands
+        );
+    }
+
+    #[test]
+    fn a_shipped_preset_is_exported_as_it_came_unless_its_first_band_is_below_the_ladder() {
+        // Every preset the Windows build ships starts at 62.5 Hz and ends at or below 16 kHz, where
+        // its wheels stop, and goes back out exactly as it came. Two this port revoiced reach
+        // lower, and a `.fac` for Windows carries their first band at 62.5 Hz (0.4.0 audit R6).
+        let tmp = tempdir("export-shipped");
+        let store = store_in(&tmp);
+        assert!(store.entries().len() > 30, "the factory presets are there");
+        let out = tmp.join("out");
+        let mut moved = Vec::new();
+        for entry in store.entries() {
+            let original = crate::load(&entry.path).expect("load a shipped preset");
+            let path = store.export(&entry.name, &out).expect("export");
+            let exported = crate::load(&path).expect("parse the export");
+            if exported.eq_bands == original.eq_bands {
+                continue;
+            }
+            moved.push(entry.name.clone());
+            assert!(original.eq_bands[0].center_hz < 62.5, "{}", entry.name);
+            assert_eq!(exported.eq_bands[0].center_hz, 62.5, "{}", entry.name);
+            assert_eq!(
+                exported.eq_bands[0].boost_db, original.eq_bands[0].boost_db,
+                "{}",
+                entry.name
+            );
+            assert_eq!(
+                exported.eq_bands[1..],
+                original.eq_bands[1..],
+                "{}",
+                entry.name
+            );
+        }
+        moved.sort();
+        assert_eq!(moved, ["Competitive FPS", "Trap"]);
     }
 
     #[test]

@@ -115,3 +115,4 @@ countries: Taiwan
 "Equalizer settings" = "等化器設定"
 "Effects" = "音效"
 "Right-click to reset" = "按右鍵以重設"
+"Ctrl+Alt+drag to hear this band alone" = "按住 Ctrl+Alt 拖曳以單獨聆聽此頻段"

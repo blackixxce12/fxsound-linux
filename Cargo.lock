@@ -1404,6 +1404,7 @@ dependencies = [
  "eframe",
  "egui",
  "fxsound-core",
+ "fxsound-dsp",
  "log",
  "resvg",
  "tiny-skia",

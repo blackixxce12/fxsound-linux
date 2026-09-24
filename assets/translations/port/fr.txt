@@ -118,3 +118,4 @@ countries: fr
 "Equalizer settings" = "Paramètres de l'égaliseur"
 "Effects" = "Effets"
 "Right-click to reset" = "Clic droit pour réinitialiser"
+"Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+glisser pour n'écouter que cette bande"

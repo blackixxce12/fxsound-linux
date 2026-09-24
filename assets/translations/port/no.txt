@@ -120,3 +120,4 @@ countries: no
 "Equalizer settings" = "Equalizer-innstillinger"
 "Effects" = "Effekter"
 "Right-click to reset" = "Høyreklikk for å tilbakestille"
+"Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+dra for å høre bare dette båndet"

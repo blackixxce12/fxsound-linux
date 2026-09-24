@@ -12,6 +12,7 @@
 //! cargo run -p fxsound-ui --example preview -- --lite
 //! cargo run -p fxsound-ui --example preview -- --input --lang=de
 //! cargo run -p fxsound-ui --example preview -- --levels --eq-off
+//! cargo run -p fxsound-ui --example preview -- --curve
 //! cargo run -p fxsound-ui --example preview -- --apps --light
 //! cargo run -p fxsound-ui --example preview -- --stored
 //! cargo run -p fxsound-ui --example preview -- --lang=de --message
@@ -20,7 +21,8 @@
 //!
 //! Flags: `--light`, `--input` (edit the microphone lane), `--lite`, `--notice[=TEXT]`,
 //! `--detached` (both lanes off), `--levels` (start with the effect column turned over to the
-//! equalizer's controls), `--eq-off` (the equalizer switched off), `--power-off`, `--stored` (the
+//! equalizer's controls), `--eq-off` (the equalizer switched off), `--curve` (a curve of boosts and
+//! cuts rather than a flat one, to see the response drawn), `--power-off`, `--stored` (the
 //! effects as a Windows preset stores them, between the sliders' positions), `--lang=CODE`
 //! (one of the translation tables' codes; English otherwise), `--apps[=empty]` (Settings ▸
 //! Applications over a made-up list of applications, or none), `--settings=TAB` (Settings on
@@ -69,6 +71,12 @@ fn main() -> eframe::Result<()> {
     }
     if flag("--eq-off") {
         state.eq_on = false;
+    }
+    if flag("--curve") {
+        let gains = [4.0, 6.0, 2.0, -2.0, -5.0, -1.0, 2.0, 7.0, 3.0, -3.0];
+        for (band, gain) in state.eq_bands.iter_mut().zip(gains) {
+            band.boost_db = gain;
+        }
     }
     if flag("--power-off") {
         state.power = false;
@@ -397,6 +405,13 @@ impl Preview {
                     slot.boost_db = *gain;
                 }
             }
+            UiAction::SetBandFrequency(band, hz) => {
+                if let Some(slot) = self.state.eq_bands.get_mut(*band) {
+                    slot.center_hz = *hz;
+                }
+            }
+            // The solo is heard, not stored: the window draws the walk itself.
+            UiAction::SoloBand(_) => {}
             UiAction::SetBandCount(count) => self.set_band_count(*count),
             UiAction::SetMasterGain(db) => self.state.master_gain_db = *db,
             UiAction::SetVolumeLeveling(amount) => self.state.volume_leveling = *amount,

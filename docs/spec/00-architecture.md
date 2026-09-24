@@ -76,14 +76,15 @@ fxsound-linux/
     ├── fxsound-dsp      core                                          [WRITTEN except leveling + ambience]
     ├── fxsound-preset   core                                          [WRITTEN]
     ├── fxsound-audio    core + dsp + pipewire                         [EMPTY]
-    ├── fxsound-ui       core + egui + resvg                           [theme/layout/assets/state/slider WRITTEN]
+    ├── fxsound-ui       core + dsp (EQ response, D-27) + egui + resvg [theme/layout/assets/state/slider WRITTEN]
     └── fxsound-app      all of the above + eframe/ksni/notify-rust/rfd/clap   [EMPTY]
 ```
 
 Dependency edges are acyclic and deliberately narrow: **`fxsound-ui` must never depend on
 `fxsound-audio`, `fxsound-preset` or `pipewire`.** It renders a `UiState` and returns a
-`UiResponse`; that is what makes it testable headless. **`fxsound-dsp` must never depend on
-`pipewire`.** It is a pure `&mut [f32]` transformer.
+`UiResponse`; that is what makes it testable headless. It does use `fxsound-dsp`, a pure library,
+for one thing: the equalizer curve is drawn from the audio thread's own filter designs (D-27).
+**`fxsound-dsp` must never depend on `pipewire`.** It is a pure `&mut [f32]` transformer.
 
 ### 2.2 What is already written and is a fixed contract
 
@@ -583,7 +584,7 @@ PipeWire's data-thread naming convention, run for 10 minutes under load (Phase 2
 | `GUI/FxAudioControls.{h,cpp}` | 168×257 two-faced card, 5 effect sliders, 4 level sliders, flip, restore | `fxsound-ui::view::controls`, `layout::audio_controls` | `layout` [W], view P3 |
 | `GUI/FxAudioSlider.{h,cpp}` | value-label slider | `fxsound-ui::widgets::slider::FxSlider` | [W] |
 | `GUI/FxBalanceSlider.{h,cpp}` | two-sided gradient track | `fxsound-ui::widgets::FxBalanceSlider` | P3 |
-| `GUI/FxEqualizer.{h,cpp}` | band layout, curve, alt-solo, tooltips | `fxsound-ui::view::equalizer` + `widgets::{FxVerticalSlider,FxRotary}` | P3 |
+| `GUI/FxEqualizer.{h,cpp}` | band layout, curve, solo (Ctrl+Alt here, D-19), tooltips | `fxsound-ui::view::equalizer` + `widgets::{FxVerticalSlider,FxRotary}` | P3 |
 | `GUI/FxVisualizer.{h,cpp}` | 960×120, 100 bars, mirrored history, gradient | `fxsound-ui::widgets::visualizer` | P3 |
 | `GUI/FxPowerButton.{h,cpp}` | 24×24 two-state | `fxsound-ui::widgets::FxPowerButton` | P3 |
 | `GUI/FxComboBox.{h,cpp}` | themed combo, error outline, lazy popup | `fxsound-ui::widgets::FxComboBox` | P3 |
@@ -950,13 +951,15 @@ against upstream does not "restore" them.
 | D-16 | `user_selected_playback` read in four places, never written | `docs/spec/12-audio-io.md:1716-1721` | `set_output` writes it |
 | D-17 | `savePreset("")` can shadow a factory preset into the user dir | `docs/spec/05-controller-model.md:706-708` | Invariant asserted inside the function |
 | D-18 | N=31 EQ columns overlap by 8 px; "last child wins" | `docs/spec/04-equalizer-visualizer.md:1386-1390` | Interactive width clamped to `min(32, col_w)` |
-| D-19 | Alt+drag "solo" collides with the compositor's window-move gesture | `docs/spec/04-equalizer-visualizer.md:1437-1439` | Rebound to Ctrl+Alt+drag, and surfaced with a per-band affordance |
+| D-19 | Alt+drag "solo" (`FxEqualizer.cpp:123-210`) collides with the compositor's window-move gesture, and its walk goes through the controller, which marks the preset modified | `docs/spec/04-equalizer-visualizer.md` §A16, `:1437-1439` | Built on Ctrl+Alt+drag (0.4.0 audit R10): every other band walks to −10 dB a decibel per 1/30 s and the curve comes back on release, as upstream; the walk is only played (`UiAction::SoloBand`, laid over the snapshot by `App::played_params`), never written to the curve, the preset or its modified mark; the press itself does not move the band; the application holds the one solo, and whatever ends it there — a preset, a band count or a lane from outside the window with the button still down — ends it in the window too (`UiState::eq_solo_generation`); every band's tooltip names the gesture |
 | D-20 | Master Gain and Balance step by 2 dB while the controller and CLI round to 1 (audit #22) | `docs/spec/03-controls.md` §5.2 | Step 1 dB |
 | D-21 | Light theme: `withSaturation(0)` turns the power-off spectrum and a bypassed EQ white on `#e0e0e0` (audit #24) | `FxVisualizer.cpp:177-199` | `Palette::greyed`: luma, no lighter than `#767676`, in the light theme |
 | D-22 | Light `Outline` `#fafafa` is invisible as the Settings rule and the menu's edge (audit #25) | `FxTheme.cpp:26` | `Palette::divider`: `#c0c0c0` in the light theme |
 | D-23 | The lit slider thumb fitted by its 64×64 viewBox, a quarter of its size (audit #40) | `docs/spec/02-theme.md` §4.4 | Rasterised by its ink, 16×16 |
 | D-24 | Effect values and EQ band gains hidden with the power off (audit #42) | `FxAudioControls.cpp:208-211` | Shown at half alpha |
 | D-25 | Preset list, menu preset items and tray preset menu dead with the power off, while the CLI works (audit R7) | `FxProView.cpp:117-121`, `FxSystemTrayView.cpp:313-316` | Live with the power off |
+| D-26 | The first band of the five- and ten-band EQ sits at the bottom of its wheel's range and the last at the top, so each turns one way only (audit R6) | `GraphicEqGet.cpp:105-168`, `docs/spec/04-equalizer-visualizer.md` §A4 | The two end bands reach half a band past the ladder's edges, within 20 Hz–20 kHz (`fxsound_core::eq::band_frequency_range`; ten bands 46–85 Hz and 11768–20000 Hz, five 31–125 Hz and 8010–20000 Hz); an exported `.fac` has an end band past the edge put back on it (`fxsound_core::eq::move_end_bands_back_inside_the_ladder`), an imported one keeps what it carries |
+| D-27 | The EQ curve is a polyline through the band values, so the filter width and the bands' overlap never show (audit R8) | `FxEqualizer.cpp:350-393`, `docs/spec/04-equalizer-visualizer.md` §A9 | The magnitude response of the running designs (`fxsound_dsp::eq::GraphicEq::response_db`, at the device's rate and the filter width in force), about 200 points, in the original's colour, stroke and fill; worked out only when the bands, the width, the count or the rate change (`ResponseCache`) |
 
 Behaviours ported **verbatim** because they are the product's fingerprint: the 100 ms tick and the
 5-tick (500 ms) processing debounce; the 60 s autosave (missing until 0.4.0, audit #47; now a

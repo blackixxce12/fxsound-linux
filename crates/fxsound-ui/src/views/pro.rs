@@ -1624,8 +1624,10 @@ mod tests {
     }
 
     #[test]
-    fn every_band_tip_names_the_right_click_and_at_ten_bands_says_what_the_band_is_first() {
-        use crate::widgets::equalizer::{BAND_TOOLTIPS, EqLayout};
+    fn every_band_tip_names_the_right_click_and_the_solo_and_at_ten_bands_says_what_the_band_is_first()
+     {
+        use crate::widgets::equalizer::{BAND_TOOLTIPS, EqLayout, SOLO_TIP};
+        let gestures = format!("{}\n{SOLO_TIP}", slider::RESET_TIP);
         let panel = layout::pro::equalizer();
         for count in [10, 31] {
             let mut state = state();
@@ -1639,12 +1641,12 @@ mod tests {
             let shown = harness.rest(&state, hit.center());
             let tip = shown
                 .iter()
-                .find(|text| text.ends_with(slider::RESET_TIP))
+                .find(|text| text.ends_with(&gestures))
                 .unwrap_or_else(|| panic!("{count} bands: {shown:?}"));
             if count == 10 {
                 assert!(tip.starts_with(BAND_TOOLTIPS[2]), "{tip:?}");
             } else {
-                assert_eq!(tip, slider::RESET_TIP);
+                assert_eq!(*tip, gestures);
             }
         }
     }

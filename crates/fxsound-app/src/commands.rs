@@ -1116,11 +1116,11 @@ fn device_names(list: &[DeviceStatus]) -> Vec<String> {
 }
 
 /// Upstream's `equalizer` block, from the edit direction's controls. The bands' ranges are the
-/// equalizer's own (`fxsound_dsp::eq::band_frequency_range` over the band count's table).
+/// ones the window's wheels tune them over ([`fxsound_core::eq::band_frequency_range`]): the
+/// Windows ranges, with the first and last band reaching half a band past the ladder (0.4.0 audit
+/// R6).
 fn equalizer(state: &UiState) -> Equalizer {
     let count = state.eq_bands.len();
-    let (min_hz, max_hz) = fxsound_dsp::eq::band_table(count)
-        .map_or((20.0, 20_000.0), |(_, min_hz, max_hz)| (min_hz, max_hz));
     Equalizer {
         num_bands: count,
         master_gain: Level(state.master_gain_db),
@@ -1132,8 +1132,7 @@ fn equalizer(state: &UiState) -> Equalizer {
             .iter()
             .enumerate()
             .map(|(index, band)| {
-                let (low, high) =
-                    fxsound_dsp::eq::band_frequency_range(index, count, min_hz, max_hz);
+                let (low, high) = fxsound_core::eq::band_frequency_range(index, count);
                 BandStatus {
                     index,
                     frequency: exact(band.center_hz),
@@ -1912,6 +1911,25 @@ mod tests {
                 "fifine Microphone Analogue Stereo"
             ]),
             "upstream's list, in the same order"
+        );
+    }
+
+    #[test]
+    fn the_first_and_last_band_report_the_wider_range_the_window_tunes_them_over() {
+        // 0.4.0 audit R6: 46..85 Hz and 11768..20000 Hz on ten bands, where Windows reports
+        // 62.5..85 and 11768..16000.
+        let mut a = app();
+        run(&mut a, &[Command::NumBands(10)]);
+        let json = status(&mut a);
+        let bands = &json["equalizer"]["bands"];
+        assert_eq!(bands[0]["min_frequency"].as_f64(), Some(46.0));
+        assert_eq!(bands[0]["max_frequency"].as_f64(), Some(85.0));
+        assert_eq!(bands[9]["min_frequency"].as_f64(), Some(11768.0));
+        assert_eq!(bands[9]["max_frequency"].as_f64(), Some(20000.0));
+        assert_eq!(
+            bands[1]["min_frequency"].as_f64(),
+            Some(86.0),
+            "inner bands as on Windows"
         );
     }
 

@@ -558,6 +558,147 @@ pub mod eq {
             false
         }
     }
+
+    /// The lowest centre a band can be tuned to: the command line's floor, and where the design
+    /// stops narrowing a low band's Q (`fxsound_dsp::biquad::calc_parametric`, rule A).
+    pub const TUNING_FLOOR_HZ: f32 = 20.0;
+    /// The highest: the command line's ceiling, and the top of the thirty-one-band ladder.
+    pub const TUNING_CEILING_HZ: f32 = 20_000.0;
+
+    /// The spectrum edges of a band count's ladder (`GraphicEqSet.cpp:430-486`), for the five
+    /// counts that have a table; `None` for any other. `fxsound_dsp::eq::band_table` hands out
+    /// the same edges with the ladders themselves; they are here so that the window and the
+    /// preset store, which do not run an engine, can work out the tuning ranges.
+    #[must_use]
+    pub const fn ladder_edges_hz(num_bands: usize) -> Option<(f32, f32)> {
+        match num_bands {
+            5 | 10 => Some((62.5, 16_000.0)),
+            15 => Some((25.0, 16_000.0)),
+            20 => Some((20.0, 16_000.0)),
+            31 => Some((20.0, 20_000.0)),
+            _ => None,
+        }
+    }
+
+    /// How far band `band` may be tuned in the Windows build, between the ladder's edges `min_hz`
+    /// and `max_hz` (`GraphicEqGet.cpp:105-168`).
+    ///
+    /// The bounds sit at the geometric midpoints of the generic log-spaced grid, with `+1` below
+    /// a kilohertz and `+10` above it on the low edge so that two bands never meet; the two end
+    /// bands stop at the ladder's own edges. Which is why band 1 of the five- and ten-band
+    /// equalizer, at 62.5 Hz, can only be turned up, and the top band, at 16 kHz, only down: each
+    /// sits at an end of its own range. [`band_frequency_range`] is the port's range.
+    #[must_use]
+    pub fn windows_band_range(
+        band: usize,
+        num_bands: usize,
+        min_hz: f32,
+        max_hz: f32,
+    ) -> (f32, f32) {
+        if num_bands <= 1 {
+            return (min_hz, max_hz);
+        }
+        let ratio = f64::from(max_hz) / f64::from(min_hz);
+        let denominator = (num_bands * 2 - 2) as f64;
+        let one_based = band + 1;
+
+        let low = if band == 0 {
+            min_hz
+        } else {
+            let exponent = ((one_based as f64 - 1.0) * 2.0 - 1.0) / denominator;
+            let edge = (f64::from(min_hz) * ratio.powf(exponent)).round() as f32;
+            if edge < 1000.0 {
+                edge + 1.0
+            } else {
+                edge + 10.0
+            }
+        };
+        let high = if one_based >= num_bands {
+            max_hz
+        } else {
+            let exponent = (one_based as f64 * 2.0 - 1.0) / denominator;
+            (f64::from(min_hz) * ratio.powf(exponent)).round() as f32
+        };
+        (low, high)
+    }
+
+    /// Band `band`'s tuning range in the Windows build, for the count's own ladder.
+    #[must_use]
+    pub fn windows_band_frequency_range(band: usize, num_bands: usize) -> (f32, f32) {
+        let (min_hz, max_hz) =
+            ladder_edges_hz(num_bands).unwrap_or((TUNING_FLOOR_HZ, TUNING_CEILING_HZ));
+        windows_band_range(band, num_bands, min_hz, max_hz)
+    }
+
+    /// How far band `band` may be tuned here: the Windows range, except that each end band
+    /// reaches half a band past the ladder's edge as well, so it can be tuned both ways (audit
+    /// report R6).
+    ///
+    /// In the Windows build the first band of the five- and ten-band equalizer, at 62.5 Hz, sits at
+    /// the bottom of its own range and the last, at 16 kHz, at the top of its: the first could
+    /// only move up, the last only down, and no sub-bass below 62.5 Hz could be reached at all.
+    /// Here the first band's range starts as far below its ladder's edge as its range ends above
+    /// it (ten bands: 46 to 85 Hz, five: 31 to 125 Hz), and the last band's range goes as far
+    /// above (ten bands: 11 768 Hz to 20 kHz), never past [`TUNING_FLOOR_HZ`] and
+    /// [`TUNING_CEILING_HZ`]: the twenty- and thirty-one-band ladders already start at 20 Hz and
+    /// the thirty-one-band one ends at 20 kHz. Every other band keeps the Windows range.
+    ///
+    /// A `.fac` written for a Windows FxSound has its end bands put back on the ladder's edges
+    /// ([`move_end_bands_back_inside_the_ladder`]); one read in keeps whatever it carries.
+    #[must_use]
+    pub fn band_frequency_range(band: usize, num_bands: usize) -> (f32, f32) {
+        let (min_hz, max_hz) =
+            ladder_edges_hz(num_bands).unwrap_or((TUNING_FLOOR_HZ, TUNING_CEILING_HZ));
+        let (mut low, mut high) = windows_band_range(band, num_bands, min_hz, max_hz);
+        if num_bands <= 1 {
+            return (low, high);
+        }
+        // The square root of the ratio between two neighbouring bands of the generic grid: the
+        // factor by which every range already reaches either side of its band.
+        let half_step =
+            (f64::from(max_hz) / f64::from(min_hz)).powf(1.0 / (num_bands * 2 - 2) as f64);
+        if band == 0 {
+            let below = (f64::from(min_hz) / half_step).round() as f32;
+            low = below.max(TUNING_FLOOR_HZ).min(low);
+        }
+        if band + 1 >= num_bands {
+            let above = (f64::from(max_hz) * half_step).round() as f32;
+            high = above.min(TUNING_CEILING_HZ).max(high);
+        }
+        (low, high)
+    }
+
+    /// Put a curve's first and last band back on the ladder's edges where this port let them go
+    /// past, for a `.fac` written for a Windows FxSound to open, and say whether either moved
+    /// (audit report R6).
+    ///
+    /// Only the two end bands reach further here than in the Windows build
+    /// ([`band_frequency_range`]), and only past the ladder's own edges: a first band below the
+    /// ladder's bottom goes back to it and a last band above its top goes back to that — on five
+    /// and ten bands, 62.5 Hz and 16 kHz, where the Windows build's wheels stop. Nothing else is
+    /// clamped: the factory presets themselves put inner bands outside their wheels' ranges
+    /// (Metal's 1000 Hz sits below the 1010 Hz its band's wheel starts at), and the Windows build
+    /// plays such a centre as it is, so a preset Windows made is exported exactly as it came. A
+    /// curve of a count with no table is left alone, and so is a centre that is not a number.
+    pub fn move_end_bands_back_inside_the_ladder(bands: &mut [EqBand]) -> bool {
+        let Some((min_hz, max_hz)) = ladder_edges_hz(bands.len()) else {
+            return false;
+        };
+        let mut moved = false;
+        if let Some(first) = bands.first_mut()
+            && first.center_hz < min_hz
+        {
+            first.center_hz = min_hz;
+            moved = true;
+        }
+        if let Some(last) = bands.last_mut()
+            && last.center_hz > max_hz
+        {
+            last.center_hz = max_hz;
+            moved = true;
+        }
+        moved
+    }
 }
 
 /// Everything a `.fac` preset carries, in the file's own units.
@@ -1461,6 +1602,161 @@ mod tests {
             twenty(&eq::TWENTY_BAND_CENTRES_HZ),
             "and back, exactly"
         );
+    }
+
+    /// The five counts the window offers, which are the ones with a ladder of their own.
+    const TABLE_COUNTS: [usize; 5] = [5, 10, 15, 20, 31];
+
+    #[test]
+    fn the_windows_tuning_ranges_are_the_spec_tables() {
+        // docs/spec/04-equalizer-visualizer.md §A4, from `GraphicEqGet.cpp:105-168`.
+        let five = [
+            (62.5_f32, 125.0_f32),
+            (126.0, 500.0),
+            (501.0, 2000.0),
+            (2010.0, 8000.0),
+            (8010.0, 16000.0),
+        ];
+        for (band, expected) in five.into_iter().enumerate() {
+            assert_eq!(eq::windows_band_frequency_range(band, 5), expected);
+        }
+        let ten = [
+            (62.5_f32, 85.0_f32),
+            (86.0, 157.0),
+            (158.0, 292.0),
+            (293.0, 540.0),
+            (541.0, 1000.0),
+            (1010.0, 1852.0),
+            (1862.0, 3429.0),
+            (3439.0, 6350.0),
+            (6360.0, 11758.0),
+            (11768.0, 16000.0),
+        ];
+        for (band, expected) in ten.into_iter().enumerate() {
+            assert_eq!(eq::windows_band_frequency_range(band, 10), expected);
+        }
+        assert_eq!(eq::windows_band_frequency_range(0, 15), (25.0, 31.0));
+        assert_eq!(eq::windows_band_frequency_range(14, 15), (12713.0, 16000.0));
+        assert_eq!(eq::windows_band_frequency_range(19, 20), (13429.0, 16000.0));
+        assert_eq!(eq::windows_band_frequency_range(30, 31), (17835.0, 20000.0));
+    }
+
+    #[test]
+    fn the_first_and_last_band_of_five_and_ten_can_be_tuned_both_ways() {
+        // Audit report R6: on Windows band 1 sits at the bottom of 62.5..85 Hz and band 10 at the
+        // top of 11768..16000 Hz.
+        assert_eq!(eq::band_frequency_range(0, 10), (46.0, 85.0));
+        assert_eq!(eq::band_frequency_range(9, 10), (11768.0, 20000.0));
+        assert_eq!(eq::band_frequency_range(0, 5), (31.0, 125.0));
+        assert_eq!(eq::band_frequency_range(4, 5), (8010.0, 20000.0));
+        for count in [5, 10] {
+            let first = eq::band_frequency_range(0, count);
+            let last = eq::band_frequency_range(count - 1, count);
+            assert!(first.0 < 62.5 && 62.5 < first.1, "{count}: {first:?}");
+            assert!(last.0 < 16000.0 && 16000.0 < last.1, "{count}: {last:?}");
+        }
+    }
+
+    #[test]
+    fn every_band_but_the_two_at_the_ends_keeps_its_windows_range() {
+        for count in TABLE_COUNTS.into_iter().chain([2, 7, 12]) {
+            for band in 1..count - 1 {
+                assert_eq!(
+                    eq::band_frequency_range(band, count),
+                    eq::windows_band_frequency_range(band, count),
+                    "{count} bands, band {band}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_wider_ranges_stay_between_20_hz_and_20_khz_and_never_meet() {
+        for count in TABLE_COUNTS {
+            for band in 0..count {
+                let (low, high) = eq::band_frequency_range(band, count);
+                let (windows_low, windows_high) = eq::windows_band_frequency_range(band, count);
+                assert!(low <= windows_low && high >= windows_high, "{count}/{band}");
+                assert!(low >= eq::TUNING_FLOOR_HZ && high <= eq::TUNING_CEILING_HZ);
+                if band + 1 < count {
+                    let (next_low, _) = eq::band_frequency_range(band + 1, count);
+                    assert!(high < next_low, "{count} bands: {band} reaches {band}+1");
+                }
+            }
+        }
+        // Ladders that already start at 20 Hz or end at 20 kHz keep those ends; the rest reach
+        // as far as the floor or the ceiling allows.
+        assert_eq!(eq::band_frequency_range(0, 20), (20.0, 24.0));
+        assert_eq!(eq::band_frequency_range(0, 31), (20.0, 22.0));
+        assert_eq!(eq::band_frequency_range(30, 31), (17835.0, 20000.0));
+        assert_eq!(eq::band_frequency_range(0, 15), (20.0, 31.0));
+        assert_eq!(eq::band_frequency_range(14, 15), (12713.0, 20000.0));
+        assert_eq!(eq::band_frequency_range(19, 20), (13429.0, 19077.0));
+    }
+
+    #[test]
+    fn a_curve_for_windows_has_its_end_bands_put_back_on_the_ladders_edges() {
+        // Audit report R6: a `.fac` Windows reads carries end bands its wheels can show.
+        let mut ten = eq::default_bands();
+        ten[0].center_hz = 46.0;
+        ten[9].center_hz = 20000.0;
+        ten[4].boost_db = 3.0;
+        assert!(eq::move_end_bands_back_inside_the_ladder(&mut ten));
+        assert_eq!(ten[0].center_hz, 62.5);
+        assert_eq!(ten[9].center_hz, 16000.0);
+        assert_eq!(ten[4].boost_db, 3.0, "gains are not touched");
+
+        let mut five: Vec<EqBand> = [31.0, 250.0, 1000.0, 4000.0, 20000.0]
+            .iter()
+            .map(|&hz| EqBand::new(hz, 1.0))
+            .collect();
+        assert!(eq::move_end_bands_back_inside_the_ladder(&mut five));
+        let centres: Vec<f32> = five.iter().map(|b| b.center_hz).collect();
+        assert_eq!(centres, [62.5, 250.0, 1000.0, 4000.0, 16000.0]);
+
+        // Fifteen bands reach 20 Hz and 20 kHz here and stop at 25 Hz and 16 kHz on Windows.
+        let mut fifteen: Vec<EqBand> = (0..15)
+            .map(|i| EqBand::new(100.0 * (i + 1) as f32, 0.0))
+            .collect();
+        fifteen[0].center_hz = 20.0;
+        fifteen[14].center_hz = 19_000.0;
+        assert!(eq::move_end_bands_back_inside_the_ladder(&mut fifteen));
+        assert_eq!(
+            (fifteen[0].center_hz, fifteen[14].center_hz),
+            (25.0, 16000.0)
+        );
+    }
+
+    #[test]
+    fn a_curve_whose_end_bands_are_inside_the_ladder_is_exported_as_it_is() {
+        let mut ten = eq::default_bands();
+        assert!(!eq::move_end_bands_back_inside_the_ladder(&mut ten));
+        assert_eq!(ten, eq::default_bands());
+        let mut windows_twenty = twenty(&eq::WINDOWS_TWENTY_BAND_CENTRES_HZ);
+        let before = windows_twenty.clone();
+        assert!(!eq::move_end_bands_back_inside_the_ladder(
+            &mut windows_twenty
+        ));
+        assert_eq!(windows_twenty, before);
+        // Inner bands outside their wheels' ranges are the factory presets' own (Metal's 1000 Hz
+        // is below band 6's 1010 Hz), and so is an end band turned inwards past its range.
+        let mut metal = eq::default_bands();
+        metal[5].center_hz = 1000.0;
+        metal[0].center_hz = 100.0;
+        metal[9].center_hz = 11000.0;
+        let before = metal.clone();
+        assert!(!eq::move_end_bands_back_inside_the_ladder(&mut metal));
+        assert_eq!(metal, before);
+        // A count with no table has no ladder to go back inside, and a NaN is not a place.
+        let mut twelve: Vec<EqBand> = (0..12).map(|i| EqBand::new(5.0 + i as f32, 0.0)).collect();
+        let before = twelve.clone();
+        assert!(!eq::move_end_bands_back_inside_the_ladder(&mut twelve));
+        assert_eq!(twelve, before);
+        let mut broken = eq::default_bands();
+        broken[0].center_hz = f32::NAN;
+        assert!(!eq::move_end_bands_back_inside_the_ladder(&mut broken));
+        assert!(broken[0].center_hz.is_nan());
+        assert!(!eq::move_end_bands_back_inside_the_ladder(&mut []));
     }
 
     #[test]

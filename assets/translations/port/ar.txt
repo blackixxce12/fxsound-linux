@@ -116,3 +116,4 @@ countries: EG sa
 "Equalizer settings" = "إعدادات الإكولايزر"
 "Effects" = "المؤثرات"
 "Right-click to reset" = "انقر بزر الماوس الأيمن لإعادة التعيين"
+"Ctrl+Alt+drag to hear this band alone" = "اسحب مع Ctrl+Alt لسماع هذا النطاق وحده"

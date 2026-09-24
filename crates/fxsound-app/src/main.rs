@@ -1600,6 +1600,9 @@ impl eframe::App for Shell<'_> {
 /// The window gives what it showed back to the runtime for the next window ([`Panes`]).
 impl Drop for Shell<'_> {
     fn drop(&mut self) {
+        // A gesture ends with its window, and a solo is one: the window hidden with the button
+        // still down on a band leaves nobody to let go of it.
+        self.rt.app.end_solo();
         self.rt.panes = Panes {
             scratch: std::mem::take(&mut self.scratch),
             settings: self.settings.take(),

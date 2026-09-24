@@ -18,8 +18,10 @@
 //! * an `FxBandCenterFreqSlider` — a 36 × 36 rotary wheel over the band's allowed frequency range,
 //!   hidden entirely once the band count passes 10.
 //!
-//! Behind them the parent paints the response curve: a per-segment polyline plus a closed polygon
-//! filled with a vertical `EqStart → EqEnd` gradient (`FxEqualizer.cpp:350-393`).
+//! Behind them the parent paints the response curve: a per-segment polyline through the band
+//! values plus a closed polygon filled with a vertical `EqStart → EqEnd` gradient
+//! (`FxEqualizer.cpp:350-393`). Here the same stroke and fill draw the equalizer's real frequency
+//! response instead (see below).
 //!
 //! ## Why the geometry looks arbitrary
 //!
@@ -37,9 +39,24 @@
 //!   JUCE 8 px of every boundary belongs to two sliders and the later child wins. Here the
 //!   interactive width is clamped to the column (`docs/spec/04-equalizer-visualizer.md`, open
 //!   question 4), so a click always lands on the band it looks like it lands on.
-//! * **No Alt+drag solo mode.** `FxEqualizer.cpp:123-210` walks every other band down to −10 dB
-//!   while you drag one. Alt+drag is the window-move gesture on GNOME and KDE, so the binding is
-//!   unusable on Wayland and the feature is left out rather than rebound silently.
+//! * **The curve is the response the equalizer runs** (0.4.0 audit R8). The original joins the
+//!   band values with straight lines, so the filter width changed what you heard and not what you
+//!   saw, and neighbouring boosts that add up drew as if they did not. Here the curve is the
+//!   magnitude response of the very filter designs the audio thread installs
+//!   ([`fxsound_dsp::eq::GraphicEq::response_db`]), at the device's rate and the filter width in
+//!   force, sampled about [`RESPONSE_POINTS`] times across the panel. Each fader still stands at
+//!   its band's centre frequency; between two faders the frequency runs geometrically. The points
+//!   are worked out only when the bands, the width, the band count or the rate change
+//!   ([`ResponseCache`]), never per frame.
+//! * **Solo on Ctrl+Alt+drag** (`docs/spec/00-architecture.md` D-19). `FxEqualizer.cpp:123-210`
+//!   walks every other band down to −10 dB while you Alt+drag one. Alt+drag moves windows on
+//!   several desktops, so here the gesture takes Ctrl as well, and every band's tooltip says so. The
+//!   walk is played, not written: it never touches the curve or marks the preset modified
+//!   ([`crate::state::EqSolo`]). A Ctrl+Alt press leaves the band where it is until the pointer
+//!   moves. The application holds the one solo there is: when it ends it — a preset load, say,
+//!   from the tray with the button still down — the window lets go as well
+//!   ([`UiState::eq_solo_generation`]).
+//! * **The end bands turn both ways** (0.4.0 audit R6): see [`band_frequency_range`].
 //! * **An EQ bypass exists.** `FxEqualizer` has no on/off control at all
 //!   (`docs/spec/04-equalizer-visualizer.md` §A15); [`UiState::eq_on`] drives the desaturated
 //!   painting the original reserves for the power state, while interaction still follows power
@@ -51,7 +68,7 @@
 //! This widget renders only what `FxEqualizer` itself renders.
 
 use crate::assets::{AssetCache, FxImage};
-use crate::state::{UiAction, UiResponse, UiState};
+use crate::state::{EqSolo, UiAction, UiResponse, UiState};
 use crate::theme::{self, FxColor, Palette};
 use crate::widgets::slider;
 use egui::{
@@ -125,6 +142,21 @@ pub const BAND_TOOLTIPS: [&str; 10] = [
     "The core high-end range. Increase this to make your audio sound more like it's in an airy, large space, reduce it to help with room noises and unwanted echoing.",
     "The highest range of average human hearing. Increase this to give your sound more of a crisp tone, with lots of overtones. Reduce it to remove hiss or painfully high sounds.",
 ];
+
+/// Where a solo walks every band but the one being dragged: `-(MAX_GAIN - 2)`
+/// (`FxEqualizer.cpp:187`).
+pub const SOLO_FLOOR_DB: f32 = -(MAX_GAIN_DB - 2.0);
+/// A solo walks the other bands a decibel per tick of a 30 Hz timer (`startTimerHz(30)`,
+/// `FxEqualizer.cpp:136`): from 0 dB to the floor in a third of a second.
+pub const SOLO_STEPS_PER_SECOND: f64 = 30.0;
+/// What every band's tooltip adds about the solo, under the reset line.
+pub const SOLO_TIP: &str = "Ctrl+Alt+drag to hear this band alone";
+/// About how many points the response curve is drawn through; the exact count puts a point on
+/// every band's centre (0.4.0 audit R8).
+pub const RESPONSE_POINTS: usize = 200;
+/// The highest panel y the curve is drawn at: a response the boosts add up to past the panel's top
+/// runs along its edge.
+const CURVE_TOP: f32 = 1.0;
 
 /// The one tooltip every frequency wheel shares (`FxEqualizer.cpp:296-299`).
 pub const WHEEL_TOOLTIP: &str = "This wheel allows you to adjust which frequencies this EQ band is affecting\nup or down to target different frequencies/pitches. The EQ slider above\ncontrols the volume of this EQ band. Increase or decrease to boost or cut\na portion of your audio's frequencies, without modifying the rest of your sound.";
@@ -340,53 +372,28 @@ pub fn snap_gain(gain_db: f32) -> f32 {
 /// The spectrum edges a band count implies (`GraphicEqSet.cpp:430-486`).
 ///
 /// The five counts the UI offers each overwrite `min_band_freq` / `max_band_freq` with their own
-/// pair; anything else keeps whatever the engine had, which for a freshly created equalizer is the
-/// full 20 Hz … 20 kHz span.
+/// pair ([`fxsound_core::eq::ladder_edges_hz`]); anything else keeps whatever the engine had, which
+/// is taken here as the full 20 Hz … 20 kHz span.
 #[must_use]
 pub fn band_span_hz(num_bands: usize) -> (f32, f32) {
-    match num_bands {
-        5 | 10 => (62.5, 16_000.0),
-        15 => (25.0, 16_000.0),
-        20 => (20.0, 16_000.0),
-        31 => (20.0, 20_000.0),
-        _ => (20.0, 20_000.0),
-    }
+    fxsound_core::eq::ladder_edges_hz(num_bands).unwrap_or((
+        fxsound_core::eq::TUNING_FLOOR_HZ,
+        fxsound_core::eq::TUNING_CEILING_HZ,
+    ))
 }
 
-/// How far band `band` may be tuned, in Hz (`GraphicEqGet.cpp:105-168`).
+/// How far band `band`'s wheel tunes it, in Hz: [`fxsound_core::eq::band_frequency_range`].
 ///
-/// The bounds sit at the *geometric midpoints* of the generic log-spaced grid, which is why they do
-/// not line up with the hard-coded ISO centres: band 1 of the five-band EQ is pinned at 62.5 Hz,
-/// the very bottom of its own 62.5…125 range. The `+1` below a kilohertz and `+10` above it are the
-/// dead zone that stops two bands ever reaching the same frequency.
+/// The Windows ranges (`GraphicEqGet.cpp:105-168`) sit at the *geometric midpoints* of the generic
+/// log-spaced grid, with a `+1` below a kilohertz and `+10` above it as the dead zone that stops two
+/// bands ever reaching the same frequency, and pin each end band at its ladder's edge: band 1 of
+/// the five- and ten-band EQ sits at 62.5 Hz, the very bottom of its own range, and could only be
+/// turned up, the last band only down. Here the two end bands reach half a band past the edges
+/// (0.4.0 audit R6), so both wheels start part-way round and turn either way; every other band
+/// keeps the Windows range.
 #[must_use]
 pub fn band_frequency_range(band: usize, num_bands: usize) -> (f32, f32) {
-    let (min_hz, max_hz) = band_span_hz(num_bands);
-    if num_bands <= 1 {
-        return (min_hz, max_hz);
-    }
-    let ratio = f64::from(max_hz) / f64::from(min_hz);
-    let denominator = (num_bands * 2 - 2) as f64;
-    let one_based = band + 1;
-
-    let low = if band == 0 {
-        min_hz
-    } else {
-        let power = ((one_based as f64 - 1.0) * 2.0 - 1.0) / denominator;
-        let edge = (f64::from(min_hz) * ratio.powf(power)).round() as f32;
-        if edge < 1000.0 {
-            edge + 1.0
-        } else {
-            edge + 10.0
-        }
-    };
-    let high = if one_based >= num_bands {
-        max_hz
-    } else {
-        let power = (one_based as f64 * 2.0 - 1.0) / denominator;
-        (f64::from(min_hz) * ratio.powf(power)).round() as f32
-    };
-    (low, high)
+    fxsound_core::eq::band_frequency_range(band, num_bands)
 }
 
 /// The wheel's step: a hundred positions across the band's range (`FxEqualizer.cpp:55`).
@@ -490,34 +497,217 @@ fn fixed(value: f32, decimals: usize) -> String {
 // Curve sampling
 // ---------------------------------------------------------------------------------------------
 
-/// The response curve's vertices in panel space, one per band.
+/// One point of the drawn response.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResponsePoint {
+    /// Panel x.
+    pub x: f32,
+    /// The frequency the curve shows at `x`, in Hz.
+    pub hz: f32,
+    /// The equalizer's gain there, in dB.
+    pub db: f32,
+}
+
+/// The frequency each fader stands for on the curve's axis: its band's centre, when the centres
+/// rise from band to band as every ladder and every wheel keeps them; otherwise — a band the
+/// command line moved past its neighbour — the standard ladder of the count, so the axis still
+/// runs one way.
+fn axis_hz(centres_hz: &[f32]) -> Vec<f32> {
+    if centres_hz.windows(2).all(|pair| pair[0] < pair[1]) {
+        centres_hz.to_vec()
+    } else {
+        fxsound_dsp::eq::standard_centres(centres_hz.len())
+    }
+}
+
+/// The equalizer's frequency response as the window draws it (0.4.0 audit R8).
 ///
-/// The original draws straight segments between the sliders, not a computed transfer function
-/// (`FxEqualizer.cpp:350-370`), so this really is the whole curve.
+/// The curve is built from what the audio thread would be sent — the bands and the filter width
+/// through `DspParams::sanitise`, the same clamps and fallbacks — and designed by the audio
+/// thread's own [`fxsound_dsp::eq::GraphicEq`] at `sample_rate` (the device's; `0` leaves it at
+/// 48 kHz, as a fresh engine does), so what is drawn is the magnitude of the very sections that
+/// run: the Q the band count gives, the filter width, the design's own limits on Q at low
+/// frequencies and small gains, a band at 0 dB or past Nyquist left out.
+///
+/// It runs from the first fader to the last, as the original's polyline does. Each fader stands
+/// at its band's centre frequency, and between two faders the frequency runs geometrically, so
+/// the curve is sampled evenly along the panel with a point on every centre: on the standard
+/// ladders, which are geometric, the axis is a plain logarithmic one. Past half the rate the
+/// response of the rate's top is drawn, since nothing above it can be played.
 #[must_use]
-pub fn curve_points(layout: &EqLayout, gains_db: &[f32]) -> Vec<Pos2> {
-    gains_db
+pub fn response_curve(
+    layout: &EqLayout,
+    centres_hz: &[f32],
+    gains_db: &[f32],
+    filter_q: f32,
+    sample_rate: u32,
+) -> Vec<ResponsePoint> {
+    use fxsound_core::EqBand;
+    use fxsound_core::messages::DspParams;
+
+    let count = layout.num_bands.min(centres_hz.len()).min(gains_db.len());
+    if count == 0 {
+        return Vec::new();
+    }
+    let bands: Vec<EqBand> = centres_hz
         .iter()
-        .take(layout.num_bands)
-        .enumerate()
-        .map(|(i, &gain)| pos2(layout.center_x(i), layout.gain_to_y(gain)))
+        .zip(gains_db)
+        .take(count)
+        .map(|(&hz, &db)| EqBand::new(hz, db))
+        .collect();
+    let mut params = DspParams::default();
+    params.set_bands(&bands);
+    params.filter_q = filter_q;
+    params.sanitise();
+    let (centres, gains) = params.bands();
+
+    let mut eq = fxsound_dsp::eq::GraphicEq::new();
+    eq.set_sample_rate(sample_rate as f32);
+    eq.set_q_multiplier(params.filter_q);
+    eq.set_bands(centres, gains);
+    let top_hz = eq.sample_rate() * 0.5 * 0.999;
+    let db_at = |hz: f32| {
+        let db = eq.response_db(hz.min(top_hz));
+        if db.is_finite() { db } else { 0.0 }
+    };
+
+    let axis = axis_hz(centres);
+    let count = axis.len();
+    if count == 1 {
+        return vec![ResponsePoint {
+            x: layout.center_x(0),
+            hz: axis[0],
+            db: db_at(axis[0]),
+        }];
+    }
+    let per_band = RESPONSE_POINTS.div_ceil(count - 1);
+    let mut points = Vec::with_capacity(per_band * (count - 1) + 1);
+    for band in 0..count - 1 {
+        let (x0, x1) = (layout.center_x(band), layout.center_x(band + 1));
+        let (f0, f1) = (axis[band], axis[band + 1]);
+        for step in 0..per_band {
+            let t = step as f32 / per_band as f32;
+            let hz = f0 * (f1 / f0).powf(t);
+            points.push(ResponsePoint {
+                x: x0 + (x1 - x0) * t,
+                hz,
+                db: db_at(hz),
+            });
+        }
+    }
+    let last = count - 1;
+    points.push(ResponsePoint {
+        x: layout.center_x(last),
+        hz: axis[last],
+        db: db_at(axis[last]),
+    });
+    points
+}
+
+/// The response curve, worked out only when what it is drawn from changes.
+///
+/// A frame compares the band count, the rate, the width and every centre and gain with what the
+/// points were worked out from — a few dozen integers, no allocation — and only a difference
+/// designs the sections and samples them again. A window left alone costs nothing for the curve,
+/// and a drag costs one computation per step the band actually moves.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResponseCache {
+    /// What `points` were worked out from, bit for bit: the band count, the rate, the width, then
+    /// every centre and every gain.
+    key: Vec<u32>,
+    points: Vec<ResponsePoint>,
+    computations: u64,
+}
+
+impl ResponseCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The curve for these bands, from the cache when nothing changed since the last call.
+    pub fn curve(
+        &mut self,
+        layout: &EqLayout,
+        centres_hz: &[f32],
+        gains_db: &[f32],
+        filter_q: f32,
+        sample_rate: u32,
+    ) -> &[ResponsePoint] {
+        let key = || {
+            [layout.num_bands as u32, sample_rate, filter_q.to_bits()]
+                .into_iter()
+                .chain(centres_hz.iter().map(|hz| hz.to_bits()))
+                .chain(gains_db.iter().map(|db| db.to_bits()))
+        };
+        if self.computations == 0 || !self.key.iter().copied().eq(key()) {
+            self.points = response_curve(layout, centres_hz, gains_db, filter_q, sample_rate);
+            self.key = key().collect();
+            self.computations += 1;
+        }
+        &self.points
+    }
+
+    /// How many times the curve has been worked out.
+    #[must_use]
+    pub const fn computations(&self) -> u64 {
+        self.computations
+    }
+}
+
+/// Where a response point is drawn: its gain's y, kept inside the panel above and at the fill's
+/// baseline below.
+#[must_use]
+pub fn response_y(layout: &EqLayout, db: f32) -> f32 {
+    layout.gain_to_y(db).clamp(CURVE_TOP, layout.baseline())
+}
+
+/// The response curve's vertices in panel space.
+#[must_use]
+pub fn curve_points(layout: &EqLayout, response: &[ResponsePoint]) -> Vec<Pos2> {
+    response
+        .iter()
+        .map(|point| pos2(point.x, response_y(layout, point.db)))
         .collect()
 }
 
 /// The closed polygon the gradient fills: the curve, dropped to the baseline at both ends
 /// (`FxEqualizer.cpp:372-389`).
 #[must_use]
-pub fn fill_polygon(layout: &EqLayout, gains_db: &[f32]) -> Vec<Pos2> {
-    let curve = curve_points(layout, gains_db);
+pub fn fill_polygon(layout: &EqLayout, curve: &[Pos2]) -> Vec<Pos2> {
     if curve.is_empty() {
         return Vec::new();
     }
     let baseline = layout.baseline();
     let mut polygon = Vec::with_capacity(curve.len() + 2);
     polygon.push(pos2(curve[0].x, baseline));
-    polygon.extend_from_slice(&curve);
+    polygon.extend_from_slice(curve);
     polygon.push(pos2(curve[curve.len() - 1].x, baseline));
     polygon
+}
+
+/// Where a band at `gain_db` has got to `steps` ticks into a solo: a decibel a tick towards
+/// [`SOLO_FLOOR_DB`], and there it stays (`FxEqualizer.cpp:172-210`).
+///
+/// The original steps from wherever the band is by a whole decibel and stops only on the floor
+/// exactly, so a band at +2.5 dB — a `.fac` can hold one — overshoots to −10.5 dB and then swings
+/// between it and −9.5 dB until the drag ends; here it settles on −10 dB.
+#[must_use]
+pub fn solo_walk(gain_db: f32, steps: u32) -> f32 {
+    let steps = steps as f32;
+    if gain_db > SOLO_FLOOR_DB {
+        (gain_db - steps).max(SOLO_FLOOR_DB)
+    } else {
+        (gain_db + steps).min(SOLO_FLOOR_DB)
+    }
+}
+
+/// How many ticks of the solo's 30 Hz walk `elapsed` seconds hold. The first comes a tick after
+/// the press, as the original's timer's does.
+#[must_use]
+pub fn solo_steps(elapsed: f64) -> u32 {
+    // Past 64 ticks every band from −12 to +12 dB is on the floor.
+    (elapsed.max(0.0) * SOLO_STEPS_PER_SECOND).floor().min(64.0) as u32
 }
 
 /// Where the dashes of a `{5, 2}` dashed line start and end along `top..bottom`.
@@ -574,16 +764,39 @@ struct WheelDrag {
     start_proportion: f32,
 }
 
+/// A solo in progress: the band held with Ctrl+Alt, since when, and what the application was last
+/// told to play.
+#[derive(Debug, Clone, PartialEq)]
+struct Solo {
+    band: usize,
+    /// `egui::InputState::time` at the press.
+    started: f64,
+    /// [`UiState::eq_solo_generation`] at the press: once it has moved, the application has ended
+    /// the solo, and the window lets go of it too.
+    generation: u64,
+    /// The gains last sent with [`UiAction::SoloBand`], so each step of the walk is sent once.
+    sent: Vec<f32>,
+}
+
 /// What the equalizer remembers between frames.
 ///
-/// Only genuinely transient things live here — which band is under the pointer and which control is
-/// mid-drag. Everything else is read from [`UiState`], so the widget stays a pure function of the
-/// model plus this scratch.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// Only genuinely transient things live here — which band is under the pointer, which control is
+/// mid-drag, a solo — and the response curve last worked out, which is a cache and not state.
+/// Everything else is read from [`UiState`], so the widget stays a pure function of the model plus
+/// this scratch.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EqInteraction {
     gain_drag: Option<usize>,
     wheel_drag: Option<WheelDrag>,
     hovered: Option<usize>,
+    solo: Option<Solo>,
+    /// The band a Ctrl+Alt press landed on, until the pointer moves. Pressing to solo is not an
+    /// edit, so the band stays where it is — also once the solo is over, when the application
+    /// ended it under a button still held.
+    still: Option<usize>,
+    /// What the last frame drew every band at: the curve, with a solo's walk laid over it.
+    drawn: Vec<f32>,
+    response: ResponseCache,
 }
 
 impl EqInteraction {
@@ -613,9 +826,33 @@ impl EqInteraction {
         self.hovered
     }
 
-    /// Forget every in-progress gesture, e.g. after the band count changed underneath us.
+    /// The band being soloed, if any.
+    #[must_use]
+    pub fn soloed_band(&self) -> Option<usize> {
+        self.solo.as_ref().map(|solo| solo.band)
+    }
+
+    /// What the last frame drew every band at, in dB: the curve, with a solo's walk laid over it
+    /// while one is on — what the window says the equalizer plays.
+    #[must_use]
+    pub fn drawn_gains(&self) -> &[f32] {
+        &self.drawn
+    }
+
+    /// The response curve's cache.
+    #[must_use]
+    pub const fn response(&self) -> &ResponseCache {
+        &self.response
+    }
+
+    /// Forget every in-progress gesture, e.g. after the band count changed underneath us. The
+    /// response curve is kept: it is worked out again only if it no longer fits.
     pub fn clear(&mut self) {
-        *self = Self::default();
+        self.gain_drag = None;
+        self.wheel_drag = None;
+        self.hovered = None;
+        self.solo = None;
+        self.still = None;
     }
 }
 
@@ -668,6 +905,34 @@ impl<'a> EqualizerWidget<'a> {
         } = self;
 
         let layout = EqLayout::new(state.eq_bands.len());
+        // Power gates interaction, exactly as `FxProView::paint` gates `setEnabled`.
+        let powered = state.controls_enabled();
+        let (now, primary_down, primary_pressed, solo_keys) = ui.input(|input| {
+            (
+                input.time,
+                input.pointer.primary_down(),
+                input.pointer.primary_pressed(),
+                input.modifiers.ctrl && input.modifiers.alt,
+            )
+        });
+
+        // A solo lasts while the button that started it is held, on a band that is still there,
+        // with the power on, and until the application ends it — a preset, a band count or a lane
+        // that came from the tray, the command line or D-Bus with the button still down. When it
+        // ends the application is told, so the curve plays again; when the application ended it,
+        // that is news only to a step of the walk that reached it afterwards.
+        if interaction.solo.as_ref().is_some_and(|solo| {
+            !primary_down
+                || !powered
+                || solo.band >= layout.num_bands
+                || solo.generation != state.eq_solo_generation
+        }) {
+            interaction.solo = None;
+            response.push(UiAction::SoloBand(None));
+        }
+        if !primary_down {
+            interaction.still = None;
+        }
         // A band count that changed underneath a drag would carry the gesture onto the wrong band.
         if interaction
             .gain_drag
@@ -678,15 +943,6 @@ impl<'a> EqualizerWidget<'a> {
         {
             interaction.clear();
         }
-
-        let ctx = PaintCtx {
-            origin: rect.min.to_vec2(),
-            palette,
-            // Power gates interaction, exactly as `FxProView::paint` gates `setEnabled`.
-            powered: state.controls_enabled(),
-            // A bypassed equalizer is drawn dead but stays editable; see the module docs.
-            lit: state.controls_enabled() && state.eq_on,
-        };
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(
@@ -700,9 +956,9 @@ impl<'a> EqualizerWidget<'a> {
         interaction.hovered = None;
         let mut gains: Vec<f32> = state.eq_bands.iter().map(|band| band.boost_db).collect();
         for (band, gain) in gains.iter_mut().enumerate().take(layout.num_bands) {
-            let hit = translate(layout.gain_hit_rect(band), ctx.origin);
+            let hit = translate(layout.gain_hit_rect(band), rect.min.to_vec2());
             let id = Id::new("fx_eq_band").with(band);
-            let sense = if ctx.powered {
+            let sense = if powered {
                 Sense::click_and_drag()
             } else {
                 Sense::hover()
@@ -711,23 +967,49 @@ impl<'a> EqualizerWidget<'a> {
 
             if band_response.hovered() {
                 interaction.hovered = Some(band);
-                if ctx.powered {
+                if powered {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
             }
 
-            if ctx.powered {
+            if powered {
                 let mut new_gain = *gain;
+
+                // Ctrl+Alt on the press solos the band (`FxEqualizer::sliderDragStarted`,
+                // `FxEqualizer.cpp:123-149`, which reads Alt alone).
+                if interaction.solo.is_none()
+                    && solo_keys
+                    && primary_pressed
+                    && band_response.is_pointer_button_down_on()
+                {
+                    interaction.solo = Some(Solo {
+                        band,
+                        started: now,
+                        generation: state.eq_solo_generation,
+                        sent: Vec::new(),
+                    });
+                    interaction.still = Some(band);
+                }
+                // A solo is for listening, and pressing to start one is not an edit: the band
+                // stays where it is until the pointer moves it, and then follows it as any drag.
+                if interaction.still == Some(band)
+                    && band_response
+                        .total_drag_delta()
+                        .is_some_and(|moved| moved != Vec2::ZERO)
+                {
+                    interaction.still = None;
+                }
 
                 // Right-click resets the band to flat (`FxEqualizer.cpp:481-494`).
                 if band_response.secondary_clicked() {
                     new_gain = 0.0;
                 } else if band_response.is_pointer_button_down_on()
                     && let Some(pointer) = band_response.interact_pointer_pos()
+                    && interaction.still != Some(band)
                 {
                     // JUCE's `setSliderSnapsToMousePosition` default: the value jumps to the
                     // pointer on press and then tracks it.
-                    new_gain = layout.y_to_gain(pointer.y - ctx.origin.y);
+                    new_gain = layout.y_to_gain(pointer.y - rect.min.y);
                 }
 
                 if band_response.drag_started() {
@@ -757,28 +1039,60 @@ impl<'a> EqualizerWidget<'a> {
 
             // `FxEqualizer::paint` re-applies the per-band tooltips every frame, and only ever at
             // ten bands (`FxEqualizer.cpp:326-343`). Under them, and alone at the other counts,
-            // the right-click reset nothing else mentions (0.4.0 audit R9).
+            // the right-click reset nothing else mentions (0.4.0 audit R9) and the solo.
             if !state.hide_tooltips {
                 let described = (layout.num_bands == BAND_TOOLTIPS.len())
                     .then(|| BAND_TOOLTIPS.get(band))
                     .flatten()
                     .map(|tip| tr(tip));
-                let _ = band_response.on_hover_text(slider::with_reset_tip(described.as_deref()));
+                let tip = format!(
+                    "{}\n{}",
+                    slider::with_reset_tip(described.as_deref()),
+                    tr(SOLO_TIP)
+                );
+                let _ = band_response.on_hover_text(tip);
             }
         }
+
+        let solo = walk_the_solo(ui, interaction, &mut gains, now, response);
+        interaction.drawn.clone_from(&gains);
+
+        let ctx = PaintCtx {
+            origin: rect.min.to_vec2(),
+            palette,
+            powered,
+            // A bypassed equalizer is drawn dead but stays editable; see the module docs.
+            lit: powered && state.eq_on,
+            solo,
+        };
+
+        let centres: Vec<f32> = state.eq_bands.iter().map(|band| band.center_hz).collect();
+        let curve = curve_points(
+            &layout,
+            interaction.response.curve(
+                &layout,
+                &centres,
+                &gains,
+                state.filter_q,
+                state.sample_rate,
+            ),
+        );
 
         if db_scale {
             paint_db_scale(&painter, &ctx, &layout);
         }
-        paint_curve_fill(&painter, &ctx, &layout, &gains);
-        paint_curve_line(&painter, &ctx, &layout, &gains);
+        paint_curve_fill(&painter, &ctx, &layout, &curve);
+        paint_curve_line(&painter, &ctx, &layout, &curve);
 
         // `gains` is built from `state.eq_bands`, which is what `layout.num_bands` counts, so the
         // two always agree in length.
         for (band, &gain) in gains.iter().enumerate().take(layout.num_bands) {
-            paint_fader(&painter, &ctx, &layout, band, gain, interaction);
+            paint_fader(&painter, &ctx, &layout, band, interaction);
             paint_thumb(&painter, ui, assets, &ctx, &layout, band, gain);
-            paint_gain_label(&painter, &ctx, &layout, band, gain);
+            // `showValue(false)` on every band a solo walks (`FxEqualizer.cpp:140-141`).
+            if ctx.solo.is_none_or(|soloed| soloed == band) {
+                paint_gain_label(&painter, &ctx, &layout, band, gain);
+            }
             paint_freq_label(&painter, &ctx, &layout, band, state);
         }
 
@@ -798,6 +1112,52 @@ impl<'a> EqualizerWidget<'a> {
     }
 }
 
+/// Take a solo one frame further: every band but the soloed one walks towards
+/// [`SOLO_FLOOR_DB`] from its gain on the curve, `gains` is left holding what is played and drawn,
+/// and the application hears of each new step once. Returns the soloed band.
+///
+/// The walk is measured from the press, so a slow frame catches up rather than slowing it down,
+/// and the window asks for a frame at the next step until every band is on the floor.
+fn walk_the_solo(
+    ui: &Ui,
+    interaction: &mut EqInteraction,
+    gains: &mut [f32],
+    now: f64,
+    response: &mut UiResponse,
+) -> Option<usize> {
+    let solo = interaction.solo.as_mut()?;
+    let band = solo.band;
+    let steps = solo_steps(now - solo.started);
+    for (index, gain) in gains.iter_mut().enumerate() {
+        if index != band {
+            *gain = solo_walk(*gain, steps);
+        }
+    }
+    let stepped = solo.sent.len() != gains.len()
+        || gains
+            .iter()
+            .zip(&solo.sent)
+            .enumerate()
+            .any(|(index, (now, sent))| index != band && now != sent);
+    if stepped {
+        solo.sent = gains.to_vec();
+        response.push(UiAction::SoloBand(Some(EqSolo {
+            band,
+            gains_db: gains.to_vec(),
+        })));
+    }
+    let walking = gains
+        .iter()
+        .enumerate()
+        .any(|(index, &gain)| index != band && gain != SOLO_FLOOR_DB);
+    if walking {
+        let next = solo.started + f64::from(steps + 1) / SOLO_STEPS_PER_SECOND;
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64((next - now).max(0.0)));
+    }
+    Some(band)
+}
+
 /// Everything the painting helpers need that does not change between bands.
 struct PaintCtx {
     origin: Vec2,
@@ -806,6 +1166,9 @@ struct PaintCtx {
     powered: bool,
     /// Whether the colours keep their hue.
     lit: bool,
+    /// The band being soloed: every other fader is drawn disabled meanwhile, as the original
+    /// disables them (`FxEqualizer.cpp:138-139`).
+    solo: Option<usize>,
 }
 
 impl PaintCtx {
@@ -813,12 +1176,17 @@ impl PaintCtx {
     /// `Colour::withSaturation(0.0f)` in the dark palette and, in the light one, a grey that can
     /// still be seen ([`Palette::greyed`], 0.4.0 audit #24).
     fn colour(&self, id: FxColor, alpha: f32) -> Color32 {
+        self.colour_if(self.lit, id, alpha)
+    }
+
+    fn colour_if(&self, lit: bool, id: FxColor, alpha: f32) -> Color32 {
         let base = self.palette.color_alpha(id, alpha);
-        if self.lit {
-            base
-        } else {
-            self.palette.greyed(base)
-        }
+        if lit { base } else { self.palette.greyed(base) }
+    }
+
+    /// Whether band `band`'s own fader keeps its colours: not while another band is soloed.
+    fn band_lit(&self, band: usize) -> bool {
+        self.lit && self.solo.is_none_or(|soloed| soloed == band)
     }
 
     fn theme_mode(&self) -> ThemeMode {
@@ -831,23 +1199,22 @@ fn translate(rect: Rect, origin: Vec2) -> Rect {
 }
 
 /// The `EqStart@0.34 → EqEnd@0.00` ramp, anchored to band 1's fader rather than to the panel
-/// (`FxEqualizer.cpp:391`).
+/// (`FxEqualizer.cpp:391`). A solo desaturates its bottom stop (`FxEqualizer.cpp:345-348`).
 fn fill_colour_at(ctx: &PaintCtx, layout: &EqLayout, panel_y: f32) -> Color32 {
     let top = Y_MARGIN;
     let bottom = Y_MARGIN + layout.slider_height;
     let t = ((panel_y - top) / (bottom - top)).clamp(0.0, 1.0);
     let start = ctx.colour(FxColor::EqStart, 0.34);
-    let end = ctx.colour(FxColor::EqEnd, 0.0);
+    let end = ctx.colour_if(ctx.lit && ctx.solo.is_none(), FxColor::EqEnd, 0.0);
     start.lerp_to_gamma(end, t)
 }
 
-/// The filled area under the curve, as one gradient-shaded quad per band pair.
+/// The filled area under the curve, as one gradient-shaded quad per pair of points.
 ///
 /// egui has no gradient brush, and the polygon is not convex, so it goes out as a `Mesh` with
 /// per-vertex colours. The polygon is x-monotone with a flat bottom, which makes the fan trivially
 /// correct.
-fn paint_curve_fill(painter: &egui::Painter, ctx: &PaintCtx, layout: &EqLayout, gains: &[f32]) {
-    let curve = curve_points(layout, gains);
+fn paint_curve_fill(painter: &egui::Painter, ctx: &PaintCtx, layout: &EqLayout, curve: &[Pos2]) {
     if curve.len() < 2 {
         return;
     }
@@ -857,8 +1224,8 @@ fn paint_curve_fill(painter: &egui::Painter, ctx: &PaintCtx, layout: &EqLayout, 
     let mut mesh = Mesh::default();
     mesh.reserve_vertices(curve.len() * 2);
     mesh.reserve_triangles((curve.len() - 1) * 2);
-    for point in &curve {
-        let top = pos2(point.x, point.y) + ctx.origin;
+    for point in curve {
+        let top = *point + ctx.origin;
         let bottom = pos2(point.x, baseline) + ctx.origin;
         mesh.colored_vertex(top, fill_colour_at(ctx, layout, point.y));
         mesh.colored_vertex(bottom, baseline_colour);
@@ -871,20 +1238,56 @@ fn paint_curve_fill(painter: &egui::Painter, ctx: &PaintCtx, layout: &EqLayout, 
     painter.add(Shape::mesh(mesh));
 }
 
-/// The curve itself: one independent segment per band pair, with butt caps at every vertex because
-/// the original clears its `Path` between segments (`FxEqualizer.cpp:350-370`).
+/// The curve itself, in the original's colour and weight.
 ///
 /// The original's `addLineSegment(line, 1.0)` + `strokePath(PathStrokeType(1.0))` lays down roughly
-/// two pixels of ink around a hollow core; 1.5 px is the closest single stroke.
-fn paint_curve_line(painter: &egui::Painter, ctx: &PaintCtx, layout: &EqLayout, gains: &[f32]) {
-    let curve = curve_points(layout, gains);
-    let colour = ctx.colour(FxColor::SliderTrack, 1.0);
-    for pair in curve.windows(2) {
-        painter.line_segment(
-            [pair[0] + ctx.origin, pair[1] + ctx.origin],
-            Stroke::new(1.5, colour),
-        );
+/// two pixels of ink around a hollow core; 1.5 px is the closest single stroke. It went out as one
+/// segment per band pair; a response sampled a couple of hundred times is one path.
+///
+/// During a solo only the stretch from the soloed band's left neighbour to its right one keeps its
+/// colour — the two segments the original leaves coloured because one of their ends is enabled
+/// (`FxEqualizer.cpp:360-367`) — and the rest is grey.
+fn paint_curve_line(painter: &egui::Painter, ctx: &PaintCtx, layout: &EqLayout, curve: &[Pos2]) {
+    if curve.len() < 2 {
+        return;
     }
+    let colour = ctx.colour(FxColor::SliderTrack, 1.0);
+    let stroke = |lit: bool| {
+        Stroke::new(
+            1.5,
+            if lit {
+                colour
+            } else {
+                ctx.palette.greyed(colour)
+            },
+        )
+    };
+    let line = |points: &[Pos2], lit: bool| {
+        let points = points.iter().map(|p| *p + ctx.origin).collect();
+        painter.add(Shape::line(points, stroke(lit)));
+    };
+    let Some(band) = ctx.solo else {
+        line(curve, true);
+        return;
+    };
+    let last = layout.num_bands.saturating_sub(1);
+    let from = layout.center_x(band.saturating_sub(1));
+    let to = layout.center_x((band + 1).min(last));
+    let lit_segment = |pair: &[Pos2]| {
+        let middle = (pair[0].x + pair[1].x) / 2.0;
+        (from..=to).contains(&middle)
+    };
+    let mut start = 0;
+    let mut lit = lit_segment(&curve[0..2]);
+    for i in 1..curve.len() - 1 {
+        let next = lit_segment(&curve[i..i + 2]);
+        if next != lit {
+            line(&curve[start..=i], lit);
+            start = i;
+            lit = next;
+        }
+    }
+    line(&curve[start..], lit);
 }
 
 /// One fader's dashed track and, while it is being dragged or focused, its highlight.
@@ -892,20 +1295,20 @@ fn paint_curve_line(painter: &egui::Painter, ctx: &PaintCtx, layout: &EqLayout, 
 /// The dash gradient runs `SliderTrack@0.4` at the component's own top down to
 /// `VerticalSliderLow@0.4` at `region_size` below it — *not* at the line's own end
 /// (`FxTheme.cpp:201-202`), so the bottom quarter of every track is flat colour. That mismatch is
-/// reproduced rather than corrected.
+/// reproduced rather than corrected. A disabled fader's track is grey (`FxTheme.cpp:195-199`).
 fn paint_fader(
     painter: &egui::Painter,
     ctx: &PaintCtx,
     layout: &EqLayout,
     band: usize,
-    gain_db: f32,
     interaction: &EqInteraction,
 ) {
     let x = layout.center_x(band) + ctx.origin.x;
     let top = layout.track_top();
     let bottom = layout.track_bottom();
-    let colour_top = ctx.colour(FxColor::SliderTrack, 0.4);
-    let colour_bottom = ctx.colour(FxColor::VerticalSliderLow, 0.4);
+    let lit = ctx.band_lit(band);
+    let colour_top = ctx.colour_if(lit, FxColor::SliderTrack, 0.4);
+    let colour_bottom = ctx.colour_if(lit, FxColor::VerticalSliderLow, 0.4);
 
     for (dash_top, dash_bottom) in dash_spans(top, bottom) {
         let middle = (dash_top + dash_bottom) / 2.0;
@@ -932,12 +1335,10 @@ fn paint_fader(
             ctx.palette.color_alpha(FxColor::SliderHighlight, 0.1),
         );
     }
-
-    let _ = gain_db;
 }
 
 /// The thumb: `Slider_Thumb.svg` in a 16 × 16 box centred on the value, or the grey variant when
-/// the equalizer is not contributing (`FxTheme.cpp:204-207`).
+/// the equalizer is not contributing or another band is soloed (`FxTheme.cpp:204-207`).
 #[allow(clippy::too_many_arguments)]
 fn paint_thumb(
     painter: &egui::Painter,
@@ -950,7 +1351,7 @@ fn paint_thumb(
 ) {
     let center = pos2(layout.center_x(band), layout.gain_to_y(gain_db)) + ctx.origin;
     let rect = Rect::from_center_size(center, Vec2::splat(THUMB_RADIUS * 2.0));
-    let image = if ctx.lit {
+    let image = if ctx.band_lit(band) {
         FxImage::SliderThumb
     } else {
         FxImage::SliderThumbBW
@@ -1396,15 +1797,16 @@ mod tests {
         assert_eq!(label.width(), FADER_WIDTH);
     }
 
-    /// §A4's full range tables for the five selectable band counts.
+    /// §A4's full range tables for the five selectable band counts, with the two end bands
+    /// reaching half a band past the ladder (0.4.0 audit R6).
     #[test]
-    fn band_frequency_ranges_match_the_spec_tables() {
+    fn band_frequency_ranges_are_the_spec_tables_with_the_end_bands_widened() {
         let five = [
-            (62.5_f32, 125.0_f32),
+            (31.0_f32, 125.0_f32),
             (126.0, 500.0),
             (501.0, 2000.0),
             (2010.0, 8000.0),
-            (8010.0, 16000.0),
+            (8010.0, 20000.0),
         ];
         for (band, expected) in five.into_iter().enumerate() {
             assert_eq!(
@@ -1415,7 +1817,7 @@ mod tests {
         }
 
         let ten = [
-            (62.5_f32, 85.0_f32),
+            (46.0_f32, 85.0_f32),
             (86.0, 157.0),
             (158.0, 292.0),
             (293.0, 540.0),
@@ -1424,7 +1826,7 @@ mod tests {
             (1862.0, 3429.0),
             (3439.0, 6350.0),
             (6360.0, 11758.0),
-            (11768.0, 16000.0),
+            (11768.0, 20000.0),
         ];
         for (band, expected) in ten.into_iter().enumerate() {
             assert_eq!(
@@ -1435,15 +1837,32 @@ mod tests {
         }
 
         // Spot checks from the 15, 20 and 31 band tables, including both ends.
-        assert_eq!(band_frequency_range(0, 15), (25.0, 31.0));
+        assert_eq!(band_frequency_range(0, 15), (20.0, 31.0));
         assert_eq!(band_frequency_range(8, 15), (798.0, 1264.0));
-        assert_eq!(band_frequency_range(14, 15), (12713.0, 16000.0));
+        assert_eq!(band_frequency_range(14, 15), (12713.0, 20000.0));
         assert_eq!(band_frequency_range(0, 20), (20.0, 24.0));
         assert_eq!(band_frequency_range(11, 20), (805.0, 1143.0));
-        assert_eq!(band_frequency_range(19, 20), (13429.0, 16000.0));
+        assert_eq!(band_frequency_range(19, 20), (13429.0, 19077.0));
         assert_eq!(band_frequency_range(0, 31), (20.0, 22.0));
         assert_eq!(band_frequency_range(16, 31), (711.0, 893.0));
         assert_eq!(band_frequency_range(30, 31), (17835.0, 20000.0));
+    }
+
+    /// Audit report R6: on Windows the first wheel of five and ten bands starts at its minimum and
+    /// the last at its maximum, so each turns one way only.
+    #[test]
+    fn the_end_wheels_of_five_and_ten_bands_start_part_way_round() {
+        for count in [5, 10] {
+            for band in [0, count - 1] {
+                let (low, high) = band_frequency_range(band, count);
+                let centre = default_band_frequency(band, count);
+                let proportion = (centre - low) / (high - low);
+                assert!(
+                    (0.3..0.7).contains(&proportion),
+                    "{count} bands, band {band}: {centre} Hz sits at {proportion} of {low}..{high}"
+                );
+            }
+        }
     }
 
     /// The `+1` below a kilohertz and `+10` above it keep adjacent bands from ever meeting.
@@ -1465,14 +1884,20 @@ mod tests {
     /// §A4's step column: a hundred positions across the range.
     #[test]
     fn the_wheel_steps_a_hundredth_of_the_band_range() {
+        let step = frequency_step(1, 10);
+        assert!(
+            (step - 0.71).abs() < 1e-4,
+            "band 2 of ten stepped by {step}"
+        );
+        // The end bands' ranges are wider, and so are their steps.
         let step = frequency_step(0, 10);
         assert!(
-            (step - 0.225).abs() < 1e-4,
+            (step - 0.39).abs() < 1e-4,
             "band 1 of ten stepped by {step}"
         );
         let step = frequency_step(4, 5);
         assert!(
-            (step - 79.9).abs() < 1e-3,
+            (step - 119.9).abs() < 1e-3,
             "band 5 of five stepped by {step}"
         );
     }
@@ -1498,21 +1923,25 @@ mod tests {
 
     #[test]
     fn frequencies_snap_into_their_band_range() {
-        // Band 1 of ten spans 62.5 … 85 in steps of 0.225, and the range's own low edge is the
-        // grid's origin, so only 62.5 + k * 0.225 is reachable.
+        // Band 2 of ten spans 86 … 157 in steps of 0.71, and the range's own low edge is the
+        // grid's origin, so only 86 + k * 0.71 is reachable.
         for (raw, expected) in [
-            (62.5_f32, 62.5_f32),
-            (0.0, 62.5),
-            (1e6, 85.0),
-            // 70 Hz is 33.33 steps up from 62.5, and JUCE rounds that to 33: 62.5 + 7.425.
-            (70.0, 69.925),
+            (86.0_f32, 86.0_f32),
+            (0.0, 86.0),
+            (1e6, 157.0),
+            // 115.734 Hz is 41.87 steps up from 86, and JUCE rounds that to 42: 86 + 29.82.
+            (115.734, 115.82),
         ] {
-            let snapped = snap_frequency(raw, 0, 10);
+            let snapped = snap_frequency(raw, 1, 10);
             assert!(
                 (snapped - expected).abs() < 1e-3,
                 "{raw} Hz snapped to {snapped}, not {expected}"
             );
         }
+        // Band 1 reaches below the ladder now: 46 … 85 Hz in steps of 0.39.
+        assert_eq!(snap_frequency(0.0, 0, 10), 46.0);
+        assert!((snap_frequency(50.0, 0, 10) - 49.9).abs() < 1e-3);
+        assert_eq!(snap_frequency(1e6, 9, 10), 20000.0);
     }
 
     /// §A12's format table, including the deliberate `>` / `>=` asymmetry at 1000 Hz.
@@ -1570,53 +1999,321 @@ mod tests {
         assert_eq!(gain_label(-12.0), "-12");
     }
 
+    fn centres(count: usize) -> Vec<f32> {
+        fxsound_dsp::eq::standard_centres(count)
+    }
+
     #[test]
-    fn the_curve_is_one_vertex_per_band_at_the_fader_centres() {
+    fn a_flat_curve_is_a_straight_line_at_zero_decibels_from_the_first_fader_to_the_last() {
+        for count in BAND_COUNTS {
+            let layout = EqLayout::new(count);
+            let response = response_curve(&layout, &centres(count), &vec![0.0; count], 1.0, 48_000);
+            assert!(response.iter().all(|p| p.db == 0.0), "{count} bands");
+            let curve = curve_points(&layout, &response);
+            assert!(curve.iter().all(|p| p.y == layout.gain_to_y(0.0)));
+            assert_eq!(curve[0].x, layout.center_x(0));
+            assert_eq!(curve[curve.len() - 1].x, layout.center_x(count - 1));
+        }
+        // Ten bands: the 0 dB line at y = 106, from x = 53 to 719, as the original's.
         let layout = EqLayout::new(10);
-        let gains = [0.0, 6.0, -6.0, 12.0, -12.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let curve = curve_points(&layout, &gains);
-        assert_eq!(curve.len(), 10);
+        let curve = curve_points(
+            &layout,
+            &response_curve(&layout, &centres(10), &[0.0; 10], 1.0, 48_000),
+        );
         assert_eq!(curve[0], pos2(53.0, 106.0));
-        assert_eq!(curve[1], pos2(127.0, 69.0));
-        assert_eq!(curve[2], pos2(201.0, 143.0));
-        assert_eq!(curve[3], pos2(275.0, 32.0));
-        assert_eq!(curve[4], pos2(349.0, 180.0));
+        assert_eq!(curve[curve.len() - 1], pos2(719.0, 106.0));
+    }
+
+    #[test]
+    fn the_curve_has_about_two_hundred_points_and_one_on_every_bands_centre() {
+        for count in BAND_COUNTS {
+            let layout = EqLayout::new(count);
+            let ladder = centres(count);
+            let response = response_curve(&layout, &ladder, &vec![3.0; count], 1.0, 48_000);
+            assert!(
+                (RESPONSE_POINTS..RESPONSE_POINTS + count).contains(&response.len()),
+                "{count} bands: {} points",
+                response.len()
+            );
+            for (band, &hz) in ladder.iter().enumerate() {
+                assert!(
+                    response
+                        .iter()
+                        .any(|p| p.x == layout.center_x(band) && p.hz == hz),
+                    "{count} bands: no point on band {band}"
+                );
+            }
+            // The axis only ever rises, in x and in frequency.
+            for pair in response.windows(2) {
+                assert!(pair[0].x < pair[1].x && pair[0].hz < pair[1].hz);
+            }
+        }
+    }
+
+    #[test]
+    fn a_lone_band_peaks_on_its_own_thumb() {
+        let layout = EqLayout::new(10);
+        let mut gains = [0.0_f32; 10];
+        gains[4] = 6.0;
+        let response = response_curve(&layout, &centres(10), &gains, 1.0, 48_000);
+        let peak = response
+            .iter()
+            .max_by(|a, b| a.db.total_cmp(&b.db))
+            .expect("points");
+        assert_eq!(peak.x, layout.center_x(4));
+        assert!((peak.db - 6.0).abs() < 0.01, "peaked at {} dB", peak.db);
+        assert!((response_y(&layout, peak.db) - layout.gain_to_y(6.0)).abs() < 0.1);
+        // Two bands away it is back near flat, as a peak is.
+        let far = response
+            .iter()
+            .find(|p| p.x == layout.center_x(2))
+            .expect("band 3");
+        assert!(far.db.abs() < 0.5, "{} dB two bands away", far.db);
+    }
+
+    #[test]
+    fn neighbouring_boosts_add_up_where_the_old_polyline_drew_them_level() {
+        // 0.4.0 audit R8: every band at +6 dB was a straight line at +6 dB. What plays is higher,
+        // and not flat.
+        let layout = EqLayout::new(10);
+        let response = response_curve(&layout, &centres(10), &[6.0; 10], 1.0, 48_000);
+        let inner: Vec<f32> = response
+            .iter()
+            .filter(|p| p.x > layout.center_x(1) && p.x < layout.center_x(8))
+            .map(|p| p.db)
+            .collect();
+        let (low, high) = inner.iter().fold((f32::MAX, f32::MIN), |(lo, hi), &db| {
+            (lo.min(db), hi.max(db))
+        });
+        assert!(low > 7.0, "the sum dips to {low} dB");
+        assert!(high - low > 0.5, "ripple of {} dB", high - low);
+    }
+
+    #[test]
+    fn a_narrower_filter_width_draws_a_narrower_peak() {
+        // 0.4.0 audit R8: Filter Q x1 against x3 is plain to hear, and the polyline did not move.
+        let layout = EqLayout::new(10);
+        let mut gains = [0.0_f32; 10];
+        gains[5] = 12.0;
+        let wide = response_curve(&layout, &centres(10), &gains, 1.0, 48_000);
+        let narrow = response_curve(&layout, &centres(10), &gains, 3.0, 48_000);
+        let at = |curve: &[ResponsePoint], x: f32| {
+            curve.iter().find(|p| p.x == x).expect("a point there").db
+        };
+        let peak = layout.center_x(5);
+        assert!((at(&wide, peak) - 12.0).abs() < 0.01);
+        assert!((at(&narrow, peak) - 12.0).abs() < 0.01);
+        let neighbour = layout.center_x(6);
+        assert!(
+            at(&wide, neighbour) > at(&narrow, neighbour) + 3.0,
+            "x1 {} dB, x3 {} dB at the next band",
+            at(&wide, neighbour),
+            at(&narrow, neighbour)
+        );
+    }
+
+    /// Run a tone through the audio thread's own equalizer and measure what it does to it.
+    fn measured_gain_db(eq: &mut fxsound_dsp::eq::GraphicEq, hz: f32, sample_rate: f32) -> f32 {
+        eq.reset();
+        let settle = (sample_rate * 0.5) as usize;
+        let window = (sample_rate * 0.5) as usize;
+        let omega = std::f64::consts::TAU * f64::from(hz) / f64::from(sample_rate);
+        let input: Vec<f32> = (0..settle + window)
+            .map(|n| (0.1 * (omega * n as f64).sin()) as f32)
+            .collect();
+        let mut output = input.clone();
+        eq.process(&mut output, 1);
+        // The same window of both, correlated at the tone's frequency: whatever the window does
+        // to the one it does to the other, so their ratio is the equalizer's gain.
+        let amplitude = |signal: &[f32]| {
+            let (mut re, mut im) = (0.0_f64, 0.0_f64);
+            for (n, &x) in signal.iter().enumerate().skip(settle) {
+                let phase = omega * n as f64;
+                re += f64::from(x) * phase.cos();
+                im += f64::from(x) * phase.sin();
+            }
+            re.hypot(im)
+        };
+        (20.0 * (amplitude(&output) / amplitude(&input)).log10()) as f32
+    }
+
+    #[test]
+    fn the_curve_is_what_the_equalizer_does_to_a_tone_within_a_tenth_of_a_decibel() {
+        // 0.4.0 audit R8: the curve is the running equalizer's response. The engine's own
+        // `GraphicEq`, built as the engine builds it, plays a tone at points along the curve.
+        /// A band count, a filter width, a rate and each band's gain.
+        type Case = (usize, f32, u32, fn(usize) -> f32);
+        let cases: [Case; 4] = [
+            (10, 1.0, 48_000, |band| {
+                [4.0, -3.0, 8.0, 0.0, -12.0, 6.0, 2.0, -5.0, 12.0, 3.0][band]
+            }),
+            (
+                10,
+                2.5,
+                44_100,
+                |band| if band % 2 == 0 { 9.0 } else { -4.0 },
+            ),
+            (5, 3.0, 48_000, |band| [-6.0, 12.0, 0.0, 5.0, -2.0][band]),
+            (31, 1.5, 96_000, |band| (band as f32 * 1.7).sin() * 11.0),
+        ];
+        for (count, filter_q, rate, gain) in cases {
+            let layout = EqLayout::new(count);
+            let ladder = centres(count);
+            let gains: Vec<f32> = (0..count).map(gain).collect();
+            let response = response_curve(&layout, &ladder, &gains, filter_q, rate);
+
+            let mut eq = fxsound_dsp::eq::GraphicEq::new();
+            eq.set_sample_rate(rate as f32);
+            eq.set_q_multiplier(filter_q);
+            eq.set_bands(&ladder, &gains);
+            for point in response.iter().step_by(17).filter(|p| p.hz >= 40.0) {
+                let measured = measured_gain_db(&mut eq, point.hz, rate as f32);
+                assert!(
+                    (measured - point.db).abs() < 0.1,
+                    "{count} bands, Q x{filter_q}, {rate} Hz: at {} Hz the curve says {} dB, \
+                     the equalizer does {measured} dB",
+                    point.hz,
+                    point.db
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_curve_follows_a_band_moved_by_its_wheel() {
+        // The fader stays in its column; the curve's peak follows the frequency the band plays at.
+        let layout = EqLayout::new(10);
+        let mut ladder = centres(10);
+        ladder[0] = 46.0;
+        let mut gains = [0.0_f32; 10];
+        gains[0] = 9.0;
+        let response = response_curve(&layout, &ladder, &gains, 1.0, 48_000);
+        let first = response[0];
+        assert_eq!((first.x, first.hz), (layout.center_x(0), 46.0));
+        assert!((first.db - 9.0).abs() < 0.01, "{} dB", first.db);
+    }
+
+    #[test]
+    fn a_band_past_half_the_rate_is_left_out_of_the_curve_as_it_is_out_of_the_sound() {
+        // A 16 kHz headset: the top two bands of ten cannot be built, and the curve past 8 kHz is
+        // what the rate's top plays.
+        let layout = EqLayout::new(10);
+        let mut gains = [0.0_f32; 10];
+        gains[9] = 12.0;
+        let response = response_curve(&layout, &centres(10), &gains, 1.0, 16_000);
+        assert!(
+            response.iter().all(|p| p.db.abs() < 1e-3),
+            "a dead band drew a peak"
+        );
+    }
+
+    #[test]
+    fn a_response_past_the_panel_runs_along_its_edges() {
+        let layout = EqLayout::new(31);
+        let response = response_curve(&layout, &centres(31), &[12.0; 31], 1.0, 48_000);
+        assert!(
+            response.iter().any(|p| layout.gain_to_y(p.db) < 0.0),
+            "boosts add up past it"
+        );
+        let curve = curve_points(&layout, &response);
+        assert!(
+            curve
+                .iter()
+                .all(|p| p.y >= CURVE_TOP && p.y <= layout.baseline())
+        );
+        let cut = curve_points(
+            &layout,
+            &response_curve(&layout, &centres(31), &[-12.0; 31], 1.0, 48_000),
+        );
+        assert!(
+            cut.iter().all(|p| p.y == layout.baseline()),
+            "cuts below −12 dB have no area"
+        );
     }
 
     #[test]
     fn the_fill_polygon_closes_on_the_baseline_at_both_ends() {
         let layout = EqLayout::new(10);
-        let gains = [0.0_f32; 10];
-        let polygon = fill_polygon(&layout, &gains);
-        assert_eq!(polygon.len(), 12);
+        let curve = curve_points(
+            &layout,
+            &response_curve(&layout, &centres(10), &[0.0; 10], 1.0, 48_000),
+        );
+        let polygon = fill_polygon(&layout, &curve);
+        assert_eq!(polygon.len(), curve.len() + 2);
         assert_eq!(polygon[0], pos2(53.0, 180.0));
         assert_eq!(polygon[1], pos2(53.0, 106.0));
-        assert_eq!(polygon[10], pos2(719.0, 106.0));
-        assert_eq!(polygon[11], pos2(719.0, 180.0));
-    }
-
-    #[test]
-    fn a_fully_cut_curve_has_no_area() {
-        let layout = EqLayout::new(10);
-        let gains = [-12.0_f32; 10];
-        let polygon = fill_polygon(&layout, &gains);
-        assert!(
-            polygon.iter().all(|p| p.y == layout.baseline()),
-            "every vertex should collapse onto the baseline"
-        );
+        assert_eq!(polygon[polygon.len() - 2], pos2(719.0, 106.0));
+        assert_eq!(polygon[polygon.len() - 1], pos2(719.0, 180.0));
     }
 
     #[test]
     fn an_empty_band_list_produces_no_curve() {
         let layout = EqLayout::new(0);
-        assert!(curve_points(&layout, &[]).is_empty());
+        assert!(response_curve(&layout, &[], &[], 1.0, 48_000).is_empty());
         assert!(fill_polygon(&layout, &[]).is_empty());
+        // One band is one point, which draws nothing.
+        let one = EqLayout::new(1);
+        assert_eq!(
+            response_curve(&one, &[1000.0], &[3.0], 1.0, 48_000).len(),
+            1
+        );
         // And the degenerate layout still answers every question finitely: the gain axis is fixed
         // by the fader height alone, so a y that reads +1 dB at ten bands reads +1 dB at none.
         assert!(layout.gain_to_y(0.0).is_finite());
         let gain = layout.y_to_gain(100.0);
         assert!((gain - 1.0).abs() < 1e-6, "y = 100 gave {gain} dB, not 1");
         assert!((gain - EqLayout::new(10).y_to_gain(100.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_band_the_command_line_put_past_its_neighbour_still_draws_a_rising_axis() {
+        let layout = EqLayout::new(10);
+        let mut ladder = centres(10);
+        ladder[3] = 900.0;
+        let response = response_curve(&layout, &ladder, &[2.0; 10], 1.0, 48_000);
+        for pair in response.windows(2) {
+            assert!(pair[0].hz < pair[1].hz);
+        }
+    }
+
+    #[test]
+    fn the_curve_is_worked_out_again_only_when_what_it_shows_changes() {
+        let layout = EqLayout::new(10);
+        let ladder = centres(10);
+        let mut gains = vec![0.0_f32; 10];
+        let mut cache = ResponseCache::new();
+        let _ = cache.curve(&layout, &ladder, &gains, 1.0, 48_000);
+        for _ in 0..100 {
+            let _ = cache.curve(&layout, &ladder, &gains, 1.0, 48_000);
+        }
+        assert_eq!(
+            cache.computations(),
+            1,
+            "an unchanged curve is not recomputed"
+        );
+
+        gains[2] = 4.0;
+        let _ = cache.curve(&layout, &ladder, &gains, 1.0, 48_000);
+        assert_eq!(cache.computations(), 2, "a gain");
+        let _ = cache.curve(&layout, &ladder, &gains, 2.0, 48_000);
+        assert_eq!(cache.computations(), 3, "the width");
+        let _ = cache.curve(&layout, &ladder, &gains, 2.0, 44_100);
+        assert_eq!(cache.computations(), 4, "the rate");
+        let mut moved = ladder.clone();
+        moved[0] = 50.0;
+        let _ = cache.curve(&layout, &moved, &gains, 2.0, 44_100);
+        assert_eq!(cache.computations(), 5, "a centre");
+        let five = EqLayout::new(5);
+        let curve = cache
+            .curve(&five, &centres(5), &gains[..5], 2.0, 44_100)
+            .to_vec();
+        assert_eq!(cache.computations(), 6, "the band count");
+        assert_eq!(
+            curve,
+            response_curve(&five, &centres(5), &gains[..5], 2.0, 44_100)
+        );
+        let _ = cache.curve(&five, &centres(5), &gains[..5], 2.0, 44_100);
+        assert_eq!(cache.computations(), 6);
     }
 
     #[test]
@@ -1727,5 +2424,477 @@ mod tests {
     fn every_band_has_a_tooltip_at_the_default_band_count() {
         assert_eq!(BAND_TOOLTIPS.len(), fxsound_core::eq::DEFAULT_BANDS);
         assert!(BAND_TOOLTIPS.iter().all(|tip| !tip.is_empty()));
+    }
+
+    #[test]
+    fn a_solo_walks_a_decibel_a_tick_to_minus_ten_and_stays_there() {
+        assert_eq!(solo_walk(0.0, 0), 0.0);
+        assert_eq!(solo_walk(0.0, 1), -1.0);
+        assert_eq!(solo_walk(0.0, 10), -10.0);
+        assert_eq!(solo_walk(0.0, 64), -10.0);
+        // From below the floor it walks up (`FxEqualizer.cpp:189-193`).
+        assert_eq!(solo_walk(-12.0, 1), -11.0);
+        assert_eq!(solo_walk(-12.0, 5), -10.0);
+        assert_eq!(solo_walk(12.0, 21), -9.0);
+        assert_eq!(solo_walk(12.0, 22), -10.0);
+        // The original swings a band at +2.5 dB between −9.5 and −10.5 for ever; here it settles.
+        assert_eq!(solo_walk(2.5, 12), -9.5);
+        assert_eq!(solo_walk(2.5, 13), -10.0);
+        assert_eq!(solo_walk(2.5, 14), -10.0);
+    }
+
+    #[test]
+    fn the_solos_ticks_come_thirty_a_second_from_the_press() {
+        assert_eq!(solo_steps(0.0), 0);
+        assert_eq!(solo_steps(0.03), 0);
+        assert_eq!(solo_steps(0.034), 1);
+        assert_eq!(solo_steps(1.0 / 3.0 + 0.001), 10);
+        assert_eq!(solo_steps(-1.0), 0);
+        assert_eq!(solo_steps(1e9), 64);
+    }
+
+    mod in_the_window {
+        use super::*;
+        use crate::views::testing::{Harness, texts};
+        use egui::{Event, Modifiers, PointerButton};
+        use fxsound_core::ThemeMode;
+
+        const CTRL_ALT: Modifiers = Modifiers {
+            alt: true,
+            ctrl: true,
+            shift: false,
+            mac_cmd: false,
+            command: true,
+        };
+
+        fn panel() -> Vec2 {
+            crate::layout::pro::equalizer().min.to_vec2()
+        }
+
+        fn thumb(state: &UiState, band: usize) -> Pos2 {
+            let layout = EqLayout::new(state.eq_bands.len());
+            pos2(
+                layout.center_x(band),
+                layout.gain_to_y(state.eq_bands[band].boost_db),
+            ) + panel()
+        }
+
+        fn button(pos: Pos2, pressed: bool, modifiers: Modifiers) -> Event {
+            Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed,
+                modifiers,
+            }
+        }
+
+        fn solos(actions: &[UiAction]) -> Vec<Option<EqSolo>> {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    UiAction::SoloBand(solo) => Some(solo.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn gain_moves(actions: &[UiAction]) -> Vec<(usize, f32)> {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    UiAction::SetBandGain(band, db) => Some((*band, *db)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A window on `state` with the pointer pressed on band `band`'s thumb, `modifiers` held,
+        /// and what the press reported.
+        fn pressed_on(
+            state: &UiState,
+            band: usize,
+            modifiers: Modifiers,
+        ) -> (Harness, Vec<UiAction>) {
+            let mut harness = Harness::new(ThemeMode::Dark);
+            harness.settle(state);
+            harness.modifiers = modifiers;
+            let at = thumb(state, band);
+            harness.frame(state, vec![Event::PointerMoved(at)]);
+            let (actions, _) = harness.frame(
+                state,
+                vec![Event::PointerMoved(at), button(at, true, modifiers)],
+            );
+            (harness, actions)
+        }
+
+        fn curve() -> UiState {
+            let mut state = UiState::default();
+            state.eq_bands[0].boost_db = 3.0;
+            state.eq_bands[1].boost_db = -12.0;
+            state.eq_bands[5].boost_db = 6.0;
+            state
+        }
+
+        #[test]
+        fn ctrl_alt_on_a_band_solos_it_and_walks_every_other_band_down_to_minus_ten() {
+            // 0.4.0 audit R10: `FxEqualizer.cpp:123-210`, bound to Ctrl+Alt here (D-19).
+            let state = curve();
+            let (mut harness, actions) = pressed_on(&state, 5, CTRL_ALT);
+            assert_eq!(harness.scratch.eq.soloed_band(), Some(5));
+            assert!(
+                gain_moves(&actions).is_empty(),
+                "the press moved {actions:?}"
+            );
+            let played: Vec<f32> = state.eq_bands.iter().map(|b| b.boost_db).collect();
+            assert_eq!(
+                solos(&actions),
+                [Some(EqSolo {
+                    band: 5,
+                    gains_db: played
+                })],
+                "the curve as it is, to start with"
+            );
+
+            // Seven frames of a sixtieth: three and a half ticks, so three steps.
+            let mut sent = Vec::new();
+            for _ in 0..7 {
+                let (actions, _) = harness.frame(&state, Vec::new());
+                assert!(gain_moves(&actions).is_empty());
+                sent.extend(solos(&actions));
+            }
+            let solo = sent.last().cloned().flatten().expect("a step was sent");
+            assert_eq!(solo.band, 5);
+            assert_eq!(solo.gains_db[0], 0.0, "+3 dB three steps down");
+            assert_eq!(solo.gains_db[1], -10.0, "-12 dB two steps up, and there");
+            assert_eq!(solo.gains_db[2], -3.0);
+            assert_eq!(solo.gains_db[5], 6.0, "the soloed band plays its own gain");
+
+            // Half a second on, everything is on the floor, and each step went out once: +3 dB
+            // is thirteen steps from it.
+            for _ in 0..30 {
+                sent.extend(solos(&harness.frame(&state, Vec::new()).0));
+            }
+            assert_eq!(sent.len(), 13, "one message a step: {sent:?}");
+            let solo = sent.last().cloned().flatten().expect("the last step");
+            for (band, &db) in solo.gains_db.iter().enumerate() {
+                if band != 5 {
+                    assert_eq!(db, SOLO_FLOOR_DB, "band {band}");
+                }
+            }
+
+            // Letting go ends it, and nothing was ever an edit.
+            let at = thumb(&state, 5);
+            let (actions, _) = harness.frame(&state, vec![button(at, false, CTRL_ALT)]);
+            assert_eq!(solos(&actions), [None]);
+            assert!(gain_moves(&actions).is_empty());
+            assert_eq!(harness.scratch.eq.soloed_band(), None);
+            let (actions, _) = harness.frame(&state, Vec::new());
+            assert!(solos(&actions).is_empty(), "ended once");
+        }
+
+        #[test]
+        fn a_press_without_both_ctrl_and_alt_is_no_solo() {
+            let ctrl = Modifiers {
+                ctrl: true,
+                command: true,
+                ..Modifiers::default()
+            };
+            let alt = Modifiers {
+                alt: true,
+                ..Modifiers::default()
+            };
+            for modifiers in [Modifiers::default(), ctrl, alt] {
+                let state = curve();
+                let (mut harness, mut actions) = pressed_on(&state, 5, modifiers);
+                for _ in 0..10 {
+                    actions.extend(harness.frame(&state, Vec::new()).0);
+                }
+                assert!(solos(&actions).is_empty(), "{modifiers:?}: {actions:?}");
+                assert_eq!(harness.scratch.eq.soloed_band(), None);
+            }
+        }
+
+        #[test]
+        fn the_soloed_band_moves_only_when_the_pointer_does() {
+            let state = UiState::default();
+            let (mut harness, _) = pressed_on(&state, 3, CTRL_ALT);
+            let at = thumb(&state, 3);
+            // Six decibels up is 37 points on a 148-point travel.
+            let up = at - vec2(0.0, 37.0);
+            let mut actions = Vec::new();
+            for pos in [at - vec2(0.0, 10.0), up] {
+                actions.extend(harness.frame(&state, vec![Event::PointerMoved(pos)]).0);
+            }
+            let moves = gain_moves(&actions);
+            assert!(!moves.is_empty(), "the drag moved nothing: {actions:?}");
+            assert!(moves.iter().all(|&(band, _)| band == 3), "{moves:?}");
+            assert_eq!(moves.last(), Some(&(3, 6.0)));
+            assert_eq!(harness.scratch.eq.soloed_band(), Some(3), "still soloing");
+        }
+
+        #[test]
+        fn switching_the_power_off_ends_a_solo() {
+            let mut state = UiState::default();
+            let (mut harness, _) = pressed_on(&state, 2, CTRL_ALT);
+            state.power = false;
+            let (actions, _) = harness.frame(&state, Vec::new());
+            assert_eq!(solos(&actions), [None]);
+            assert_eq!(harness.scratch.eq.soloed_band(), None);
+        }
+
+        #[test]
+        fn a_band_count_that_drops_under_the_soloed_band_ends_the_solo() {
+            let mut state = UiState::default();
+            let (mut harness, _) = pressed_on(&state, 8, CTRL_ALT);
+            state.eq_bands.truncate(5);
+            let (actions, _) = harness.frame(&state, Vec::new());
+            assert_eq!(solos(&actions), [None]);
+        }
+
+        /// What `state`'s curve holds, band by band.
+        fn curve_of(state: &UiState) -> Vec<f32> {
+            state.eq_bands.iter().map(|band| band.boost_db).collect()
+        }
+
+        #[test]
+        fn a_solo_the_application_ended_ends_in_the_window_with_the_button_still_down() {
+            // A preset from the tray while the button is held on a band: the application stops
+            // playing the solo and moves the generation on. The walk here has long reached the
+            // floor, where the new curve walked would send nothing new, so it is the generation
+            // alone that tells the window.
+            let mut state = curve();
+            let (mut harness, _) = pressed_on(&state, 5, CTRL_ALT);
+            for _ in 0..50 {
+                harness.frame(&state, Vec::new());
+            }
+            assert!(
+                harness
+                    .scratch
+                    .eq
+                    .drawn_gains()
+                    .iter()
+                    .enumerate()
+                    .all(|(band, &db)| band == 5 || db == SOLO_FLOOR_DB),
+                "walked: {:?}",
+                harness.scratch.eq.drawn_gains()
+            );
+
+            for (band, slot) in state.eq_bands.iter_mut().enumerate() {
+                slot.boost_db = band as f32 - 4.0;
+            }
+            state.eq_solo_generation += 1;
+            let (actions, _) = harness.frame(&state, Vec::new());
+            assert_eq!(solos(&actions), [None], "the window lets go of it");
+            assert_eq!(harness.scratch.eq.soloed_band(), None);
+            assert_eq!(harness.scratch.eq.drawn_gains(), curve_of(&state));
+            assert!(gain_moves(&actions).is_empty(), "holding still is no edit");
+
+            let (actions, _) = harness.frame(&state, Vec::new());
+            assert!(
+                solos(&actions).is_empty() && gain_moves(&actions).is_empty(),
+                "and that was all: {actions:?}"
+            );
+            assert_eq!(harness.scratch.eq.drawn_gains(), curve_of(&state));
+        }
+
+        #[test]
+        fn a_solo_the_application_ended_mid_walk_sends_no_step_of_the_new_curve() {
+            let mut state = curve();
+            let (mut harness, _) = pressed_on(&state, 5, CTRL_ALT);
+            for _ in 0..4 {
+                harness.frame(&state, Vec::new());
+            }
+            state.eq_bands[0].boost_db = 9.0;
+            state.eq_solo_generation += 1;
+            let (actions, _) = harness.frame(&state, Vec::new());
+            assert_eq!(solos(&actions), [None], "{actions:?}");
+            assert_eq!(harness.scratch.eq.drawn_gains(), curve_of(&state));
+        }
+
+        #[test]
+        fn a_band_pressed_to_solo_stays_put_when_the_solo_is_ended_for_it_until_the_pointer_moves()
+        {
+            // The press landed on the band at 0 dB; the preset loaded meanwhile puts it at
+            // -4 dB. Snapping it back to the pointer would be an edit nobody made.
+            let mut state = UiState::default();
+            let at = thumb(&state, 3);
+            let (mut harness, _) = pressed_on(&state, 3, CTRL_ALT);
+            state.eq_bands[3].boost_db = -4.0;
+            state.eq_solo_generation += 1;
+            let mut actions = Vec::new();
+            for _ in 0..5 {
+                actions.extend(harness.frame(&state, Vec::new()).0);
+            }
+            assert!(gain_moves(&actions).is_empty(), "{actions:?}");
+
+            // Moved, it is a drag like any other: six decibels up is 37 points.
+            let (actions, _) =
+                harness.frame(&state, vec![Event::PointerMoved(at - vec2(0.0, 37.0))]);
+            assert_eq!(gain_moves(&actions).last(), Some(&(3, 6.0)));
+            assert!(solos(&actions).is_empty(), "no solo came back: {actions:?}");
+        }
+
+        #[test]
+        fn the_generation_moving_with_no_solo_on_changes_nothing_in_the_window() {
+            let mut state = curve();
+            let mut harness = Harness::new(ThemeMode::Dark);
+            harness.settle(&state);
+            state.eq_solo_generation += 1;
+            let (actions, _) = harness.frame(&state, Vec::new());
+            assert!(
+                solos(&actions).is_empty() && gain_moves(&actions).is_empty(),
+                "{actions:?}"
+            );
+            assert_eq!(harness.scratch.eq.drawn_gains(), curve_of(&state));
+        }
+
+        #[test]
+        fn during_a_solo_only_the_soloed_band_shows_its_gain() {
+            // `showValue(false)` on every other band (`FxEqualizer.cpp:140-141`).
+            let state = UiState::default();
+            let eq = crate::layout::pro::equalizer();
+            let gain_labels = |shapes: &[egui::epaint::ClippedShape]| -> Vec<String> {
+                texts(shapes)
+                    .into_iter()
+                    .filter(|(text, rect, _)| {
+                        eq.contains(rect.center()) && text.parse::<i32>().is_ok()
+                    })
+                    .map(|(text, ..)| text)
+                    .collect()
+            };
+            let mut harness = Harness::new(ThemeMode::Dark);
+            assert_eq!(gain_labels(&harness.settle(&state)).len(), 10);
+
+            let (mut harness, _) = pressed_on(&state, 4, CTRL_ALT);
+            let mut shapes = Vec::new();
+            for _ in 0..30 {
+                shapes = harness.frame(&state, Vec::new()).1;
+            }
+            assert_eq!(gain_labels(&shapes), ["0"]);
+        }
+
+        #[test]
+        fn every_bands_tooltip_says_how_to_solo_it() {
+            for count in [5, 10, 31] {
+                let state = UiState {
+                    eq_bands: centres(count)
+                        .into_iter()
+                        .map(|hz| fxsound_core::EqBand::new(hz, 0.0))
+                        .collect(),
+                    ..UiState::default()
+                };
+                let mut harness = Harness::new(ThemeMode::Dark);
+                harness.settle(&state);
+                let shown = harness
+                    .rest(&state, thumb(&state, 0) + vec2(0.0, 20.0))
+                    .join("\n");
+                assert!(shown.contains(SOLO_TIP), "{count} bands: {shown}");
+                assert!(shown.contains(slider::RESET_TIP), "{count} bands: {shown}");
+            }
+        }
+
+        #[test]
+        fn a_window_left_alone_works_the_curve_out_once() {
+            // 0.4.0 audit R8: the response is a cache, not a per-frame cost.
+            let mut state = UiState::default();
+            state.eq_bands[3].boost_db = 5.0;
+            let mut harness = Harness::new(ThemeMode::Dark);
+            for _ in 0..60 {
+                harness.frame(&state, Vec::new());
+            }
+            assert_eq!(harness.scratch.eq.response().computations(), 1);
+
+            state.theme = ThemeMode::Light;
+            state.eq_on = false;
+            state.power = false;
+            for _ in 0..10 {
+                harness.frame(&state, Vec::new());
+            }
+            assert_eq!(
+                harness.scratch.eq.response().computations(),
+                1,
+                "colours are not the curve"
+            );
+            state.filter_q = 2.0;
+            harness.frame(&state, Vec::new());
+            state.sample_rate = 44_100;
+            harness.frame(&state, Vec::new());
+            state.eq_bands[3].boost_db = 6.0;
+            for _ in 0..10 {
+                harness.frame(&state, Vec::new());
+            }
+            assert_eq!(harness.scratch.eq.response().computations(), 4);
+        }
+
+        #[test]
+        fn the_drawn_curve_is_the_response_in_the_originals_colour_and_weight() {
+            let mut state = UiState::default();
+            state.eq_bands[4].boost_db = 9.0;
+            let mut harness = Harness::new(ThemeMode::Dark);
+            let shapes = harness.settle(&state);
+            let palette = Palette::new(ThemeMode::Dark);
+            let layout = EqLayout::new(10);
+            let expected = curve_points(
+                &layout,
+                &response_curve(
+                    &layout,
+                    &centres(10),
+                    &[0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    1.0,
+                    48_000,
+                ),
+            );
+            let drawn: Vec<&egui::epaint::PathShape> = shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    Shape::Path(path) if path.points.len() == expected.len() => Some(path),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(drawn.len(), 1, "one path for the curve");
+            let path = drawn[0];
+            assert_eq!(path.stroke.width, 1.5);
+            assert_eq!(
+                path.stroke.color,
+                egui::epaint::ColorMode::Solid(palette.color(FxColor::SliderTrack))
+            );
+            for (drawn, want) in path.points.iter().zip(&expected) {
+                assert_eq!(*drawn, *want + panel());
+            }
+        }
+
+        #[test]
+        fn the_first_wheel_of_ten_bands_turns_below_the_ladder() {
+            // 0.4.0 audit R6: on Windows band 1's wheel starts at its minimum, 62.5 Hz.
+            let state = UiState::default();
+            let layout = EqLayout::new(10);
+            let wheel = layout
+                .wheel_rect(0)
+                .expect("ten bands have wheels")
+                .center()
+                + panel();
+            let mut harness = Harness::new(ThemeMode::Dark);
+            harness.settle(&state);
+            let none = Modifiers::default();
+            let mut actions = Vec::new();
+            for events in [
+                vec![Event::PointerMoved(wheel)],
+                vec![Event::PointerMoved(wheel), button(wheel, true, none)],
+                vec![Event::PointerMoved(wheel - vec2(10.0, 0.0))],
+                vec![Event::PointerMoved(wheel - vec2(100.0, 0.0))],
+                vec![button(wheel - vec2(100.0, 0.0), false, none)],
+            ] {
+                actions.extend(harness.frame(&state, events).0);
+            }
+            let tuned: Vec<f32> = actions
+                .iter()
+                .filter_map(|action| match action {
+                    UiAction::SetBandFrequency(0, hz) => Some(*hz),
+                    _ => None,
+                })
+                .collect();
+            let lowest = tuned.iter().copied().fold(f32::MAX, f32::min);
+            assert!((46.0..62.5).contains(&lowest), "tuned to {tuned:?}");
+        }
     }
 }

@@ -116,3 +116,4 @@ countries: id
 "Equalizer settings" = "Pengaturan equalizer"
 "Effects" = "Efek"
 "Right-click to reset" = "Klik kanan untuk mengatur ulang"
+"Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+seret untuk mendengar pita ini saja"

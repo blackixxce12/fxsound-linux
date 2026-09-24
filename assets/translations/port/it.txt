@@ -117,3 +117,4 @@ countries: it
 "Equalizer settings" = "Impostazioni dell'equalizzatore"
 "Effects" = "Effetti"
 "Right-click to reset" = "Clic destro per ripristinare"
+"Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+trascina per ascoltare solo questa banda"

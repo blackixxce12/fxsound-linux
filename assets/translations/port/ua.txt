@@ -116,3 +116,4 @@ countries: ua
 "Equalizer settings" = "Налаштування еквалайзера"
 "Effects" = "Ефекти"
 "Right-click to reset" = "Правий клік — скидання"
+"Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+перетягування — слухати лише цю смугу"

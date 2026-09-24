@@ -115,3 +115,4 @@ countries: tr
 "Equalizer settings" = "Ekolayzır ayarları"
 "Effects" = "Efektler"
 "Right-click to reset" = "Sıfırlamak için sağ tıklayın"
+"Ctrl+Alt+drag to hear this band alone" = "Yalnızca bu bandı duymak için Ctrl+Alt ile sürükleyin"

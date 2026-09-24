@@ -340,6 +340,15 @@ or 1), and **Shift** with the arrow keys, the wheel or a drag steps one stored v
 loading a preset and saving it changes nothing. Ambience's positions 1 to 10 run over the values it
 can be heard at; on Windows positions 1 to 3 were all but silent.
 
+The equalizer's curve is the response the equalizer really has, filter width and all, where the
+Windows build joins the band values with straight lines: bands boosted side by side add up, and a
+narrower filter width draws a narrower peak. The first and last band's wheels on five and ten bands
+turn both ways, reaching half a band past the ladder (on ten bands 46 Hz and 20 kHz); a preset
+exported for Windows has such a band put back at 62.5 Hz or 16 kHz, where its wheels stop.
+**Ctrl+Alt**+drag on a band solos it, as Alt+drag does on Windows: every other band sinks to
+−10 dB while you listen and comes back when you let go, or when a preset, the band count or the
+lane changes under it, and the preset is not marked as changed.
+
 A preset lands on your band count, as in the original since 1.2.11: pick a ten-band preset while on
 31 bands and its curve is fitted onto the 31, and changing the band count carries the curve over
 instead of flattening it. Both go by frequency, so a boost stays where it was. The band count is

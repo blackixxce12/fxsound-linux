@@ -117,6 +117,13 @@ pub struct UiState {
     pub eq_bands: Vec<EqBand>,
     /// The filter-width knob, `1.0..=3.0` in steps of `0.5`.
     pub filter_q: f32,
+    /// Moves on each time the application ends the equalizer's solo ([`UiAction::SoloBand`]) on
+    /// its own: a preset load, a band count, a switch of the edit direction, the power, the Lite
+    /// view or the window closing — whether the window asked for it or the command line, the tray,
+    /// D-Bus or a device's preset did, with the button still down on the band. A solo in the
+    /// window began under the number it saw at the press and ends once the number has moved, so
+    /// the window never draws a solo the equalizer has stopped playing.
+    pub eq_solo_generation: u64,
 
     // ---- levels ----------------------------------------------------------------------------
     /// `-20..=20` dB in steps of 2.
@@ -132,9 +139,10 @@ pub struct UiState {
     pub audio_active: bool,
     /// The rate the engine is running at, which is the device's, not a preference.
     ///
-    /// Read for one purpose: an equalizer band centred at or above half of it cannot be built, so
-    /// the band is bypassed. A bypassed band that still *looks* live is a control that silently
-    /// does nothing, which is the one thing this port keeps refusing to ship.
+    /// Read for the equalizer. A band centred at or above half of it cannot be built, so the band
+    /// is bypassed, and a bypassed band that still *looks* live is a control that silently does
+    /// nothing, which is the one thing this port keeps refusing to ship. And the response curve is
+    /// designed at it, as the filters that play are.
     pub sample_rate: u32,
     /// Gain reduction of the three microphone stages, in dB, as positive numbers.
     ///
@@ -231,6 +239,7 @@ impl Default for UiState {
             eq_on: true,
             eq_bands: fxsound_core::eq::default_bands(),
             filter_q: 1.0,
+            eq_solo_generation: 0,
             master_gain_db: 0.0,
             balance_db: 0.0,
             volume_leveling: 0.0,
@@ -438,9 +447,11 @@ impl UiState {
     pub fn band_is_live(&self, band: usize) -> bool {
         // Spelled `2·f0 < fs` rather than `f0 < fs/2` to match `GraphicEq::set_band_boost`
         // character for character. The two are the same number in exact arithmetic and the same
-        // number in f32, but this rule is duplicated across a crate boundary — the equalizer
-        // cannot be reached from here — and a duplicated rule that is *written* differently is one
-        // that drifts. `fxsound-app` holds the test that keeps the two answering alike.
+        // number in f32, but this rule is duplicated across a crate boundary — the equalizer keeps
+        // it inside `set_band_boost` and offers no function for it — and a duplicated rule that is
+        // *written* differently is one that drifts. `fxsound-app` holds the test that keeps the
+        // two answering alike, and the response curve, drawn by the equalizer itself, leaves such
+        // a band out as the sound does.
         self.eq_bands
             .get(band)
             .is_some_and(|band| band.center_hz * 2.0 < self.sample_rate as f32)
@@ -476,6 +487,22 @@ impl UiState {
                 .map_or(count - 1, |i| (i + count - 1) % count),
         )
     }
+}
+
+/// What the equalizer plays while one band is soloed: the solo of `FxEqualizer.cpp:123-210`,
+/// on Ctrl+Alt+drag here (`docs/spec/00-architecture.md` D-19).
+///
+/// Every other band walks down to −10 dB a decibel at a time, thirty steps a second, so the band
+/// being dragged is heard on its own; letting go puts the curve back. The walk is a listening aid,
+/// not an edit: it never reaches [`UiState::eq_bands`], and the preset is not marked modified,
+/// saved or reported with it. Moving the soloed band itself is an edit like any other drag.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EqSolo {
+    /// The band being listened to, which plays its own gain from the curve.
+    pub band: usize,
+    /// What every band plays meanwhile, in dB, one per band of the curve; the soloed band's own
+    /// entry is not read.
+    pub gains_db: Vec<f32>,
 }
 
 /// Something the user did. Views emit these; the application layer acts on them.
@@ -524,6 +551,9 @@ pub enum UiAction {
     SetBandGain(usize, f32),
     /// Move one equalizer band's centre frequency, in Hz.
     SetBandFrequency(usize, f32),
+    /// Solo a band (Ctrl+Alt+drag on it), or end the solo with `None`: what the equalizer plays
+    /// meanwhile, without touching the curve, the preset or its modified mark.
+    SoloBand(Option<EqSolo>),
     /// Switch the equalizer on or off.
     SetEqEnabled(bool),
     /// Change how many bands the equalizer has.

@@ -115,3 +115,4 @@ countries: th
 "Equalizer settings" = "การตั้งค่าอีควอไลเซอร์"
 "Effects" = "เอฟเฟกต์"
 "Right-click to reset" = "คลิกขวาเพื่อรีเซ็ต"
+"Ctrl+Alt+drag to hear this band alone" = "Ctrl+Alt+ลากเพื่อฟังเฉพาะย่านนี้"
