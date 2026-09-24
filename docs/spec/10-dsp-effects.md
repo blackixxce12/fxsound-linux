@@ -148,6 +148,7 @@ write — so every stage must write exactly one output per input.
     │  bypass_all==1 && eq_on:  master_gain only                     │
     │        GraphicEqProcess_MasterGainOnly → SosProcess.cpp:501-517│
     │  eq_on==0: NOTHING (not even master gain)  ← see §12 traps     │
+    │  (port, audit R3: the bypass pass also carries the balance)    │
     └────────────────────────────────────────────────────────────────┘
     │
     ├─ BinauralSyn HRIR headphone virtualisation, only if
@@ -340,9 +341,13 @@ Applied at:
 
 **This is not cosmetic.** Under MUSIC2:
 
-* **Ambience is fully bypassed for UI ≤ 3.0** — `int(midi·0.34) ≤ 12` triggers
-  `DFXP_MIN_EFFECTIVE_MIDI_AMBIENCE` (`dfxpComm.cpp:50, 1688-1691`). The first
-  30 % of the Ambience slider does nothing at all.
+* **Ambience does nothing useful for UI ≤ 3.0.** The bypass test
+  (`DFXP_MIN_EFFECTIVE_MIDI_AMBIENCE`, `dfxpComm.cpp:50, 1688-1691`) reads the
+  *unscaled* MIDI value, so only UI 0 is bypassed (§6.6). But `int(midi·0.34) ≤ 12`
+  takes the wet gain to zero or below (§6.7). Positions 1 and 2 run a phase-inverted
+  tail, and position 3 runs none. An earlier version of this bullet said
+  "fully bypassed", which contradicted §6.6. The port copied that mistake until the
+  0.4.0 audit (#39, §6.7a).
 * **Dynamic Boost saturates at UI ≈ 5.59** (`midi ≥ 71` → `71·1.8 = 127.8` →
   clamped to 127). The top 44 % of the Dynamic Boost slider does nothing.
 
@@ -996,6 +1001,26 @@ non-positive number. See §12.3.
 
 Because the 0.34 factor caps `eff` at 43, the shipped app never uses a decay
 above **0.206**; the reverb is a short, dense ambience, not a hall.
+
+### 6.7a Where the port departs from it (0.4.0 audit)
+
+* **#39 — the bypass reads the stored value, as the original's does.** Only a stored value of 12
+  or less, which is UI 0, is bypassed. The port used to test the warped value and so silenced
+  positions 1–3. For stored 13–38, where the warp gives wet ≤ 0 and dry ≥ 1, the port does not
+  copy the original. It runs a straight line from wet 0 / dry 1 at the threshold to the warp's
+  own pair at 39 (wet 0.00975, dry 0.99632). The tail never inverts, the dry signal is never
+  boosted, and the effect grows with the slider. Stored 39 and above, which covers every factory
+  preset, are bit-identical. This implements §14 items 3 and 4. Positions 1–3 are only *audible*
+  once the slider's positions are spread over stored 39–127 (§14 item 2), which is the
+  application's job. Until then they run but stay far below hearing: after a −6 dBFS 440 Hz tone
+  the tail reaches −73, −51 and −45 dBFS at positions 1–3, against −31 dBFS at position 4. The
+  original's position 1, a wet gain of −0.078, was about −22 dB, but phase-inverted.
+* **#9 — a switched-on reverb starts from an empty tank.** The original skips a bypassed tank
+  and resumes from what it held, up to 150 ms of old music. After a second of a tone at full
+  Ambience, that measured −15.3 dBFS in silence. The port empties the part of the ring the
+  current rate uses on the first block after the effect comes back on. That is 165 kB at 48 kHz,
+  once per switch-on. The same applies to Bass and Fidelity: their filters are cleared on the
+  off→on edge. Before, they rang at +4.9 dBFS and −6.5 dBFS respectively.
 
 ### 6.8 Memory and state
 
@@ -1910,14 +1935,18 @@ record it.
    but expose the true effective range in the UI, or remap the slider so its
    full travel is useful. Currently Ambience's bottom 30 % and Dynamic Boost's
    top 44 % do nothing.
+   **Dynamic Boost's slider is remapped in 0.4.0.** Ambience's slider remap (positions 1..10 →
+   stored 39..127, audit #39) belongs to the application. The DSP side is §6.7a.
 3. **Ambience `wet_gain` goes negative** for `12 > eff_midi ≥ 0` (§6.7,
    `dfxpComm.cpp:630`: `(pc_liveliness − 12) × …`). It is masked because the
    bypass flag uses the *unscaled* MIDI value, so the block is skipped
    below UI 0.95 — but between UI 0.95 and 3.07 the reverb runs with
    `wet_gain ≤ 0`, i.e. a phase-inverted (and at UI ≤ 0.94 also bypassed) tail.
    Recommend: clamp `wet_gain` to `≥ 0`.
+   **Done in 0.4.0** (audit #39): wet ramps from 0 there instead, §6.7a.
 4. **Ambience `dry_gain` exceeds 1.0** below eff_midi 12 (up to 1.044 at 0,
    `dfxpComm.cpp:631`). Same masking, same recommendation: clamp to `≤ 1.0`.
+   **Done in 0.4.0** (audit #39), §6.7a.
 5. **Maximizer level estimate uses the left channel only** (`Maxi32.c:258-259`).
    Recommend: use `max(|L|,|R|)²` or `(L²+R²)/2` and document the change; the
    current behaviour mis-tracks hard-panned material.

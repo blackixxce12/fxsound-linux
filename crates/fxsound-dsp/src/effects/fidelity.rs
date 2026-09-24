@@ -132,10 +132,19 @@ impl Effect for Fidelity {
         self.reset();
     }
 
+    /// Linear in MIDI, and `amount` is already `midi / 127`.
+    ///
+    /// Coming back from zero clears the high-pass. At zero the chain skips the stage and its
+    /// history stands still, as the original's does (`Play32.c:640-647`); resumed from it, the
+    /// waveshaper turns the old treble into a click — −6.5 dBFS into silence after a 3 kHz tone
+    /// at full Fidelity (audit report #9).
     fn set_amount(&mut self, amount: Real) {
+        let was_active = self.is_active();
         self.amount = amount.clamp(0.0, 1.0);
-        // Linear in MIDI, and `amount` is already `midi / 127`.
         self.drive = DRIVE_MAX * self.amount;
+        if !was_active && self.is_active() {
+            self.reset();
+        }
     }
 
     fn amount(&self) -> Real {
@@ -306,6 +315,38 @@ mod tests {
             buffer.as_chunks::<2>().0.iter().all(|f| f[1].abs() < 1e-20),
             "the right channel picked up the left channel's signal"
         );
+    }
+
+    /// Peak of the output when silence goes into a Fidelity that has shaped a loud 3 kHz tone at
+    /// full drive and then been set to `off_amount` and back to full.
+    fn ring_after_switching(off_amount: Real) -> Real {
+        let mut f = Fidelity::new(48_000.0);
+        f.set_amount(1.0);
+        let mut tone: Vec<Real> = (0..24_001)
+            .flat_map(|n| {
+                let s = (n as Real * 3_000.0 * TWO_PI / 48_000.0).sin() * 0.5;
+                [s, s]
+            })
+            .collect();
+        f.process(&mut tone, 2);
+        f.set_amount(off_amount);
+        f.set_amount(1.0);
+        let mut silence = vec![0.0; 2 * 4_800];
+        f.process(&mut silence, 2);
+        silence.iter().fold(0.0, |m: Real, s| m.max(s.abs()))
+    }
+
+    #[test]
+    fn fidelity_brought_back_from_zero_starts_from_rest() {
+        // Audit report #9: the high-pass resumed from the treble it last heard, and the
+        // waveshaper turned it into a click at -6.5 dBFS in silence.
+        let peak = ring_after_switching(0.0);
+        assert!(peak < 1e-20, "the old state came out at {peak}");
+    }
+
+    #[test]
+    fn fidelity_that_stays_on_keeps_its_state_through_an_amount_change() {
+        assert!(ring_after_switching(0.5) > 1e-3);
     }
 
     #[test]

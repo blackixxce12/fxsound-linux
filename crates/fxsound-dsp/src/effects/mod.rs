@@ -338,6 +338,31 @@ mod tests {
     }
 
     #[test]
+    fn an_effect_switched_off_and_on_by_snapshot_starts_from_rest() {
+        // Audit report #9, through the path the engine takes: a snapshot that zeroes an effect and
+        // one that brings it back. Bass, Fidelity and Ambience keep history; each must start
+        // clean, so silence in is silence out behind Dynamic Boost, which is never bypassed.
+        for effect in [EffectId::Bass, EffectId::Fidelity, EffectId::Ambience] {
+            let mut chain = Chain::new(48_000.0);
+            let mut on = DspParams::default();
+            on.set_effect(effect, 1.0);
+            let off = DspParams::default();
+            chain.apply(&on);
+            let mut loud = tone(48_000, 2, 0.5);
+            chain.process(&mut loud, 2);
+
+            chain.apply(&off);
+            let mut quiet = vec![0.0; 2 * 4_800];
+            chain.process(&mut quiet, 2);
+            chain.apply(&on);
+            let mut silence = vec![0.0; 2 * 9_600];
+            chain.process(&mut silence, 2);
+            let peak = silence.iter().fold(0.0, |m: Real, s| m.max(s.abs()));
+            assert!(peak < 1e-6, "{effect:?} came back with old audio at {peak}");
+        }
+    }
+
+    #[test]
     fn sample_rates_outside_the_supported_range_are_clamped() {
         let mut chain = Chain::new(8_000.0);
         assert_eq!(chain.sample_rate(), MIN_SAMPLE_RATE);

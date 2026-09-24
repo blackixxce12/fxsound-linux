@@ -124,10 +124,35 @@ const DAMPING_MIDI: usize = 81;
 /// (`DfxDspPreset.cpp:242`), and the public API has no way to leave it, so the warp is
 /// unconditional here rather than a mode switch that can only ever hold one value.
 const MUSIC2_AMBIENCE_FACTOR: Real = 0.34;
-/// `DFXP_MIN_EFFECTIVE_MIDI_AMBIENCE` (`dfxpComm.cpp:50`). At or below this warped value the
-/// effect is bypassed outright (`dfxpComm.cpp:1688`) — which is why slider positions 1, 2 and 3 do
-/// nothing at all. That is shipped behaviour, reproduced deliberately.
+/// `DFXP_MIN_EFFECTIVE_MIDI_AMBIENCE` (`dfxpComm.cpp:50`). At or below this *stored* value the
+/// effect is bypassed outright, so that a slider reading zero is silent (`dfxpComm.cpp:1662-1691`,
+/// which reads the knob with `dfxp_GetKnobValue_MIDI` and never applies the MUSIC2 warp).
+///
+/// The port used to test the *warped* value here, which switched off slider positions 1, 2 and 3
+/// — stored 13, 25 and 38 — and called that shipped behaviour; it never was (audit report #39).
+/// In the original those three run, with the gains the warp gives them (see
+/// [`FIRST_WARPED_ABOVE_THRESHOLD_MIDI`]).
 const MIN_EFFECTIVE_MIDI: i32 = 12;
+/// The first stored value whose MUSIC2 warp clears [`MIN_EFFECTIVE_MIDI`]: `(int)(39 · 0.34) = 13`,
+/// where `(int)(38 · 0.34) = 12`.
+///
+/// The wet/dry warp below was written for the unwarped scale, where it starts from wet 0 at the
+/// bypass threshold (`dfxpComm.cpp:619-632`, "at low pc_liveness wet is tending to zero"). MUSIC2
+/// feeds it the warped value instead, so every stored value from 13 to 38 reaches it at 12 or
+/// less and it runs off the end of its range: wet −0.078 and dry 1.029 at slider position 1,
+/// −0.039 at 2, exactly zero at 3 — a reverb in opposite phase, then none, then the real one from
+/// position 4. Over those stored values this port carries the warp's own intent instead: wet rises
+/// in a straight line from zero at the threshold to the value the warp gives at 39, and dry falls
+/// from unity to its value there, so the effect never inverts, never boosts the dry signal and
+/// grows with the slider. Stored 39 and above — every factory preset — are untouched.
+///
+/// That makes positions 1–3 run, not makes them heard. The warp gives stored 39 a wet gain of
+/// 0.00975, −40 dB, so the ramp below it is quieter still: after a −6 dBFS tone the tail reaches
+/// −73, −51 and −45 dBFS at positions 1, 2 and 3, against −31 dBFS at position 4. Steps a
+/// listener can hear need the slider's ten positions spread over stored 39–127, as Dynamic
+/// Boost's are spread over its useful range; that is the slider's mapping
+/// (`fxsound_core::scale::slider_to_value_for`), not this stage's.
+const FIRST_WARPED_ABOVE_THRESHOLD_MIDI: i32 = 39;
 /// `PLY_DECAY_MIN_VALUE` / `PLY_DECAY_MAX_VALUE` (`c_play.h:100-101`), exponential curve
 /// (`dfxpQnt.cpp:144-151`).
 const DECAY_MIN: Real = 0.095;
@@ -351,6 +376,9 @@ pub struct Ambience {
     damp2_z: Real,
     /// The tank's cross-feed: D4's longest tap, read one frame later by AP5 (`Lex32.c:422, 665`).
     d4_out: Real,
+    /// The tank still holds what it heard before the effect was last switched off, and is to be
+    /// emptied before the next frame goes in (see [`Effect::set_amount`]).
+    clear_pending: bool,
 
     sample_rate: Real,
     amount: Real,
@@ -392,6 +420,7 @@ impl Ambience {
             damp1_z: 0.0,
             damp2_z: 0.0,
             d4_out: 0.0,
+            clear_pending: false,
             sample_rate: clamp_rate(sample_rate),
             amount: 0.0,
             active: false,
@@ -440,6 +469,34 @@ impl Ambience {
             self.sample_rate,
         );
         self.one_minus_damping = 1.0 - self.damping;
+    }
+
+    /// Empty the tank before it runs again after a bypass.
+    ///
+    /// Only the part of the arena the current rate's lines occupy: everything past it is already
+    /// zero, because the only way to have written there is to have run at a higher rate, and a
+    /// rate change clears the whole arena ([`Effect::reset`]). At 48 kHz that is 41 404 floats,
+    /// a quarter of the arena, so the once-per-switch-on cost on the audio thread is a 165 kB
+    /// fill rather than 663 kB.
+    fn clear_tank(&mut self) {
+        let used = self.lines[NUM_LINES - 1].start + self.lines[NUM_LINES - 1].len;
+        match self.arena.get_mut(..used) {
+            Some(tank) => tank.fill(0.0),
+            None => self.arena.fill(0.0),
+        }
+        self.clear_state();
+    }
+
+    /// Everything but the delay memory: write positions and the three one-pole states.
+    fn clear_state(&mut self) {
+        for line in &mut self.lines {
+            line.write = 0;
+        }
+        self.bandwidth_z = 0.0;
+        self.damp1_z = 0.0;
+        self.damp2_z = 0.0;
+        self.d4_out = 0.0;
+        self.clear_pending = false;
     }
 
     #[inline(always)]
@@ -599,6 +656,14 @@ impl Ambience {
     }
 }
 
+/// The wet/dry pair `dfxpComm.cpp:628-632` gives a warped value from 13 to 40, where it runs from
+/// wet 0.0098 / dry 0.996 up to meet the fixed pair at 40.
+fn warped_wet_dry(warped: i32) -> (Real, Real) {
+    let wet = (f64::from(warped - 12) * (1.0 / WARP_SPAN) * f64::from(WET_MAX)) as Real;
+    let dry = DRY_MIN + (f64::from(40 - warped) * (1.0 / WARP_SPAN)) as Real * DRY_SPAN;
+    (wet, dry)
+}
+
 /// `DAW_MIN_SAMPLING_FREQ`…`DAW_MAX_SAMPLING_FREQ` (`u_dfxp.h:44-45`), with non-finite input
 /// pinned to the bottom of the range so the layout can never be asked for a nonsense length.
 fn clamp_rate(sample_rate: Real) -> Real {
@@ -622,16 +687,28 @@ impl Effect for Ambience {
 
     /// `dfxp_CommunicateAmbience` (`dfxpComm.cpp:571-679`) end to end.
     ///
-    /// Four stages: normalised → MIDI, MIDI → MUSIC2 warp, warp → bypass test, warp → coefficients.
-    /// Nothing here allocates and the longest loop is the 43-step quantiser ladder, so it is safe
-    /// to call from the audio thread when a parameter message arrives mid-block.
+    /// Four stages: normalised → MIDI, MIDI → bypass test, MIDI → MUSIC2 warp, warp →
+    /// coefficients. Nothing here allocates and the longest loop is the 43-step quantiser ladder,
+    /// so it is safe to call from the audio thread when a parameter message arrives mid-block.
+    ///
+    /// Switching the effect back on asks for the tank to be emptied before it next runs. A
+    /// bypassed reverb is skipped, so its delay lines still hold the music they heard when it went
+    /// to zero — in the original too (`Play32.c:659-667`) — and a tank resumed from them plays up
+    /// to 150 ms of it back over whatever is playing now: after a second of a tone at full
+    /// Ambience, the stale tail reached −15.3 dBFS in pure silence (audit report #9). The fill is
+    /// left to [`Effect::process`] so that it happens once, on the frame the tank is about to
+    /// hear, however many snapshots arrive in between.
     fn set_amount(&mut self, amount: Real) {
+        let was_active = self.active;
         self.amount = amount.clamp(0.0, 1.0);
 
-        let midi = fxsound_core::scale::value_to_midi(self.amount);
+        let midi = i32::from(fxsound_core::scale::value_to_midi(self.amount));
+        self.active = midi > MIN_EFFECTIVE_MIDI;
+        if self.active && !was_active {
+            self.clear_pending = true;
+        }
         // `(int)(midi * 0.34)` — truncating, so the warped value only ever reaches 43.
-        let warped = (Real::from(midi) * MUSIC2_AMBIENCE_FACTOR) as i32;
-        self.active = warped > MIN_EFFECTIVE_MIDI;
+        let warped = (midi as Real * MUSIC2_AMBIENCE_FACTOR) as i32;
 
         let decay = exp_qnt(DECAY_MIN, DECAY_MAX, warped.clamp(0, 127) as usize);
         // `pow(decay, roomsize)` (`dfxpComm.cpp:611`): a bigger room takes longer to decay, so the
@@ -639,19 +716,20 @@ impl Effect for Ambience {
         self.decay = f64::from(decay).powf(f64::from(ROOM_SIZE)) as Real;
         self.lat6_coeff = (self.decay + 0.15).clamp(0.25, 0.5);
 
-        // Below the bypass threshold this warp runs off the end of its own range: at warped 0 it
-        // yields wet −0.117 and dry 1.044. The original computes and transmits those values too
-        // (`dfxpComm.cpp:628-632` has no floor) and they are harmless only because the effect is
-        // switched off there. Anyone who "simplifies" `is_active` away gets phase-inverted wet and
-        // 0.4 dB of dry boost for free.
         if warped > 40 {
             self.wet_gain = WET_MAX;
             self.dry_gain = DRY_MIN;
+        } else if warped > MIN_EFFECTIVE_MIDI {
+            (self.wet_gain, self.dry_gain) = warped_wet_dry(warped);
         } else {
-            self.wet_gain =
-                (f64::from(warped - 12) * (1.0 / WARP_SPAN) * f64::from(WET_MAX)) as Real;
-            self.dry_gain =
-                DRY_MIN + (f64::from(40 - warped) * (1.0 / WARP_SPAN)) as Real * DRY_SPAN;
+            // Stored 1..=38 (see `FIRST_WARPED_ABOVE_THRESHOLD_MIDI`): a straight line from the
+            // bypass — wet 0, dry 1 — to the warp's own pair at 39. At 12 and below the stage is
+            // bypassed and the pair is never used.
+            let (wet_at_39, dry_at_39) = warped_wet_dry(MIN_EFFECTIVE_MIDI + 1);
+            let t = f64::from((midi - MIN_EFFECTIVE_MIDI).max(0))
+                / f64::from(FIRST_WARPED_ABOVE_THRESHOLD_MIDI - MIN_EFFECTIVE_MIDI);
+            self.wet_gain = (t * f64::from(wet_at_39)) as Real;
+            self.dry_gain = (1.0 + t * (f64::from(dry_at_39) - 1.0)) as Real;
         }
     }
 
@@ -671,13 +749,7 @@ impl Effect for Ambience {
     /// a previous format's audio sitting in memory a later, higher rate would read back.
     fn reset(&mut self) {
         self.arena.fill(0.0);
-        for line in &mut self.lines {
-            line.write = 0;
-        }
-        self.bandwidth_z = 0.0;
-        self.damp1_z = 0.0;
-        self.damp2_z = 0.0;
-        self.d4_out = 0.0;
+        self.clear_state();
     }
 
     /// Interleaved, in place.
@@ -688,6 +760,9 @@ impl Effect for Ambience {
     fn process(&mut self, buffer: &mut [Real], channels: usize) {
         if !self.active || channels == 0 {
             return;
+        }
+        if self.clear_pending {
+            self.clear_tank();
         }
 
         if channels == 1 {
@@ -924,18 +999,216 @@ mod tests {
     }
 
     #[test]
-    fn the_bottom_three_slider_positions_are_bypassed() {
-        // §7.4: the MUSIC2 warp pushes sliders 1..3 to a warped value of 12 or less, and the
-        // effect is switched off there. Shipped behaviour, and a known user complaint.
+    fn only_a_slider_at_zero_bypasses_the_reverb() {
+        // Changed on purpose: audit report #39. This test was
+        // `the_bottom_three_slider_positions_are_bypassed`, and held the port's own mistake: it
+        // tested the bypass on the warped value, where the original tests the stored one
+        // (`dfxpComm.cpp:1662-1691`), so positions 1 to 3 — stored 13, 25, 38 — did nothing.
         let mut reverb = Ambience::new(48_000.0);
-        for slider in 0..=3 {
-            reverb.set_amount(slider_to_value(slider as Real));
-            assert!(!reverb.is_active(), "slider {slider} should be bypassed");
-        }
-        for slider in 4..=10 {
+        reverb.set_amount(0.0);
+        assert!(!reverb.is_active(), "slider 0 should be bypassed");
+        for slider in 1..=10 {
             reverb.set_amount(slider_to_value(slider as Real));
             assert!(reverb.is_active(), "slider {slider} should be active");
         }
+        // The threshold itself is the original's: stored 12 is off, 13 is on.
+        reverb.set_amount(fxsound_core::scale::midi_to_value(12));
+        assert!(!reverb.is_active());
+        reverb.set_amount(fxsound_core::scale::midi_to_value(13));
+        assert!(reverb.is_active());
+    }
+
+    #[test]
+    fn the_bottom_three_slider_positions_run_and_grow_with_the_slider() {
+        // Audit report #39. Positions 1-3 were silent in the port; in the original they run with
+        // the warp's gains off the end of its range — wet -0.078, -0.039 and 0, dry up to 1.029,
+        // a reverb in opposite phase and then none. Now wet rises from zero and dry falls from
+        // unity, position by position, into the original's own pair at position 4.
+        let mut reverb = Ambience::new(48_000.0);
+        let mut previous = (0.0, 1.0);
+        for slider in 1..=4 {
+            reverb.set_amount(slider_to_value(slider as Real));
+            let (wet, dry) = (reverb.wet_gain, reverb.dry_gain);
+            assert!(
+                wet > previous.0,
+                "slider {slider}: wet {wet} after {}",
+                previous.0
+            );
+            assert!(
+                dry < previous.1,
+                "slider {slider}: dry {dry} after {}",
+                previous.1
+            );
+            previous = (wet, dry);
+        }
+        // Position 1 is stored 13, one step of the twenty-seven from the threshold to 39.
+        reverb.set_amount(slider_to_value(1.0));
+        assert!(
+            (reverb.wet_gain - 0.00975 / 27.0).abs() < 1e-7,
+            "{}",
+            reverb.wet_gain
+        );
+        // Position 4 is the original's value, untouched.
+        reverb.set_amount(slider_to_value(4.0));
+        assert!((reverb.wet_gain - 0.048_75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_stored_value_inverts_the_reverb_or_boosts_the_dry_signal() {
+        // Every stored value, not just the eleven slider positions: a `.fac` from Windows or the
+        // command line can hold any of them. Wet never below zero, dry never above unity, both
+        // monotonic, and continuous where the ramp meets the original's warp at 39.
+        let mut reverb = Ambience::new(48_000.0);
+        let mut previous = (0.0_f32, 1.0_f32);
+        for midi in 0..=127_u8 {
+            reverb.set_amount(fxsound_core::scale::midi_to_value(midi));
+            let (wet, dry) = (reverb.wet_gain, reverb.dry_gain);
+            assert!((0.0..=WET_MAX).contains(&wet), "stored {midi}: wet {wet}");
+            assert!((DRY_MIN..=1.0).contains(&dry), "stored {midi}: dry {dry}");
+            assert!(
+                wet >= previous.0 && dry <= previous.1,
+                "stored {midi} went backwards"
+            );
+            assert!(
+                wet - previous.0 < 0.01,
+                "stored {midi}: wet jumped by {}",
+                wet - previous.0
+            );
+            previous = (wet, dry);
+        }
+        assert_eq!(
+            (38.0 * MUSIC2_AMBIENCE_FACTOR) as i32,
+            MIN_EFFECTIVE_MIDI,
+            "38 is the last stored value the warp takes to the threshold"
+        );
+        assert_eq!(
+            (FIRST_WARPED_ABOVE_THRESHOLD_MIDI as Real * MUSIC2_AMBIENCE_FACTOR) as i32,
+            MIN_EFFECTIVE_MIDI + 1
+        );
+    }
+
+    /// The loudest sample of the tail, in dBFS, over the 200 ms after a second of a −6 dBFS
+    /// 440 Hz tone stops.
+    fn tail_after_a_tone_dbfs(amount: Real) -> Real {
+        let mut reverb = Ambience::new(48_000.0);
+        reverb.set_amount(amount);
+        let amplitude = 10.0_f32.powf(-6.0 / 20.0);
+        let mut tone: Vec<Real> = (0..48_000)
+            .flat_map(|n| {
+                let s = (n as Real * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * amplitude;
+                [s, s]
+            })
+            .collect();
+        reverb.process(&mut tone, 2);
+        let mut silence = vec![0.0; 2 * 9_600];
+        reverb.process(&mut silence, 2);
+        20.0 * silence
+            .iter()
+            .fold(0.0, |m: Real, s| m.max(s.abs()))
+            .log10()
+    }
+
+    #[test]
+    fn the_bottom_three_positions_leave_a_tail_that_grows_towards_the_fourths() {
+        // Audit report #39, measured. Before, positions 1-3 left no tail at all. Now the tail
+        // reaches -73, -51 and -45 dBFS, rising to position 4's -31 dBFS, which is untouched.
+        // They run, but they are not yet heard: steps a listener can hear need the slider's
+        // positions spread over stored 39-127 (`FIRST_WARPED_ABOVE_THRESHOLD_MIDI`).
+        let tails: Vec<Real> = (1..=4)
+            .map(|slider| tail_after_a_tone_dbfs(slider_to_value(slider as Real)))
+            .collect();
+        for (got, want) in tails.iter().zip([-73.4, -51.1, -45.0, -30.7]) {
+            assert!((got - want).abs() < 0.5, "tails {tails:?} dBFS");
+        }
+        assert!(tails.windows(2).all(|pair| pair[1] > pair[0]), "{tails:?}");
+        // And position 0 is still an exact bypass: no tail at all.
+        let off = tail_after_a_tone_dbfs(0.0);
+        assert!(off.is_infinite() && off < 0.0, "{off}");
+    }
+
+    /// A reverb that has heard a second of a loud tone, then been switched off and back on.
+    fn switched_off_and_on_after_a_loud_passage(off_amount: Real) -> Ambience {
+        let mut reverb = Ambience::new(48_000.0);
+        reverb.set_amount(1.0);
+        let mut loud: Vec<Real> = (0..48_000)
+            .flat_map(|n| {
+                let s = (n as Real * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5;
+                [s, s]
+            })
+            .collect();
+        reverb.process(&mut loud, 2);
+        reverb.set_amount(off_amount);
+        reverb.set_amount(1.0);
+        reverb
+    }
+
+    #[test]
+    fn a_reverb_switched_off_and_back_on_does_not_replay_the_old_tail() {
+        // Audit report #9: the tank kept the music it heard when it went to zero, and played up
+        // to 150 ms of it back when it came on again — -15.3 dBFS in pure silence here.
+        let mut reverb = switched_off_and_on_after_a_loud_passage(0.0);
+        let mut silence = vec![0.0; 2 * 7_200];
+        reverb.process(&mut silence, 2);
+        assert!(
+            silence.iter().all(|s| s.abs() < 1e-30),
+            "the old tail came back: {}",
+            silence.iter().fold(0.0, |m: Real, s| m.max(s.abs()))
+        );
+    }
+
+    #[test]
+    fn a_reverb_that_stays_on_keeps_its_tail_through_an_amount_change() {
+        // Only the off-to-on edge empties the tank: turning the knob while the effect runs must
+        // not cut the tail off mid-note.
+        let mut reverb = switched_off_and_on_after_a_loud_passage(0.7);
+        let mut silence = vec![0.0; 2 * 2_400];
+        reverb.process(&mut silence, 2);
+        assert!(
+            silence.iter().any(|s| s.abs() > 1e-3),
+            "the tail was cut by a change that never switched the effect off"
+        );
+    }
+
+    #[test]
+    fn switching_on_empties_the_tank_on_the_next_block_not_before() {
+        // The fill waits for `process`, so a snapshot storm while the effect is off costs nothing,
+        // and it happens once.
+        let mut reverb = switched_off_and_on_after_a_loud_passage(0.0);
+        assert!(reverb.clear_pending);
+        assert!(
+            reverb.arena.iter().any(|s| *s != 0.0),
+            "nothing to clear yet"
+        );
+        let mut block = vec![0.0; 2 * 64];
+        reverb.process(&mut block, 2);
+        assert!(!reverb.clear_pending);
+        let mut loud = vec![0.5; 2 * 64];
+        reverb.process(&mut loud, 2);
+        assert!(!reverb.clear_pending, "a second block cleared again");
+    }
+
+    #[test]
+    fn the_partial_clear_leaves_nothing_a_rate_change_could_read_back() {
+        // The tank is emptied only as far as the current rate's lines reach, which is safe only
+        // because everything past them is already zero. Run at 192 kHz, drop to 48 kHz, run,
+        // switch off and on, and the whole arena must be clean.
+        let mut reverb = Ambience::new(192_000.0);
+        reverb.set_amount(1.0);
+        let mut loud = vec![0.5; 2 * 48_000];
+        reverb.process(&mut loud, 2);
+        reverb.set_sample_rate(48_000.0);
+        let mut loud = vec![0.5; 2 * 48_000];
+        reverb.process(&mut loud, 2);
+        reverb.set_amount(0.0);
+        reverb.set_amount(1.0);
+        let mut block = vec![0.0; 2];
+        reverb.process(&mut block, 2);
+        let used = Layout::for_rate(48_000.0).total();
+        assert!(reverb.arena[used..].iter().all(|s| *s == 0.0));
+        assert!(
+            reverb.arena[..used].iter().filter(|s| **s != 0.0).count() <= NUM_LINES * 2,
+            "more than the one frame just written survived the clear"
+        );
     }
 
     #[test]

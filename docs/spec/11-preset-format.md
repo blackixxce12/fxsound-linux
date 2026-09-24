@@ -369,7 +369,7 @@ frequency table and only remaps gain (`dsp/DfxDspEq.cpp:168-227`). Those tables,
 | 5 | 62.5 / 16000 | 62.5, 250, 1000, 4000, 16000 | `GraphicEqSet.cpp:430-440` |
 | **10** | **62.5 / 16000** | **62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0** | `GraphicEqSet.cpp:441-455` |
 | 15 | 25 / 16000 | 25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 16000 | `GraphicEqSet.cpp:456-467` |
-| 20 | 20 / 16000 | 20, 31.5, 40, 63, 80, 125, 160, 250, 315, 500, 630, 1000, 1250, 2000, 2500, 4000, 5000, 8000, 10000, 16000 | `GraphicEqSet.cpp:468-479` |
+| 20 | 20 / 16000 | 20, 31.5, 40, 63, 80, 125, 160, 250, 315, 500, 630, 1000, 1250, 2000, 2500, 4000, 5000, 8000, 10000, 16000 — **the port departs** (0.4.0 audit R4): geometric half-octave ladder between the same ends, see `09-dsp-eq.md` §3.1. A preset's own twenty centres are still installed as written | `GraphicEqSet.cpp:468-479` |
 | 31 | 20 / 20000 | 20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000 | `GraphicEqSet.cpp:480-492` |
 | other | as given | geometric: `f_i = f_min * (f_max/f_min)^(i/(n-1))` | `GraphicEqSet.cpp:493-509` |
 

@@ -8,15 +8,41 @@
 //!       └─── GraphicEq block: skipped while the EQ is off ────┘
 //!
 //! power off:
-//! in ─► master gain, while the EQ is on (no balance) ─► spectrum tap ─► out
+//! in ─► master gain · balance, while the EQ is on ─► spectrum tap ─► out
 //! ```
 //!
 //! The equalizer's switch is the whole block's switch, not the filters' alone: master gain,
 //! balance and the levelling stage all live inside the original's `sosProcessBuffer`, which
-//! `dfxpProcessReal.cpp:143-157` does not call while the equalizer is off (upstream aad64c1,
-//! "disable leveling when EQ is off"). Power off calls `GraphicEqProcess_MasterGainOnly` instead
-//! (`:158-169`), one multiply per sample on every channel (`SosProcess.cpp:500-516`) — and that
-//! call sits behind the same EQ test.
+//! `dfxpProcessReal.cpp:143-157` does not call while the equalizer is off. That predates upstream
+//! aad64c1, whose title only names the leveller: before it, the equalizer-off branch ran the
+//! levelling alone and its comment kept "the other SOS gain stages" bypassed as well.
+//!
+//! Power off keeps the gain stage, as the original does, so that switching FxSound off does not
+//! jump the volume — but not the way it does it. The original calls
+//! `GraphicEqProcess_MasterGainOnly` (`dfxpProcessReal.cpp:158-169`), which multiplies by the
+//! master gain alone (`SosProcess.cpp:500-516`), behind the same equalizer test. So a mix balanced
+//! to one side recentred the moment FxSound went off, and on 5.1 or 7.1, where the test read
+//! `(i_eq_on) && a || b || c` until aad64c1 bracketed it, the master gain came in with the
+//! equalizer off too. Here power off applies the master gain *and* the balance, and exactly when
+//! the powered path does: while the equalizer is on (audit report R3). The bypass is the powered
+//! gain stage and nothing else, so switching FxSound off never moves the level by more than
+//! Dynamic Boost's 0.3 dB ceiling or the balance by anything, with the equalizer on or off.
+//!
+//! The audit's option (b) read "whatever the equalizer says", and that is the one half of it not
+//! taken. With the equalizer off the powered path plays neither the master gain nor the balance
+//! (the block above, which the audit keeps), so a bypass that applied them would *bring them in*
+//! on switching off: at −6 dB and a balance of +6 dB, −0.3 dB on both sides powered would become
+//! −12 dB on the left and −6 dB on the right, the very step (b) was chosen to avoid. Taking that
+//! step out the other way, by running the gain stage while powered with the equalizer off, would
+//! undo the block the audit keeps (`docs/0.4.0-upstream.md`, U3).
+//!
+//! The balance works by side, not by index: every left-hand speaker is turned down together and
+//! every right-hand one together, the centre and the subwoofer never (audit report #44). The
+//! original only has a balance on stereo (`SosProcess.cpp:630-631`; its surround path has none,
+//! `:840-908`), and the port's first cut applied it to channels 0 and 1 of any layout, so on 5.1
+//! a balance of +10 dB turned down the front-left speaker and left the rear-left one playing.
+//! The sides come from [`Engine::set_channel_sides`] when the layout is known and are inferred
+//! from the channel count, the front pair and the subwoofer otherwise ([`default_sides`]).
 //!
 //! Everything after construction is allocation-free. [`Engine::process`] is the only method the
 //! real-time thread calls per buffer; the others are called from the same thread in response to a
@@ -28,6 +54,80 @@ use crate::eq::GraphicEq;
 use crate::leveller::VolumeLeveller;
 use crate::spectrum::SpectrumAnalyser;
 use fxsound_core::messages::{DspEvent, DspParams, Meters};
+
+/// Which side of the listener a speaker stands on, which is what the balance acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelSide {
+    /// Front-left, side-left, rear-left and the like: turned down by a balance to the right.
+    Left,
+    /// Their right-hand mirrors: turned down by a balance to the left.
+    Right,
+    /// Centre, subwoofer, rear-centre, mono, and any position that is neither: the balance never
+    /// touches it. The master gain still does.
+    Centre,
+}
+
+/// The sides of PipeWire's default positions for a channel count — the layout a device that
+/// publishes none gets (`FL,FR`; `FL,FR,LFE`; `FL,FR,RL,RR`; `FL,FR,FC,RL,RR`;
+/// `FL,FR,FC,LFE,RL,RR`; `FL,FR,FC,LFE,RC,SL,SR`; `FL,FR,FC,LFE,RL,RR,SL,SR`), with one channel
+/// read as mono.
+#[must_use]
+pub fn standard_sides(channels: usize) -> [ChannelSide; crate::biquad::MAX_CHANNELS] {
+    use ChannelSide::{Centre as C, Left as L, Right as R};
+    let layout: &[ChannelSide] = match channels {
+        0 | 1 => &[C],
+        2 => &[L, R],
+        3 => &[L, R, C],
+        4 => &[L, R, L, R],
+        5 => &[L, R, C, L, R],
+        6 => &[L, R, C, C, L, R],
+        7 => &[L, R, C, C, C, L, R],
+        _ => &[L, R, C, C, L, R, L, R],
+    };
+    let mut sides = [C; crate::biquad::MAX_CHANNELS];
+    sides[..layout.len()].copy_from_slice(layout);
+    sides
+}
+
+/// The sides the engine assumes when nobody has named them: [`standard_sides`] for the count,
+/// as long as what the engine does know — the front pair and the subwoofer — sits where that
+/// layout puts them; otherwise the device orders its channels some other way, and only the front
+/// pair is balanced, rather than a guess turning down a speaker on the wrong side. Either way the
+/// front pair is left and right and the subwoofer is centre.
+#[must_use]
+pub fn default_sides(
+    channels: usize,
+    lfe: Option<usize>,
+    front_pair: Option<(usize, usize)>,
+) -> [ChannelSide; crate::biquad::MAX_CHANNELS] {
+    let channels = channels.clamp(1, crate::biquad::MAX_CHANNELS);
+    let standard_lfe = match channels {
+        3 => Some(2),
+        6..=8 => Some(3),
+        _ => None,
+    };
+    let standard_front = (channels >= 2).then_some((0, 1));
+    let agrees = front_pair.is_none_or(|pair| Some(pair) == standard_front)
+        && lfe.is_none_or(|index| Some(index) == standard_lfe);
+
+    let mut sides = if agrees {
+        standard_sides(channels)
+    } else {
+        [ChannelSide::Centre; crate::biquad::MAX_CHANNELS]
+    };
+    if let Some((left, right)) = front_pair.or(standard_front)
+        && left < channels
+        && right < channels
+        && left != right
+    {
+        sides[left] = ChannelSide::Left;
+        sides[right] = ChannelSide::Right;
+    }
+    if let Some(index) = lfe.filter(|index| *index < channels) {
+        sides[index] = ChannelSide::Centre;
+    }
+    sides
+}
 
 /// The complete FxSound processing chain.
 #[derive(Debug)]
@@ -55,6 +155,12 @@ pub struct Engine {
     active: bool,
     /// Index of the subwoofer channel in the current layout, when there is one.
     lfe_channel: Option<usize>,
+    /// The front pair, when the layout names one.
+    front_pair: Option<(usize, usize)>,
+    /// The sides the layout's owner named, and for how many channels.
+    named_sides: Option<([ChannelSide; crate::biquad::MAX_CHANNELS], usize)>,
+    /// The sides the balance uses for `channels`: the named ones when they fit, else the default.
+    sides: [ChannelSide; crate::biquad::MAX_CHANNELS],
 }
 
 impl Engine {
@@ -85,7 +191,11 @@ impl Engine {
             peak_right: 0.0,
             active: false,
             lfe_channel: None,
+            front_pair: None,
+            named_sides: None,
+            sides: [ChannelSide::Centre; crate::biquad::MAX_CHANNELS],
         };
+        engine.refresh_sides();
         let params = DspParams::default();
         engine.apply_unconditionally(&params);
         engine
@@ -114,6 +224,7 @@ impl Engine {
         self.leveller.set_sample_rate(sample_rate);
         self.chain.set_sample_rate(sample_rate);
         self.spectrum.set_sample_rate(sample_rate);
+        self.refresh_sides();
         self.reset();
     }
 
@@ -125,6 +236,7 @@ impl Engine {
     pub fn set_lfe_channel(&mut self, channel: Option<usize>) {
         self.lfe_channel = channel;
         self.chain.set_lfe_channel(channel);
+        self.refresh_sides();
     }
 
     /// Name the front pair, so the two stereo-by-nature stages run over the right channels.
@@ -132,7 +244,39 @@ impl Engine {
     /// `None` keeps the historical behaviour of using the first two, which is correct for every
     /// layout that starts `FL, FR` — that is, all the standard ones.
     pub fn set_front_pair(&mut self, pair: Option<(usize, usize)>) {
+        self.front_pair = pair;
         self.chain.set_front_pair(pair);
+        self.refresh_sides();
+    }
+
+    /// Name the side of every channel, from the device's own channel positions, so the balance
+    /// turns down the speakers on one side of the room and nothing else.
+    ///
+    /// One entry per channel, in the device's order. `None`, or a list that does not have one
+    /// entry per channel of the current format, leaves the engine to infer the sides
+    /// ([`default_sides`]), which is right for every layout PipeWire makes up for a device that
+    /// publishes none, but can only balance the front pair of one ordered some other way.
+    pub fn set_channel_sides(&mut self, sides: Option<&[ChannelSide]>) {
+        self.named_sides = sides.map(|sides| {
+            let mut named = [ChannelSide::Centre; crate::biquad::MAX_CHANNELS];
+            let len = sides.len().min(crate::biquad::MAX_CHANNELS);
+            named[..len].copy_from_slice(&sides[..len]);
+            (named, sides.len())
+        });
+        self.refresh_sides();
+    }
+
+    /// The sides the balance acts on, for the current format.
+    #[must_use]
+    pub fn channel_sides(&self) -> &[ChannelSide] {
+        &self.sides[..self.channels]
+    }
+
+    fn refresh_sides(&mut self) {
+        self.sides = match self.named_sides {
+            Some((named, len)) if len == self.channels => named,
+            _ => default_sides(self.channels, self.lfe_channel, self.front_pair),
+        };
     }
 
     /// Adopt a parameter snapshot, skipping anything that has not changed.
@@ -235,10 +379,11 @@ impl Engine {
             }
             self.chain.process(buffer, channels);
         } else if self.applied.eq_on {
-            // Bypassed, the master gain is the one stage that survives — without the balance, and
-            // only while the equalizer is on (`dfxpProcessReal.cpp:158-169`,
-            // `SosProcess.cpp:500-516`).
-            self.apply_master_gain_only(buffer);
+            // Bypassed, the gain stage is the one that survives, and all of it: the master gain
+            // and the balance (audit report R3). It survives exactly where the powered branch
+            // above plays it, behind the equalizer's switch, so the power switch never moves the
+            // level; the module documentation has the original's version and why it is not this.
+            self.apply_gain_stage(buffer, channels);
         }
 
         // A block that went in finite can still come out non-finite if a stage's own state has
@@ -257,38 +402,52 @@ impl Engine {
     }
 
     /// The master gain and the balance attenuation, folded into one pass.
-    fn apply_gain_stage(&mut self, buffer: &mut [f32], channels: usize) {
+    ///
+    /// Every channel takes the master gain; a left-hand one takes the left attenuation with it and
+    /// a right-hand one the right (see the module documentation). Mono has no sides and takes the
+    /// master gain alone. On stereo this is the gain stage the original folds into
+    /// `sosProcessBuffer` (`SosProcess.cpp:583`, `:630-631`), and it is what this did before.
+    fn apply_gain_stage(&self, buffer: &mut [f32], channels: usize) {
         if self.master_gain == 1.0 && self.balance_left == 1.0 && self.balance_right == 1.0 {
             return;
         }
-        if channels >= 2 {
-            let left = self.master_gain * self.balance_left;
-            let right = self.master_gain * self.balance_right;
-            for frame in buffer.chunks_exact_mut(channels) {
-                frame[0] *= left;
-                frame[1] *= right;
-                // Balance is stereo-only in the original; any further channels take the plain
-                // master gain (`SosProcess.cpp:583`).
-                for sample in &mut frame[2..] {
-                    *sample *= self.master_gain;
-                }
-            }
-        } else {
+        if channels < 2 {
             for sample in buffer.iter_mut() {
                 *sample *= self.master_gain;
             }
-        }
-    }
-
-    /// The bypass's gain stage: `sosProcessBuffer_MasterGainOnly`, which multiplies every sample
-    /// of every channel — the subwoofer and the rears included — by the master gain and nothing
-    /// else (`SosProcess.cpp:500-516`).
-    fn apply_master_gain_only(&self, buffer: &mut [f32]) {
-        if self.master_gain == 1.0 {
             return;
         }
-        for sample in buffer.iter_mut() {
-            *sample *= self.master_gain;
+
+        let left = self.master_gain * self.balance_left;
+        let right = self.master_gain * self.balance_right;
+        // A block in a format the engine was not told about (`process` clamps rather than
+        // refuses) is balanced by the count's default layout.
+        let sides = if channels == self.channels {
+            self.sides
+        } else {
+            standard_sides(channels)
+        };
+        let mut gains = [self.master_gain; crate::biquad::MAX_CHANNELS];
+        for (gain, side) in gains.iter_mut().zip(sides).take(channels) {
+            *gain = match side {
+                ChannelSide::Left => left,
+                ChannelSide::Right => right,
+                ChannelSide::Centre => self.master_gain,
+            };
+        }
+
+        if channels == 2 {
+            let (first, second) = (gains[0], gains[1]);
+            for frame in buffer.as_chunks_mut::<2>().0 {
+                frame[0] *= first;
+                frame[1] *= second;
+            }
+        } else {
+            for frame in buffer.chunks_exact_mut(channels) {
+                for (sample, gain) in frame.iter_mut().zip(&gains) {
+                    *sample *= gain;
+                }
+            }
         }
     }
 
@@ -441,11 +600,10 @@ mod tests {
 
     #[test]
     fn master_gain_survives_a_bypass() {
-        // The original keeps the master gain live when the engine is bypassed — but only while the
-        // equalizer is on, and without the balance: `dfxpProcessReal.cpp:158-169` calls
-        // `GraphicEqProcess_MasterGainOnly` behind an `i_eq_on` test, and it multiplies by the
-        // master gain alone (`SosProcess.cpp:500-516`). The two conditions have tests of their own
-        // below; this one pins the half that has not changed.
+        // The original keeps the master gain live when the engine is bypassed, so that switching
+        // FxSound off does not jump the volume (`dfxpProcessReal.cpp:158-169`). It now carries the
+        // balance as well (audit report R3), which has tests of its own below; this one pins the
+        // half that has not changed.
         let mut engine = Engine::new(48_000.0, 256, 2);
         let params = DspParams {
             power: false,
@@ -475,10 +633,8 @@ mod tests {
 
     #[test]
     fn balance_reaches_the_audio_path() {
-        // Powered on, because a bypass carries the master gain but not the balance
-        // (`SosProcess.cpp:500-516`). That means the whole chain, where Dynamic Boost's look-ahead
-        // delays the output and its ceiling scales both sides alike; the ratio between the sides
-        // is what the balance set.
+        // Powered on: the whole chain, where Dynamic Boost's look-ahead delays the output and its
+        // ceiling scales both sides alike; the ratio between the sides is what the balance set.
         let mut engine = Engine::new(48_000.0, 4096, 2);
         let params = DspParams {
             balance: 20.0,
@@ -726,9 +882,10 @@ mod tests {
 
     // --- The equalizer's switch is the GraphicEq block's switch (U3) ---------------------------
     //
-    // `dfxpProcessReal.cpp:143-170`: powered, the block — filters, master gain, balance, levelling
-    // — runs only while the equalizer is on; bypassed, `GraphicEqProcess_MasterGainOnly` runs
-    // behind the same test, and it is the master gain alone (`SosProcess.cpp:500-516`).
+    // `dfxpProcessReal.cpp:143-157`: powered, the block — filters, master gain, balance, levelling
+    // — runs only while the equalizer is on. Bypassed, the original runs the master gain alone
+    // behind the same test (`:158-169`, `SosProcess.cpp:500-516`); here the master gain and the
+    // balance run behind it (audit report R3), so the power switch never moves the level.
 
     /// A snapshot that gives every stage of the GraphicEq block something audible to do.
     fn busy_graphic_eq_block(eq_on: bool) -> DspParams {
@@ -851,30 +1008,49 @@ mod tests {
         );
     }
 
+    /// What the gain stage alone does to a stereo buffer: the master gain on both sides and the
+    /// balance's attenuation on one, each side's factor folded first, as the engine folds it.
+    fn gain_stage_reference(input: &[f32], params: &DspParams) -> Vec<f32> {
+        let master = db_to_linear(params.master_gain_db);
+        let (left, right) = balance_gains(params.balance);
+        let (left, right) = (master * left, master * right);
+        input
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|frame| [frame[0] * left, frame[1] * right])
+            .collect()
+    }
+
     #[test]
-    fn the_bypass_applies_the_master_gain_without_the_balance() {
-        let mut engine = Engine::new(48_000.0, 256, 2);
-        engine.apply(&DspParams {
+    fn the_bypass_applies_the_master_gain_and_the_balance() {
+        // Changed on purpose: audit report R3. This test was
+        // `the_bypass_applies_the_master_gain_without_the_balance`: the original's bypass
+        // multiplies by the master gain alone (`SosProcess.cpp:500-516`), so a mix balanced to
+        // the right recentred the moment FxSound was switched off.
+        let params = DspParams {
             power: false,
             master_gain_db: -6.0,
             balance: 20.0,
             ..DspParams::default()
-        });
+        };
+        let mut engine = Engine::new(48_000.0, 256, 2);
+        engine.apply(&params);
 
-        let mut buffer = vec![0.5_f32; 16];
+        let input = vec![0.5_f32; 16];
+        let mut buffer = input.clone();
         engine.process(&mut buffer, 2);
-        let expected = 0.5 * db_to_linear(-6.0);
-        for (index, sample) in buffer.iter().enumerate() {
-            assert_eq!(
-                sample.to_bits(),
-                expected.to_bits(),
-                "sample {index}: {sample}, expected the plain master gain {expected}"
-            );
-        }
+        assert_same_bits(&buffer, &gain_stage_reference(&input, &params), "bypassed");
+        // -6 dB on the right, -26 dB on the left.
+        assert!((buffer[1] - 0.5 * db_to_linear(-6.0)).abs() < 1e-7);
+        assert!((buffer[0] - 0.5 * db_to_linear(-26.0)).abs() < 1e-7);
     }
 
     #[test]
     fn the_bypass_passes_the_audio_untouched_while_the_equalizer_is_off() {
+        // Audit report R3 keeps this test as it was before 0.4.0: the powered path leaves the gain
+        // stage out with the equalizer off, so the bypass does too, or switching FxSound off
+        // would bring in a master gain and a balance that were not playing.
         let mut params = busy_graphic_eq_block(false);
         params.power = false;
         params.master_gain_db = 6.0;
@@ -889,21 +1065,102 @@ mod tests {
         }
     }
 
+    /// Each side's settled level in dB, output against input, for a steady 300 Hz tone at
+    /// −12 dBFS: well under Dynamic Boost's ceiling, so its limiter never acts.
+    fn settled_side_levels(params: &DspParams) -> [f32; 2] {
+        const AMPLITUDE: f32 = 0.25;
+        let mut engine = Engine::new(48_000.0, LEVELLER_BLOCK, 2);
+        engine.apply(params);
+        let mut peaks = [0.0_f32; 2];
+        for block in 0..100 {
+            let mut buffer = continuous_tone(block * LEVELLER_BLOCK, LEVELLER_BLOCK, AMPLITUDE);
+            engine.process(&mut buffer, 2);
+            if block >= 80 {
+                for (channel, peak) in peaks.iter_mut().enumerate() {
+                    *peak = peak.max(channel_peak(&buffer, 2, channel));
+                }
+            }
+        }
+        peaks.map(|peak| 20.0 * (peak / AMPLITUDE).log10())
+    }
+
+    /// Master gain −6 dB and balance +6 dB, the audit's R3 scenario, powered and bypassed.
+    fn power_switch_levels(eq_on: bool) -> ([f32; 2], [f32; 2]) {
+        let params = |power| DspParams {
+            power,
+            eq_on,
+            master_gain_db: -6.0,
+            balance: 6.0,
+            ..DspParams::default()
+        };
+        (
+            settled_side_levels(&params(true)),
+            settled_side_levels(&params(false)),
+        )
+    }
+
+    #[test]
+    fn switching_fxsound_off_with_the_equalizer_on_keeps_the_level_and_the_balance() {
+        // Audit report R3. Powered, the gain stage gives -12 dB left and -6 dB right, and Dynamic
+        // Boost's ceiling takes 0.3 dB off both. Switched off, the original kept the master gain
+        // alone, -6 dB on both sides, so the left side jumped up 6.3 dB and the mix recentred.
+        // Now the bypass keeps both: -12 and -6, within Dynamic Boost's 0.3 dB of the powered
+        // level.
+        let (powered, bypassed) = power_switch_levels(true);
+        assert_levels(&powered, &[-12.3, -6.3], "powered, equalizer on");
+        assert_levels(&bypassed, &[-12.0, -6.0], "bypassed, equalizer on");
+    }
+
+    #[test]
+    fn switching_fxsound_off_with_the_equalizer_off_does_not_move_the_level() {
+        // Audit report R3, the half of option (b) not taken. Powered with the equalizer off, the
+        // gain stage is out with the rest of the block and Dynamic Boost's ceiling takes 0.3 dB
+        // off both sides. A bypass that applied the master gain and the balance whatever the
+        // equalizer says dropped the left side to -12 dB and the right to -6 dB, a step of 11.7
+        // and 5.7 dB that Windows does not have. Now the bypass leaves them out as well: 0 dB on
+        // both sides, the same 0.3 dB from the powered level as with the equalizer on.
+        let (powered, bypassed) = power_switch_levels(false);
+        assert_levels(&powered, &[-0.3, -0.3], "powered, equalizer off");
+        assert_levels(&bypassed, &[0.0, 0.0], "bypassed, equalizer off");
+    }
+
+    #[test]
+    fn the_power_switch_moves_neither_side_by_more_than_dynamic_boosts_ceiling() {
+        // Audit report R3: master gain -6 dB and balance +6 dB. Whatever the equalizer switch
+        // says, switching FxSound off lands each side within Dynamic Boost's 0.3 dB of where it
+        // played powered, and the difference between the sides, the balance, does not move.
+        for eq_on in [true, false] {
+            let (powered, bypassed) = power_switch_levels(eq_on);
+            for side in 0..2 {
+                let step = (bypassed[side] - powered[side]).abs();
+                assert!(
+                    step < 0.35,
+                    "equalizer {eq_on}, side {side}: the level moved {step} dB"
+                );
+            }
+            let balance_moved = ((bypassed[0] - bypassed[1]) - (powered[0] - powered[1])).abs();
+            assert!(
+                balance_moved < 0.05,
+                "equalizer {eq_on}: the balance moved {balance_moved} dB"
+            );
+        }
+    }
+
     #[test]
     fn the_bypass_leaves_out_the_equalizer_curve_and_the_leveller() {
-        // Only the master gain survives a bypass; the curve and the levelling stay behind even
-        // while the equalizer is on.
+        // Only the gain stage survives a bypass; the curve and the levelling stay behind even
+        // while the equalizer is on. Changed on purpose: audit report R3 — the gain stage now
+        // carries the fixture's balance as well as its master gain.
         for master_gain_db in [0.0, -3.0] {
             let mut params = busy_graphic_eq_block(true);
             params.power = false;
             params.master_gain_db = master_gain_db;
-            let gain = db_to_linear(master_gain_db);
             let mut engine = Engine::new(48_000.0, LEVELLER_BLOCK, 2);
             engine.apply(&params);
 
             for block in 0..10 {
                 let input = continuous_tone(block * LEVELLER_BLOCK, LEVELLER_BLOCK, 0.02);
-                let expected: Vec<f32> = input.iter().map(|s| s * gain).collect();
+                let expected = gain_stage_reference(&input, &params);
                 let mut buffer = input;
                 engine.process(&mut buffer, 2);
                 assert_same_bits(&buffer, &expected, "bypassed with the equalizer on");
@@ -915,6 +1172,8 @@ mod tests {
     fn the_bypass_applies_the_master_gain_to_every_channel_of_a_surround_layout() {
         // `sosProcessBuffer_MasterGainOnly` runs over `i_num_sample_sets * i_num_channels`
         // samples: the subwoofer and the rears take the gain exactly as the front pair does.
+        // Changed on purpose: audit reports R3 and #44 — the balance comes along, and on 5.1 it
+        // turns down both right-hand speakers, front and rear, and nothing else.
         let channels = 6;
         let mut engine = Engine::new(48_000.0, 1024, channels);
         engine.set_lfe_channel(Some(LFE));
@@ -929,8 +1188,148 @@ mod tests {
         let mut buffer = input.clone();
         engine.process(&mut buffer, channels);
         let gain = db_to_linear(-6.0);
-        let expected: Vec<f32> = input.iter().map(|s| s * gain).collect();
+        let right = gain * balance_gains(-10.0).1;
+        let expected: Vec<f32> = input
+            .chunks_exact(channels)
+            .flat_map(|frame| {
+                frame.iter().enumerate().map(move |(channel, s)| {
+                    // FL FR FC LFE RL RR: the right-hand pair is 1 and 5.
+                    s * if channel == 1 || channel == 5 {
+                        right
+                    } else {
+                        gain
+                    }
+                })
+            })
+            .collect();
         assert_same_bits(&buffer, &expected, "bypassed 5.1");
+    }
+
+    // --- Balance by side (audit report #44) ---------------------------------------------------
+
+    /// Each channel's level in dB against the same engine with the balance centred, so the
+    /// effects Dynamic Boost always applies cancel out.
+    fn balance_levels(channels: usize, setup: impl Fn(&mut Engine), balance: f32) -> Vec<f32> {
+        let render = |balance| {
+            let mut engine = Engine::new(48_000.0, 4096, channels);
+            setup(&mut engine);
+            engine.apply(&DspParams {
+                balance,
+                ..DspParams::default()
+            });
+            let mut buffer = tone(4096, channels, 0.25);
+            engine.process(&mut buffer, channels);
+            buffer
+        };
+        let (balanced, centred) = (render(balance), render(0.0));
+        (0..channels)
+            .map(|channel| {
+                20.0 * (channel_peak(&balanced, channels, channel)
+                    / channel_peak(&centred, channels, channel))
+                .log10()
+            })
+            .collect()
+    }
+
+    fn assert_levels(got: &[f32], want: &[f32], what: &str) {
+        for (channel, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() < 0.01,
+                "{what}: channel {channel} at {g:.2} dB, expected {w} dB (all: {got:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_balance_on_surround_turns_down_every_speaker_on_one_side() {
+        // 5.1, balance +10 dB to the right. The port used to turn down channel 0 alone — the
+        // front-left speaker at -10 dB and the rear-left one untouched — which on a surround
+        // system is a speaker switched down, not a balance.
+        let levels = balance_levels(6, |engine| engine.set_lfe_channel(Some(LFE)), 10.0);
+        assert_levels(&levels, &[-10.0, 0.0, 0.0, 0.0, -10.0, 0.0], "5.1 right");
+
+        let levels = balance_levels(6, |engine| engine.set_lfe_channel(Some(LFE)), -10.0);
+        assert_levels(&levels, &[0.0, -10.0, 0.0, 0.0, 0.0, -10.0], "5.1 left");
+
+        // 7.1: FL FR FC LFE RL RR SL SR — three speakers a side.
+        let levels = balance_levels(8, |engine| engine.set_lfe_channel(Some(LFE)), 10.0);
+        assert_levels(
+            &levels,
+            &[-10.0, 0.0, 0.0, 0.0, -10.0, 0.0, -10.0, 0.0],
+            "7.1 right",
+        );
+    }
+
+    #[test]
+    fn stereo_and_mono_balance_as_they_always_did() {
+        assert_levels(&balance_levels(2, |_| {}, 10.0), &[-10.0, 0.0], "stereo");
+        assert_levels(&balance_levels(2, |_| {}, -10.0), &[0.0, -10.0], "stereo");
+        assert_levels(&balance_levels(1, |_| {}, 10.0), &[0.0], "mono has no side");
+    }
+
+    #[test]
+    fn a_device_that_names_its_sides_is_balanced_by_them() {
+        // FL FC FR LFE SL SR: front right at index 2, as some devices order it.
+        use ChannelSide::{Centre as C, Left as L, Right as R};
+        let levels = balance_levels(
+            6,
+            |engine| {
+                engine.set_front_pair(Some((0, 2)));
+                engine.set_lfe_channel(Some(3));
+                engine.set_channel_sides(Some(&[L, C, R, C, L, R]));
+            },
+            10.0,
+        );
+        assert_levels(&levels, &[-10.0, 0.0, 0.0, 0.0, -10.0, 0.0], "named sides");
+    }
+
+    #[test]
+    fn an_unfamiliar_order_nobody_named_balances_the_front_pair_alone() {
+        // The same device with only the front pair and the subwoofer known: the default layout's
+        // guess would call the centre speaker "right", so only the pair the engine is sure of is
+        // balanced.
+        let levels = balance_levels(
+            6,
+            |engine| {
+                engine.set_front_pair(Some((0, 2)));
+                engine.set_lfe_channel(Some(3));
+            },
+            -10.0,
+        );
+        assert_levels(
+            &levels,
+            &[0.0, 0.0, -10.0, 0.0, 0.0, 0.0],
+            "front pair only",
+        );
+    }
+
+    #[test]
+    fn the_default_sides_follow_pipewires_default_positions() {
+        use ChannelSide::{Centre as C, Left as L, Right as R};
+        let expected: [&[ChannelSide]; 8] = [
+            &[C],
+            &[L, R],
+            &[L, R, C],
+            &[L, R, L, R],
+            &[L, R, C, L, R],
+            &[L, R, C, C, L, R],
+            &[L, R, C, C, C, L, R],
+            &[L, R, C, C, L, R, L, R],
+        ];
+        for (index, want) in expected.iter().enumerate() {
+            let channels = index + 1;
+            let engine = Engine::new(48_000.0, 256, channels);
+            assert_eq!(engine.channel_sides(), *want, "{channels} channels");
+        }
+        // Named sides of the wrong length are ignored rather than half-applied.
+        let mut engine = Engine::new(48_000.0, 256, 6);
+        engine.set_channel_sides(Some(&[R, L]));
+        assert_eq!(engine.channel_sides(), expected[5]);
+        // And a format change drops back to the default for the new count.
+        engine.set_channel_sides(Some(&[R, L, C, C, R, L]));
+        assert_eq!(engine.channel_sides(), &[R, L, C, C, R, L]);
+        engine.set_format(48_000.0, 2);
+        assert_eq!(engine.channel_sides(), &[L, R]);
     }
 
     #[test]

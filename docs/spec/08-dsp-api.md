@@ -487,7 +487,17 @@ float buffer (interleaved, in place)
 * When the engine is bypassed, the EQ chain is replaced by a **master-gain-only** pass —
   so the master-gain slider still works with the power button off, but EQ, balance,
   normalization and volume leveling do not (`dfxpProcessReal.cpp:158-170`,
-  `dsp/ptutil/SOS/SosProcess.cpp:501-516`).
+  `dsp/ptutil/SOS/SosProcess.cpp:501-516`). That pass sits behind the same `i_eq_on` test as
+  the powered block, so with the equalizer off the master gain goes too.
+  **The port departs (0.4.0 audit, R3):** with the power off it applies the master gain *and*
+  the balance, behind the same `i_eq_on` test as the powered block. The EQ curve, normalization
+  and levelling still stay behind. So the bypass is exactly the powered gain stage, and the level
+  and the balance never move when the power does, with the equalizer on or off. The audit's
+  option (b) said "whether the equalizer is on or off"; that half is not taken, because with the
+  equalizer off the powered block skips the gain stage, and a bypass that applied it would bring
+  in a step of up to the master gain plus the balance (11.7/5.7 dB at −6 dB and +6) that the
+  original does not have. `crates/fxsound-dsp/src/engine.rs` has the reasoning and the numbers,
+  and `docs/0.4.0-upstream.md` (U3) the decision.
 * The spectrum is computed from the **post-EQ, post-effects** front-channel signal
   (`rp_buf` after step 5) and is fed zero input while bypassed
   (`dsp/ptutil/DspUtil/spectrum/spectrumProcess.cpp:73-82`).
@@ -598,6 +608,13 @@ if (balance_db < 0) balance_right = powf(10,  balance_db/20);   // GraphicEqSet.
   `fxsound/Source/GUI/FxBalanceSlider.cpp:53`.
 * **Stereo only.** The mono branch of `sosProcessBuffer` ignores balance entirely
   (`SosProcess.cpp:583`). Surround (`sosProcessSurroundBuffer`) likewise.
+  **The port departs (0.4.0 audit, #44):** on surround it balances by side. Every left-hand
+  speaker takes the left attenuation, every right-hand one the right, and centre and LFE take
+  neither. The sides come from the device's channel positions (`Engine::set_channel_sides`), or
+  from PipeWire's default layout for the channel count. Mono is unchanged. Before this, the port
+  applied the balance to channels 0 and 1 of any layout. Until `fxsound-audio` passes the
+  device's positions, a device that orders its channels some other way has only its front pair
+  balanced (`engine::default_sides`).
 
 ### 8.3 `setNormalization(float gain_db)`
 
@@ -802,7 +819,7 @@ the five supported counts, and geometric spacing otherwise (`:495-509`):
 | 5 | 62.5 / 16000 | 62.5, 250, 1000, 4000, 16000 | `GraphicEqSet.cpp:430-434` |
 | 10 | 62.5 / 16000 | 62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000 — **legacy geometric grid, not ISO** | `GraphicEqSet.cpp:441-449` |
 | 15 | 25 / 16000 | 25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 16000 | `GraphicEqSet.cpp:456-461` |
-| 20 | 20 / 16000 | 20, 31.5, 40, 63, 80, 125, 160, 250, 315, 500, 630, 1000, 1250, 2000, 2500, 4000, 5000, 8000, 10000, 16000 | `GraphicEqSet.cpp:468-473` |
+| 20 | 20 / 16000 | 20, 31.5, 40, 63, 80, 125, 160, 250, 315, 500, 630, 1000, 1250, 2000, 2500, 4000, 5000, 8000, 10000, 16000 — **the port departs** (0.4.0 audit R4): geometric half-octave ladder between the same ends, see `09-dsp-eq.md` §3.1 | `GraphicEqSet.cpp:468-473` |
 | 31 | 20 / 20000 | 20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000 | `GraphicEqSet.cpp:480-486` |
 
 Band index in the *public* API is **0-based**; every private call adds 1

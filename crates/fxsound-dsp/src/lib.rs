@@ -17,7 +17,7 @@ pub mod spectrum;
 
 pub use biquad::{BiquadCoeffs, Real, Section, cascade_db, magnitude};
 pub use effects::{Chain, Effect};
-pub use engine::Engine;
+pub use engine::{ChannelSide, Engine};
 pub use eq::GraphicEq;
 pub use input::{AudioProcessor, ChainSpec, InputChain, InputEngine};
 pub use leveller::VolumeLeveller;

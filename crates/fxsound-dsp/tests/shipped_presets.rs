@@ -18,10 +18,13 @@ use fxsound_core::{Effect, Preset, scale};
 use fxsound_dsp::eq::GraphicEq;
 use std::path::{Path, PathBuf};
 
-/// Below this stored value the Ambience stage never turns on at all.
+/// Below this stored value the Ambience stage is all but silent.
 ///
-/// `(int)(midi * 0.34) > 12`, so the first value that reaches it is 39 — a slider position of 3.1
-/// out of 10. Anything from 1 to 38 is a preset claiming an effect it does not get.
+/// The stage turns on above 12, as the original's does, but the MUSIC2 warp only gives it a real
+/// wet level from `(int)(midi * 0.34) > 12`, and the first value that reaches that is 39 — a
+/// slider position of 3.1 out of 10. From 13 to 38 the wet level only ramps up to the one at 39,
+/// −40 dB below the dry signal (audit report #39), so a preset storing one of those is claiming
+/// an effect it barely gets.
 const AMBIENCE_MIN_AUDIBLE_MIDI: u8 = 39;
 
 /// Above this stored value Dynamic Boost stops changing.
@@ -114,7 +117,7 @@ fn no_preset_stores_an_effect_the_engine_ignores() {
         if (1..AMBIENCE_MIN_AUDIBLE_MIDI).contains(&ambience) {
             complaints.push(format!(
                 "{name}: Ambience is {ambience}, below the {AMBIENCE_MIN_AUDIBLE_MIDI} the stage \
-                 needs to turn on \u{2014} the file claims an effect it does not get"
+                 needs to be heard \u{2014} the file claims an effect it barely gets"
             ));
         }
     }

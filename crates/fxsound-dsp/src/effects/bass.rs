@@ -65,11 +65,20 @@ impl Effect for Bass {
         self.reset();
     }
 
+    /// Linear in MIDI from 0 to 15 dB (`QntitoBoostCut.cpp:75, 89`).
+    ///
+    /// Coming back from zero clears the filter. At zero the chain skips the stage, so the section
+    /// still holds whatever it last filtered — in the original too (`Play32.c:692-759`) — and a
+    /// section that resumes from it plays that history back as a click: a 90 Hz tone at full
+    /// Bass, taken to zero and back, rang at +4.9 dBFS into silence (audit report #9).
     fn set_amount(&mut self, amount: Real) {
+        let was_active = self.is_active();
         self.amount = amount.clamp(0.0, 1.0);
-        // Linear in MIDI from 0 to 15 dB (`QntitoBoostCut.cpp:75, 89`).
         self.boost_db = MAX_BOOST_DB * self.amount;
         self.design();
+        if !was_active && self.is_active() {
+            self.section.reset();
+        }
     }
 
     fn amount(&self) -> Real {
@@ -216,6 +225,40 @@ mod tests {
             (db - 15.0).abs() < 0.3,
             "measured {db} dB after the rate change"
         );
+    }
+
+    /// Peak of the output when silence goes into a Bass that has filtered a loud 90 Hz tone at
+    /// full boost and then been set to `off_amount` and back to full.
+    fn ring_after_switching(off_amount: Real) -> Real {
+        let mut b = Bass::new(48_000.0);
+        b.set_amount(1.0);
+        let mut tone: Vec<Real> = (0..24_000)
+            .flat_map(|n| {
+                let s = (n as Real * CENTER_HZ * std::f32::consts::TAU / 48_000.0).sin() * 0.5;
+                [s, s]
+            })
+            .collect();
+        b.process(&mut tone, 2);
+        b.set_amount(off_amount);
+        b.set_amount(1.0);
+        let mut silence = vec![0.0; 2 * 4_800];
+        b.process(&mut silence, 2);
+        silence.iter().fold(0.0, |m: Real, s| m.max(s.abs()))
+    }
+
+    #[test]
+    fn bass_brought_back_from_zero_starts_from_rest() {
+        // Audit report #9: the section kept the state it had when Bass went to zero, and rang it
+        // out on the way back — +4.9 dBFS into silence, a loud click.
+        let peak = ring_after_switching(0.0);
+        assert!(peak < 1e-20, "the old state rang out at {peak}");
+    }
+
+    #[test]
+    fn bass_that_stays_on_keeps_its_state_through_an_amount_change() {
+        // A knob turned while the stage runs must not click either way, so only the off-to-on
+        // edge clears the filter.
+        assert!(ring_after_switching(0.5) > 0.1);
     }
 
     #[test]

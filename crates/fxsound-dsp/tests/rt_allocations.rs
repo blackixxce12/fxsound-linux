@@ -320,3 +320,57 @@ fn the_music_engine_allocates_nothing_whatever_the_power_and_equalizer_switches_
         "the music engine allocated {n} times on the audio path"
     );
 }
+
+#[test]
+fn switching_effects_off_and_on_and_naming_the_sides_allocates_nothing() {
+    // An effect coming back from zero is cleared on the data thread — the reverb's tank on the
+    // first block it runs — and a layout's sides can arrive between blocks; none of it may
+    // allocate. Surround at 5.1 so the side-aware balance runs on every block.
+    use fxsound_dsp::engine::ChannelSide::{Centre, Left, Right};
+    let channels = 6;
+    let mut engine = Engine::new(FS, 1_024, channels);
+    let input: Vec<f32> = stereo_fixture(1_024 * 4)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|frame| [frame[0], frame[1], frame[0], frame[0], frame[0], frame[1]])
+        .collect();
+    let mut block = input.clone();
+
+    let mut snapshots = Vec::new();
+    for amount in [0.8, 0.0, 0.8, 0.0, 0.3] {
+        let mut params = DspParams {
+            balance: -6.0,
+            master_gain_db: -2.0,
+            ..DspParams::default()
+        };
+        for effect in [Effect::Ambience, Effect::Bass, Effect::Fidelity] {
+            params.set_effect(effect, amount);
+        }
+        params.band_boost_db[0] = if amount == 0.0 { 0.0 } else { 4.0 };
+        params.sanitise();
+        snapshots.push(params);
+    }
+    let mut off = snapshots[0];
+    off.power = false;
+    snapshots.push(off);
+
+    let n = allocations_on_a_fresh_thread(|| {
+        engine.set_lfe_channel(Some(3));
+        engine.set_channel_sides(Some(&[Left, Right, Centre, Centre, Left, Right]));
+        for params in &snapshots {
+            engine.apply(params);
+            block.copy_from_slice(&input);
+            for chunk in block.chunks_mut(1_024 * channels) {
+                engine.process(chunk, channels);
+            }
+        }
+        engine.set_channel_sides(None);
+        block.copy_from_slice(&input);
+        engine.process(&mut block, channels);
+    });
+    assert_eq!(
+        n, 0,
+        "switching effects and naming sides allocated {n} times"
+    );
+}

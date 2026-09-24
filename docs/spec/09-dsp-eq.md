@@ -163,6 +163,38 @@ comment at `:443-446` says this grid is what the factory/community presets were 
 630, 1000, 1250, 2000, 2500, 4000, 5000, 8000, 10000, 16000
 ```
 
+**The port departs (0.4.0 audit, R4).** These twenty are the octave bands with one third-octave
+neighbour each. They come in pairs a third of an octave apart, with two-thirds of an octave
+between pairs. The single Q of §4 assumes geometric half-octave spacing, so every band at +6 dB
+reads 10.5 dB on the pairs and 6.6 dB between them: 3.9 dB of ripple from 100 Hz to 10 kHz. Ten
+bands give 2.3 dB and thirty-one give 2.5. The port's twenty-band ladder is the geometric one
+between the same ends, written to six figures like the ten-band table:
+
+```
+   20, 28.4331, 40.4221, 57.4662, 81.6971, 116.145, 165.118, 234.741, 333.721, 474.436,
+674.485, 958.885,  1363.2,  1938.0, 2755.17, 3916.91, 5568.49, 7916.47, 11254.5,  16000
+```
+
+Its ripple is 1.9 dB. The Q and the band edges are unchanged. A Q per band from its neighbours'
+spacing, the approved sketch, cannot fix the old ladder. Every inner band has one neighbour a
+third of an octave away and one two-thirds away, so every such rule gives each band the same Q.
+A lower uniform Q only trades ripple for level: 3.5 dB of ripple at a curve 2.5 dB higher.
+Correcting the gains, which also keeps the centres, fails for the same reason. Every band borders
+one pair and one gap, so whatever lowers a pair lowers a gap. The best least-squares correction of
+the twenty gains towards a flat +6 dB that was found sets them between 3.3 and 6.0 dB and ripples
+2.6 dB (4.3 to 7.0 dB). That is no better than every band at +4 dB; the new ladder at +4 dB ripples
+1.2 dB (5.2 to 6.4 dB). Moving the centres is a departure from the approved sketch and needs the
+user's approval as such.
+
+A curve that brings its own twenty centres, from a preset or from settings, keeps them. So
+20-band settings saved before 0.4.0 and Windows 20-band `.fac` files still sit on the old
+ladder, with its 3.9 dB of ripple (5.2 dB from 40 Hz to 12 kHz, against 3.0 on the new one),
+until the application moves them to the new ladder.
+`fxsound_dsp::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ` holds the old ladder for recognising them;
+band for band, no centre moves by more than 0.17 of an octave. The new centres are not round
+numbers: the window's captions (`frequency_label`) read 28, 57, 116, 474 and 959 Hz, then 1.4,
+2.8, 7.9 and 11 kHz, and so on.
+
 **31 bands (full ISO third-octave)** — `GraphicEqSet.cpp:480-492`, min `20`, max `20000`:
 
 ```
@@ -371,7 +403,10 @@ tables start at 62.5 Hz so they never hit it, but the 20/31-band tables start ex
 (`maxQ = 1.0`) and a preset-supplied or user-dragged frequency below 20 Hz is legal down to the
 10 Hz clamp of `GraphicEqSetBandFreq` — at which point `Q` goes negative,
 `bandwidth = center_freq / Q` goes negative, and `filtBW2ANGLE` is fed a negative bandwidth. See
-§18.
+§18. **The port departs (0.4.0 audit, #12):** `maxQ` is floored at `1.0`, the value the
+original's own comment asks for at 20 Hz ("Limit to Q of 1 at 20 hz", `FiltCalcBiqd.cpp:140-142`).
+In the original a +6 dB band at 15 Hz measured +6.0 dB at 1 kHz and at 10 kHz. In the port it
+peaks at 15 Hz and is flat above. At 20 Hz and up nothing changes.
 
 **Rule B — low-boost Q warp** (`FiltCalcBiqd.cpp:168-176`). The comment at
 `FiltCalcBiqd.cpp:115-121` explains the motive: at small boosts the designed numerator and
@@ -1242,6 +1277,37 @@ The scratch arrays are `realtype r_boost_cut_original[35]` / `r_boost_cut_interp
 The same remap logic appears again, independently, in `GraphicEqSetNumBands`
 (`GraphicEqSet.cpp:207-245`) for live band-count changes.
 
+**The port departs (0.4.0 audit, #13):** it remaps by *frequency*, not by position, in
+`fxsound_dsp::eq::remap_band_gains` (band-count changes, between the standard ladders) and
+`fit_preset_gains` (presets, from the preset's own centres to the live ladder). By position, a
+ten-band +6 dB at 62.5 Hz landed on thirty-one bands as +6 dB at 20 Hz and 0 dB at 63 Hz, and a
+ten-band curve taken to thirty-one bands and back returned up to 2.4 dB away. Now:
+
+* **More bands:** each new band reads the old curve at its centre, linear in log-frequency
+  between the two old bands either side, and held flat past the old first and last band. The
+  62.5 Hz boost reads 5.92 dB at 63 Hz, 3.60 at 80 Hz, 1.42 at 100 Hz and 6 dB below 62.5 Hz.
+* **Fewer bands:** if the old curve is exactly a reading of some curve on the new ladder, that
+  curve comes back. The test is a least-squares fit that reproduces every old point to 1e-3 dB,
+  rounded to 1e-5 dB so that zeros stay zeros. It is tried only where it cannot extrapolate. A
+  new band past the old curve's first or last band is held at the end gain, as a reading holds
+  it. Every other new band needs an old band on it, or one on each side of it before the next
+  new band. Without the first rule a seven-band tilt from 0 to +6 dB over 150 Hz–2 kHz came
+  back on five bands as −2.03, 1.18, 4.39, 7.61 and 6.00 dB. Without the second, 0 dB at 62.5 Hz
+  and +3 dB at 90 Hz with nothing else below 1 kHz put +11.4 dB at 250 Hz on five bands. With
+  both, a band solved from a slope always has an equation to spare that checks it, so a curve
+  that is not a reading fails the fit. Any curve that fails is read at the new centres in the
+  same way as when growing. A least-squares fit of detail finer than the new ladder would also
+  ring: three +12 dB bands beside three −12 dB bands fitted to +16.5 dB.
+
+  Round trips are exact when the larger ladder reaches as far as the smaller one at both ends
+  and has a band on or between every two neighbouring bands of it. That holds for every pair of
+  the window's counts (5, 10, 15, 20, 31), and for some geometric ones such as 7 ↔ 12. It does
+  not hold for 14 → 15 → 14: fifteen bands have only thirteen in the range fourteen cover. Such
+  a trip comes back as a reading of the larger curve. It is lossy, because the loss happened on
+  the way up, but it stays inside the curve's range.
+* **Equal counts** copy, as before. A preset's centres are clamped to 10 Hz–21 kHz, and a NaN is
+  read as 10 Hz, the way the equalizer would install them. Order does not matter.
+
 Empty-EQ presets (`hp_graphicEq == NULL`) turn the EQ **on** and flatten every band
 (`DfxDspEq.cpp:144-158`).
 
@@ -1540,6 +1606,9 @@ pub fn band_table(n: usize) -> Option<(&'static [Real], Real, Real)> {
                              1360.79, 2519.84, 4666.12, 8640.48, 16000.0];
     const F15: [Real; 15] = [25.0, 40.0, 63.0, 100.0, 160.0, 250.0, 400.0, 630.0,
                              1000.0, 1600.0, 2500.0, 4000.0, 6300.0, 10000.0, 16000.0];
+    // The original's twenty-band table. The port hands out the geometric half-octave ladder
+    // between the same ends instead (0.4.0 audit R4, see §3.1), and keeps this one as
+    // `WINDOWS_TWENTY_BAND_CENTRES_HZ` to recognise curves saved on it.
     const F20: [Real; 20] = [20.0, 31.5, 40.0, 63.0, 80.0, 125.0, 160.0, 250.0, 315.0, 500.0,
                              630.0, 1000.0, 1250.0, 2000.0, 2500.0, 4000.0, 5000.0, 8000.0,
                              10000.0, 16000.0];
@@ -1680,7 +1749,7 @@ pub fn calc_rounded_value(v: Real, delta: Real, out_min: Real, out_max: Real) ->
    an `asin` of a negative `d` — which happens to stay in range, producing a *mirror-image*
    filter. No band table in the tree starts below 20 Hz, but preset band frequencies do reach the
    DSP (`DfxDspEq.cpp:236-240`). **Clamp `q` to at least some small positive value in Rust and note
-   the divergence.**
+   the divergence.** **Done in 0.4.0** (audit #12): Rule A's cap is floored at 1.0, see §6.2.
 
 2. **The `1e-30` bias is a permanent DC injection.** It is added to *every* section's output on
    *every* sample (`SosProcess.cpp:576, 617, 623, 897`). With 31 cascaded sections at 48 kHz, the
@@ -1695,7 +1764,12 @@ pub fn calc_rounded_value(v: Real, delta: Real, out_min: Real, out_max: Real) ->
    anywhere — `sosSetSection` stores `a1_old`/`a2_old` (`SosSet.cpp:56-57`) as if it intended to,
    but nothing reads them. Dragging an EQ slider **clicks**. If you fix this in Rust (ramp
    coefficients over ~10 ms, or reset state when re-enabling) say so in the changelog, because it
-   will not be bit-identical.
+   will not be bit-identical. **Done in 0.4.0** (audit #10): a section that comes back from
+   exactly 0 dB, or from the Nyquist bypass, starts from rest (`GraphicEq::set_band_boost`). A
+   running section keeps its state through a redesign. Coming back from +3 → 0 → −1 dB at
+   62.5 Hz after loud bass used to ring at −17.5 dBFS into silence. The whole equalizer coming
+   back on starts every section from rest too (`GraphicEq::set_enabled`): switched off and on
+   under the same bass, it rang at −16.8 dBFS. The slider-drag click is audit #11, not this.
 
 4. **`GraphicEqSetNumBands` does not resize the SOS.** It sets `num_bands`
    (`GraphicEqSet.cpp:151`) and calls `GraphicEqReSetAllBandFreqs` + `GraphicEq_InitSections`, but

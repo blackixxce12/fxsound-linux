@@ -185,8 +185,16 @@ pub fn calc_parametric(fs: Real, f0: Real, boost_db: Real, q: Real) -> BiquadCoe
 
     // Rule A: narrow filters at low frequencies ring, so cap Q as f0 approaches 20 Hz. At exactly
     // 20 Hz this yields Q = 1.0, which is why the golden vectors show 1.0 for the 20 Hz band.
+    //
+    // Below 20 Hz the original carries on down the same line (`FiltCalcBiqd.cpp:159-165`): the
+    // cap reaches zero at 17.9 Hz and goes negative under it, a negative Q is a negative
+    // bandwidth, and the "peak" it designs is a flat gain across the whole spectrum — a +6 dB band
+    // at 15 Hz in a hand-made `.fac` lifted 1 kHz and 10 kHz by the full 6 dB (audit report #12).
+    // Its own comment says what it meant, "limit to Q of 1 at 20 hz" (`:140-142`), and that floor
+    // is held below 20 Hz, so a band there is as wide as the 20 Hz band and stays in the
+    // sub-bass. At 20 Hz and above nothing changes: the line never goes under the floor there.
     if f0 < Q_UPPER_LIMIT_FREQ {
-        let max_q = (f0 - Q_LOWER_LIMIT_FREQ) * Q_LIMIT_SCALE + Q_LOWER_LIMIT;
+        let max_q = ((f0 - Q_LOWER_LIMIT_FREQ) * Q_LIMIT_SCALE + Q_LOWER_LIMIT).max(Q_LOWER_LIMIT);
         if q > max_q {
             q = max_q;
         }
@@ -577,6 +585,24 @@ mod tests {
         let wide = calc_parametric(48_000.0, 20.0, 6.0, 1.0);
         let narrow = calc_parametric(48_000.0, 20.0, 6.0, 4.333_365_4);
         assert_eq!(wide, narrow);
+    }
+
+    #[test]
+    fn below_20hz_the_q_limiter_holds_its_20hz_floor_instead_of_going_negative() {
+        // Audit report #12. The cap is `(f0 - 20)·0.475 + 1`: -1.375 at 15 Hz, which designed a
+        // flat +6 dB gain at every frequency. Held at the Q it gives at 20 Hz, a band under 20 Hz
+        // is as wide as the 20 Hz band and peaks where it says it does.
+        for f0 in [10.0, 15.0, 17.9, 19.99] {
+            let asked = calc_parametric(48_000.0, f0, 6.0, 4.333_365_4);
+            assert_eq!(asked, calc_parametric(48_000.0, f0, 6.0, 1.0), "{f0} Hz");
+            let at_centre = 20.0 * magnitude(&asked, f0 / 48_000.0).log10();
+            let far_away = 20.0 * magnitude(&asked, 1_000.0 / 48_000.0).log10();
+            assert!(
+                (at_centre - 6.0).abs() < 0.3,
+                "{f0} Hz: {at_centre} dB at the centre"
+            );
+            assert!(far_away.abs() < 0.05, "{f0} Hz: {far_away} dB at 1 kHz");
+        }
     }
 
     #[test]
