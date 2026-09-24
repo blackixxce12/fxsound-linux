@@ -463,12 +463,11 @@ impl FxTray {
     }
 
     /// The two lanes' preset submenus, `Output Presets ▸` and `Input Presets ▸` — the original's
-    /// `Preset Select ▸`, once per lane, and like it present only while the power is on
-    /// (`FxSystemTrayView.cpp:313-316`). A lane with no presets has no submenu.
+    /// `Preset Select ▸`, once per lane. The original drops it while the power is off
+    /// (`FxSystemTrayView.cpp:313-316`); here it stays, as the window's preset list and the
+    /// command line do, so a preset can be picked before switching on (0.4.0 audit R7). A lane
+    /// with no presets has no submenu.
     fn preset_menus(&self) -> Vec<MenuItem<Self>> {
-        if !self.state.power {
-            return Vec::new();
-        }
         DeviceDirection::ALL
             .into_iter()
             .filter_map(|direction| self.preset_menu(direction))
@@ -1095,20 +1094,22 @@ mod tests {
     }
 
     #[test]
-    fn the_preset_submenus_are_only_there_while_power_is_on() {
-        // `FxSystemTrayView.cpp:313-316`: with power off the menu is Open / Turn On / devices /
-        // Settings / Theme / Always On Top / Donate / Exit — here without the two this port
-        // dropped.
+    fn the_preset_submenus_stay_while_the_power_is_off() {
+        // `FxSystemTrayView.cpp:313-316` drops them with the power off; the port keeps them, as
+        // the window's list and the command line do (0.4.0 audit R7).
+        let (on, _rx) = with_state(populated());
         let (tray, _rx) = with_state(TrayState {
             power: false,
             ..populated()
         });
-        let menu = tray.menu();
-        let labels = labels(&menu);
-        assert!(!labels.contains(&tr("Output Presets")), "{labels:?}");
-        assert!(!labels.contains(&tr("Input Presets")), "{labels:?}");
-        assert_eq!(labels[1], "Turn On", "the item says what it will do");
-        assert!(labels.contains(&tr("Playback Device Select")));
+        let off = labels(&tray.menu());
+        assert!(off.contains(&tr("Output Presets")), "{off:?}");
+        assert!(off.contains(&tr("Input Presets")), "{off:?}");
+        assert_eq!(off[1], "Turn On", "the item says what it will do");
+        assert!(off.contains(&tr("Playback Device Select")));
+        // The same items as with the power on, but for the power item's words.
+        let on = labels(&on.menu());
+        assert_eq!(off.len(), on.len(), "{off:?} / {on:?}");
     }
 
     #[test]
@@ -1202,6 +1203,25 @@ mod tests {
         );
         (voices[0].select)(&mut tray, 9);
         assert!(rx.try_recv().is_err(), "a row past the group sends nothing");
+    }
+
+    #[test]
+    fn a_preset_picked_in_the_tray_with_the_power_off_is_sent_as_with_it_on() {
+        // 0.4.0 audit R7.
+        let (mut tray, rx) = with_state(TrayState {
+            power: false,
+            ..populated()
+        });
+        let menu = tray.menu();
+        let music = radio_groups(submenu_of(&menu, "Output Presets"));
+        (music[1].select)(&mut tray, 0);
+        assert_eq!(
+            rx.try_recv(),
+            Ok(TrayCommand::SelectPreset {
+                direction: OUT,
+                name: "My Mix".to_owned(),
+            })
+        );
     }
 
     #[test]

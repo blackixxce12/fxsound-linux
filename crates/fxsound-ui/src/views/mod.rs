@@ -205,10 +205,12 @@ pub fn device_sections(devices: &[AudioDevice]) -> DeviceSections {
 
 /// The preset picker, which `FxView` gives to both windows (`FxView.cpp:24-56`).
 ///
-/// It is disabled with the master power (`FxProView.cpp:117-121`, `FxLiteView.cpp:57`) while the
-/// device pickers deliberately are **not** — the one thing a user must still be able to do with
-/// the power off is pick a different device. It lists the edit direction's presets. The box's
-/// response is handed back for a tooltip.
+/// The original disables it with the master power (`FxProView.cpp:117-121`, `FxLiteView.cpp:57`).
+/// Here it stays live, as the device pickers do (0.4.0 audit R7): the command line and D-Bus pick
+/// presets with the power off, so the window refusing to was the two contradicting each other,
+/// and a preset can now be chosen before switching on. What the preset sets stays grey until
+/// then. It lists the edit direction's presets, and a long name is cut before its `*`, never
+/// the `*` itself (audit #26). The box's response is handed back for a tooltip.
 pub(crate) fn preset_combo(
     ui: &mut Ui,
     state: &UiState,
@@ -223,7 +225,7 @@ pub(crate) fn preset_combo(
         .map(|preset| combo::preset_label(&preset.name, preset.modified))
         .collect();
     let (combo, picked) = FxComboBox::new(&presets, state.selected_preset)
-        .enabled(state.controls_enabled())
+        .keep_suffix(combo::MODIFIED_SUFFIX)
         .separator_before(first_user_preset(&state.presets))
         .show(ui, rect, palette, assets, "preset_list");
     if let Some(index) = picked {
@@ -554,6 +556,18 @@ pub(crate) mod testing {
         pub fn settle(&mut self, state: &UiState) -> Vec<ClippedShape> {
             self.frame(state, Vec::new());
             self.frame(state, Vec::new()).1
+        }
+
+        /// Rest the pointer on `pos` past egui's half-second tooltip delay, and every line of text
+        /// the last frame painted.
+        pub fn rest(&mut self, state: &UiState, pos: Pos2) -> Vec<String> {
+            self.frame(state, vec![Event::PointerMoved(pos)]);
+            // Sixty quiet frames of a sixtieth each.
+            let mut shapes = Vec::new();
+            for _ in 0..60 {
+                shapes = self.frame(state, Vec::new()).1;
+            }
+            texts(&shapes).into_iter().map(|(text, ..)| text).collect()
         }
 
         /// Hover, press and release at `pos`, with everything reported on the way.

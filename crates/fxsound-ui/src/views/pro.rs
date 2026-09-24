@@ -36,7 +36,8 @@
 //! `FxProView::paint` assigns `setEnabled(...)` to its children from the power state
 //! (`FxProView.cpp:112-122`) — a mutation inside a paint routine. In immediate mode the same thing
 //! falls out for free: [`UiState::controls_enabled`] is read each frame, and the two device
-//! combos are the controls deliberately left live with the power off.
+//! combos and the preset list are the controls deliberately left live with the power off — the
+//! preset list as a port departure (0.4.0 audit R7, [`views::preset_combo`]).
 
 use crate::assets::{AssetCache, FxImage};
 use crate::layout;
@@ -769,8 +770,14 @@ fn audio_controls(
     }
 
     // Last, so it is on top of either face. A child of the card, so the power switch disables it
-    // with everything else (`FxProView.cpp:112-122`); it has no tooltip in the original.
+    // with everything else (`FxProView.cpp:112-122`). It has no tooltip in the original, and the
+    // small glyph is the only way to the master gain, the leveling, the width, the balance and
+    // the band count (0.4.0 audit #27): the tip names the face a click turns to.
     let enabled = state.controls_enabled();
+    let tip = tr(match *face {
+        ColumnFace::Effects => "Equalizer settings",
+        ColumnFace::EqualizerControls => "Effects",
+    });
     let flip = IconButton::new(FxImage::FlipButton)
         .hover(FxImage::FlipButtonHover)
         .enabled(enabled)
@@ -779,6 +786,8 @@ fn audio_controls(
         } else {
             equalizer_controls::DISABLED_BUTTON_OPACITY
         })
+        .tooltip(&tip)
+        .hide_tooltips(state.hide_tooltips)
         .show(
             ui,
             equalizer_controls::flip_button(column),
@@ -809,7 +818,15 @@ fn effect_column(
     let applies = state.music_effects_apply();
     let enabled = state.controls_enabled() && applies;
     let caption_colour = palette.color(FxColor::DefaultText);
-    let value_colour = palette.color(FxColor::HighlightedText);
+    // At a disabled label's half alpha while the power is off, as face B's readouts are.
+    let value_colour = if enabled {
+        palette.color(FxColor::HighlightedText)
+    } else {
+        palette.color_alpha(
+            FxColor::HighlightedText,
+            equalizer_controls::DISABLED_TEXT_ALPHA,
+        )
+    };
 
     for (index, effect) in Effect::ALL.into_iter().enumerate() {
         let caption = effects::caption_rect(column, index);
@@ -828,21 +845,26 @@ fn effect_column(
         let mut value = state.effect(effect);
         // 0…10 in whole steps (`FxAudioControls.cpp:113`), and with Shift one stored value at a
         // time (0.4.0 audit #14): the eleven positions stand over 128 values a preset can store.
-        // The five effect sliders are the ones *without* right-click-to-reset — that belongs to
-        // `FxAudioSlider` and `FxBalanceSlider` (`docs/spec/03-controls.md` §3.5).
+        // A right-click switches the effect off, as it puts a level back to its neutral value on
+        // the other face: the original gives only `FxAudioSlider` and `FxBalanceSlider` the reset
+        // (`docs/spec/03-controls.md` §3.5), and the port gives it these five too (0.4.0 audit R9).
         let steps = StoredSteps(effect);
         let slider = FxSlider::new(&mut value, 0.0, scale::SLIDER_MAX, 1.0)
             .fine_steps(&steps)
+            .default_value(0.0)
+            .reset_on_secondary_click(true)
             .enabled(enabled)
             .show(ui, rect, palette, assets, effect.key());
         let changed = slider.changed();
-        // The five help tips (`FxAudioControls.cpp:157-161`), cleared while the user has ticked
-        // "Hide help tips for audio controls" (`:169-176`). On a microphone the tip is replaced
-        // rather than dropped: the question a greyed control raises is "why", and the answer has
-        // to be somewhere the user is already looking.
+        // The five help tips (`FxAudioControls.cpp:157-161`), with the right-click under them,
+        // cleared while the user has ticked "Hide help tips for audio controls" (`:169-176`). On a
+        // microphone the tip is replaced rather than dropped: the question a greyed control raises
+        // is "why", and the answer has to be somewhere the user is already looking.
         if !state.hide_tooltips {
             let _ = if applies {
-                slider.on_hover_text(tr(effect.tooltip()))
+                slider.on_hover_text(crate::widgets::slider::with_reset_tip(Some(&tr(
+                    effect.tooltip()
+                ))))
             } else {
                 slider.on_hover_text(tr(MICROPHONE_INERT_TIP))
             };
@@ -853,12 +875,16 @@ fn effect_column(
 
         // `showValue(show)` is `show && isEnabled()` (`FxAudioControls.cpp:208-211`), and since
         // v2.0 `show` is unconditionally true so touch users can read the value
-        // (`FxProView.cpp:70`).
+        // (`FxProView.cpp:70`). With the power off the original's values go with `isEnabled()`,
+        // which is an accident of a stale state rather than a rule — "values always visible since
+        // version 2.0" (`FxProView.cpp:56-73`) — so here they stay, at half alpha, and say what
+        // switching back on will play (0.4.0 audit #42). On a microphone they are the playback
+        // chain's and not this one's, and the slider says so instead.
         //
         // A value between two positions — General's Surround is stored as 20, between positions 1
         // and 2 — shows with its decimal, "1.6", rather than as the position ("2") that would
         // save as something else (0.4.0 audit #14).
-        if enabled {
+        if applies {
             let t = value / scale::SLIDER_MAX;
             let label = effects::value_label_rect(rect, t);
             ui.painter().text(
@@ -1370,6 +1396,300 @@ mod tests {
             Some(&UiAction::SetEffect(Effect::Surround, 1.0)),
             "a plain Left arrow from 1.6 stops at the position below it, 1"
         );
+    }
+
+    #[test]
+    fn shift_and_one_wheel_notch_step_one_stored_value_where_a_notch_steps_a_position() {
+        // 0.4.0 audit #14 and #48: the wheel reads raw notches now, and Shift still turns one of
+        // them into one stored value, not a position and not a run of them.
+        let wheel = |modifiers| Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 1.0),
+            phase: egui::TouchPhase::Move,
+            modifiers,
+        };
+        let state = surround_between_positions();
+        let over = effects::slider_rect(column(), Effect::Surround as usize).center();
+
+        let mut harness = Harness::new(ThemeMode::Dark);
+        harness.frame(&state, vec![Event::PointerMoved(over)]);
+        harness.settle(&state);
+        let mut actions = harness
+            .frame(
+                &state,
+                vec![
+                    Event::ModifiersChanged(egui::Modifiers::SHIFT),
+                    wheel(egui::Modifiers::SHIFT),
+                ],
+            )
+            .0;
+        for _ in 0..30 {
+            actions.extend(harness.frame(&state, Vec::new()).0);
+        }
+        let stepped: Vec<u8> = actions
+            .iter()
+            .filter_map(|action| match action {
+                UiAction::SetEffect(Effect::Surround, value) => {
+                    Some(scale::slider_to_midi_for(Effect::Surround, *value))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stepped,
+            vec![21],
+            "Shift and one notch up from 20: {actions:?}"
+        );
+
+        let mut harness = Harness::new(ThemeMode::Dark);
+        harness.frame(&state, vec![Event::PointerMoved(over)]);
+        harness.settle(&state);
+        let actions = harness.frame(&state, vec![wheel(egui::Modifiers::NONE)]).0;
+        assert_eq!(
+            actions.first(),
+            Some(&UiAction::SetEffect(Effect::Surround, 2.0)),
+            "a plain notch up from 1.6 stops at the next position, 2"
+        );
+    }
+
+    /// Press and release `button` at `pos`, every frame's actions reported.
+    fn press(
+        harness: &mut Harness,
+        state: &UiState,
+        pos: Pos2,
+        button: PointerButton,
+    ) -> Vec<UiAction> {
+        let event = |pressed| Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut actions = Vec::new();
+        for events in [
+            vec![Event::PointerMoved(pos)],
+            vec![Event::PointerMoved(pos), event(true)],
+            vec![event(false)],
+        ] {
+            actions.extend(harness.frame(state, events).0);
+        }
+        actions
+    }
+
+    #[test]
+    fn a_right_click_on_an_effect_switches_it_off_without_moving_it_to_the_pointer_first() {
+        // 0.4.0 audit R9: the original gives the reset to the level sliders only.
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let state = state();
+        harness.settle(&state);
+        for effect in Effect::ALL {
+            let track = slider::track_rect(effects::slider_rect(column(), effect as usize));
+            let at = pos2(track.right() - 2.0, track.center().y);
+            let actions = press(&mut harness, &state, at, PointerButton::Secondary);
+            assert_eq!(
+                actions,
+                vec![UiAction::SetEffect(effect, 0.0)],
+                "{effect:?}"
+            );
+        }
+        // An effect already off has nothing to reset.
+        let mut off = state.clone();
+        off.effects[Effect::Bass as usize] = 0.0;
+        let track = slider::track_rect(effects::slider_rect(column(), Effect::Bass as usize));
+        assert!(press(&mut harness, &off, track.center(), PointerButton::Secondary).is_empty());
+    }
+
+    #[test]
+    fn an_effects_tip_names_the_right_click_under_its_own() {
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let rect = effects::slider_rect(column(), Effect::Bass as usize);
+        let shown = harness.rest(&state(), rect.center());
+        let tip = shown
+            .iter()
+            .find(|text| text.starts_with("Boosts low end"))
+            .unwrap_or_else(|| panic!("no tip in {shown:?}"));
+        assert!(tip.ends_with(slider::RESET_TIP), "{tip:?}");
+        // On a microphone the tip is the reason instead, and there is nothing to reset.
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let shown = harness.rest(&microphone_state(), rect.center());
+        assert!(shown.iter().any(|t| t == MICROPHONE_INERT_TIP), "{shown:?}");
+        assert!(
+            !shown.iter().any(|t| t.contains(slider::RESET_TIP)),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
+    fn with_the_power_off_the_effect_values_stay_on_screen_at_half_alpha() {
+        // 0.4.0 audit #42: the original hides them with `isEnabled()`, against its own "values
+        // always visible since version 2.0".
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let palette = Palette::new(mode);
+            let mut harness = Harness::new(mode);
+            let shapes = harness.settle(&UiState {
+                power: false,
+                ..state()
+            });
+            let greyed = palette.color_alpha(
+                FxColor::HighlightedText,
+                equalizer_controls::DISABLED_TEXT_ALPHA,
+            );
+            for (index, value) in ["3", "5", "7", "4", "8"].into_iter().enumerate() {
+                let slider = effects::slider_rect(column(), index);
+                let found: Vec<_> = texts(&shapes)
+                    .into_iter()
+                    .filter(|(text, rect, _)| text == value && slider.contains(rect.center()))
+                    .collect();
+                assert_eq!(found.len(), 1, "{mode:?} row {index}: {found:?}");
+                assert_eq!(found[0].2, greyed, "{mode:?} row {index}");
+            }
+            // With the power on they are at full strength.
+            let shapes = harness.settle(&state());
+            let (_, _, colour) = texts(&shapes)
+                .into_iter()
+                .find(|(text, rect, _)| {
+                    text == "3" && effects::slider_rect(column(), 0).contains(rect.center())
+                })
+                .expect("Clarity's value");
+            assert_eq!(colour, palette.color(FxColor::HighlightedText), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_card_flip_says_which_face_it_turns_to() {
+        // 0.4.0 audit #27: the one way to the master gain, the leveling, the width, the balance
+        // and the band count had no word on it.
+        let state = state();
+        let flip = equalizer_controls::flip_button(column()).center();
+        let mut harness = Harness::new(ThemeMode::Dark);
+        assert!(
+            harness
+                .rest(&state, flip)
+                .contains(&"Equalizer settings".to_owned())
+        );
+        let mut harness = Harness::new(ThemeMode::Dark);
+        harness.scratch.column_face = ColumnFace::EqualizerControls;
+        assert!(harness.rest(&state, flip).contains(&"Effects".to_owned()));
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let hidden = UiState {
+            hide_tooltips: true,
+            ..state
+        };
+        assert!(
+            !harness
+                .rest(&hidden, flip)
+                .contains(&"Equalizer settings".to_owned())
+        );
+    }
+
+    #[test]
+    fn with_the_power_off_the_band_gains_stay_on_screen_at_half_alpha() {
+        // 0.4.0 audit #42, the equalizer's half.
+        use crate::widgets::equalizer::{EqLayout, gain_label, gain_label_colour};
+        let mut state = state();
+        state.eq_bands[3].boost_db = 5.0;
+        let panel = layout::pro::equalizer();
+        let layout = EqLayout::new(state.eq_bands.len());
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let palette = Palette::new(mode);
+            let mut harness = Harness::new(mode);
+            let off = UiState {
+                power: false,
+                ..state.clone()
+            };
+            let shapes = harness.settle(&off);
+            for (band, eq_band) in off.eq_bands.iter().enumerate() {
+                let label = layout
+                    .gain_label_rect(band, eq_band.boost_db)
+                    .translate(panel.min.to_vec2());
+                let wanted = gain_label(eq_band.boost_db);
+                let found: Vec<_> = texts(&shapes)
+                    .into_iter()
+                    .filter(|(text, rect, _)| {
+                        *text == wanted && (rect.center().x - label.center().x).abs() < 1.0
+                    })
+                    .collect();
+                assert_eq!(found.len(), 1, "{mode:?} band {band}: {found:?}");
+                assert_eq!(
+                    found[0].2,
+                    gain_label_colour(palette, false),
+                    "{mode:?} band {band}"
+                );
+            }
+            assert_eq!(
+                gain_label_colour(palette, false),
+                palette.color_alpha(FxColor::DefaultText, 0.5)
+            );
+        }
+    }
+
+    #[test]
+    fn every_band_tip_names_the_right_click_and_at_ten_bands_says_what_the_band_is_first() {
+        use crate::widgets::equalizer::{BAND_TOOLTIPS, EqLayout};
+        let panel = layout::pro::equalizer();
+        for count in [10, 31] {
+            let mut state = state();
+            state.eq_bands = (0..count)
+                .map(|band| fxsound_core::EqBand::new(30.0 + 500.0 * band as f32, 0.0))
+                .collect();
+            let hit = EqLayout::new(count)
+                .gain_hit_rect(2)
+                .translate(panel.min.to_vec2());
+            let mut harness = Harness::new(ThemeMode::Dark);
+            let shown = harness.rest(&state, hit.center());
+            let tip = shown
+                .iter()
+                .find(|text| text.ends_with(slider::RESET_TIP))
+                .unwrap_or_else(|| panic!("{count} bands: {shown:?}"));
+            if count == 10 {
+                assert!(tip.starts_with(BAND_TOOLTIPS[2]), "{tip:?}");
+            } else {
+                assert_eq!(tip, slider::RESET_TIP);
+            }
+        }
+    }
+
+    #[test]
+    fn a_bypassed_equalizer_is_grey_that_can_be_seen_in_the_light_palette() {
+        // 0.4.0 audit #24: the light palette's curve fill greyed to white.
+        let palette = Palette::new(ThemeMode::Light);
+        let panel_colour = palette.color(FxColor::ControlBackground);
+        let mut state = state();
+        state.eq_bands[4].boost_db = 8.0;
+        state.eq_on = false;
+        let mut harness = Harness::new(ThemeMode::Light);
+        let shapes = harness.settle(&state);
+        let eq = layout::pro::equalizer();
+        let meshes: Vec<_> = shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Mesh(mesh)
+                    if mesh.texture_id == egui::TextureId::default()
+                        && mesh.vertices.iter().all(|v| eq.contains(v.pos)) =>
+                {
+                    Some(mesh.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let fill = meshes.first().expect("the curve's fill");
+        // The fill fades from 0.34 alpha to none, and a faint vertex's straight colour is only
+        // known to a few levels; the ones that show are the grey `Palette::greyed` gives, which
+        // reads at 3:1 on the panel, where the original's was white.
+        let limit = crate::theme::LIGHT_GREY_LIMIT;
+        let seen: Vec<_> = fill
+            .vertices
+            .iter()
+            .map(|vertex| vertex.color.to_srgba_unmultiplied())
+            .filter(|[.., a]| *a >= 40)
+            .collect();
+        assert!(!seen.is_empty(), "{:?}", fill.vertices);
+        for [r, g, b, _] in seen {
+            assert!(r == g && g == b, "{r} {g} {b}");
+            assert!(r.abs_diff(limit) <= 6, "{r:#x}");
+        }
+        let grey = egui::Color32::from_gray(limit);
+        assert!(crate::theme::contrast_ratio(grey, panel_colour) >= 3.0);
     }
 
     /// The same window with a microphone selected.

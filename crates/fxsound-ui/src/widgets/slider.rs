@@ -22,16 +22,17 @@
 //! None of the sliders customise JUCE's defaults, so: clicking the track jumps to that position
 //! and starts a drag, the wheel steps by the interval, the arrow keys step by the interval, and
 //! **double-click does nothing** — FxSound has no double-click-to-reset. Right-click resets to the
-//! default on the audio sliders and on balance, and does nothing on the five effect sliders.
+//! default on the audio sliders and on balance, and — a port addition (0.4.0 audit R9) — on the
+//! five effect sliders too, which the original leaves without it; every slider's tooltip says so
+//! ([`RESET_TIP`]), since nothing else would.
 //!
 //! Two departures (0.4.0 audit #14). On **every** slider a press on the thumb moves nothing until
 //! the pointer does, where JUCE jumps to the pointer there too: a value can sit between a
 //! slider's positions — a preset's Surround of 1.6 among eleven positions over 128 stored
-//! values, a `--master_gain=3` on the speakers' 2 dB interval — and a touch snapped it to one,
-//! and even on a position a press half a thumb off centre moved the master gain or the balance
-//! by a whole 2 dB step. And on a slider whose values are finer than its interval, the five
-//! effects, **Shift** makes the arrows, the wheel and a drag move by one stored value
-//! ([`FineSteps`]).
+//! values — and a touch snapped it to one, and even on a position a press half a thumb off
+//! centre moved the master gain or the balance by a whole step. And on a slider whose values are
+//! finer than its interval, the five effects, **Shift** makes the arrows, the wheel and a drag
+//! move by one stored value ([`FineSteps`]).
 //!
 //! ## Balance
 //!
@@ -55,15 +56,21 @@ const TRACK_CORNER_RADIUS: f32 = 5.6;
 /// How faithfully to reproduce the original's painting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Fidelity {
-    /// Reproduce `drawLinearSlider` exactly, including the filled-track overshoot: the original
-    /// passes the thumb's absolute x as the fill's *width*, so the fill is 8 px wide at the
-    /// minimum and runs 8 px past the track at the maximum (`FxTheme.cpp:230-237`).
+    /// Reproduce `drawLinearSlider` and `FxBalanceSlider::paint` exactly, slips included: the
+    /// original passes the thumb's absolute x as the fill's *width*, so the fill is 8 px wide at
+    /// the minimum and runs 8 px past the track at the maximum (`FxTheme.cpp:230-237`), and ends
+    /// the balance gradient eight points short of the track (`FxBalanceSlider.cpp:89`).
     ///
-    /// This is the default, because matching the Windows build pixel for pixel is the point of
-    /// this port.
-    #[default]
+    /// Kept to compare against the Windows build; nothing in the window asks for it.
     Faithful,
-    /// Fill the track from its start to the thumb, which is what the original clearly meant.
+    /// Fill the track from its start to the thumb and run the balance gradient to the track's
+    /// end, which is what the original clearly meant (D-2 and D-3,
+    /// `docs/spec/00-architecture.md` §9).
+    ///
+    /// The default (0.4.0 audit #41). On Windows the 16-point thumb covers most of the overshoot;
+    /// here the overshoot showed round a thumb drawn a quarter of its size (#40), and D-2 and D-3
+    /// were listed as fixed while every slider still drew them.
+    #[default]
     Corrected,
 }
 
@@ -76,7 +83,7 @@ pub enum Track {
     /// `FxBalanceSlider::paint`: one bar in a horizontal gradient from `SliderTrack` at `1 − t`
     /// alpha on the left to `t` on the right, with no fill (`FxBalanceSlider.cpp:79-92`).
     ///
-    /// [`Fidelity::Faithful`] keeps the original's slip: the gradient's end is given as the
+    /// [`Fidelity::Faithful`] would keep the original's slip: the gradient's end is given as the
     /// track's *width*, 112, where an x was meant, so it stops eight points short of the track's
     /// end at 120 and the last eight points are the end colour (`docs/spec/03-controls.md` §3.4).
     Balance,
@@ -139,8 +146,9 @@ impl<'a> FxSlider<'a> {
         self
     }
 
-    /// Enable right-click-to-reset, which `FxAudioSlider` and `FxBalanceSlider` have and the five
-    /// effect sliders do not.
+    /// Enable right-click-to-reset, which `FxAudioSlider` and `FxBalanceSlider` have, and which the
+    /// port gives the five effect sliders too (0.4.0 audit R9). A slider with it should say so in
+    /// its tooltip ([`with_reset_tip`]).
     #[must_use]
     pub fn reset_on_secondary_click(mut self, reset: bool) -> Self {
         self.reset_on_secondary_click = reset;
@@ -249,24 +257,16 @@ impl<'a> FxSlider<'a> {
                 interacted = true;
             }
 
-            if response.hovered() {
-                // 0.36 exposes only the smoothed delta; one notch is still one step, which is
-                // what JUCE's default wheel handling does. With Shift held egui turns the wheel
-                // sideways, so the fine step reads the other axis.
-                let scroll = ui.input(|i| {
-                    if fine.is_some() {
-                        i.smooth_scroll_delta.x + i.smooth_scroll_delta.y
-                    } else {
-                        i.smooth_scroll_delta.y
-                    }
-                });
-                if scroll != 0.0 {
+            // One step a wheel notch, as JUCE's default wheel handling does (see [`wheel_steps`]).
+            let notches = wheel_steps(ui, id, response.hovered());
+            if notches != 0 {
+                for _ in 0..notches.unsigned_abs() {
                     new_value = match fine {
-                        Some(fine) => fine.step(new_value, scroll > 0.0),
-                        None => step_towards(new_value, min, step, scroll > 0.0),
+                        Some(fine) => fine.step(new_value, notches > 0),
+                        None => step_towards(new_value, min, step, notches > 0),
                     };
-                    interacted = true;
                 }
+                interacted = true;
             }
 
             if response.has_focus() {
@@ -319,6 +319,82 @@ impl<'a> FxSlider<'a> {
         );
         response
     }
+}
+
+/// What a slider that resets on a right-click adds to its tooltip (0.4.0 audit R9): the reset is
+/// invisible otherwise, and nobody finds a gesture nothing mentions.
+pub const RESET_TIP: &str = "Right-click to reset";
+
+/// A slider's tooltip with [`RESET_TIP`] under it, translated; [`RESET_TIP`] alone for a slider
+/// with nothing else to say.
+#[must_use]
+pub fn with_reset_tip(tip: Option<&str>) -> String {
+    let reset = fxsound_core::i18n::tr(RESET_TIP);
+    match tip {
+        Some(tip) if !tip.is_empty() => format!("{tip}\n{reset}"),
+        _ => reset,
+    }
+}
+
+/// How far a touchpad or a smooth-scrolling wheel has to scroll, in points, to make one step.
+///
+/// About two lines of text, so a short flick moves a slider a step or two rather than across its
+/// range. A wheel that reports lines — every notched mouse wheel — makes one step a line.
+pub const WHEEL_POINTS_PER_STEP: f32 = 40.0;
+
+/// The steps the wheel asks for over a slider this frame: positive up, negative down.
+///
+/// Read from the raw [`egui::Event::MouseWheel`] events, not from egui's smoothed scroll delta:
+/// egui 0.36 spreads one notch over about a sixth of a second of frames, so a slider stepping on
+/// every frame that saw some of it went about ten steps a notch — 0 to +20 dB of master gain in
+/// one click (0.4.0 audit #48). A notch of a line is one step; points (a touchpad) and fractions
+/// of a line (a high-resolution wheel) add up until they make one, and what is left over waits,
+/// per slider, for the next event. Turning the other way starts afresh, and so does leaving the
+/// slider. Scrolling sideways counts where there is no vertical movement, which is how a tilt
+/// wheel, and Shift on some platforms, reports.
+fn wheel_steps(ui: &Ui, id: Id, hovered: bool) -> i32 {
+    let key = id.with("wheel_remainder");
+    if !hovered {
+        if ui.data(|d| d.get_temp::<f32>(key)).is_some() {
+            ui.data_mut(|d| d.remove::<f32>(key));
+        }
+        return 0;
+    }
+    let deltas: Vec<f32> = ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::MouseWheel { unit, delta, .. } => {
+                    let along = if delta.y == 0.0 { delta.x } else { delta.y };
+                    Some(match unit {
+                        egui::MouseWheelUnit::Line | egui::MouseWheelUnit::Page => along,
+                        egui::MouseWheelUnit::Point => along / WHEEL_POINTS_PER_STEP,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    });
+    if deltas.is_empty() {
+        return 0;
+    }
+    let mut remainder = ui.data(|d| d.get_temp::<f32>(key)).unwrap_or(0.0);
+    let mut steps = 0;
+    for delta in deltas {
+        if delta == 0.0 || !delta.is_finite() {
+            continue;
+        }
+        if remainder != 0.0 && remainder.signum() != delta.signum() {
+            remainder = 0.0;
+        }
+        remainder += delta;
+        // Float noise on a whole line still counts as the line.
+        let whole = (remainder + remainder.signum() * 1e-4).trunc();
+        steps += whole as i32;
+        remainder -= whole;
+    }
+    ui.data_mut(|d| d.insert_temp(key, remainder));
+    steps
 }
 
 /// Whether the press under way began on the thumb and the pointer has not left its starting
@@ -375,8 +451,8 @@ pub fn quantise(value: f32, min: f32, max: f32, step: f32) -> f32 {
 /// direction of travel from a value between two.
 ///
 /// Adding a whole step to a value between positions and then rounding skipped a position:
-/// Surround at 1.57 went up to 3 and `--master_gain=3` on the 2 dB step went up to 6 (0.4.0
-/// audit #14 keeps such values until the user moves the slider). The result is not clamped;
+/// Surround at 1.57 went up to 3, and a master gain of 3 dB on the original's 2 dB step went up
+/// to 6 (0.4.0 audit #14 keeps such values until the user moves the slider). The result is not clamped;
 /// [`quantise`] does that.
 #[must_use]
 pub fn step_towards(value: f32, min: f32, step: f32, up: bool) -> f32 {
@@ -610,6 +686,327 @@ mod tests {
         assert_eq!(value, 5.0);
     }
 
+    /// A slider over `min..=max` by `step`, kept across frames: each call runs one frame with
+    /// `events` and hands back the value and what was painted.
+    struct Rig {
+        ctx: egui::Context,
+        assets: crate::assets::AssetCache,
+        value: f32,
+        fine: Option<&'static dyn FineSteps>,
+    }
+
+    impl Rig {
+        fn new(value: f32) -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                assets: crate::assets::AssetCache::new(),
+                value,
+                fine: None,
+            }
+        }
+
+        fn frame(
+            &mut self,
+            (min, max, step): (f32, f32, f32),
+            events: Vec<egui::Event>,
+        ) -> Vec<egui::epaint::ClippedShape> {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 40.0))),
+                events,
+                ..Default::default()
+            };
+            let Self {
+                ctx,
+                assets,
+                value,
+                fine,
+            } = self;
+            let mut output = ctx.run_ui(input, |ui| {
+                let mut slider = FxSlider::new(value, min, max, step);
+                if let Some(fine) = *fine {
+                    slider = slider.fine_steps(fine);
+                }
+                let _ = slider.show(ui, slider_rect(), Palette::default(), assets, "rig");
+            });
+            let shapes = std::mem::take(&mut output.shapes);
+            output.drop_without_applying_deltas();
+            shapes
+        }
+    }
+
+    const GAIN: (f32, f32, f32) = (-20.0, 20.0, 1.0);
+
+    /// An effect-like slider: whole positions 0 to 10, and fine values between them.
+    const EFFECT: (f32, f32, f32) = (0.0, 10.0, 1.0);
+
+    /// Fine values a quarter of a position apart — any spacing other than the whole step will do.
+    struct Quarters;
+
+    static QUARTERS: Quarters = Quarters;
+
+    impl FineSteps for Quarters {
+        fn step(&self, value: f32, up: bool) -> f32 {
+            let here = self.nearest(value);
+            let next = if up { here + 0.25 } else { here - 0.25 };
+            next.clamp(0.0, 10.0)
+        }
+
+        fn nearest(&self, value: f32) -> f32 {
+            (value * 4.0).round() / 4.0
+        }
+    }
+
+    fn wheel(unit: egui::MouseWheelUnit, y: f32) -> egui::Event {
+        wheel_along(unit, vec2(0.0, y), egui::Modifiers::NONE)
+    }
+
+    fn wheel_along(
+        unit: egui::MouseWheelUnit,
+        delta: egui::Vec2,
+        modifiers: egui::Modifiers,
+    ) -> egui::Event {
+        egui::Event::MouseWheel {
+            unit,
+            delta,
+            phase: egui::TouchPhase::Move,
+            modifiers,
+        }
+    }
+
+    /// A rig with the pointer resting on the slider.
+    fn hovered(value: f32) -> Rig {
+        hovered_over(Rig::new(value), GAIN)
+    }
+
+    fn hovered_over(mut rig: Rig, range: (f32, f32, f32)) -> Rig {
+        let over = slider_rect().center() + vec2(30.0, 0.0);
+        rig.frame(range, vec![egui::Event::PointerMoved(over)]);
+        rig.frame(range, Vec::new());
+        rig
+    }
+
+    /// A rig over [`EFFECT`] with [`Quarters`] and the pointer resting on the slider.
+    fn hovered_with_fine_steps(value: f32) -> Rig {
+        let mut rig = Rig::new(value);
+        rig.fine = Some(&QUARTERS);
+        hovered_over(rig, EFFECT)
+    }
+
+    const SHIFT_DOWN: egui::Event = egui::Event::ModifiersChanged(egui::Modifiers::SHIFT);
+    const SHIFT_UP: egui::Event = egui::Event::ModifiersChanged(egui::Modifiers::NONE);
+
+    #[test]
+    fn shift_and_one_wheel_notch_move_a_slider_with_fine_steps_one_fine_step() {
+        // 0.4.0 audit #14 and #48: the #48 rewrite reads raw wheel events, and Shift must still
+        // pick the fine values from them — one a notch, however many frames follow.
+        let mut rig = hovered_with_fine_steps(2.0);
+        rig.frame(
+            EFFECT,
+            vec![
+                SHIFT_DOWN,
+                wheel_along(
+                    egui::MouseWheelUnit::Line,
+                    vec2(0.0, 1.0),
+                    egui::Modifiers::SHIFT,
+                ),
+            ],
+        );
+        for _ in 0..30 {
+            rig.frame(EFFECT, Vec::new());
+        }
+        assert_eq!(rig.value, 2.25);
+        rig.frame(
+            EFFECT,
+            vec![wheel_along(
+                egui::MouseWheelUnit::Line,
+                vec2(0.0, -1.0),
+                egui::Modifiers::SHIFT,
+            )],
+        );
+        assert_eq!(rig.value, 2.0, "one notch back is one fine step back");
+    }
+
+    #[test]
+    fn shift_and_a_wheel_reported_sideways_still_make_one_fine_step_a_notch() {
+        // Some platforms turn a vertical notch sideways while Shift is held.
+        let mut rig = hovered_with_fine_steps(2.0);
+        rig.frame(
+            EFFECT,
+            vec![
+                SHIFT_DOWN,
+                wheel_along(
+                    egui::MouseWheelUnit::Line,
+                    vec2(1.0, 0.0),
+                    egui::Modifiers::SHIFT,
+                ),
+            ],
+        );
+        assert_eq!(rig.value, 2.25);
+    }
+
+    #[test]
+    fn a_wheel_notch_without_shift_moves_a_slider_with_fine_steps_a_whole_position() {
+        let mut rig = hovered_with_fine_steps(2.25);
+        rig.frame(EFFECT, vec![wheel(egui::MouseWheelUnit::Line, 1.0)]);
+        assert_eq!(
+            rig.value, 3.0,
+            "from between positions to the next one, not past it"
+        );
+        rig.frame(EFFECT, vec![SHIFT_DOWN]);
+        rig.frame(EFFECT, vec![SHIFT_UP]);
+        rig.frame(EFFECT, vec![wheel(egui::MouseWheelUnit::Line, 1.0)]);
+        assert_eq!(rig.value, 4.0, "Shift let go is Shift no longer held");
+    }
+
+    #[test]
+    fn shift_does_nothing_to_the_wheel_on_a_slider_without_fine_steps() {
+        let mut rig = hovered(0.0);
+        rig.frame(
+            GAIN,
+            vec![
+                SHIFT_DOWN,
+                wheel_along(
+                    egui::MouseWheelUnit::Line,
+                    vec2(0.0, 1.0),
+                    egui::Modifiers::SHIFT,
+                ),
+            ],
+        );
+        assert_eq!(rig.value, 1.0);
+    }
+
+    #[test]
+    fn one_wheel_notch_is_one_step_however_many_frames_follow_it() {
+        // 0.4.0 audit #48: egui 0.36 spreads a notch over some ten frames of its smoothed delta,
+        // and a slider stepping on each of them went from 0 to +20 dB of master gain in a click.
+        let mut rig = hovered(0.0);
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Line, 1.0)]);
+        for _ in 0..30 {
+            rig.frame(GAIN, Vec::new());
+        }
+        assert_eq!(rig.value, 1.0);
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Line, -1.0)]);
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Line, -1.0)]);
+        for _ in 0..30 {
+            rig.frame(GAIN, Vec::new());
+        }
+        assert_eq!(rig.value, -1.0);
+    }
+
+    #[test]
+    fn two_notches_in_one_frame_are_two_steps() {
+        let mut rig = hovered(0.0);
+        rig.frame(
+            GAIN,
+            vec![
+                wheel(egui::MouseWheelUnit::Line, 1.0),
+                wheel(egui::MouseWheelUnit::Line, 1.0),
+            ],
+        );
+        assert_eq!(rig.value, 2.0);
+    }
+
+    #[test]
+    fn a_touchpad_steps_once_every_forty_points_and_keeps_the_rest_for_later() {
+        let mut rig = hovered(0.0);
+        for _ in 0..3 {
+            rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Point, 12.0)]);
+        }
+        assert_eq!(rig.value, 0.0, "36 points are not a step yet");
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Point, 12.0)]);
+        assert_eq!(rig.value, 1.0, "48 points are one");
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Point, 75.0)]);
+        assert_eq!(rig.value, 3.0, "8 left over and 75 more make two more");
+        assert_eq!(WHEEL_POINTS_PER_STEP, 40.0);
+    }
+
+    #[test]
+    fn a_high_resolution_wheel_steps_once_its_fractions_make_a_line() {
+        let mut rig = hovered(0.0);
+        for _ in 0..3 {
+            rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Line, 0.25)]);
+        }
+        assert_eq!(rig.value, 0.0);
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Line, 0.25)]);
+        assert_eq!(rig.value, 1.0);
+    }
+
+    #[test]
+    fn turning_the_wheel_back_drops_what_was_left_over_the_other_way() {
+        let mut rig = hovered(0.0);
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Point, 30.0)]);
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Point, -30.0)]);
+        assert_eq!(rig.value, 0.0);
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Point, -12.0)]);
+        assert_eq!(
+            rig.value, -1.0,
+            "30 back and 12 more is past 40 the other way"
+        );
+    }
+
+    #[test]
+    fn the_wheel_does_nothing_to_a_slider_the_pointer_is_not_on() {
+        let mut rig = Rig::new(0.0);
+        rig.frame(GAIN, vec![egui::Event::PointerMoved(pos2(190.0, 35.0))]);
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Line, 1.0)]);
+        assert_eq!(rig.value, 0.0);
+    }
+
+    #[test]
+    fn leaving_the_slider_forgets_a_touchpads_left_over_points() {
+        let mut rig = hovered(0.0);
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Point, 30.0)]);
+        rig.frame(GAIN, vec![egui::Event::PointerMoved(pos2(190.0, 35.0))]);
+        let over = slider_rect().center() + vec2(30.0, 0.0);
+        rig.frame(GAIN, vec![egui::Event::PointerMoved(over)]);
+        rig.frame(GAIN, vec![wheel(egui::MouseWheelUnit::Point, 30.0)]);
+        assert_eq!(rig.value, 0.0);
+    }
+
+    /// The opaque track-coloured rectangles painted: the fill.
+    fn fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<Rect> {
+        let colour = Palette::default().color(FxColor::SliderTrack);
+        shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(rect) if rect.fill == colour => Some(rect.rect),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_fill_runs_from_the_tracks_start_to_the_thumb_and_never_past_the_track() {
+        // 0.4.0 audit #41: the original's overshoot, D-2, was fixed on paper and still drawn.
+        assert_eq!(Fidelity::default(), Fidelity::Corrected);
+        let track = track_rect(slider_rect());
+        for (value, right) in [(20.0, track.right()), (0.0, track.center().x)] {
+            let mut rig = Rig::new(value);
+            let shapes = rig.frame(GAIN, Vec::new());
+            let fill = fills(&shapes);
+            assert_eq!(fill.len(), 1, "{fill:?}");
+            assert_eq!(fill[0].left(), track.left());
+            assert!(
+                (fill[0].right() - right).abs() < 1e-3,
+                "{value}: {:?}",
+                fill[0]
+            );
+        }
+        // At the minimum there is nothing to fill.
+        let mut rig = Rig::new(-20.0);
+        assert!(fills(&rig.frame(GAIN, Vec::new())).is_empty());
+    }
+
+    #[test]
+    fn the_right_click_reset_is_named_under_a_tooltip_or_alone() {
+        assert_eq!(with_reset_tip(None), RESET_TIP);
+        assert_eq!(with_reset_tip(Some("")), RESET_TIP);
+        assert_eq!(
+            with_reset_tip(Some("Boosts low end")),
+            format!("Boosts low end\n{RESET_TIP}")
+        );
+    }
+
     #[test]
     fn the_track_geometry_matches_the_derivation() {
         // docs/spec/03-controls.md §3.1: (8, 7, 112, 3) for a 160x18 slider.
@@ -636,7 +1033,7 @@ mod tests {
         assert_eq!(quantise(3.6, 0.0, 10.0, 1.0), 4.0);
         assert_eq!(quantise(-5.0, 0.0, 10.0, 1.0), 0.0);
         assert_eq!(quantise(99.0, 0.0, 10.0, 1.0), 10.0);
-        // The master gain steps by 2 dB over -20..+20.
+        // A 2 dB step over -20..+20, as the original's master gain had.
         assert_eq!(quantise(3.0, -20.0, 20.0, 2.0), 4.0);
         assert_eq!(quantise(-3.0, -20.0, 20.0, 2.0), -2.0);
         // Filter width steps by 0.5 over 1..3.

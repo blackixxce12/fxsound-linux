@@ -61,8 +61,8 @@ use crate::theme::{FxColor, Palette};
 use crate::widgets::FxComboBox;
 use crate::widgets::icon_button::IconButton;
 use egui::{
-    Align2, Color32, Context, CornerRadius, CursorIcon, Id, Key, Rangef, Rect, Sense, Stroke,
-    StrokeKind, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2,
+    Align2, Color32, Context, CornerRadius, CursorIcon, Id, Key, Rect, Sense, Stroke, StrokeKind,
+    TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use fxsound_core::{
     AppKey, DeEsserMode, DenoiseChannelsOverride, DereverbLevel, DeviceDirection,
@@ -105,6 +105,11 @@ pub const NAV_ICON_CORNER: f32 = BUTTON_SIZE.y / 4.0;
 pub const NAV_ICON_INSET: f32 = 10.0;
 /// The label starts `height + 5` points in (`FxSettingsDialog.cpp:73-75`).
 pub const NAV_LABEL_GAP: f32 = 5.0;
+/// How far short of the rule a tab's caption stops (0.4.0 audit #29).
+pub const NAV_LABEL_CLEARANCE: f32 = 6.0;
+/// The smallest a tab's caption is set in to fit, before it is elided: 0.7 of the normal font,
+/// the least a JUCE label squeezes a line to (`Font::getDefaultMinimumHorizontalScaleFactor`).
+pub const MIN_NAV_FONT: f32 = 12.0;
 
 /// The pane, to the right of the rule.
 ///
@@ -126,7 +131,8 @@ pub fn pane_rect(content: Rect) -> Rect {
 /// `FxSettingsDialog::paint` draws this at *window* x 152 while `SettingsComponent` lays the pane
 /// out at *content* x 153, and the content is offset by `SHADOW_WIDTH`, so the original's line
 /// lands five points to the left of the pane's edge and shows through the tab buttons' labels
-/// (§1.2). Drawn once, at the pane's edge, here.
+/// (§1.2). Drawn once, whole, at the pane's edge, here; the captions stop short of it
+/// ([`nav_label_rect`]).
 #[must_use]
 pub fn divider_x(content: Rect) -> f32 {
     pane_rect(content).left() - 1.0
@@ -146,58 +152,58 @@ pub fn nav_button_rect(content: Rect, index: usize) -> Rect {
     )
 }
 
-/// Where a tab button's caption goes: `(height + 5, 0, width - height + 5, height)` — note the
-/// label is allowed five points more than is left, so it may run one glyph past the button's right
-/// edge (`FxSettingsDialog.cpp:73-75`).
+/// Where a tab button's caption goes: from `height + 5` points in, as the original's
+/// (`FxSettingsDialog.cpp:73-75`), to [`NAV_LABEL_CLEARANCE`] short of the rule — 81 points.
 ///
-/// A caption cannot use all of it, though: the Audio and Applications panes' lists start at
-/// content x 173, seven points short of the box's end, and are painted over the nav rows, so the
-/// translations are held to about 104 points, which the tests check in every language.
+/// The original's box is `width - height + 5` wide, 115 points, and runs past the rule at 87: its
+/// three English captions stop short of it, but a translation did not (Bosnian `Opšte Opcije` for
+/// General, about 103 points), nor do the port's `Microphone` and `Applications` in English (about
+/// 93 and 98), and the rule ran through them — 0.3.0 broke the rule around them instead, which
+/// hid the collision and left the text over the pane's edge (0.4.0 audit #29). A caption now fits
+/// this box: [`nav_caption_font`] sets one too long for it in a smaller size.
 #[must_use]
 pub fn nav_label_rect(button: Rect) -> Rect {
-    Rect::from_min_size(
-        pos2(
-            button.left() + button.height() + NAV_LABEL_GAP,
-            button.top(),
-        ),
-        vec2(
-            button.width() - button.height() + NAV_LABEL_GAP,
-            button.height(),
-        ),
+    let left = button.left() + button.height() + NAV_LABEL_GAP;
+    // The button's own left is `BUTTON_X` into the content, and the rule `SEPARATOR_X`.
+    let rule = button.left() - BUTTON_X + SEPARATOR_X;
+    Rect::from_min_max(
+        pos2(left, button.top()),
+        pos2(rule - NAV_LABEL_CLEARANCE, button.bottom()),
     )
 }
 
-/// The pieces of the vertical rule that are drawn: the content's height, less `gaps`.
+/// The font a tab's caption is set in: the normal font where the caption fits [`nav_label_rect`],
+/// and otherwise the largest size down to [`MIN_NAV_FONT`] that does, in half points. A caption
+/// too long even for that is elided at the smallest size by [`draw_truncated`].
 ///
-/// The buttons are wider than the space left of the rule — 150 points from x 20 run to 170, and
-/// the rule is at 152 — so a caption longer than about 87 points crosses it. The original draws
-/// the rule through such a caption (§1.2); here the rule stops for it instead, the way a group
-/// box's frame stops for its title. The original's three English captions never reach it, but a
-/// translation of one already did (Bosnian `Opšte Opcije` for General, about 103 points), and
-/// the port's `Microphone` and `Applications` do in English (about 93 and 98): a shorter word
-/// would lose what the tab holds and the name §8 and the per-application design give it, and
-/// running the rule through new text would be a new control overlapping an old one, so the break
-/// is the smaller departure.
+/// A smaller size rather than an ellipsis: `Applicati…` would not say which pane the button opens,
+/// and JUCE's own labels squeeze a line that does not fit rather than cut it. egui cannot squeeze
+/// a glyph sideways, so the whole caption is set smaller; the other captions keep the normal font.
 #[must_use]
-pub fn divider_segments(span: Rangef, gaps: &[Rangef]) -> Vec<Rangef> {
-    let mut gaps: Vec<Rangef> = gaps
-        .iter()
-        .map(|gap| gap.intersection(span))
-        .filter(|gap| gap.span() > 0.0)
-        .collect();
-    gaps.sort_by(|a, b| a.min.total_cmp(&b.min));
-    let mut segments = Vec::new();
-    let mut from = span.min;
-    for gap in gaps {
-        if gap.min > from {
-            segments.push(Rangef::new(from, gap.min));
-        }
-        from = from.max(gap.max);
+pub fn nav_caption_font(ctx: &Context, text: &str, room: f32) -> egui::FontId {
+    let width = |size: f32| {
+        ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    text.to_owned(),
+                    crate::theme::semibold(size),
+                    Color32::PLACEHOLDER,
+                )
+                .size()
+                .x
+        })
+    };
+    let normal = width(super::NORMAL_FONT);
+    if normal <= room || normal <= 0.0 {
+        return normal_font();
     }
-    if from < span.max {
-        segments.push(Rangef::new(from, span.max));
+    // Width follows the size closely; start from the proportion and step down to be sure.
+    let mut size = ((super::NORMAL_FONT * room / normal) * 2.0).floor() / 2.0;
+    size = size.clamp(MIN_NAV_FONT, super::NORMAL_FONT);
+    while size > MIN_NAV_FONT && width(size) > room {
+        size = (size - 0.5).max(MIN_NAV_FONT);
     }
-    segments
+    crate::theme::semibold(size)
 }
 
 /// A pane's title: `(20, 5, paneWidth - 20, 24)` (`FxSettingsDialog.cpp:168-172`).
@@ -897,32 +903,12 @@ impl<'a> SettingsDialog<'a> {
             SettingsAction::Close,
         );
 
-        // §1.2's rule, drawn once and at the pane's edge, and broken where a caption crosses it.
-        let rule = divider_x(content);
-        let gaps: Vec<Rangef> = SettingsTab::ALL
-            .into_iter()
-            .filter_map(|tab| {
-                let label = nav_label_rect(nav_button_rect(content, tab.index()));
-                let size = ui
-                    .painter()
-                    .layout_no_wrap(tr(tab.nav_label()), normal_font(), Color32::PLACEHOLDER)
-                    .size();
-                (label.left() + size.x.min(label.width()) > rule).then(|| {
-                    Rangef::new(
-                        label.center().y - size.y / 2.0,
-                        label.center().y + size.y / 2.0,
-                    )
-                    .expand(1.0)
-                })
-            })
-            .collect();
-        for segment in divider_segments(content.y_range(), &gaps) {
-            ui.painter().vline(
-                rule,
-                segment,
-                Stroke::new(1.0, palette.color(FxColor::Outline)),
-            );
-        }
+        // §1.2's rule, drawn once, whole, at the pane's edge; the captions stop short of it.
+        ui.painter().vline(
+            divider_x(content),
+            content.y_range(),
+            Stroke::new(1.0, palette.divider()),
+        );
 
         for tab in SettingsTab::ALL {
             let rect = nav_button_rect(content, tab.index());
@@ -1000,10 +986,12 @@ fn nav_button(
         palette.color(FxColor::DefaultText)
     };
     let label = nav_label_rect(rect);
+    let caption = tr(tab.nav_label());
+    let font = nav_caption_font(ui.ctx(), &caption, label.width());
     draw_truncated(
         ui.painter(),
-        &tr(tab.nav_label()),
-        normal_font(),
+        &caption,
+        font,
         colour,
         label,
         Align2::LEFT_CENTER,
@@ -4127,87 +4115,127 @@ mod tests {
         assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 
-    #[test]
-    fn the_rule_is_whole_where_nothing_crosses_it_and_stops_where_a_caption_does() {
-        let span = Rangef::new(0.0, 100.0);
-        assert_eq!(divider_segments(span, &[]), vec![span]);
-        assert_eq!(
-            divider_segments(span, &[Rangef::new(40.0, 60.0)]),
-            vec![Rangef::new(0.0, 40.0), Rangef::new(60.0, 100.0)]
-        );
-        // Overlapping, unordered and out-of-range gaps are all taken as they fall.
-        assert_eq!(
-            divider_segments(
-                span,
-                &[
-                    Rangef::new(70.0, 80.0),
-                    Rangef::new(-10.0, 5.0),
-                    Rangef::new(75.0, 90.0),
-                    Rangef::new(200.0, 300.0),
-                ]
-            ),
-            vec![Rangef::new(5.0, 70.0), Rangef::new(90.0, 100.0)]
-        );
-        assert!(divider_segments(span, &[Rangef::new(-1.0, 101.0)]).is_empty());
-    }
-
-    #[test]
-    fn a_translation_of_the_originals_own_captions_reaches_the_rule_too() {
-        // So the break in the rule is not the microphone's alone: 0.3.0 drew it through one of
-        // these.
-        let ctx = test_context();
-        let content = content();
-        let label = nav_label_rect(nav_button_rect(content, 0));
-        let room = divider_x(content) - label.left();
-        frame(&ctx, |ui| {
-            let crossing: Vec<String> =
-                [SettingsTab::Audio, SettingsTab::General, SettingsTab::Help]
-                    .into_iter()
-                    .flat_map(|tab| every_translation(tab.nav_label()))
-                    .filter(|(_, text)| {
-                        ui.painter()
-                            .layout_no_wrap(text.clone(), normal_font(), Color32::PLACEHOLDER)
-                            .size()
-                            .x
-                            > room
-                    })
-                    .map(|(code, text)| format!("{code}: {text}"))
-                    .collect();
-            assert!(!crossing.is_empty());
-            assert!(
-                crossing.iter().all(|c| !c.starts_with("en:")),
-                "{crossing:?}"
-            );
-        });
-    }
-
-    #[test]
-    fn only_the_ports_two_captions_reach_the_rule_in_english() {
-        // Which is why the rule has to make room for them: the original's three stop short.
-        let ctx = test_context();
-        let content = content();
-        frame(&ctx, |ui| {
-            for tab in SettingsTab::ALL {
-                let label = nav_label_rect(nav_button_rect(content, tab.index()));
+    /// Every translation of every tab's caption, with the font [`nav_caption_font`] sets it in and
+    /// the width it comes to.
+    fn fitted_captions(ui: &Ui, room: f32) -> Vec<(SettingsTab, String, f32, f32)> {
+        let mut all = Vec::new();
+        for tab in SettingsTab::ALL {
+            for (code, text) in every_translation(tab.nav_label()) {
+                let font = nav_caption_font(ui.ctx(), &text, room);
                 let width = ui
                     .painter()
-                    .layout_no_wrap(
-                        tab.nav_label().to_owned(),
-                        normal_font(),
-                        Color32::PLACEHOLDER,
-                    )
+                    .layout_no_wrap(text.clone(), font.clone(), Color32::PLACEHOLDER)
                     .size()
                     .x;
-                let crosses = label.left() + width > divider_x(content);
-                assert_eq!(
-                    crosses,
-                    matches!(tab, SettingsTab::Microphone | SettingsTab::Applications),
-                    "{tab:?} is {width}"
-                );
-                // …and every caption still fits the label box the original allows it.
-                assert!(width <= label.width(), "{tab:?} is elided");
+                all.push((tab, format!("{code}: {text}"), font.size, width));
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn a_tabs_caption_box_ends_six_points_short_of_the_rule() {
+        // 0.4.0 audit #29: the original's box ran 28 points past the rule.
+        let content = content();
+        for tab in SettingsTab::ALL {
+            let label = nav_label_rect(nav_button_rect(content, tab.index()));
+            assert!(
+                (divider_x(content) - label.right() - NAV_LABEL_CLEARANCE).abs() < 1e-4,
+                "{tab:?}: {label:?}"
+            );
+            assert!((label.width() - 81.0).abs() < 1e-4, "{label:?}");
+            let button = nav_button_rect(content, tab.index());
+            assert!((label.left() - (button.left() + 45.0)).abs() < 1e-4);
+            assert_eq!(label.y_range(), button.y_range());
+        }
+    }
+
+    #[test]
+    fn every_languages_tab_captions_fit_whole_short_of_the_rule() {
+        // Set smaller where they must, but never elided: every caption of the thirty languages
+        // fits at or above the smallest size.
+        let ctx = test_context();
+        let content = content();
+        let room = nav_label_rect(nav_button_rect(content, 0)).width();
+        frame(&ctx, |ui| {
+            let problems: Vec<String> = fitted_captions(ui, room)
+                .into_iter()
+                .filter(|(_, _, size, width)| *width > room || *size < MIN_NAV_FONT)
+                .map(|(tab, text, size, width)| format!("{tab:?} {text}: {width:.1} at {size}"))
+                .collect();
+            assert!(problems.is_empty(), "{}", problems.join("\n"));
+        });
+    }
+
+    #[test]
+    fn a_caption_that_fits_keeps_the_normal_font_and_only_a_long_one_is_set_smaller() {
+        // In English the original's three captions keep getNormalFont(); the port's Microphone
+        // and Applications, about 93 and 98 points in it, come down to fit 81.
+        let ctx = test_context();
+        let content = content();
+        let room = nav_label_rect(nav_button_rect(content, 0)).width();
+        frame(&ctx, |ui| {
+            for (tab, text, size, width) in fitted_captions(ui, room) {
+                if !text.starts_with("en: ") {
+                    continue;
+                }
+                let long = matches!(tab, SettingsTab::Microphone | SettingsTab::Applications);
+                assert_eq!(size < super::super::NORMAL_FONT, long, "{text} at {size}");
+                if long {
+                    // As large as fits, to the half point.
+                    assert!(width > room - 5.0, "{text}: {width} in {room}");
+                }
             }
         });
+    }
+
+    #[test]
+    fn a_caption_too_long_even_at_the_smallest_size_is_elided_there() {
+        let ctx = test_context();
+        frame(&ctx, |ui| {
+            let text = "Einstellungen für Anwendungen und Geräte";
+            let font = nav_caption_font(ui.ctx(), text, 81.0);
+            assert_eq!(font.size, MIN_NAV_FONT);
+            let painter = ui.painter();
+            let label = Rect::from_min_size(pos2(0.0, 0.0), vec2(81.0, 40.0));
+            let placed = draw_truncated(
+                painter,
+                text,
+                font,
+                Color32::WHITE,
+                label,
+                Align2::LEFT_CENTER,
+            );
+            assert!(placed.width() <= 81.0 + 0.01, "{placed:?}");
+        });
+    }
+
+    #[test]
+    fn the_rule_is_one_whole_line_down_the_content_in_the_divider_colour() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let palette = Palette::new(mode);
+            let mut window = Window::new(mode);
+            let (_, shapes) = window.frame(&SettingsState::default(), Vec::new());
+            let content = content();
+            let rule = divider_x(content);
+            let lines: Vec<(egui::Pos2, egui::Pos2)> = shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::LineSegment { points, stroke }
+                        if (points[0].x - rule).abs() < 1e-3
+                            && (points[1].x - rule).abs() < 1e-3
+                            && stroke.color == palette.divider() =>
+                    {
+                        Some((points[0], points[1]))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(lines.len(), 1, "{mode:?}: {lines:?}");
+            let (top, bottom) = lines[0];
+            assert!((top.y - content.top()).abs() < 1e-3, "{top:?}");
+            assert!((bottom.y - content.bottom()).abs() < 1e-3, "{bottom:?}");
+        }
     }
 
     // ---- the applications pane ----------------------------------------------------------------
@@ -5022,29 +5050,23 @@ mod tests {
     }
 
     #[test]
-    fn every_languages_tab_captions_stop_short_of_the_lists_painted_over_the_nav_rows() {
+    fn a_tabs_caption_box_ends_short_of_the_lists_painted_over_the_nav_rows() {
         // The Applications list runs down past the last tab row and the Audio pane's covers all
         // but the first, both from x 173 and both painted after the nav, so a caption that
-        // reached one would lose its last glyphs under it with no ellipsis: a caption may not use
-        // all of the label box's 115 points (`nav_label_rect`). German `Anwendungen`, about 114,
-        // did.
+        // reached one would lose its last glyphs under it with no ellipsis — German
+        // `Anwendungen`, about 114 points, did in the original's 115-point box. The box now ends
+        // at the rule, well short of either, and every caption fits it
+        // (`every_languages_tab_captions_fit_whole_short_of_the_rule`).
         const CLEARANCE: f32 = 4.0;
-        let ctx = test_context();
         let content = content();
         let pane = pane_rect(content);
         let edge = app_list_rect(pane)
             .left()
             .min(output_list_rect(pane).left());
-        let mut problems = Vec::new();
-        frame(&ctx, |ui| {
-            for tab in SettingsTab::ALL {
-                let label = nav_label_rect(nav_button_rect(content, tab.index()));
-                let room = edge - label.left() - CLEARANCE;
-                assert!(room < label.width(), "{room} in {}", label.width());
-                problems.extend(wider_than(ui, tab.nav_label(), &normal_font(), room));
-            }
-        });
-        assert!(problems.is_empty(), "{}", problems.join("\n"));
+        for tab in SettingsTab::ALL {
+            let label = nav_label_rect(nav_button_rect(content, tab.index()));
+            assert!(label.right() + CLEARANCE <= edge, "{tab:?}: {label:?}");
+        }
     }
 
     #[test]

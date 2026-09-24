@@ -22,6 +22,9 @@
 //! `FxView::modelChanged` builds the preset items as `preset.modified ? name + " *" : name`
 //! (`FxView.cpp:205-225`, `docs/spec/03-controls.md` §8.4), so the marker is part of the *label*,
 //! not of the widget. [`preset_label`] is that one line, kept here so the marker is written once.
+//! The original elides a label too long for its box from the end, so the marker went first and a
+//! long preset name lost the one sign of its unsaved changes (0.4.0 audit #26); the preset list
+//! passes [`FxComboBox::keep_suffix`], and a label is cut in its name instead.
 //! Item ids in the original are `index + 1` because JUCE reserves id 0 for "nothing selected";
 //! [`FxComboBox::new`] takes an `Option<usize>` index instead, which is the same information
 //! without the off-by-one.
@@ -337,6 +340,7 @@ pub struct FxComboBox<'a> {
     headers: &'a [SectionHeader<'a>],
     row_height: Option<f32>,
     accent: bool,
+    keep: &'a str,
 }
 
 impl<'a> FxComboBox<'a> {
@@ -357,7 +361,17 @@ impl<'a> FxComboBox<'a> {
             headers: &[],
             row_height: None,
             accent: false,
+            keep: "",
         }
+    }
+
+    /// A suffix that is never elided **(port addition)**: an item ending in it that does not fit is
+    /// cut before it, `Evening Headphones M… *`, not after. The preset list passes
+    /// [`MODIFIED_SUFFIX`] (0.4.0 audit #26).
+    #[must_use]
+    pub fn keep_suffix(mut self, suffix: &'a str) -> Self {
+        self.keep = suffix;
+        self
     }
 
     /// Outline the box as the one the window is editing **(port addition)**.
@@ -459,6 +473,7 @@ impl<'a> FxComboBox<'a> {
             headers,
             row_height,
             accent,
+            keep,
         } = self;
 
         let id = Id::new("fx_combo_box").with(id_salt);
@@ -482,6 +497,7 @@ impl<'a> FxComboBox<'a> {
                 selected,
                 placeholder,
                 current,
+                keep,
             },
             enabled,
             error,
@@ -502,7 +518,7 @@ impl<'a> FxComboBox<'a> {
             selected,
             separator_before,
             headers,
-            row_h,
+            (row_h, keep),
             &response,
         );
         (response, picked)
@@ -516,6 +532,8 @@ struct BoxText<'a> {
     selected: Option<usize>,
     placeholder: &'a str,
     current: Option<&'a str>,
+    /// [`FxComboBox::keep_suffix`].
+    keep: &'a str,
 }
 
 /// Everything `FxTheme::drawComboBox` puts on screen, in its order (`FxTheme.cpp:135-164`).
@@ -536,6 +554,7 @@ fn paint_box(
         selected,
         placeholder,
         current,
+        keep,
     } = text;
     let painter = ui.painter().clone();
     let corner = CornerRadius::same(corner_radius(rect.height()) as u8);
@@ -575,7 +594,7 @@ fn paint_box(
         let box_ = text_box(rect);
         draw_truncated(
             &painter,
-            label,
+            (label, keep),
             font,
             colour,
             left,
@@ -614,7 +633,7 @@ fn popup(
     selected: Option<usize>,
     separator_before: Option<usize>,
     headers: &[SectionHeader<'_>],
-    row_height: f32,
+    (row_height, keep): (f32, &str),
     response: &Response,
 ) -> Option<usize> {
     let popup_id = egui::Popup::default_response_id(response);
@@ -682,7 +701,8 @@ fn popup(
                             header(ui, palette, section.label, &header_font, width, row_height);
                         }
                         let ticked = selected == Some(index);
-                        if row(ui, palette, item, &font, width, row_height, ticked) {
+                        let text = (item.as_str(), keep);
+                        if row(ui, palette, text, &font, width, row_height, ticked) {
                             picked = Some(index);
                             ui.close();
                         }
@@ -696,7 +716,7 @@ fn popup(
 fn row(
     ui: &mut Ui,
     palette: Palette,
-    text: &str,
+    text: (&str, &str),
     font: &FontId,
     width: f32,
     height: f32,
@@ -775,7 +795,7 @@ fn header(ui: &mut Ui, palette: Palette, text: &str, font: &FontId, width: f32, 
         ui.allocate_exact_size(vec2(width, popup_header_height(row_height)), Sense::hover());
     draw_truncated(
         ui.painter(),
-        text,
+        (text, ""),
         font.clone(),
         palette.color_alpha(FxColor::MenuText, HEADER_TEXT_ALPHA),
         rect.left() + popup_text_x(row_height),
@@ -784,24 +804,42 @@ fn header(ui: &mut Ui, palette: Palette, text: &str, font: &FontId, width: f32, 
     );
 }
 
-/// Draw one line of text, elided with `…` rather than condensed.
+/// Draw one line of text, elided with `…` rather than condensed, and never in `keep` when the
+/// text ends in it ([`FxComboBox::keep_suffix`]): the part before it is elided instead.
 ///
 /// `label.setMinimumHorizontalScale(1.0)` (`FxTheme.cpp:130`) is what rules out JUCE's default
 /// squeeze-to-fit; `drawFittedText` then drops the overflow. egui's `TextWrapping::truncate_at_width`
 /// is the same contract with a nicer ellipsis.
 fn draw_truncated(
     painter: &egui::Painter,
-    text: &str,
+    (text, keep): (&str, &str),
     font: FontId,
     colour: Color32,
     left: f32,
     right: f32,
     center_y: f32,
 ) {
-    let mut job =
-        LayoutJob::single_section(text.to_owned(), egui::TextFormat::simple(font, colour));
-    job.wrap = TextWrapping::truncate_at_width((right - left).max(0.0));
-    let galley = painter.layout_job(job);
+    let room = (right - left).max(0.0);
+    let line = |text: &str, room: f32| {
+        let mut job = LayoutJob::single_section(
+            text.to_owned(),
+            egui::TextFormat::simple(font.clone(), colour),
+        );
+        job.wrap = TextWrapping::truncate_at_width(room);
+        painter.layout_job(job)
+    };
+    let galley = line(text, room);
+    if galley.elided
+        && !keep.is_empty()
+        && let Some(head) = text.strip_suffix(keep)
+    {
+        let tail = painter.layout_no_wrap(keep.to_owned(), font.clone(), colour);
+        let head = line(head, (room - tail.size().x).max(0.0));
+        let x = left + head.size().x;
+        painter.galley(pos2(left, center_y - head.size().y / 2.0), head, colour);
+        painter.galley(pos2(x, center_y - tail.size().y / 2.0), tail, colour);
+        return;
+    }
     let y = center_y - galley.size().y / 2.0;
     painter.galley(pos2(left, y), galley, colour);
 }
@@ -1072,6 +1110,79 @@ mod tests {
                 "accent = {accent}"
             );
         }
+    }
+
+    /// The texts the closed `combo` box paints for `item`, each with where its glyphs end.
+    fn closed_box_texts(item: &str, keep: &str, combo: Rect) -> Vec<(String, Rect, bool)> {
+        let items = [item.to_owned()];
+        let mut assets = AssetCache::new();
+        let ctx = test_context();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            FxComboBox::new(&items, Some(0)).keep_suffix(keep).show(
+                ui,
+                combo,
+                Palette::new(ThemeMode::Dark),
+                &mut assets,
+                "presets",
+            );
+        });
+        let shapes = std::mem::take(&mut output.shapes);
+        output.drop_without_applying_deltas();
+        shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    clipped.shape.visual_bounding_rect(),
+                    text.galley.elided,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_long_modified_name_is_cut_in_the_name_and_keeps_its_star() {
+        // 0.4.0 audit #26: "Evening Headphones Mix *" came out "Evening Headphones M…", and the
+        // one sign of unsaved changes went first.
+        let narrow = Rect::from_min_size(pos2(0.0, 0.0), vec2(225.0, 40.0));
+        let name = "Evening Headphones Mix for the Late Train Home";
+        let label = preset_label(name, true);
+        let painted = closed_box_texts(&label, MODIFIED_SUFFIX, narrow);
+        assert_eq!(painted.len(), 2, "{painted:?}");
+        let (head, head_rect, head_elided) = &painted[0];
+        let (star, star_rect, star_elided) = &painted[1];
+        assert_eq!(head, name);
+        assert!(*head_elided, "the name is cut");
+        assert_eq!(star, MODIFIED_SUFFIX);
+        assert!(!star_elided);
+        // The star follows the cut name and ends inside the text box.
+        assert!(
+            star_rect.left() >= head_rect.right() - 1.0,
+            "{head_rect:?} {star_rect:?}"
+        );
+        assert!(
+            star_rect.right() <= text_box(narrow).right() + 0.5,
+            "{star_rect:?}"
+        );
+    }
+
+    #[test]
+    fn a_label_that_fits_or_has_no_star_is_drawn_as_one_line() {
+        let wide = pro_combo();
+        let painted = closed_box_texts(&preset_label("Rock", true), MODIFIED_SUFFIX, wide);
+        assert_eq!(painted.len(), 1, "{painted:?}");
+        assert_eq!(painted[0].0, "Rock *");
+        assert!(!painted[0].2);
+        // A long name without unsaved changes is cut at its end, as ever.
+        let narrow = Rect::from_min_size(pos2(0.0, 0.0), vec2(225.0, 40.0));
+        let long = "Evening Headphones Mix for the Late Train Home";
+        let painted = closed_box_texts(long, MODIFIED_SUFFIX, narrow);
+        assert_eq!(painted.len(), 1, "{painted:?}");
+        assert!(painted[0].2);
+        // And a box that keeps nothing cuts a starred label at its end too.
+        let painted = closed_box_texts(&preset_label(long, true), "", narrow);
+        assert_eq!(painted.len(), 1, "{painted:?}");
     }
 
     #[test]

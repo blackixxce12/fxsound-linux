@@ -15,6 +15,7 @@
 //! cargo run -p fxsound-ui --example preview -- --apps --light
 //! cargo run -p fxsound-ui --example preview -- --stored
 //! cargo run -p fxsound-ui --example preview -- --lang=de --message
+//! cargo run -p fxsound-ui --example preview -- --settings=general --light
 //! ```
 //!
 //! Flags: `--light`, `--input` (edit the microphone lane), `--lite`, `--notice[=TEXT]`,
@@ -22,7 +23,8 @@
 //! equalizer's controls), `--eq-off` (the equalizer switched off), `--power-off`, `--stored` (the
 //! effects as a Windows preset stores them, between the sliders' positions), `--lang=CODE`
 //! (one of the translation tables' codes; English otherwise), `--apps[=empty]` (Settings ▸
-//! Applications over a made-up list of applications, or none), `--message[=TEXT]` (the Yes/No
+//! Applications over a made-up list of applications, or none), `--settings=TAB` (Settings on
+//! `audio`, `general`, `help`, `microphone` or `applications`), `--message[=TEXT]` (the Yes/No
 //! message box over the window: `TEXT` is translated, and its `%s` is a long preset name; the
 //! export's overwrite question otherwise), `--exit-after-paint`. Keys while it
 //! runs: `I` switches the edit direction, `N` puts a notice up, `L` flips Pro/Lite, `T` flips the
@@ -96,6 +98,17 @@ fn main() -> eframe::Result<()> {
     }
     if let Some(which) = args.iter().find_map(|a| a.strip_prefix("--apps")) {
         preview.settings = Some(demo_settings(which == "=empty"));
+    }
+    if let Some(which) = args.iter().find_map(|a| a.strip_prefix("--settings=")) {
+        let mut settings = demo_settings(false);
+        settings.tab = match which {
+            "general" => SettingsTab::General,
+            "help" => SettingsTab::Help,
+            "microphone" => SettingsTab::Microphone,
+            "applications" => SettingsTab::Applications,
+            _ => SettingsTab::Audio,
+        };
+        preview.settings = Some(settings);
     }
     preview.message = args.iter().find_map(|a| {
         a.strip_prefix("--message").map(|rest| {

@@ -46,6 +46,7 @@ use crate::widgets::PowerButton;
 use crate::widgets::icon_button::{self, IconButton};
 use egui::{CornerRadius, CursorIcon, Id, Painter, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2};
 use fxsound_core::ViewMode;
+use fxsound_core::i18n::tr;
 
 /// `FxWindow::CLOSE_BUTTON_WIDTH` (`FxWindow.h:45`) — the ✕ is a 15 point square.
 pub const CLOSE_SIZE: f32 = 15.0;
@@ -219,8 +220,8 @@ pub fn show(
         palette,
         assets,
         at(origin, chrome.menu.rect()),
-        FxImage::MenuButton,
-        FxImage::MenuButtonHover,
+        (FxImage::MenuButton, FxImage::MenuButtonHover),
+        &TitleButton::Menu.tip(state),
         "menu",
     )
     .clicked()
@@ -228,7 +229,9 @@ pub fn show(
         response.push(UiAction::OpenMenu);
     }
 
+    let power_tip = TitleButton::Power.tip(state);
     if PowerButton::new(state.power)
+        .tooltip(&power_tip)
         .hide_tooltips(state.hide_tooltips)
         .show(
             ui,
@@ -242,15 +245,14 @@ pub fn show(
         response.push(UiAction::TogglePower);
     }
 
-    let (flip_normal, flip_hover) = flip_images(state.view);
     if icon(
         ui,
         state,
         palette,
         assets,
         at(origin, chrome.flip.rect()),
-        flip_normal,
-        flip_hover,
+        flip_images(state.view),
+        &TitleButton::View.tip(state),
         "flip",
     )
     .clicked()
@@ -264,8 +266,11 @@ pub fn show(
         palette,
         assets,
         at(origin, chrome.minimize.rect()),
-        FxImage::MinimizeWindowButton,
-        FxImage::MinimizeWindowButtonHover,
+        (
+            FxImage::MinimizeWindowButton,
+            FxImage::MinimizeWindowButtonHover,
+        ),
+        &TitleButton::Minimize.tip(state),
         "minimize",
     )
     .clicked()
@@ -273,7 +278,16 @@ pub fn show(
         response.push(UiAction::Minimise);
     }
 
-    if close(ui, palette, at(origin, chrome.close.rect())).clicked() {
+    let close_tip = TitleButton::Close.tip(state);
+    if close(
+        ui,
+        state,
+        palette,
+        at(origin, chrome.close.rect()),
+        &close_tip,
+    )
+    .clicked()
+    {
         response.push(UiAction::Close);
     }
 
@@ -352,12 +366,56 @@ fn paint_logo(
     }
 }
 
-/// One `DrawableButton` from the bar.
-///
-/// No button in this bar carries a tooltip: the original gives each of them `setHelpText`, which
-/// is accessibility text rather than a hover bubble (`FxMainWindow.cpp:194`, `:200`, `:205`,
-/// `:221`). `hide_tooltips` is still threaded through so the setting reaches the widget the same
-/// way it does everywhere else.
+/// The bar's buttons, for their tooltips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleButton {
+    Menu,
+    Power,
+    /// Pro ⇄ Lite.
+    View,
+    Minimize,
+    Close,
+}
+
+impl TitleButton {
+    /// Every button, left to right in the Pro bar.
+    pub const ALL: [Self; 5] = [
+        Self::Menu,
+        Self::Power,
+        Self::View,
+        Self::Minimize,
+        Self::Close,
+    ];
+
+    /// What the button's tooltip says, translated: what a click will do **(port addition)**.
+    ///
+    /// The original gives each of them `setHelpText` — "Power Button", "Menu Button", "Resize
+    /// Button", "Minimize Button" — which is accessibility text and never a hover bubble
+    /// (`FxMainWindow.cpp:193-221`), so five small glyphs, two of which change what they mean
+    /// with the state, went unexplained (0.4.0 audit #27). The power button's two are the tray
+    /// menu's own, translated in every table. "Hide help tips" hides these as it hides the rest.
+    #[must_use]
+    pub fn tip(self, state: &UiState) -> String {
+        tr(match self {
+            Self::Menu => "Menu",
+            Self::Power => {
+                if state.power {
+                    "Turn Off"
+                } else {
+                    "Turn On"
+                }
+            }
+            Self::View => match state.view {
+                ViewMode::Pro => "Switch to Lite view",
+                ViewMode::Lite => "Switch to Pro view",
+            },
+            Self::Minimize => "Minimize",
+            Self::Close => "Close",
+        })
+    }
+}
+
+/// One `DrawableButton` from the bar, its `(normal, hover)` artwork and its tooltip.
 #[allow(clippy::too_many_arguments)]
 fn icon(
     ui: &mut Ui,
@@ -365,25 +423,30 @@ fn icon(
     palette: Palette,
     assets: &mut AssetCache,
     rect: Rect,
-    normal: FxImage,
-    hover: FxImage,
+    (normal, hover): (FxImage, FxImage),
+    tip: &str,
     id_salt: &'static str,
 ) -> Response {
     IconButton::new(normal)
         .hover(hover)
+        .tooltip(tip)
         .hide_tooltips(state.hide_tooltips)
         .show(ui, rect, palette, assets, id_salt)
 }
 
-/// The hand-drawn ✕, with the enlarged hit area `docs/spec/01-window-layout.md` §4.2 invites.
-fn close(ui: &mut Ui, palette: Palette, rect: Rect) -> Response {
-    let response = ui
+/// The hand-drawn ✕, with the enlarged hit area `docs/spec/01-window-layout.md` §4.2 invites,
+/// and its tooltip in the one the image buttons use.
+fn close(ui: &mut Ui, state: &UiState, palette: Palette, rect: Rect, tip: &str) -> Response {
+    let mut response = ui
         .interact(
             icon_button::hit_rect(rect, icon_button::MIN_HIT_SIZE),
             Id::new("fx_close_button"),
             Sense::click(),
         )
         .on_hover_cursor(CursorIcon::PointingHand);
+    if !state.hide_tooltips {
+        response = response.on_hover_text(icon_button::tooltip_text(tip, palette));
+    }
     paint_close_glyph(ui.painter(), rect, palette);
     response
 }
@@ -708,5 +771,69 @@ mod tests {
             "a press on the hamburger leaked into the drag region: {actions:?}"
         );
         assert_eq!(actions, vec![UiAction::OpenMenu]);
+    }
+
+    /// Every line painted after resting on `button` in `state`'s view.
+    fn resting_on(state: &UiState, button: TitleButton) -> Vec<String> {
+        let chrome = chrome(state.view);
+        let rect = match button {
+            TitleButton::Menu => chrome.menu.rect(),
+            TitleButton::Power => chrome.power.rect(),
+            TitleButton::View => chrome.flip.rect(),
+            TitleButton::Minimize => chrome.minimize.rect(),
+            TitleButton::Close => chrome.close.rect(),
+        };
+        let mut harness = crate::views::testing::Harness::new(fxsound_core::ThemeMode::Dark);
+        harness.rest(state, rect.center())
+    }
+
+    #[test]
+    fn every_title_bar_button_says_on_hover_what_a_click_does() {
+        // 0.4.0 audit #27: the original's `setHelpText` never shows.
+        for (view, flip) in [
+            (ViewMode::Pro, "Switch to Lite view"),
+            (ViewMode::Lite, "Switch to Pro view"),
+        ] {
+            let state = state(view);
+            for (button, tip) in [
+                (TitleButton::Menu, "Menu"),
+                (TitleButton::Power, "Turn Off"),
+                (TitleButton::View, flip),
+                (TitleButton::Minimize, "Minimize"),
+                (TitleButton::Close, "Close"),
+            ] {
+                assert_eq!(button.tip(&state), tip);
+                let shown = resting_on(&state, button);
+                assert!(
+                    shown.iter().any(|text| text == tip),
+                    "{view:?} {button:?}: {shown:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_power_buttons_tip_says_what_the_click_will_do_either_way() {
+        let off = UiState {
+            power: false,
+            ..state(ViewMode::Pro)
+        };
+        assert_eq!(TitleButton::Power.tip(&off), "Turn On");
+        assert!(resting_on(&off, TitleButton::Power).contains(&"Turn On".to_owned()));
+    }
+
+    #[test]
+    fn hide_help_tips_hides_the_title_bars_tips_too() {
+        let state = UiState {
+            hide_tooltips: true,
+            ..state(ViewMode::Pro)
+        };
+        for button in TitleButton::ALL {
+            let tip = button.tip(&state);
+            assert!(
+                !resting_on(&state, button).contains(&tip),
+                "{button:?} still says {tip:?}"
+            );
+        }
     }
 }

@@ -469,7 +469,8 @@ to these controls.
 
 Quirk worth noting: the Master Gain slider's step is **2** while the controller rounds to the
 nearest integer, so only even dB values are ever reachable from the slider; the odd values exist
-only if a preset or the settings file supplies them.
+only if a preset or the settings file supplies them. **Port (0.4.0 audit #22):** the master gain and
+the balance step by 1 dB.
 
 Each slider's `onValueChange` writes through only when the value actually differs from the
 controller's current value (`FxAudioControls.cpp:315-321`, `:333-339`, `:351-357`). The balance
@@ -1319,7 +1320,8 @@ write is cheap enough to do on every drag frame (the original writes on every `v
    label, which does (`FxAudioControls.cpp:190`). In the original, clicking directly on the
    `"0 dB"` text does not move the Master Gain slider. This is a bug; do not reproduce it.
 10. **The Master Gain step (2) versus the controller's integer rounding** means half the nominal
-    range is unreachable from the UI. Confirm whether the intent was `step = 1`.
+    range is unreachable from the UI. Confirm whether the intent was `step = 1`. *Resolved in
+    0.4.0 (audit #22): the port steps the master gain and the balance by 1.*
 11. **`showValues(false)` is dead** (§4.5) but the plumbing survives. Decide whether to keep a
     compact mode or delete the flag.
 12. **`FxPresetNameEditor` is dead code** duplicated inline in `FxMainWindow.cpp` (§11.1). Build one
@@ -1330,7 +1332,8 @@ write is cheap enough to do on every drag frame (the original writes on every `v
     Do not try to reverse-engineer meaning from them.
 14. **Right-click-to-reset is undiscoverable and undocumented in the UI** (no tooltip mentions it,
     §3.5). Consider adding a visible affordance (a small reset glyph on hover) in the Linux port,
-    or at least mention it in the tooltip text.
+    or at least mention it in the tooltip text. *Resolved in 0.4.0 (audit R9): every slider's
+    tooltip names the right-click reset, and the effect sliders now reset to 0.*
 15. **Theme switching re-creates every `Drawable` from SVG** (`FxPowerButton.cpp:62-67`,
     `FxTheme.cpp:99-102`) and `FxBalanceSlider` re-parses its thumb on *every value change*
     (`FxBalanceSlider.cpp:154-155`). Cache aggressively in Rust; a naive `resvg` call per frame

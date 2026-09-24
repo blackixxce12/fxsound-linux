@@ -879,6 +879,7 @@ const SPELLED_AS_IN_ENGLISH: &[&str] = &[
     "Help",
     "Import",
     "Independent",
+    "Menu",
     "Microphone",
     "Mono",
     "No",

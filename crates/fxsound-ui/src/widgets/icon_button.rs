@@ -50,7 +50,8 @@ pub const JUCE_HEIGHT_PER_EM: f32 = 1.2;
 /// The whole texture, for [`egui::Painter::image`].
 const UV_FULL: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
 
-/// Natural size of every image, in `FxImage` order, read from each file's `viewBox`.
+/// Natural size of every image, in `FxImage` order, read from each file's `viewBox` — or, for an
+/// image fitted by what it draws ([`crate::assets::fitted_by_ink`]), from that.
 ///
 /// [`AssetCache::texture`] rasterises into whatever size it is handed *without* preserving the
 /// aspect ratio, so anything that wants JUCE's `RectanglePlacement::centred` behaviour has to know
@@ -87,7 +88,7 @@ pub const ART_SIZES: [Vec2; NUM_IMAGES] = [
     vec2(6.0, 5.0),       // ArrowDown
     vec2(11.0, 7.0),      // DropDownArrow — dropdown_arrow_bw.svg
     vec2(11.0, 7.0),      // DropDownArrowHover
-    vec2(64.0, 64.0),     // SliderThumb — a 16 × 16 glyph in a 64 × 64 viewBox
+    vec2(16.0, 16.0),     // SliderThumb — its 16 × 16 ink, not its 64 × 64 viewBox (audit #40)
     vec2(16.0, 16.0),     // SliderThumbBW
 ];
 
@@ -226,10 +227,9 @@ impl<'a> IconButton<'a> {
 
     /// A hover tooltip in the app's own tooltip style (`FxTheme::drawTooltip`).
     ///
-    /// None of the title bar's buttons sets one — the original gives them `setHelpText`, which is
-    /// accessibility text rather than a bubble (`FxMainWindow.cpp:194-221`) — so this is for an
-    /// image button that does want hover text, the way `FxPowerButton` carries its Remote Desktop
-    /// notice while disabled (`FxMainWindow.cpp:413`).
+    /// The original's title-bar buttons carry `setHelpText` only, which is accessibility text
+    /// rather than a bubble (`FxMainWindow.cpp:194-221`); the port gives them, the card's flip
+    /// and Restore Defaults a tooltip each (0.4.0 audit #27).
     #[must_use]
     pub fn tooltip(mut self, text: &'a str) -> Self {
         self.tooltip = Some(text);
@@ -290,14 +290,19 @@ impl<'a> IconButton<'a> {
         if let Some(text) = tooltip
             && !hide_tooltips
         {
-            response = response.on_hover_text(
-                egui::RichText::new(text)
-                    .font(theme::semibold(TOOLTIP_FONT_PX / JUCE_HEIGHT_PER_EM))
-                    .color(palette.color(FxColor::DefaultText)),
-            );
+            response = response.on_hover_text(tooltip_text(text, palette));
         }
         response
     }
+}
+
+/// A tooltip's text in the app's tooltip style (`FxTheme::drawTooltip`): Gilroy Semibold at 14
+/// JUCE pixels, in `DefaultText`.
+#[must_use]
+pub fn tooltip_text(text: &str, palette: Palette) -> egui::RichText {
+    egui::RichText::new(text)
+        .font(theme::semibold(TOOLTIP_FONT_PX / JUCE_HEIGHT_PER_EM))
+        .color(palette.color(FxColor::DefaultText))
 }
 
 #[cfg(test)]
@@ -349,13 +354,15 @@ mod tests {
             for theme in [ThemeMode::Dark, ThemeMode::Light] {
                 let tree = usvg::Tree::from_data(svg_bytes(image, theme), &options)
                     .unwrap_or_else(|e| panic!("{image:?} {theme:?} failed to parse: {e}"));
-                let size = tree.size();
+                let (width, height) = if crate::assets::fitted_by_ink(image) {
+                    let ink = tree.root().abs_stroke_bounding_box();
+                    (ink.width(), ink.height())
+                } else {
+                    (tree.size().width(), tree.size().height())
+                };
                 assert!(
-                    (size.width() - expected.x).abs() < 0.01
-                        && (size.height() - expected.y).abs() < 0.01,
-                    "{image:?} {theme:?} is {} x {}, the table says {expected:?}",
-                    size.width(),
-                    size.height()
+                    (width - expected.x).abs() < 0.01 && (height - expected.y).abs() < 0.01,
+                    "{image:?} {theme:?} is {width} x {height}, the table says {expected:?}"
                 );
             }
         }

@@ -3317,8 +3317,9 @@ mod tests {
 
     #[test]
     fn preset_commands_run_with_the_power_off_where_the_original_ignored_them() {
-        // A deliberate difference (README): the menu greys its preset items out while the power
-        // is off, and the original's command line ignores them, but a script here is answered.
+        // A deliberate difference (README): the original's menu greys its preset items out while
+        // the power is off and its command line ignores them, but a script here is answered, and
+        // the menu offers them too (0.4.0 audit R7).
         let tag = "power-off";
         let mut a = app_with_presets(tag);
         let outcome = run(
@@ -3336,7 +3337,7 @@ mod tests {
             a.lane_preset(DeviceDirection::Output),
             Some(("Mine", false))
         );
-        assert!(!a.preset_menu().delete, "while the menu offers nothing");
+        assert!(a.preset_menu().delete, "and the menu offers the same");
         let _ = std::fs::remove_dir_all(user_dir(tag).parent().expect("the root"));
     }
 

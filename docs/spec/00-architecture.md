@@ -660,13 +660,15 @@ widget fills it.
 
 **Disabled state.** egui's built-in "greyed out" tint is a multiply toward the background; JUCE uses
 `Colour::withSaturation(0.0)`, which is **`grey = max(r,g,b)`**, not a luma grey
-(`docs/spec/02-theme.md:315-333`). `fxsound-ui::theme` must gain:
+(`docs/spec/02-theme.md:315-333`). `fxsound-ui::theme` has:
 
 ```rust
-#[must_use] pub fn desaturate(c: Color32) -> Color32;   // grey = max(r,g,b), alpha preserved
+#[must_use] pub fn greyed(self, c: Color32) -> Color32;   // on Palette; alpha preserved
 ```
 
-and every custom painter calls it instead of relying on `ui.add_enabled_ui`.
+`max(r,g,b)` in the dark palette; in the light one a luma grey no lighter than `#767676`, because
+`max(r,g,b)` turns its light blues white (D-21). Every custom painter calls it instead of relying on
+`ui.add_enabled_ui`.
 
 ---
 
@@ -949,6 +951,12 @@ against upstream does not "restore" them.
 | D-17 | `savePreset("")` can shadow a factory preset into the user dir | `docs/spec/05-controller-model.md:706-708` | Invariant asserted inside the function |
 | D-18 | N=31 EQ columns overlap by 8 px; "last child wins" | `docs/spec/04-equalizer-visualizer.md:1386-1390` | Interactive width clamped to `min(32, col_w)` |
 | D-19 | Alt+drag "solo" collides with the compositor's window-move gesture | `docs/spec/04-equalizer-visualizer.md:1437-1439` | Rebound to Ctrl+Alt+drag, and surfaced with a per-band affordance |
+| D-20 | Master Gain and Balance step by 2 dB while the controller and CLI round to 1 (audit #22) | `docs/spec/03-controls.md` §5.2 | Step 1 dB |
+| D-21 | Light theme: `withSaturation(0)` turns the power-off spectrum and a bypassed EQ white on `#e0e0e0` (audit #24) | `FxVisualizer.cpp:177-199` | `Palette::greyed`: luma, no lighter than `#767676`, in the light theme |
+| D-22 | Light `Outline` `#fafafa` is invisible as the Settings rule and the menu's edge (audit #25) | `FxTheme.cpp:26` | `Palette::divider`: `#c0c0c0` in the light theme |
+| D-23 | The lit slider thumb fitted by its 64×64 viewBox, a quarter of its size (audit #40) | `docs/spec/02-theme.md` §4.4 | Rasterised by its ink, 16×16 |
+| D-24 | Effect values and EQ band gains hidden with the power off (audit #42) | `FxAudioControls.cpp:208-211` | Shown at half alpha |
+| D-25 | Preset list, menu preset items and tray preset menu dead with the power off, while the CLI works (audit R7) | `FxProView.cpp:117-121`, `FxSystemTrayView.cpp:313-316` | Live with the power off |
 
 Behaviours ported **verbatim** because they are the product's fingerprint: the 100 ms tick and the
 5-tick (500 ms) processing debounce; the 60 s autosave (missing until 0.4.0, audit #47; now a

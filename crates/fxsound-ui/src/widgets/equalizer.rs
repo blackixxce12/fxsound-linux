@@ -53,6 +53,7 @@
 use crate::assets::{AssetCache, FxImage};
 use crate::state::{UiAction, UiResponse, UiState};
 use crate::theme::{self, FxColor, Palette};
+use crate::widgets::slider;
 use egui::{
     Align2, Color32, CornerRadius, Id, Mesh, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2,
 };
@@ -93,6 +94,9 @@ pub const CORNER_RADIUS: f32 = 8.0;
 pub const WHEEL_BAND_LIMIT: usize = 10;
 /// At or above this many bands the wheel is inert even when visible (`FxEqualizer.cpp:592-593`).
 pub const FIXED_FREQUENCY_BAND_LIMIT: usize = 15;
+/// A JUCE `Label` paints its text at half alpha while disabled **[JUCE semantics]**: the gain
+/// captions with the power off.
+pub const DISABLED_LABEL_ALPHA: f32 = 0.5;
 /// The band counts the combo box offers (`FxAudioControls.h:106`).
 pub const BAND_COUNTS: [usize; 5] = [5, 10, 15, 20, 31];
 
@@ -558,18 +562,6 @@ pub fn wheel_drag_proportion(start_proportion: f32, drag: Vec2) -> f32 {
     (start_proportion + (drag.x - drag.y) / WHEEL_DRAG_PIXELS).clamp(0.0, 1.0)
 }
 
-/// JUCE's `Colour::withSaturation(0.0f)`.
-///
-/// `withSaturation` round-trips through **HSB**, whose brightness is `max(r, g, b)`, so a
-/// zero-saturation colour is that maximum on all three channels — `#e33250` greys to `#e3e3e3`,
-/// not to a mid grey. (`widgets::slider` desaturates through HSL instead; the two disagree, and
-/// `docs/spec/04-equalizer-visualizer.md` §A8's precomputed table is the HSB one.)
-#[must_use]
-pub fn desaturate(colour: Color32) -> Color32 {
-    let brightness = colour.r().max(colour.g()).max(colour.b());
-    Color32::from_rgba_premultiplied(brightness, brightness, brightness, colour.a())
-}
-
 // ---------------------------------------------------------------------------------------------
 // Interaction state
 // ---------------------------------------------------------------------------------------------
@@ -764,12 +756,14 @@ impl<'a> EqualizerWidget<'a> {
             }
 
             // `FxEqualizer::paint` re-applies the per-band tooltips every frame, and only ever at
-            // ten bands (`FxEqualizer.cpp:326-343`).
-            if !state.hide_tooltips
-                && layout.num_bands == BAND_TOOLTIPS.len()
-                && let Some(tip) = BAND_TOOLTIPS.get(band)
-            {
-                let _ = band_response.on_hover_text(tr(tip));
+            // ten bands (`FxEqualizer.cpp:326-343`). Under them, and alone at the other counts,
+            // the right-click reset nothing else mentions (0.4.0 audit R9).
+            if !state.hide_tooltips {
+                let described = (layout.num_bands == BAND_TOOLTIPS.len())
+                    .then(|| BAND_TOOLTIPS.get(band))
+                    .flatten()
+                    .map(|tip| tr(tip));
+                let _ = band_response.on_hover_text(slider::with_reset_tip(described.as_deref()));
             }
         }
 
@@ -815,10 +809,16 @@ struct PaintCtx {
 }
 
 impl PaintCtx {
-    /// A palette colour, desaturated when the equalizer is not contributing.
+    /// A palette colour, greyed when the equalizer is not contributing: the original's
+    /// `Colour::withSaturation(0.0f)` in the dark palette and, in the light one, a grey that can
+    /// still be seen ([`Palette::greyed`], 0.4.0 audit #24).
     fn colour(&self, id: FxColor, alpha: f32) -> Color32 {
         let base = self.palette.color_alpha(id, alpha);
-        if self.lit { base } else { desaturate(base) }
+        if self.lit {
+            base
+        } else {
+            self.palette.greyed(base)
+        }
     }
 
     fn theme_mode(&self) -> ThemeMode {
@@ -960,6 +960,11 @@ fn paint_thumb(
 
 /// The floating gain caption, which `FxProView` keeps visible at all times since v2.0
 /// (`FxProView.cpp:70`).
+///
+/// With the power off too, at a disabled label's half alpha. The original hides it there because
+/// `showValue(show)` is `show && isEnabled()` (`FxEqualizer.cpp:423-426`) — an accident of a
+/// stale state against "values always visible since version 2.0" (`FxProView.cpp:56-73`), which
+/// left the curve on screen with nothing saying what its bands are set to (0.4.0 audit #42).
 fn paint_gain_label(
     painter: &egui::Painter,
     ctx: &PaintCtx,
@@ -967,18 +972,24 @@ fn paint_gain_label(
     band: usize,
     gain_db: f32,
 ) {
-    if !ctx.powered {
-        // `showValue(show)` is `show && isEnabled()` (`FxEqualizer.cpp:423-426`).
-        return;
-    }
     let rect = translate(layout.gain_label_rect(band, gain_db), ctx.origin);
     painter.text(
         rect.center_top(),
         Align2::CENTER_TOP,
         gain_label(gain_db),
         theme::semibold(LABEL_HEIGHT),
-        ctx.palette.color(FxColor::DefaultText),
+        gain_label_colour(ctx.palette, ctx.powered),
     );
+}
+
+/// A band's gain caption colour: `DefaultText`, at [`DISABLED_LABEL_ALPHA`] with the power off.
+#[must_use]
+pub fn gain_label_colour(palette: Palette, powered: bool) -> Color32 {
+    if powered {
+        palette.color(FxColor::DefaultText)
+    } else {
+        palette.color_alpha(FxColor::DefaultText, DISABLED_LABEL_ALPHA)
+    }
 }
 
 /// The frequency caption, `centredTop` across the whole column (`FxEqualizer.cpp:44`).
@@ -1132,7 +1143,8 @@ fn wheel(
     }
 
     if !state.hide_tooltips {
-        let _ = wheel_response.on_hover_text(tr(WHEEL_TOOLTIP));
+        let tip = tr(WHEEL_TOOLTIP);
+        let _ = wheel_response.on_hover_text(slider::with_reset_tip(Some(&tip)));
     }
 
     // `reduced(2)` then `radius - lineW * 0.5` (`FxTheme.cpp:348-352`).
@@ -1663,34 +1675,6 @@ mod tests {
         // And it never escapes 0..=1.
         assert_eq!(wheel_drag_proportion(0.9, vec2(1000.0, 0.0)), 1.0);
         assert_eq!(wheel_drag_proportion(0.1, vec2(-1000.0, 0.0)), 0.0);
-    }
-
-    /// §A8's precomputed greys — `Colour::withSaturation(0)` keeps HSB brightness, i.e. the
-    /// channel maximum.
-    #[test]
-    fn desaturation_matches_the_spec_grey_table() {
-        let cases = [
-            (Color32::from_rgb(0xe3, 0x32, 0x50), 0xe3), // SliderTrack, dark
-            (Color32::from_rgb(0x0a, 0x4d, 0x66), 0x66), // SliderTrack, light
-            (Color32::from_rgb(0xd5, 0x15, 0x35), 0xd5), // GraphHigh, dark
-            (Color32::from_rgb(0xef, 0x4b, 0x65), 0xef), // EqStart, dark
-            (Color32::from_rgb(0x74, 0x28, 0x34), 0x74), // EqEnd, dark
-            (Color32::from_rgb(0x06, 0x32, 0x44), 0x44), // EqEnd, light
-        ];
-        for (colour, expected) in cases {
-            let grey = desaturate(colour);
-            assert_eq!(
-                (grey.r(), grey.g(), grey.b()),
-                (expected, expected, expected),
-                "{colour:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn desaturation_keeps_the_alpha() {
-        let translucent = Color32::from_rgba_premultiplied(0x74, 0x28, 0x34, 0x55);
-        assert_eq!(desaturate(translucent).a(), 0x55);
     }
 
     #[test]

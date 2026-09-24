@@ -25,11 +25,14 @@
 //!
 //! Every control writes through the same [`UiAction`] the command line uses, so what a control does
 //! is the controller's business: the band count carries the curve over rather than flattening it
-//! (upstream 182a329), and Restore Defaults puts back ten bands, no leveling, a centred balance,
-//! the narrowest filter and no gain, and keeps the curve, which is the preset's and not a default
-//! (`FxEqualizerControl::restoreDefaults`, `FxAudioControls.cpp:529-544`). The ranges, steps and
+//! (upstream 182a329), and Restore Defaults puts back no leveling, a centred balance, the
+//! narrowest filter and no gain, and keeps the band count and the curve, which are the user's and
+//! the preset's and not defaults (`FxEqualizerControl::restoreDefaults`,
+//! `FxAudioControls.cpp:529-544`, which also put back ten bands; 0.4.0 audit R5). The ranges and the
 //! right-click resets are the original's (§5.2): the four level sliders are `FxAudioSlider` and
-//! `FxBalanceSlider`, which both reset to their default on a right-click, unlike the effect sliders.
+//! `FxBalanceSlider`, which both reset to their default on a right-click. The steps are too, but
+//! for the master gain and the balance, which step by one decibel where the original's step by two
+//! ([`Level::range`], 0.4.0 audit #22).
 //!
 //! ## On a microphone
 //!
@@ -40,10 +43,10 @@
 //!   music chain's does;
 //! * **Makeup Gain in the place of Master Gain**. It is the same control and the same action, and
 //!   on a voice it *is* the preset's makeup gain — the stage after the compressor — so it is named
-//!   for what it does there. It steps in whole decibels rather than the master gain's two: voice
-//!   presets are voiced at 3, 5, 7 and 9 dB, which a two-decibel step could not reach;
-//! * **Restore Defaults**, with the controller's meaning for a voice (the gain goes back to 0 as an
-//!   edit to the preset, the band count to ten).
+//!   for what it does there. It steps in whole decibels, as the master gain does: voice presets
+//!   are voiced at 3, 5, 7 and 9 dB;
+//! * **Restore Defaults**, with the controller's meaning for a voice (the gain goes back to 0 and
+//!   the width to x1, as an edit to the preset; the band count and the curve stay).
 //!
 //! Volume Leveling and Balance belong to the music chain's equalizer block and have no stage in
 //! the voice chain, so on a microphone they are not drawn at all, and Filter Q moves up into the
@@ -281,16 +284,21 @@ impl Level {
         }
     }
 
-    /// The original's range and step (`docs/spec/03-controls.md` §5.2), except the makeup gain's
-    /// whole-decibel step on a microphone.
+    /// The original's range and step (`docs/spec/03-controls.md` §5.2), except that the master
+    /// gain and the balance step by one decibel rather than two, in either direction.
+    ///
+    /// The original's sliders step by 2 dB while its controller and command line round to whole
+    /// decibels (`FxAudioControls.cpp:312`, `FxBalanceSlider.cpp:36`, `FxController.cpp:1801-1818`),
+    /// so `--master_gain=3` could not be set from the window and one arrow press took it to 4
+    /// (0.4.0 audit #22). One decibel is what the rest of the app already means by a step, and a
+    /// voice's makeup gain needs it anyway: voice presets are voiced at 3, 5, 7 and 9 dB.
     #[must_use]
     pub const fn range(self, direction: DeviceDirection) -> LevelRange {
-        let (min, max, step, default) = match (self, direction) {
-            (Self::MasterGain, DeviceDirection::Output) => (-20.0, 20.0, 2.0, 0.0),
-            (Self::MasterGain, DeviceDirection::Input) => (-20.0, 20.0, 1.0, 0.0),
-            (Self::VolumeLeveling, _) => (0.0, 4.0, 0.5, 0.0),
-            (Self::FilterQ, _) => (1.0, 3.0, 0.5, 1.0),
-            (Self::Balance, _) => (-20.0, 20.0, 2.0, 0.0),
+        let _ = direction;
+        let (min, max, step, default) = match self {
+            Self::MasterGain | Self::Balance => (-20.0, 20.0, 1.0, 0.0),
+            Self::VolumeLeveling => (0.0, 4.0, 0.5, 0.0),
+            Self::FilterQ => (1.0, 3.0, 0.5, 1.0),
         };
         LevelRange {
             min,
@@ -334,17 +342,19 @@ impl Level {
         }
     }
 
-    /// The floating readout: the original's `printf` formats, `%0.0f dB`, `%.1f dB`, `%.1fx`, and
-    /// the balance's magnitude alone — which side it leans to is the thumb's and the Left and
-    /// Right captions' to say (`FxAudioControls.cpp:268-271`, `FxBalanceSlider.cpp:146`).
+    /// The floating readout: the original's `printf` formats, `%0.0f dB` and `%.1fx`, and the
+    /// balance's magnitude alone — which side it leans to is the thumb's and the Left and Right
+    /// captions' to say (`FxAudioControls.cpp:268-271`, `FxBalanceSlider.cpp:146`).
     ///
-    /// One liberty: a value that rounds to nothing reads `0`, never `-0` — a voice preset's
-    /// −0.4 dB of makeup is no gain, not a negative one.
+    /// Two liberties. The volume leveling reads a bare `%.1f`: the original says `%.1f dB`, but
+    /// the amount is a 0 to 4 setting of the leveller, whose 2.0 is a target level and no two
+    /// decibels of anything (0.4.0 audit #23). And a value that rounds to nothing reads `0`, never
+    /// `-0` — a voice preset's −0.4 dB of makeup is no gain, not a negative one.
     #[must_use]
     pub fn readout(self, value: f32) -> String {
         let (number, unit) = match self {
             Self::MasterGain => (format!("{value:.0}"), " dB"),
-            Self::VolumeLeveling => (format!("{value:.1}"), " dB"),
+            Self::VolumeLeveling => (format!("{value:.1}"), ""),
             Self::FilterQ => (format!("{value:.1}"), "x"),
             Self::Balance => (format!("{:.0}", value.abs()), " dB"),
         };
@@ -440,6 +450,11 @@ pub fn show(
             .show(ui, rect, palette, assets, ("fx_level", level as u8));
         if slider.changed() && value != before {
             response.push(level.action(value));
+        }
+        // The original has no tooltip here, and so nothing that tells of the right-click reset
+        // (0.4.0 audit R9); "Hide help tips" hides it with the rest.
+        if !state.hide_tooltips {
+            let _ = slider.on_hover_text(slider::with_reset_tip(None));
         }
 
         // A plain visible child in the original, so — unlike face A's — shown with the power off
@@ -778,17 +793,36 @@ mod tests {
     // ---- the levels --------------------------------------------------------------------------
 
     #[test]
-    fn the_four_levels_have_the_originals_ranges_steps_and_defaults() {
-        // docs/spec/03-controls.md §5.2.
+    fn the_four_levels_have_the_originals_ranges_and_defaults() {
+        // docs/spec/03-controls.md §5.2, and the original's steps but for the gain and the
+        // balance's (below).
         let out = DeviceDirection::Output;
         let range = |level: Level| {
             let r = level.range(out);
             (r.min, r.max, r.step, r.default)
         };
-        assert_eq!(range(Level::MasterGain), (-20.0, 20.0, 2.0, 0.0));
+        assert_eq!(range(Level::MasterGain), (-20.0, 20.0, 1.0, 0.0));
         assert_eq!(range(Level::VolumeLeveling), (0.0, 4.0, 0.5, 0.0));
         assert_eq!(range(Level::FilterQ), (1.0, 3.0, 0.5, 1.0));
-        assert_eq!(range(Level::Balance), (-20.0, 20.0, 2.0, 0.0));
+        assert_eq!(range(Level::Balance), (-20.0, 20.0, 1.0, 0.0));
+    }
+
+    #[test]
+    fn the_master_gain_and_the_balance_step_by_the_whole_decibel_the_command_line_rounds_to() {
+        // 0.4.0 audit #22: the original's 2 dB step left every odd decibel `--master_gain` and
+        // `--balance` accept out of the window's reach, 21 positions of the 41.
+        for level in [Level::MasterGain, Level::Balance] {
+            let r = level.range(DeviceDirection::Output);
+            let reachable = (-20..=20)
+                .filter(|&db| {
+                    let db = db as f32;
+                    slider::quantise(db, r.min, r.max, r.step) == db
+                })
+                .count();
+            assert_eq!(reachable, 41, "{level:?}");
+            assert_eq!(slider::step_towards(3.0, r.min, r.step, true), 4.0);
+            assert_eq!(slider::step_towards(3.0, r.min, r.step, false), 2.0);
+        }
     }
 
     #[test]
@@ -811,10 +845,20 @@ mod tests {
     }
 
     #[test]
+    fn the_volume_leveling_reads_its_amount_without_a_unit_it_does_not_have() {
+        // 0.4.0 audit #23: the original's "2.0 dB" is the leveller's 0 to 4 amount, whose 2.0 is
+        // a target level, not two decibels.
+        assert_eq!(Level::VolumeLeveling.readout(1.5), "1.5");
+        assert_eq!(Level::VolumeLeveling.readout(4.0), "4.0");
+        assert_eq!(Level::VolumeLeveling.readout(0.0), "0.0");
+        assert!(!Level::VolumeLeveling.readout(2.0).contains("dB"));
+    }
+
+    #[test]
     fn the_readouts_use_the_originals_formats() {
         assert_eq!(Level::MasterGain.readout(-4.0), "-4 dB");
         assert_eq!(Level::MasterGain.readout(20.0), "20 dB");
-        assert_eq!(Level::VolumeLeveling.readout(1.5), "1.5 dB");
+        assert_eq!(Level::FilterQ.readout(1.0), "1.0x");
         assert_eq!(Level::FilterQ.readout(2.0), "2.0x");
         // The balance says how far, not which way.
         assert_eq!(Level::Balance.readout(-14.0), "14 dB");
@@ -825,7 +869,7 @@ mod tests {
     fn a_readout_never_says_minus_zero() {
         assert_eq!(Level::MasterGain.readout(-0.4), "0 dB");
         assert_eq!(Level::MasterGain.readout(-0.0), "0 dB");
-        assert_eq!(Level::VolumeLeveling.readout(-0.01), "0.0 dB");
+        assert_eq!(Level::VolumeLeveling.readout(-0.01), "0.0");
         assert_eq!(Level::MasterGain.readout(-0.6), "-1 dB");
     }
 
@@ -896,7 +940,7 @@ mod tests {
                 "Master Gain",
                 "-4 dB",
                 "Volume Leveling",
-                "1.5 dB",
+                "1.5",
                 "Filter Q",
                 "2.0x",
                 "Balance",
@@ -1107,6 +1151,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_level_slider_says_on_hover_that_a_right_click_resets_it() {
+        // 0.4.0 audit R9: the reset was there and nothing said so.
+        for (row, _) in Level::OUTPUT.iter().enumerate() {
+            let mut harness = turned_over(ThemeMode::Dark);
+            let shown = harness.rest(&speakers(), slider_rect(column(), row).center());
+            assert!(
+                shown.iter().any(|text| text == slider::RESET_TIP),
+                "row {row}: {shown:?}"
+            );
+        }
+        let mut harness = turned_over(ThemeMode::Dark);
+        let hidden = UiState {
+            hide_tooltips: true,
+            ..speakers()
+        };
+        let shown = harness.rest(&hidden, slider_rect(column(), 0).center());
+        assert!(
+            !shown.iter().any(|text| text == slider::RESET_TIP),
+            "{shown:?}"
+        );
+    }
+
     /// The centre of `level`'s thumb on the speakers' `row`.
     fn level_thumb(state: &UiState, row: usize, level: Level) -> Pos2 {
         let rect = slider_rect(column(), row);
@@ -1150,11 +1217,11 @@ mod tests {
 
     #[test]
     fn a_master_gain_between_its_steps_survives_a_touch_and_a_drag_from_the_thumb_still_steps() {
-        // `--master_gain=3` leaves the speakers' gain between two of its 2 dB positions; a touch
-        // on the thumb used to snap it to 4 dB.
+        // A gain between two of the slider's whole-decibel positions, from a settings file
+        // written by hand, used to be snapped by a touch on the thumb (0.4.0 audit #14).
         let mut harness = turned_over(ThemeMode::Dark);
         let state = UiState {
-            master_gain_db: 3.0,
+            master_gain_db: 3.5,
             ..speakers()
         };
         harness.settle(&state);
@@ -1162,7 +1229,7 @@ mod tests {
         let actions = press(&mut harness, &state, from, PointerButton::Primary);
         assert!(actions.is_empty(), "a touch moved it: {actions:?}");
 
-        // Thirty points right is 10.7 dB up: 13.7 dB, which the drag puts on its 14 dB step.
+        // Thirty points right is 10.7 dB up: 14.2 dB, which the drag puts on its 14 dB step.
         let to = from + vec2(30.0, 0.0);
         let button = |pos, pressed| Event::PointerButton {
             pos,
@@ -1184,10 +1251,10 @@ mod tests {
 
     #[test]
     fn an_arrow_on_a_master_gain_between_its_steps_stops_at_the_next_step_either_way() {
-        // `--master_gain=3` sits between the speakers' 2 dB positions. A whole step added and
-        // then rounded took Right to 6 dB and skipped 4 dB.
+        // 3.5 dB sits between two positions. A whole step added and then rounded took Right to
+        // 5 dB and skipped 4 dB.
         let state = UiState {
-            master_gain_db: 3.0,
+            master_gain_db: 3.5,
             ..speakers()
         };
         let arrow = |key| Event::Key {
@@ -1197,7 +1264,7 @@ mod tests {
             repeat: false,
             modifiers: Modifiers::NONE,
         };
-        for (key, expected) in [(egui::Key::ArrowRight, 4.0), (egui::Key::ArrowLeft, 2.0)] {
+        for (key, expected) in [(egui::Key::ArrowRight, 4.0), (egui::Key::ArrowLeft, 3.0)] {
             let mut harness = turned_over(ThemeMode::Dark);
             harness.settle(&state);
             harness.ctx.memory_mut(|m| {
@@ -1221,7 +1288,7 @@ mod tests {
             repeat: false,
             modifiers: Modifiers::NONE,
         };
-        for (key, expected) in [(egui::Key::ArrowRight, -2.0), (egui::Key::ArrowLeft, -6.0)] {
+        for (key, expected) in [(egui::Key::ArrowRight, -3.0), (egui::Key::ArrowLeft, -5.0)] {
             let mut harness = turned_over(ThemeMode::Dark);
             harness.settle(&state);
             harness.ctx.memory_mut(|m| {
@@ -1382,9 +1449,10 @@ mod tests {
             assert_eq!(left, want_left, "{mode:?}");
             assert_eq!(end.color, want_right, "{mode:?}");
             assert!(left.a() > end.color.a());
-            // The original's gradient ends eight points early and holds its end colour after.
-            assert_eq!(end.pos.x, track.right() - 8.0);
-            assert!(mesh.vertices.iter().any(|v| v.pos.x == track.right()));
+            // The gradient runs to the track's end, where the original's ended eight points early
+            // and held its end colour after (D-3, 0.4.0 audit #41): one quad, end to end.
+            assert_eq!(end.pos.x, track.right());
+            assert_eq!(mesh.vertices.len(), 4, "{:?}", mesh.vertices);
             // And no 20 % track under it: the bar is the whole track.
             assert_eq!(fill_at(&shapes, track), None);
         }
@@ -1403,7 +1471,7 @@ mod tests {
         let shapes = harness.settle(&state);
         let readouts: Vec<_> = texts(&shapes)
             .into_iter()
-            .filter(|(text, _, _)| ["20 dB", "4.0 dB", "3.0x"].contains(&text.as_str()))
+            .filter(|(text, _, _)| ["20 dB", "4.0", "3.0x"].contains(&text.as_str()))
             .collect();
         // The gain and the balance both read "20 dB".
         assert_eq!(readouts.len(), 4, "{readouts:?}");

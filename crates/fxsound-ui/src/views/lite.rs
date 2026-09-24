@@ -378,93 +378,58 @@ mod tests {
     }
 
     #[test]
-    fn the_preset_combo_dies_with_the_power_and_the_output_combo_does_not() {
-        // FxLiteView.cpp:57 gates only `preset_list_` — the user must still be able to change
-        // outputs with the power off.
-        let ctx = test_context();
-        let mut scratch = ViewScratch::new();
-        let mut assets = AssetCache::new();
+    fn with_the_power_off_the_preset_list_and_the_output_list_both_still_open() {
+        // FxLiteView.cpp:57 gates `preset_list_` with the power and leaves the output list
+        // alone. The port leaves both live (0.4.0 audit R7): the command line picks a preset with
+        // the power off, and so can the window.
         let state = UiState {
             power: false,
             ..state()
         };
-
-        let preset = layout::lite::preset_combo().center();
-        let output = layout::lite::output_combo().center();
-        for _ in 0..2 {
+        for (combo, salt) in [
+            (layout::lite::preset_combo(), "preset_list"),
+            (layout::lite::output_combo(), "output_list"),
+        ] {
+            let ctx = test_context();
+            let mut scratch = ViewScratch::new();
+            let mut assets = AssetCache::new();
+            let at = combo.center();
             frame(
                 &ctx,
                 &state,
                 &mut scratch,
                 &mut assets,
-                vec![Event::PointerMoved(preset)],
+                vec![Event::PointerMoved(at)],
+            );
+            frame(
+                &ctx,
+                &state,
+                &mut scratch,
+                &mut assets,
+                vec![
+                    Event::PointerMoved(at),
+                    Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+            );
+            // `FxComboBox` hangs its menu off `Id::new("fx_combo_box").with(id_salt)`, and
+            // `Popup::default_response_id` is that id with "popup" mixed in.
+            let popup_id = egui::Id::new("fx_combo_box").with(salt).with("popup");
+            assert!(
+                egui::Popup::is_id_open(&ctx, popup_id),
+                "{salt} should open with the power off"
             );
         }
-        // A disabled combo returns no selection and never opens its menu.
-        let actions = frame(
-            &ctx,
-            &state,
-            &mut scratch,
-            &mut assets,
-            vec![
-                Event::PointerMoved(preset),
-                Event::PointerButton {
-                    pos: preset,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::default(),
-                },
-                Event::PointerButton {
-                    pos: preset,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ],
-        );
-        assert!(
-            actions.is_empty(),
-            "a powered-down preset list reacted: {actions:?}"
-        );
-
-        // The output list is still live: its popup opens on a click.
-        frame(
-            &ctx,
-            &state,
-            &mut scratch,
-            &mut assets,
-            vec![Event::PointerMoved(output)],
-        );
-        frame(
-            &ctx,
-            &state,
-            &mut scratch,
-            &mut assets,
-            vec![
-                Event::PointerMoved(output),
-                Event::PointerButton {
-                    pos: output,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::default(),
-                },
-                Event::PointerButton {
-                    pos: output,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ],
-        );
-        // `FxComboBox` hangs its menu off `Id::new("fx_combo_box").with(id_salt)`, and
-        // `Popup::default_response_id` is that id with "popup" mixed in.
-        let popup_id = egui::Id::new("fx_combo_box")
-            .with("output_list")
-            .with("popup");
-        assert!(
-            egui::Popup::is_id_open(&ctx, popup_id),
-            "the playback-device list should open with the power off"
-        );
     }
 
     // ---- two lanes in one list ---------------------------------------------------------------

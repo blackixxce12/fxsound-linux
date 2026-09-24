@@ -409,7 +409,8 @@ impl UiState {
     }
 
     /// Whether the controls should be drawn enabled. The original greys everything out when the
-    /// power is off (`FxProView.cpp:117-123`).
+    /// power is off (`FxProView.cpp:117-123`); here everything but the device lists and the
+    /// preset list, which stay live with the power off (0.4.0 audit R7).
     #[must_use]
     pub const fn controls_enabled(&self) -> bool {
         self.power

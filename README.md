@@ -321,9 +321,17 @@ directions between this port and the Windows build.
 
 The flip button at the top of the effect column turns it over to the equalizer's own controls, as in
 the original since 1.2.12: the band count, the master gain, the volume leveling, the filter width,
-the balance and Restore Defaults. Each slider has the original's range and step, and a right-click
-puts it back to its default. A press on a slider's thumb, here as on the effects, moves nothing until
-the pointer does, where Windows jumps to the pointer and can move the gain or the balance by a step.
+the balance and Restore Defaults. Each slider has the original's range and step, except that the
+master gain and the balance step by 1 dB where Windows steps by 2, so every value `--master_gain`
+and `--balance` take can be set from the window too. The volume leveling reads its 0 to 4 amount
+without the "dB" Windows puts after it. A right-click puts any slider back to its default, the
+effects included (which it switches off), and every slider's tooltip says so. A press on a slider's
+thumb moves nothing until the pointer does, where Windows jumps to the pointer and can move the
+gain or the balance by a step, and one wheel notch is one step. Every title-bar button and the flip
+button say on hover what they do, and *Hide help tips* hides that too.
+
+With the power off the sliders are grey but still show their values, and a preset can still be
+picked, from the window, the menu or the tray, as from the command line; switching back on plays it.
 
 An effect slider has the original's eleven positions, but a preset stores 128 values: one between two
 positions is shown with its decimal (General's Surround reads 1.6), a press on the thumb does not
@@ -365,11 +373,12 @@ Each of these is a considered decision, not an oversight:
 - **Q multiplier no longer resets the band layout.** Changing the filter width in the original
   silently discards preset-supplied band frequencies and resets the sample rate to 44100 until the
   next buffer. That is a bug; this port only redesigns the coefficients.
-- **Preset commands work with the power off.** The original's command line ignores `--preset`,
-  `--save_preset` and the rest while processing is off. Here they run either way, and are refused
-  exactly where the hamburger menu greys the item out — an overwrite or rename of a factory
-  preset, a rename with unsaved changes, a name already taken, the user-preset limit — with the
-  reason on stderr, exit status 1, and `org.fxsound.FxSound.Error.Refused` on D-Bus.
+- **Presets work with the power off.** The original greys out its preset list, its menu's preset
+  items and its tray's preset menu while processing is off, and its command line ignores
+  `--preset`, `--save_preset` and the rest. Here all of them work either way, and a command is
+  refused exactly where the hamburger menu greys the item out — an overwrite or rename of a
+  factory preset, a rename with unsaved changes, a name already taken, the user-preset limit —
+  with the reason on stderr, exit status 1, and `org.fxsound.FxSound.Error.Refused` on D-Bus.
 - **Global hotkeys live in the compositor.** See above.
 - **Window position is not restored.** Wayland gives a client no way to place its own toplevel. The
   setting is still written so it survives a move back to X11.
@@ -434,9 +443,13 @@ Each of these is a considered decision, not an oversight:
   the original ships; English otherwise. Node *names* (`fxsound_sink`, `fxsound_source`, …) are
   fixed ASCII, because they are what gets written into metadata.
 
-The two known painting artefacts in the original — the slider fill overshooting its track by 8 px,
-and the balance gradient ending 8 px early — *are* reproduced, because matching the look is the
-point. `widgets::slider::Fidelity::Corrected` turns the first one off.
+The original's painting slips are fixed rather than reproduced: the slider fill no longer overshoots
+its track by 8 px, the balance gradient no longer ends 8 px early, and the lit slider thumb is drawn
+at its 16 points instead of a quarter of that (`widgets::slider::Fidelity::Faithful` keeps the first
+two for comparison). In the light theme the power-off spectrum and a bypassed equalizer go a grey
+that can be seen instead of white, the Settings rule and the menu's edge get a colour that shows on
+the light background, and Settings' tab captions are set smaller where a translation would run
+past the rule.
 
 ## Implementation status
 

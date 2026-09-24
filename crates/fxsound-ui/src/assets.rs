@@ -140,6 +140,20 @@ pub fn svg_bytes(image: FxImage, theme: ThemeMode) -> &'static [u8] {
     }
 }
 
+/// Whether `image` is fitted by the bounds of what it draws rather than by its `viewBox`.
+///
+/// JUCE's `Drawable::drawWithin` fits `getDrawableBounds()`, which for a parsed SVG is the union
+/// of what its elements draw. For every image but one that is the `viewBox` give or take a point,
+/// and the rest of the port fits the `viewBox` as it always has. The exception is the lit slider
+/// thumb: `Slider_Thumb.svg` and its blue twin draw a 16 × 16 circle at (24, 20) in a 64 × 64
+/// `viewBox`, so fitted by the `viewBox` the thumb came out a quarter of its size, a 4-point dot,
+/// and grew fourfold when the power went off, since the grey thumb's `viewBox` is its 16 × 16
+/// circle (0.4.0 audit #40).
+#[must_use]
+pub const fn fitted_by_ink(image: FxImage) -> bool {
+    matches!(image, FxImage::SliderThumb)
+}
+
 /// Rasterise an SVG to an egui image at an exact pixel size.
 ///
 /// `width_px` and `height_px` are *physical* pixels: multiply logical points by
@@ -149,6 +163,28 @@ pub fn svg_bytes(image: FxImage, theme: ThemeMode) -> &'static [u8] {
 /// rather than panicking, because a missing icon must never take the audio path down with it.
 #[must_use]
 pub fn rasterise(svg: &[u8], width_px: u32, height_px: u32) -> Option<ColorImage> {
+    rasterise_area(svg, width_px, height_px, false)
+}
+
+/// [`rasterise`] one image as the window draws it: by its ink where [`fitted_by_ink`] says so.
+#[must_use]
+pub fn rasterise_image(
+    image: FxImage,
+    theme: ThemeMode,
+    width_px: u32,
+    height_px: u32,
+) -> Option<ColorImage> {
+    rasterise_area(
+        svg_bytes(image, theme),
+        width_px,
+        height_px,
+        fitted_by_ink(image),
+    )
+}
+
+/// Render the whole `viewBox`, or with `ink` only the bounds of what is drawn, strokes included
+/// and effects such as a drop shadow's blur not, into `width_px` × `height_px`.
+fn rasterise_area(svg: &[u8], width_px: u32, height_px: u32, ink: bool) -> Option<ColorImage> {
     if width_px == 0 || height_px == 0 {
         return None;
     }
@@ -156,15 +192,20 @@ pub fn rasterise(svg: &[u8], width_px: u32, height_px: u32) -> Option<ColorImage
     let tree = usvg::Tree::from_data(svg, &options).ok()?;
 
     let size = tree.size();
-    if size.width() <= 0.0 || size.height() <= 0.0 {
+    let area = if ink {
+        let bounds = tree.root().abs_stroke_bounding_box();
+        (bounds.x(), bounds.y(), bounds.width(), bounds.height())
+    } else {
+        (0.0, 0.0, size.width(), size.height())
+    };
+    let (x, y, width, height) = area;
+    if width <= 0.0 || height <= 0.0 {
         return None;
     }
 
     let mut pixmap = tiny_skia::Pixmap::new(width_px, height_px)?;
-    let transform = tiny_skia::Transform::from_scale(
-        width_px as f32 / size.width(),
-        height_px as f32 / size.height(),
-    );
+    let (sx, sy) = (width_px as f32 / width, height_px as f32 / height);
+    let transform = tiny_skia::Transform::from_row(sx, 0.0, 0.0, sy, -x * sx, -y * sy);
     resvg::render(&tree, transform, &mut pixmap.as_mut());
 
     // tiny-skia works premultiplied and hands back straight-alpha RGBA bytes, which is exactly
@@ -250,7 +291,7 @@ impl AssetCache {
         };
 
         if let std::collections::hash_map::Entry::Vacant(slot) = self.textures.entry(key) {
-            let colour_image = rasterise(svg_bytes(image, theme), width_px, height_px)?;
+            let colour_image = rasterise_image(image, theme, width_px, height_px)?;
             let name = format!("{image:?}-{theme:?}-{width_px}x{height_px}");
             let handle = ctx.load_texture(name, colour_image, TextureOptions::LINEAR);
             slot.insert(handle);
@@ -335,6 +376,65 @@ mod tests {
                 assert_eq!(raster.size, [32, 32]);
                 assert_eq!(raster.pixels.len(), 32 * 32);
             }
+        }
+    }
+
+    /// The share of `image`'s pixels at least half opaque.
+    fn coverage(image: &ColorImage) -> f32 {
+        let opaque = image.pixels.iter().filter(|p| p.a() >= 128).count();
+        opaque as f32 / image.pixels.len() as f32
+    }
+
+    #[test]
+    fn the_lit_thumb_fills_its_box_as_the_grey_one_does() {
+        // 0.4.0 audit #40: fitted by its 64-point viewBox the lit thumb was a 4 x 4 dot in its
+        // 16 x 16 box, a sixteenth of the grey one's area.
+        for theme in [ThemeMode::Dark, ThemeMode::Light] {
+            let lit = rasterise_image(FxImage::SliderThumb, theme, 64, 64).expect("lit");
+            let grey = rasterise_image(FxImage::SliderThumbBW, theme, 64, 64).expect("grey");
+            let (lit, grey) = (coverage(&lit), coverage(&grey));
+            // A circle fills pi/4 of its square.
+            assert!(
+                (lit - std::f32::consts::FRAC_PI_4).abs() < 0.05,
+                "{theme:?}: {lit}"
+            );
+            assert!(
+                (lit - grey).abs() < 0.03,
+                "{theme:?}: lit {lit}, grey {grey}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lit_thumbs_circle_touches_all_four_sides_of_its_box() {
+        let lit = rasterise_image(FxImage::SliderThumb, ThemeMode::Dark, 64, 64).expect("lit");
+        let alpha = |x: usize, y: usize| lit.pixels[y * 64 + x].a();
+        for (x, y) in [(32, 1), (32, 62), (1, 32), (62, 32)] {
+            assert!(alpha(x, y) >= 200, "({x}, {y}) is {}", alpha(x, y));
+        }
+        // The dark dot at its centre, r = 3 of 8.
+        let centre = lit.pixels[32 * 64 + 32];
+        assert!(centre.r() < 40 && centre.a() > 200, "{centre:?}");
+    }
+
+    #[test]
+    fn only_the_lit_thumb_is_fitted_by_its_ink() {
+        for image in ALL {
+            assert_eq!(
+                fitted_by_ink(image),
+                image == FxImage::SliderThumb,
+                "{image:?}"
+            );
+        }
+        // Every other image's ink spans most of its viewBox along at least one axis, so fitting
+        // either comes to much the same; the lit thumb's spans a quarter of it both ways.
+        let options = usvg::Options::default();
+        for image in ALL {
+            let tree = usvg::Tree::from_data(svg_bytes(image, ThemeMode::Dark), &options).unwrap();
+            let ink = tree.root().abs_stroke_bounding_box();
+            let size = tree.size();
+            let spans = (ink.width() / size.width()).max(ink.height() / size.height());
+            assert_eq!(spans < 0.5, fitted_by_ink(image), "{image:?} spans {spans}");
         }
     }
 

@@ -1017,8 +1017,9 @@ impl<'a> Shell<'a> {
         let anchor = chrome.menu.rect().translate(self.content_origin.to_vec2());
 
         // The enablement predicates of `FxMainWindow.cpp:536-543`: the preset items are the
-        // controller's one rule, which the command line and D-Bus are refused by too; Export and
-        // Import need only the power (0.4.0 audit #18, [`App::preset_menu`]).
+        // controller's one rule, which the command line and D-Bus are refused by too, with the
+        // power on or off (0.4.0 audit R7); Export and Import are always offered (audit #18,
+        // [`App::preset_menu`]).
         let preset = app.state.preset();
         let PresetMenu {
             save_new: can_save_new,
@@ -1059,7 +1060,7 @@ impl<'a> Shell<'a> {
             .show(ctx, |ui| {
                 egui::Frame::NONE
                     .fill(palette.color(FxColor::DefaultFill))
-                    .stroke(egui::Stroke::new(1.0, palette.color(FxColor::Outline)))
+                    .stroke(egui::Stroke::new(1.0, palette.divider()))
                     .corner_radius(egui::CornerRadius::same(8))
                     .inner_margin(egui::Margin::symmetric(8, 8))
                     .show(ui, |ui| {
@@ -1863,7 +1864,7 @@ fn menu_separator(ui: &mut egui::Ui, palette: Palette) {
     ui.painter().hline(
         rect.x_range(),
         rect.center().y,
-        egui::Stroke::new(1.0, palette.color(FxColor::Outline)),
+        egui::Stroke::new(1.0, palette.divider()),
     );
 }
 

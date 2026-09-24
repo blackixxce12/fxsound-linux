@@ -225,9 +225,9 @@ const fn lane_noun(lane: DeviceDirection) -> &'static str {
 }
 
 /// Which of the hamburger menu's preset items are offered: each is
-/// [`App::preset_command_allowed`] for its command, while the power is on
-/// (`FxMainWindow.cpp:536-543`). Export and Import are not preset commands; they are offered while
-/// the power is on, whether or not the preset has unsaved changes (0.4.0 audit #18).
+/// [`App::preset_command_allowed`] for its command (`FxMainWindow.cpp:536-543`), with the power on
+/// or off (0.4.0 audit R7). Export and Import are not preset commands; they are always offered,
+/// whether or not the preset has unsaved changes (0.4.0 audit #18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PresetMenu {
     pub save_new: bool,
@@ -3212,10 +3212,10 @@ impl App {
     ///
     /// The menu's own predicates (`FxMainWindow.cpp:536-543`) and the original's command line
     /// (`FxController.cpp:377-448`) agree on all of it but the power switch: the menu greys every
-    /// preset item out while the power is off and the original's command line ignores them, but a
-    /// script here gets its preset command carried out either way. A new or renamed preset's name
-    /// is checked last, so a refusal about the name ([`Refusal::is_about_the_name`]) means
-    /// everything else would allow it.
+    /// preset item out while the power is off and the original's command line ignores them. Here
+    /// the power stands in the way of neither, the menu, the window's preset list and the tray
+    /// included (0.4.0 audit R7). A new or renamed preset's name is checked last, so a refusal
+    /// about the name ([`Refusal::is_about_the_name`]) means everything else would allow it.
     ///
     /// # Errors
     ///
@@ -3324,27 +3324,29 @@ impl App {
     }
 
     /// The hamburger menu's preset items: each offered when [`App::preset_command_allowed`]
-    /// allows its command and the power is on — Save New Preset and Rename Preset whatever the
-    /// name, which their editor asks for.
+    /// allows its command — Save New Preset and Rename Preset whatever the name, which their
+    /// editor asks for.
     ///
-    /// Export Presets and Import Presets need only the power. The original greys both out while
+    /// The original greys every one of them out while the power is off (`FxMainWindow.cpp:536-543`),
+    /// though its command line and this one's D-Bus run them; the port offers them either way, so
+    /// a preset can be picked, saved or tidied before switching on (0.4.0 audit R7).
+    ///
+    /// Export Presets and Import Presets are always offered. The original greys both out while
     /// the preset has unsaved changes (`FxMainWindow.cpp:540-541`), which protects nothing here:
     /// the export writes the presets as saved, and the import skips a name already taken, the
     /// modified preset's included (0.4.0 audit #18).
     #[must_use]
     pub fn preset_menu(&self) -> PresetMenu {
         let offered = |command: PresetCommand| {
-            self.state.power
-                && self
-                    .preset_command_allowed(&command)
-                    .or_else(|refusal| {
-                        if refusal.is_about_the_name() {
-                            Ok(())
-                        } else {
-                            Err(refusal)
-                        }
-                    })
-                    .is_ok()
+            self.preset_command_allowed(&command)
+                .or_else(|refusal| {
+                    if refusal.is_about_the_name() {
+                        Ok(())
+                    } else {
+                        Err(refusal)
+                    }
+                })
+                .is_ok()
         };
         PresetMenu {
             save_new: offered(PresetCommand::SaveAs(String::new())),
@@ -3352,8 +3354,8 @@ impl App {
             undo: offered(PresetCommand::Undo),
             rename: offered(PresetCommand::Rename(String::new())),
             delete: offered(PresetCommand::Delete),
-            export: self.state.power,
-            import: self.state.power,
+            export: true,
+            import: true,
         }
     }
 
@@ -10933,8 +10935,9 @@ mod tests {
     fn the_menu_offers_a_preset_item_exactly_when_its_command_would_run() {
         // One rule for the hamburger and the command path (U15), and it is still the original's
         // enablement (`FxMainWindow.cpp:536-543`) but for Save New Preset, which a preset with no
-        // unsaved changes offers too, to save a copy (0.4.0 audit #17), and Export and Import,
-        // which a preset with unsaved changes no longer greys out (#18).
+        // unsaved changes offers too, to save a copy (0.4.0 audit #17), Export and Import,
+        // which a preset with unsaved changes no longer greys out (#18), and the power, which
+        // greys out none of them (R7).
         for factory in [true, false] {
             for modified in [false, true] {
                 for power in [true, false] {
@@ -10946,28 +10949,21 @@ mod tests {
                         Err(refusal) => refusal.is_about_the_name(),
                     };
                     let case = format!("factory {factory}, modified {modified}, power {power}");
-                    assert_eq!(
-                        menu.save_new,
-                        power && runs(P::SaveAs(String::new())),
-                        "{case}"
-                    );
-                    assert_eq!(menu.overwrite, power && runs(P::Overwrite), "{case}");
-                    assert_eq!(menu.undo, power && runs(P::Undo), "{case}");
-                    assert_eq!(
-                        menu.rename,
-                        power && runs(P::Rename(String::new())),
-                        "{case}"
-                    );
-                    assert_eq!(menu.delete, power && runs(P::Delete), "{case}");
+                    assert_eq!(menu.save_new, runs(P::SaveAs(String::new())), "{case}");
+                    assert_eq!(menu.overwrite, runs(P::Overwrite), "{case}");
+                    assert_eq!(menu.undo, runs(P::Undo), "{case}");
+                    assert_eq!(menu.rename, runs(P::Rename(String::new())), "{case}");
+                    assert_eq!(menu.delete, runs(P::Delete), "{case}");
 
-                    assert_eq!(menu.save_new, power, "{case}");
-                    assert_eq!(menu.overwrite, modified && !factory && power, "{case}");
-                    assert_eq!(menu.undo, modified && power, "{case}");
-                    assert_eq!(menu.rename, !modified && !factory && power, "{case}");
-                    assert_eq!(menu.delete, !factory && power, "{case}");
-                    // Unsaved changes stand in the way of neither (0.4.0 audit #18).
-                    assert_eq!(menu.export, power, "{case}");
-                    assert_eq!(menu.import, power, "{case}");
+                    assert!(menu.save_new, "{case}");
+                    assert_eq!(menu.overwrite, modified && !factory, "{case}");
+                    assert_eq!(menu.undo, modified, "{case}");
+                    assert_eq!(menu.rename, !modified && !factory, "{case}");
+                    assert_eq!(menu.delete, !factory, "{case}");
+                    // Unsaved changes stand in the way of neither (0.4.0 audit #18), and nor
+                    // does the power (R7).
+                    assert!(menu.export, "{case}");
+                    assert!(menu.import, "{case}");
                 }
             }
         }
@@ -10998,14 +10994,11 @@ mod tests {
             "after an equalizer band: {menu:?}"
         );
 
-        // The power is what greys them out, changes or none.
+        // Nor does the power (0.4.0 audit R7).
         app.handle(&[UiAction::TogglePower]);
         assert!(!app.state.power);
         let menu = app.preset_menu();
-        assert!(!menu.export && !menu.import, "{menu:?}");
-        app.handle(&[UiAction::TogglePower]);
-        let menu = app.preset_menu();
-        assert!(menu.export && menu.import, "{menu:?}");
+        assert!(menu.export && menu.import && menu.undo, "{menu:?}");
     }
 
     #[test]
@@ -11949,6 +11942,35 @@ mod tests {
         });
         assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Alpha"));
         assert_eq!(app.lane_preset(IN), Some(("Loud", false)));
+    }
+
+    #[test]
+    fn a_preset_picked_in_the_tray_or_the_window_with_the_power_off_is_selected_and_stays_off() {
+        // 0.4.0 audit R7: the window, the tray and the menu pick presets with the power off, as
+        // the command line and D-Bus always did; the power stays off and the preset is what
+        // switching on will play.
+        let (mut app, engine, _dir) = both_lanes_attached();
+        app.handle(&[UiAction::TogglePower]);
+        assert!(!app.state.power);
+        app.handle_tray(crate::tray::TrayCommand::SelectPreset {
+            direction: OUT,
+            name: "Alpha".to_owned(),
+        });
+        assert_eq!(app.lane_preset(OUT), Some(("Alpha", false)));
+        let at = app
+            .state
+            .presets
+            .iter()
+            .position(|p| p.name == "Beta")
+            .expect("Beta");
+        app.handle(&[UiAction::SelectPreset(at)]);
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        assert!(
+            !app.state.power,
+            "picking a preset does not switch FxSound on"
+        );
+        assert!(!engine.params().expect("published").power);
+        assert!(app.tray_state().output.presets.len() > 1);
     }
 
     #[test]
