@@ -104,3 +104,6 @@ countries: th
 "FxSound's preset" = "พรีเซ็ตของ FxSound"
 "No application has played or recorded through FxSound yet" = "ยังไม่มีแอปที่เล่นหรืออัดเสียงผ่าน FxSound"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "ไมโครโฟนบลูทูธจะทำงานเฉพาะเมื่อมีแอปบันทึกเสียงจาก FxSound (อินพุต) และเมื่อนั้นจะสลับชุดหูฟังไปเป็นคุณภาพการโทร"
+"Unsaved preset changes discarded" = "ละทิ้งการเปลี่ยนแปลงพรีเซตที่ยังไม่ได้บันทึกแล้ว"
+"Move the preset %s to the trash?" = "ย้ายพรีเซต %s ไปที่ถังขยะหรือไม่"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "ละทิ้งการเปลี่ยนแปลงที่ยังไม่ได้บันทึกของพรีเซตทั้งหมดหรือไม่ พรีเซตที่บันทึกไว้จะยังคงอยู่"

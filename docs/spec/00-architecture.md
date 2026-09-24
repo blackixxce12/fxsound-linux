@@ -951,10 +951,13 @@ against upstream does not "restore" them.
 | D-19 | Alt+drag "solo" collides with the compositor's window-move gesture | `docs/spec/04-equalizer-visualizer.md:1437-1439` | Rebound to Ctrl+Alt+drag, and surfaced with a per-band affordance |
 
 Behaviours ported **verbatim** because they are the product's fingerprint: the 100 ms tick and the
-5-tick (500 ms) processing debounce; the 600-tick (60 s) autosave; autosave-shadow semantics
-(`modified` derived only from the shadow file's existence, `setPreset` prefers the shadow); the
-`" *"` suffix; the single separator between factory and user presets; the 64-char preset name cap
-with `<>:"/\|?*` stripped and case-insensitive uniqueness; the five quantisation rules
+5-tick (500 ms) processing debounce; the 60 s autosave (missing until 0.4.0, audit #47; now a
+deadline a minute after the first edit, `App::next_deadline`, rather than a tick counter);
+autosave-shadow semantics (`modified` derived only from the shadow file's existence, `setPreset`
+prefers the shadow); the `" *"` suffix; the single separator between factory and user presets; the
+64-char preset name cap (and, for a new name, the 126 bytes Windows reads a name line in, audit
+#15) with `<>:"/\|?*` stripped and case-insensitive uniqueness (a rename that changes only case is
+allowed, audit #19); the five quantisation rules
 (master gain → integer, balance → integer, volume levelling → 0.5, filter Q → 0.5); wrap-around
 preset/output cycling including the "skip < 2 channel devices" loop; device priority as array order
 with an unlisted device sorting last; 7 s / 8 s notification timeouts, 3 lines maximum.

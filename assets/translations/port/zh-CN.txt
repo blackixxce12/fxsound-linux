@@ -104,3 +104,6 @@ countries: cn sg
 "FxSound's preset" = "FxSound 的预设"
 "No application has played or recorded through FxSound yet" = "尚无应用通过 FxSound 播放或录音"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "蓝牙麦克风仅在有应用从 FxSound (输入) 录音时才会启用，此时会将耳机切换到通话音质。"
+"Unsaved preset changes discarded" = "已放弃预设的未保存更改"
+"Move the preset %s to the trash?" = "将预设 %s 移到回收站？"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "放弃所有预设的未保存更改？已保存的预设将保留。"

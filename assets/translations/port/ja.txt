@@ -104,3 +104,6 @@ countries: ja
 "FxSound's preset" = "FxSound のプリセット"
 "No application has played or recorded through FxSound yet" = "FxSound を通して再生・録音したアプリはまだありません"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Bluetooth マイクは、アプリが FxSound (入力) から録音している間だけ起動し、そのときヘッドセットを通話品質に切り替えます。"
+"Unsaved preset changes discarded" = "プリセットの未保存の変更を破棄しました"
+"Move the preset %s to the trash?" = "プリセット%sをごみ箱に移動しますか？"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "すべてのプリセットの未保存の変更を破棄しますか？保存済みのプリセットは残ります。"

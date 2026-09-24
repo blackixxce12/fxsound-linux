@@ -105,3 +105,6 @@ countries: EG sa
 "FxSound's preset" = "الإعداد المسبق لـ FxSound"
 "No application has played or recorded through FxSound yet" = "لم يشغّل أي تطبيق صوتًا أو يسجّله عبر FxSound بعد"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "لا يعمل ميكروفون البلوتوث إلا أثناء تسجيل تطبيق من FxSound (الإدخال)، وعندها يحوّل سماعة الرأس إلى جودة المكالمات."
+"Unsaved preset changes discarded" = "تم تجاهل التغييرات غير المحفوظة في القوالب"
+"Move the preset %s to the trash?" = "نقل القالب %s إلى سلة المهملات؟"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "تجاهل التغييرات غير المحفوظة في كل القوالب؟ تبقى القوالب المحفوظة كما هي."

@@ -1,40 +1,36 @@
 //! The whole signal chain in one object, driven from the audio callback.
 //!
 //! Mirrors the order in `dfxpProcessReal.cpp` and `Play32.c`, which
-//! `docs/spec/10-dsp-effects.md` §11 draws in full:
+//! `docs/spec/10-dsp-effects.md` §11 draws in full, with one change (audit report R3):
 //!
 //! ```text
-//! in ─► graphic EQ ─► master gain · balance ─► volume levelling ─► effect chain ─► spectrum tap ─► out
-//!       └─── GraphicEq block: skipped while the EQ is off ────┘
+//! in ─► master gain · balance ─► graphic EQ ─► volume levelling ─► effect chain ─► spectrum tap ─► out
+//!                                └─ skipped while the EQ is off ─┘
 //!
 //! power off:
-//! in ─► master gain · balance, while the EQ is on ─► spectrum tap ─► out
+//! in ─► master gain · balance ─► spectrum tap ─► out
 //! ```
 //!
-//! The equalizer's switch is the whole block's switch, not the filters' alone: master gain,
-//! balance and the levelling stage all live inside the original's `sosProcessBuffer`, which
-//! `dfxpProcessReal.cpp:143-157` does not call while the equalizer is off. That predates upstream
-//! aad64c1, whose title only names the leveller: before it, the equalizer-off branch ran the
-//! levelling alone and its comment kept "the other SOS gain stages" bypassed as well.
+//! **The master gain and the balance play whatever the power and the equalizer's switch say
+//! (audit report R3, the user's decision of 2026-09-24).** In the original the gain stage lives
+//! inside the GraphicEq block with the filters and the levelling: `sosProcessBuffer`, which
+//! `dfxpProcessReal.cpp:143-157` does not call while the equalizer is off (upstream aad64c1, whose
+//! title only names the leveller; before it the equalizer-off branch ran the levelling alone). With
+//! the power off it calls `GraphicEqProcess_MasterGainOnly` (`:158-169`), the master gain alone and no
+//! balance (`SosProcess.cpp:500-516`), behind the same equalizer test — and on 5.1 or 7.1, where
+//! that test read `(i_eq_on) && a || b || c` until aad64c1 bracketed it, whatever the equalizer
+//! said. So on Windows the level jumped by the master gain whenever the equalizer's switch moved,
+//! and a mix balanced to one side recentred the moment FxSound went off. Here the gain stage is taken out
+//! of the block and runs on every path, so neither switch moves the level by the master gain or
+//! the balance: at −6 dB and a balance of +6 dB each side plays −12/−6 dB powered with the
+//! equalizer on or off, and the same with FxSound off, within Dynamic Boost's 0.3 dB ceiling.
 //!
-//! Power off keeps the gain stage, as the original does, so that switching FxSound off does not
-//! jump the volume — but not the way it does it. The original calls
-//! `GraphicEqProcess_MasterGainOnly` (`dfxpProcessReal.cpp:158-169`), which multiplies by the
-//! master gain alone (`SosProcess.cpp:500-516`), behind the same equalizer test. So a mix balanced
-//! to one side recentred the moment FxSound went off, and on 5.1 or 7.1, where the test read
-//! `(i_eq_on) && a || b || c` until aad64c1 bracketed it, the master gain came in with the
-//! equalizer off too. Here power off applies the master gain *and* the balance, and exactly when
-//! the powered path does: while the equalizer is on (audit report R3). The bypass is the powered
-//! gain stage and nothing else, so switching FxSound off never moves the level by more than
-//! Dynamic Boost's 0.3 dB ceiling or the balance by anything, with the equalizer on or off.
-//!
-//! The audit's option (b) read "whatever the equalizer says", and that is the one half of it not
-//! taken. With the equalizer off the powered path plays neither the master gain nor the balance
-//! (the block above, which the audit keeps), so a bypass that applied them would *bring them in*
-//! on switching off: at −6 dB and a balance of +6 dB, −0.3 dB on both sides powered would become
-//! −12 dB on the left and −6 dB on the right, the very step (b) was chosen to avoid. Taking that
-//! step out the other way, by running the gain stage while powered with the equalizer off, would
-//! undo the block the audit keeps (`docs/0.4.0-upstream.md`, U3).
+//! It runs *before* the equalizer rather than between it and the leveller, where the original's
+//! block had it, so that the equalizer's switch can fade the rest of the block in and out against
+//! a signal that already carries it. The two orders give the same signal: the gain stage and the
+//! equalizer are both linear and per channel, so they commute, and the leveller still hears the
+//! equalized, gained signal it always did. What the equalizer's switch still takes with it is the
+//! curve and the levelling (`dfxpProcessReal.cpp:143-157`); the effects never depended on it.
 //!
 //! The balance works by side, not by index: every left-hand speaker is turned down together and
 //! every right-hand one together, the centre and the subwoofer never (audit report #44). The
@@ -48,8 +44,8 @@
 //! stepping between two samples, as every other gain and filter the user can move does (audit
 //! report #11, [`crate::smooth`]): the original writes the gain straight into the float the audio
 //! thread multiplies by, so a 2 dB step on the slider was a 2 dB step in the waveform, and a click.
-//! The equalizer's switch fades the whole GraphicEq block in or out over the same 20 ms, mixing
-//! its output with the audio it was given, for the same reason: with 62.5 Hz at +6 dB under a
+//! The equalizer's switch fades the rest of the GraphicEq block — the curve and the levelling — in
+//! or out over the same 20 ms, mixing its output with the audio it was given, for the same reason: with 62.5 Hz at +6 dB under a
 //! 50 Hz tone at 0.3, switching the equalizer off moved the waveform by 0.143 between two samples,
 //! and now by no more than the tone moves on its own.
 //! The power switch is the one control that still acts between two samples: it is the listener's
@@ -433,29 +429,26 @@ impl Engine {
         self.heard = true;
 
         let block_runs = self.eq_block_runs();
+        // The master gain and the balance, on every path: powered or not, equalizer on or off
+        // (audit report R3; the module documentation has the original's version and why it is
+        // not this). Before the equalizer, so its switch fades the rest of the block against a
+        // signal that already carries them.
+        self.apply_gain_stage(buffer, channels);
         if self.applied.power {
-            // The GraphicEq block, whole or not at all (`dfxpProcessReal.cpp:143-157`), faded in
-            // or out when the equalizer's switch moves. While it is skipped the equalizer's and
-            // the leveller's state stand still, as the original's do, rather than being reset.
+            // The rest of the GraphicEq block, whole or not at all (`dfxpProcessReal.cpp:143-157`),
+            // faded in or out when the equalizer's switch moves. While it is skipped the
+            // equalizer's and the leveller's state stand still, as the original's do, rather than
+            // being reset.
             if block_runs {
-                self.run_eq_block(buffer, channels, true);
+                self.run_eq_block(buffer, channels);
             } else {
                 self.sit_out_eq_block();
             }
             self.chain.process(buffer, channels);
         } else {
-            // Bypassed, the gain stage is the one that survives, and all of it: the master gain
-            // and the balance (audit report R3). It survives exactly where the powered branch
-            // above plays it, behind the equalizer's switch, so the power switch never moves the
-            // level; the module documentation has the original's version and why it is not this.
-            // The filters and the leveller stand still.
-            self.eq.sit_out();
-            self.leveller.sit_out();
-            if block_runs {
-                self.run_eq_block(buffer, channels, false);
-            } else {
-                self.gains.settle();
-            }
+            // Bypassed, the gain stage above is all that plays. The filters and the leveller
+            // stand still.
+            self.sit_out_eq_block();
         }
         if !self.eq_block_runs() {
             self.eq.set_enabled(false);
@@ -486,32 +479,32 @@ impl Engine {
     ///
     /// Each stage settles what it was gliding towards, so that when the block comes back it
     /// starts where it was set rather than playing out a glide the listener did not hear begin:
-    /// the gain stage its gains, the equalizer its crossfades, and the leveller the let-down it
-    /// starts when it is switched off (`GraphicEq::sit_out`, `VolumeLeveller::sit_out`).
+    /// the equalizer its crossfades, and the leveller the let-down it starts when it is switched
+    /// off (`GraphicEq::sit_out`, `VolumeLeveller::sit_out`). The gain stage is not one of them:
+    /// it plays whatever the switches say, and glides as it always does.
     fn sit_out_eq_block(&mut self) {
         self.eq.sit_out();
         self.leveller.sit_out();
-        self.gains.settle();
     }
 
-    /// The GraphicEq block over one buffer — the equalizer, the gain stage and the leveller, or
-    /// with FxSound off the gain stage alone — and while the equalizer's switch is fading, its
-    /// output mixed with the audio it was given.
+    /// The GraphicEq block over one buffer — the equalizer and the leveller, the gain stage having
+    /// run before it — and while the equalizer's switch is fading, its output mixed with the audio
+    /// it was given.
     ///
     /// The mix is linear, as every crossfade here is ([`crate::smooth::FadingSection`]). The dry
     /// copy holds a bounded stretch, so a buffer larger than that is taken a stretch at a time
     /// while the fade runs: 2 048 frames of stereo, 512 of 7.1. The leveller then sees those
     /// stretches as buffers, which only matters to how far ahead of a hit it can dip (its
     /// module documentation, audit #4), and only for the 20 ms of the fade.
-    fn run_eq_block(&mut self, buffer: &mut [f32], channels: usize, filters: bool) {
+    fn run_eq_block(&mut self, buffer: &mut [f32], channels: usize) {
         if !self.eq_block.is_gliding() {
-            self.eq_block_pass(buffer, channels, filters);
+            self.eq_block_pass(buffer, channels);
             return;
         }
         let stretch = (self.dry.0.len() / channels).max(1) * channels;
         for part in buffer.chunks_mut(stretch) {
             self.dry.0[..part.len()].copy_from_slice(part);
-            self.eq_block_pass(part, channels, filters);
+            self.eq_block_pass(part, channels);
             for (frame, dry) in part
                 .chunks_exact_mut(channels)
                 .zip(self.dry.0.chunks_exact(channels))
@@ -527,21 +520,16 @@ impl Engine {
         }
     }
 
-    /// The GraphicEq block's stages, in order, at full strength.
-    fn eq_block_pass(&mut self, buffer: &mut [f32], channels: usize, filters: bool) {
-        if filters {
-            self.eq.process(buffer, channels);
-        }
-        self.apply_gain_stage(buffer, channels);
-        if filters {
-            // The subwoofer is levelled with every other channel but kept out of the level
-            // analysis: it carries a deliberately enormous share of the programme's energy, so
-            // letting it into the statistics would pull the gain down on bass-heavy material for
-            // reasons that have nothing to do with how loud the programme actually is. The stage
-            // keeps its own 10 ms clock, whatever the quantum.
-            self.leveller
-                .process_with_lfe(buffer, channels, self.lfe_channel);
-        }
+    /// The GraphicEq block's stages after the gain stage, in order, at full strength.
+    fn eq_block_pass(&mut self, buffer: &mut [f32], channels: usize) {
+        self.eq.process(buffer, channels);
+        // The subwoofer is levelled with every other channel but kept out of the level analysis:
+        // it carries a deliberately enormous share of the programme's energy, so letting it into
+        // the statistics would pull the gain down on bass-heavy material for reasons that have
+        // nothing to do with how loud the programme actually is. The stage keeps its own 10 ms
+        // clock, whatever the quantum.
+        self.leveller
+            .process_with_lfe(buffer, channels, self.lfe_channel);
     }
 
     /// The master gain and the balance attenuation, folded into one pass.
@@ -1102,8 +1090,9 @@ mod tests {
             }
         }
 
+        // The gain stage first, as the engine runs it since audit R3 (it commutes with the
+        // equalizer, but bit for bit only in the order it is done in).
         let mut reference = input;
-        eq.process(&mut reference, 2);
         let (left, right) = balance_gains(params.balance);
         let left = db_to_linear(params.master_gain_db) * left;
         let right = db_to_linear(params.master_gain_db) * right;
@@ -1111,6 +1100,7 @@ mod tests {
             frame[0] *= left;
             frame[1] *= right;
         }
+        eq.process(&mut reference, 2);
         chain.process(&mut reference, 2);
 
         for (index, (got, want)) in through_engine.iter().zip(reference.iter()).enumerate() {
@@ -1122,12 +1112,13 @@ mod tests {
         }
     }
 
-    // --- The equalizer's switch is the GraphicEq block's switch (U3) ---------------------------
+    // --- The equalizer's switch is the GraphicEq block's switch (U3), bar the gain stage (R3) ----
     //
     // `dfxpProcessReal.cpp:143-157`: powered, the block — filters, master gain, balance, levelling
     // — runs only while the equalizer is on. Bypassed, the original runs the master gain alone
-    // behind the same test (`:158-169`, `SosProcess.cpp:500-516`); here the master gain and the
-    // balance run behind it (audit report R3), so the power switch never moves the level.
+    // behind the same test (`:158-169`, `SosProcess.cpp:500-516`). Here the curve and the levelling
+    // are the block; the master gain and the balance run on every path (audit report R3, the
+    // user's decision), so neither the power switch nor the equalizer's moves the level.
 
     /// A snapshot that gives every stage of the GraphicEq block something audible to do.
     fn busy_graphic_eq_block(eq_on: bool) -> DspParams {
@@ -1175,13 +1166,19 @@ mod tests {
     }
 
     #[test]
-    fn turning_the_equalizer_off_takes_the_master_gain_the_balance_and_the_leveller_with_it() {
-        // Upstream aad64c1. With the equalizer off, an engine whose block is set to do a great
-        // deal and one whose block is set to do nothing must hand back the same bits.
+    fn turning_the_equalizer_off_takes_the_curve_and_the_leveller_but_not_the_gain_stage() {
+        // Upstream aad64c1, less the gain stage (audit report R3, changed on purpose: this test
+        // was `turning_the_equalizer_off_takes_the_master_gain_the_balance_and_the_leveller_with_it`).
+        // With the equalizer off, an engine whose curve and leveller are set to do a great deal
+        // and one whose curve and leveller are set to do nothing, at the same master gain and
+        // balance, must hand back the same bits.
         let busy = render_blocks(&busy_graphic_eq_block(false), 60, 0.05);
+        let gains_only = busy_graphic_eq_block(false);
         let plain = render_blocks(
             &DspParams {
                 eq_on: false,
+                master_gain_db: gains_only.master_gain_db,
+                balance: gains_only.balance,
                 ..DspParams::default()
             },
             60,
@@ -1199,9 +1196,10 @@ mod tests {
     }
 
     #[test]
-    fn with_the_equalizer_off_only_the_effect_chain_touches_the_signal() {
+    fn with_the_equalizer_off_only_the_gain_stage_and_the_effect_chain_touch_the_signal() {
         // The effects are not part of the block (`dfxpProcessReal.cpp:174` onwards is outside it),
-        // so the engine must equal the effect chain alone, bit for bit, block for block.
+        // and the gain stage no longer is either (audit report R3), so the engine must equal the
+        // gain stage followed by the effect chain, bit for bit, block for block.
         let mut params = busy_graphic_eq_block(false);
         params.set_effect(EffectId::Fidelity, 0.4);
         params.set_effect(EffectId::Bass, 0.6);
@@ -1213,7 +1211,8 @@ mod tests {
         chain.apply(&params);
         let mut reference = Vec::new();
         for block in 0..20 {
-            let mut buffer = continuous_tone(block * LEVELLER_BLOCK, LEVELLER_BLOCK, 0.2);
+            let input = continuous_tone(block * LEVELLER_BLOCK, LEVELLER_BLOCK, 0.2);
+            let mut buffer = gain_stage_reference(&input, &params);
             chain.process(&mut buffer, 2);
             reference.extend_from_slice(&buffer);
         }
@@ -1289,10 +1288,11 @@ mod tests {
     }
 
     #[test]
-    fn the_bypass_passes_the_audio_untouched_while_the_equalizer_is_off() {
-        // Audit report R3 keeps this test as it was before 0.4.0: the powered path leaves the gain
-        // stage out with the equalizer off, so the bypass does too, or switching FxSound off
-        // would bring in a master gain and a balance that were not playing.
+    fn the_bypass_applies_the_master_gain_and_the_balance_while_the_equalizer_is_off_too() {
+        // Changed on purpose: audit report R3, the user's decision. This test was
+        // `the_bypass_passes_the_audio_untouched_while_the_equalizer_is_off`: the powered path
+        // used to leave the gain stage out with the equalizer off, so the bypass did too. Both now
+        // play it whatever the equalizer says, so switching FxSound off brings in nothing.
         let mut params = busy_graphic_eq_block(false);
         params.power = false;
         params.master_gain_db = 6.0;
@@ -1300,10 +1300,11 @@ mod tests {
         engine.apply(&params);
 
         for block in 0..10 {
-            let input = continuous_tone(block * LEVELLER_BLOCK, LEVELLER_BLOCK, 0.3);
-            let mut buffer = input.clone();
+            let input = continuous_tone(block * LEVELLER_BLOCK, LEVELLER_BLOCK, 0.1);
+            let expected = gain_stage_reference(&input, &params);
+            let mut buffer = input;
             engine.process(&mut buffer, 2);
-            assert_same_bits(&buffer, &input, "bypassed with the equalizer off");
+            assert_same_bits(&buffer, &expected, "bypassed with the equalizer off");
         }
     }
 
@@ -1354,16 +1355,41 @@ mod tests {
     }
 
     #[test]
-    fn switching_fxsound_off_with_the_equalizer_off_does_not_move_the_level() {
-        // Audit report R3, the half of option (b) not taken. Powered with the equalizer off, the
-        // gain stage is out with the rest of the block and Dynamic Boost's ceiling takes 0.3 dB
-        // off both sides. A bypass that applied the master gain and the balance whatever the
-        // equalizer says dropped the left side to -12 dB and the right to -6 dB, a step of 11.7
-        // and 5.7 dB that Windows does not have. Now the bypass leaves them out as well: 0 dB on
-        // both sides, the same 0.3 dB from the powered level as with the equalizer on.
+    fn switching_fxsound_off_with_the_equalizer_off_keeps_the_level_and_the_balance() {
+        // Audit report R3, the user's decision: the master gain and the balance play powered with
+        // the equalizer off as well. Windows plays neither there (0 dB on both sides, less Dynamic
+        // Boost's 0.3 dB), and with FxSound off it plays neither either; the port's first answer
+        // to R3 brought them in on switching off, a step of 11.7 and 5.7 dB. Now both paths play
+        // -12 dB on the left and -6 dB on the right, within the ceiling's 0.3 dB of each other.
         let (powered, bypassed) = power_switch_levels(false);
-        assert_levels(&powered, &[-0.3, -0.3], "powered, equalizer off");
-        assert_levels(&bypassed, &[0.0, 0.0], "bypassed, equalizer off");
+        assert_levels(&powered, &[-12.3, -6.3], "powered, equalizer off");
+        assert_levels(&bypassed, &[-12.0, -6.0], "bypassed, equalizer off");
+    }
+
+    #[test]
+    fn switching_the_equalizer_off_keeps_the_master_gain_and_the_balance() {
+        // Audit report R3, the user's decision. On Windows the equalizer's switch took the master
+        // gain and the balance with it (upstream aad64c1), so at -6 dB and +6 dB switching the
+        // equalizer off jumped the left side up 12 dB and the right 6 dB. With a flat curve and
+        // no levelling the switch now moves neither side at all.
+        let levels = |eq_on| {
+            settled_side_levels(&DspParams {
+                eq_on,
+                master_gain_db: -6.0,
+                balance: 6.0,
+                ..DspParams::default()
+            })
+        };
+        let (on, off) = (levels(true), levels(false));
+        for side in 0..2 {
+            assert!(
+                (on[side] - off[side]).abs() < 0.01,
+                "side {side}: {} dB with the equalizer on, {} dB with it off",
+                on[side],
+                off[side]
+            );
+        }
+        assert_levels(&off, &[-12.3, -6.3], "equalizer off");
     }
 
     #[test]

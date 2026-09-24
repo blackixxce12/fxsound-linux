@@ -3217,7 +3217,6 @@ mod tests {
             (PresetCommand::Overwrite, "factory"),
             (PresetCommand::Rename("Mine".into()), "factory"),
             (PresetCommand::Delete, "factory"),
-            (PresetCommand::SaveAs("Mine".into()), "no unsaved changes"),
             (PresetCommand::Undo, "no unsaved changes"),
         ] {
             let outcome = run(&mut a, &[preset(command.clone())]);
@@ -3265,6 +3264,31 @@ mod tests {
         );
         let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("Mine".into()))]);
         assert!(!outcome.failed, "{}", outcome.stderr);
+        let _ = std::fs::remove_dir_all(user.parent().expect("the root"));
+    }
+
+    #[test]
+    fn save_preset_on_a_preset_with_no_unsaved_changes_saves_a_copy_of_it() {
+        // 0.4.0 audit #17: `--save_preset=Copy` on a clean preset was refused, so copying a
+        // factory preset meant moving a slider and moving it back first.
+        let tag = "save-a-copy";
+        let mut a = app_with_presets(tag);
+        let user = user_dir(tag);
+        run(&mut a, &[preset(PresetCommand::Select("Alpha".into()))]);
+        let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("Copy".into()))]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert!(user.join("Copy.fac").is_file(), "the copy was written");
+        assert_eq!(
+            a.lane_preset(DeviceDirection::Output),
+            Some(("Copy", false))
+        );
+        assert!(
+            a.state
+                .presets
+                .iter()
+                .any(|p| p.name == "Alpha" && p.factory),
+            "the preset it copies is still there"
+        );
         let _ = std::fs::remove_dir_all(user.parent().expect("the root"));
     }
 

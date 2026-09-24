@@ -24,6 +24,15 @@
 //! **double-click does nothing** — FxSound has no double-click-to-reset. Right-click resets to the
 //! default on the audio sliders and on balance, and does nothing on the five effect sliders.
 //!
+//! Two departures (0.4.0 audit #14). On **every** slider a press on the thumb moves nothing until
+//! the pointer does, where JUCE jumps to the pointer there too: a value can sit between a
+//! slider's positions — a preset's Surround of 1.6 among eleven positions over 128 stored
+//! values, a `--master_gain=3` on the speakers' 2 dB interval — and a touch snapped it to one,
+//! and even on a position a press half a thumb off centre moved the master gain or the balance
+//! by a whole 2 dB step. And on a slider whose values are finer than its interval, the five
+//! effects, **Shift** makes the arrows, the wheel and a drag move by one stored value
+//! ([`FineSteps`]).
+//!
 //! ## Balance
 //!
 //! `FxBalanceSlider` is the one slider that paints itself (`FxBalanceSlider.cpp:65-105`): no
@@ -73,6 +82,14 @@ pub enum Track {
     Balance,
 }
 
+/// The values between a slider's whole steps that it can also stand at: what Shift reaches.
+pub trait FineSteps {
+    /// The value one fine step from `value`, up or down; `value` itself at either end.
+    fn step(&self, value: f32, up: bool) -> f32;
+    /// The fine value nearest `value`.
+    fn nearest(&self, value: f32) -> f32;
+}
+
 /// A horizontal slider drawn like FxSound's.
 pub struct FxSlider<'a> {
     value: &'a mut f32,
@@ -85,6 +102,7 @@ pub struct FxSlider<'a> {
     reset_on_secondary_click: bool,
     fidelity: Fidelity,
     track: Track,
+    fine: Option<&'a dyn FineSteps>,
 }
 
 impl<'a> FxSlider<'a> {
@@ -101,7 +119,16 @@ impl<'a> FxSlider<'a> {
             reset_on_secondary_click: false,
             fidelity: Fidelity::default(),
             track: Track::default(),
+            fine: None,
         }
+    }
+
+    /// The values between the whole steps this slider can stand at, which the arrows, the wheel
+    /// and a drag reach with Shift held (0.4.0 audit #14). Without them Shift does nothing.
+    #[must_use]
+    pub fn fine_steps(mut self, fine: &'a dyn FineSteps) -> Self {
+        self.fine = Some(fine);
+        self
     }
 
     /// The value a right-click resets to. Only meaningful with
@@ -171,6 +198,7 @@ impl<'a> FxSlider<'a> {
             reset_on_secondary_click,
             fidelity,
             track: style,
+            fine,
         } = self;
 
         let id = Id::new("fx_slider").with(id_salt);
@@ -197,15 +225,22 @@ impl<'a> FxSlider<'a> {
             // resets without first dragging the thumb to the pointer.
             let resetting = reset_on_secondary_click
                 && ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+            // Shift asks for the fine values, where the slider has them.
+            let fine = fine.filter(|_| ui.input(|i| i.modifiers.shift));
 
             // Clicking the track jumps to that position and starts the drag from there, which is
-            // JUCE's `snapsToMousePos` default.
+            // JUCE's `snapsToMousePos` default — except a press on the thumb, which holds the
+            // value until the pointer moves (see the module documentation).
             if !resetting
                 && response.is_pointer_button_down_on()
                 && let Some(pointer) = response.interact_pointer_pos()
+                && !held_on_thumb(ui, id, rect, track, (*value - min) / span, pointer)
             {
                 let t = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0);
                 new_value = min + t * span;
+                if let Some(fine) = fine {
+                    new_value = fine.nearest(new_value);
+                }
                 interacted = true;
             }
 
@@ -216,33 +251,52 @@ impl<'a> FxSlider<'a> {
 
             if response.hovered() {
                 // 0.36 exposes only the smoothed delta; one notch is still one step, which is
-                // what JUCE's default wheel handling does.
-                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                // what JUCE's default wheel handling does. With Shift held egui turns the wheel
+                // sideways, so the fine step reads the other axis.
+                let scroll = ui.input(|i| {
+                    if fine.is_some() {
+                        i.smooth_scroll_delta.x + i.smooth_scroll_delta.y
+                    } else {
+                        i.smooth_scroll_delta.y
+                    }
+                });
                 if scroll != 0.0 {
-                    new_value += scroll.signum() * step;
+                    new_value = match fine {
+                        Some(fine) => fine.step(new_value, scroll > 0.0),
+                        None => step_towards(new_value, min, step, scroll > 0.0),
+                    };
                     interacted = true;
                 }
             }
 
             if response.has_focus() {
                 let stepped = ui.input(|i| {
-                    let mut delta = 0.0;
+                    let mut delta = 0;
                     if i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::ArrowRight) {
-                        delta += step;
+                        delta += 1;
                     }
                     if i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::ArrowLeft) {
-                        delta -= step;
+                        delta -= 1;
                     }
                     delta
                 });
-                if stepped != 0.0 {
-                    new_value += stepped;
+                if stepped != 0 {
+                    new_value = match fine {
+                        Some(fine) => fine.step(new_value, stepped > 0),
+                        None => step_towards(new_value, min, step, stepped > 0),
+                    };
                     interacted = true;
                 }
             }
 
             if interacted {
-                let new_value = quantise(new_value, min, max, step);
+                // A fine value is already one the slider can stand at; snapping it to the
+                // interval would take it straight back to a whole step.
+                let new_value = if fine.is_some() {
+                    new_value.clamp(min.min(max), max.max(min))
+                } else {
+                    quantise(new_value, min, max, step)
+                };
                 if new_value != *value {
                     *value = new_value;
                     response.mark_changed();
@@ -267,6 +321,33 @@ impl<'a> FxSlider<'a> {
     }
 }
 
+/// Whether the press under way began on the thumb and the pointer has not left its starting
+/// point since, in which case the slider holds its value: a touch is not a move (0.4.0 audit
+/// #14), on every slider, the levels as much as the effects. Once the pointer has moved two
+/// points the press is an ordinary drag for the rest of its life, back over its starting point
+/// included.
+fn held_on_thumb(ui: &Ui, id: Id, rect: Rect, track: Rect, t: f32, pointer: egui::Pos2) -> bool {
+    let Some(origin) = ui.input(|i| i.pointer.press_origin()) else {
+        return false;
+    };
+    let key = id.with("held_on_thumb");
+    let (pressed_at, mut holding) = ui
+        .data(|d| d.get_temp::<(egui::Pos2, bool)>(key))
+        .filter(|(pressed_at, _)| *pressed_at == origin)
+        .unwrap_or_else(|| {
+            let thumb = pos2(
+                track.left() + track.width() * t.clamp(0.0, 1.0),
+                rect.center().y,
+            );
+            (origin, origin.distance(thumb) <= THUMB_RADIUS)
+        });
+    if holding && (pointer.x - pressed_at.x).abs() >= 2.0 {
+        holding = false;
+    }
+    ui.data_mut(|d| d.insert_temp(key, (pressed_at, holding)));
+    holding
+}
+
 /// The track rectangle inside a slider component.
 #[must_use]
 pub fn track_rect(rect: Rect) -> Rect {
@@ -287,6 +368,32 @@ pub fn quantise(value: f32, min: f32, max: f32, step: f32) -> f32 {
     }
     let steps = ((clamped - min) / step).round();
     (min + steps * step).clamp(min.min(max), max.max(min))
+}
+
+/// Where one arrow key or wheel notch takes `value` on a slider whose positions sit every
+/// `step` from `min`: one position on from a value that is on one, and the next position in the
+/// direction of travel from a value between two.
+///
+/// Adding a whole step to a value between positions and then rounding skipped a position:
+/// Surround at 1.57 went up to 3 and `--master_gain=3` on the 2 dB step went up to 6 (0.4.0
+/// audit #14 keeps such values until the user moves the slider). The result is not clamped;
+/// [`quantise`] does that.
+#[must_use]
+pub fn step_towards(value: f32, min: f32, step: f32, up: bool) -> f32 {
+    if step <= 0.0 {
+        return value;
+    }
+    let steps = (value - min) / step;
+    let nearest = steps.round();
+    // A value on a position up to float noise, such as a sum of tenths, counts as on it.
+    let target = if (steps - nearest).abs() <= 1e-3 {
+        nearest + if up { 1.0 } else { -1.0 }
+    } else if up {
+        steps.ceil()
+    } else {
+        steps.floor()
+    };
+    min + target * step
 }
 
 /// Where the balance gradient stops: at the track's end, or — reproducing
@@ -534,6 +641,51 @@ mod tests {
         assert_eq!(quantise(-3.0, -20.0, 20.0, 2.0), -2.0);
         // Filter width steps by 0.5 over 1..3.
         assert_eq!(quantise(1.7, 1.0, 3.0, 0.5), 1.5);
+    }
+
+    #[test]
+    fn a_step_from_a_position_moves_one_whole_step_either_way() {
+        assert_eq!(step_towards(2.0, 0.0, 1.0, true), 3.0);
+        assert_eq!(step_towards(2.0, 0.0, 1.0, false), 1.0);
+        assert_eq!(step_towards(4.0, -20.0, 2.0, true), 6.0);
+        assert_eq!(step_towards(-4.0, -20.0, 2.0, false), -6.0);
+        // Float noise on a position still counts as the position.
+        assert_eq!(step_towards(0.1 + 0.2, 0.0, 0.1, true), 0.4);
+    }
+
+    #[test]
+    fn a_step_from_between_two_positions_stops_at_the_next_one_in_that_direction() {
+        // 0.4.0 audit #14: Surround at 1.57 went up to 3 and a master gain of 3 dB to 6 dB.
+        assert_eq!(step_towards(1.57, 0.0, 1.0, true), 2.0);
+        assert_eq!(step_towards(1.57, 0.0, 1.0, false), 1.0);
+        assert_eq!(step_towards(3.0, -20.0, 2.0, true), 4.0);
+        assert_eq!(step_towards(3.0, -20.0, 2.0, false), 2.0);
+        assert_eq!(step_towards(-3.0, -20.0, 2.0, true), -2.0);
+        assert_eq!(step_towards(-3.0, -20.0, 2.0, false), -4.0);
+        // Filter width steps by 0.5 from 1.
+        assert_eq!(step_towards(1.7, 1.0, 0.5, true), 2.0);
+        assert_eq!(step_towards(1.7, 1.0, 0.5, false), 1.5);
+    }
+
+    #[test]
+    fn a_step_past_either_end_is_clamped_back_by_quantise() {
+        assert_eq!(
+            quantise(step_towards(10.0, 0.0, 1.0, true), 0.0, 10.0, 1.0),
+            10.0
+        );
+        assert_eq!(
+            quantise(step_towards(0.0, 0.0, 1.0, false), 0.0, 10.0, 1.0),
+            0.0
+        );
+        assert_eq!(
+            quantise(step_towards(19.0, -20.0, 2.0, true), -20.0, 20.0, 2.0),
+            20.0
+        );
+    }
+
+    #[test]
+    fn a_step_without_a_step_size_leaves_the_value_alone() {
+        assert_eq!(step_towards(3.456, 0.0, 0.0, true), 3.456);
     }
 
     #[test]

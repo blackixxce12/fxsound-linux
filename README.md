@@ -218,15 +218,17 @@ For an output device, processing order is fixed by the original and is **not** t
 sliders appear in:
 
 ```
-in ─► 31-band graphic EQ ─► master gain · balance ─► volume levelling
-      └───────────── skipped whole while the EQ is off ─────────────┘
+in ─► master gain · balance ─► 31-band graphic EQ ─► volume levelling
+                               └─── skipped while the EQ is off ───┘
    ─► Fidelity ─► Ambience ─► Surround ─► Bass ─► Dynamic Boost ─► out
 ```
 
-The first three stages are one block in the original, and the equalizer's switch is that block's
-switch: with the EQ off, the master gain, the balance and the volume levelling go with it, and only
-the effects run. Power off bypasses everything but the master gain, which still applies — without
-the balance, and only while the EQ is on.
+The EQ, the master gain, the balance and the volume levelling are one block in the original, whose
+switch the equalizer's is. Here the master gain and the balance play whatever the EQ switch and the
+power button say, so neither switch moves the level or the balance: with the EQ off the curve and
+the volume levelling are skipped and the effects run, and power off bypasses everything but the
+master gain and the balance. On 5.1 and 7.1 the balance turns down a whole side — front, side and
+rear — and leaves the centre and the subwoofer alone.
 
 | Effect | Algorithm |
 |---|---|
@@ -234,7 +236,7 @@ the balance, and only while the EQ is on.
 | Ambience | Dattorro/Lexicon-224-style figure-of-eight plate reverb |
 | Surround | Mid/side gain widener, side ×(1+3i), mid ×(1−0.3i) |
 | Bass | One parametric peaking biquad, 90 Hz, Q 2.5, 0–15 dB |
-| Dynamic Boost | ~1.6 s RMS auto-gain plus a 0.75 ms look-ahead brick-wall limiter |
+| Dynamic Boost | ~1.6 s RMS auto-gain plus a 0.75 ms look-ahead brick-wall limiter, linked across the channels, that holds its gain 20 ms before letting go |
 
 Total added latency is the limiter's look-ahead: 0.75 ms.
 
@@ -260,7 +262,7 @@ mic ─► RNNoise ─► high-pass ─► gate ─► 10-band EQ ─► de-esse
 | De-esser | Split-band, fourth-order Linkwitz–Riley crossover, acting only on the high band |
 | Compressor | Threshold, ratio, soft knee, attack, release, peak or RMS detection |
 | Makeup | Applied after everything that measures, so a preset's thresholds mean what they say |
-| Limiter | 1 ms look-ahead, always running. It is the only stage that cannot be switched off: makeup gain is the one control here that can push a sample past full scale |
+| Limiter | 1 ms look-ahead, linked across the channels with a 20 ms hold, always running. It is the only stage that cannot be switched off: makeup gain is the one control here that can push a sample past full scale |
 
 The order is not a preference — each position is argued, with its reason, at the top of
 [`crates/fxsound-dsp/src/input/chain.rs`](crates/fxsound-dsp/src/input/chain.rs). Denoising goes
@@ -320,12 +322,31 @@ directions between this port and the Windows build.
 The flip button at the top of the effect column turns it over to the equalizer's own controls, as in
 the original since 1.2.12: the band count, the master gain, the volume leveling, the filter width,
 the balance and Restore Defaults. Each slider has the original's range and step, and a right-click
-puts it back to its default.
+puts it back to its default. A press on a slider's thumb, here as on the effects, moves nothing until
+the pointer does, where Windows jumps to the pointer and can move the gain or the balance by a step.
+
+An effect slider has the original's eleven positions, but a preset stores 128 values: one between two
+positions is shown with its decimal (General's Surround reads 1.6), a press on the thumb does not
+move it, a plain arrow key or wheel notch takes it to the next position that way (Surround 1.6 to 2
+or 1), and **Shift** with the arrow keys, the wheel or a drag steps one stored value at a time, so
+loading a preset and saving it changes nothing. Ambience's positions 1 to 10 run over the values it
+can be heard at; on Windows positions 1 to 3 were all but silent.
 
 A preset lands on your band count, as in the original since 1.2.11: pick a ten-band preset while on
 31 bands and its curve is fitted onto the 31, and changing the band count carries the curve over
-instead of flattening it. Restore Defaults puts back ten bands and the neutral levels, and keeps the
-curve. Export writes a preset as last saved, never its unsaved edits.
+instead of flattening it. Both go by frequency, so a boost stays where it was. The band count is
+your setting, not an edit to the preset. Restore Defaults puts back the neutral levels and keeps the
+band count and the curve. The twenty-band equalizer's bands sit every half octave; a Windows
+twenty-band preset is moved onto them band for band, and exported back on the Windows ladder.
+Export writes a preset as last saved, never its unsaved edits.
+
+Unsaved edits are kept in `AutoSave/` a minute after the first one and whenever you switch presets
+or quit, so a crash loses at most a minute. **Delete Preset** asks first and moves the file to the
+desktop's trash, where a file manager can restore it, and its unsaved edits with it: restore both
+and the preset is back with its `*`. **Save New Preset** also copies a preset with
+no unsaved changes. A new preset's name is cut to the 126 bytes a Windows FxSound reads a name in
+(63 Cyrillic letters). **Reset presets** in Settings asks first, then discards every unsaved change
+and keeps your saved presets. `max_user_presets` in the settings file allows 10 to 1000 presets.
 
 The settings file keeps the original's key names so it can be diffed against the Windows
 `FxSound.settings`. Settings and presets are written durably — temporary file, fsync, rename — so an

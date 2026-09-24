@@ -28,9 +28,16 @@
 //! the engines stay what they were, a pure function of their input and their snapshot. The
 //! meters still describe the chain's output, not the silence; nobody reads them while the system
 //! sleeps. Upstream does the same thing one step later — its mute keeps capturing and processing
-//! and only skips the playback call (`AudioPassthruPrivate.cpp:568`) — and its cut is as hard as
-//! this one: a de-click ramp belongs with the fade in from silence a new pair gets ([`Tail`],
-//! U10), which is where it would go.
+//! and only skips the playback call (`AudioPassthruPrivate.cpp:568`) — and its cut is a hard one.
+//! Here the lane fades out over [`MUTE_FADE_SECONDS`] and back in over the same when the mute
+//! lifts, in the stage that fades a new pair in ([`Tail::fade_mute`]), so neither the mute nor the
+//! unmute clicks: a hard cut in the middle of a bass note is a step of up to full scale between
+//! two samples. What the lane holds while muted is silence, exactly. Only a mute or an unmute that
+//! comes while the lane plays fades: a lane's first block, and the first block of each new pair
+//! (or of a fade in again), take the mute as they find it, because nothing was playing that a cut
+//! could click in. A lane or a route muted from the start — a microphone muted before the recorder
+//! opens — gives silence from its first sample, and one that is not rises with the pair's own fade
+//! in from silence.
 //!
 //! # After the chain
 //!
@@ -91,6 +98,10 @@ use crate::{DEFAULT_SAMPLE_RATE, MAX_CHANNELS, MAX_QUANTUM_FRAMES, MIN_CHANNELS}
 /// upstream review asked for, long enough that a first sound is not a click and short enough to
 /// be over before a listener could call it a fade.
 pub(crate) const FADE_IN_SECONDS: f32 = 0.03;
+
+/// How long a mute takes to fade the lane out, and an unmute to fade it back in: the 20 ms every
+/// other gain the user can move glides over in the chain (`fxsound_dsp::smooth::GLIDE_SECONDS`).
+pub(crate) const MUTE_FADE_SECONDS: f32 = 0.02;
 
 /// The DSP state of one lane, kept across reconnects and pairs of nodes.
 ///
@@ -184,11 +195,12 @@ impl LaneDsp {
         self.begin_pair();
     }
 
-    /// Where the subwoofer and the front pair sit in the negotiated layout. The output lane's
-    /// business only — see [`OutputDsp::set_layout`]; the input lane has nothing to place.
-    pub(crate) fn set_layout(&mut self, lfe: Option<usize>, front_pair: Option<(usize, usize)>) {
+    /// Where the subwoofer and the front pair sit in the negotiated layout, and which side each
+    /// channel is on. The output lane's business only — see [`OutputDsp::set_layout`]; the input
+    /// lane has nothing to place.
+    pub(crate) fn set_layout(&mut self, positions: &crate::devices::ChannelMap) {
         if let Self::Output(dsp) = self {
-            dsp.set_layout(lfe, front_pair);
+            dsp.set_layout(positions);
         }
     }
 
@@ -444,13 +456,17 @@ impl OutputDsp {
         self.engine.set_format(sample_rate, channels);
     }
 
-    /// Where the subwoofer and the front pair sit in the negotiated layout.
+    /// Where the subwoofer and the front pair sit in the negotiated layout, and the side of every
+    /// channel, which the balance turns down by and Dynamic Boost's limiter links by (0.4.0 audit
+    /// #44, R2). After [`Self::set_format`], so the list has one entry per channel.
     ///
     /// Output only, and not because the input side was forgotten: the voice chain has no stage
     /// that mixes one channel into another, so there is no layout for it to get wrong.
-    fn set_layout(&mut self, lfe: Option<usize>, front_pair: Option<(usize, usize)>) {
-        self.engine.set_lfe_channel(lfe);
-        self.engine.set_front_pair(front_pair);
+    fn set_layout(&mut self, positions: &crate::devices::ChannelMap) {
+        self.engine.set_lfe_channel(positions.lfe_index());
+        self.engine.set_front_pair(positions.front_pair());
+        let (sides, len) = positions.sides();
+        self.engine.set_channel_sides(Some(&sides[..len]));
     }
 
     #[inline]
@@ -477,7 +493,8 @@ impl OutputDsp {
         let scratch = decode(&mut self.scratch, block, channels)?;
         self.boost.apply(scratch, channels);
         self.engine.process(scratch, channels);
-        silence_if(self.muted || self.system_muted, scratch);
+        self.tail
+            .fade_mute(self.muted || self.system_muted, scratch, channels);
         self.tail.apply(scratch, channels);
         Some(scratch)
     }
@@ -636,7 +653,8 @@ impl InputDsp {
         let scratch = decode(&mut self.scratch, block, channels)?;
         self.boost.apply(scratch, channels);
         self.engine.process(scratch, channels);
-        silence_if(self.muted || self.system_muted, scratch);
+        self.tail
+            .fade_mute(self.muted || self.system_muted, scratch, channels);
         self.tail.apply(scratch, channels);
         Some(scratch)
     }
@@ -699,6 +717,12 @@ pub(crate) struct Tail {
     fade_done: u32,
     /// The fade's length in frames, at the rate the pair runs.
     fade_len: u32,
+    /// How much of the lane the mute lets through: 1 unmuted, 0 muted, and a straight line between
+    /// the two while a mute or an unmute fades ([`Self::fade_mute`]).
+    mute_level: f32,
+    /// The next block takes the mute as it finds it instead of fading to it: a new lane's first
+    /// block and a new pair's (see the module's "Mute").
+    mute_unsettled: bool,
     sample_rate: f32,
 }
 
@@ -709,6 +733,8 @@ impl Tail {
             target: [1.0; CHANNELS],
             fade_done: 0,
             fade_len: 0,
+            mute_level: 1.0,
+            mute_unsettled: true,
             sample_rate: DEFAULT_SAMPLE_RATE as f32,
         }
     }
@@ -719,11 +745,46 @@ impl Tail {
         }
     }
 
-    /// Start a new pair: from silence, at the gains it was told last rather than ramping there.
+    /// Fade the lane out while `muted`, and back in once it is not, over [`MUTE_FADE_SECONDS`]
+    /// (see the module's "Mute"): each frame one step of the fade, and a lane that has faded out
+    /// silence, exactly. After the chain, so the chain has already seen the block.
+    ///
+    /// The first block of a lane, and of each new pair, starts at the mute it finds: silence from
+    /// its first sample when muted, the whole signal — under the pair's fade in from silence —
+    /// when not. Nothing played before it that a cut could click in.
+    #[inline]
+    fn fade_mute(&mut self, muted: bool, block: &mut [f32], channels: usize) {
+        let target = if muted { 0.0 } else { 1.0 };
+        if self.mute_unsettled {
+            self.mute_unsettled = false;
+            self.mute_level = target;
+        }
+        if self.mute_level == target {
+            if muted {
+                block.fill(0.0);
+            }
+            return;
+        }
+        let step = 1.0 / (self.sample_rate * MUTE_FADE_SECONDS).max(1.0);
+        for frame in block.chunks_exact_mut(channels.max(1)) {
+            self.mute_level = if muted {
+                (self.mute_level - step).max(0.0)
+            } else {
+                (self.mute_level + step).min(1.0)
+            };
+            for sample in frame {
+                *sample *= self.mute_level;
+            }
+        }
+    }
+
+    /// Start a new pair: from silence, at the gains it was told last rather than ramping there,
+    /// and at the mute its first block finds ([`Self::fade_mute`]).
     fn begin_pair(&mut self) {
         self.current = self.target;
         self.fade_len = ((self.sample_rate * FADE_IN_SECONDS) as u32).max(1);
         self.fade_done = 0;
+        self.mute_unsettled = true;
     }
 
     /// Take each channel's volume, of which this stage applies the part up to unity: nothing after
@@ -846,16 +907,6 @@ impl Boost {
 /// eight channels (`docs/spec/12-audio-io.md` §24). Allocated once, on the main loop.
 fn worst_case_scratch() -> Vec<f32> {
     vec![0.0; MAX_QUANTUM_FRAMES * MAX_CHANNELS as usize]
-}
-
-/// Replace a processed block with silence while the lane is muted. After the chain, so the chain
-/// has already seen the block; a `fill` of memory that exists, so nothing here can allocate or
-/// panic.
-#[inline]
-fn silence_if(muted: bool, processed: &mut [f32]) {
-    if muted {
-        processed.fill(0.0);
-    }
 }
 
 /// Read as many whole frames of little-endian `f32` out of `block` as fit, into the front of
@@ -1144,13 +1195,36 @@ pub(crate) mod tests {
         assert_eq!(lanes.output.meters(), before);
 
         let spec = |dsp: &mut LaneDsp| dsp.as_input_mut().map(|d| d.engine.spec());
-        lanes.input.set_layout(Some(3), Some((0, 1)));
+        lanes
+            .input
+            .set_layout(&crate::devices::ChannelMap::default_for(6));
         assert_eq!(spec(&mut lanes.input), Some(ChainSpec::voice()));
         assert_eq!(
             spec(&mut lanes.output),
             None,
             "the music lane has no voice chain"
         );
+    }
+
+    #[test]
+    fn the_music_lane_balances_the_sides_its_device_names_whatever_their_order() {
+        // 0.4.0 audit #44: the engine was never told the sides, so a device that orders its
+        // channels its own way had only its front pair balanced, and `FL,FR,FC,RC` had its centre
+        // and rear centre taken for the rears and turned down.
+        use fxsound_dsp::ChannelSide::{Centre as C, Left as L, Right as R};
+        let (mut lanes, _handover) = lanes_for_tests();
+        for (layout, expected) in [
+            ("RL,RR,FL,FR,FC,LFE", vec![L, R, L, R, C, C]),
+            ("FL,FR,FC,RC", vec![L, R, C, C]),
+        ] {
+            let positions = crate::devices::ChannelMap::parse(layout).expect("a layout");
+            lanes.output.set_format(48_000.0, positions.len());
+            lanes.output.set_layout(&positions);
+            let LaneDsp::Output(dsp) = &lanes.output else {
+                unreachable!("the output slot holds the output lane's DSP");
+            };
+            assert_eq!(dsp.engine.channel_sides(), expected.as_slice(), "{layout}");
+        }
     }
 
     /// The audio thread never drops an engine. When the return channel is full — the main loop
@@ -1275,6 +1349,16 @@ pub(crate) mod tests {
         block.iter().all(|sample| *sample == 0.0)
     }
 
+    /// How many of [`tone_block`]'s 480-frame blocks a mute or an unmute takes to fade: 20 ms at
+    /// 48 kHz is 960 frames.
+    const FADE_BLOCKS: usize = 2;
+
+    fn peak(block: &[f32]) -> f32 {
+        block
+            .iter()
+            .fold(0.0_f32, |acc, sample| acc.max(sample.abs()))
+    }
+
     /// A snapshot of the music chain with state that remembers: a boosted band, the leveller, and
     /// every effect up — so a chain that stopped while muted would come back different.
     pub(crate) fn busy_output_params(mute: bool) -> DspParams {
@@ -1290,13 +1374,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_muted_output_lane_hands_the_ring_silence() {
+    fn a_muted_output_lane_fades_to_silence_and_hands_the_ring_silence() {
         let mut w = wired();
         let playing = run_block(&mut w.lanes.output, 0);
         assert!(!is_silent(&playing), "the tone gets through unmuted");
 
         w.params.write(busy_output_params(true));
-        for index in 1..5 {
+        for index in 1..=FADE_BLOCKS {
+            let fading = run_block(&mut w.lanes.output, index);
+            assert!(!is_silent(&fading), "block {index} is the fade, not a cut");
+        }
+        for index in FADE_BLOCKS + 1..FADE_BLOCKS + 5 {
             assert!(
                 is_silent(&run_block(&mut w.lanes.output, index)),
                 "block {index}"
@@ -1305,9 +1393,59 @@ pub(crate) mod tests {
 
         w.params.write(busy_output_params(false));
         assert!(
-            !is_silent(&run_block(&mut w.lanes.output, 5)),
+            !is_silent(&run_block(&mut w.lanes.output, 10)),
             "and comes back on the first block after the unmute"
         );
+    }
+
+    #[test]
+    fn a_mute_and_an_unmute_ramp_the_level_rather_than_stepping_it() {
+        // The DSP track's note on audit #11: the mute was a hard cut, a step of up to full scale
+        // between two samples under a bass note, and so was the unmute. Measured against a lane
+        // that is never muted, fed the same: neither edge of the mute may add a step to what the
+        // programme does on its own.
+        let mut muted = wired();
+        let mut reference = wired();
+        muted.params.write(busy_output_params(false));
+        reference.params.write(busy_output_params(false));
+        let mut out = Vec::new();
+        let mut plain = Vec::new();
+        for index in 0..2 + 2 * FADE_BLOCKS + 2 {
+            if index == 2 {
+                muted.params.write(busy_output_params(true));
+            }
+            if index == 2 + FADE_BLOCKS + 1 {
+                muted.params.write(busy_output_params(false));
+            }
+            out.extend(run_block(&mut muted.lanes.output, index));
+            plain.extend(run_block(&mut reference.lanes.output, index));
+        }
+        let steps = |samples: &[f32]| -> Vec<f32> {
+            samples
+                .iter()
+                .step_by(2)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .map(|pair| (pair[1] - pair[0]).abs())
+                .collect()
+        };
+        // From the second block on, past the chain's own start.
+        let (plain, out) = (&plain[960..], &out[960..]);
+        let natural = steps(plain).into_iter().fold(0.0_f32, f32::max);
+        let loudest = out.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        assert!(
+            natural > 0.0 && natural < loudest / 2.0,
+            "the fixture must tell a cut from the programme: {natural} against {loudest}"
+        );
+        for (at, step) in steps(out).into_iter().enumerate() {
+            assert!(
+                step <= natural * 1.05,
+                "a step of {step} at frame {at}, the programme's own at most {natural}"
+            );
+        }
+        // And the fade really reaches silence in between.
+        let silent = &out[(1 + FADE_BLOCKS) * 960..(2 + FADE_BLOCKS) * 960];
+        assert!(is_silent(silent), "peak {}", peak(silent));
     }
 
     #[test]
@@ -1319,7 +1457,10 @@ pub(crate) mod tests {
             mute: true,
             ..InputDspParams::default()
         });
-        for index in 1..5 {
+        for index in 1..=FADE_BLOCKS {
+            run_block(&mut w.lanes.input, index);
+        }
+        for index in FADE_BLOCKS + 1..FADE_BLOCKS + 5 {
             assert!(
                 is_silent(&run_block(&mut w.lanes.input, index)),
                 "block {index}"
@@ -1327,7 +1468,7 @@ pub(crate) mod tests {
         }
 
         w.input_params.write(InputDspParams::default());
-        assert!(!is_silent(&run_block(&mut w.lanes.input, 5)));
+        assert!(!is_silent(&run_block(&mut w.lanes.input, 10)));
     }
 
     #[test]
@@ -1350,6 +1491,91 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_lane_muted_from_its_first_block_is_silent_from_its_first_sample() {
+        // A microphone muted before the recorder opens it gets exact silence, not the 20 ms of
+        // fade out a mute while it plays takes: nothing played before its first block.
+        let mut w = wired();
+        w.params.write(busy_output_params(true));
+        w.input_params.write(InputDspParams {
+            mute: true,
+            ..InputDspParams::default()
+        });
+        for index in 0..=FADE_BLOCKS {
+            assert!(
+                is_silent(&run_block(&mut w.lanes.output, index)),
+                "the music lane, block {index}"
+            );
+            assert!(
+                is_silent(&run_block(&mut w.lanes.input, index)),
+                "the microphone, block {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_pair_starts_at_the_mute_it_finds_and_only_a_mute_while_it_plays_fades() {
+        // One period of the 1 kHz tone at 48 kHz, both channels: where a fade shows.
+        const PERIOD: usize = 2 * 48;
+        let rises =
+            |block: &[f32]| peak(&block[..PERIOD]) < 0.2 * peak(&block[block.len() - PERIOD..]);
+        let mut w = wired();
+        for (direction, dsp) in w.lanes.iter_mut() {
+            let lane = direction.key();
+            // Playing, unmuted; then muted while it has no pair — a device change, a reconnect.
+            assert!(!is_silent(&run_block_held(dsp, 0, false)), "{lane}");
+            dsp.begin_pair();
+            for index in 1..=FADE_BLOCKS {
+                assert!(
+                    is_silent(&run_block_held(dsp, index, true)),
+                    "the {lane} lane's new pair, muted, block {index}"
+                );
+            }
+            // Unmuted while it plays: the 20 ms fade in, from silence.
+            let back = run_block_held(dsp, FADE_BLOCKS + 1, false);
+            assert!(
+                !is_silent(&back) && rises(&back),
+                "the {lane} lane fades in"
+            );
+            // Muted again, and the next pair unmuted: whole at once under the pair's own fade in
+            // from silence, with no mute fade left to finish behind it.
+            for index in FADE_BLOCKS + 2..=3 * FADE_BLOCKS + 2 {
+                run_block_held(dsp, index, true);
+            }
+            dsp.begin_pair();
+            let pair = run_block_held(dsp, 20, false);
+            assert!(
+                !is_silent(&pair) && rises(&pair),
+                "the {lane} lane's pair fades in"
+            );
+            assert!(
+                (dsp.tail_mut().mute_level - 1.0).abs() < f32::EPSILON,
+                "the {lane} lane's new pair plays unmuted from its first block"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_muted_from_its_first_block_is_silent_from_its_first_sample() {
+        let (mut dsp, _writer, _, _) = route(
+            RouteParams::Output(busy_output_params(true)),
+            ChainSpec::voice(),
+        );
+        dsp.set_format(48_000.0, 2);
+        dsp.begin_pair();
+        assert!(is_silent(&run_block(&mut dsp, 0)));
+        let (mut dsp, _writer, _, _) = route(
+            RouteParams::Input(InputDspParams {
+                mute: true,
+                ..InputDspParams::default()
+            }),
+            ChainSpec::voice(),
+        );
+        dsp.set_format(48_000.0, 2);
+        dsp.begin_pair();
+        assert!(is_silent(&run_block(&mut dsp, 0)));
+    }
+
+    #[test]
     fn the_output_chain_keeps_running_under_the_mute_so_the_unmute_joins_it_in_step() {
         // Two lanes fed the same programme, one muted for a while. If the mute had stopped the
         // chain, the filters, the leveller and the effects would resume from the state they held
@@ -1366,12 +1592,21 @@ pub(crate) mod tests {
 
         muted.params.write(busy_output_params(true));
         for index in 3..40 {
-            assert!(is_silent(&run_block(&mut muted.lanes.output, index)));
+            let block = run_block(&mut muted.lanes.output, index);
+            assert!(
+                index < 3 + FADE_BLOCKS || is_silent(&block),
+                "block {index}"
+            );
             run_block(&mut reference.lanes.output, index);
         }
 
+        // Once the unmute has faded in, bit for bit the never-muted lane's.
         muted.params.write(busy_output_params(false));
-        for index in 40..43 {
+        for index in 40..40 + FADE_BLOCKS {
+            run_block(&mut muted.lanes.output, index);
+            run_block(&mut reference.lanes.output, index);
+        }
+        for index in 40 + FADE_BLOCKS..43 + FADE_BLOCKS {
             assert_eq!(
                 run_block(&mut muted.lanes.output, index),
                 run_block(&mut reference.lanes.output, index),
@@ -1400,7 +1635,11 @@ pub(crate) mod tests {
         }
         muted.input_params.write(mute);
         for index in 3..40 {
-            assert!(is_silent(&run_block(&mut muted.lanes.input, index)));
+            let block = run_block(&mut muted.lanes.input, index);
+            assert!(
+                index < 3 + FADE_BLOCKS || is_silent(&block),
+                "block {index}"
+            );
             run_block(&mut reference.lanes.input, index);
         }
         let (during, expected) = (muted.lanes.input.meters(), reference.lanes.input.meters());
@@ -1411,7 +1650,11 @@ pub(crate) mod tests {
         assert!(during.input_peak > 0.4, "{}", during.input_peak);
 
         muted.input_params.write(InputDspParams::default());
-        for index in 40..43 {
+        for index in 40..40 + FADE_BLOCKS {
+            run_block(&mut muted.lanes.input, index);
+            run_block(&mut reference.lanes.input, index);
+        }
+        for index in 40 + FADE_BLOCKS..43 + FADE_BLOCKS {
             assert_eq!(
                 run_block(&mut muted.lanes.input, index),
                 run_block(&mut reference.lanes.input, index),
@@ -1477,7 +1720,10 @@ pub(crate) mod tests {
                 "the {} lane plays before the sleep",
                 direction.key()
             );
-            for index in 1..5 {
+            for index in 1..=FADE_BLOCKS {
+                run_block_held(dsp, index, true);
+            }
+            for index in FADE_BLOCKS + 1..FADE_BLOCKS + 5 {
                 assert!(
                     is_silent(&run_block_held(dsp, index, true)),
                     "the {} lane, block {index}",
@@ -1485,7 +1731,7 @@ pub(crate) mod tests {
                 );
             }
             assert!(
-                !is_silent(&run_block_held(dsp, 5, false)),
+                !is_silent(&run_block_held(dsp, 10, false)),
                 "the {} lane plays on the first block after the engine lets it",
                 direction.key()
             );
@@ -1528,14 +1774,18 @@ pub(crate) mod tests {
             run_block(&mut reference.lanes.output, index);
         }
         for index in 3..40 {
-            assert!(is_silent(&run_block_held(
-                &mut held.lanes.output,
-                index,
-                true
-            )));
+            let block = run_block_held(&mut held.lanes.output, index, true);
+            assert!(
+                index < 3 + FADE_BLOCKS || is_silent(&block),
+                "block {index}"
+            );
             run_block(&mut reference.lanes.output, index);
         }
-        for index in 40..43 {
+        for index in 40..40 + FADE_BLOCKS {
+            run_block_held(&mut held.lanes.output, index, false);
+            run_block(&mut reference.lanes.output, index);
+        }
+        for index in 40 + FADE_BLOCKS..43 + FADE_BLOCKS {
             assert_eq!(
                 run_block_held(&mut held.lanes.output, index, false),
                 run_block(&mut reference.lanes.output, index),
@@ -1558,17 +1808,46 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn silencing_touches_only_the_processed_block() {
+    fn the_mute_touches_only_the_processed_block() {
+        let mut tail = Tail::new();
         let mut scratch = [0.25_f32; 8];
         let (block, rest) = scratch.split_at_mut(4);
-        silence_if(true, block);
+        tail.fade_mute(true, block, 2);
         assert_eq!(block, [0.0; 4]);
         assert_eq!(
             rest, [0.25; 4],
             "the scratch past the block is not the ring's"
         );
-        silence_if(false, rest);
+        let mut tail = Tail::new();
+        tail.fade_mute(false, rest, 2);
         assert_eq!(rest, [0.25; 4], "unmuted is a straight wire");
+    }
+
+    /// A [`Tail`] past its first block, playing unmuted: the one a mute fades.
+    fn playing_tail() -> Tail {
+        let mut tail = Tail::new();
+        tail.fade_mute(false, &mut [0.5; 2], 2);
+        tail
+    }
+
+    #[test]
+    fn a_mute_fades_out_in_twenty_milliseconds_at_any_rate() {
+        for rate in [44_100.0_f32, 48_000.0, 96_000.0] {
+            let mut tail = playing_tail();
+            tail.set_rate(rate);
+            let frames = (rate * MUTE_FADE_SECONDS).round() as usize;
+            let mut block = vec![1.0_f32; frames * 2];
+            tail.fade_mute(true, &mut block, 2);
+            assert!(block[0] > 0.99, "{rate}: the first frame is nearly whole");
+            assert!(
+                block[frames * 2 - 1] < 1e-3,
+                "{rate}: {}",
+                block[frames * 2 - 1]
+            );
+            for pair in block.as_chunks::<2>().0.windows(2) {
+                assert!(pair[1][0] <= pair[0][0], "{rate}: the level only falls");
+            }
+        }
     }
 
     /// The music lane never takes a voice engine, however many are waiting: the hand-over's
@@ -1976,16 +2255,23 @@ pub(crate) mod tests {
         dsp.set_format(48_000.0, 2);
         assert!(!is_silent(&run_block(&mut dsp, 0)));
 
-        // The engine writes a later preset's parameters on the main loop; the next block runs them.
+        // The engine writes a later preset's parameters on the main loop; the next block runs them
+        // — a mute, faded out over the next two blocks.
         assert!(writer.write(RouteParams::Output(busy_output_params(true))));
-        assert!(is_silent(&run_block(&mut dsp, 1)));
+        let first = run_block(&mut dsp, 1);
+        assert!(
+            peak(&first[first.len() - 2..]) < peak(&first[..2]).max(1e-3),
+            "fading"
+        );
+        run_block(&mut dsp, 2);
+        assert!(is_silent(&run_block(&mut dsp, 3)));
         assert!(
             !writer.write(RouteParams::Input(InputDspParams::default())),
             "the other lane's snapshot is refused"
         );
-        assert!(is_silent(&run_block(&mut dsp, 2)), "and changed nothing");
+        assert!(is_silent(&run_block(&mut dsp, 4)), "and changed nothing");
         assert!(writer.write(RouteParams::Output(busy_output_params(false))));
-        assert!(!is_silent(&run_block(&mut dsp, 3)));
+        assert!(!is_silent(&run_block(&mut dsp, 5)));
     }
 
     #[test]

@@ -489,15 +489,12 @@ float buffer (interleaved, in place)
   normalization and volume leveling do not (`dfxpProcessReal.cpp:158-170`,
   `dsp/ptutil/SOS/SosProcess.cpp:501-516`). That pass sits behind the same `i_eq_on` test as
   the powered block, so with the equalizer off the master gain goes too.
-  **The port departs (0.4.0 audit, R3):** with the power off it applies the master gain *and*
-  the balance, behind the same `i_eq_on` test as the powered block. The EQ curve, normalization
-  and levelling still stay behind. So the bypass is exactly the powered gain stage, and the level
-  and the balance never move when the power does, with the equalizer on or off. The audit's
-  option (b) said "whether the equalizer is on or off"; that half is not taken, because with the
-  equalizer off the powered block skips the gain stage, and a bypass that applied it would bring
-  in a step of up to the master gain plus the balance (11.7/5.7 dB at −6 dB and +6) that the
-  original does not have. `crates/fxsound-dsp/src/engine.rs` has the reasoning and the numbers,
-  and `docs/0.4.0-upstream.md` (U3) the decision.
+  **The port departs (0.4.0 audit, R3, the user's decision):** the master gain and the balance
+  play always — powered or bypassed, equalizer on or off — so neither the power button nor the
+  equalizer's switch moves the level or the balance. The engine runs them before the equalizer
+  (the two commute); the equalizer's switch takes the curve and the levelling with it, and power
+  off bypasses everything but the gain stage. `crates/fxsound-dsp/src/engine.rs` has the
+  reasoning and the numbers, and `docs/0.4.0-upstream.md` (U3) the decision.
 * The spectrum is computed from the **post-EQ, post-effects** front-channel signal
   (`rp_buf` after step 5) and is fed zero input while bypassed
   (`dsp/ptutil/DspUtil/spectrum/spectrumProcess.cpp:73-82`).
@@ -648,8 +645,8 @@ Constants at `SosProcess.cpp:688-694` and `:699-708`.
 * **No public GUI control exposes this** — `setNormalization` is never called from
   `fxsound/Source/GUI/`. It is dead in the shipping app but present in the API.
 * **Port: not ported** (0.4.0 audit #37). With nothing to set a target the stage never ran on
-  Windows, so `fxsound-dsp` carries no normaliser, and `DspParams.normalization_db` reaches
-  nothing.
+  Windows, so `fxsound-dsp` carries no normaliser, and `DspParams` has no `normalization_db`
+  (removed in 0.4.0; no settings file, preset or socket message ever carried it).
 
 ### 8.4 `setVolumeLeveling(float gain_db)` — the parameter is **not** dB
 
@@ -1487,7 +1484,7 @@ pub struct Params {
 
     pub master_gain_db:    f32,            // -20..=+20 step 2, default 0.0
     pub balance_db:        f32,            // -20..=+20 step 1, default 0.0
-    pub normalization_db:  f32,            // default 0.0 == disabled
+    // (no normalisation target: the stage was never reachable on Windows, 0.4.0 audit #37)
     pub volume_leveling:   f32,            // 0.0..=4.0 step 0.5, default 0.0 == disabled
 }
 

@@ -576,6 +576,72 @@ impl ChannelMap {
         (left != right).then_some((left, right))
     }
 
+    /// Which side of the listener each channel stands on, for the balance and for Dynamic Boost's
+    /// linked limiter (0.4.0 audit #44, R2): every left-hand position — front, side, rear, wide,
+    /// high, top — is [`ChannelSide::Left`], every right-hand one [`ChannelSide::Right`], and the
+    /// centres, the subwoofers, mono and any position that is neither are
+    /// [`ChannelSide::Centre`]. One entry per channel, in the device's order, which is what
+    /// [`fxsound_dsp::Engine::set_channel_sides`] takes; without it the engine infers the sides
+    /// from the count, which balances only the front pair of a device that orders its channels
+    /// some other way, and turned down the centre and the rear centre of `FL,FR,FC,RC`.
+    ///
+    /// [`ChannelSide::Left`]: fxsound_dsp::ChannelSide::Left
+    /// [`ChannelSide::Right`]: fxsound_dsp::ChannelSide::Right
+    /// [`ChannelSide::Centre`]: fxsound_dsp::ChannelSide::Centre
+    #[must_use]
+    pub fn sides(&self) -> ([fxsound_dsp::ChannelSide; MAX_POSITIONS], usize) {
+        use fxsound_dsp::ChannelSide;
+        use libspa::sys::{
+            SPA_AUDIO_CHANNEL_BLC, SPA_AUDIO_CHANNEL_BRC, SPA_AUDIO_CHANNEL_FL,
+            SPA_AUDIO_CHANNEL_FLC, SPA_AUDIO_CHANNEL_FLH, SPA_AUDIO_CHANNEL_FLW,
+            SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_CHANNEL_FRC, SPA_AUDIO_CHANNEL_FRH,
+            SPA_AUDIO_CHANNEL_FRW, SPA_AUDIO_CHANNEL_RL, SPA_AUDIO_CHANNEL_RLC,
+            SPA_AUDIO_CHANNEL_RR, SPA_AUDIO_CHANNEL_RRC, SPA_AUDIO_CHANNEL_SL,
+            SPA_AUDIO_CHANNEL_SR, SPA_AUDIO_CHANNEL_TFL, SPA_AUDIO_CHANNEL_TFLC,
+            SPA_AUDIO_CHANNEL_TFR, SPA_AUDIO_CHANNEL_TFRC, SPA_AUDIO_CHANNEL_TRL,
+            SPA_AUDIO_CHANNEL_TRR, SPA_AUDIO_CHANNEL_TSL, SPA_AUDIO_CHANNEL_TSR,
+        };
+        const LEFT: [u32; 12] = [
+            SPA_AUDIO_CHANNEL_FL,
+            SPA_AUDIO_CHANNEL_SL,
+            SPA_AUDIO_CHANNEL_RL,
+            SPA_AUDIO_CHANNEL_FLC,
+            SPA_AUDIO_CHANNEL_RLC,
+            SPA_AUDIO_CHANNEL_FLW,
+            SPA_AUDIO_CHANNEL_FLH,
+            SPA_AUDIO_CHANNEL_TFL,
+            SPA_AUDIO_CHANNEL_TFLC,
+            SPA_AUDIO_CHANNEL_TSL,
+            SPA_AUDIO_CHANNEL_TRL,
+            SPA_AUDIO_CHANNEL_BLC,
+        ];
+        const RIGHT: [u32; 12] = [
+            SPA_AUDIO_CHANNEL_FR,
+            SPA_AUDIO_CHANNEL_SR,
+            SPA_AUDIO_CHANNEL_RR,
+            SPA_AUDIO_CHANNEL_FRC,
+            SPA_AUDIO_CHANNEL_RRC,
+            SPA_AUDIO_CHANNEL_FRW,
+            SPA_AUDIO_CHANNEL_FRH,
+            SPA_AUDIO_CHANNEL_TFR,
+            SPA_AUDIO_CHANNEL_TFRC,
+            SPA_AUDIO_CHANNEL_TSR,
+            SPA_AUDIO_CHANNEL_TRR,
+            SPA_AUDIO_CHANNEL_BRC,
+        ];
+        let mut sides = [ChannelSide::Centre; MAX_POSITIONS];
+        for (side, id) in sides.iter_mut().zip(self.ids()) {
+            *side = if LEFT.contains(id) {
+                ChannelSide::Left
+            } else if RIGHT.contains(id) {
+                ChannelSide::Right
+            } else {
+                ChannelSide::Centre
+            };
+        }
+        (sides, self.len())
+    }
+
     /// The layout for exactly `channels` channels: this one when it already has that many, and
     /// PipeWire's default layout for the count when it does not — which is how a mono device's
     /// `MONO` becomes the `FL,FR` its lane's pair runs, whichever way the adapter then converts.
@@ -1404,6 +1470,37 @@ pub fn default_node_value(node_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sides_of(text: &str) -> Vec<fxsound_dsp::ChannelSide> {
+        let map = ChannelMap::parse(text).expect("a layout");
+        let (sides, len) = map.sides();
+        sides[..len].to_vec()
+    }
+
+    #[test]
+    fn every_channel_is_placed_on_its_side_of_the_listener() {
+        // 0.4.0 audit #44: the balance turns down a whole side, and needs to know which channels
+        // are on it whatever order the device lists them in.
+        use fxsound_dsp::ChannelSide::{Centre as C, Left as L, Right as R};
+        assert_eq!(sides_of("FL,FR"), [L, R]);
+        assert_eq!(sides_of("MONO"), [C]);
+        assert_eq!(
+            sides_of("FL,FR,FC,LFE,RL,RR,SL,SR"),
+            [L, R, C, C, L, R, L, R]
+        );
+        // An order of its own: the rears first, the subwoofer last.
+        assert_eq!(sides_of("RL,RR,FL,FR,FC,LFE"), [L, R, L, R, C, C]);
+        // Four channels with no rear pair: the centre and the rear centre are no side's, where
+        // the engine's guess from the count alone took them for the rears.
+        assert_eq!(sides_of("FL,FR,FC,RC"), [L, R, C, C]);
+        assert_eq!(sides_of("FLC,FRC,TC,NA"), [L, R, C, C]);
+        // And PipeWire's own default for each count agrees with the engine's standard sides.
+        for channels in 1..=8_u32 {
+            let (sides, len) = ChannelMap::default_for(channels).sides();
+            let standard = fxsound_dsp::engine::standard_sides(channels as usize);
+            assert_eq!(&sides[..len], &standard[..len], "{channels} channels");
+        }
+    }
 
     /// A `pw-dump` taken on a live PipeWire 1.6.8 session, filtered to the Node and Metadata
     /// objects this module cares about. Captured rather than hand-written so the property spellings

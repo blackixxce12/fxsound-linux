@@ -28,10 +28,12 @@ pub const MAX_BAND_FREQ_HZ: Real = 21_000.0;
 /// them, ripple and all — 3.9 dB of it with every band at +6 dB. Whoever owns such a curve can
 /// recognise it by this ladder and move it to `band_table(20)`: band for band, no centre moves by
 /// more than 0.17 of an octave.
-pub const WINDOWS_TWENTY_BAND_CENTRES_HZ: [Real; 20] = [
-    20.0, 31.5, 40.0, 63.0, 80.0, 125.0, 160.0, 250.0, 315.0, 500.0, 630.0, 1000.0, 1250.0, 2000.0,
-    2500.0, 4000.0, 5000.0, 8000.0, 10000.0, 16000.0,
-];
+///
+/// The table itself is `fxsound_core::eq`'s, which moves a curve between the two ladders
+/// ([`fxsound_core::eq::move_off_the_windows_twenty_band_ladder`]) where the preset store and the
+/// application, neither of which runs an engine, can reach it.
+pub const WINDOWS_TWENTY_BAND_CENTRES_HZ: [Real; 20] =
+    fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ;
 
 /// The hard-coded ladders (`GraphicEqSet.cpp:430-492`), with the band edges each one implies.
 ///
@@ -76,10 +78,7 @@ pub fn band_table(num_bands: usize) -> Option<(&'static [Real], Real, Real)> {
         25.0, 40.0, 63.0, 100.0, 160.0, 250.0, 400.0, 630.0, 1000.0, 1600.0, 2500.0, 4000.0,
         6300.0, 10000.0, 16000.0,
     ];
-    const F20: [Real; 20] = [
-        20.0, 28.4331, 40.4221, 57.4662, 81.6971, 116.145, 165.118, 234.741, 333.721, 474.436,
-        674.485, 958.885, 1363.2, 1938.0, 2755.17, 3916.91, 5568.49, 7916.47, 11254.5, 16000.0,
-    ];
+    const F20: [Real; 20] = fxsound_core::eq::TWENTY_BAND_CENTRES_HZ;
     const F31: [Real; 31] = [
         20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0, 250.0, 315.0, 400.0,
         500.0, 630.0, 800.0, 1000.0, 1250.0, 1600.0, 2000.0, 2500.0, 3150.0, 4000.0, 5000.0,

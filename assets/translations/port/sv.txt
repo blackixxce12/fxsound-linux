@@ -105,3 +105,6 @@ countries: se
 "FxSound's preset" = "FxSounds förinställning"
 "No application has played or recorded through FxSound yet" = "Inget program har spelat upp eller spelat in genom FxSound ännu"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "En Bluetooth-mikrofon vaknar bara medan ett program spelar in från FxSound (Ingång), och byter då headsetet till samtalskvalitet."
+"Unsaved preset changes discarded" = "Osparade ändringar i förinställningar har förkastats"
+"Move the preset %s to the trash?" = "Flytta förinställningen %s till papperskorgen?"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "Förkasta osparade ändringar i alla förinställningar? Sparade förinställningar behålls."

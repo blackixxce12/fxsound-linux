@@ -42,7 +42,7 @@ use fxsound_core::{DenoiseLevel, Detection, NUM_SPECTRUM_BARS, limits};
 use fxsound_preset::input::{Compressor, Denoise, Gate, InputPreset};
 use fxsound_ui::dialogs::{CalibrationPhase, CalibrationResultView, CalibrationView};
 
-use crate::app::{FORBIDDEN_PRESET_NAME_CHARS, MAX_PRESET_NAME_CHARS};
+use crate::app::FORBIDDEN_PRESET_NAME_CHARS;
 
 /// How long the input lane has, after Start, to be attached to a microphone and processing. A
 /// Bluetooth headset switching to its hands-free profile takes one to two seconds.
@@ -491,9 +491,10 @@ pub fn signed_db(db: f32) -> String {
 /// The name of the voice preset a calibration of `description` writes: `Calibrated — <device>`.
 ///
 /// Held to what a typed name may be — no character the name editor filters out, no control
-/// characters, at most [`MAX_PRESET_NAME_CHARS`] — so the preset can be renamed, exported and
-/// copied to Windows like one the user named. Not translated: a preset's name is written as it is
-/// in every language, like the shipped ones.
+/// characters, at most [`crate::app::MAX_PRESET_NAME_CHARS`] characters and
+/// [`fxsound_preset::MAX_NAME_BYTES`] bytes — so the preset can be renamed, exported and copied to
+/// Windows like one the user named.
+/// Not translated: a preset's name is written as it is in every language, like the shipped ones.
 #[must_use]
 pub fn calibrated_preset_name(description: &str) -> String {
     let cleaned: String = description
@@ -506,11 +507,9 @@ pub fn calibrated_preset_name(description: &str) -> String {
     } else {
         format!("Calibrated — {cleaned}")
     };
-    name.chars()
-        .take(MAX_PRESET_NAME_CHARS)
-        .collect::<String>()
-        .trim_end()
-        .to_owned()
+    // At most sixty-four characters and the 126 bytes a Windows FxSound reads a name in (0.4.0
+    // audit #15): "Calibrated — " and a Cyrillic device name reach the bytes first.
+    fxsound_preset::new_preset_name(&name)
 }
 
 /// A finished calibration: the microphone, what was measured on it and what that suggests.
@@ -1628,8 +1627,20 @@ mod tests {
         );
         assert_eq!(calibrated_preset_name(" ?* "), "Calibrated");
         let long = calibrated_preset_name(&"Very Long Microphone Name ".repeat(5));
-        assert!(long.chars().count() <= MAX_PRESET_NAME_CHARS, "{long}");
+        assert!(
+            long.chars().count() <= crate::app::MAX_PRESET_NAME_CHARS,
+            "{long}"
+        );
         assert!(!long.ends_with(' '));
+        // 0.4.0 audit #15: a Cyrillic device name reaches the bytes a Windows FxSound reads a name
+        // in before it reaches sixty-four characters.
+        let cyrillic = calibrated_preset_name(&"Микрофон ".repeat(8));
+        assert!(
+            cyrillic.len() <= fxsound_preset::MAX_NAME_BYTES,
+            "{cyrillic}"
+        );
+        assert!(cyrillic.starts_with("Calibrated — Микрофон"));
+        assert!(!cyrillic.ends_with(' '));
     }
 
     #[test]

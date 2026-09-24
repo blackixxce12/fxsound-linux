@@ -23,6 +23,11 @@ use crate::{
     DeEsserMode, DenoiseChannelsOverride, DereverbLevel, DeviceDirection, NoiseSuppressionOverride,
 };
 
+/// How many user presets `max_user_presets` may allow (audit report #20). The floor is the
+/// original's; the ceiling was 120 there, raised because a preset is a few hundred bytes and the
+/// limit only exists to keep the tray's submenu finite.
+pub const USER_PRESET_LIMITS: std::ops::RangeInclusive<u32> = 10..=1000;
+
 /// Which of the two window layouts is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -275,7 +280,7 @@ pub struct Settings {
     pub hotkeys: bool,
     #[serde(flatten)]
     pub hotkey_bindings: Hotkeys,
-    /// How many presets the user may save.
+    /// How many presets the user may save, from 10 to 1000 ([`USER_PRESET_LIMITS`]).
     pub max_user_presets: u32,
 
     // ---- housekeeping ----------------------------------------------------------------------
@@ -512,6 +517,12 @@ impl Settings {
         );
         self.filter_q = finite(self.filter_q, limits::FILTER_Q, default.filter_q);
         self.num_bands = self.num_bands.clamp(1, crate::eq::MAX_BANDS as u32);
+        // Clamped rather than replaced (audit report #20): the original reads anything outside
+        // 10..=120 as 120 (`FxController.cpp:194-198`), so a file asking for 500 got fewer than
+        // it asked for, and one asking for 5 got more.
+        self.max_user_presets = self
+            .max_user_presets
+            .clamp(*USER_PRESET_LIMITS.start(), *USER_PRESET_LIMITS.end());
 
         // Replayed onto the node the user listens through, so an entry that is not a volume
         // anyone set goes, rather than being guessed at. Order is kept: it is the order the
@@ -768,6 +779,25 @@ mod tests {
         parsed.sanitise();
         assert_eq!(parsed.output_preset, "Jazz");
         assert_eq!(parsed.max_user_presets, 120);
+    }
+
+    #[test]
+    fn a_user_preset_limit_out_of_range_is_clamped_rather_than_reset_to_120() {
+        // Audit report #20: the original read anything outside 10..=120 as 120, so 500 became 120
+        // and 5 became 120 too.
+        for (written, read) in [
+            (500, 500),
+            (5000, 1000),
+            (5, 10),
+            (0, 10),
+            (10, 10),
+            (1000, 1000),
+        ] {
+            let mut settings: Settings =
+                toml::from_str(&format!("max_user_presets = {written}")).expect("parse");
+            settings.sanitise();
+            assert_eq!(settings.max_user_presets, read, "{written}");
+        }
     }
 
     #[test]

@@ -16,7 +16,8 @@
 //! one place; the shadowing bug this module carried in 0.3.0 would have been copied along with
 //! it. [`PresetStore`] is the `.fac` store and [`crate::InputPresetStore`] the voice one.
 
-use crate::{PresetError, sanitise_preset_name};
+use crate::trash::{self, Discarded};
+use crate::{PresetError, new_preset_name, sanitise_preset_name};
 use fxsound_core::{Preset, Settings};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -68,6 +69,13 @@ pub trait PresetFile: Clone {
     fn empty_name() -> Self::Error;
     /// The error for a name whose file, `file`, is already the listed preset `existing`'s.
     fn shared_file(name: &str, existing: &str, file: &str) -> Self::Error;
+    /// The preset as it is written for someone else to open: an export. The same preset unless
+    /// the format has a reader elsewhere that expects something of it — the `.fac` a Windows
+    /// FxSound reads puts a twenty-band curve back on the Windows ladder (0.4.0 audit R4).
+    #[must_use]
+    fn exported(&self) -> Self {
+        self.clone()
+    }
 }
 
 impl PresetFile for Preset {
@@ -109,6 +117,15 @@ impl PresetFile for Preset {
             file: file.to_owned(),
         }
     }
+
+    /// A twenty-band curve on the half-octave ladder is exported on the Windows one, band for
+    /// band, which is what the Windows build tunes twenty bands to; this port moves it back when
+    /// it reads it ([`fxsound_core::eq::move_off_the_windows_twenty_band_ladder`]).
+    fn exported(&self) -> Self {
+        let mut preset = self.clone();
+        fxsound_core::eq::move_onto_the_windows_twenty_band_ladder(&mut preset.eq_bands);
+        preset
+    }
 }
 
 /// The full preset list plus the directories it was built from.
@@ -118,6 +135,10 @@ pub struct Store<F: PresetFile> {
     factory_dirs: Vec<PathBuf>,
     user_dir: PathBuf,
     autosave_dir: PathBuf,
+    /// Where a deleted preset goes: `None` for the desktop's home trash, found when a preset is
+    /// deleted ([`crate::trash`]); otherwise a directory laid out as a trash, for a store that must
+    /// not touch the user's, such as a test's.
+    trash_dir: Option<PathBuf>,
     format: PhantomData<F>,
 }
 
@@ -149,7 +170,7 @@ impl Store<Preset> {
             factory_dirs.push(Path::new(prefix).join("presets/BonusPresets"));
         }
 
-        Self::with_dirs(factory_dirs, Settings::user_preset_dir())
+        Self::with_dirs(factory_dirs, Settings::user_preset_dir()).with_home_trash()
     }
 }
 
@@ -157,16 +178,37 @@ impl<F: PresetFile> Store<F> {
     /// Build a store from explicit directories. Used by the tests and by `--preset-dir`.
     ///
     /// Autosaves live in `AutoSave` under the user directory, whichever directory that is.
+    ///
+    /// A store built this way keeps what it deletes in a trash of its own, `.Trash` under the user
+    /// directory, so that a test's deletions never reach the desktop's; the stores built from the
+    /// standard locations use the desktop's ([`Store::with_home_trash`]).
     #[must_use]
     pub fn with_dirs(factory_dirs: Vec<PathBuf>, user_dir: PathBuf) -> Self {
         let autosave_dir = user_dir.join("AutoSave");
+        let trash_dir = Some(user_dir.join(".Trash"));
         Self {
             entries: Vec::new(),
             factory_dirs,
             user_dir,
             autosave_dir,
+            trash_dir,
             format: PhantomData,
         }
+    }
+
+    /// Send deleted presets to `dir`, laid out as a trash (`files/`, `info/`).
+    #[must_use]
+    pub fn with_trash(mut self, dir: PathBuf) -> Self {
+        self.trash_dir = Some(dir);
+        self
+    }
+
+    /// Send deleted presets to the desktop's home trash, where a file manager can restore them
+    /// (0.4.0 audit #16).
+    #[must_use]
+    pub fn with_home_trash(mut self) -> Self {
+        self.trash_dir = None;
+        self
     }
 
     /// Where user presets are saved.
@@ -320,13 +362,23 @@ impl<F: PresetFile> Store<F> {
         Ok(path)
     }
 
-    /// Delete a user preset. Factory presets are refused, as in the original.
+    /// Delete a user preset: its file goes to the desktop's trash, where a file manager can
+    /// restore it, or when the trash cannot take it, is set aside beside itself as
+    /// `<file>.1.bak` or the next free number ([`trash::set_aside`]) (0.4.0 audit #16; the
+    /// original deletes it for good). Factory presets are refused, as in the original.
+    ///
+    /// Its unsaved edits, the autosave, go the same way after it rather than being dropped: a
+    /// preset with unsaved changes can be deleted, and those edits exist nowhere else. The trash
+    /// records each file's own place, so restoring both puts the preset back in the list with its
+    /// edits and its `*`. Should the autosave move nowhere at all, it is left where it is.
+    ///
+    /// Returns where the preset's file went, or `None` for a name the list does not hold.
     ///
     /// # Errors
-    /// The preset is a factory one, or its file cannot be removed.
-    pub fn delete(&mut self, name: &str) -> Result<(), F::Error> {
+    /// The preset is a factory one, or its file can be neither trashed nor renamed.
+    pub fn delete(&mut self, name: &str) -> Result<Option<Discarded>, F::Error> {
         let Some(entry) = self.find(name) else {
-            return Ok(());
+            return Ok(None);
         };
         if entry.source == PresetSource::Factory {
             return Err(std::io::Error::new(
@@ -336,8 +388,90 @@ impl<F: PresetFile> Store<F> {
             .into());
         }
         let path = entry.path.clone();
-        std::fs::remove_file(path)?;
-        self.clear_autosave(name);
+        let discarded = self.discard(&path)?;
+        let autosave = self.autosave_path(name);
+        if autosave.is_file() {
+            match self.discard(&autosave) {
+                Ok(Discarded::Trash(to) | Discarded::Backup(to)) => {
+                    log::info!("{name}: its unsaved changes went to {}", to.display());
+                }
+                Err(err) => log::warn!("{}: left where it is: {err}", autosave.display()),
+            }
+        }
+        self.rescan();
+        Ok(Some(discarded))
+    }
+
+    /// [`trash::discard`] into this store's trash.
+    fn discard(&self, path: &Path) -> std::io::Result<Discarded> {
+        match &self.trash_dir {
+            Some(dir) => trash::discard_into(path, dir),
+            None => trash::discard(path),
+        }
+    }
+
+    /// Give the user preset `old` the name `new` (0.4.0 audit #19).
+    ///
+    /// A move, not a copy: the file is rewritten in place with the new name inside it and then
+    /// renamed with [`std::fs::rename`], and its autosave, if it has one, is renamed the same way.
+    /// The original saves a copy under the new name and deletes the old file
+    /// (`FxController.cpp:1244-1276`), and on a filesystem that folds case — a FAT or exFAT stick,
+    /// a case-insensitive ext4 directory — `rock.fac` and `Rock.fac` are one file, so renaming
+    /// `rock` to `Rock` that way wrote the new file over the old one and then deleted it. Renaming
+    /// the one file cannot. The name inside is written first, so that a rename that then fails
+    /// still leaves a preset the list shows under its new name.
+    ///
+    /// A name that would take another listed preset's file is refused, as [`Store::save_as`]
+    /// refuses it; the preset's own file is not another's, so a change of case alone is allowed.
+    /// An unlisted file already under the new name is set aside as `<file>.1.bak` or the next free
+    /// number ([`trash::set_aside`]), never over a `.bak` already there.
+    ///
+    /// # Errors
+    /// `old` is not a user preset, `new` leaves nothing to file it under or is another preset's
+    /// file, or the files cannot be written or moved.
+    pub fn rename(&mut self, old: &str, new: &str) -> Result<(), F::Error> {
+        let entry = self.find(old).ok_or_else(|| F::unknown(old))?;
+        if entry.source == PresetSource::Factory {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{old} is a factory preset"),
+            )
+            .into());
+        }
+        let from = entry.path.clone();
+        let file = Self::file_name(new)?;
+        // Another preset of exactly the new name, or one whose file the new name would take.
+        if let Some(other) = self
+            .find(new)
+            .filter(|other| other.name != old)
+            .or_else(|| self.holder_of(&file, new).filter(|other| other.name != old))
+        {
+            return Err(F::shared_file(new, &other.name, &file));
+        }
+        let to = self.user_dir.join(&file);
+
+        let mut preset = F::load(&from)?;
+        preset.set_name(new);
+        // Another file already there that is not this one: kept, beside every other `.bak`.
+        if to != from && to.exists() && !same_file(&from, &to) {
+            trash::set_aside(&to)?;
+        }
+        preset.save(&from)?;
+        std::fs::rename(&from, &to)?;
+
+        let old_autosave = self.autosave_path(old);
+        if old_autosave.is_file() {
+            let new_autosave = self.autosave_dir.join(&file);
+            let moved = F::load(&old_autosave).and_then(|mut stash| {
+                stash.set_name(new);
+                stash.save(&old_autosave)?;
+                std::fs::rename(&old_autosave, &new_autosave)?;
+                Ok(())
+            });
+            if let Err(err) = moved {
+                log::warn!("{}: {err}", old_autosave.display());
+            }
+        }
         self.rescan();
         Ok(())
     }
@@ -345,17 +479,22 @@ impl<F: PresetFile> Store<F> {
     /// Import a preset file into the user directory, rejecting anything that does not parse.
     ///
     /// Returns the imported preset's name, which is the file's stem: a file someone chose to
-    /// import is a file they know by its name on disk.
+    /// import is a file they know by its name on disk. The stem is a new name, so it is made one
+    /// every FxSound can read ([`new_preset_name`]), and that is the name written inside the
+    /// copy too (0.4.0 audit #15): a file called `a:b.fac` used to be imported as `ab.fac` with
+    /// `a:b` inside it, a name the Windows build could never file.
     ///
     /// # Errors
-    /// The file does not parse, or cannot be saved into the user directory.
+    /// The file does not parse, its name leaves nothing to file it under, or it cannot be saved
+    /// into the user directory.
     pub fn import(&mut self, source: &Path) -> Result<String, F::Error> {
         let preset = F::load(source)?;
-        let name = source
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_else(|| preset.name())
-            .to_owned();
+        let name = new_preset_name(
+            source
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_else(|| preset.name()),
+        );
         self.save_as(&preset, &name)?;
         Ok(name)
     }
@@ -370,7 +509,7 @@ impl<F: PresetFile> Store<F> {
     /// # Errors
     /// The name is unknown, leaves nothing to file it under, or the file cannot be written.
     pub fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, F::Error> {
-        let preset = self.load_saved(name)?;
+        let preset = self.load_saved(name)?.exported();
         let path = dir.join(Self::file_name(name)?);
         preset.save(&path)?;
         Ok(path)
@@ -415,6 +554,16 @@ impl<F: PresetFile> Store<F> {
         self.entries.iter().find(|entry| {
             entry.name != name && Self::file_name(&entry.name).is_ok_and(|held| held == file)
         })
+    }
+}
+
+/// Whether two paths are one file: the same inode, which on a filesystem that folds case is what
+/// `rock.fac` and `Rock.fac` are.
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
     }
 }
 
@@ -994,5 +1143,365 @@ mod tests {
         store.save_as(&mine, "Mine").expect("overwrite Mine");
         assert!(Path::new(&backup).is_file());
         assert_eq!(crate::load(&path).expect("reload").main_midi[0], 99);
+    }
+
+    fn twenty_band_preset(name: &str, ladder: &[f32; 20]) -> Preset {
+        Preset {
+            name: name.into(),
+            eq_bands: ladder
+                .iter()
+                .enumerate()
+                .map(|(i, &hz)| fxsound_core::EqBand::new(hz, i as f32 - 10.0))
+                .collect(),
+            ..Preset::default()
+        }
+    }
+
+    #[test]
+    fn a_deleted_preset_goes_to_the_trash_with_a_record_of_where_it_was() {
+        // 0.4.0 audit #16: the original deletes a user preset for good.
+        let tmp = tempdir("delete-to-trash");
+        let trash = tmp.join("Trash");
+        let mut store =
+            PresetStore::with_dirs(Vec::new(), tmp.join("user")).with_trash(trash.clone());
+        let mut mine = Preset {
+            name: "Mine".into(),
+            ..Preset::default()
+        };
+        mine.main_midi[0] = 42;
+        let path = store.save_as(&mine, "Mine").expect("save");
+        mine.main_midi[0] = 43;
+        store.autosave(&mine).expect("autosave");
+
+        let went = store
+            .delete("Mine")
+            .expect("delete")
+            .expect("it was listed");
+        let crate::trash::Discarded::Trash(trashed) = went else {
+            panic!("expected the trash, got {went:?}");
+        };
+        assert_eq!(trashed, trash.join("files/Mine.fac"));
+        assert!(!path.exists(), "gone from the user directory");
+        assert!(store.find("Mine").is_none(), "and from the list");
+        assert_eq!(
+            crate::load(&trashed)
+                .expect("the trashed file is the preset")
+                .main_midi[0],
+            42,
+            "the saved preset, restorable"
+        );
+        let info = std::fs::read_to_string(trash.join("info/Mine.fac.trashinfo")).expect("info");
+        assert!(info.contains("Mine.fac"), "{info}");
+        assert!(
+            !store.autosave_path("Mine").exists(),
+            "its unsaved edits went with it"
+        );
+        // Deleting a name that is not there is nothing, not an error.
+        assert_eq!(store.delete("Mine").expect("no-op"), None);
+    }
+
+    #[test]
+    fn deleting_a_preset_with_unsaved_changes_puts_them_in_the_trash_and_restoring_both_brings_them_back()
+     {
+        // The edits exist nowhere but in the autosave, and a modified preset can be deleted:
+        // dropping the autosave lost them for good however the preset itself was kept.
+        let tmp = tempdir("delete-unsaved");
+        let trash = tmp.join("Trash");
+        let mut store =
+            PresetStore::with_dirs(Vec::new(), tmp.join("user")).with_trash(trash.clone());
+        let mut mine = Preset {
+            name: "Mine".into(),
+            ..Preset::default()
+        };
+        mine.main_midi[0] = 42;
+        let path = store.save_as(&mine, "Mine").expect("save");
+        mine.main_midi[0] = 43;
+        store.autosave(&mine).expect("autosave");
+        store.rescan();
+        assert!(store.find("Mine").expect("listed").modified);
+        let autosave = store.autosave_path("Mine");
+
+        store
+            .delete("Mine")
+            .expect("delete")
+            .expect("it was listed");
+        assert!(!autosave.exists(), "gone from the autosaves");
+        // The preset took its own name in the trash, so its edits take the next one.
+        let edits = trash.join("files/Mine.2.fac");
+        assert_eq!(
+            crate::load(&edits)
+                .expect("the trashed autosave is a preset")
+                .main_midi[0],
+            43,
+            "the unsaved edits, recoverable"
+        );
+        let info =
+            std::fs::read_to_string(trash.join("info/Mine.2.fac.trashinfo")).expect("its record");
+        let autosave = std::path::absolute(&autosave).expect("absolute");
+        assert!(
+            info.lines()
+                .any(|line| line == format!("Path={}", crate::trash::encode_path(&autosave))),
+            "restored, it goes back among the autosaves: {info}"
+        );
+
+        // Restore both, as a file manager does: each to the place its record names.
+        std::fs::rename(trash.join("files/Mine.fac"), &path).expect("restore the preset");
+        std::fs::rename(&edits, &autosave).expect("restore its edits");
+        store.rescan();
+        assert!(
+            store.find("Mine").expect("listed again").modified,
+            "with its *"
+        );
+        let (loaded, from_autosave) = store.load("Mine").expect("load");
+        assert!(from_autosave);
+        assert_eq!(loaded.main_midi[0], 43, "the edits are back");
+        assert_eq!(store.load_saved("Mine").expect("saved").main_midi[0], 42);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_delete_the_trash_cannot_take_keeps_the_preset_its_edits_and_the_overwrites_backup() {
+        // The trash under a path that is a file: nothing can be made there, as when it is on
+        // another filesystem. The fallback used to rename the preset over the `.bak` an earlier
+        // overwrite had left, and to delete the autosave.
+        let tmp = tempdir("delete-no-trash");
+        let blocked = tmp.join("data");
+        std::fs::write(&blocked, b"not a directory").expect("block the trash");
+        let mut store =
+            PresetStore::with_dirs(Vec::new(), tmp.join("user")).with_trash(blocked.join("Trash"));
+        let mut mine = Preset {
+            name: "Mine".into(),
+            ..Preset::default()
+        };
+        mine.main_midi[0] = 10;
+        store.save_as(&mine, "Mine").expect("save");
+        mine.main_midi[0] = 99;
+        let path = store.save_as(&mine, "Mine").expect("overwrite");
+        let overwritten = tmp.join("user/Mine.fac.bak");
+        assert_eq!(
+            crate::load(&overwritten)
+                .expect("the overwrite's backup")
+                .main_midi[0],
+            10
+        );
+        mine.main_midi[0] = 43;
+        store.autosave(&mine).expect("autosave");
+
+        let went = store
+            .delete("Mine")
+            .expect("delete")
+            .expect("it was listed");
+        let aside = tmp.join("user/Mine.fac.1.bak");
+        assert_eq!(went, crate::trash::Discarded::Backup(aside.clone()));
+        assert!(!path.exists());
+        assert_eq!(
+            crate::load(&aside).expect("the deleted preset").main_midi[0],
+            99
+        );
+        assert_eq!(
+            crate::load(&overwritten)
+                .expect("the overwrite's backup survives")
+                .main_midi[0],
+            10
+        );
+        let edits = tmp.join("user/AutoSave/Mine.fac.1.bak");
+        assert_eq!(
+            crate::load(&edits)
+                .expect("the unsaved edits survive")
+                .main_midi[0],
+            43
+        );
+        assert!(!store.autosave_path("Mine").exists());
+        assert!(store.entries().is_empty(), "{:?}", store.entries());
+
+        // A second overwrite of a new Mine takes only its own `.bak`, never the deleted one.
+        store.save_as(&mine, "Mine").expect("a new Mine");
+        store.save_as(&mine, "Mine").expect("overwrite it");
+        assert_eq!(
+            crate::load(&aside)
+                .expect("still the deleted preset")
+                .main_midi[0],
+            99
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_rename_onto_an_unlisted_file_sets_it_aside_beside_the_bak_already_there() {
+        let tmp = tempdir("rename-aside");
+        let user = tmp.join("user");
+        let mut store = PresetStore::with_dirs(Vec::new(), user.clone());
+        let mut mine = Preset {
+            name: "Mine".into(),
+            ..Preset::default()
+        };
+        mine.main_midi[0] = 42;
+        store.save_as(&mine, "Mine").expect("save");
+        // Under the new name: a file the list cannot read, and an older `.bak` of it.
+        std::fs::write(user.join("New.fac"), b"not a preset").expect("unlisted");
+        std::fs::write(user.join("New.fac.bak"), b"older").expect("backup");
+        store.rescan();
+        assert!(store.find("New").is_none());
+
+        store.rename("Mine", "New").expect("rename");
+        assert_eq!(
+            crate::load(&user.join("New.fac"))
+                .expect("renamed")
+                .main_midi[0],
+            42
+        );
+        assert_eq!(std::fs::read(user.join("New.fac.bak")).unwrap(), b"older");
+        assert_eq!(
+            std::fs::read(user.join("New.fac.1.bak")).unwrap(),
+            b"not a preset"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_rename_that_only_changes_case_keeps_the_one_file() {
+        // 0.4.0 audit #19. The original saves a copy and deletes the old file; where the
+        // filesystem folds case, `rock.fac` and `Rock.fac` are one file and that deleted it.
+        let tmp = tempdir("rename-case");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let mut rock = Preset {
+            name: "rock".into(),
+            ..Preset::default()
+        };
+        rock.main_midi[0] = 77;
+        let old_path = store.save_as(&rock, "rock").expect("save");
+
+        store.rename("rock", "Rock").expect("rename");
+        let names: Vec<_> = store.entries().iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, ["Rock"]);
+        let entry = store.find("Rock").expect("listed under the new name");
+        assert!(entry.path.ends_with("Rock.fac"), "{}", entry.path.display());
+        assert!(!old_path.exists() || same_file(&old_path, &entry.path));
+        let reloaded = crate::load(&entry.path).expect("load");
+        assert_eq!(reloaded.name, "Rock", "the name inside moved too");
+        assert_eq!(reloaded.main_midi[0], 77);
+        let files: Vec<_> = std::fs::read_dir(tmp.join("user"))
+            .expect("read")
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "fac"))
+            .collect();
+        assert_eq!(files.len(), 1, "one file, not a copy beside the original");
+    }
+
+    #[test]
+    fn a_rename_moves_the_autosave_with_the_preset() {
+        let tmp = tempdir("rename-autosave");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let mut preset = Preset {
+            name: "Old".into(),
+            ..Preset::default()
+        };
+        store.save_as(&preset, "Old").expect("save");
+        preset.main_midi[0] = 99;
+        store.autosave(&preset).expect("autosave");
+        store.rescan();
+
+        store.rename("Old", "New").expect("rename");
+        assert!(!store.autosave_path("Old").exists());
+        let (loaded, from_autosave) = store.load("New").expect("load");
+        assert!(from_autosave, "the unsaved edits came along");
+        assert_eq!(loaded.main_midi[0], 99);
+        assert_eq!(loaded.name, "New");
+        assert!(store.find("New").expect("listed").modified);
+    }
+
+    #[test]
+    fn a_rename_onto_another_presets_file_is_refused_and_changes_nothing() {
+        let tmp = tempdir("rename-shared");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let preset = Preset::default();
+        store.save_as(&preset, "Music").expect("save Music");
+        store.save_as(&preset, "Mine").expect("save Mine");
+        let err = store.rename("Mine", "Mu:sic").unwrap_err();
+        assert!(
+            matches!(&err, PresetError::SharedFile { existing, .. } if existing == "Music"),
+            "{err}"
+        );
+        let mut names: Vec<_> = store.entries().iter().map(|e| e.name.clone()).collect();
+        names.sort();
+        assert_eq!(names, ["Mine", "Music"]);
+        // Nor onto another preset's own name: that preset's file would be put aside for it.
+        assert!(store.rename("Mine", "Music").is_err());
+        let music = store.find("Music").expect("still listed").path.clone();
+        assert!(music.is_file());
+        assert!(store.find("Mine").is_some());
+        // A factory preset has no file of the user's to rename.
+        let mut with_factory = store_in(&tmp.join("factory-case"));
+        assert!(with_factory.rename("Jazz", "Jazz 2").is_err());
+    }
+
+    #[test]
+    fn an_imported_file_is_saved_under_a_name_windows_can_file_and_carries_it_inside() {
+        // 0.4.0 audit #15: `a:b.fac` became `ab.fac` with `a:b` inside it.
+        let tmp = tempdir("import-sanitised");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let source_dir = tmp.join("from");
+        std::fs::create_dir_all(&source_dir).expect("mkdir");
+        let source = source_dir.join("Mu:sic?.fac");
+        crate::save(
+            &Preset {
+                name: "whatever".into(),
+                ..Preset::default()
+            },
+            &source,
+        )
+        .expect("write the source");
+
+        let name = store.import(&source).expect("import");
+        assert_eq!(name, "Music");
+        let entry = store.find("Music").expect("listed");
+        assert!(entry.path.ends_with("Music.fac"));
+        assert_eq!(crate::load(&entry.path).expect("load").name, "Music");
+    }
+
+    #[test]
+    fn a_twenty_band_curve_is_exported_on_the_windows_ladder_band_for_band() {
+        // 0.4.0 audit R4: the port's twenty bands sit every half octave; a `.fac` for a Windows
+        // FxSound carries the ladder it tunes twenty bands to.
+        let tmp = tempdir("export-twenty");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let preset = twenty_band_preset("Twenty", &fxsound_core::eq::TWENTY_BAND_CENTRES_HZ);
+        let saved = store.save_as(&preset, "Twenty").expect("save");
+        assert_eq!(
+            crate::load(&saved).expect("load").eq_bands,
+            preset.eq_bands,
+            "the user's own file keeps the port's ladder"
+        );
+
+        let out = tmp.join("out");
+        let path = store.export("Twenty", &out).expect("export");
+        let exported = crate::load(&path).expect("parse the export");
+        let centres: Vec<f32> = exported.eq_bands.iter().map(|b| b.center_hz).collect();
+        assert_eq!(centres, fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ);
+        let gains = |p: &Preset| p.eq_bands.iter().map(|b| b.boost_db).collect::<Vec<_>>();
+        assert_eq!(gains(&exported), gains(&preset), "every gain on its band");
+
+        // A ten-band preset is exported as it is.
+        let ten = Preset {
+            name: "Ten".into(),
+            ..Preset::default()
+        };
+        store.save_as(&ten, "Ten").expect("save ten");
+        let path = store.export("Ten", &out).expect("export ten");
+        assert_eq!(crate::load(&path).expect("load").eq_bands, ten.eq_bands);
+    }
+
+    #[test]
+    fn a_store_on_explicit_directories_keeps_what_it_deletes_to_itself() {
+        // A test's deletion must never reach the desktop's trash, and the store's own trash must
+        // never show up in its list.
+        let tmp = tempdir("private-trash");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        store.save_as(&Preset::default(), "Gone").expect("save");
+        store.delete("Gone").expect("delete");
+        assert!(tmp.join("user/.Trash/files/Gone.fac").is_file());
+        store.rescan();
+        assert!(store.entries().is_empty(), "{:?}", store.entries());
+        assert!(PresetStore::with_default_dirs().trash_dir.is_none());
     }
 }

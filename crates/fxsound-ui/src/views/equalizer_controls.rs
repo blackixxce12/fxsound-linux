@@ -357,14 +357,15 @@ impl Level {
 
     /// Whether the stage this slider sets is in the signal path right now.
     ///
-    /// On the speakers all four are the equalizer block's and go with its switch (upstream
-    /// aad64c1); on a microphone the filter width is the equalizer's and the makeup gain a stage
-    /// of its own.
+    /// The filter width is the equalizer's and the volume leveller is in its block, so both go
+    /// with its switch (upstream aad64c1). The master gain and the balance do not: the engine
+    /// plays them whatever the equalizer's switch says (0.4.0 audit R3), where upstream took
+    /// them out with the block. On a microphone the makeup gain is a stage of its own.
     #[must_use]
     pub const fn in_path(self, state: &UiState) -> bool {
-        match (self, state.direction) {
-            (Self::MasterGain, DeviceDirection::Input) => true,
-            _ => state.eq_on,
+        match self {
+            Self::MasterGain | Self::Balance => true,
+            Self::VolumeLeveling | Self::FilterQ => state.eq_on,
         }
     }
 }
@@ -840,12 +841,17 @@ mod tests {
     }
 
     #[test]
-    fn with_the_equalizer_off_only_a_voices_makeup_gain_is_still_in_the_path() {
+    fn with_the_equalizer_off_the_leveller_and_the_width_leave_the_path_and_the_gains_stay() {
+        // 0.4.0 audit R3: the master gain and the balance play whatever the equalizer's switch
+        // says, so they are not drawn as if it had taken them out.
         let off = UiState {
             eq_on: false,
             ..speakers()
         };
-        assert!(Level::OUTPUT.iter().all(|level| !level.in_path(&off)));
+        assert!(Level::MasterGain.in_path(&off));
+        assert!(Level::Balance.in_path(&off));
+        assert!(!Level::VolumeLeveling.in_path(&off));
+        assert!(!Level::FilterQ.in_path(&off));
         let voice_off = UiState {
             eq_on: false,
             ..microphone()
@@ -1101,6 +1107,134 @@ mod tests {
         }
     }
 
+    /// The centre of `level`'s thumb on the speakers' `row`.
+    fn level_thumb(state: &UiState, row: usize, level: Level) -> Pos2 {
+        let rect = slider_rect(column(), row);
+        let track = slider::track_rect(rect);
+        let range = level.range(DeviceDirection::Output);
+        let t = (level.value(state) - range.min) / (range.max - range.min);
+        pos2(track.left() + track.width() * t, rect.center().y)
+    }
+
+    #[test]
+    fn a_press_on_a_level_sliders_thumb_moves_nothing_until_the_pointer_does() {
+        // 0.4.0 audit #14 holds for the levels too. JUCE jumps to the pointer even on the thumb,
+        // and the thumb's eight-point radius is more than half a step of the master gain, the
+        // leveller and the balance: a touch off its centre moved them a whole step.
+        let mut harness = turned_over(ThemeMode::Dark);
+        let state = speakers();
+        harness.settle(&state);
+        let off_centre = 7.5;
+        for (row, &level) in Level::OUTPUT.iter().enumerate() {
+            let at = level_thumb(&state, row, level) + vec2(off_centre, 0.0);
+            let range = level.range(DeviceDirection::Output);
+            let jumped = slider::quantise(
+                level.value(&state)
+                    + off_centre / slider::track_rect(slider_rect(column(), row)).width()
+                        * (range.max - range.min),
+                range.min,
+                range.max,
+                range.step,
+            );
+            if level != Level::FilterQ {
+                // What the jump would have set, so the test would catch its return.
+                assert_ne!(jumped, level.value(&state), "{level:?}");
+            }
+            let actions = press(&mut harness, &state, at, PointerButton::Primary);
+            assert!(
+                actions.is_empty(),
+                "{level:?}: a touch moved it: {actions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_master_gain_between_its_steps_survives_a_touch_and_a_drag_from_the_thumb_still_steps() {
+        // `--master_gain=3` leaves the speakers' gain between two of its 2 dB positions; a touch
+        // on the thumb used to snap it to 4 dB.
+        let mut harness = turned_over(ThemeMode::Dark);
+        let state = UiState {
+            master_gain_db: 3.0,
+            ..speakers()
+        };
+        harness.settle(&state);
+        let from = level_thumb(&state, 0, Level::MasterGain);
+        let actions = press(&mut harness, &state, from, PointerButton::Primary);
+        assert!(actions.is_empty(), "a touch moved it: {actions:?}");
+
+        // Thirty points right is 10.7 dB up: 13.7 dB, which the drag puts on its 14 dB step.
+        let to = from + vec2(30.0, 0.0);
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::default(),
+        };
+        let mut actions = Vec::new();
+        for events in [
+            vec![Event::PointerMoved(from)],
+            vec![Event::PointerMoved(from), button(from, true)],
+            vec![Event::PointerMoved(to)],
+            vec![button(to, false)],
+        ] {
+            actions.extend(harness.frame(&state, events).0);
+        }
+        assert_eq!(actions, vec![UiAction::SetMasterGain(14.0)]);
+    }
+
+    #[test]
+    fn an_arrow_on_a_master_gain_between_its_steps_stops_at_the_next_step_either_way() {
+        // `--master_gain=3` sits between the speakers' 2 dB positions. A whole step added and
+        // then rounded took Right to 6 dB and skipped 4 dB.
+        let state = UiState {
+            master_gain_db: 3.0,
+            ..speakers()
+        };
+        let arrow = |key| Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for (key, expected) in [(egui::Key::ArrowRight, 4.0), (egui::Key::ArrowLeft, 2.0)] {
+            let mut harness = turned_over(ThemeMode::Dark);
+            harness.settle(&state);
+            harness.ctx.memory_mut(|m| {
+                m.request_focus(
+                    egui::Id::new("fx_slider").with(("fx_level", Level::MasterGain as u8)),
+                );
+            });
+            harness.frame(&state, Vec::new());
+            let (actions, _) = harness.frame(&state, vec![arrow(key)]);
+            assert_eq!(actions, vec![UiAction::SetMasterGain(expected)], "{key:?}");
+        }
+    }
+
+    #[test]
+    fn an_arrow_on_a_master_gain_on_a_step_moves_a_whole_step() {
+        let state = speakers();
+        let arrow = |key| Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        };
+        for (key, expected) in [(egui::Key::ArrowRight, -2.0), (egui::Key::ArrowLeft, -6.0)] {
+            let mut harness = turned_over(ThemeMode::Dark);
+            harness.settle(&state);
+            harness.ctx.memory_mut(|m| {
+                m.request_focus(
+                    egui::Id::new("fx_slider").with(("fx_level", Level::MasterGain as u8)),
+                );
+            });
+            harness.frame(&state, Vec::new());
+            let (actions, _) = harness.frame(&state, vec![arrow(key)]);
+            assert_eq!(actions, vec![UiAction::SetMasterGain(expected)], "{key:?}");
+        }
+    }
+
     #[test]
     fn picking_a_band_count_asks_for_it() {
         let mut harness = turned_over(ThemeMode::Dark);
@@ -1187,21 +1321,25 @@ mod tests {
     }
 
     #[test]
-    fn with_the_equalizer_off_the_levels_are_grey_but_still_answer() {
+    fn with_the_equalizer_off_the_levels_it_takes_are_grey_but_still_answer() {
         let mut harness = turned_over(ThemeMode::Dark);
         let state = UiState {
             eq_on: false,
             ..speakers()
         };
         let shapes = harness.settle(&state);
-        for row in 0..3 {
+        // The leveller (row 1) and the width (row 2) go with the equalizer; the master gain
+        // (row 0) stays in the path (0.4.0 audit R3) and keeps its colour.
+        for row in 1..3 {
             let track = slider::track_rect(slider_rect(column(), row));
             let fill = fill_at(&shapes, track).expect("an unfilled track");
             assert!(is_grey(fill), "row {row}: {fill:?}");
         }
-        let target = slider::track_rect(slider_rect(column(), 0)).center();
+        let gain = fill_at(&shapes, slider::track_rect(slider_rect(column(), 0))).unwrap();
+        assert!(!is_grey(gain), "{gain:?}");
+        let target = slider::track_rect(slider_rect(column(), 1)).center();
         let actions = press(&mut harness, &state, target, PointerButton::Primary);
-        assert_eq!(actions, vec![UiAction::SetMasterGain(0.0)]);
+        assert_eq!(actions, vec![UiAction::SetVolumeLeveling(2.0)]);
 
         // On a voice the makeup gain is a stage of its own and keeps its colour.
         let mut harness = turned_over(ThemeMode::Dark);

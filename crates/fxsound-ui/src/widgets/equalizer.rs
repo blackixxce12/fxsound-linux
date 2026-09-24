@@ -1524,6 +1524,26 @@ mod tests {
     }
 
     #[test]
+    fn the_half_octave_twenty_band_ladder_reads_as_whole_hertz_and_one_decimal_of_kilohertz() {
+        // 0.4.0 audit R4: the twenty bands sit every half octave, so their captions are no longer
+        // the round ISO numbers; the format table reads them as it reads any centre.
+        let labels: Vec<String> = fxsound_core::eq::TWENTY_BAND_CENTRES_HZ
+            .iter()
+            .map(|&hz| frequency_label(hz, 20).replace('\n', " "))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "20 Hz", "28 Hz", "40 Hz", "57 Hz", "82 Hz", "116 Hz", "165 Hz", "235 Hz",
+                "334 Hz", "474 Hz", "674 Hz", "959 Hz", "1.4 kHz", "1.9 kHz", "2.8 kHz", "3.9 kHz",
+                "5.6 kHz", "7.9 kHz", "11 kHz", "16 kHz",
+            ]
+        );
+        // Every caption stays within its column: no more characters than the old ladder's widest.
+        assert!(labels.iter().all(|label| label.len() <= "1.4 kHz".len()));
+    }
+
+    #[test]
     fn a_non_positive_frequency_has_no_label() {
         assert_eq!(frequency_label(0.0, 10), "");
         assert_eq!(frequency_label(-1.0, 15), "");

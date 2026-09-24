@@ -104,3 +104,6 @@ countries: ba
 "FxSound's preset" = "FxSound preset"
 "No application has played or recorded through FxSound yet" = "Nijedna aplikacija još nije reproducirala ni snimala zvuk kroz FxSound"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Bluetooth mikrofon se uključuje samo dok neka aplikacija snima sa FxSound (Ulaz), a tada prebacuje slušalice na kvalitet poziva."
+"Unsaved preset changes discarded" = "Nesačuvane izmjene profila su odbačene"
+"Move the preset %s to the trash?" = "Premjestiti profil %s u smeće?"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "Odbaciti nesačuvane izmjene svih profila? Sačuvani profili ostaju."

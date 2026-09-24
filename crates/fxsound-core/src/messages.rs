@@ -29,9 +29,13 @@ use crate::{
 /// callback. Deliberately `Copy` and free of heap-owning fields.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DspParams {
-    /// Master bypass. When `false` the engine skips everything but the master gain, which it
-    /// still applies, without the balance, while `eq_on` is set (`dfxpProcessReal.cpp:158-169`,
-    /// `SosProcess.cpp:500-516`); with the equalizer off as well, audio passes through untouched.
+    /// Master bypass. When `false` the engine skips everything but the master gain and the
+    /// balance, which it applies whatever `eq_on` says (0.4.0 audit R3), so the power button
+    /// changes the level only by what the effects, the bands and the leveller add. The original
+    /// kept the master gain alone on this path, and only while the equalizer was on
+    /// (`dfxpProcessReal.cpp:158-169`, `SosProcess.cpp:500-516`). On 5.1 and 7.1 the balance turns
+    /// down a whole side — front, side and rear — and leaves the centre and the subwoofer alone
+    /// (audit #44).
     pub power: bool,
     /// Hand the device silence, whatever `power` says: the snapshot's mute, the app's to set.
     ///
@@ -46,9 +50,11 @@ pub struct DspParams {
     pub mute: bool,
     /// The five effect knobs on the engine's `0.0..=1.0` scale, indexed by `Effect as usize`.
     pub effects: [f32; Effect::COUNT],
-    /// Whether the GraphicEq block runs: the equalizer and, with it, the master gain, the balance
-    /// and the volume levelling, which the original processes as one block and switches as one
-    /// (`dfxpProcessReal.cpp:143-157`, upstream aad64c1). The effects do not depend on it.
+    /// Whether the equalizer's bands and the volume levelling run, while the power is on. The
+    /// original switches the master gain and the balance with them as one block
+    /// (`dfxpProcessReal.cpp:143-157`, upstream aad64c1); this engine applies those two whatever
+    /// this says, powered or not (0.4.0 audit R3), so neither this switch nor the power button
+    /// moves the level by the master gain. The effects do not depend on it.
     pub eq_on: bool,
     /// How many entries of the band arrays are live.
     pub num_bands: u8,
@@ -62,8 +68,6 @@ pub struct DspParams {
     pub master_gain_db: f32,
     /// Left/right balance; negative is left, positive is right.
     pub balance: f32,
-    /// Peak-normalisation target in dB.
-    pub normalization_db: f32,
     /// Volume-levelling strength in dB.
     pub volume_leveling_db: f32,
 }
@@ -152,11 +156,6 @@ impl DspParams {
             default.master_gain_db,
         );
         self.balance = finite(self.balance, limits::BALANCE_DB, default.balance);
-        self.normalization_db = finite(
-            self.normalization_db,
-            limits::NORMALIZATION_DB,
-            default.normalization_db,
-        );
         self.volume_leveling_db = finite(
             self.volume_leveling_db,
             limits::VOLUME_LEVELING,
@@ -184,7 +183,6 @@ impl Default for DspParams {
             filter_q: 1.0,
             master_gain_db: 0.0,
             balance: 0.0,
-            normalization_db: 0.0,
             volume_leveling_db: 0.0,
         }
     }

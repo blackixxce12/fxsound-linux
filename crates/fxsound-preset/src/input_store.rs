@@ -74,6 +74,7 @@ impl Store<InputPreset> {
             InputPreset::default_dirs(),
             Settings::user_preset_dir().join("Input"),
         )
+        .with_home_trash()
     }
 }
 

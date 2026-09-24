@@ -31,7 +31,7 @@
 //! original's two buttons onto [`OverwriteChoice::OverwriteAll`] and [`OverwriteChoice::SkipAll`],
 //! with dismissal cancelling the export outright.
 
-use super::message::{ConfirmChoice, MessageBox};
+use super::message::{ConfirmChoice, MessageBox, message_with_name};
 use super::{DialogChrome, DialogResponse, TextButton, draw_truncated, normal_font, small_font};
 use crate::assets::AssetCache;
 use crate::theme::{FxColor, Palette};
@@ -260,7 +260,8 @@ impl<'a> ImportDialog<'a> {
 
         match &self.state.notice {
             Some(notice) => {
-                if MessageBox::ok(notice)
+                // The app files the notice under its English key.
+                if MessageBox::ok(&tr(notice))
                     .show_modal(ui.ctx(), palette, assets, id.with("notice"))
                     .is_some()
                 {
@@ -670,7 +671,12 @@ impl<'a> ExportDialog<'a> {
         }
 
         if !self.state.collisions.is_empty() {
-            let message = overwrite_message(&self.state.collisions);
+            // One name goes into the question, shortened in the middle if the box needs it to
+            // show the question whole (0.4.0 audit #49).
+            let message = match self.state.collisions.as_slice() {
+                [one] => message_with_name(ui.ctx(), &tr(OVERWRITE_MESSAGE), one),
+                many => overwrite_message(many),
+            };
             if let Some(choice) = MessageBox::new(&message).show_modal(
                 ui.ctx(),
                 palette,

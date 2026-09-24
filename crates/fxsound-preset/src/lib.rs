@@ -13,6 +13,11 @@
 //! * floats are written with C's `%g`, i.e. six significant digits with trailing zeros stripped;
 //! * the equalizer block exists only in files of version 9 or newer.
 //!
+//! One thing is deliberately **not** reproduced from the file it came from: its version. The
+//! writer always writes the current one, [`VALS_FILE_VERSION`], as the original's
+//! `createValsFromStateInfo` does (`dsp/DfxDspPreset.cpp:278`) — a preset read from an older file
+//! is saved as a current one (0.4.0 audit #46).
+//!
 //! Line endings are accepted as LF or CRLF, with or without a final terminator, because the files
 //! in the FxSound tree are a mix of all three.
 
@@ -21,6 +26,7 @@
 pub mod input;
 pub mod input_store;
 mod store;
+pub mod trash;
 
 pub use input_store::InputPresetStore;
 pub use store::{PresetEntry, PresetFile, PresetSource, PresetStore, Store};
@@ -81,6 +87,14 @@ const NUM_ELEMENT_PARAMS: usize = 7;
 const NUM_APP_INTS: usize = 7;
 /// The first version that carries an equalizer block.
 const EQ_MIN_VERSION: f32 = 9.0;
+/// The version every file is written as: `DFXG_VALS_FILE_VERSION` (`dsp/DfxDspPreset.cpp:53`).
+pub const VALS_FILE_VERSION: f32 = 9.0;
+/// The first version with a bass boost (`dsp/DfxDspPreset.cpp:206-210`).
+const BASS_MIN_VERSION: f32 = 3.0;
+/// The first version with a headphone flag (`dsp/DfxDspPreset.cpp:226-229`).
+const HEADPHONE_MIN_VERSION: f32 = 4.0;
+/// `DFXG_VALS_APP_DEPEND_HEADPHONE_INDEX`.
+const HEADPHONE_APP_INT: usize = 5;
 /// `DFXG_MAX_PRESET_NAME_LENGTH`: what the file format can hold.
 pub const MAX_NAME_LEN: usize = 128;
 
@@ -118,6 +132,36 @@ pub fn sanitise_preset_name(name: &str) -> String {
         .collect();
     let cut: String = stripped.trim().chars().take(MAX_PRESET_NAME_LEN).collect();
     cut.trim_end().to_owned()
+}
+
+/// The most bytes a preset name may take in a `.fac` file: the Windows reader takes the name line
+/// with `fgets(…, LINE_LENGTH = 128, …)` (`dsp/ptutil/VALS/Valsfile.cpp:38`, `:320-331`), which
+/// keeps 127 bytes and the newline has to be one of them, and then drops the name's last byte as
+/// that newline. A name of 126 bytes comes back whole; one byte longer and Windows cuts it, reads
+/// the rest of the line as the next field, and every field after it lands one line late.
+pub const MAX_NAME_BYTES: usize = 126;
+
+/// A name for a preset about to be **created** — Save New Preset, Rename Preset, `--save_preset`,
+/// an import, the calibration wizard's — made safe for every FxSound to read (0.4.0 audit #15):
+/// [`sanitise_preset_name`], then cut to [`MAX_NAME_BYTES`] on a character boundary.
+///
+/// Sixty-four characters is what the original's editor allows, but its file reader counts bytes:
+/// sixty-four Cyrillic letters are 128 bytes, and the Windows build read a preset with such a
+/// name back shifted by a line. Only new names are cut. A preset already on disk keeps its name
+/// and its files — the autosave and export paths come from [`sanitise_preset_name`], which is
+/// unchanged — so nothing that exists is orphaned.
+#[must_use]
+pub fn new_preset_name(name: &str) -> String {
+    let mut name = sanitise_preset_name(name);
+    if name.len() > MAX_NAME_BYTES {
+        let mut end = MAX_NAME_BYTES;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+        name.truncate(name.trim_end().len());
+    }
+    name
 }
 
 /// Parse a `.fac` file.
@@ -207,7 +251,8 @@ pub fn parse(bytes: &[u8]) -> Result<Preset, PresetError> {
 
     // The equalizer block. The writer emits it whenever it holds an EQ handle; the reader only
     // looks for it from version 9 on, and that is the behaviour that matters for compatibility.
-    let (eq_bands, eq_on) = if version >= EQ_MIN_VERSION && !lines.is_exhausted() {
+    let eq_block = version >= EQ_MIN_VERSION && !lines.is_exhausted();
+    let (eq_bands, eq_on) = if eq_block {
         let num_bands = lines.next_i64("the band count")?.max(0) as usize;
         if num_bands > eq::MAX_BANDS {
             return Err(PresetError::TooManyBands(num_bands));
@@ -225,6 +270,17 @@ pub fn parse(bytes: &[u8]) -> Result<Preset, PresetError> {
         (eq::default_bands(), true)
     };
 
+    // What an older file does not carry, read the way the original reads it
+    // (`dsp/DfxDspPreset.cpp:206-229`), so that saving it again — always as the current version —
+    // writes what it meant rather than whatever its slots happened to hold.
+    if version < BASS_MIN_VERSION {
+        main_midi[fxsound_core::Effect::Bass.vals_index()] = 0;
+        app_ints[fxsound_core::Effect::Bass.app_depend_index()] = 0;
+    }
+    if version < HEADPHONE_MIN_VERSION {
+        app_ints[HEADPHONE_APP_INT] = 0;
+    }
+
     Ok(Preset {
         name,
         version,
@@ -241,12 +297,19 @@ pub fn parse(bytes: &[u8]) -> Result<Preset, PresetError> {
 /// Byte-identical to what the original writes for any preset it produced, apart from the line
 /// ending: the Windows build opens the file in text mode so it emits CRLF. Files in the FxSound
 /// tree use both, and the reader accepts either.
+///
+/// Always as the current version, [`VALS_FILE_VERSION`], whatever `preset.version` says, and so
+/// always with the double-params line and the equalizer block its reader expects (0.4.0 audit
+/// #46). Writing the version a preset was read with, as this did, made a re-saved version 7 file
+/// one whose equalizer block the reader skips — an imported preset lost its curve the moment it
+/// was saved — and a version 1 file one whose double-params line the reader takes for the element
+/// count, so every field after it shifted.
 #[must_use]
 pub fn write(preset: &Preset) -> String {
     let mut out = String::with_capacity(1024);
 
     let _ = writeln!(out, "CLASS1 : Effect Type");
-    let _ = writeln!(out, "{}: Version", format_g(preset.version));
+    let _ = writeln!(out, "{}: Version", format_g(VALS_FILE_VERSION));
     let _ = writeln!(out, "{}", preset.name);
     let _ = writeln!(out, "0: Double Params Flag");
     let _ = writeln!(out, "1: Total number of elements");
@@ -762,5 +825,121 @@ Band 10
         // do not count towards the 64, so ten colons in front of 64 letters leave all 64.
         let name = format!("{}{}", ":".repeat(10), "a".repeat(MAX_PRESET_NAME_LEN));
         assert_eq!(sanitise_preset_name(&name), "a".repeat(MAX_PRESET_NAME_LEN));
+    }
+
+    /// The fixture as a file of another version: `version` on its second line and, for a version
+    /// 1 file, no double-params line, as `valsSave` writes one (`Valsfile.cpp:93-96`).
+    fn fixture_as_version(version: &str) -> String {
+        let mut text = FIXTURE.replacen("9: Version", &format!("{version}: Version"), 1);
+        if version.parse::<f32>().is_ok_and(|v| v <= 1.0) {
+            text = text.replacen("0: Double Params Flag\n", "", 1);
+        }
+        text
+    }
+
+    #[test]
+    fn a_preset_read_from_an_older_file_is_written_as_the_current_version() {
+        // 0.4.0 audit #46. Imported from a version 7 file, moved on the equalizer, saved: the
+        // writer kept "7: Version", the reader skips the equalizer block below version 9, and the
+        // curve came back flat after a restart.
+        let mut preset = parse(fixture_as_version("7").as_bytes()).expect("a version 7 file");
+        assert_eq!(preset.version, 7.0);
+        assert_eq!(
+            preset.eq_bands,
+            eq::default_bands(),
+            "version 7 carries no curve"
+        );
+        preset.eq_bands[3].boost_db = 5.0;
+
+        let text = write(&preset);
+        assert!(text.contains("\n9: Version\n"), "{text}");
+        let again = parse(text.as_bytes()).expect("reparse");
+        assert_eq!(again.eq_bands[3].boost_db, 5.0, "the edited curve survives");
+        assert_eq!(again.main_midi, preset.main_midi);
+    }
+
+    #[test]
+    fn a_version_one_file_reads_right_and_is_saved_as_one_that_reads_right() {
+        // A version 1 file has no double-params line. Written back as version 1 with one, as the
+        // writer used to, the reader took "0: Double Params Flag" for the element count and every
+        // field after it was read one line late.
+        let old = parse(fixture_as_version("1").as_bytes()).expect("a version 1 file");
+        assert_eq!(old.version, 1.0);
+        assert_eq!(old.name, "Fixture");
+        let again = parse(write(&old).as_bytes()).expect("reparse what was written");
+        assert_eq!(again.name, old.name);
+        assert_eq!(again.main_midi, old.main_midi);
+        assert_eq!(again.app_ints, old.app_ints);
+        assert_eq!(again.element_params, old.element_params);
+    }
+
+    #[test]
+    fn a_file_older_than_version_three_has_no_bass_and_one_older_than_four_no_headphones() {
+        // `DfxDspPreset.cpp:206-229`: before version 3 the file has no bass boost, before 4 no
+        // headphone flag. Whatever those slots hold is not a setting.
+        let two = parse(fixture_as_version("2").as_bytes()).expect("version 2");
+        assert_eq!(two.main_midi[fxsound_core::Effect::Bass.vals_index()], 0);
+        assert!(!two.is_effect_on(fxsound_core::Effect::Bass));
+        assert_eq!(
+            two.app_ints[fxsound_core::Effect::Bass.app_depend_index()],
+            0
+        );
+        let three = parse(
+            fixture_as_version("3")
+                .replacen("0: Integer[5]", "1: Integer[5]", 1)
+                .as_bytes(),
+        )
+        .expect("version 3");
+        assert_eq!(three.main_midi[fxsound_core::Effect::Bass.vals_index()], 60);
+        assert_eq!(
+            three.app_ints[HEADPHONE_APP_INT], 0,
+            "no headphone flag before 4"
+        );
+        let four = parse(
+            fixture_as_version("4")
+                .replacen("0: Integer[5]", "1: Integer[5]", 1)
+                .as_bytes(),
+        )
+        .expect("version 4");
+        assert_eq!(four.app_ints[HEADPHONE_APP_INT], 1);
+    }
+
+    #[test]
+    fn a_current_file_is_still_written_back_byte_for_byte() {
+        let preset = parse(FIXTURE.as_bytes()).expect("parse");
+        assert_eq!(write(&preset), FIXTURE);
+    }
+
+    #[test]
+    fn a_new_name_is_cut_to_what_the_windows_reader_takes_on_a_character_boundary() {
+        // 0.4.0 audit #15: 64 Cyrillic letters are 128 bytes, two more than the Windows reader
+        // keeps, and that preset read back shifted by a line.
+        let cyrillic = "я".repeat(MAX_PRESET_NAME_LEN);
+        assert_eq!(cyrillic.len(), 128);
+        let cut = new_preset_name(&cyrillic);
+        assert_eq!(cut, "я".repeat(63));
+        assert_eq!(cut.len(), MAX_NAME_BYTES);
+        // A three-byte letter never splits: 42 of them are 126 bytes, 43 cannot fit.
+        let cjk = "音".repeat(50);
+        assert_eq!(new_preset_name(&cjk), "音".repeat(42));
+        // A cut that lands after a space does not leave a trailing space.
+        let spaced = format!("{} {}", "я".repeat(62), "яя");
+        assert_eq!(new_preset_name(&spaced), "я".repeat(62));
+        // What fits is left alone, and the sanitiser still runs first.
+        assert_eq!(new_preset_name(" Rock:  "), "Rock");
+        assert_eq!(
+            new_preset_name(&"a".repeat(80)),
+            "a".repeat(MAX_PRESET_NAME_LEN)
+        );
+        // And a name cut this way is one the reader gives back whole.
+        let mut preset = parse(FIXTURE.as_bytes()).expect("parse");
+        preset.name = cut.clone();
+        let text = write(&preset);
+        let name_line = text.lines().nth(2).expect("the name line");
+        assert!(
+            name_line.len() < 128,
+            "fits fgets(…, 128, …) with its newline"
+        );
+        assert_eq!(parse(text.as_bytes()).expect("reparse").name, cut);
     }
 }

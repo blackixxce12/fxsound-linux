@@ -105,3 +105,6 @@ countries: vn
 "FxSound's preset" = "Preset của FxSound"
 "No application has played or recorded through FxSound yet" = "Chưa có ứng dụng nào phát hoặc ghi âm qua FxSound"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Micrô Bluetooth chỉ hoạt động khi có ứng dụng ghi âm từ FxSound (Đầu vào), và khi đó sẽ chuyển tai nghe sang chất lượng cuộc gọi."
+"Unsaved preset changes discarded" = "Đã hủy các thay đổi preset chưa lưu"
+"Move the preset %s to the trash?" = "Chuyển preset %s vào thùng rác?"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "Hủy các thay đổi chưa lưu của mọi preset? Các preset đã lưu vẫn được giữ."

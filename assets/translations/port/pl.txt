@@ -105,3 +105,6 @@ countries: pl
 "FxSound's preset" = "Preset FxSound"
 "No application has played or recorded through FxSound yet" = "Żadna aplikacja nie odtwarzała ani nie nagrywała jeszcze przez FxSound"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Mikrofon Bluetooth włącza się tylko wtedy, gdy aplikacja nagrywa z FxSound (Wejście), i przełącza wtedy zestaw słuchawkowy na jakość rozmowy."
+"Unsaved preset changes discarded" = "Odrzucono niezapisane zmiany ustawień wstępnych"
+"Move the preset %s to the trash?" = "Przenieść ustawienie wstępne %s do kosza?"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "Odrzucić niezapisane zmiany wszystkich ustawień wstępnych? Zapisane ustawienia wstępne zostaną zachowane."

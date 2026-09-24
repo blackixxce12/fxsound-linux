@@ -83,6 +83,12 @@ const INDIRECT_CALLS: &[(&str, &[&str])] = &[
     ("self.denoise.label()", &[]),
     ("effect.label()", &[]),
     ("effect.tooltip()", &[]),
+    // The import window's notice in `dialogs/presets.rs`, which the app files under its English
+    // key (`fxsound-app/src/app.rs`, `handle_import`).
+    (
+        "notice",
+        &["Preset files not found in the selected folder."],
+    ),
 ];
 
 // ---------------------------------------------------------------------------------------------

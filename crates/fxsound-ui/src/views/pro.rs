@@ -826,10 +826,13 @@ fn effect_column(
 
         let rect = effects::slider_rect(column, index);
         let mut value = state.effect(effect);
-        // 0…10 in whole steps (`FxAudioControls.cpp:113`). The five effect sliders are the ones
-        // *without* right-click-to-reset — that belongs to `FxAudioSlider` and `FxBalanceSlider`
-        // (`docs/spec/03-controls.md` §3.5).
+        // 0…10 in whole steps (`FxAudioControls.cpp:113`), and with Shift one stored value at a
+        // time (0.4.0 audit #14): the eleven positions stand over 128 values a preset can store.
+        // The five effect sliders are the ones *without* right-click-to-reset — that belongs to
+        // `FxAudioSlider` and `FxBalanceSlider` (`docs/spec/03-controls.md` §3.5).
+        let steps = StoredSteps(effect);
         let slider = FxSlider::new(&mut value, 0.0, scale::SLIDER_MAX, 1.0)
+            .fine_steps(&steps)
             .enabled(enabled)
             .show(ui, rect, palette, assets, effect.key());
         let changed = slider.changed();
@@ -851,13 +854,17 @@ fn effect_column(
         // `showValue(show)` is `show && isEnabled()` (`FxAudioControls.cpp:208-211`), and since
         // v2.0 `show` is unconditionally true so touch users can read the value
         // (`FxProView.cpp:70`).
+        //
+        // A value between two positions — General's Surround is stored as 20, between positions 1
+        // and 2 — shows with its decimal, "1.6", rather than as the position ("2") that would
+        // save as something else (0.4.0 audit #14).
         if enabled {
             let t = value / scale::SLIDER_MAX;
             let label = effects::value_label_rect(rect, t);
             ui.painter().text(
                 pos2(label.left() + effects::LABEL_BORDER_LEFT, label.center().y),
                 Align2::LEFT_CENTER,
-                format!("{value:.0}"),
+                scale::slider_label_for(effect, value),
                 caption_font(VALUE_FONT_PX),
                 value_colour,
             );
@@ -878,6 +885,20 @@ fn effect_column(
             caption_font(CAPTION_FONT_PX),
             palette.color(FxColor::DefaultText),
         );
+    }
+}
+
+/// The values an effect's slider stands at between its whole positions: every value a preset can
+/// store, one Shift-step apart ([`scale::stored_step_for`]).
+struct StoredSteps(Effect);
+
+impl crate::widgets::slider::FineSteps for StoredSteps {
+    fn step(&self, value: f32, up: bool) -> f32 {
+        scale::stored_step_for(self.0, value, up)
+    }
+
+    fn nearest(&self, value: f32) -> f32 {
+        scale::nearest_stored_position_for(self.0, value)
     }
 }
 
@@ -1198,6 +1219,157 @@ mod tests {
         }
 
         assert_eq!(actions, vec![UiAction::SetEffect(Effect::Fidelity, 5.0)]);
+    }
+
+    /// General's Surround: stored as 20, between positions 1 (13) and 2 (25) — the audit's
+    /// scenario for #14.
+    fn surround_between_positions() -> UiState {
+        let mut state = state();
+        state.effects[Effect::Surround as usize] = scale::midi_to_slider_for(Effect::Surround, 20);
+        state
+    }
+
+    fn thumb_of(state: &UiState, effect: Effect) -> Pos2 {
+        let rect = effects::slider_rect(column(), effect as usize);
+        let track = slider::track_rect(rect);
+        let t = state.effect(effect) / scale::SLIDER_MAX;
+        Pos2::new(track.left() + track.width() * t, rect.center().y)
+    }
+
+    #[test]
+    fn a_value_between_positions_is_shown_with_its_decimal_and_a_position_without() {
+        // 0.4.0 audit #14: the readout used to round 1.57 to "2", which saves as 25.
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let shapes = harness.settle(&surround_between_positions());
+        let shown: Vec<String> = texts(&shapes).into_iter().map(|(text, ..)| text).collect();
+        assert!(shown.iter().any(|t| t == "1.6"), "{shown:?}");
+        assert!(!shown.iter().any(|t| t == "2"), "{shown:?}");
+        // The whole positions of the other four still read as whole numbers.
+        for whole in ["3", "5", "4", "8"] {
+            assert!(shown.iter().any(|t| t == whole), "{whole} in {shown:?}");
+        }
+    }
+
+    #[test]
+    fn a_press_on_the_thumb_without_moving_leaves_a_value_between_positions_alone() {
+        // 0.4.0 audit #14: one touch snapped the stored 20 to a whole position and the preset
+        // was saved as 25.
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let state = surround_between_positions();
+        harness.settle(&state);
+        let actions = harness.click(&state, thumb_of(&state, Effect::Surround));
+        assert!(actions.is_empty(), "a touch moved the slider: {actions:?}");
+    }
+
+    #[test]
+    fn a_drag_off_the_thumb_still_lands_on_whole_positions() {
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let state = surround_between_positions();
+        harness.settle(&state);
+        let from = thumb_of(&state, Effect::Surround);
+        let to = from + egui::vec2(34.0, 0.0);
+        let press = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut actions = Vec::new();
+        for events in [
+            vec![Event::PointerMoved(from)],
+            vec![Event::PointerMoved(from), press(from, true)],
+            vec![Event::PointerMoved(to)],
+            vec![press(to, false)],
+        ] {
+            actions.extend(harness.frame(&state, events).0);
+        }
+        let Some(UiAction::SetEffect(Effect::Surround, value)) = actions.last() else {
+            panic!("the drag did nothing: {actions:?}");
+        };
+        assert_eq!(*value, value.round(), "{value}");
+    }
+
+    #[test]
+    fn shift_and_an_arrow_step_one_stored_value_where_an_arrow_steps_a_position() {
+        // 0.4.0 audit #14: the fine step reaches every value a preset can store, the Windows
+        // presets' 20 included, and the plain arrow keeps its whole positions.
+        let ctx = test_context();
+        let mut scratch = ViewScratch::new();
+        let mut assets = AssetCache::new();
+        let state = surround_between_positions();
+        let key = |modifiers| Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let focus = || {
+            ctx.memory_mut(|m| {
+                m.request_focus(egui::Id::new("fx_slider").with(Effect::Surround.key()));
+            });
+        };
+        frame(&ctx, &state, &mut scratch, &mut assets, Vec::new());
+        focus();
+        frame(&ctx, &state, &mut scratch, &mut assets, Vec::new());
+        // Shift held: the modifiers of the frame, as egui-winit reports them, and of the key.
+        let mut actions = Vec::new();
+        let input = raw_input(vec![
+            Event::ModifiersChanged(egui::Modifiers::SHIFT),
+            key(egui::Modifiers::SHIFT),
+        ]);
+        ctx.run_ui(input, |ui| {
+            actions = show(
+                ui,
+                &state,
+                &mut scratch,
+                Palette::new(ThemeMode::Dark),
+                &mut assets,
+            )
+            .actions;
+        })
+        .drop_without_applying_deltas();
+        let Some(UiAction::SetEffect(Effect::Surround, value)) = actions.first() else {
+            panic!("Shift+Right did nothing: {actions:?}");
+        };
+        assert_eq!(scale::slider_to_midi_for(Effect::Surround, *value), 21);
+
+        focus();
+        frame(
+            &ctx,
+            &state,
+            &mut scratch,
+            &mut assets,
+            vec![Event::ModifiersChanged(egui::Modifiers::NONE)],
+        );
+        let actions = frame(
+            &ctx,
+            &state,
+            &mut scratch,
+            &mut assets,
+            vec![key(egui::Modifiers::NONE)],
+        );
+        assert_eq!(
+            actions.first(),
+            Some(&UiAction::SetEffect(Effect::Surround, 2.0)),
+            "a plain Right arrow from 1.6 stops at the next position, 2, and does not skip it"
+        );
+
+        let left = Event::Key {
+            key: egui::Key::ArrowLeft,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        focus();
+        frame(&ctx, &state, &mut scratch, &mut assets, Vec::new());
+        let actions = frame(&ctx, &state, &mut scratch, &mut assets, vec![left]);
+        assert_eq!(
+            actions.first(),
+            Some(&UiAction::SetEffect(Effect::Surround, 1.0)),
+            "a plain Left arrow from 1.6 stops at the position below it, 1"
+        );
     }
 
     /// The same window with a microphone selected.

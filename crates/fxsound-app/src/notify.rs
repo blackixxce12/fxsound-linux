@@ -199,10 +199,12 @@ impl Message {
         Self::new(tr_args("Preset %s is deleted.", &[name]))
     }
 
-    /// The preset list was reset (`FxController.cpp:1381`). Note the original has no full stop.
+    /// Settings ▸ Reset Presets dropped every unsaved change. The original says "Presets are
+    /// restored to factory defaults" (`FxController.cpp:1381`), because its reset deletes the user
+    /// presets too; this one keeps them, and says what it did (0.4.0 audit #21).
     #[must_use]
     pub fn presets_restored() -> Self {
-        Self::new(tr("Presets are restored to factory defaults"))
+        Self::new(tr("Unsaved preset changes discarded"))
     }
 
     /// Power toggled from a hotkey rather than the tray or the window
@@ -527,7 +529,7 @@ mod tests {
         );
         assert_eq!(
             Message::presets_restored().body,
-            "Presets are restored to factory defaults"
+            "Unsaved preset changes discarded"
         );
         assert_eq!(Message::power_toggled(true).body, "FxSound is on.");
         assert_eq!(Message::power_toggled(false).body, "FxSound is off.");

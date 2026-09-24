@@ -700,8 +700,28 @@ Triggers: the 60 s timer (`.cpp:2103-2110`), switching away from a modified pres
 | **Delete** `deletePreset()` | `type==UserPreset && power` | `deleteAutoSavedPreset(name)`; `SHFileOperation` delete; `initPresets()`; select the output's configured preset if any, else index `0`; message `"Preset %s is deleted."` | `.cpp:1278-1315` |
 | **Undo** `undoPreset()` | `isPresetModified()` | clear modified → `PresetModified`; `deleteAutoSavedPreset(name)`; `setPreset(idx)` (now loads the original) | `.cpp:1317-1332` |
 | **Reset to factory** `resetPresets()` | UI enables it when `userPresetCount > 0` or any preset is modified (`FxSettingsDialog.cpp:210-220`) | reset the five globals to their `DEFAULT_*`; delete every autosave of a modified preset; `SHFileOperation`-delete **every** `UserPreset` file; `initPresets()`; select the output's configured preset else `0`; message `"Presets are restored to factory defaults"` | `.cpp:1334-1382` |
-| **Export** `exportPresets(list)` | menu enabled when `!isPresetModified() && power` | `mkdir Documents\FxSound\Presets\Export`; per preset, if the target exists ask `"Preset file %s already exists in the export path, do you want to overwrite the preset file?"`; else `dfx_dsp_.exportPreset(src, name, dir)` | `.cpp:1384-1417` |
-| **Import** `importPresets(files, out imported, out skipped)` | same | for each file, `getPresetInfo()`; if the name is unique, copy into the user preset dir as `<name>.fac` and record in `imported`, else record in `skipped`; if anything was imported → `initPresets()` + `setPreset(settings("preset"))`, return `true` | `.cpp:1419-1458` |
+| **Export** `exportPresets(list)` | menu enabled when `!isPresetModified() && power` (the port: `power` only, audit #18) | `mkdir Documents\FxSound\Presets\Export`; per preset, if the target exists ask `"Preset file %s already exists in the export path, do you want to overwrite the preset file?"`; else `dfx_dsp_.exportPreset(src, name, dir)` | `.cpp:1384-1417` |
+| **Import** `importPresets(files, out imported, out skipped)` | same (the port: `power` only, audit #18) | for each file, `getPresetInfo()`; if the name is unique, copy into the user preset dir as `<name>.fac` and record in `imported`, else record in `skipped`; if anything was imported → `initPresets()` + `setPreset(settings("preset"))`, return `true` | `.cpp:1419-1458` |
+
+**The port departs (0.4.0 audit #16, #17, #18, #19, #20, #21).** The table is the original's.
+In the port, one rule — `App::preset_command_allowed`, which the menu (`App::preset_menu`), the
+command line and D-Bus all go by — decides:
+
+* **Save New** needs only `userPresetCount < max_user_presets && power`: a preset with no unsaved
+  changes is saved as a copy (#17). `max_user_presets` is clamped to `10..=1000`, not reset to 120
+  when outside `10..=120` (#20).
+* **Export** and **Import** need only `power` (#18): the export writes the presets as saved, the
+  import skips a name already taken, the modified preset's included.
+* **Rename** to the preset's own name in other letter case is allowed, and moves the file and its
+  autosave instead of saving a copy and deleting the old file (#19).
+* **Delete** is asked about first (`"Move the preset %s to the trash?"`) and moves the file and its
+  autosave to the desktop's trash, or sets them aside as `<name>.fac.1.bak` when the trash is on
+  another filesystem — never the permanent `SHFileOperation` delete (#16).
+* **Reset** (Settings ▸ Reset presets) is offered only while some preset of either lane has
+  unsaved changes, asks first (`"Discard the unsaved changes of every preset? Saved presets are
+  kept."`), drops every autosave in both lanes' stores and loads each lane's preset — the one its
+  device remembers, or else the selected one — as saved. It deletes no saved preset and resets no
+  global, and says `"Unsaved preset changes discarded"` (#21).
 
 ⚠ `savePreset("")` writes into the **user** preset directory using the *current* preset's name even
 if the current preset is an `AppPreset` — the only thing preventing a shadow copy of a factory

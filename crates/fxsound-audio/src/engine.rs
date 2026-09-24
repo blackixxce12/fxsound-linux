@@ -5183,9 +5183,10 @@ fn build_nodes(
     // can, and the adaptive de-esser places its corner from them (`docs/0.4.0-design.md` §6).
     // The music chain has no use for it and its lane ignores it.
     dsp.set_source_rate(source_rate.map(|rate| rate as f32));
-    // The subwoofer and the front pair: the music chain's business, ignored by the voice chain's
-    // lane, which has no stage that mixes one channel into another.
-    dsp.set_layout(positions.lfe_index(), positions.front_pair());
+    // The subwoofer, the front pair and the side of every channel (the balance's, audit #44): the
+    // music chain's business, ignored by the voice chain's lane, which has no stage that mixes one
+    // channel into another.
+    dsp.set_layout(&positions);
     // Read before the engine is handed to the node's user data, where it can no longer be reached
     // from the main loop.
     let dsp_latency_frames = dsp.latency_frames();

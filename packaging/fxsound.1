@@ -90,7 +90,10 @@ inverts the current state.
 .TP
 .BI \-\-set_effect= NAME:VALUE[,NAME:VALUE...]
 Set effect levels on the slider scale,
-.RB 0 \(en 10 .
+.RB 0 \(en 10 ,
+as the window's sliders read them: Dynamic Boost's and Ambience's ten
+positions run over the values that sound different, so a position means the
+same on the command line as in the window.
 Accepted names are
 .BR fidelity " (also " clarity "), " ambience ", " surround ", "
 .BR dynamicboost " (also " dynamic_boost ") and " bass " (also"
@@ -102,8 +105,9 @@ voice chain instead.
 .BI \-\-num_bands= N
 Number of equalizer bands. Only 5, 10, 15, 20 and 31 are accepted; anything
 else is an error rather than a silent fallback. The curve is carried over to
-the new count by position rather than reset, and every output preset is then
-fitted onto this count: a ten-band preset picked on 31 bands stays on 31.
+the new count by frequency rather than reset, and every output preset is then
+fitted onto this count: a ten-band preset picked on 31 bands stays on 31. On
+the speakers the count is a setting, not an edit to the selected preset.
 With
 .B \-\-edit=input
 it sets the voice preset's band count, and the speakers' setting is left as it
@@ -167,9 +171,11 @@ reaches it. A device named on the same command line is selected first, so
 finds the preset in the microphone's list.
 .TP
 .BI \-\-save_preset= NAME
-Save the current modified settings as a new user preset. Refused with nothing
-modified, with a name a preset already has (in any case), and at the
-user-preset limit.
+Save the current settings as a new user preset: its unsaved changes, or a copy
+of it when it has none. Refused with a name a preset already has (in any
+case), and at the user-preset limit
+.RB ( max_user_presets
+in the settings file, 10 to 1000).
 .TP
 .B \-\-overwrite_preset
 Overwrite the selected user preset with its unsaved changes. A factory preset
@@ -180,10 +186,22 @@ Discard the selected preset's unsaved changes.
 .TP
 .BI \-\-rename_preset= NAME
 Rename the selected user preset. A factory preset, one with unsaved changes
-(save or undo them first) and a name already taken are refused.
+(save or undo them first) and a name another preset has are refused; a new
+spelling of the preset's own name, such as
+.B Rock
+for
+.BR rock ,
+is a rename.
 .TP
 .B \-\-delete_preset
-Delete the selected user preset. A factory preset is refused.
+Delete the selected user preset: its file goes to the desktop's trash
+.RI ( $XDG_DATA_HOME/Trash ),
+where a file manager can restore it, or stays beside itself as
+.I NAME.fac.1.bak
+(or the next free number) when the trash is on another filesystem. Its
+unsaved changes go the same way from
+.IR AutoSave/ ;
+restore both and the preset is back with them. A factory preset is refused.
 .PP
 Each of these is refused exactly where the window's menu greys its item out,
 with the reason on standard error, except that they also run while processing
@@ -194,8 +212,10 @@ A preset name becomes a
 filename, and preset files are meant to travel between Linux and Windows, so
 the Windows reserved characters
 .RB ( < " " > " " : " " \(dq " " / " " \e " " | " " ? " " * )
-are stripped from a name and the result is truncated to 64 characters. Voice
-presets follow the same rule with a
+are stripped from a name and the result is truncated to 64 characters. A new
+name is also cut to 126 bytes, on a character boundary, since a Windows FxSound
+reads a preset's name in that many: 63 Cyrillic letters. Voice presets follow
+the same rule with a
 .I .toml
 extension.
 .SS Devices and directions

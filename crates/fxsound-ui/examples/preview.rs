@@ -13,13 +13,18 @@
 //! cargo run -p fxsound-ui --example preview -- --input --lang=de
 //! cargo run -p fxsound-ui --example preview -- --levels --eq-off
 //! cargo run -p fxsound-ui --example preview -- --apps --light
+//! cargo run -p fxsound-ui --example preview -- --stored
+//! cargo run -p fxsound-ui --example preview -- --lang=de --message
 //! ```
 //!
 //! Flags: `--light`, `--input` (edit the microphone lane), `--lite`, `--notice[=TEXT]`,
 //! `--detached` (both lanes off), `--levels` (start with the effect column turned over to the
-//! equalizer's controls), `--eq-off` (the equalizer switched off), `--power-off`, `--lang=CODE`
+//! equalizer's controls), `--eq-off` (the equalizer switched off), `--power-off`, `--stored` (the
+//! effects as a Windows preset stores them, between the sliders' positions), `--lang=CODE`
 //! (one of the translation tables' codes; English otherwise), `--apps[=empty]` (Settings ▸
-//! Applications over a made-up list of applications, or none), `--exit-after-paint`. Keys while it
+//! Applications over a made-up list of applications, or none), `--message[=TEXT]` (the Yes/No
+//! message box over the window: `TEXT` is translated, and its `%s` is a long preset name; the
+//! export's overwrite question otherwise), `--exit-after-paint`. Keys while it
 //! runs: `I` switches the edit direction, `N` puts a notice up, `L` flips Pro/Lite, `T` flips the
 //! palette, `Esc` quits.
 //!
@@ -66,6 +71,19 @@ fn main() -> eframe::Result<()> {
     if flag("--power-off") {
         state.power = false;
     }
+    if flag("--stored") {
+        // General's stored values: 50, 64, 20, 60 and 60 of 127, most of them between positions.
+        use fxsound_core::{Effect, scale};
+        for (effect, midi) in [
+            (Effect::Fidelity, 50),
+            (Effect::Ambience, 64),
+            (Effect::Surround, 20),
+            (Effect::DynamicBoost, 60),
+            (Effect::Bass, 60),
+        ] {
+            state.effects[effect as usize] = scale::midi_to_slider_for(effect, midi);
+        }
+    }
     let mut preview = Preview::new(state, flag("--exit-after-paint"));
     if flag("--levels") {
         preview.scratch.column_face = views::ColumnFace::EqualizerControls;
@@ -79,6 +97,13 @@ fn main() -> eframe::Result<()> {
     if let Some(which) = args.iter().find_map(|a| a.strip_prefix("--apps")) {
         preview.settings = Some(demo_settings(which == "=empty"));
     }
+    preview.message = args.iter().find_map(|a| {
+        a.strip_prefix("--message").map(|rest| {
+            rest.strip_prefix('=')
+                .unwrap_or(fxsound_ui::dialogs::presets::OVERWRITE_MESSAGE)
+                .to_owned()
+        })
+    });
 
     let size = if preview.settings.is_some() {
         settings::WINDOW_SIZE
@@ -287,6 +312,8 @@ struct Preview {
     icons: NavIcons,
     /// The preset list and selection of the lane not being edited.
     parked: (Vec<PresetEntry>, Option<usize>),
+    /// The message box's template, while `--message` keeps it up.
+    message: Option<String>,
     exit_after_paint: bool,
     frames: u32,
 }
@@ -300,6 +327,7 @@ impl Preview {
             settings: None,
             icons: NavIcons::new(),
             parked: (input_presets(), Some(0)),
+            message: None,
             exit_after_paint,
             frames: 0,
         }
@@ -530,6 +558,24 @@ impl eframe::App for Preview {
         );
         for action in &response.actions {
             self.handle(&ctx, action);
+        }
+        if let Some(template) = &self.message {
+            let text = fxsound_ui::dialogs::message::message_with_name(
+                &ctx,
+                &fxsound_core::i18n::tr(template),
+                "Rock Ballad Extended Night",
+            );
+            if fxsound_ui::dialogs::MessageBox::new(&text)
+                .show_modal(
+                    &ctx,
+                    Palette::new(self.state.theme),
+                    &mut self.assets,
+                    "preview.message",
+                )
+                .is_some()
+            {
+                self.message = None;
+            }
         }
 
         self.frames += 1;

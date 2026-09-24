@@ -69,7 +69,10 @@ use clap::Parser as _;
 use eframe::egui;
 use fxsound_app::{
     App, WindowVisibility,
-    app::{FORBIDDEN_PRESET_NAME_CHARS, MAX_PRESET_NAME_CHARS, PresetMenu, preset_name_available},
+    app::{
+        FORBIDDEN_PRESET_NAME_CHARS, MAX_PRESET_NAME_CHARS, PresetMenu, preset_name_available,
+        rename_name_available,
+    },
     cli::{Cli, Command},
     commands::{self, WindowRequest},
     dbus::{self, DbusHandle},
@@ -84,8 +87,8 @@ use fxsound_core::{ThemeMode, ViewMode, i18n::tr};
 use fxsound_ui::{
     FxColor, Palette, UiAction,
     dialogs::{
-        self, CalibrationDialog, CalibrationView, ExportDialog, ExportState, ImportDialog,
-        ImportState, PresetsAction,
+        self, CalibrationDialog, CalibrationView, ConfirmChoice, ExportDialog, ExportState,
+        ImportDialog, ImportState, MessageBox, PresetsAction,
         changelog::{ChangelogAction, ChangelogPane},
         settings::{NavIcons, SettingsAction, SettingsDialog, SettingsState},
     },
@@ -765,7 +768,52 @@ struct Shell<'a> {
     /// Where the design-size content starts this frame: the viewport's origin, or the centred
     /// offset when the surface is larger than the design (see [`fit_zoom`]).
     content_origin: egui::Pos2,
+    /// A question the window is asking before it does something that cannot be taken back from
+    /// inside FxSound: deleting a preset, discarding every unsaved change.
+    confirm: Option<Confirm>,
 }
+
+/// What [`Shell::confirm`] asks about. The answer is acted on only while it still means what was
+/// asked: a Delete for the preset and lane on screen when it was asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Confirm {
+    /// Delete Preset (0.4.0 audit #16): the original deletes at once and for good.
+    Delete {
+        lane: fxsound_core::DeviceDirection,
+        name: String,
+    },
+    /// Settings ▸ Reset Presets (0.4.0 audit #21): every unsaved change, on both lanes.
+    ResetPresets,
+}
+
+impl Confirm {
+    /// The question, in the user's language, as the message box shows it: wrapped over its two
+    /// lines, and a preset name too wide for them cut in the middle rather than the question at
+    /// its end ([`dialogs::message::message_with_name`]).
+    fn question(&self, ctx: &egui::Context) -> String {
+        let template = match self {
+            Self::Delete { .. } => tr(DELETE_QUESTION),
+            Self::ResetPresets => tr(RESET_QUESTION),
+        };
+        self.question_from(ctx, &template)
+    }
+
+    /// [`Confirm::question`] from its question in any language: [`DELETE_QUESTION`]'s `%s` is the
+    /// preset's name.
+    fn question_from(&self, ctx: &egui::Context, template: &str) -> String {
+        match self {
+            Self::Delete { name, .. } => dialogs::message::message_with_name(ctx, template, name),
+            Self::ResetPresets => template.to_owned(),
+        }
+    }
+}
+
+/// The question Delete Preset asks. The preset goes to the desktop's trash
+/// (`fxsound_preset::trash`), where a file manager can restore it.
+const DELETE_QUESTION: &str = "Move the preset %s to the trash?";
+/// The question Reset Presets asks: what it does, which is less than its label says — saved
+/// presets stay.
+const RESET_QUESTION: &str = "Discard the unsaved changes of every preset? Saved presets are kept.";
 
 impl<'a> Shell<'a> {
     fn new(rt: &'a mut Runtime, applied_theme: ThemeMode) -> Self {
@@ -804,6 +852,7 @@ impl<'a> Shell<'a> {
             changelog,
             calibration: None,
             content_origin: egui::Pos2::ZERO,
+            confirm: None,
         }
     }
 
@@ -873,6 +922,9 @@ impl<'a> Shell<'a> {
         if let Some(calibration) = &self.calibration {
             size = grown(size, calibration.window_size());
         }
+        if self.confirm.is_some() {
+            size = grown(size, dialogs::message::WINDOW_SIZE);
+        }
         size
     }
 
@@ -889,6 +941,7 @@ impl<'a> Shell<'a> {
             || self.export.is_some()
             || self.changelog
             || self.calibration.is_some()
+            || self.confirm.is_some()
     }
 
     fn open_settings(&mut self) {
@@ -964,18 +1017,18 @@ impl<'a> Shell<'a> {
         let anchor = chrome.menu.rect().translate(self.content_origin.to_vec2());
 
         // The enablement predicates of `FxMainWindow.cpp:536-543`: the preset items are the
-        // controller's one rule, which the command line and D-Bus are refused by too.
+        // controller's one rule, which the command line and D-Bus are refused by too; Export and
+        // Import need only the power (0.4.0 audit #18, [`App::preset_menu`]).
         let preset = app.state.preset();
-        let power = app.state.power;
-        let modified = preset.is_some_and(|p| p.modified);
         let PresetMenu {
             save_new: can_save_new,
             overwrite: can_overwrite,
             undo: can_undo,
             rename: can_rename,
             delete: can_delete,
+            export: can_export,
+            import: can_import,
         } = app.preset_menu();
-        let can_transfer = !modified && power;
         let overwrite_label = if can_overwrite {
             format!(
                 "{} - {}",
@@ -1026,7 +1079,7 @@ impl<'a> Shell<'a> {
                         }
                         if saving
                             && let Some(editor) = editor.as_mut()
-                            && let Some(name) = name_editor(ui, editor, presets, palette)
+                            && let Some(name) = name_editor(ui, editor, presets, None, palette)
                         {
                             committed = Some((EditorPurpose::SaveNew, name));
                         }
@@ -1053,7 +1106,13 @@ impl<'a> Shell<'a> {
                         }
                         if renaming
                             && let Some(editor) = editor.as_mut()
-                            && let Some(name) = name_editor(ui, editor, presets, palette)
+                            && let Some(name) = name_editor(
+                                ui,
+                                editor,
+                                presets,
+                                preset.map(|p| p.name.as_str()),
+                                palette,
+                            )
                         {
                             committed = Some((EditorPurpose::Rename, name));
                         }
@@ -1063,10 +1122,10 @@ impl<'a> Shell<'a> {
                         }
                         menu_separator(ui, palette);
 
-                        if menu_row(ui, &tr("Export Presets"), can_transfer, Mark::None, palette) {
+                        if menu_row(ui, &tr("Export Presets"), can_export, Mark::None, palette) {
                             chosen = Some(MenuChoice::Export);
                         }
-                        if menu_row(ui, &tr("Import Presets"), can_transfer, Mark::None, palette) {
+                        if menu_row(ui, &tr("Import Presets"), can_import, Mark::None, palette) {
                             chosen = Some(MenuChoice::Import);
                         }
                         menu_separator(ui, palette);
@@ -1129,7 +1188,15 @@ impl<'a> Shell<'a> {
             MenuChoice::Settings => self.open_settings(),
             MenuChoice::Overwrite => self.rt.app.handle(&[UiAction::SavePreset]),
             MenuChoice::Undo => self.rt.app.handle(&[UiAction::UndoPresetChanges]),
-            MenuChoice::Delete => self.rt.app.handle(&[UiAction::DeletePreset]),
+            // Asked first (0.4.0 audit #16); `show_confirmation` deletes on Yes.
+            MenuChoice::Delete => {
+                if let Some(preset) = self.rt.app.state.preset() {
+                    self.confirm = Some(Confirm::Delete {
+                        lane: self.rt.app.state.direction,
+                        name: preset.name.clone(),
+                    });
+                }
+            }
             MenuChoice::Export => self.open_export(),
             MenuChoice::Import => self.open_import(),
             MenuChoice::Theme(mode) => {
@@ -1184,18 +1251,87 @@ impl<'a> Shell<'a> {
 
         // Escape closes it, as it does in the original (`FxSettingsDialog.cpp:78-88`) — unless
         // the changelog is open on top, in which case Escape is its.
-        let mut closed = !self.changelog && ctx.input(|i| i.key_pressed(egui::Key::Escape));
-        for action in &response.actions {
+        let escaped = !self.changelog && ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        let closed = self.act_on_settings(&response.actions, &mut state);
+        if !(escaped || closed) {
+            self.settings = Some(state);
+        }
+    }
+
+    /// Act on what the Settings pane reported this frame, on the pane's `state`; true if it asked
+    /// to be closed. The pane's own buttons open the changelog and the wizard here, the reset is
+    /// asked about first, and the rest goes to the controller.
+    fn act_on_settings(&mut self, actions: &[SettingsAction], state: &mut SettingsState) -> bool {
+        let mut closed = false;
+        for action in actions {
             match action {
                 SettingsAction::Close => closed = true,
                 SettingsAction::ShowChangelog => self.changelog = true,
                 SettingsAction::OpenCalibration => self.open_calibration(),
+                // Asked first (0.4.0 audit #21); `show_confirmation` resets on Yes.
+                SettingsAction::ResetPresets => {
+                    self.confirm = Some(Confirm::ResetPresets);
+                    continue;
+                }
                 _ => {}
             }
-            self.rt.app.handle_settings(action, &mut state);
+            self.rt.app.handle_settings(action, state);
         }
-        if !closed {
-            self.settings = Some(state);
+        closed
+    }
+
+    /// Ask the question in [`Shell::confirm`], if there is one, and act on the answer.
+    fn show_confirmation(&mut self, ctx: &egui::Context, palette: Palette) {
+        let Some(confirm) = self.confirm.clone() else {
+            return;
+        };
+        let question = confirm.question(ctx);
+        if let Some(choice) = MessageBox::new(&question).show_modal(
+            ctx,
+            palette,
+            &mut self.rt.app.assets,
+            "fxsound.confirm",
+        ) {
+            self.answer(choice);
+        }
+    }
+
+    /// Put the question away and act on a Yes.
+    ///
+    /// Delete goes ahead only if the preset asked about is still the one selected on the lane
+    /// asked about: a keybind, the tray or D-Bus can move the selection while the question is up,
+    /// and a Yes to one name must not delete another.
+    fn answer(&mut self, choice: ConfirmChoice) {
+        let Some(confirm) = self.confirm.take() else {
+            return;
+        };
+        if choice != ConfirmChoice::Yes {
+            return;
+        }
+        match confirm {
+            Confirm::Delete { lane, name } => {
+                let app = &mut self.rt.app;
+                if app.state.direction == lane && app.state.preset().is_some_and(|p| p.name == name)
+                {
+                    app.handle(&[UiAction::DeletePreset]);
+                } else {
+                    log::info!("{name} is no longer the selected preset; not deleting it");
+                }
+            }
+            Confirm::ResetPresets => {
+                let open = self.settings.is_some();
+                let mut state = self
+                    .settings
+                    .take()
+                    .unwrap_or_else(|| self.rt.app.settings_state());
+                self.rt
+                    .app
+                    .handle_settings(&SettingsAction::ResetPresets, &mut state);
+                self.rt.app.refresh_settings_state(&mut state);
+                if open {
+                    self.settings = Some(state);
+                }
+            }
         }
     }
 
@@ -1443,6 +1579,7 @@ impl eframe::App for Shell<'_> {
         self.show_import(ui, palette);
         self.show_export(ui, palette);
         self.show_menu(&ctx, palette);
+        self.show_confirmation(&ctx, palette);
 
         // Sixty frames a second only while they show something moving (see `frame_interval`).
         let (minimised, focused) = ctx.input(|i| (i.viewport().minimized, i.viewport().focused));
@@ -1735,12 +1872,15 @@ fn menu_separator(ui: &mut egui::Ui, palette: Palette) {
 /// A 200 × 30 field with a 2 px outline: `ValidTextBorder` while the typed name is unique and
 /// non-empty, `InvalidTextBorder` otherwise — so it starts red and turns blue once a usable name
 /// is in it (§11.3, §11.4). Input is filtered through [`FORBIDDEN_PRESET_NAME_CHARS`] and capped
-/// at [`MAX_PRESET_NAME_CHARS`]. Returns the name on Enter when it is valid (§11.5); Escape is
-/// the menu's business.
+/// at [`MAX_PRESET_NAME_CHARS`] and at the bytes a Windows FxSound reads a name in
+/// ([`fxsound_preset::MAX_NAME_BYTES`], 0.4.0 audit #15). Renaming, the preset's own name is not
+/// taken, so its letter case can change (audit #19). Returns the name on Enter when it is valid
+/// (§11.5); Escape is the menu's business.
 fn name_editor(
     ui: &mut egui::Ui,
     editor: &mut NameEditor,
     presets: &[PresetEntry],
+    renaming: Option<&str>,
     palette: Palette,
 ) -> Option<String> {
     let (row, _) = ui.allocate_exact_size(
@@ -1794,7 +1934,11 @@ fn name_editor(
             .text
             .retain(|c| !FORBIDDEN_PRESET_NAME_CHARS.contains(c));
     }
-    let valid = preset_name_available(presets, &editor.text);
+    cap_name_bytes(&mut editor.text);
+    let valid = match (editor.purpose, renaming) {
+        (EditorPurpose::Rename, Some(old)) => rename_name_available(presets, old, &editor.text),
+        _ => preset_name_available(presets, &editor.text),
+    };
 
     let border = palette.color(if valid {
         FxColor::ValidTextBorder
@@ -1817,6 +1961,19 @@ fn name_editor(
         response.request_focus();
     }
     None
+}
+
+/// Cut a name being typed to [`fxsound_preset::MAX_NAME_BYTES`] on a character boundary, as the
+/// sixty-four characters are cut by the field itself: sixty-four Cyrillic letters are two bytes
+/// more than a Windows FxSound reads (0.4.0 audit #15).
+fn cap_name_bytes(text: &mut String) {
+    if text.len() > fxsound_preset::MAX_NAME_BYTES {
+        let mut end = fxsound_preset::MAX_NAME_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
 }
 
 /// The runtime's glue, over a real control socket in a scratch directory and a headless
@@ -2508,6 +2665,254 @@ mod zoom_tests {
             fit_zoom(egui::vec2(0.0, 0.0), egui::vec2(1040.0, 588.0), 0.0),
             1.0
         );
+    }
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+    use fxsound_app::audio_link::FakeEngine;
+    use fxsound_core::{DeviceDirection, Effect, Preset, Settings};
+    use fxsound_preset::{InputPresetStore, PresetStore};
+
+    /// The question `confirm` puts in the message box, laid out with the app's fonts.
+    fn asked(confirm: &Confirm) -> String {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(theme::font_definitions());
+        let mut question = String::new();
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            question = confirm.question(ui.ctx());
+        })
+        .drop_without_applying_deltas();
+        question
+    }
+
+    #[test]
+    fn each_confirmation_question_fits_the_message_box_in_every_language() {
+        // The questions before Delete Preset and Reset presets (0.4.0 audit #16, #21) on one
+        // elided line lost "Saved presets are kept." in every language, and a long preset name
+        // took the question mark with it. Measured with the app's own fonts, in the box's own
+        // 410 x 52 message rect, in English and all 29 tables.
+        use fxsound_core::i18n::{Catalogue, LANGUAGES};
+        let ctx = egui::Context::default();
+        ctx.set_fonts(theme::font_definitions());
+        let names = [
+            "Rock".to_owned(),
+            "Rock Ballad Extended Night".to_owned(),
+            "Rock Ballad Extended Night Mix For The Living Room Speakers 2026".to_owned(),
+            // The widest a name can be: sixty-four capital Ws, and the 126 bytes of Cyrillic and
+            // of CJK a Windows FxSound reads a name in.
+            "W".repeat(64),
+            "Ш".repeat(63),
+            "音".repeat(42),
+        ];
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            for language in &LANGUAGES {
+                let table = Catalogue::for_language(language);
+                let translate = |key: &str| table.get(key).unwrap_or(key).to_owned();
+                for confirm in
+                    std::iter::once(Confirm::ResetPresets).chain(names.iter().map(|name| {
+                        Confirm::Delete {
+                            lane: DeviceDirection::Output,
+                            name: name.clone(),
+                        }
+                    }))
+                {
+                    let key = match confirm {
+                        Confirm::Delete { .. } => DELETE_QUESTION,
+                        Confirm::ResetPresets => RESET_QUESTION,
+                    };
+                    let question = confirm.question_from(ui.ctx(), &translate(key));
+                    let galley =
+                        dialogs::message::message_galley(ui.ctx(), &question, egui::Color32::WHITE);
+                    let case = format!("{}: {question}", language.code);
+                    assert!(!galley.elided, "{case}");
+                    assert!(
+                        galley.size().y <= dialogs::message::MESSAGE_HEIGHT + 0.01,
+                        "{case}: {:?}",
+                        galley.size()
+                    );
+                    let Confirm::Delete { name, .. } = &confirm else {
+                        assert_eq!(question, translate(RESET_QUESTION), "{case}");
+                        continue;
+                    };
+                    let template = translate(DELETE_QUESTION);
+                    let (before, after) = template.split_once("%s").expect("a placeholder");
+                    assert!(
+                        question.starts_with(before) && question.ends_with(after),
+                        "{case}: the question is whole"
+                    );
+                    if name.contains(' ') || name.len() < 8 {
+                        assert!(
+                            question.contains(name.as_str()),
+                            "{case}: the name is whole"
+                        );
+                    }
+                }
+            }
+        })
+        .drop_without_applying_deltas();
+    }
+
+    /// A runtime over a controller whose speakers list the user presets `Mine` and `Other`, with
+    /// `Mine` selected.
+    fn runtime(dir: &std::path::Path) -> Runtime {
+        let Instance::Primary(listener) = Instance::acquire_in(dir).expect("acquire") else {
+            panic!("expected to be primary");
+        };
+        let mut presets = PresetStore::with_dirs(Vec::new(), dir.join("presets"));
+        for name in ["Mine", "Other"] {
+            let preset = Preset {
+                name: name.to_owned(),
+                ..Preset::default()
+            };
+            presets.save_as(&preset, name).expect("save");
+        }
+        let voices = InputPresetStore::with_dirs(Vec::new(), dir.join("presets").join("Input"));
+        let mut settings = Settings::default();
+        settings.output_preset = "Mine".to_owned();
+        let app = App::start_for_tests(settings, presets, voices, &FakeEngine::new());
+        let (_tray_tx, tray_rx) = crossbeam_channel::unbounded();
+        Runtime {
+            app,
+            dbus: None,
+            server: listener.serve().expect("serve"),
+            sleep: None,
+            sleep_rx: crossbeam_channel::never(),
+            tray: None,
+            tray_rx,
+            exit: WindowExit::Hidden,
+            settings_requested: false,
+            terminate: Arc::new(AtomicBool::new(false)),
+            terminating: false,
+            waker: Waker::new(),
+            signals: None,
+            panes: Panes::default(),
+        }
+    }
+
+    fn listed(shell: &Shell<'_>) -> Vec<String> {
+        shell
+            .rt
+            .app
+            .state
+            .presets
+            .iter()
+            .map(|p| p.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn delete_preset_asks_first_and_deletes_only_on_yes() {
+        // 0.4.0 audit #16: one click on the menu used to delete the preset for good.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = runtime(dir.path());
+        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        assert_eq!(listed(&shell), ["Mine", "Other"]);
+
+        shell.act_on_menu(MenuChoice::Delete);
+        assert_eq!(
+            listed(&shell),
+            ["Mine", "Other"],
+            "nothing happens before the answer"
+        );
+        assert_eq!(
+            shell.confirm.as_ref().map(asked).as_deref(),
+            Some("Move the preset Mine to the trash?")
+        );
+        assert!(
+            shell.pane_open(),
+            "the menu stays shut while the question is up"
+        );
+        assert!(shell.window_size().y >= dialogs::message::WINDOW_SIZE.y);
+
+        shell.answer(ConfirmChoice::No);
+        assert_eq!(listed(&shell), ["Mine", "Other"]);
+        assert!(shell.confirm.is_none());
+
+        shell.act_on_menu(MenuChoice::Delete);
+        shell.answer(ConfirmChoice::Dismissed);
+        assert_eq!(listed(&shell), ["Mine", "Other"], "closing the box is a no");
+
+        shell.act_on_menu(MenuChoice::Delete);
+        shell.answer(ConfirmChoice::Yes);
+        assert_eq!(listed(&shell), ["Other"]);
+        assert!(dir.path().join("presets/.Trash/files/Mine.fac").is_file());
+    }
+
+    #[test]
+    fn a_yes_to_a_preset_that_is_no_longer_selected_deletes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = runtime(dir.path());
+        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        shell.act_on_menu(MenuChoice::Delete);
+        // A keybind moves the selection while the question is up.
+        shell.rt.app.cycle_preset(true);
+        assert_eq!(
+            shell.rt.app.state.preset().map(|p| p.name.as_str()),
+            Some("Other")
+        );
+        shell.answer(ConfirmChoice::Yes);
+        assert_eq!(listed(&shell), ["Mine", "Other"]);
+    }
+
+    #[test]
+    fn reset_presets_asks_first_and_discards_the_unsaved_changes_on_yes() {
+        // 0.4.0 audit #21: the settings pane's button reset at once.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = runtime(dir.path());
+        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        shell
+            .rt
+            .app
+            .handle(&[UiAction::SetEffect(Effect::Bass, 7.0)]);
+        shell.open_settings();
+        // The pane's button, through the code `show_settings` runs on what the pane reports.
+        let press_reset = |shell: &mut Shell<'_>| {
+            let mut state = shell.settings.take().expect("the pane is open");
+            assert!(state.can_reset_presets, "the button is live");
+            let closed = shell.act_on_settings(&[SettingsAction::ResetPresets], &mut state);
+            assert!(!closed, "the reset does not close the pane");
+            shell.settings = Some(state);
+        };
+        press_reset(&mut shell);
+        assert_eq!(
+            shell.rt.app.lane_preset(DeviceDirection::Output),
+            Some(("Mine", true)),
+            "nothing is discarded before the answer"
+        );
+        assert!(
+            shell.settings.as_ref().is_some_and(|s| s.can_reset_presets),
+            "the pane still offers the reset"
+        );
+        assert_eq!(
+            shell.confirm.as_ref().map(asked).as_deref(),
+            Some("Discard the unsaved changes of every preset? Saved presets are kept.")
+        );
+        shell.answer(ConfirmChoice::No);
+        assert_eq!(
+            shell.rt.app.lane_preset(DeviceDirection::Output),
+            Some(("Mine", true))
+        );
+        press_reset(&mut shell);
+        shell.answer(ConfirmChoice::Dismissed);
+        assert_eq!(
+            shell.rt.app.lane_preset(DeviceDirection::Output),
+            Some(("Mine", true)),
+            "closing the box is a no"
+        );
+        press_reset(&mut shell);
+        assert_eq!(
+            shell.rt.app.lane_preset(DeviceDirection::Output),
+            Some(("Mine", true))
+        );
+        shell.answer(ConfirmChoice::Yes);
+        assert_eq!(
+            shell.rt.app.lane_preset(DeviceDirection::Output),
+            Some(("Mine", false))
+        );
+        assert!(shell.settings.is_some(), "the pane stays open");
+        assert!(!shell.settings.as_ref().is_some_and(|s| s.can_reset_presets));
     }
 }
 

@@ -105,3 +105,6 @@ countries: id
 "FxSound's preset" = "Preset FxSound"
 "No application has played or recorded through FxSound yet" = "Belum ada aplikasi yang memutar atau merekam melalui FxSound"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Mikrofon Bluetooth hanya aktif selama ada aplikasi yang merekam dari FxSound (Masukan), dan saat itu mengalihkan headset ke kualitas panggilan."
+"Unsaved preset changes discarded" = "Perubahan preset yang belum disimpan dibuang"
+"Move the preset %s to the trash?" = "Pindahkan preset %s ke tempat sampah?"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "Buang perubahan yang belum disimpan pada semua preset? Preset yang tersimpan tetap ada."

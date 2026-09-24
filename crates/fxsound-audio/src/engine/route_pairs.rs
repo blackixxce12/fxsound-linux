@@ -958,7 +958,7 @@ fn build_pair(
     };
     dsp.set_format(rate as f32, channels as usize);
     dsp.set_source_rate(source_rate.map(|rate| rate as f32));
-    dsp.set_layout(positions.lfe_index(), positions.front_pair());
+    dsp.set_layout(&positions);
     let dsp_latency_frames = dsp.latency_frames();
     dsp.reset();
     let volume: &Arc<LaneVolume> = &lane.volume;

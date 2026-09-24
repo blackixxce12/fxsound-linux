@@ -105,3 +105,6 @@ countries: ru
 "FxSound's preset" = "Пресет FxSound"
 "No application has played or recorded through FxSound yet" = "Ни одно приложение ещё не воспроизводило и не записывало звук через FxSound"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Микрофон Bluetooth включается, только пока приложение записывает с FxSound (Ввод), и тогда переводит гарнитуру в режим звонка."
+"Unsaved preset changes discarded" = "Несохранённые изменения шаблонов отменены"
+"Move the preset %s to the trash?" = "Переместить шаблон %s в корзину?"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "Отменить несохранённые изменения всех шаблонов? Сохранённые шаблоны останутся."

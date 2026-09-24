@@ -61,7 +61,7 @@ use fxsound_ui::state::RoutedApp;
 
 use super::{
     App, MusicControls, MusicLevels, PresetVoicing, apply_microphone_settings, ladder, lane_index,
-    music_controls, write_music_params,
+    music_controls, voice_params, write_music_params,
 };
 use crate::events::AppEvent;
 use fxsound_core::i18n::tr_args;
@@ -1074,7 +1074,7 @@ impl App {
     /// A voice preset as a recording route runs it: its own parameters with the Settings pane's
     /// microphone settings written over them, as the input lane's own snapshot is built.
     fn voice_route_params(&self, preset: &InputPreset) -> InputDspParams {
-        let mut params = preset.to_params();
+        let mut params = voice_params(preset);
         let voicing = PresetVoicing::of(&params);
         apply_microphone_settings(&mut params, &voicing, &self.settings);
         params.power = self.state.power;

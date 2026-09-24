@@ -188,39 +188,153 @@ pub mod scale {
     /// to MIDI is plain linear. This is inherited, not introduced.
     pub const DYNAMIC_BOOST_MAX_MIDI: u8 = 70;
 
+    /// The stored value Ambience's first slider position is saved as: the first one it can be
+    /// heard at (audit report #39).
+    ///
+    /// The stage runs from 13 up, as the original's does, but the MUSIC2 warp only gives the
+    /// reverb a real wet level from `(int)(midi × 0.34) > 12`, which 39 is the first to reach;
+    /// from 13 to 38 the wet level only ramps towards it, and the tail of a −6 dBFS tone at the old
+    /// positions 1, 2 and 3 (stored 13, 25, 38) played at −73, −51 and −45 dBFS against −31 at
+    /// position 4. So the slider's first position is 39 and its ten positions are spread from
+    /// there to 127, as Dynamic Boost's are spread below its dead top.
+    pub const AMBIENCE_FIRST_AUDIBLE_MIDI: u8 = 39;
+
     /// Slider position to engine value, for one effect.
     ///
-    /// Identical to [`slider_to_value`] for four of the five. Dynamic Boost's eleven positions are
-    /// spread over `0..=DYNAMIC_BOOST_MAX_MIDI` instead of the full MIDI range, so that every one
-    /// of them is a different amount of gain rather than five of them being the same one.
+    /// Identical to [`slider_to_value`] for three of the five. The other two spread their eleven
+    /// positions over the stored values that sound different, so that every position is a
+    /// different sound rather than several of them being the same one:
+    ///
+    /// - **Dynamic Boost** over `0..=DYNAMIC_BOOST_MAX_MIDI`, below its dead top.
+    /// - **Ambience** (audit report #39): position 0 is off, positions 1 to 10 run from
+    ///   [`AMBIENCE_FIRST_AUDIBLE_MIDI`] to 127, and a position between 0 and 1 — which only a
+    ///   stored value can give — reads straight from 0 to 39, so a Windows preset storing 13..38,
+    ///   all but silent, shows below position 1 where it sounds.
     ///
     /// **This changes no preset and no sound.** The mapping from a *stored* value to a gain is
     /// untouched, so every `.fac` — this port's, and any imported from Windows — produces exactly
-    /// the gain it always did. What changes is only which value the application writes when a user
-    /// moves that one slider, and the positions it shows a stored value at.
+    /// the sound it always did. What changes is only which value the application writes when a
+    /// user moves one of these sliders, and the positions it shows a stored value at.
     #[inline]
     #[must_use]
     pub fn slider_to_value_for(effect: crate::Effect, slider: f32) -> f32 {
+        let slider = if slider.is_nan() {
+            0.0
+        } else {
+            slider.clamp(0.0, SLIDER_MAX)
+        };
         match effect {
             crate::Effect::DynamicBoost => {
                 let top = f32::from(DYNAMIC_BOOST_MAX_MIDI) / f32::from(MIDI_MAX);
-                (slider / SLIDER_MAX).clamp(0.0, 1.0) * top
+                slider / SLIDER_MAX * top
+            }
+            crate::Effect::Ambience => {
+                let first = f32::from(AMBIENCE_FIRST_AUDIBLE_MIDI);
+                let midi = if slider <= 1.0 {
+                    slider * first
+                } else {
+                    first + (slider - 1.0) * (f32::from(MIDI_MAX) - first) / (SLIDER_MAX - 1.0)
+                };
+                (midi / f32::from(MIDI_MAX)).clamp(0.0, 1.0)
             }
             _ => slider_to_value(slider),
         }
     }
 
-    /// The inverse of [`slider_to_value_for`]. A stored value past the dead point shows at the top
-    /// of the slider, which is where it actually sounds.
+    /// The inverse of [`slider_to_value_for`]. A Dynamic Boost stored past the dead point shows at
+    /// the top of the slider, which is where it actually sounds.
     #[inline]
     #[must_use]
     pub fn value_to_slider_for(effect: crate::Effect, value: f32) -> f32 {
+        let value = if value.is_nan() {
+            0.0
+        } else {
+            value.clamp(0.0, 1.0)
+        };
         match effect {
             crate::Effect::DynamicBoost => {
                 let top = f32::from(DYNAMIC_BOOST_MAX_MIDI) / f32::from(MIDI_MAX);
-                (value.clamp(0.0, 1.0) / top * SLIDER_MAX).min(SLIDER_MAX)
+                (value / top * SLIDER_MAX).min(SLIDER_MAX)
+            }
+            crate::Effect::Ambience => {
+                let first = f32::from(AMBIENCE_FIRST_AUDIBLE_MIDI);
+                let midi = value * f32::from(MIDI_MAX);
+                let slider = if midi <= first {
+                    midi / first
+                } else {
+                    1.0 + (midi - first) * (SLIDER_MAX - 1.0) / (f32::from(MIDI_MAX) - first)
+                };
+                slider.clamp(0.0, SLIDER_MAX)
             }
             _ => value_to_slider(value),
+        }
+    }
+
+    /// The stored value a slider position of `effect` is saved as.
+    #[inline]
+    #[must_use]
+    pub fn slider_to_midi_for(effect: crate::Effect, slider: f32) -> u8 {
+        value_to_midi(slider_to_value_for(effect, slider))
+    }
+
+    /// The slider position a stored value of `effect` shows at.
+    #[inline]
+    #[must_use]
+    pub fn midi_to_slider_for(effect: crate::Effect, midi: u8) -> f32 {
+        value_to_slider_for(effect, midi_to_value(midi))
+    }
+
+    /// The whole position `slider` saves as the same value as, if there is one: what the slider
+    /// shows as a whole number (audit report #14).
+    ///
+    /// A whole position is saved as the nearest stored value, so it comes back from a preset a
+    /// hair off — position 1 of Fidelity is saved as 13 and shows at 1.024 — and that is still
+    /// position 1. A stored value no whole position is saved as, 20 for Surround, is not a
+    /// position at all, and the slider shows it with its decimal (1.6) rather than rounding it to
+    /// a position (2) that would save as something else (25).
+    #[must_use]
+    pub fn whole_position_for(effect: crate::Effect, slider: f32) -> Option<f32> {
+        let whole = slider.round().clamp(0.0, SLIDER_MAX);
+        (slider_to_midi_for(effect, whole) == slider_to_midi_for(effect, slider)).then_some(whole)
+    }
+
+    /// The slider position of the stored value one step from `slider`, up or down: the fine step
+    /// that reaches every value a preset can store (audit report #14). Values that show at the
+    /// same position — Dynamic Boost's past its dead top — are stepped over; at either end the
+    /// position stays where it is.
+    #[must_use]
+    pub fn stored_step_for(effect: crate::Effect, slider: f32, up: bool) -> f32 {
+        let here = midi_to_slider_for(effect, slider_to_midi_for(effect, slider));
+        let mut midi = slider_to_midi_for(effect, slider);
+        loop {
+            midi = match (up, midi) {
+                (true, MIDI_MAX) | (false, MIDI_MIN) => return here,
+                (true, m) => m + 1,
+                (false, m) => m - 1,
+            };
+            let there = midi_to_slider_for(effect, midi);
+            if (up && there > here) || (!up && there < here) {
+                return there;
+            }
+        }
+    }
+
+    /// The slider position of the stored value nearest `slider`, for a gesture that asks for
+    /// exact steps rather than whole positions.
+    #[inline]
+    #[must_use]
+    pub fn nearest_stored_position_for(effect: crate::Effect, slider: f32) -> f32 {
+        midi_to_slider_for(effect, slider_to_midi_for(effect, slider))
+    }
+
+    /// The effect slider's readout: a whole number at a whole position, and one decimal
+    /// otherwise, so a stored value between positions is never shown as a position it is not
+    /// (audit report #14).
+    #[must_use]
+    pub fn slider_label_for(effect: crate::Effect, slider: f32) -> String {
+        match whole_position_for(effect, slider) {
+            Some(whole) => format!("{whole:.0}"),
+            None => format!("{slider:.1}"),
         }
     }
 }
@@ -260,8 +374,6 @@ pub mod limits {
     pub const VOLUME_LEVELING: std::ops::RangeInclusive<f32> = 0.0..=4.0;
     /// `--filter_q`, the multiplier applied to each band's derived Q.
     pub const FILTER_Q: std::ops::RangeInclusive<f32> = 1.0..=3.0;
-    /// Peak-normalisation target.
-    pub const NORMALIZATION_DB: std::ops::RangeInclusive<f32> = -20.0..=0.0;
 
     // ---- the input chain ----
     //
@@ -382,6 +494,70 @@ pub mod eq {
             .map(|&hz| EqBand::new(hz, 0.0))
             .collect()
     }
+
+    /// The twenty-band ladder since 0.4.0: half an octave apart from 20 Hz to 16 kHz (audit report
+    /// R4). `fxsound_dsp::eq::band_table(20)` hands these out; they live here so that the preset
+    /// store, which does not depend on the engine, can move a curve between them and
+    /// [`WINDOWS_TWENTY_BAND_CENTRES_HZ`].
+    pub const TWENTY_BAND_CENTRES_HZ: [f32; 20] = [
+        20.0, 28.4331, 40.4221, 57.4662, 81.6971, 116.145, 165.118, 234.741, 333.721, 474.436,
+        674.485, 958.885, 1363.2, 1938.0, 2755.17, 3916.91, 5568.49, 7916.47, 11254.5, 16000.0,
+    ];
+
+    /// The Windows build's twenty-band ladder (`GraphicEqSet.cpp:468-478`): octave bands from
+    /// 31.5 Hz with the third-octave band above each, so they come in pairs. Twenty-band curves
+    /// saved before 0.4.0 and Windows twenty-band presets carry these centres.
+    pub const WINDOWS_TWENTY_BAND_CENTRES_HZ: [f32; 20] = [
+        20.0, 31.5, 40.0, 63.0, 80.0, 125.0, 160.0, 250.0, 315.0, 500.0, 630.0, 1000.0, 1250.0,
+        2000.0, 2500.0, 4000.0, 5000.0, 8000.0, 10000.0, 16000.0,
+    ];
+
+    /// How close a centre has to be to a ladder's to count as on it: the `%g` a `.fac` stores
+    /// centres with keeps six figures, so 0.01 Hz separates a ladder from a band someone moved.
+    const LADDER_TOLERANCE_HZ: f32 = 0.01;
+
+    fn on_ladder(bands: &[EqBand], ladder: &[f32]) -> bool {
+        bands.len() == ladder.len()
+            && bands
+                .iter()
+                .zip(ladder)
+                .all(|(band, &hz)| (band.center_hz - hz).abs() <= LADDER_TOLERANCE_HZ)
+    }
+
+    fn move_to(bands: &mut [EqBand], ladder: &[f32]) {
+        for (band, &hz) in bands.iter_mut().zip(ladder) {
+            band.center_hz = hz;
+        }
+    }
+
+    /// Move a twenty-band curve on the Windows ladder to the half-octave one, band for band, and
+    /// say whether it moved (audit report R4).
+    ///
+    /// The gains stay where they are, so every boost and cut keeps its band: no centre moves by
+    /// more than 0.171 of an octave, and the 3.9 dB of ripple the paired ladder gave a broad boost
+    /// goes. A curve on any other centres — a band someone dragged, another count — is left alone.
+    /// Wherever a curve reaches the application: a preset's own file, its autosave, an import, a
+    /// voice preset saved by 0.3.0.
+    pub fn move_off_the_windows_twenty_band_ladder(bands: &mut [EqBand]) -> bool {
+        if on_ladder(bands, &WINDOWS_TWENTY_BAND_CENTRES_HZ) {
+            move_to(bands, &TWENTY_BAND_CENTRES_HZ);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The other way, for a `.fac` written for someone else to open: a twenty-band curve on the
+    /// half-octave ladder is written on the Windows one, band for band, which is what the Windows
+    /// build draws and tunes twenty bands to. Anything else is left alone. Says whether it moved.
+    pub fn move_onto_the_windows_twenty_band_ladder(bands: &mut [EqBand]) -> bool {
+        if on_ladder(bands, &TWENTY_BAND_CENTRES_HZ) {
+            move_to(bands, &WINDOWS_TWENTY_BAND_CENTRES_HZ);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Everything a `.fac` preset carries, in the file's own units.
@@ -392,7 +568,9 @@ pub mod eq {
 pub struct Preset {
     /// Display name. In the file this is a bare line; on disk it is also the file stem.
     pub name: String,
-    /// File format version (`9` in every shipped preset).
+    /// The format version the file declared when it was read (`9` in every shipped preset). What
+    /// an older version does not carry is filled in as the original reads it; a preset is always
+    /// written as the current version, whatever this says (0.4.0 audit #46).
     pub version: f32,
     /// The six `Main` slots as raw MIDI values, slot 2 unused.
     pub main_midi: [u8; 6],
@@ -1112,6 +1290,180 @@ mod tests {
     }
 
     #[test]
+    fn every_stored_value_of_every_effect_comes_back_from_its_slider_position() {
+        // Audit report #14: a value a preset stores has a slider position that saves it again,
+        // so loading a preset and saving it changes nothing. The one exception is Dynamic Boost
+        // past its dead top, where every value sounds the same and shows at the top.
+        for effect in Effect::ALL {
+            for midi in scale::MIDI_MIN..=scale::MIDI_MAX {
+                let shown = scale::midi_to_slider_for(effect, midi);
+                let saved = scale::slider_to_midi_for(effect, shown);
+                if effect == Effect::DynamicBoost && midi > scale::DYNAMIC_BOOST_MAX_MIDI {
+                    assert_eq!(saved, scale::DYNAMIC_BOOST_MAX_MIDI, "{effect:?} {midi}");
+                } else {
+                    assert_eq!(saved, midi, "{effect:?}: {midi} shows at {shown}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_whole_position_of_every_effect_is_a_different_stored_value() {
+        for effect in Effect::ALL {
+            let saved: Vec<u8> = (0..=10)
+                .map(|p| scale::slider_to_midi_for(effect, p as f32))
+                .collect();
+            let mut distinct = saved.clone();
+            distinct.dedup();
+            assert_eq!(distinct, saved, "{effect:?}: {saved:?}");
+            assert_eq!(saved[0], 0, "{effect:?}: position 0 is off");
+        }
+    }
+
+    #[test]
+    fn ambiences_ten_positions_run_from_its_first_audible_value_to_the_top() {
+        // Audit report #39: positions 1..3 used to store 13, 25 and 38, a reverb 40 dB and more
+        // under the dry signal. Position 1 is now the first value it can be heard at.
+        let saved: Vec<u8> = (0..=10)
+            .map(|p| scale::slider_to_midi_for(Effect::Ambience, p as f32))
+            .collect();
+        assert_eq!(
+            saved,
+            [0, 39, 49, 59, 68, 78, 88, 98, 107, 117, 127],
+            "position by position"
+        );
+        // A Windows preset's 13..38 shows below position 1, where it sounds, and 0 stays off.
+        for midi in 1..scale::AMBIENCE_FIRST_AUDIBLE_MIDI {
+            let shown = scale::midi_to_slider_for(Effect::Ambience, midi);
+            assert!(shown > 0.0 && shown < 1.0, "{midi} shows at {shown}");
+        }
+        // The factory presets' 39..64 sit from position 1 up.
+        assert_eq!(scale::midi_to_slider_for(Effect::Ambience, 39), 1.0);
+        let at_64 = scale::midi_to_slider_for(Effect::Ambience, 64);
+        assert!((at_64 - 3.557).abs() < 0.01, "{at_64}");
+    }
+
+    #[test]
+    fn a_stored_value_between_positions_is_shown_with_its_decimal() {
+        // Audit report #14: General's Surround is 20, between positions 1 (13) and 2 (25). It
+        // used to show as "2", and touching the slider saved 25.
+        let surround = scale::midi_to_slider_for(Effect::Surround, 20);
+        assert_eq!(scale::slider_label_for(Effect::Surround, surround), "1.6");
+        assert_eq!(scale::whole_position_for(Effect::Surround, surround), None);
+        // A whole position comes back from its stored value a hair off and is still that position.
+        let one = scale::midi_to_slider_for(Effect::Fidelity, 13);
+        assert!(
+            one != 1.0,
+            "the fixture needs a position that comes back off by a hair"
+        );
+        assert_eq!(scale::slider_label_for(Effect::Fidelity, one), "1");
+        assert_eq!(scale::slider_label_for(Effect::Fidelity, 7.0), "7");
+        // Next to a position but not it: the decimal says so.
+        let beside_two = scale::midi_to_slider_for(Effect::Fidelity, 26);
+        assert_eq!(scale::slider_label_for(Effect::Fidelity, beside_two), "2.0");
+    }
+
+    #[test]
+    fn a_fine_step_reaches_every_stored_value_one_at_a_time() {
+        for effect in Effect::ALL {
+            let top = if effect == Effect::DynamicBoost {
+                scale::DYNAMIC_BOOST_MAX_MIDI
+            } else {
+                scale::MIDI_MAX
+            };
+            let mut slider = 0.0;
+            for midi in 1..=top {
+                slider = scale::stored_step_for(effect, slider, true);
+                assert_eq!(
+                    scale::slider_to_midi_for(effect, slider),
+                    midi,
+                    "{effect:?} up"
+                );
+            }
+            assert_eq!(
+                scale::stored_step_for(effect, slider, true),
+                slider,
+                "{effect:?} top"
+            );
+            for midi in (0..top).rev() {
+                slider = scale::stored_step_for(effect, slider, false);
+                assert_eq!(
+                    scale::slider_to_midi_for(effect, slider),
+                    midi,
+                    "{effect:?} down"
+                );
+            }
+            assert_eq!(scale::stored_step_for(effect, 0.0, false), 0.0);
+        }
+    }
+
+    fn twenty(ladder: &[f32; 20]) -> Vec<EqBand> {
+        ladder
+            .iter()
+            .enumerate()
+            .map(|(i, &hz)| EqBand::new(hz, i as f32 * 0.5 - 4.0))
+            .collect()
+    }
+
+    #[test]
+    fn a_curve_on_the_windows_twenty_band_ladder_moves_to_the_half_octave_one_band_for_band() {
+        // Audit report R4: the gains stay on their bands, only the centres move.
+        let mut bands = twenty(&eq::WINDOWS_TWENTY_BAND_CENTRES_HZ);
+        let gains: Vec<f32> = bands.iter().map(|b| b.boost_db).collect();
+        assert!(eq::move_off_the_windows_twenty_band_ladder(&mut bands));
+        let centres: Vec<f32> = bands.iter().map(|b| b.center_hz).collect();
+        assert_eq!(centres, eq::TWENTY_BAND_CENTRES_HZ);
+        assert_eq!(bands.iter().map(|b| b.boost_db).collect::<Vec<_>>(), gains);
+        // No band moves by more than a sixth of an octave (0.1705, at 10 kHz).
+        for (old, new) in eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+            .iter()
+            .zip(eq::TWENTY_BAND_CENTRES_HZ)
+        {
+            assert!(
+                (new / old).log2().abs() < 1.0 / 6.0 + 0.004,
+                "{old} -> {new}"
+            );
+        }
+        // Moved once, it stays where it is.
+        assert!(!eq::move_off_the_windows_twenty_band_ladder(&mut bands));
+    }
+
+    #[test]
+    fn a_curve_on_any_other_centres_is_left_where_it_is() {
+        // A band someone dragged is not the Windows ladder any more.
+        let mut dragged = twenty(&eq::WINDOWS_TWENTY_BAND_CENTRES_HZ);
+        dragged[7].center_hz = 260.0;
+        let before = dragged.clone();
+        assert!(!eq::move_off_the_windows_twenty_band_ladder(&mut dragged));
+        assert_eq!(dragged, before);
+        // Nor is a curve of another count, or the ten-band default.
+        let mut ten = eq::default_bands();
+        assert!(!eq::move_off_the_windows_twenty_band_ladder(&mut ten));
+        assert!(!eq::move_onto_the_windows_twenty_band_ladder(&mut ten));
+        assert_eq!(ten, eq::default_bands());
+        // `%g` writes six figures: a centre read back from a file is the ladder's to 0.01 Hz.
+        let mut read_back = twenty(&eq::WINDOWS_TWENTY_BAND_CENTRES_HZ);
+        read_back[12].center_hz = 1250.004;
+        assert!(eq::move_off_the_windows_twenty_band_ladder(&mut read_back));
+    }
+
+    #[test]
+    fn a_half_octave_curve_goes_back_onto_the_windows_ladder_for_a_file_windows_will_read() {
+        let mut bands = twenty(&eq::TWENTY_BAND_CENTRES_HZ);
+        let gains: Vec<f32> = bands.iter().map(|b| b.boost_db).collect();
+        assert!(eq::move_onto_the_windows_twenty_band_ladder(&mut bands));
+        let centres: Vec<f32> = bands.iter().map(|b| b.center_hz).collect();
+        assert_eq!(centres, eq::WINDOWS_TWENTY_BAND_CENTRES_HZ);
+        assert_eq!(bands.iter().map(|b| b.boost_db).collect::<Vec<_>>(), gains);
+        assert!(eq::move_off_the_windows_twenty_band_ladder(&mut bands));
+        assert_eq!(
+            bands,
+            twenty(&eq::TWENTY_BAND_CENTRES_HZ),
+            "and back, exactly"
+        );
+    }
+
+    #[test]
     fn the_three_orderings_do_not_collide() {
         let mut vals: Vec<_> = Effect::ALL.iter().map(|e| e.vals_index()).collect();
         vals.sort_unstable();
@@ -1142,7 +1494,6 @@ mod tests {
             master_gain_db: f32::INFINITY,
             balance: f32::NEG_INFINITY,
             volume_leveling_db: f32::NAN,
-            normalization_db: f32::NAN,
             num_bands: 200,
             ..DspParams::default()
         };

@@ -104,3 +104,6 @@ countries: tr
 "FxSound's preset" = "FxSound'un ön ayarı"
 "No application has played or recorded through FxSound yet" = "Henüz hiçbir uygulama FxSound üzerinden çalmadı veya kaydetmedi"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Bluetooth mikrofon yalnızca bir uygulama FxSound (Giriş) üzerinden kayıt yaparken uyanır ve o zaman kulaklığı arama kalitesine geçirir."
+"Unsaved preset changes discarded" = "Ön ayarlardaki kaydedilmemiş değişiklikler atıldı"
+"Move the preset %s to the trash?" = "%s ön ayarı çöp kutusuna taşınsın mı?"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "Tüm ön ayarlardaki kaydedilmemiş değişiklikler atılsın mı? Kaydedilmiş ön ayarlar korunur."

@@ -104,3 +104,6 @@ countries: fi
 "FxSound's preset" = "FxSoundin esiasetus"
 "No application has played or recorded through FxSound yet" = "Mikään sovellus ei ole vielä toistanut tai tallentanut FxSoundin kautta"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Bluetooth-mikrofoni herää vain, kun jokin sovellus nauhoittaa lähteestä FxSound (Tulo), ja vaihtaa silloin kuulokemikrofonin puhelulaatuun."
+"Unsaved preset changes discarded" = "Esiasetusten tallentamattomat muutokset hylättiin"
+"Move the preset %s to the trash?" = "Siirretäänkö esiasetus %s roskakoriin?"
+"Discard the unsaved changes of every preset? Saved presets are kept." = "Hylätäänkö kaikkien esiasetusten tallentamattomat muutokset? Tallennetut esiasetukset säilyvät."

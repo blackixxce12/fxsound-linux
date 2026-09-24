@@ -22,10 +22,11 @@ use std::path::{Path, PathBuf};
 ///
 /// The stage turns on above 12, as the original's does, but the MUSIC2 warp only gives it a real
 /// wet level from `(int)(midi * 0.34) > 12`, and the first value that reaches that is 39 — a
-/// slider position of 3.1 out of 10. From 13 to 38 the wet level only ramps up to the one at 39,
-/// −40 dB below the dry signal (audit report #39), so a preset storing one of those is claiming
-/// an effect it barely gets.
-const AMBIENCE_MIN_AUDIBLE_MIDI: u8 = 39;
+/// slider position of 3.1 out of 10 on Windows, and position 1 here since the slider was spread
+/// over the audible values (audit report #39, `scale::AMBIENCE_FIRST_AUDIBLE_MIDI`). From 13 to
+/// 38 the wet level only ramps up to the one at 39, −40 dB below the dry signal, so a preset
+/// storing one of those is claiming an effect it barely gets.
+const AMBIENCE_MIN_AUDIBLE_MIDI: u8 = scale::AMBIENCE_FIRST_AUDIBLE_MIDI;
 
 /// Above this stored value Dynamic Boost stops changing.
 ///
@@ -289,34 +290,53 @@ fn a_presets_curve_does_no_more_than_its_loudest_band_asks_for() {
 
 #[test]
 fn every_effect_amount_a_preset_stores_is_one_a_slider_can_reach() {
-    // The GUI slider has eleven positions. A stored value between them cannot be reproduced by a
-    // user, so saving the preset again would silently change it.
+    // Audit report #14. The GUI slider has eleven whole positions, and 49 of the shipped
+    // presets' 170 effect amounts sit between them: touching the slider used to snap such a value
+    // to a position and save that, silently. The slider now shows such a value where it is, with
+    // its decimal, and reaches every stored value with Shift, so a preset loaded and saved again
+    // is the preset it was. Checked through the mapping the window uses, both ways. The one
+    // exception is a Dynamic Boost past its saturation point, where every value is the same gain:
+    // it shows at the top of the slider and is saved as the top.
     let mut complaints = Vec::new();
+    let mut between = 0;
     for (name, preset) in shipped() {
         for effect in Effect::ALL {
             let midi = preset.main_midi[effect.vals_index()];
-            let round_tripped = scale::value_to_midi(scale::slider_to_value(
-                scale::value_to_slider(scale::midi_to_value(midi)).round(),
-            ));
-            if midi != round_tripped {
+            let shown = scale::midi_to_slider_for(effect, midi);
+            let saved = scale::slider_to_midi_for(effect, shown);
+            let expected = if effect == Effect::DynamicBoost && midi > DYNAMIC_BOOST_SATURATION_MIDI
+            {
+                DYNAMIC_BOOST_SATURATION_MIDI
+            } else {
+                midi
+            };
+            if saved != expected {
                 complaints.push(format!(
-                    "{name}: {:?} is {midi}, which is between slider positions (nearest is \
-                     {round_tripped})",
-                    effect
+                    "{name}: {effect:?} is {midi}, shown at {shown}, saved again as {saved}"
                 ));
+            }
+            if scale::whole_position_for(effect, shown).is_none() {
+                between += 1;
+                let label = scale::slider_label_for(effect, shown);
+                if !label.contains('.') {
+                    complaints.push(format!(
+                        "{name}: {effect:?} is {midi}, between positions, but reads {label:?}"
+                    ));
+                }
             }
         }
     }
-    // Reported rather than asserted: the shipped files were authored against the Windows build,
-    // whose slider had the same eleven positions but whose preset editor did not round. Turning
-    // this into a failure would mean rewriting files that must round-trip byte for byte.
-    if !complaints.is_empty() {
-        eprintln!(
-            "note: {} stored amount(s) sit between slider positions:\n  {}",
-            complaints.len(),
-            complaints.join("\n  ")
-        );
-    }
+    assert!(
+        complaints.is_empty(),
+        "{} stored amount(s) do not survive the slider:\n  {}",
+        complaints.len(),
+        complaints.join("\n  ")
+    );
+    // The fixture really does hold values between positions, or this checks nothing.
+    assert!(
+        between > 0,
+        "no shipped preset stores a value between positions"
+    );
 }
 
 #[test]

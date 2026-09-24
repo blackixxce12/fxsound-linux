@@ -63,8 +63,16 @@ pub const MAX_PRESET_NAME_CHARS: usize = 64;
 /// one per step. Whatever is still unsaved at exit is written by [`App::shutdown`].
 const VOLUME_SAVE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// `FxModel::isPresetNameValid` (`FxModel.cpp:142-153`): a name can be used for a new or renamed
-/// preset when it is not blank and no preset already has it, compared case-insensitively.
+/// How long unsaved edits wait before they are stashed in their autosave, counted from the first
+/// edit since the last stash (0.4.0 audit #47): upstream's `FxController` stashes the selected
+/// preset's edits once a minute (`FxController.cpp:2101-2110`), and this port only did on a switch
+/// and on the way out, so a crash, a `SIGKILL` or a compositor going down lost every edit since
+/// the preset was picked. A minute of quiet costs nothing: the deadline is one [`Instant`], set by
+/// an edit and cleared by the stash.
+pub const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `FxModel::isPresetNameValid` (`FxModel.cpp:142-153`): a name can be used for a new preset when
+/// it is not blank and no preset already has it, compared case-insensitively.
 #[must_use]
 pub fn preset_name_available(existing: &[PresetEntry], name: &str) -> bool {
     let wanted = name.trim();
@@ -73,6 +81,22 @@ pub fn preset_name_available(existing: &[PresetEntry], name: &str) -> bool {
     }
     let wanted = wanted.to_lowercase();
     !existing.iter().any(|p| p.name.to_lowercase() == wanted)
+}
+
+/// [`preset_name_available`] for renaming the preset `old`: the preset does not stand in its own
+/// way, so a rename that changes only letter case — `rock` to `Rock` — is allowed (0.4.0 audit
+/// #19; the original checks against every preset, itself included, `FxPresetNameEditor.cpp:104-117`,
+/// and refused it). Renaming a preset to exactly its own name is not a rename.
+#[must_use]
+pub fn rename_name_available(existing: &[PresetEntry], old: &str, name: &str) -> bool {
+    let wanted = name.trim();
+    if wanted.is_empty() || wanted == old {
+        return false;
+    }
+    let wanted = wanted.to_lowercase();
+    !existing
+        .iter()
+        .any(|p| p.name != old && p.name.to_lowercase() == wanted)
 }
 
 /// Why a preset command is refused: the reasons the hamburger menu greys an item out
@@ -94,7 +118,7 @@ pub enum Refusal {
     },
     /// Nothing is selected to save, overwrite, undo, rename or delete.
     NoPresetSelected,
-    /// Save New Preset or Overwrite with no unsaved changes: there is nothing to save.
+    /// Overwrite with no unsaved changes: there is nothing to save.
     NothingToSave {
         preset: String,
     },
@@ -202,7 +226,8 @@ const fn lane_noun(lane: DeviceDirection) -> &'static str {
 
 /// Which of the hamburger menu's preset items are offered: each is
 /// [`App::preset_command_allowed`] for its command, while the power is on
-/// (`FxMainWindow.cpp:536-543`). Export and Import are not preset commands and stay the menu's.
+/// (`FxMainWindow.cpp:536-543`). Export and Import are not preset commands; they are offered while
+/// the power is on, whether or not the preset has unsaved changes (0.4.0 audit #18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PresetMenu {
     pub save_new: bool,
@@ -210,6 +235,8 @@ pub struct PresetMenu {
     pub undo: bool,
     pub rename: bool,
     pub delete: bool,
+    pub export: bool,
+    pub import: bool,
 }
 
 /// What the window shows for one lane: the design's `ChainControls` (0.4.0 design §1.4), of which
@@ -396,11 +423,10 @@ trait LaneStore {
     fn file_name(&self, name: &str) -> Option<String>;
     fn rescan(&mut self);
     fn clear_autosave(&mut self, name: &str);
+    /// Move a user preset to the trash ([`Store::delete`], 0.4.0 audit #16).
     fn delete(&mut self, name: &str) -> Result<(), String>;
-    /// Save the preset under `new` and remove `old`, as the original does through its preset list
-    /// rather than a filesystem rename (`FxController.cpp:1244-1276`). What moves is the saved
-    /// file; an autosave under `old` goes with `old`. A failure to remove `old` once the copy
-    /// exists is logged, not returned: the rename has happened.
+    /// Give the user preset `old` the name `new`, moving its file and its autosave rather than
+    /// copying and deleting them ([`Store::rename`], 0.4.0 audit #19).
     fn rename(&mut self, old: &str, new: &str) -> Result<(), String>;
     fn import(&mut self, source: &Path) -> Result<String, String>;
     fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, String>;
@@ -428,16 +454,20 @@ impl<F: PresetFile> LaneStore for Store<F> {
     }
 
     fn delete(&mut self, name: &str) -> Result<(), String> {
-        Store::delete(self, name).map_err(|err| err.to_string())
+        match Store::delete(self, name).map_err(|err| err.to_string())? {
+            Some(fxsound_preset::trash::Discarded::Trash(path)) => {
+                log::info!("{name}: moved to the trash as {}", path.display());
+            }
+            Some(fxsound_preset::trash::Discarded::Backup(path)) => {
+                log::info!("{name}: kept as {}", path.display());
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     fn rename(&mut self, old: &str, new: &str) -> Result<(), String> {
-        let preset = self.load_saved(old).map_err(|err| err.to_string())?;
-        self.save_as(&preset, new).map_err(|err| err.to_string())?;
-        if let Err(err) = Store::delete(self, old) {
-            log::warn!("could not remove the old preset {old}: {err}");
-        }
-        Ok(())
+        Store::rename(self, old, new).map_err(|err| err.to_string())
     }
 
     fn import(&mut self, source: &Path) -> Result<String, String> {
@@ -517,6 +547,9 @@ pub struct App {
     /// When the per-device volumes the engine reported last are due to be written to the settings
     /// file (see [`VOLUME_SAVE_DELAY`]).
     volume_save_due: Option<Instant>,
+    /// When the unsaved edits are next due to be stashed in their autosaves ([`AUTOSAVE_INTERVAL`]
+    /// after the first edit since the last time), or `None` while nothing has been edited since.
+    autosave_due: Option<Instant>,
     /// A `--output` or `--input` that arrived before the list did, waiting for it — at most one
     /// per lane, so `--output X --input Y` at login waits for both.
     pending_devices: Vec<PendingDevice>,
@@ -671,6 +704,7 @@ impl App {
                     .map(str::to_owned)
             }),
             volume_save_due: None,
+            autosave_due: None,
             pending_devices: Vec::new(),
             settings,
             presets,
@@ -814,6 +848,7 @@ impl App {
         notice
             .into_iter()
             .chain(self.volume_save_due)
+            .chain(self.autosave_due)
             .chain(self.app_rules_due())
             .min()
     }
@@ -841,6 +876,11 @@ impl App {
         if self.volume_save_due.is_some_and(|due| due <= now) {
             self.volume_save_due = None;
             self.settings_dirty = true;
+        }
+        // Unsaved edits a minute old go to their autosave (see `AUTOSAVE_INTERVAL`).
+        if self.autosave_due.is_some_and(|due| due <= now) {
+            self.autosave_due = None;
+            self.autosave_unsaved_presets();
         }
         // The applications seen playing since the store was last written, likewise a while later;
         // a write that failed, again; a cold start's wait for the streams, over.
@@ -1307,11 +1347,11 @@ impl App {
                     self.send(message);
                 }
                 self.show_lane_selections();
-                // Coming back from a bypass, the filters still hold whatever was in them when the
-                // power went off, and `Chain::set_power` clears only the five effects — never the
-                // equalizer or the leveller. That also makes the power button the one recovery a
-                // user with broken-sounding audio will reach for first, so it has to be the one
-                // that actually clears the history. Both the tray and `--power` route here.
+                // Coming back from a bypass the engine starts the effects and the equalizer from
+                // rest on its own (`Chain::set_power`, `Engine::apply`), but resumes the leveller,
+                // as the original does. The reset clears that too, and the power button is the one
+                // recovery a user with broken-sounding audio will reach for first, so it has to be
+                // the one that clears every history. Both the tray and `--power` route here.
                 // Power is one switch over both chains, so both lanes are reset.
                 if self.state.power
                     && let Some(engine) = &self.engine
@@ -1504,19 +1544,14 @@ impl App {
     ///
     /// The four stage switches live in [`UiState`] rather than in the mapping precisely so that
     /// this can move them: without it a preset's gate is a number nothing reads.
+    ///
+    /// Read through [`voice_params`], which moves a twenty-band curve off the Windows ladder
+    /// (0.4.0 audit R4).
     fn apply_input_preset(&mut self, preset: &InputPreset) {
-        let params = preset.to_params();
+        let params = voice_params(preset);
+        let (centres, boosts) = params.bands();
         self.state.eq_on = params.eq_on;
-        self.state.eq_bands = params
-            .bands()
-            .0
-            .iter()
-            .zip(params.bands().1)
-            .map(|(&center_hz, &boost_db)| fxsound_core::EqBand {
-                center_hz,
-                boost_db,
-            })
-            .collect();
+        self.state.eq_bands = bands_of(centres, boosts);
         self.state.filter_q = params.filter_q;
         self.state.master_gain_db = params.makeup_db;
         self.state.denoise_on = params.rnnoise;
@@ -1545,8 +1580,15 @@ impl App {
     ///
     /// The same steps on both lanes, as the original's `setPreset` (`FxController.cpp:1048-1104`):
     /// switching away from unsaved edits stashes them first, so nothing the user did is silently
-    /// lost; the device in use remembers the preset; and the lane's filter history is cleared,
-    /// since a new band layout makes the old one meaningless.
+    /// lost; and the device in use remembers the preset.
+    ///
+    /// The lane's filter history is cleared only when the preset brings another band count, since
+    /// a new band layout makes the old one meaningless. Otherwise the engine glides from the old
+    /// preset to the new one over 20 ms — the curves crossfading, the effects fading, the gains
+    /// gliding (audit report #11) — where clearing it on every pick switched in one step, and
+    /// dropped Dynamic Boost's reading of the programme so a full boost played for a second and a
+    /// half after each change. The music lane fits every preset onto the user's band count, so
+    /// there it is a voice preset of another ladder that clears it.
     fn select_preset(&mut self, index: usize) {
         let Some(entry) = self.state.presets.get(index) else {
             return;
@@ -1562,6 +1604,7 @@ impl App {
             self.autosave_lane_preset(&preset);
         }
 
+        let bands_before = self.state.eq_bands.len();
         let loaded = match lane {
             DeviceDirection::Output => self.presets.load(&name).map_or_else(
                 |err| Err(err.to_string()),
@@ -1593,7 +1636,9 @@ impl App {
                 // loads the lane off screen through here too, and the two are the same by now.
                 self.settings.set_preset_for_direction(lane, &name);
                 self.settings_dirty = true;
-                if let Some(engine) = &self.engine {
+                if self.state.eq_bands.len() != bands_before
+                    && let Some(engine) = &self.engine
+                {
                     engine.send_event(lane, DspEvent::ResetFilterState);
                 }
             }
@@ -1669,9 +1714,9 @@ impl App {
     /// its own (upstream `DfxDspEq.cpp:127-247`).
     ///
     /// A user on thirty-one bands who picks a ten-band factory preset stays on thirty-one bands:
-    /// the live ladder is kept and the preset's gains are fitted onto it by position
-    /// ([`fxsound_dsp::eq::fit_preset_gains`]). Only a preset of the live count brings its own
-    /// centre frequencies. A preset with no equalizer at all is the original's "old preset": the
+    /// the live ladder is kept and the preset's gains are fitted onto it by frequency
+    /// ([`fxsound_dsp::eq::fit_preset_gains`], audit #13). Only a preset of the live count brings
+    /// its own centre frequencies. A preset with no equalizer at all is the original's "old preset": the
     /// equalizer on and flat. See [`music_controls`], which an application's route reads its
     /// preset with too.
     fn apply_preset(&mut self, preset: &Preset) {
@@ -1851,19 +1896,43 @@ impl App {
             && let Some(entry) = self.state.presets.get_mut(index)
         {
             entry.modified = true;
+            // The first edit since the last stash starts the clock; later ones ride on it.
+            if self.autosave_due.is_none() {
+                self.autosave_due = Some(Instant::now() + AUTOSAVE_INTERVAL);
+            }
         }
         self.note_presets();
     }
 
+    /// Stash every lane's unsaved edits in its autosave: the periodic save (0.4.0 audit #47). A
+    /// lane whose preset has none writes nothing, so a clock left running by an edit that was
+    /// saved or undone since costs nothing when it runs out.
+    fn autosave_unsaved_presets(&mut self) {
+        for lane in DeviceDirection::ALL {
+            if let Some(preset) = self.unsaved_lane_preset(lane) {
+                self.autosave_lane_preset(&preset);
+            }
+        }
+    }
+
     /// Save the edit direction's controls: over the selected preset (`None`), or as a new user
     /// preset called `new_name` — into that lane's store, as that lane's kind of file.
+    ///
+    /// A new name is cut to what every FxSound reads ([`fxsound_preset::new_preset_name`], 0.4.0
+    /// audit #15), and a preset with no unsaved changes is saved as a copy of itself (audit #17).
     fn save_preset(&mut self, new_name: Option<String>) {
         let Some(preset) = self.current_preset_snapshot() else {
             return;
         };
         let lane = preset.direction();
         let is_new = new_name.is_some();
-        let name = new_name.unwrap_or_else(|| preset.name().to_owned());
+        let name = new_name.map_or_else(
+            || preset.name().to_owned(),
+            |name| fxsound_preset::new_preset_name(&name),
+        );
+        if name.is_empty() {
+            return;
+        }
 
         match self.save_lane_preset(preset, &name) {
             Ok(()) => {
@@ -1957,27 +2026,58 @@ impl App {
         }
     }
 
-    /// Change the edit direction's band count, carrying the curve over by position rather than
-    /// wiping it flat (upstream 182a329, `GraphicEqSet.cpp:200-245`): the window, `--num_bands`
-    /// and Restore Defaults all come through here.
+    /// Change the edit direction's band count, carrying the curve over rather than wiping it
+    /// flat (upstream 182a329, `GraphicEqSet.cpp:200-245`) — by frequency, from the centres the
+    /// curve sits on, where the original goes by position (0.4.0 audit #13,
+    /// [`fxsound_dsp::eq::fit_preset_gains`]): the window and `--num_bands` come through here.
     ///
     /// The new ladder is the engine's own for the count. On the speakers the count is the user's
-    /// setting, which every music preset is then fitted onto ([`App::apply_preset`]); on a
-    /// microphone it is the voice preset's own, as its ladder is, and the setting is left alone,
-    /// as the four level settings are.
+    /// setting, which every music preset is fitted onto ([`App::apply_preset`]), so changing it is
+    /// no edit to the preset (audit #45; the original does not mark it either,
+    /// `FxController.cpp:1778-1782`): a preset with no unsaved changes is read again from its own
+    /// file onto the new ladder, as picking it would read it, rather than carrying the curve the
+    /// last count fitted it to — which, marked modified as it used to be, the autosave then kept
+    /// in place of the preset's own. A preset with unsaved changes carries those over and stays as
+    /// modified as it was, and so does a curve with no preset selected, or one whose selected
+    /// preset is not the one last read. On a microphone the count is the voice preset's own, as its ladder is:
+    /// an edit to it, and the setting is left alone, as the four level settings are.
     fn set_band_count(&mut self, count: usize) {
         let count = count.clamp(1, fxsound_core::eq::MAX_BANDS);
         if count == self.state.eq_bands.len() {
             return;
         }
-        let gains: Vec<f32> = self.state.eq_bands.iter().map(|b| b.boost_db).collect();
-        let gains = fxsound_dsp::eq::remap_band_gains(&gains, count);
-        self.state.eq_bands = bands_of(&ladder(count), &gains);
-        if self.state.direction == DeviceDirection::Output {
-            self.settings.num_bands = count as u32;
-            self.settings_dirty = true;
+        let new_ladder = ladder(count);
+        let lane = self.state.direction;
+        // Only the preset the list shows, unedited, and the one last read are the same curve: with
+        // nothing selected — the last preset deleted from a list with no factory presets — the
+        // last one read may be gone, and the curve on screen is the user's alone.
+        let unedited = self
+            .state
+            .preset()
+            .filter(|p| !p.modified)
+            .zip(self.loaded_preset.as_ref())
+            .filter(|(shown, read)| shown.name == read.name)
+            .map(|(_, read)| read);
+        self.state.eq_bands = match (unedited, lane) {
+            (Some(preset), DeviceDirection::Output) => music_controls(preset, &new_ladder).eq_bands,
+            _ => {
+                let centres: Vec<f32> = self.state.eq_bands.iter().map(|b| b.center_hz).collect();
+                let gains: Vec<f32> = self.state.eq_bands.iter().map(|b| b.boost_db).collect();
+                bands_of(
+                    &new_ladder,
+                    &fxsound_dsp::eq::fit_preset_gains(&centres, &gains, &new_ladder),
+                )
+            }
+        };
+        match lane {
+            DeviceDirection::Output => {
+                self.settings.num_bands = count as u32;
+                self.settings_dirty = true;
+                // The list's marker and `--watch` say nothing new: nothing was edited.
+                self.note_presets();
+            }
+            DeviceDirection::Input => self.mark_preset_modified(),
         }
-        self.mark_preset_modified();
         self.sync_params_from_state();
         // The new ladder is the edited chain's; the other lane keeps its own curve until it is
         // edited, so only this lane's filter history is stale.
@@ -1987,16 +2087,19 @@ impl App {
     }
 
     /// Restore Defaults under the equalizer (`FxEqualizerControl::restoreDefaults`,
-    /// `FxAudioControls.cpp:529-544`): ten bands, no volume leveling, centred balance, the
-    /// narrowest filter width and no master gain. The curve is kept — carried onto ten bands
-    /// ([`App::set_band_count`]) — since it is the preset's, not a default.
+    /// `FxAudioControls.cpp:529-544`): no volume leveling, centred balance, the widest filter
+    /// (Q ×1) and no master gain. The curve is the preset's, not a default, and stays as it is.
+    ///
+    /// **The band count stays as well (0.4.0 audit R5, option A).** The original also sets ten
+    /// bands, so asking for the balance back carried a thirty-one-band curve onto ten bands and
+    /// back never came: the fine detail was gone, with no question asked and no undo. The band
+    /// count has its own control right beside this button.
     ///
     /// Each value goes where its own control sends it: on the speakers the levels are settings
     /// over every preset; on a microphone the gain is the voice preset's makeup and the width its
     /// equalizer's, so moving either is an edit to the preset. The microphone's face has no
     /// balance or leveller — those are the speakers' — so it leaves them alone.
     fn restore_defaults(&mut self) {
-        self.set_band_count(fxsound_core::eq::DEFAULT_BANDS);
         let voice_moved = self.state.master_gain_db != 0.0 || self.state.filter_q != 1.0;
         self.state.filter_q = 1.0;
         self.state.master_gain_db = 0.0;
@@ -2346,7 +2449,8 @@ impl App {
                 // on ten bands whatever the settings file says.
                 let ladder = self.music_ladder();
                 if ladder.len() != self.state.eq_bands.len() {
-                    let gains = fxsound_dsp::eq::remap_band_gains(boosts, ladder.len());
+                    // By frequency, from the centres the snapshot holds (audit #13).
+                    let gains = fxsound_dsp::eq::fit_preset_gains(centres, boosts, &ladder);
                     self.state.eq_bands = bands_of(&ladder, &gains);
                 }
             }
@@ -2694,6 +2798,7 @@ impl App {
             requested_device: [None, None],
             preset_device: [None, None],
             volume_save_due: None,
+            autosave_due: None,
             pending_devices: Vec::new(),
             settings: Settings::default(),
             presets: PresetStore::with_dirs(
@@ -3090,16 +3195,15 @@ impl App {
 }
 
 impl App {
-    /// `FxController::getMaxUserPresets()`: the setting, with anything below 10 or above 120 read
-    /// as 120 (`FxController.cpp:194-198`, `docs/spec/03-controls.md` §8.5).
+    /// `FxController::getMaxUserPresets()`: the setting, clamped to 10..=1000
+    /// ([`fxsound_core::settings::USER_PRESET_LIMITS`]). The original reads anything outside
+    /// 10..=120 as 120 (`FxController.cpp:194-198`), so asking for 500 got 120 (0.4.0 audit #20).
     #[must_use]
     pub fn max_user_presets(&self) -> usize {
-        let max = self.settings.max_user_presets;
-        if (10..=120).contains(&max) {
-            max as usize
-        } else {
-            120
-        }
+        let limits = fxsound_core::settings::USER_PRESET_LIMITS;
+        self.settings
+            .max_user_presets
+            .clamp(*limits.start(), *limits.end()) as usize
     }
 
     /// Whether `command` may run on the edit direction's presets now, and if not, why: the one
@@ -3130,13 +3234,11 @@ impl App {
                     other_lane_has_it: self.lane_has_preset(lane.other(), name),
                 })
             }
+            // A clean preset is saved as a copy (0.4.0 audit #17): the original offers Save New
+            // Preset only with unsaved changes (`FxMainWindow.cpp:535`), so copying a factory
+            // preset meant moving a slider and moving it back first.
             PresetCommand::SaveAs(name) => {
-                let preset = selected()?;
-                if !preset.modified {
-                    return Err(Refusal::NothingToSave {
-                        preset: preset.name.clone(),
-                    });
-                }
+                selected()?;
                 let max = self.max_user_presets();
                 if self.user_preset_count() >= max {
                     return Err(Refusal::LimitReached { max });
@@ -3179,7 +3281,7 @@ impl App {
                         preset: preset.name.clone(),
                     });
                 }
-                self.new_name_allowed(name)
+                self.rename_allowed(&preset.name, name)
             }
             PresetCommand::Delete => {
                 let preset = selected()?;
@@ -3195,23 +3297,40 @@ impl App {
         }
     }
 
-    /// Whether a new or renamed preset may be called `name` ([`preset_name_available`]).
+    /// Whether a new preset may be called `name` ([`preset_name_available`]), as the name it
+    /// would be saved under ([`fxsound_preset::new_preset_name`]).
     fn new_name_allowed(&self, name: &str) -> Result<(), Refusal> {
-        let name = name.trim();
+        let name = fxsound_preset::new_preset_name(name);
         if name.is_empty() {
             Err(Refusal::EmptyName)
-        } else if self.is_preset_name_available(name) {
+        } else if self.is_preset_name_available(&name) {
             Ok(())
         } else {
-            Err(Refusal::NameTaken {
-                name: name.to_owned(),
-            })
+            Err(Refusal::NameTaken { name })
+        }
+    }
+
+    /// Whether the preset `old` may be renamed `name`: as [`App::new_name_allowed`], except that
+    /// the preset itself does not take the name, so `rock` can become `Rock` (0.4.0 audit #19).
+    fn rename_allowed(&self, old: &str, name: &str) -> Result<(), Refusal> {
+        let name = fxsound_preset::new_preset_name(name);
+        if name.is_empty() {
+            Err(Refusal::EmptyName)
+        } else if rename_name_available(&self.state.presets, old, &name) {
+            Ok(())
+        } else {
+            Err(Refusal::NameTaken { name })
         }
     }
 
     /// The hamburger menu's preset items: each offered when [`App::preset_command_allowed`]
     /// allows its command and the power is on — Save New Preset and Rename Preset whatever the
     /// name, which their editor asks for.
+    ///
+    /// Export Presets and Import Presets need only the power. The original greys both out while
+    /// the preset has unsaved changes (`FxMainWindow.cpp:540-541`), which protects nothing here:
+    /// the export writes the presets as saved, and the import skips a name already taken, the
+    /// modified preset's included (0.4.0 audit #18).
     #[must_use]
     pub fn preset_menu(&self) -> PresetMenu {
         let offered = |command: PresetCommand| {
@@ -3233,6 +3352,8 @@ impl App {
             undo: offered(PresetCommand::Undo),
             rename: offered(PresetCommand::Rename(String::new())),
             delete: offered(PresetCommand::Delete),
+            export: self.state.power,
+            import: self.state.power,
         }
     }
 
@@ -3252,16 +3373,18 @@ impl App {
     /// store.
     ///
     /// User presets only; a factory preset refuses with a notification, as deleting one does.
-    /// Implemented as save-under-the-new-name then delete-the-old, which is what the original does
-    /// through its preset list rather than a filesystem rename. The saved file is what gets
-    /// renamed, not unsaved edits: the menu only offers Rename while the preset is unmodified
-    /// (`docs/spec/03-controls.md` §8.5), and a caller that ignores that keeps its edits in the
-    /// autosave under the *old* name, which the store's delete then removes.
+    /// The file and its autosave are moved, not copied and deleted as the original does through
+    /// its preset list (0.4.0 audit #19, [`Store::rename`]), so a rename that changes only letter
+    /// case — which the preset's own name no longer stands in the way of — cannot lose the preset
+    /// on a filesystem that folds case. The new name is cut to what every FxSound reads
+    /// ([`fxsound_preset::new_preset_name`], audit #15). The menu only offers Rename while the
+    /// preset is unmodified (`docs/spec/03-controls.md` §8.5).
     ///
     /// Everything that named the preset follows it: the lane's saved preset and every device that
     /// remembers it, so plugging one back in does not look for a name that no longer exists.
     pub fn rename_preset(&mut self, new_name: &str) {
-        let new_name = new_name.trim();
+        let new_name = fxsound_preset::new_preset_name(new_name);
+        let new_name = new_name.as_str();
         let Some(entry) = self.state.preset() else {
             return;
         };
@@ -3273,7 +3396,7 @@ impl App {
         if new_name.is_empty() || new_name == old {
             return;
         }
-        if !self.is_preset_name_available(new_name) {
+        if !rename_name_available(&self.state.presets, &old, new_name) {
             self.raise_notice(tr_args("A preset named %s already exists", &[new_name]));
             return;
         }
@@ -3370,8 +3493,9 @@ impl App {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .map_or_else(|| path.display().to_string(), str::to_owned);
-            // `Store::import` names the preset after the file, so that is the name to check.
-            if !self.is_preset_name_available(&stem) {
+            // `Store::import` names the preset after the file, as a new name, so that is the name
+            // to check.
+            if !self.is_preset_name_available(&fxsound_preset::new_preset_name(&stem)) {
                 summary.skipped.push(stem);
                 continue;
             }
@@ -3760,19 +3884,26 @@ struct MusicControls {
 ///
 /// The effects land where the slider shows them, which is where they sound: a Dynamic Boost past
 /// the slider's dead top is read as the top ([`scale::value_to_slider_for`]). The curve is the
-/// preset's own when it has as many bands as the ladder, fitted onto the ladder by position when
-/// it has another count ([`fxsound_dsp::eq::fit_preset_gains`]), and flat with the equalizer on
-/// when it has none, the original's "old preset".
+/// preset's own when it has as many bands as the ladder, fitted onto the ladder by frequency when
+/// it has another count ([`fxsound_dsp::eq::fit_preset_gains`], audit #13), and flat with the
+/// equalizer on when it has none, the original's "old preset".
+///
+/// A twenty-band curve on the Windows ladder — a Windows preset, or one saved before 0.4.0 — is
+/// read on the half-octave ladder that replaced it, band for band (0.4.0 audit R4,
+/// [`fxsound_core::eq::move_off_the_windows_twenty_band_ladder`]), so it plays without the
+/// paired ladder's ripple and is saved on the new one the next time it is saved.
 fn music_controls(preset: &Preset, ladder: &[f32]) -> MusicControls {
     let effects =
         Effect::ALL.map(|effect| scale::value_to_slider_for(effect, preset.effect(effect)));
-    let (eq_on, eq_bands) = if preset.eq_bands.is_empty() {
+    let mut preset_bands = preset.eq_bands.clone();
+    fxsound_core::eq::move_off_the_windows_twenty_band_ladder(&mut preset_bands);
+    let (eq_on, eq_bands) = if preset_bands.is_empty() {
         (true, bands_of(ladder, &vec![0.0; ladder.len()]))
-    } else if preset.eq_bands.len() == ladder.len() {
-        (preset.eq_on, preset.eq_bands.clone())
+    } else if preset_bands.len() == ladder.len() {
+        (preset.eq_on, preset_bands)
     } else {
-        let centres: Vec<f32> = preset.eq_bands.iter().map(|b| b.center_hz).collect();
-        let gains: Vec<f32> = preset.eq_bands.iter().map(|b| b.boost_db).collect();
+        let centres: Vec<f32> = preset_bands.iter().map(|b| b.center_hz).collect();
+        let gains: Vec<f32> = preset_bands.iter().map(|b| b.boost_db).collect();
         let fitted = fxsound_dsp::eq::fit_preset_gains(&centres, &gains, ladder);
         (preset.eq_on, bands_of(ladder, &fitted))
     };
@@ -3781,6 +3912,22 @@ fn music_controls(preset: &Preset, ladder: &[f32]) -> MusicControls {
         eq_on,
         eq_bands,
     }
+}
+
+/// A voice preset's own parameters — the one reading of a voice preset there is: the lane's own
+/// ([`App::apply_input_preset`]) and a recording route's ([`per_app`]) both go through it.
+///
+/// A twenty-band curve on the Windows ladder, which a voice preset saved by 0.3.0 can carry, is
+/// read on the half-octave ladder that replaced it (0.4.0 audit R4), as [`music_controls`] reads a
+/// `.fac`.
+fn voice_params(preset: &InputPreset) -> InputDspParams {
+    let mut params = preset.to_params();
+    let (centres, boosts) = params.bands();
+    let mut bands = bands_of(centres, boosts);
+    if fxsound_core::eq::move_off_the_windows_twenty_band_ladder(&mut bands) {
+        params.set_bands(&bands);
+    }
+    params
 }
 
 /// The levels every music chain shares: settings over every `.fac`, as the original's.
@@ -4107,16 +4254,17 @@ impl App {
             .collect()
     }
 
-    /// Whether Settings ▸ Reset Presets has something to lose (`FxSettingsDialog.cpp:210-220`), on
+    /// Whether Settings ▸ Reset Presets has something to do: a preset with unsaved changes, on
     /// either lane, since the reset covers both.
+    ///
+    /// The original also offers it with any user preset saved (`FxSettingsDialog.cpp:210-220`),
+    /// because its reset deletes them (`FxController.cpp:1334-1382`). This one drops unsaved
+    /// changes and nothing else, so with only saved presets it did nothing and said the presets
+    /// were restored to factory defaults (0.4.0 audit #21).
     fn can_reset_presets(&self) -> bool {
         DeviceDirection::ALL.into_iter().any(|lane| {
             self.lane_preset(lane).is_some_and(|(_, modified)| modified)
-                || self
-                    .store(lane)
-                    .entries()
-                    .iter()
-                    .any(|p| p.source != fxsound_preset::PresetSource::Factory || p.modified)
+                || self.store(lane).entries().iter().any(|p| p.modified)
         })
     }
 
@@ -4195,7 +4343,8 @@ impl App {
     }
 
     /// Settings ▸ Reset Presets: every preset of **both** lanes back to what shipped or was last
-    /// saved, by dropping every autosave in both stores.
+    /// saved, by dropping every autosave in both stores. The window asks first (0.4.0 audit #21);
+    /// saved presets are never touched, as the original's reset deletes them.
     ///
     /// Each lane then loads the preset its device remembers (upstream 7f160b6), or else its
     /// selected one again as saved — the lane in the window and the one off screen alike, so the
@@ -5007,12 +5156,12 @@ mod tests {
     }
 
     #[test]
-    fn restoring_defaults_keeps_the_curve_on_ten_bands_and_resets_the_levels() {
-        // `FxEqualizerControl::restoreDefaults` (`FxAudioControls.cpp:529-544`): ten bands,
-        // leveling, balance, width and gain back to their defaults — and the curve, which is the
-        // preset's, carried onto the ten bands rather than flattened (U1).
-        // The curve is carried by frequency (audit report #13): a boost at 63 Hz and a cut at
-        // 16 kHz on thirty-one bands stay at 62.5 Hz and 16 kHz on ten.
+    fn restoring_defaults_keeps_the_band_count_and_the_curve_and_resets_the_levels() {
+        // `FxEqualizerControl::restoreDefaults` (`FxAudioControls.cpp:529-544`): leveling,
+        // balance, width and gain back to their defaults. The original also goes back to ten
+        // bands, and a thirty-one-band curve carried onto ten lost its detail for good, when all
+        // that was asked for was the balance (0.4.0 audit R5, option A): the band count and the
+        // curve stay as they are.
         let mut app = with_presets(&["Jazz"]);
         app.handle(&[
             UiAction::SetBandCount(31),
@@ -5024,18 +5173,13 @@ mod tests {
             UiAction::SetFilterQ(2.5),
         ]);
         let curve = gains(&app);
+        let ladder_before = centres(&app);
         app.handle(&[UiAction::RestoreDefaults]);
 
-        assert_eq!(gains(&app), fxsound_dsp::eq::remap_band_gains(&curve, 10));
-        assert!(
-            (8.5..=9.0).contains(&gains(&app)[0]),
-            "the 63 Hz boost is read at 62.5 Hz: {:?}",
-            gains(&app)
-        );
-        assert_eq!(gains(&app)[9], -5.0, "16 kHz is on both ladders");
-        assert_eq!(centres(&app), ladder(10));
-        assert_eq!(app.settings.num_bands, 10);
-        assert_eq!(app.params().num_bands, 10);
+        assert_eq!(gains(&app), curve, "every band where it was");
+        assert_eq!(centres(&app), ladder_before);
+        assert_eq!(app.settings.num_bands, 31);
+        assert_eq!(app.params().num_bands, 31);
         assert_eq!(app.state.master_gain_db, 0.0);
         assert_eq!(app.state.volume_leveling, 0.0);
         assert_eq!(app.state.balance_db, 0.0);
@@ -5161,10 +5305,11 @@ mod tests {
     }
 
     #[test]
-    fn restoring_defaults_on_a_microphone_carries_its_curve_onto_ten_bands_as_an_edit_to_it() {
-        // On a voice the band count and the gain are the preset's own ([`App::set_band_count`],
-        // `SetMasterGain`), so Restore Defaults edits the voice preset; the speakers' band count
-        // and levels are settings over the music presets, which it does not reach.
+    fn restoring_defaults_on_a_microphone_keeps_its_band_count_and_curve_and_edits_its_gain() {
+        // On a voice the gain and the width are the preset's own (`SetMasterGain`, `SetFilterQ`),
+        // so Restore Defaults edits the voice preset; its band count and curve stay (0.4.0 audit
+        // R5); and the speakers' band count and levels are settings over the music presets, which
+        // it does not reach.
         let (mut app, _engine, _dir) = restoring_on_the_microphone("Loud");
         let speakers = (speakers_settings(&app), *app.params());
         app.handle(&[
@@ -5177,11 +5322,9 @@ mod tests {
         let curve = gains(&app);
         app.handle(&[UiAction::RestoreDefaults]);
 
-        assert_eq!(app.input_params().num_bands, 10);
-        assert_eq!(gains(&app), fxsound_dsp::eq::remap_band_gains(&curve, 10));
-        assert_eq!(gains(&app)[0], 6.0);
-        assert_eq!(gains(&app)[9], -4.0);
-        assert_eq!(centres(&app), ladder(10));
+        assert_eq!(app.input_params().num_bands, 5);
+        assert_eq!(gains(&app), curve);
+        assert_eq!(centres(&app), ladder(5));
         assert_eq!(app.input_params().makeup_db, 0.0);
         assert_eq!(app.input_params().filter_q, 1.0);
         assert_eq!(app.lane_preset(IN), Some(("Loud", true)));
@@ -7316,15 +7459,18 @@ mod tests {
     }
 
     #[test]
-    fn the_user_preset_cap_is_clamped_the_way_the_original_clamps_it() {
+    fn the_user_preset_cap_is_clamped_to_ten_and_a_thousand_rather_than_reset_to_120() {
+        // 0.4.0 audit #20: the original reads anything outside 10..=120 as 120.
         let mut app = headless();
         assert_eq!(app.max_user_presets(), 120);
         app.settings.max_user_presets = 50;
         assert_eq!(app.max_user_presets(), 50);
         app.settings.max_user_presets = 3;
-        assert_eq!(app.max_user_presets(), 120);
+        assert_eq!(app.max_user_presets(), 10);
         app.settings.max_user_presets = 500;
-        assert_eq!(app.max_user_presets(), 120);
+        assert_eq!(app.max_user_presets(), 500);
+        app.settings.max_user_presets = 50_000;
+        assert_eq!(app.max_user_presets(), 1000);
     }
 
     #[test]
@@ -7989,14 +8135,14 @@ mod tests {
                 "editing {edit:?}: the microphone runs Loud"
             );
             assert_eq!(app.state.direction, edit);
-            // And each chain's history was cleared for the preset it now runs.
+            // Nothing is cleared: neither preset changes its lane's band count, and an engine
+            // that has not processed a block takes its first snapshot at once.
             let events = engine.take_events();
-            for lane in [OUT, IN] {
-                assert!(
-                    events.contains(&(lane, DspEvent::ResetFilterState)),
-                    "editing {edit:?}: {events:?}"
-                );
-            }
+            assert!(
+                !events.contains(&(OUT, DspEvent::ResetFilterState))
+                    && !events.contains(&(IN, DspEvent::ResetFilterState)),
+                "editing {edit:?}: {events:?}"
+            );
         }
     }
 
@@ -8785,19 +8931,37 @@ mod tests {
     }
 
     #[test]
-    fn a_preset_clears_the_history_of_its_own_lane_only() {
+    fn a_preset_of_the_same_band_count_glides_in_and_one_of_another_clears_its_own_lane() {
+        // The DSP track's note on audit #11: a reset on every pick ended every glide at once, so
+        // a preset change still switched in one step, and dropped Dynamic Boost's reading of the
+        // programme. Only a new band layout makes the old history meaningless.
         let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        let _ = engine.take_events();
         app.handle(&[UiAction::SelectPreset(0)]);
-        assert_eq!(engine.take_events(), [(OUT, DspEvent::ResetFilterState)]);
+        assert_eq!(
+            engine.take_events(),
+            [],
+            "Alpha on the speakers' ten bands glides in"
+        );
 
         app.handle(&[UiAction::SetEditDirection(IN), UiAction::SelectPreset(1)]);
-        assert_eq!(engine.take_events(), [(IN, DspEvent::ResetFilterState)]);
+        assert_eq!(
+            engine.take_events(),
+            [],
+            "Quiet on the microphone's ten bands glides in"
+        );
         assert!(
             engine.take_sent().contains(&UiToAudio::SetInputChain(
                 fxsound_preset::input::DEFAULT_CHAIN.to_owned()
             )),
             "Quiet runs the default chain, and the engine is told"
         );
+
+        // Quiet taken to five bands, then Loud on its own ten: the microphone's ladder changes.
+        app.handle(&[UiAction::SetBandCount(5)]);
+        let _ = engine.take_events();
+        app.handle(&[UiAction::SelectPreset(0)]);
+        assert_eq!(engine.take_events(), [(IN, DspEvent::ResetFilterState)]);
     }
 
     #[test]
@@ -9505,15 +9669,49 @@ mod tests {
         );
         assert_eq!(app.state.direction, OUT, "the window stayed where it was");
         assert_eq!(app.settings.device_direction, OUT);
+        // What it did, where the original's words promised factory presets (0.4.0 audit #21).
         assert_eq!(
             app.state.notification.as_deref(),
-            Some("Presets are restored to factory defaults")
+            Some("Unsaved preset changes discarded")
         );
         assert!(!app.settings_state().can_reset_presets);
 
         app.handle(&[UiAction::SetEditDirection(IN)]);
         assert!(!entry(&app, "Loud").modified);
         assert_eq!(app.state.master_gain_db, 0.0);
+    }
+
+    #[test]
+    fn reset_presets_is_offered_only_while_some_preset_has_unsaved_changes() {
+        // 0.4.0 audit #21: the original offers it with any user preset saved, because its reset
+        // deletes them; this one keeps them, so with only saved presets it had nothing to do and
+        // still said the presets were restored to factory defaults.
+        let (mut app, _engine, dir) = started_with(saved_settings(OUT));
+        app.handle(&[
+            UiAction::SetEffect(Effect::Bass, 9.0),
+            UiAction::SavePresetAs("Mine".into()),
+        ]);
+        assert!(
+            dir.path().join("user/Mine.fac").is_file(),
+            "a user preset is saved"
+        );
+        assert!(
+            !app.settings_state().can_reset_presets,
+            "a saved user preset alone is nothing to reset"
+        );
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 2.0)]);
+        assert!(
+            app.settings_state().can_reset_presets,
+            "an unsaved change is"
+        );
+
+        let mut pane = app.settings_state();
+        app.handle_settings(&SettingsAction::ResetPresets, &mut pane);
+        assert!(
+            dir.path().join("user/Mine.fac").is_file(),
+            "the saved preset is kept"
+        );
+        assert_eq!(app.lane_preset(OUT), Some(("Mine", false)));
     }
 
     // ---- the calibration wizard (0.4.0 design §8), through a fake feed -------------------------
@@ -10734,7 +10932,9 @@ mod tests {
     #[test]
     fn the_menu_offers_a_preset_item_exactly_when_its_command_would_run() {
         // One rule for the hamburger and the command path (U15), and it is still the original's
-        // enablement (`FxMainWindow.cpp:536-543`).
+        // enablement (`FxMainWindow.cpp:536-543`) but for Save New Preset, which a preset with no
+        // unsaved changes offers too, to save a copy (0.4.0 audit #17), and Export and Import,
+        // which a preset with unsaved changes no longer greys out (#18).
         for factory in [true, false] {
             for modified in [false, true] {
                 for power in [true, false] {
@@ -10760,14 +10960,52 @@ mod tests {
                     );
                     assert_eq!(menu.delete, power && runs(P::Delete), "{case}");
 
-                    assert_eq!(menu.save_new, modified && power, "{case}");
+                    assert_eq!(menu.save_new, power, "{case}");
                     assert_eq!(menu.overwrite, modified && !factory && power, "{case}");
                     assert_eq!(menu.undo, modified && power, "{case}");
                     assert_eq!(menu.rename, !modified && !factory && power, "{case}");
                     assert_eq!(menu.delete, !factory && power, "{case}");
+                    // Unsaved changes stand in the way of neither (0.4.0 audit #18).
+                    assert_eq!(menu.export, power, "{case}");
+                    assert_eq!(menu.import, power, "{case}");
                 }
             }
         }
+    }
+
+    #[test]
+    fn moving_a_slider_leaves_export_and_import_presets_offered() {
+        // The report's scenario (0.4.0 audit #18): a slider moved, and Export Presets and Import
+        // Presets went grey without a word, although neither touches the unsaved changes.
+        let (mut app, _engine, _dir) = started_with(saved_settings(OUT));
+        let menu = app.preset_menu();
+        assert!(menu.export && menu.import, "{menu:?}");
+
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 7.0)]);
+        assert_eq!(
+            app.lane_preset(OUT),
+            Some(("Beta", true)),
+            "the preset has changes"
+        );
+        let menu = app.preset_menu();
+        assert!(menu.export && menu.import, "with unsaved changes: {menu:?}");
+        assert!(menu.undo, "and the changes are the menu's to undo");
+
+        app.handle(&[UiAction::SetBandGain(0, 6.0)]);
+        let menu = app.preset_menu();
+        assert!(
+            menu.export && menu.import,
+            "after an equalizer band: {menu:?}"
+        );
+
+        // The power is what greys them out, changes or none.
+        app.handle(&[UiAction::TogglePower]);
+        assert!(!app.state.power);
+        let menu = app.preset_menu();
+        assert!(!menu.export && !menu.import, "{menu:?}");
+        app.handle(&[UiAction::TogglePower]);
+        let menu = app.preset_menu();
+        assert!(menu.export && menu.import, "{menu:?}");
     }
 
     #[test]
@@ -10805,20 +11043,24 @@ mod tests {
             refused(&app, P::Overwrite),
             Refusal::NothingToSave { preset: mine() }
         );
-        assert_eq!(
-            refused(&app, P::SaveAs("New".into())),
-            Refusal::NothingToSave { preset: mine() }
-        );
+        // A clean preset is saved as a copy (0.4.0 audit #17).
+        assert_eq!(app.preset_command_allowed(&P::SaveAs("New".into())), Ok(()));
         assert_eq!(
             refused(&app, P::Undo),
             Refusal::NothingToUndo { preset: mine() }
         );
         assert_eq!(
             refused(&app, P::Rename("Mine".into())),
-            Refusal::NameTaken { name: mine() }
+            Refusal::NameTaken { name: mine() },
+            "its own name, exactly, is no rename"
         );
         assert_eq!(
             app.preset_command_allowed(&P::Rename("Yours".into())),
+            Ok(())
+        );
+        // Its own name in other letter case is (0.4.0 audit #19).
+        assert_eq!(
+            app.preset_command_allowed(&P::Rename("MINE".into())),
             Ok(())
         );
         assert_eq!(app.preset_command_allowed(&P::Delete), Ok(()));
@@ -12214,5 +12456,351 @@ mod tests {
             detail: String::new(),
         });
         assert_eq!(app.state.echo_cancel_trouble, None);
+    }
+
+    // ---- presets and data safety (0.4.0 audit, Phase F5) ----------------------------------------
+
+    /// A store with the user preset `Twenty`, a Windows twenty-band curve, selected.
+    fn with_windows_twenty_band_preset() -> (App, tempfile::TempDir) {
+        let (mut app, dir) = with_store();
+        let preset = Preset {
+            name: "Twenty".to_owned(),
+            eq_bands: fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+                .iter()
+                .enumerate()
+                .map(|(i, &hz)| EqBand::new(hz, if i == 16 { 6.0 } else { 0.0 }))
+                .collect(),
+            ..Preset::default()
+        };
+        app.presets.save_as(&preset, "Twenty").expect("saved");
+        app.refresh_preset_list();
+        (app, dir)
+    }
+
+    #[test]
+    fn a_band_count_change_on_a_preset_with_no_unsaved_changes_is_no_edit_to_it() {
+        // 0.4.0 audit #45: the band count is the user's setting over every preset; marking the
+        // preset modified autosaved the fitted curve in place of the preset's own on the next
+        // switch or at exit.
+        let (mut app, dir) = with_store();
+        let mut preset = Preset {
+            name: "Mine".to_owned(),
+            ..Preset::default()
+        };
+        for (band, gain) in [(0, 6.0), (3, -3.0), (7, 4.5)] {
+            preset.eq_bands[band].boost_db = gain;
+        }
+        app.presets.save_as(&preset, "Mine").expect("saved");
+        add_user_preset(&mut app, "Other");
+        app.select_preset(at(&app, "Mine"));
+        let ten = gains(&app);
+
+        app.handle(&[UiAction::SetBandCount(15)]);
+        assert!(!entry(&app, "Mine").modified, "no edit");
+        assert_eq!(app.settings.num_bands, 15);
+        let fitted = fxsound_dsp::eq::fit_preset_gains(
+            &preset
+                .eq_bands
+                .iter()
+                .map(|b| b.center_hz)
+                .collect::<Vec<_>>(),
+            &ten,
+            &ladder(15),
+        );
+        assert_eq!(
+            gains(&app),
+            fitted,
+            "read from the preset itself onto fifteen bands"
+        );
+
+        // Switching away stashes nothing, and back on ten bands the curve is the file's, exactly.
+        app.select_preset(at(&app, "Other"));
+        assert_eq!(music_autosaves(&dir), Vec::<String>::new());
+        app.select_preset(at(&app, "Mine"));
+        app.handle(&[UiAction::SetBandCount(10)]);
+        assert_eq!(gains(&app), ten);
+        assert!(!entry(&app, "Mine").modified);
+        app.autosave_unsaved_presets();
+        assert_eq!(music_autosaves(&dir), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_band_count_change_with_no_preset_selected_carries_the_curve_on_screen() {
+        // The last preset deleted from a list with no factory presets (a broken install) leaves
+        // nothing selected, while the preset read last is still remembered. A band-count change
+        // read that deleted preset's file again in place of the curve the user had since edited.
+        let (mut app, _dir) = with_store();
+        let mut gone = Preset {
+            name: "Gone".to_owned(),
+            ..Preset::default()
+        };
+        gone.eq_bands[2].boost_db = -8.0;
+        app.presets.save_as(&gone, "Gone").expect("saved");
+        app.refresh_preset_list();
+        app.select_preset(at(&app, "Gone"));
+        app.handle(&[UiAction::DeletePreset]);
+        assert!(app.state.presets.is_empty());
+        assert_eq!(app.state.preset(), None, "nothing is selected");
+        assert!(
+            app.loaded_preset.is_some(),
+            "the scenario: the deleted preset is remembered"
+        );
+
+        app.handle(&[UiAction::SetBandGain(6, 7.0)]);
+        let centres_before = centres(&app);
+        let gains_before = gains(&app);
+        assert_eq!(gains_before[6], 7.0, "the edit reached the curve on screen");
+        app.handle(&[UiAction::SetBandCount(15)]);
+        assert_eq!(
+            gains(&app),
+            fxsound_dsp::eq::fit_preset_gains(&centres_before, &gains_before, &ladder(15)),
+            "the curve on screen, 7 dB edit included, carried onto fifteen bands"
+        );
+        assert_eq!(app.settings.num_bands, 15);
+    }
+
+    #[test]
+    fn a_band_count_change_carries_unsaved_edits_from_where_the_bands_really_are() {
+        // Audit #13: the curve is read from its own centres, so a band dragged in the window is
+        // carried from where it was dragged to, not from where the standard ladder would put it.
+        let mut app = with_presets(&["Jazz"]);
+        app.handle(&[
+            UiAction::SetBandFrequency(4, 1000.0),
+            UiAction::SetBandGain(4, 9.0),
+        ]);
+        assert!(app.state.presets[0].modified);
+        let centres_before = centres(&app);
+        let gains_before = gains(&app);
+        app.handle(&[UiAction::SetBandCount(31)]);
+        assert_eq!(
+            gains(&app),
+            fxsound_dsp::eq::fit_preset_gains(&centres_before, &gains_before, &ladder(31))
+        );
+        let at_1k = ladder(31)
+            .iter()
+            .position(|hz| *hz == 1000.0)
+            .expect("1 kHz band");
+        assert!((gains(&app)[at_1k] - 9.0).abs() < 1e-4, "{:?}", gains(&app));
+        assert!(app.state.presets[0].modified, "the edits are still unsaved");
+    }
+
+    #[test]
+    fn a_microphones_band_count_is_still_an_edit_to_its_voice_preset() {
+        let (mut app, _engine, _dir) = started_with(saved_settings(IN));
+        assert_eq!(app.lane_preset(IN), Some(("Loud", false)));
+        app.handle(&[UiAction::SetBandCount(5)]);
+        assert_eq!(app.lane_preset(IN), Some(("Loud", true)));
+    }
+
+    #[test]
+    fn unsaved_edits_reach_their_autosave_a_minute_after_the_first_one() {
+        // 0.4.0 audit #47: the edits were stashed only on a switch and on the way out, so a crash
+        // or a SIGKILL lost them all.
+        let (mut app, _engine, dir) = started_with(saved_settings(OUT));
+        assert_eq!(
+            app.next_deadline(),
+            None,
+            "nothing to do while nothing is edited"
+        );
+        let before = Instant::now();
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 9.0)]);
+        let due = app.next_deadline().expect("a deadline for the autosave");
+        assert!(due >= before + AUTOSAVE_INTERVAL && due <= Instant::now() + AUTOSAVE_INTERVAL);
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 8.0)]);
+        assert_eq!(
+            app.next_deadline(),
+            Some(due),
+            "a later edit rides on the same minute"
+        );
+
+        app.poll_audio_at(due - std::time::Duration::from_secs(1));
+        assert_eq!(music_autosaves(&dir), Vec::<String>::new(), "not yet");
+        app.poll_audio_at(due);
+        assert_eq!(music_autosaves(&dir), ["Beta.fac"]);
+        let stashed = fxsound_preset::load(&dir.path().join("user/AutoSave/Beta.fac"))
+            .expect("the autosave is a preset");
+        assert!(
+            (stashed.effect(Effect::Bass) - scale::slider_to_value_for(Effect::Bass, 8.0)).abs()
+                < 0.01
+        );
+        assert_eq!(
+            app.next_deadline(),
+            None,
+            "and the clock stops until the next edit"
+        );
+    }
+
+    #[test]
+    fn the_periodic_autosave_writes_nothing_once_the_edits_are_saved_or_undone() {
+        let (mut app, _engine, dir) = started_with(saved_settings(OUT));
+        app.handle(&[
+            UiAction::SetEffect(Effect::Bass, 9.0),
+            UiAction::UndoPresetChanges,
+        ]);
+        let due = app.next_deadline().expect("the clock the edit started");
+        app.poll_audio_at(due);
+        assert_eq!(music_autosaves(&dir), Vec::<String>::new());
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+    }
+
+    #[test]
+    fn a_windows_twenty_band_preset_is_read_on_the_half_octave_ladder_and_exported_on_its_own() {
+        // 0.4.0 audit R4, the user's decision: the twenty bands sit every half octave now; a
+        // curve on the Windows ladder is moved band for band when it reaches the application,
+        // and an export for a Windows FxSound carries the Windows ladder again.
+        let (mut app, dir) = with_windows_twenty_band_preset();
+        app.settings.num_bands = 20;
+        app.select_preset(at(&app, "Twenty"));
+        assert_eq!(centres(&app), fxsound_core::eq::TWENTY_BAND_CENTRES_HZ);
+        assert_eq!(gains(&app)[16], 6.0, "the 5 kHz boost stays on its band");
+        assert_eq!(
+            app.params().bands().0,
+            fxsound_core::eq::TWENTY_BAND_CENTRES_HZ
+        );
+        assert!(!entry(&app, "Twenty").modified, "reading it is not an edit");
+
+        // Saved again, it is saved on the new ladder…
+        app.handle(&[UiAction::SetBandGain(0, 1.0), UiAction::SavePreset]);
+        let saved = fxsound_preset::load(&dir.path().join("user/Twenty.fac")).expect("load");
+        let saved_centres: Vec<f32> = saved.eq_bands.iter().map(|b| b.center_hz).collect();
+        assert_eq!(saved_centres, fxsound_core::eq::TWENTY_BAND_CENTRES_HZ);
+        // …and exported on the Windows one.
+        let exported = app
+            .presets
+            .export("Twenty", &dir.path().join("export"))
+            .expect("export");
+        let exported = fxsound_preset::load(&exported).expect("load the export");
+        let exported_centres: Vec<f32> = exported.eq_bands.iter().map(|b| b.center_hz).collect();
+        assert_eq!(
+            exported_centres,
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(exported.eq_bands[16].boost_db, 6.0);
+    }
+
+    #[test]
+    fn a_windows_twenty_band_preset_on_another_band_count_is_fitted_from_the_new_ladder() {
+        let (mut app, _dir) = with_windows_twenty_band_preset();
+        app.select_preset(at(&app, "Twenty"));
+        let mut moved: Vec<EqBand> = fxsound_core::eq::TWENTY_BAND_CENTRES_HZ
+            .iter()
+            .map(|&hz| EqBand::new(hz, 0.0))
+            .collect();
+        moved[16].boost_db = 6.0;
+        let expected = fxsound_dsp::eq::fit_preset_gains(
+            &fxsound_core::eq::TWENTY_BAND_CENTRES_HZ,
+            &moved.iter().map(|b| b.boost_db).collect::<Vec<_>>(),
+            &ladder(10),
+        );
+        assert_eq!(gains(&app), expected);
+        assert_eq!(centres(&app), ladder(10));
+    }
+
+    #[test]
+    fn a_voice_preset_on_the_windows_twenty_band_ladder_is_read_on_the_new_one() {
+        let (mut app, _engine, dir) = started_with(saved_settings(IN));
+        let voice = fxsound_preset::input::InputPreset {
+            name: "Twenty Voice".to_owned(),
+            eq: fxsound_preset::input::Equalizer {
+                centers_hz: fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ.to_vec(),
+                gains_db: vec![1.0; 20],
+                enabled: true,
+                q: 1.0,
+            },
+            ..loud()
+        };
+        voice
+            .save(&dir.path().join("user/Input/Twenty Voice.toml"))
+            .expect("saved");
+        app.voice_presets.rescan();
+        app.refresh_preset_list();
+        app.select_preset(at(&app, "Twenty Voice"));
+        assert_eq!(centres(&app), fxsound_core::eq::TWENTY_BAND_CENTRES_HZ);
+        assert_eq!(
+            app.input_params().bands().0,
+            fxsound_core::eq::TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(app.input_params().bands().1, [1.0; 20]);
+    }
+
+    #[test]
+    fn deleting_a_user_preset_moves_it_to_the_trash_instead_of_removing_it() {
+        // 0.4.0 audit #16 (the window asks first; that is the shell's).
+        let (mut app, dir) = with_store();
+        add_user_preset(&mut app, "Mine");
+        add_user_preset(&mut app, "Other");
+        app.select_preset(at(&app, "Mine"));
+        app.handle(&[UiAction::DeletePreset]);
+        assert_eq!(names(&app), ["Other"]);
+        assert!(!dir.path().join("user/Mine.fac").exists());
+        assert!(
+            dir.path().join("user/.Trash/files/Mine.fac").is_file(),
+            "the store's trash holds it"
+        );
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some("Preset Mine is deleted.")
+        );
+    }
+
+    #[test]
+    fn renaming_a_preset_to_its_own_name_in_other_letter_case_moves_it() {
+        // 0.4.0 audit #19: "A preset named Rock already exists" — about itself.
+        let (mut app, dir) = with_store();
+        add_user_preset(&mut app, "rock");
+        app.select_preset(0);
+        app.rename_preset("Rock");
+        assert_eq!(names(&app), ["Rock"]);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Rock"));
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some("Renamed rock to Rock")
+        );
+        let file = dir.path().join("user/Rock.fac");
+        assert_eq!(fxsound_preset::load(&file).expect("load").name, "Rock");
+        let fac_files = std::fs::read_dir(dir.path().join("user"))
+            .expect("read")
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "fac"))
+            .count();
+        assert_eq!(fac_files, 1);
+    }
+
+    #[test]
+    fn a_new_preset_name_is_cut_to_what_a_windows_fxsound_reads() {
+        // 0.4.0 audit #15: sixty-four Cyrillic letters are 128 bytes; Windows reads 126.
+        let (mut app, dir) = with_store();
+        add_user_preset(&mut app, "Mine");
+        app.select_preset(0);
+        app.handle(&[UiAction::SavePresetAs("я".repeat(64))]);
+        let cut = "я".repeat(63);
+        assert_eq!(
+            app.state.preset().map(|p| p.name.as_str()),
+            Some(cut.as_str())
+        );
+        let file = dir.path().join(format!("user/{cut}.fac"));
+        assert_eq!(fxsound_preset::load(&file).expect("load").name, cut);
+
+        app.rename_preset(&"ж".repeat(70));
+        assert_eq!(app.state.preset().map(|p| p.name.len()), Some(126));
+    }
+
+    #[test]
+    fn a_preset_already_named_past_the_new_limit_keeps_its_name_and_its_files() {
+        // The cut is for new names only: a preset with a longer name, put there by hand, is found
+        // under the files it always had, its autosave included.
+        let (mut app, dir) = with_store();
+        let long = "ю".repeat(64);
+        let preset = Preset {
+            name: long.clone(),
+            ..Preset::default()
+        };
+        fxsound_preset::save(&preset, &dir.path().join(format!("user/{long}.fac"))).expect("save");
+        app.presets.rescan();
+        app.refresh_preset_list();
+        app.select_preset(0);
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 5.0), UiAction::SavePreset]);
+        assert_eq!(names(&app), [long.as_str()]);
+        assert!(dir.path().join(format!("user/{long}.fac")).is_file());
     }
 }

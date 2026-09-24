@@ -42,7 +42,10 @@ use fxsound_core::{DeviceDirection, Effect, NoiseSuppressionOverride, ViewMode, 
 /// name saved from the command line and one saved from the window become the same file. 0.3.0
 /// kept a second sanitiser here that stripped nine characters while the store replaced three,
 /// and a `--save_preset` name and a window-typed name could land in two files.
-pub use fxsound_preset::{MAX_PRESET_NAME_LEN, PRESET_NAME_RESERVED, sanitise_preset_name};
+pub use fxsound_preset::{
+    MAX_NAME_BYTES, MAX_PRESET_NAME_LEN, PRESET_NAME_RESERVED, new_preset_name,
+    sanitise_preset_name,
+};
 
 /// The only band counts the equalizer accepts; anything else is `DEFAULT_NUM_EQ_BANDS = 10` on
 /// Windows (`FxController.cpp:283-293`, `FxController.h:45`) and an error here.
@@ -57,7 +60,8 @@ pub const FILTER_Q_RANGE: (f32, f32) = (1.0, 3.0);
 /// `0.0..=4.0` dB (`FxController.cpp:295-305`, `DEFAULT_VOLUME_LEVELING` at `FxController.h:47`).
 pub const VOLUME_LEVELING_RANGE: (f32, f32) = (0.0, 4.0);
 /// The effect sliders' own scale, `0.0..=10.0` (`docs/COMMAND_LINE_OPTIONS.md:34`). The DSP stores
-/// `0.0..=1.0`; convert with [`fxsound_core::scale::slider_to_value`].
+/// `0.0..=1.0`; convert with [`fxsound_core::scale::slider_to_value_for`], which spreads Dynamic
+/// Boost's and Ambience's positions over the values that sound different.
 pub const EFFECT_RANGE: (f32, f32) = (0.0, 10.0);
 /// The audible range a band centre may be placed in. The *per band* limit depends on the
 /// neighbouring bands and is enforced by `setEqBandFrequency` on the running instance
@@ -100,9 +104,10 @@ pub struct Cli {
     #[arg(long = "preset", value_name = "NAME")]
     pub preset: Option<String>,
 
-    /// Save the current modified settings as a new user preset.
+    /// Save the current settings as a new user preset, a copy when nothing is modified.
     ///
-    /// `--save_preset=<name>` — `docs/COMMAND_LINE_OPTIONS.md:19`, `FxController.cpp:402-412`.
+    /// `--save_preset=<name>` — `docs/COMMAND_LINE_OPTIONS.md:19`, `FxController.cpp:402-412`; the
+    /// original refuses it with nothing modified (0.4.0 audit #17).
     #[arg(long = "save_preset", alias = "save-preset", value_name = "NAME")]
     pub save_preset: Option<String>,
 
@@ -558,7 +563,8 @@ pub enum PowerCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresetCommand {
     Select(String),
-    /// Name already run through [`sanitise_preset_name`]; the case-insensitive collision check
+    /// Name already run through [`new_preset_name`] — [`sanitise_preset_name`] and the 126 bytes a
+    /// Windows FxSound reads a name in (0.4.0 audit #15); the case-insensitive collision check
     /// against existing names (step 3 of `FxController::sanitizePresetName`, `:385`) still has to
     /// happen where the preset list lives.
     SaveAs(String),
@@ -780,14 +786,14 @@ impl Cli {
         if let Some(name) = &self.preset {
             (!name.is_empty()).then(|| PresetCommand::Select(name.clone()))
         } else if let Some(name) = &self.save_preset {
-            let name = sanitise_preset_name(name);
+            let name = new_preset_name(name);
             (!name.is_empty()).then_some(PresetCommand::SaveAs(name))
         } else if self.overwrite_preset {
             Some(PresetCommand::Overwrite)
         } else if self.undo_preset {
             Some(PresetCommand::Undo)
         } else if let Some(name) = &self.rename_preset {
-            let name = sanitise_preset_name(name);
+            let name = new_preset_name(name);
             (!name.is_empty()).then_some(PresetCommand::Rename(name))
         } else if self.delete_preset {
             Some(PresetCommand::Delete)
@@ -1493,6 +1499,29 @@ mod tests {
 
         let commands = parse(&["--save_preset=Mu:sic"]).commands();
         assert!(commands.contains(&Command::Preset(PresetCommand::SaveAs("Music".to_owned()))));
+    }
+
+    #[test]
+    fn a_new_preset_name_from_the_command_line_fits_what_windows_reads() {
+        // 0.4.0 audit #15: sixty-four Cyrillic letters are 128 bytes, two more than the name line
+        // a Windows FxSound reads.
+        // Not called `long`: the man page check reads that word, an equals sign and a string as
+        // an option's name.
+        let typed = "я".repeat(64);
+        let save = format!("--save_preset={typed}");
+        let rename = format!("--rename_preset={typed}");
+        let cut = "я".repeat(63);
+        assert!(
+            parse(&[save.as_str()])
+                .commands()
+                .contains(&Command::Preset(PresetCommand::SaveAs(cut.clone())))
+        );
+        assert!(
+            parse(&[rename.as_str()])
+                .commands()
+                .contains(&Command::Preset(PresetCommand::Rename(cut.clone())))
+        );
+        assert!(cut.len() <= MAX_NAME_BYTES);
     }
 
     #[test]

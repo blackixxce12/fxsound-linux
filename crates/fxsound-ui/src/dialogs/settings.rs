@@ -39,11 +39,12 @@
 //!    never contacts the network; §9.6 says to drop the toggle and keep the key, and
 //!    `fxsound_core::settings` already documents it as inert. The Maintenance section says so in
 //!    one line instead of offering a switch that does nothing.
-//! 3. **"Reset presets to factory defaults" asks first.** The original deletes every user preset
-//!    file with no confirmation at all (`FxController.cpp:1334-1382`, Open question 4). The button
-//!    here only emits [`SettingsAction::ResetPresets`]; putting a
-//!    [`super::MessageBox`] in front of it — and routing the deletions through the XDG trash — is
-//!    the app layer's job, and this module's doc is the record that it must.
+//! 3. **"Reset presets to factory defaults" asks first, and does less.** The original deletes every
+//!    user preset file with no confirmation at all (`FxController.cpp:1334-1382`, Open question
+//!    4). This port's reset discards unsaved changes and keeps every saved preset, so the button
+//!    is offered only while some preset has unsaved changes. It only emits
+//!    [`SettingsAction::ResetPresets`]; the window puts a [`super::MessageBox`] in front of it
+//!    that says what it does (0.4.0 audit #21).
 //!
 //! `launch_toggle_`, on the other hand, is *restored*: the original hides "Launch on system
 //! startup" behind `OperatingSystemType == Windows7` (`FxSettingsDialog.cpp:402-406`), so nobody
@@ -648,9 +649,10 @@ pub struct SettingsState {
     /// Settings ▸ Applications: the applications playing or recording now, then the ones
     /// remembered, most recently seen first.
     pub apps: Vec<AppRow>,
-    /// Whether the user has anything to lose: the reset button is enabled iff there is at least
-    /// one user preset **or** some preset is modified (`FxSettingsDialog.cpp:210-220`), on either
-    /// lane.
+    /// Whether the reset has anything to do: the button is enabled iff some preset, on either lane,
+    /// has unsaved changes. The original also enables it with any user preset saved
+    /// (`FxSettingsDialog.cpp:210-220`), because its reset deletes them; this one keeps them
+    /// (0.4.0 audit #21).
     pub can_reset_presets: bool,
     /// The application version, shown as `"v" + version` and never translated
     /// (`FxSettingsDialog.cpp:542`). Pass `env!("CARGO_PKG_VERSION")`.
@@ -787,10 +789,10 @@ pub enum SettingsAction {
     SetFollowSystemDefault(bool),
     /// The user asked to restore the factory presets.
     ///
-    /// **Destructive**: this deletes every user preset file. The original does it with no
-    /// confirmation whatsoever (`FxController.cpp:1353-1366`); the app layer must put a Yes/No in
-    /// front of it and send the files to the XDG trash (`docs/spec/06-dialogs.md` Open question 4,
-    /// §9.6).
+    /// **Destructive** in the original, which deletes every user preset file with no
+    /// confirmation whatsoever (`FxController.cpp:1353-1366`). Here it discards the unsaved
+    /// changes of every preset and deletes nothing, and the window asks first
+    /// (`docs/spec/06-dialogs.md` Open question 4, 0.4.0 audit #21).
     ResetPresets,
 
     // ---- general pane -------------------------------------------------------------------------

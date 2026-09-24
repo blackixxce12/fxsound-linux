@@ -182,7 +182,12 @@ must therefore accept LF, CRLF, and a missing final terminator.
 
 Every one of the 32 `.fac` files shipped in this tree is version `9`.
 `valsInit()` is always called with `DFXG_VALS_FILE_VERSION` (`dsp/DfxDspPreset.cpp:278`),
-so the Rust writer must emit exactly `9: Version`.
+so the Rust writer must emit exactly `9: Version` — whatever version the preset was read from
+(0.4.0 audit #46: the port's writer kept the file's version, so a version 7 file saved again lost
+its EQ block to its own reader, and a version 1 file gained a double-params line its reader takes
+for the element count). Reading an older file, the port fills in what it lacks as
+`getStateInfoFromVals` reads it: no bass before version 3, no headphone flag before 4, a flat EQ
+before 9.
 
 ### 3.2 `double_params`
 
@@ -837,7 +842,8 @@ The GUI `Preset` record is `{ name: String, path: String, type: PresetType, modi
 * **Save as new** (`:1223-1241`): same write, then `initPresets()`, then `setPreset(name)`.
   Toast `"Reached the limit on new presets."` when `getUserPresetCount() == max_user_presets_`.
   `max_user_presets_` comes from settings, validated to `10..=120`, default **120**
-  (`FxController.cpp:194-198`).
+  (`FxController.cpp:194-198`) — anything outside is read as 120. **The port clamps to
+  `10..=1000` instead (0.4.0 audit #20).**
 * **Rename** (`:1244-1276`): user presets only. Writes a **new** file under the new name,
   then deletes the old path with `SHFileOperation(FO_DELETE)`. It is a copy-then-delete, not
   a rename - so a crash in between leaves both files.
@@ -1289,7 +1295,7 @@ same directory, `fsync`, then `rename()`.
 | `MAX_PATH` / `wcscpy_s` into `wchar_t[MAX_PATH]` (`FxController.cpp:1259-1264`) | 260-char path cap, and a latent truncation bug for longer paths | `PathBuf`, no cap. |
 | `swprintf(..., L"%s\\%s", dir, file)` (`Valsfile.cpp:69`, `Prelst.cpp:160-162`) | path join | `Path::join`. |
 | Registry `HKCU\...\LastUsed\EQ\EQOn` for the EQ on/off that gets *written into* the preset (`dsp/DfxDspEq.cpp:269-282`, read at `:306-313`; used by `createValsFromStateInfo` at `dsp/DfxDspPreset.cpp:290`) | persistent "is EQ enabled" outside the preset | a single TOML/JSON settings file at `$XDG_CONFIG_HOME/fxsound/settings.toml`. Do **not** invent a registry abstraction; the port needs exactly one key here. |
-| JUCE `settings_` (`preset`, `max_user_presets`, `power`, `theme_mode`, ...) (`FxController.cpp:194-198, 750, 1082`) | app preferences | same `settings.toml`. Keep `max_user_presets` with its `10..=120` clamp and `120` default for parity (`FxController.cpp:194-198`). |
+| JUCE `settings_` (`preset`, `max_user_presets`, `power`, `theme_mode`, ...) (`FxController.cpp:194-198, 750, 1082`) | app preferences | same `settings.toml`. Keep `max_user_presets` and its `120` default (`FxController.cpp:194-198`); since 0.4.0 it is clamped to `10..=1000` rather than reset to 120 when out of `10..=120` (audit #20). |
 | `MessageBox(NULL, L"TTEST", ...)` on DSP init failure (`dsp/DfxDspPrivate.cpp:77`) | debug leftover | drop it; log via `tracing`. |
 | Per-device preset memory (`DeviceConfig::getDeviceConfig(settings_, getOutputName())`, `FxController.cpp:1303-1310, 1371-1378`) | remember which preset was last used per output device | key the same map on the PipeWire **node name** (`node.name`) or the `device.id`/serial of the sink, not on a human-readable description, which is localised and unstable. |
 | `DFXP_GRAPHIC_EQ_NUM_BANDS` mutable global (`GraphicEqSet.cpp:154`) | live band count shared between GUI and DSP | an `AtomicUsize` or, better, a value owned by the DSP graph and mirrored into the UI via a channel - never a mutable global touched from the audio thread. |

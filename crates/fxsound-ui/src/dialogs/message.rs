@@ -3,8 +3,9 @@
 //! Two unrelated widgets that happen to be the two ways FxSound talks back to the user:
 //!
 //! * [`MessageBox`] is `FxConfirmationMessage` (`GUI/FxMessage.h:72-241`), a 450 × 142 modal with
-//!   either Yes/No or a single OK. Three call sites use it, all listed in §4 of
-//!   `docs/spec/06-dialogs.md`, and all three are in this crate's import/export flow.
+//!   either Yes/No or a single OK. The original's three call sites, all listed in §4 of
+//!   `docs/spec/06-dialogs.md`, are in this crate's import/export flow; the app adds two, the
+//!   questions before Delete Preset and Reset presets (0.4.0 audit #16, #21).
 //! * [`Toast`] is `FxNotification` (`GUI/FxNotification.cpp`), the rounded 216 × 80 bubble that
 //!   grows to fit up to three lines of text and an optional link.
 //!
@@ -18,6 +19,16 @@
 //! frame they do. The caller keeps the question in its own state and acts on the answer next
 //! frame, which is the inversion `docs/spec/06-dialogs.md` Open question 3 asks for.
 //!
+//! ## The message wraps
+//!
+//! The original's message is a JUCE `Label` two lines tall (`MESSAGE_HEIGHT`), which wraps the
+//! text over both lines and squeezes each one to as little as 0.7 of its width before it elides
+//! (`LookAndFeel_V2::drawLabel`, `GlyphArrangement::addFittedText`). 0.3.0 drew it on one line,
+//! elided, so the overwrite question lost the question (0.4.0 audit #49). [`message_galley`] wraps
+//! it again, centred line by line, and where two lines of the normal font do not hold it — a
+//! longer translation, a long preset name — takes the font down, to no less than 0.7 of it,
+//! because egui cannot squeeze a glyph sideways. Only a message too long even for that is elided.
+//!
 //! ## Which of the toast's two modes survives on Wayland
 //!
 //! `FxNotification` has an autohide mode — its own borderless always-on-top window, positioned at
@@ -30,14 +41,19 @@
 //! *geometry*, kept because [`layout`] is the only place the original's sizing rules are written
 //! down and a screenshot test of either mode has to agree with it.
 
-use super::{ChromeResponse, DialogChrome, TextButton, draw_truncated, link, normal_font};
+use super::{
+    ChromeResponse, DialogChrome, NORMAL_FONT, TextButton, draw_truncated, link, normal_font,
+};
 use crate::assets::{AssetCache, FxImage};
 use crate::theme::{self, FxColor, Palette};
 use crate::widgets::icon_button::{art_size, fitted_rect, paint_image};
+use egui::text::{LayoutJob, TextWrapping};
 use egui::{
-    Align2, Color32, Context, CornerRadius, Id, Rect, Response, Sense, Shadow, Ui, Vec2, pos2, vec2,
+    Align, Align2, Color32, Context, CornerRadius, Galley, Id, Pos2, Rect, Response, Sense, Shadow,
+    TextFormat, Ui, Vec2, pos2, vec2,
 };
 use fxsound_core::i18n::tr;
+use std::sync::Arc;
 
 // =============================================================================================
 // FxConfirmationMessage
@@ -93,6 +109,93 @@ pub fn message_rect(content: Rect) -> Rect {
         pos2(content.left() + MARGIN, content.top() + MARGIN),
         vec2(content.width() - MARGIN * 2.0, MESSAGE_HEIGHT),
     )
+}
+
+/// The smallest size the message is taken down to: 0.7 of the normal font's 17 px, the least a
+/// JUCE label squeezes a line to (`Font::getDefaultMinimumHorizontalScaleFactor`).
+pub const MIN_MESSAGE_FONT: f32 = 12.0;
+
+/// How far the message's font is taken down at a time, looking for a size that fits.
+const MESSAGE_FONT_STEP: f32 = 0.5;
+
+/// Lay `text` out as the box shows it in its message rect ([`message_rect`], 410 × 52): wrapped at
+/// the rect's width and centred line by line, in the normal font when that fits the rect's height —
+/// two lines — and otherwise in the largest size down to [`MIN_MESSAGE_FONT`] that does. A message
+/// that not even the smallest size holds fills the lines that fit and is elided on the last, which
+/// [`Galley::elided`] reports (see the module's "The message wraps").
+///
+/// The galley is centred on x = 0 ([`Align::Center`]): paint it at the rect's centre, as
+/// [`MessageBox::show`] does. `ctx` must be in a pass: fonts exist from the first one on.
+#[must_use]
+pub fn message_galley(ctx: &Context, text: &str, colour: Color32) -> Arc<Galley> {
+    let rect = message_rect(Rect::from_min_size(Pos2::ZERO, CONTENT_SIZE));
+    let layout = |job: LayoutJob| ctx.fonts_mut(|fonts| fonts.layout_job(job));
+    let job = |size: f32, max_rows: usize| {
+        let mut job = LayoutJob::single_section(
+            text.to_owned(),
+            TextFormat::simple(theme::semibold(size), colour),
+        );
+        job.wrap = TextWrapping {
+            max_width: rect.width().max(0.0),
+            max_rows,
+            break_anywhere: false,
+            overflow_character: Some('…'),
+        };
+        job.halign = Align::Center;
+        job
+    };
+    let fits = |galley: &Galley| galley.size().y <= rect.height() + 0.01;
+
+    let mut size = NORMAL_FONT;
+    loop {
+        let galley = layout(job(size, usize::MAX));
+        if fits(&galley) {
+            return galley;
+        }
+        if size <= MIN_MESSAGE_FONT {
+            break;
+        }
+        size = (size - MESSAGE_FONT_STEP).max(MIN_MESSAGE_FONT);
+    }
+    let row = ctx.fonts_mut(|fonts| fonts.row_height(&theme::semibold(MIN_MESSAGE_FONT)));
+    let rows = ((rect.height() / row.max(1.0)).floor() as usize).max(1);
+    layout(job(MIN_MESSAGE_FONT, rows))
+}
+
+/// `template` with its first `%s` replaced by `name`, as `FxController::FormatString` does, and
+/// the name cut in the middle — `Rock Ball…Night` — as far as it takes for the whole message to fit
+/// the box unelided ([`message_galley`]).
+///
+/// A preset name may be sixty-four of the widest letters there are, and the words after it — "to
+/// the trash?", "do you want to overwrite the preset file?" — are the question; an elision at the
+/// end would cut those. Every name of ordinary words fits whole in every language.
+#[must_use]
+pub fn message_with_name(ctx: &Context, template: &str, name: &str) -> String {
+    let with = |name: &str| template.replacen("%s", name, 1);
+    let whole = with(name);
+    if name.is_empty() || !message_galley(ctx, &whole, Color32::PLACEHOLDER).elided {
+        return whole;
+    }
+    let chars: Vec<char> = name.chars().collect();
+    let cut = |kept: usize| {
+        let head = kept.div_ceil(2);
+        let tail = kept / 2;
+        let mut short: String = chars[..head].iter().collect();
+        short.push('…');
+        short.extend(&chars[chars.len() - tail..]);
+        with(&short)
+    };
+    // The most of the name that fits: fewer letters never make the message longer.
+    let (mut fits, mut too_many) = (0, chars.len());
+    while too_many - fits > 1 {
+        let kept = fits + (too_many - fits) / 2;
+        if message_galley(ctx, &cut(kept), Color32::PLACEHOLDER).elided {
+            too_many = kept;
+        } else {
+            fits = kept;
+        }
+    }
+    cut(fits)
 }
 
 /// The row both buttons sit on: `message.bottom + 20`.
@@ -193,14 +296,12 @@ impl<'a> MessageBox<'a> {
             id.with("chrome"),
         );
 
-        draw_truncated(
-            ui.painter(),
-            text,
-            normal_font(),
-            palette.color(FxColor::DefaultText),
-            message_rect(content),
-            Align2::CENTER_CENTER,
-        );
+        let colour = palette.color(FxColor::DefaultText);
+        let area = message_rect(content);
+        let galley = message_galley(ui.ctx(), text, colour);
+        let top = area.center().y - galley.size().y / 2.0;
+        ui.painter()
+            .galley(pos2(area.center().x, top), galley, colour);
 
         let mut choice = close_clicked.then_some(ConfirmChoice::Dismissed);
         match style {
@@ -586,7 +687,7 @@ impl<'a> Toast<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{frame, test_context};
+    use super::super::tests::{every_translation, frame, test_context};
     use super::*;
     use fxsound_core::ThemeMode;
 
@@ -677,6 +778,170 @@ mod tests {
                 "exported",
             );
             assert_eq!(answer, None);
+        });
+    }
+
+    // ---- the message ------------------------------------------------------------------------
+
+    /// The font size a message galley was laid out at.
+    fn font_size(galley: &Galley) -> f32 {
+        galley.job.sections[0].format.font_id.size
+    }
+
+    /// Whether `galley` sits whole inside the 410 × 52 message rect.
+    fn fits_the_box(galley: &Galley) -> bool {
+        !galley.elided
+            && galley.size().y <= MESSAGE_HEIGHT + 0.01
+            && galley.size().x <= CONTENT_SIZE.x - MARGIN * 2.0 + 0.01
+    }
+
+    /// Names a preset can have: one of ordinary words, one of sixty-four characters, and the
+    /// widest the name field lets through — sixty-four capital Ws, and the 126 bytes of Cyrillic
+    /// and of CJK a Windows FxSound reads a name in.
+    fn preset_names() -> [String; 5] {
+        [
+            "Rock Ballad Extended Night".to_owned(),
+            "Rock Ballad Extended Night Mix For The Living Room Speakers 2026".to_owned(),
+            "W".repeat(64),
+            "Ш".repeat(63),
+            "音".repeat(42),
+        ]
+    }
+
+    #[test]
+    fn the_overwrite_question_wraps_over_both_lines_instead_of_losing_the_question() {
+        // 0.4.0 audit #49: "Preset file Rock already exists in the export p…" and two buttons.
+        let ctx = test_context();
+        frame(&ctx, |ui| {
+            let text = super::super::presets::format_string(
+                super::super::presets::OVERWRITE_MESSAGE,
+                "Rock",
+            );
+            let galley = message_galley(ui.ctx(), &text, Color32::WHITE);
+            assert!(fits_the_box(&galley), "{:?}", galley.size());
+            assert_eq!(galley.rows.len(), 2, "two lines, as the original's label");
+            assert!(
+                (font_size(&galley) - NORMAL_FONT).abs() < 1e-6,
+                "in the normal font"
+            );
+        });
+    }
+
+    #[test]
+    fn a_message_two_lines_cannot_hold_is_drawn_smaller_rather_than_cut() {
+        let ctx = test_context();
+        frame(&ctx, |ui| {
+            let text = super::super::presets::format_string(
+                super::super::presets::OVERWRITE_MESSAGE,
+                "Rock Ballad Extended Night Mix For The Living Room Speakers 2026",
+            );
+            let galley = message_galley(ui.ctx(), &text, Color32::WHITE);
+            assert!(fits_the_box(&galley), "{:?}", galley.size());
+            let size = font_size(&galley);
+            assert!((MIN_MESSAGE_FONT..NORMAL_FONT).contains(&size), "{size}");
+            // A short one stays in the normal font on one line, centred.
+            let galley = message_galley(
+                ui.ctx(),
+                "Presets are exported successfully!",
+                Color32::WHITE,
+            );
+            assert_eq!(galley.rows.len(), 1);
+            assert!((font_size(&galley) - NORMAL_FONT).abs() < 1e-6);
+            assert!(
+                (galley.rect.center().x).abs() < 1.0,
+                "centred on the anchor: {:?}",
+                galley.rect
+            );
+        });
+    }
+
+    #[test]
+    fn a_message_too_long_even_for_the_smallest_font_is_elided_inside_the_box() {
+        let ctx = test_context();
+        frame(&ctx, |ui| {
+            let text = "Preset ".repeat(60);
+            let galley = message_galley(ui.ctx(), &text, Color32::WHITE);
+            assert!(galley.elided, "{} rows", galley.rows.len());
+            assert!(
+                galley.size().y <= MESSAGE_HEIGHT + 0.01,
+                "{:?}",
+                galley.size()
+            );
+            assert!((font_size(&galley) - MIN_MESSAGE_FONT).abs() < 1e-6);
+            const { assert!(MIN_MESSAGE_FONT >= NORMAL_FONT * 0.7) };
+        });
+    }
+
+    #[test]
+    fn a_name_too_wide_for_the_box_is_cut_in_the_middle_and_the_question_stays_whole() {
+        let ctx = test_context();
+        frame(&ctx, |ui| {
+            let template = super::super::presets::OVERWRITE_MESSAGE;
+            let name = "W".repeat(64);
+            let text = message_with_name(ui.ctx(), template, &name);
+            assert!(fits_the_box(&message_galley(
+                ui.ctx(),
+                &text,
+                Color32::WHITE
+            )));
+            assert!(text.starts_with("Preset file WWW"), "{text}");
+            assert!(
+                text.ends_with("WWW already exists in the export path, do you want to overwrite the preset file?"),
+                "{text}"
+            );
+            assert!(text.contains('…'), "{text}");
+            assert!(
+                text.chars().count() > template.len(),
+                "as much of the name as fits: {text}"
+            );
+            // A name that fits is left whole, and a template without a placeholder alone.
+            assert_eq!(
+                message_with_name(ui.ctx(), template, "Rock"),
+                template.replacen("%s", "Rock", 1)
+            );
+            assert_eq!(
+                message_with_name(ui.ctx(), "No name here.", &name),
+                "No name here."
+            );
+        });
+    }
+
+    #[test]
+    fn every_message_the_import_and_export_windows_show_fits_the_box_in_every_language() {
+        use super::super::presets::{
+            EXPORT_SUCCEEDED, NO_PRESETS_FOUND, OVERWRITE_MESSAGE, OVERWRITE_MESSAGE_PLURAL,
+        };
+        let ctx = test_context();
+        frame(&ctx, |ui| {
+            for key in [NO_PRESETS_FOUND, EXPORT_SUCCEEDED] {
+                for (code, text) in every_translation(key) {
+                    let galley = message_galley(ui.ctx(), &text, Color32::WHITE);
+                    assert!(fits_the_box(&galley), "{code}: {text}");
+                }
+            }
+            for (code, template) in every_translation(OVERWRITE_MESSAGE_PLURAL) {
+                let text = template.replacen("%s", "120", 1);
+                let galley = message_galley(ui.ctx(), &text, Color32::WHITE);
+                assert!(fits_the_box(&galley), "{code}: {text}");
+            }
+            for (code, template) in every_translation(OVERWRITE_MESSAGE) {
+                for (index, name) in preset_names().iter().enumerate() {
+                    let text = message_with_name(ui.ctx(), &template, name);
+                    let galley = message_galley(ui.ctx(), &text, Color32::WHITE);
+                    assert!(fits_the_box(&galley), "{code}: {text}");
+                    let (before, after) = template.split_once("%s").expect("a placeholder");
+                    assert!(
+                        text.starts_with(before) && text.ends_with(after),
+                        "{code}: the question is whole: {text}"
+                    );
+                    if index < 2 {
+                        assert!(
+                            text.contains(name.as_str()),
+                            "{code}: the name is whole: {text}"
+                        );
+                    }
+                }
+            }
         });
     }
 
