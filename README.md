@@ -171,8 +171,10 @@ the difference that a Wayland client cannot unmap its own toplevel, so "hide" he
 the window and recreates it on demand. The minimise button hides the window into the tray as well
 while a tray icon is there to come back from (Hyprland and sway have no minimised state to put it
 in); on a desktop with no tray, such as GNOME without an AppIndicator extension, it minimises the
-window as the Windows build does, instead of making it vanish. FxSound quit with its window in the
-tray starts in the tray next time, unless it is started with `--show`.
+window as the Windows build does, instead of making it vanish, and `fxsound --show` or launching
+FxSound again brings a minimised window back (on Wayland as a fresh window in its place, since an
+application cannot take its own window out of the minimised state there). FxSound quit with its
+window in the tray starts in the tray next time, unless it is started with `--show`.
 
 Fullscreen (Hyprland's `fullscreen` dispatcher, Super+F in many configurations) and maximised
 windows scale the fixed design up to fit the monitor and centre it; the app never draws into a
@@ -193,7 +195,9 @@ bind = SUPER ALT, bracketright, exec, fxsound --next-preset
 In sway the same is `bindsym $mod+Mod1+p exec fxsound --toggle-power`. None of these raises the
 window: on the command line only `--show`, `--view` and a bare `fxsound` do, and every option that
 sets something — `--preset=Gaming` from a keybind included — does it without pulling the window over
-what you are doing.
+what you are doing. That holds when the keybind is what starts FxSound, too: it starts in the tray
+(with no tray icon after a few seconds, minimised), and `--view` at a start sets the layout without
+showing the window unless the tray state or `--show` says so.
 
 ## How the audio path works
 
@@ -358,7 +362,10 @@ turn both ways, reaching half a band past the ladder (on ten bands 46 Hz and 20 
 exported for Windows has such a band put back at 62.5 Hz or 16 kHz, where its wheels stop.
 **Ctrl+Alt**+drag on a band solos it, as Alt+drag does on Windows: every other band sinks to
 −10 dB while you listen and comes back when you let go, or when a preset, the band count or the
-lane changes under it, and the preset is not marked as changed.
+lane changes under it, and the preset is not marked as changed. The solo is offered while the
+equalizer plays, not while it is switched off. A press on a band's knob moves nothing until the
+pointer does, as on the sliders, and a band held when a preset, the band count or the lane arrives
+from elsewhere stays where the new curve puts it until you let go.
 
 A preset lands on your band count, as in the original since 1.2.11: pick a ten-band preset while on
 31 bands and its curve is fitted onto the 31, and changing the band count carries the curve over
@@ -405,7 +412,8 @@ Each of these is a considered decision, not an oversight:
   the compositor places the window.
 - **The command line raises the window only when asked to.** On Windows every option but `--status`
   shows and raises the window; here only `--show`, `--view` and `fxsound` with no options do, so a
-  keybind or a script sets a preset, the power or an effect without the window jumping in front.
+  keybind or a script sets a preset, the power or an effect without the window jumping in front —
+  and a line of such options that starts FxSound starts it in the tray.
 - **The command line says what it will not do.** Two preset options on one line (`--save_preset=A
   --preset=B`, which Windows reads as `--preset=B` alone), a new preset name that is nothing once the
   characters a `.fac` name cannot hold are gone, and a `--language` FxSound has no translation for

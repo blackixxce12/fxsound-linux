@@ -55,7 +55,15 @@
 //!   ([`crate::state::EqSolo`]). A Ctrl+Alt press leaves the band where it is until the pointer
 //!   moves. The application holds the one solo there is: when it ends it — a preset load, say,
 //!   from the tray with the button still down — the window lets go as well
-//!   ([`UiState::eq_solo_generation`]).
+//!   ([`UiState::eq_solo_generation`]). Only an equalizer that plays can be soloed, and only then
+//!   does the tooltip offer it.
+//! * **A press on a thumb holds its value** until the pointer has moved two points, as on every
+//!   slider (0.4.0 audit #14); JUCE jumps to the pointer there too, which moved a band a decibel
+//!   for a press half a thumb off centre and snapped a gain between two steps.
+//! * **A press outlives its curve.** A preset, a band count or a lane that comes from outside
+//!   with the button down on a band or a wheel — or the application ending the solo — ends the
+//!   gesture: nothing follows the pointer until the button is let go, where egui would hand the
+//!   press on to the same band of the new curve.
 //! * **The end bands turn both ways** (0.4.0 audit R6): see [`band_frequency_range`].
 //! * **An EQ bypass exists.** `FxEqualizer` has no on/off control at all
 //!   (`docs/spec/04-equalizer-visualizer.md` §A15); [`UiState::eq_on`] drives the desaturated
@@ -112,7 +120,7 @@ pub const WHEEL_BAND_LIMIT: usize = 10;
 /// At or above this many bands the wheel is inert even when visible (`FxEqualizer.cpp:592-593`).
 pub const FIXED_FREQUENCY_BAND_LIMIT: usize = 15;
 /// A JUCE `Label` paints its text at half alpha while disabled **[JUCE semantics]**: the gain
-/// captions with the power off.
+/// captions with the power off, in the dark palette ([`gain_label_colour`]).
 pub const DISABLED_LABEL_ALPHA: f32 = 0.5;
 /// The band counts the combo box offers (`FxAudioControls.h:106`).
 pub const BAND_COUNTS: [usize; 5] = [5, 10, 15, 20, 31];
@@ -764,6 +772,47 @@ struct WheelDrag {
     start_proportion: f32,
 }
 
+/// A press that holds its band at its gain: one on the thumb (0.4.0 audit #14, as on every
+/// slider) or one with Ctrl+Alt, which asks to listen and is no edit. The band follows the pointer
+/// once it has moved [`HOLD_DISTANCE`] from where the press began.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Still {
+    band: usize,
+    /// Where the press began, in window coordinates.
+    origin: Pos2,
+}
+
+/// How far the pointer has to move from where a held press began before the band follows it:
+/// the sliders' two points ([`slider`]).
+pub const HOLD_DISTANCE: f32 = 2.0;
+
+/// Which curve a gesture is on: its band count, its lane and its preset. Any of them changing
+/// under a press comes from outside the window — a preset from the tray or a device, a band count
+/// from the command line, a lane from D-Bus — since the pointer that would pick one here is busy
+/// holding a band.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CurveKey {
+    bands: usize,
+    lane: fxsound_core::DeviceDirection,
+    preset: Option<String>,
+}
+
+impl CurveKey {
+    fn of(state: &UiState) -> Self {
+        Self {
+            bands: state.eq_bands.len(),
+            lane: state.direction,
+            preset: state.preset().map(|p| p.name.clone()),
+        }
+    }
+
+    fn is(&self, state: &UiState) -> bool {
+        self.bands == state.eq_bands.len()
+            && self.lane == state.direction
+            && self.preset.as_deref() == state.preset().map(|p| p.name.as_str())
+    }
+}
+
 /// A solo in progress: the band held with Ctrl+Alt, since when, and what the application was last
 /// told to play.
 #[derive(Debug, Clone, PartialEq)]
@@ -790,10 +839,16 @@ pub struct EqInteraction {
     wheel_drag: Option<WheelDrag>,
     hovered: Option<usize>,
     solo: Option<Solo>,
-    /// The band a Ctrl+Alt press landed on, until the pointer moves. Pressing to solo is not an
-    /// edit, so the band stays where it is — also once the solo is over, when the application
-    /// ended it under a button still held.
-    still: Option<usize>,
+    /// The band a press holds at its gain until the pointer moves ([`Still`]).
+    still: Option<Still>,
+    /// The press under way began on another curve: the application ended its solo, or a preset,
+    /// a band count or a lane came from outside while the button was down. Nothing follows the
+    /// pointer until the button is let go (0.4.0 review FA): egui keeps handing the press to the
+    /// band and the wheel it began on, which on the new curve is another preset's band, another
+    /// frequency, or the other lane's.
+    outlived: bool,
+    /// The curve the last frame drew.
+    curve: Option<CurveKey>,
     /// What the last frame drew every band at: the curve, with a solo's walk laid over it.
     drawn: Vec<f32>,
     response: ResponseCache,
@@ -845,6 +900,20 @@ impl EqInteraction {
         &self.response
     }
 
+    /// Whether a press on `band`, with the pointer now at `pointer`, still holds the band at its
+    /// gain ([`Still`]). Once the pointer has moved [`HOLD_DISTANCE`] the press is an ordinary
+    /// drag for the rest of its life, back over its starting point included.
+    fn holds(&mut self, band: usize, pointer: Pos2) -> bool {
+        let Some(still) = self.still.filter(|still| still.band == band) else {
+            return false;
+        };
+        if (pointer - still.origin).length() >= HOLD_DISTANCE {
+            self.still = None;
+            return false;
+        }
+        true
+    }
+
     /// Forget every in-progress gesture, e.g. after the band count changed underneath us. The
     /// response curve is kept: it is worked out again only if it no longer fits.
     pub fn clear(&mut self) {
@@ -853,6 +922,7 @@ impl EqInteraction {
         self.hovered = None;
         self.solo = None;
         self.still = None;
+        self.outlived = false;
     }
 }
 
@@ -907,41 +977,54 @@ impl<'a> EqualizerWidget<'a> {
         let layout = EqLayout::new(state.eq_bands.len());
         // Power gates interaction, exactly as `FxProView::paint` gates `setEnabled`.
         let powered = state.controls_enabled();
-        let (now, primary_down, primary_pressed, solo_keys) = ui.input(|input| {
+        let (now, primary_down, primary_pressed, press_origin, solo_keys) = ui.input(|input| {
             (
                 input.time,
                 input.pointer.primary_down(),
                 input.pointer.primary_pressed(),
+                input.pointer.press_origin(),
                 input.modifiers.ctrl && input.modifiers.alt,
             )
         });
+        // Only a curve the equalizer plays can be listened to band by band: bypassed, the walk
+        // would be drawn and nothing heard (0.4.0 review FA).
+        let can_solo = powered && state.eq_on;
 
         // A solo lasts while the button that started it is held, on a band that is still there,
         // with the power on, and until the application ends it — a preset, a band count or a lane
         // that came from the tray, the command line or D-Bus with the button still down. When it
         // ends the application is told, so the curve plays again; when the application ended it,
         // that is news only to a step of the walk that reached it afterwards.
+        let solo_ended_outside = interaction
+            .solo
+            .as_ref()
+            .is_some_and(|solo| solo.generation != state.eq_solo_generation);
         if interaction.solo.as_ref().is_some_and(|solo| {
-            !primary_down
-                || !powered
-                || solo.band >= layout.num_bands
-                || solo.generation != state.eq_solo_generation
+            !primary_down || !powered || solo.band >= layout.num_bands || solo_ended_outside
         }) {
             interaction.solo = None;
             response.push(UiAction::SoloBand(None));
         }
         if !primary_down {
             interaction.still = None;
+            interaction.outlived = false;
         }
-        // A band count that changed underneath a drag would carry the gesture onto the wrong band.
-        if interaction
-            .gain_drag
-            .is_some_and(|band| band >= layout.num_bands)
-            || interaction
-                .wheel_drag
-                .is_some_and(|drag| drag.band >= layout.num_bands)
-        {
-            interaction.clear();
+        // A press that outlived its curve ends as a gesture: its band and its wheel stay where the
+        // new curve puts them until the button is let go (0.4.0 review FA). Holding still until
+        // the pointer moved was not enough — a drag already under way, or one moved on after,
+        // wrote the pointer's gain into the same band of the new curve.
+        let curve_changed = interaction
+            .curve
+            .as_ref()
+            .is_some_and(|curve| !curve.is(state));
+        if curve_changed || interaction.curve.is_none() {
+            interaction.curve = Some(CurveKey::of(state));
+        }
+        if curve_changed || solo_ended_outside {
+            interaction.gain_drag = None;
+            interaction.wheel_drag = None;
+            interaction.still = None;
+            interaction.outlived = primary_down;
         }
 
         let painter = ui.painter_at(rect);
@@ -975,44 +1058,48 @@ impl<'a> EqualizerWidget<'a> {
             if powered {
                 let mut new_gain = *gain;
 
-                // Ctrl+Alt on the press solos the band (`FxEqualizer::sliderDragStarted`,
-                // `FxEqualizer.cpp:123-149`, which reads Alt alone).
-                if interaction.solo.is_none()
-                    && solo_keys
-                    && primary_pressed
+                if primary_pressed
+                    && !interaction.outlived
                     && band_response.is_pointer_button_down_on()
                 {
-                    interaction.solo = Some(Solo {
-                        band,
-                        started: now,
-                        generation: state.eq_solo_generation,
-                        sent: Vec::new(),
-                    });
-                    interaction.still = Some(band);
-                }
-                // A solo is for listening, and pressing to start one is not an edit: the band
-                // stays where it is until the pointer moves it, and then follows it as any drag.
-                if interaction.still == Some(band)
-                    && band_response
-                        .total_drag_delta()
-                        .is_some_and(|moved| moved != Vec2::ZERO)
-                {
-                    interaction.still = None;
+                    let origin = press_origin
+                        .or_else(|| band_response.interact_pointer_pos())
+                        .unwrap_or_else(|| hit.center());
+                    let thumb =
+                        pos2(layout.center_x(band), layout.gain_to_y(*gain)) + rect.min.to_vec2();
+                    // Ctrl+Alt on the press solos the band (`FxEqualizer::sliderDragStarted`,
+                    // `FxEqualizer.cpp:123-149`, which reads Alt alone), when the equalizer plays.
+                    if solo_keys && can_solo && interaction.solo.is_none() {
+                        interaction.solo = Some(Solo {
+                            band,
+                            started: now,
+                            generation: state.eq_solo_generation,
+                            sent: Vec::new(),
+                        });
+                    }
+                    // Pressing to solo is not an edit, nor is touching the thumb (0.4.0 audit
+                    // #14): a gain between two steps — a `.fac` made by hand, the command line —
+                    // was snapped to one, and a press half a thumb off centre moved the band a
+                    // decibel and marked the preset modified. Anywhere else on the track the
+                    // value jumps to the pointer, JUCE's `setSliderSnapsToMousePosition` default.
+                    if solo_keys || origin.distance(thumb) <= THUMB_RADIUS {
+                        interaction.still = Some(Still { band, origin });
+                    }
                 }
 
                 // Right-click resets the band to flat (`FxEqualizer.cpp:481-494`).
                 if band_response.secondary_clicked() {
                     new_gain = 0.0;
                 } else if band_response.is_pointer_button_down_on()
+                    && !interaction.outlived
                     && let Some(pointer) = band_response.interact_pointer_pos()
-                    && interaction.still != Some(band)
+                    && !interaction.holds(band, pointer)
                 {
-                    // JUCE's `setSliderSnapsToMousePosition` default: the value jumps to the
-                    // pointer on press and then tracks it.
+                    // The value follows the pointer once a held press has moved.
                     new_gain = layout.y_to_gain(pointer.y - rect.min.y);
                 }
 
-                if band_response.drag_started() {
+                if band_response.drag_started() && !interaction.outlived {
                     interaction.gain_drag = Some(band);
                 }
                 if band_response.drag_stopped() && interaction.gain_drag == Some(band) {
@@ -1040,16 +1127,9 @@ impl<'a> EqualizerWidget<'a> {
             // `FxEqualizer::paint` re-applies the per-band tooltips every frame, and only ever at
             // ten bands (`FxEqualizer.cpp:326-343`). Under them, and alone at the other counts,
             // the right-click reset nothing else mentions (0.4.0 audit R9) and the solo.
-            if !state.hide_tooltips {
-                let described = (layout.num_bands == BAND_TOOLTIPS.len())
-                    .then(|| BAND_TOOLTIPS.get(band))
-                    .flatten()
-                    .map(|tip| tr(tip));
-                let tip = format!(
-                    "{}\n{}",
-                    slider::with_reset_tip(described.as_deref()),
-                    tr(SOLO_TIP)
-                );
+            if !state.hide_tooltips
+                && let Some(tip) = band_tooltip(band, layout.num_bands, powered, can_solo)
+            {
                 let _ = band_response.on_hover_text(tip);
             }
         }
@@ -1109,6 +1189,45 @@ impl<'a> EqualizerWidget<'a> {
                 response,
             );
         }
+    }
+}
+
+/// Band `band`'s tooltip out of `num_bands`: at ten bands the original's description of it
+/// (`FxEqualizer.cpp:326-343`), then what can be done to it — the right-click reset (0.4.0 audit
+/// R9) while the power is on, and the solo while the equalizer plays as well. Neither gesture does
+/// anything with the power off, and a solo of a bypassed equalizer would be drawn and not heard,
+/// so neither is offered then (0.4.0 review FA). `None` when there is nothing to say.
+#[must_use]
+pub fn band_tooltip(
+    band: usize,
+    num_bands: usize,
+    powered: bool,
+    can_solo: bool,
+) -> Option<String> {
+    let described = (num_bands == BAND_TOOLTIPS.len())
+        .then(|| BAND_TOOLTIPS.get(band))
+        .flatten()
+        .map(|tip| tr(tip));
+    if !powered {
+        return described;
+    }
+    let tip = slider::with_reset_tip(described.as_deref());
+    Some(if can_solo {
+        format!("{tip}\n{}", tr(SOLO_TIP))
+    } else {
+        tip
+    })
+}
+
+/// A frequency wheel's tooltip: [`WHEEL_TOOLTIP`], and the right-click reset under it while the
+/// wheel can be turned (`interactive`), which with the power off it cannot.
+#[must_use]
+pub fn wheel_tooltip(interactive: bool) -> String {
+    let tip = tr(WHEEL_TOOLTIP);
+    if interactive {
+        slider::with_reset_tip(Some(&tip))
+    } else {
+        tip
     }
 }
 
@@ -1246,7 +1365,7 @@ fn paint_curve_fill(painter: &egui::Painter, ctx: &PaintCtx, layout: &EqLayout, 
 ///
 /// During a solo only the stretch from the soloed band's left neighbour to its right one keeps its
 /// colour — the two segments the original leaves coloured because one of their ends is enabled
-/// (`FxEqualizer.cpp:360-367`) — and the rest is grey.
+/// (`FxEqualizer.cpp:360-367`) — and the rest is grey ([`solo_rest_colour`]).
 fn paint_curve_line(painter: &egui::Painter, ctx: &PaintCtx, layout: &EqLayout, curve: &[Pos2]) {
     if curve.len() < 2 {
         return;
@@ -1258,7 +1377,7 @@ fn paint_curve_line(painter: &egui::Painter, ctx: &PaintCtx, layout: &EqLayout, 
             if lit {
                 colour
             } else {
-                ctx.palette.greyed(colour)
+                solo_rest_colour(ctx.palette, colour)
             },
         )
     };
@@ -1288,6 +1407,28 @@ fn paint_curve_line(painter: &egui::Painter, ctx: &PaintCtx, layout: &EqLayout, 
         }
     }
     line(&curve[start..], lit);
+}
+
+/// The lightest grey the rest of the curve takes during a solo in the light palette: `#969696`,
+/// 3.1:1 from the light `SliderTrack` (`#0a4d66`) the soloed stretch keeps.
+pub const LIGHT_SOLO_REST: u8 = 0x96;
+
+/// The curve outside a solo's stretch: `colour` greyed ([`Palette::greyed`]), and in the light
+/// palette no darker than [`LIGHT_SOLO_REST`]. There the grey was the stroke's own luma, `#414141`
+/// beside the soloed stretch's `#0a4d66` — 1.1:1, a hue apart and nothing more, which at 1.5 points
+/// few could see and nobody who does not tell teal from grey (0.4.0 review FA). In the dark
+/// palette the red stretch stands 3.4:1 from its `#e3e3e3` rest, as the original draws it.
+#[must_use]
+pub fn solo_rest_colour(palette: Palette, colour: Color32) -> Color32 {
+    let grey = palette.greyed(colour);
+    match palette.mode() {
+        ThemeMode::Dark => grey,
+        ThemeMode::Light => {
+            let [level, _, _, alpha] = grey.to_srgba_unmultiplied();
+            let level = level.max(LIGHT_SOLO_REST);
+            Color32::from_rgba_unmultiplied(level, level, level, alpha)
+        }
+    }
 }
 
 /// One fader's dashed track and, while it is being dragged or focused, its highlight.
@@ -1383,13 +1524,20 @@ fn paint_gain_label(
     );
 }
 
-/// A band's gain caption colour: `DefaultText`, at [`DISABLED_LABEL_ALPHA`] with the power off.
+/// A band's gain caption colour: `DefaultText`, and with the power off a lighter text that still
+/// reads at 3:1 on the panel — the floor the greyed graphs keep (0.4.0 audit #24). In the dark
+/// palette that is JUCE's disabled label, `DefaultText` at [`DISABLED_LABEL_ALPHA`], 3.05:1 on
+/// `#0f0f0f`. In the light one the same half alpha came out `#979797` on `#e0e0e0`, 2.2:1, and
+/// the captions #42 kept on screen could hardly be read (0.4.0 review FA); there it is the
+/// [`theme::LIGHT_GREY_LIMIT`] grey, 3.4:1.
 #[must_use]
 pub fn gain_label_colour(palette: Palette, powered: bool) -> Color32 {
     if powered {
-        palette.color(FxColor::DefaultText)
-    } else {
-        palette.color_alpha(FxColor::DefaultText, DISABLED_LABEL_ALPHA)
+        return palette.color(FxColor::DefaultText);
+    }
+    match palette.mode() {
+        ThemeMode::Dark => palette.color_alpha(FxColor::DefaultText, DISABLED_LABEL_ALPHA),
+        ThemeMode::Light => Color32::from_gray(theme::LIGHT_GREY_LIMIT),
     }
 }
 
@@ -1507,7 +1655,7 @@ fn wheel(
                 new_hz = default;
             }
         } else {
-            if wheel_response.drag_started() {
+            if wheel_response.drag_started() && !interaction.outlived {
                 interaction.wheel_drag = Some(WheelDrag {
                     band,
                     start_proportion: proportion,
@@ -1544,8 +1692,7 @@ fn wheel(
     }
 
     if !state.hide_tooltips {
-        let tip = tr(WHEEL_TOOLTIP);
-        let _ = wheel_response.on_hover_text(slider::with_reset_tip(Some(&tip)));
+        let _ = wheel_response.on_hover_text(wheel_tooltip(interactive));
     }
 
     // `reduced(2)` then `radius - lineW * 0.5` (`FxTheme.cpp:348-352`).
@@ -2427,6 +2574,80 @@ mod tests {
     }
 
     #[test]
+    fn a_bands_tooltip_offers_only_the_gestures_that_do_something() {
+        let reset = slider::RESET_TIP;
+        let all = band_tooltip(1, 10, true, true).expect("a tip");
+        assert_eq!(all, format!("{}\n{reset}\n{SOLO_TIP}", BAND_TOOLTIPS[1]));
+        let bypassed = band_tooltip(1, 10, true, false).expect("a tip");
+        assert_eq!(bypassed, format!("{}\n{reset}", BAND_TOOLTIPS[1]));
+        let off = band_tooltip(1, 10, false, false).expect("the description");
+        assert_eq!(off, BAND_TOOLTIPS[1]);
+        assert_eq!(band_tooltip(1, 15, false, false), None, "nothing to say");
+        assert_eq!(
+            band_tooltip(1, 15, true, true).as_deref(),
+            Some(format!("{reset}\n{SOLO_TIP}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_wheels_tooltip_offers_the_reset_only_while_it_turns() {
+        assert!(wheel_tooltip(true).ends_with(slider::RESET_TIP));
+        assert_eq!(wheel_tooltip(false), WHEEL_TOOLTIP);
+    }
+
+    /// `colour` laid over the equalizer panel, as the screen shows it.
+    fn on_the_panel(palette: Palette, colour: Color32) -> Color32 {
+        let panel = palette.color(FxColor::ControlBackground);
+        let [r, g, b, a] = colour.to_srgba_unmultiplied();
+        let a = f32::from(a) / 255.0;
+        let mix = |fg: u8, bg: u8| (f32::from(fg) * a + f32::from(bg) * (1.0 - a)).round() as u8;
+        Color32::from_rgb(mix(r, panel.r()), mix(g, panel.g()), mix(b, panel.b()))
+    }
+
+    #[test]
+    fn with_the_power_off_the_gain_captions_read_at_three_to_one_in_either_palette() {
+        // FA: #42 kept them on screen at half alpha, which in the light palette came out
+        // `#979797` on `#e0e0e0`, 2.2:1.
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let palette = Palette::new(mode);
+            let panel = palette.color(FxColor::ControlBackground);
+            let off = on_the_panel(palette, gain_label_colour(palette, false));
+            let on = on_the_panel(palette, gain_label_colour(palette, true));
+            let ratio = theme::contrast_ratio(off, panel);
+            assert!(
+                ratio >= 3.0,
+                "{mode:?}: {off:?} is {ratio:.2}:1 on {panel:?}"
+            );
+            assert!(
+                theme::contrast_ratio(on, panel) > ratio,
+                "{mode:?}: still lighter than a live caption"
+            );
+        }
+    }
+
+    #[test]
+    fn a_solos_stretch_of_the_curve_stands_three_to_one_from_the_rest_in_either_palette() {
+        // FA: in the light palette the lit `#0a4d66` and its greyed rest `#414141` were 1.1:1.
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let palette = Palette::new(mode);
+            let lit = palette.color(FxColor::SliderTrack);
+            let rest = solo_rest_colour(palette, lit);
+            assert_eq!(rest.r(), rest.g(), "{mode:?}: grey");
+            let ratio = theme::contrast_ratio(lit, rest);
+            assert!(
+                ratio >= 3.0,
+                "{mode:?}: {lit:?} and {rest:?} are {ratio:.2}:1"
+            );
+        }
+        // A bypassed curve keeps the #24 grey, which the solo never draws over.
+        let light = Palette::new(ThemeMode::Light);
+        assert_eq!(
+            light.greyed(light.color(FxColor::SliderTrack)),
+            Color32::from_rgb(0x41, 0x41, 0x41)
+        );
+    }
+
+    #[test]
     fn a_solo_walks_a_decibel_a_tick_to_minus_ten_and_stays_there() {
         assert_eq!(solo_walk(0.0, 0), 0.0);
         assert_eq!(solo_walk(0.0, 1), -1.0);
@@ -2712,10 +2933,11 @@ mod tests {
         }
 
         #[test]
-        fn a_band_pressed_to_solo_stays_put_when_the_solo_is_ended_for_it_until_the_pointer_moves()
-        {
+        fn a_band_pressed_to_solo_stays_put_when_the_solo_is_ended_for_it_until_the_button_is_let_go()
+         {
             // The press landed on the band at 0 dB; the preset loaded meanwhile puts it at
-            // -4 dB. Snapping it back to the pointer would be an edit nobody made.
+            // -4 dB. Snapping it back to the pointer would be an edit nobody made, and so would
+            // dragging it on: the press was for the old curve (0.4.0 review FA).
             let mut state = UiState::default();
             let at = thumb(&state, 3);
             let (mut harness, _) = pressed_on(&state, 3, CTRL_ALT);
@@ -2725,13 +2947,291 @@ mod tests {
             for _ in 0..5 {
                 actions.extend(harness.frame(&state, Vec::new()).0);
             }
+            let up = at - vec2(0.0, 37.0);
+            actions.extend(harness.frame(&state, vec![Event::PointerMoved(up)]).0);
             assert!(gain_moves(&actions).is_empty(), "{actions:?}");
+            assert_eq!(solos(&actions), [None], "no solo came back: {actions:?}");
 
-            // Moved, it is a drag like any other: six decibels up is 37 points.
+            // Let go and pressed again, it is a drag like any other: six decibels up is 37
+            // points from 0 dB.
+            harness.frame(&state, vec![button(up, false, CTRL_ALT)]);
+            harness.modifiers = Modifiers::default();
+            let from = thumb(&state, 3);
+            let mut actions = Vec::new();
+            for events in [
+                vec![Event::PointerMoved(from)],
+                vec![button(from, true, Modifiers::default())],
+                vec![Event::PointerMoved(at - vec2(0.0, 37.0))],
+            ] {
+                actions.extend(harness.frame(&state, events).0);
+            }
+            assert_eq!(gain_moves(&actions).last(), Some(&(3, 6.0)), "{actions:?}");
+        }
+
+        /// A window on `state` with the pointer pressed at `at`, `modifiers` held, and what the
+        /// press reported.
+        fn pressed_at(state: &UiState, at: Pos2, modifiers: Modifiers) -> (Harness, Vec<UiAction>) {
+            let mut harness = Harness::new(ThemeMode::Dark);
+            harness.settle(state);
+            harness.modifiers = modifiers;
+            harness.frame(state, vec![Event::PointerMoved(at)]);
+            let (actions, _) = harness.frame(
+                state,
+                vec![Event::PointerMoved(at), button(at, true, modifiers)],
+            );
+            (harness, actions)
+        }
+
+        /// `state` with two presets listed and the first selected.
+        fn with_presets(mut state: UiState) -> UiState {
+            state.presets = ["Mine", "Other"]
+                .into_iter()
+                .map(|name| crate::state::PresetEntry {
+                    name: name.to_owned(),
+                    factory: false,
+                    modified: false,
+                })
+                .collect();
+            state.selected_preset = Some(0);
+            state
+        }
+
+        /// Frames with the pointer still at `at` and then moving on, and everything they sent.
+        fn held_and_moved(harness: &mut Harness, state: &UiState, at: Pos2) -> Vec<UiAction> {
+            let mut actions = Vec::new();
+            for _ in 0..3 {
+                actions.extend(harness.frame(state, Vec::new()).0);
+            }
+            for dy in [5.0, 20.0, 40.0] {
+                let events = vec![Event::PointerMoved(at - vec2(0.0, dy))];
+                actions.extend(harness.frame(state, events).0);
+            }
+            actions
+        }
+
+        #[test]
+        fn a_band_dragged_during_a_solo_writes_nothing_into_the_preset_that_ended_it() {
+            // FA: Ctrl+Alt+drag band 4 up a little — an edit now — and a preset arrives from the
+            // tray with the button still down. The press used to go on writing the pointer's
+            // gain into band 4 of the new preset, and mark it modified.
+            let mut state = with_presets(curve());
+            let at = thumb(&state, 4);
+            let (mut harness, _) = pressed_on(&state, 4, CTRL_ALT);
+            let up = at - vec2(0.0, 13.0);
+            let (actions, _) = harness.frame(&state, vec![Event::PointerMoved(up)]);
+            let (band, db) = *gain_moves(&actions).last().expect("the drag is an edit");
+            assert_eq!(band, 4);
+            state.eq_bands[4].boost_db = db;
+            harness.frame(&state, Vec::new());
+
+            state.selected_preset = Some(1);
+            for slot in &mut state.eq_bands {
+                slot.boost_db = -2.0;
+            }
+            state.eq_solo_generation += 1;
+            let actions = held_and_moved(&mut harness, &state, up);
+            assert!(gain_moves(&actions).is_empty(), "{actions:?}");
+            assert_eq!(solos(&actions), [None]);
+            assert_eq!(
+                harness.scratch.eq.dragged_band(),
+                None,
+                "the gesture is over"
+            );
+        }
+
+        #[test]
+        fn a_drag_writes_nothing_once_a_preset_a_band_count_or_a_lane_comes_from_outside() {
+            // FA: an ordinary drag, no solo, so no generation to move: the curve itself says it
+            // is another one.
+            type Change = fn(&mut UiState);
+            let changes: [(&str, Change); 3] = [
+                ("a preset", |state| state.selected_preset = Some(1)),
+                ("a band count", |state| {
+                    state.eq_bands = centres(15)
+                        .into_iter()
+                        .map(|hz| fxsound_core::EqBand::new(hz, 0.0))
+                        .collect();
+                }),
+                ("a lane", |state| {
+                    state.direction = fxsound_core::DeviceDirection::Input;
+                }),
+            ];
+            for (what, change) in changes {
+                let mut state = with_presets(UiState::default());
+                // Forty points above the thumb, on the track: the band jumps there and drags on.
+                let at = thumb(&state, 4) - vec2(0.0, 40.0);
+                let (mut harness, actions) = pressed_at(&state, at, Modifiers::default());
+                let moves = gain_moves(&actions);
+                assert_eq!(
+                    moves.len(),
+                    1,
+                    "{what}: the press on the track: {actions:?}"
+                );
+                state.eq_bands[4].boost_db = moves[0].1;
+                let (actions, _) =
+                    harness.frame(&state, vec![Event::PointerMoved(at - vec2(0.0, 10.0))]);
+                assert!(!gain_moves(&actions).is_empty(), "{what}: dragging");
+                assert_eq!(harness.scratch.eq.dragged_band(), Some(4));
+
+                change(&mut state);
+                let actions = held_and_moved(&mut harness, &state, at - vec2(0.0, 10.0));
+                assert!(gain_moves(&actions).is_empty(), "{what}: {actions:?}");
+                assert_eq!(harness.scratch.eq.dragged_band(), None, "{what}");
+            }
+        }
+
+        #[test]
+        fn a_wheel_turned_when_a_preset_comes_from_outside_stops_turning() {
+            let mut state = with_presets(UiState::default());
+            let layout = EqLayout::new(10);
+            let wheel = layout
+                .wheel_rect(3)
+                .expect("ten bands have wheels")
+                .center()
+                + panel();
+            let (mut harness, _) = pressed_at(&state, wheel, Modifiers::default());
             let (actions, _) =
-                harness.frame(&state, vec![Event::PointerMoved(at - vec2(0.0, 37.0))]);
-            assert_eq!(gain_moves(&actions).last(), Some(&(3, 6.0)));
-            assert!(solos(&actions).is_empty(), "no solo came back: {actions:?}");
+                harness.frame(&state, vec![Event::PointerMoved(wheel + vec2(30.0, 0.0))]);
+            assert!(
+                actions
+                    .iter()
+                    .any(|a| matches!(a, UiAction::SetBandFrequency(3, _))),
+                "turning: {actions:?}"
+            );
+            state.selected_preset = Some(1);
+            let mut actions = Vec::new();
+            for dx in [40.0, 60.0, 90.0] {
+                let events = vec![Event::PointerMoved(wheel + vec2(dx, 0.0))];
+                actions.extend(harness.frame(&state, events).0);
+            }
+            assert!(
+                !actions
+                    .iter()
+                    .any(|a| matches!(a, UiAction::SetBandFrequency(..))),
+                "{actions:?}"
+            );
+            assert_eq!(harness.scratch.eq.dragged_wheel(), None);
+        }
+
+        #[test]
+        fn a_press_on_a_bands_thumb_moves_nothing_until_the_pointer_does() {
+            // FA, #14 for the faders: band 3 at +6 dB, pressed four points above its thumb's
+            // centre, went to +7 and marked the preset modified.
+            let mut state = UiState::default();
+            state.eq_bands[3].boost_db = 6.0;
+            let at = thumb(&state, 3) - vec2(0.0, 4.0);
+            let (mut harness, actions) = pressed_at(&state, at, Modifiers::default());
+            assert!(
+                gain_moves(&actions).is_empty(),
+                "a touch moved it: {actions:?}"
+            );
+            let (actions, _) = harness.frame(&state, vec![Event::PointerMoved(at)]);
+            assert!(gain_moves(&actions).is_empty(), "{actions:?}");
+            let (actions, _) =
+                harness.frame(&state, vec![Event::PointerMoved(at + vec2(0.0, 1.0))]);
+            assert!(
+                gain_moves(&actions).is_empty(),
+                "a point is not a move: {actions:?}"
+            );
+
+            // Moved, it tracks the pointer: thirty points down from the press is 5 dB lower.
+            let (actions, _) =
+                harness.frame(&state, vec![Event::PointerMoved(at + vec2(0.0, 30.0))]);
+            assert_eq!(gain_moves(&actions).last(), Some(&(3, 2.0)), "{actions:?}");
+        }
+
+        #[test]
+        fn a_band_between_two_steps_survives_a_touch_on_its_thumb() {
+            // A `.fac` made by hand, or the command line, sets +2.5 dB; a centred click on the
+            // thumb used to write +3.
+            let mut state = UiState::default();
+            state.eq_bands[6].boost_db = 2.5;
+            let at = thumb(&state, 6);
+            let (mut harness, mut actions) = pressed_at(&state, at, Modifiers::default());
+            actions.extend(
+                harness
+                    .frame(&state, vec![button(at, false, Modifiers::default())])
+                    .0,
+            );
+            actions.extend(harness.frame(&state, Vec::new()).0);
+            assert!(gain_moves(&actions).is_empty(), "{actions:?}");
+        }
+
+        #[test]
+        fn a_press_on_the_track_away_from_the_thumb_still_jumps_there() {
+            // JUCE's `setSliderSnapsToMousePosition`, as before: 37 points above a 0 dB thumb is
+            // 6 dB.
+            let state = UiState::default();
+            let at = thumb(&state, 2) - vec2(0.0, 37.0);
+            let (_, actions) = pressed_at(&state, at, Modifiers::default());
+            assert_eq!(gain_moves(&actions), [(2, 6.0)], "{actions:?}");
+        }
+
+        #[test]
+        fn a_bypassed_equalizer_offers_no_solo_and_a_ctrl_alt_press_is_no_edit() {
+            // FA: the walk was drawn over an equalizer faded out of the sound, and nothing
+            // changed in what was heard.
+            let state = UiState {
+                eq_on: false,
+                ..curve()
+            };
+            let (mut harness, mut actions) = pressed_on(&state, 2, CTRL_ALT);
+            for _ in 0..20 {
+                actions.extend(harness.frame(&state, Vec::new()).0);
+            }
+            assert!(solos(&actions).is_empty(), "{actions:?}");
+            assert_eq!(harness.scratch.eq.soloed_band(), None);
+            assert!(gain_moves(&actions).is_empty(), "{actions:?}");
+            assert!(
+                harness
+                    .scratch
+                    .eq
+                    .drawn_gains()
+                    .iter()
+                    .zip(curve_of(&state))
+                    .all(|(drawn, db)| *drawn == db),
+                "nothing walked"
+            );
+        }
+
+        #[test]
+        fn with_the_power_off_a_band_offers_neither_the_reset_nor_the_solo() {
+            // FA: both gestures are inert then; the tooltip said to use them.
+            let state = UiState {
+                power: false,
+                ..UiState::default()
+            };
+            let mut harness = Harness::new(ThemeMode::Dark);
+            harness.settle(&state);
+            let shown = harness
+                .rest(&state, thumb(&state, 0) + vec2(0.0, 20.0))
+                .join("\n");
+            let described = band_tooltip(0, 10, false, false).expect("the description");
+            assert!(shown.contains(&described), "{shown}");
+            assert!(!shown.contains(SOLO_TIP), "{shown}");
+            assert!(!shown.contains(slider::RESET_TIP), "{shown}");
+
+            let wheel = EqLayout::new(10).wheel_rect(0).expect("a wheel").center() + panel();
+            let mut harness = Harness::new(ThemeMode::Dark);
+            harness.settle(&state);
+            let shown = harness.rest(&state, wheel).join("\n");
+            assert!(shown.contains("This wheel allows you"), "{shown}");
+            assert!(!shown.contains(slider::RESET_TIP), "{shown}");
+        }
+
+        #[test]
+        fn a_bypassed_equalizers_bands_offer_the_reset_and_not_the_solo() {
+            let state = UiState {
+                eq_on: false,
+                ..UiState::default()
+            };
+            let mut harness = Harness::new(ThemeMode::Dark);
+            harness.settle(&state);
+            let shown = harness
+                .rest(&state, thumb(&state, 0) + vec2(0.0, 20.0))
+                .join("\n");
+            assert!(shown.contains(slider::RESET_TIP), "{shown}");
+            assert!(!shown.contains(SOLO_TIP), "{shown}");
         }
 
         #[test]

@@ -20,7 +20,10 @@
 //!    same conditions are routine and recoverable (`docs/spec/00-architecture.md` §10, open
 //!    question 6).
 //! 4. Apply the cold-start options, register the tray, then alternate between the two states
-//!    below until something asks to quit.
+//!    below until something asks to quit. A line that only sets something — `fxsound
+//!    --preset=Gaming` from a keybinding — starts in the tray, as a running FxSound leaves its
+//!    window alone for it (0.4.0 audit R11); with no tray icon after a few seconds the window
+//!    comes up minimised instead ([`TRAY_WAIT`]).
 //! 5. Just before that loop, start the D-Bus service (`fxsound_app::dbus`) on its own thread. It
 //!    carries its calls to the same control channel the socket uses, so they are answered by the
 //!    pump like a forwarded command line; no session bus, or its name taken, is a log line and
@@ -49,7 +52,9 @@
 //! does when there is none (0.4.0 audit #43), so that it cannot vanish on a GNOME session without
 //! the AppIndicator extension. ✕ hides either way: FxSound processes the whole session's sound,
 //! and a close that quit would stop it; with no tray the one-time notice says how to get the
-//! window back (`fxsound --show`, or launching FxSound again). On Wayland
+//! window back (`fxsound --show`, or launching FxSound again). Either brings a minimised window
+//! back too: out of the minimised state on X11, and on Wayland, where a client cannot do that,
+//! as a fresh window in its place ([`show_action`]). On Wayland
 //! a client cannot unmap and later remap its toplevel through winit —
 //! `Window::set_visible` is a no-op there
 //! (`winit-0.30.13/src/platform_impl/linux/wayland/window/mod.rs:253`) — so "hidden" cannot be a
@@ -262,13 +267,15 @@ fn main() -> eframe::Result<()> {
     }
     // `--hide` and the saved "start minimised" preference start in the tray-only state; there is
     // no such thing as a hidden window here (see the module docs). An explicit `--show` overrides
-    // the preference, as `--hide` overrides it the other way (`Cli::cold_start_commands`).
-    let mut visibility = if cold.window.hide || (app.settings_run_minimized() && !cold.window.show)
-    {
-        WindowVisibility::Hidden
-    } else {
-        WindowVisibility::Shown
-    };
+    // the preference, as `--hide` overrides it the other way (`Cli::cold_start_commands`). So does
+    // a line that only sets something, which starts in the tray too (`cold_start_visibility`).
+    let quiet = cli.only_sets_things();
+    let mut visibility = cold_start_visibility(
+        cold.window.hide,
+        cold.window.show,
+        app.settings_run_minimized(),
+        quiet,
+    );
 
     // What start-up and the cold-start options changed is where every consumer starts from, not
     // news: the tray is built from the state as it is now, the D-Bus properties below read it,
@@ -338,12 +345,20 @@ fn main() -> eframe::Result<()> {
         signals,
         panes: Panes::default(),
         waiting_for_devices: Vec::new(),
+        // A start from a line that only sets something is in the tray, if a tray icon comes up
+        // to be in; with none after `TRAY_WAIT`, the window comes up minimised instead.
+        tray_wait: (quiet && visibility == WindowVisibility::Hidden)
+            .then(|| Instant::now() + TRAY_WAIT),
+        start_minimised: false,
+        reopening: false,
     };
 
     loop {
         match visibility {
             WindowVisibility::Shown => match runtime.run_window() {
                 Ok(WindowExit::Hidden) => visibility = WindowVisibility::Hidden,
+                // A minimised window `--show` could not bring back on Wayland: a fresh one.
+                Ok(WindowExit::Reopen) => {}
                 Ok(WindowExit::Quit) => break,
                 Err(err) => {
                     // Better to leave than to loop on a window that cannot be created; the
@@ -355,6 +370,10 @@ fn main() -> eframe::Result<()> {
             },
             WindowVisibility::Hidden => match runtime.run_headless() {
                 HeadlessExit::Show => visibility = WindowVisibility::Shown,
+                HeadlessExit::ShowMinimised => {
+                    runtime.start_minimised = true;
+                    visibility = WindowVisibility::Shown;
+                }
                 HeadlessExit::Quit => break,
             },
         }
@@ -373,13 +392,43 @@ enum WindowExit {
     Hidden,
     /// Leave: the tray's Exit item or `fxsound --quit`.
     Quit,
+    /// Close and map a fresh window at once: `--show` for a window the minimise button minimised,
+    /// which a Wayland client cannot bring back itself ([`show_action`]). Not a hide: no tray tip,
+    /// no `run_minimized`, no `window visible=false`.
+    Reopen,
 }
 
 /// Why the tray-only state ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeadlessExit {
     Show,
+    /// A start in the tray found no tray icon to be in ([`TRAY_WAIT`]): the window, minimised.
+    ShowMinimised,
     Quit,
+}
+
+/// How long a start from a line that only sets something waits for a tray icon to come up
+/// before it brings the window up minimised instead — on GNOME without the AppIndicator
+/// extension there is none, and FxSound would run with nothing on screen to reach it by. A panel
+/// that is there registers the icon well within it; one that starts later still finds FxSound in
+/// the tray.
+const TRAY_WAIT: Duration = Duration::from_secs(3);
+
+/// Where a cold start begins (0.4.0 audit R11, review FA): in the tray for `--hide`, for the
+/// remembered `run_minimized` unless `--show` overrides it, and for a line that only sets
+/// something — `fxsound --preset=Gaming` from a keybinding in a fullscreen game, which a running
+/// FxSound answers without raising its window; with the window otherwise.
+const fn cold_start_visibility(
+    hide: bool,
+    show: bool,
+    run_minimized: bool,
+    only_sets_things: bool,
+) -> WindowVisibility {
+    if hide || ((run_minimized || only_sets_things) && !show) {
+        WindowVisibility::Hidden
+    } else {
+        WindowVisibility::Shown
+    }
 }
 
 /// Everything that outlives a window: the controller, the control socket, the D-Bus service and
@@ -421,8 +470,16 @@ struct Runtime {
     /// What the last window showed that the next one shows again.
     panes: Panes,
     /// Forwarded lines held for PipeWire's first device list, each with the moment it stops
-    /// waiting ([`commands::waits_for_the_device_list`]), in the order they arrived.
+    /// waiting ([`commands::waits_for_the_device_list`]), in the order they arrived — and every
+    /// line that arrived after one of them, which waits its turn behind it.
     waiting_for_devices: Vec<(ipc::Forwarded, Instant)>,
+    /// A start in the tray that has not seen a tray icon yet, and when it stops waiting for one
+    /// ([`TRAY_WAIT`]).
+    tray_wait: Option<Instant>,
+    /// The next window comes up minimised: a start in the tray that found no tray.
+    start_minimised: bool,
+    /// The window closing now is being opened again ([`WindowExit::Reopen`]): not news.
+    reopening: bool,
 }
 
 impl Runtime {
@@ -465,8 +522,16 @@ impl Runtime {
                 continue;
             }
             // A `--forget-device` for an instance PipeWire has not listed the devices to yet: the
-            // whole line waits for the list, or until `until`, and is refused only then.
-            if now < until && commands::waits_for_the_device_list(&self.app, forwarded.commands()) {
+            // whole line waits for the list, or until `until`, and is refused only then. A line
+            // that came after a waiting one waits behind it (0.4.0 review FA): run first, a
+            // keybind's `--preset=Day` would be undone by the held `--preset=Night` before it
+            // when the list came. Its own wait is never the longer one — the line ahead of it
+            // arrived first — so its caller still hears back in time.
+            let behind = !self.waiting_for_devices.is_empty();
+            if behind
+                || (now < until
+                    && commands::waits_for_the_device_list(&self.app, forwarded.commands()))
+            {
                 self.waiting_for_devices.push((forwarded, until));
                 continue;
             }
@@ -527,9 +592,17 @@ impl Runtime {
         // The cached textures belong to the previous egui context and would draw nothing on
         // the new one.
         self.app.assets.clear();
-        let options = native_options(self.app.state.view);
+        let mut options = native_options(self.app.state.view);
+        if self.start_minimised {
+            // Not taken from the game that started FxSound, where the compositor lets a client
+            // say so.
+            options.viewport = options.viewport.with_active(false);
+        }
 
-        self.announce(&AppEvent::Window { visible: true });
+        // A window opened again in place of a minimised one was never gone.
+        if !std::mem::take(&mut self.reopening) {
+            self.announce(&AppEvent::Window { visible: true });
+        }
         self.app.set_window_shown(true);
         // `showMainWindow` writes `run_minimized = false` (`FxController.cpp:933`).
         self.app.remember_window_hidden(false);
@@ -578,6 +651,7 @@ impl Runtime {
             self.app.remember_window_hidden(tray_visible);
             self.announce(&AppEvent::Window { visible: false });
         }
+        self.reopening = self.exit == WindowExit::Reopen;
         self.exit
     }
 
@@ -599,7 +673,17 @@ impl Runtime {
             }
             // With no window, toggle means show.
             if request.show || request.toggle || self.settings_requested {
+                self.tray_wait = None;
                 return HeadlessExit::Show;
+            }
+            if let Some(until) = self.tray_wait {
+                if self.tray_visible() {
+                    self.tray_wait = None;
+                } else if Instant::now() >= until {
+                    self.tray_wait = None;
+                    log::info!("no tray icon to start in; the window comes up minimised");
+                    return HeadlessExit::ShowMinimised;
+                }
             }
             self.wait(self.pump_interval(Instant::now()));
         }
@@ -616,6 +700,9 @@ impl Runtime {
         }
         if let Some(due) = self.app.next_deadline() {
             interval = interval.min(due.saturating_duration_since(now));
+        }
+        if let Some(until) = self.tray_wait {
+            interval = interval.min(until.saturating_duration_since(now));
         }
         // A line held for the device list is refused when its wait is over, not at the keepalive
         // after; the list itself wakes the pump through the audio channel.
@@ -856,6 +943,47 @@ struct Shell<'a> {
     /// A question the window is asking before it does something that cannot be taken back from
     /// inside FxSound: deleting a preset, discarding every unsaved change.
     confirm: Option<Confirm>,
+    /// The window asked the compositor to minimise it — the minimise button with no tray icon
+    /// there (0.4.0 audit #43), or a start in the tray that found none — and has not had the
+    /// focus or the pointer since. `--show` has to bring it back ([`show_action`]).
+    minimised: bool,
+    /// Whether the window had the focus at the last frame, to see it come back.
+    was_focused: Option<bool>,
+}
+
+/// What `--show`, a bare relaunch or D-Bus `Show()` does to the window there is ([`show_action`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShowAction {
+    /// Raise it: `ViewportCommand::Focus`.
+    Focus,
+    /// Take it out of the minimised state, then raise it (X11).
+    Restore,
+    /// Close it and map a fresh one ([`WindowExit::Reopen`]): a Wayland client cannot take its
+    /// toplevel out of the minimised state, and winit's `focus_window` is a no-op there.
+    Reopen,
+}
+
+/// How to show a window that is `minimised` (review FA; `--show` is "show and raise the window"
+/// and the original's `showMainWindow` restores it). winit 0.30's `focus_window` returns early for
+/// an iconic X11 window (`x11/window.rs:1773`) and does nothing at all on Wayland
+/// (`wayland/window/mod.rs:629`), so a Focus alone left a minimised window where it was and
+/// `fxsound --show` exited 0. On X11 the window is asked out of the minimised state first; on
+/// Wayland, where nothing can do that from the client side, it is replaced by a fresh toplevel —
+/// the path hiding to the tray and showing again takes already.
+const fn show_action(minimised: bool, wayland: bool) -> ShowAction {
+    match (minimised, wayland) {
+        (false, _) => ShowAction::Focus,
+        (true, false) => ShowAction::Restore,
+        (true, true) => ShowAction::Reopen,
+    }
+}
+
+/// Whether winit runs on Wayland here: its own rule (`platform_impl/linux/mod.rs:736-766`), a
+/// non-empty `WAYLAND_DISPLAY` or `WAYLAND_SOCKET`, since FxSound forces no backend.
+fn wayland_session(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    ["WAYLAND_DISPLAY", "WAYLAND_SOCKET"]
+        .into_iter()
+        .any(|name| var(name).is_some_and(|value| !value.is_empty()))
 }
 
 /// What [`Shell::confirm`] asks about. The answer is acted on only while it still means what was
@@ -938,6 +1066,8 @@ impl<'a> Shell<'a> {
             calibration: None,
             content_origin: egui::Pos2::ZERO,
             confirm: None,
+            minimised: false,
+            was_focused: None,
         }
     }
 
@@ -953,7 +1083,19 @@ impl<'a> Shell<'a> {
             return;
         }
         if request.show {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            let wayland = wayland_session(|name| std::env::var_os(name));
+            match show_action(self.minimised, wayland) {
+                ShowAction::Focus => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+                ShowAction::Restore => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.minimised = false;
+                }
+                ShowAction::Reopen => {
+                    self.rt.exit = WindowExit::Reopen;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
         } else if request.hide || request.toggle {
             Self::hide(ctx);
         }
@@ -968,13 +1110,25 @@ impl<'a> Shell<'a> {
     }
 
     /// The title bar's minimise button: [`minimise_action`] for the tray there is now.
-    fn minimise(&self, ctx: &egui::Context) {
+    fn minimise(&mut self, ctx: &egui::Context) {
         match minimise_action(self.rt.tray_visible()) {
             MinimiseAction::HideToTray => Self::hide(ctx),
             MinimiseAction::Minimise => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true))
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                self.minimised = true;
             }
         }
+    }
+
+    /// Notice the window coming back from minimised by the user's own hand — the dock, the
+    /// taskbar, Alt+Tab: it has the focus again, or the pointer pressed in it.
+    fn follow_minimised(&mut self, ctx: &egui::Context) {
+        let (focused, pressed) = ctx.input(|i| (i.viewport().focused, i.pointer.any_pressed()));
+        if self.minimised && (pressed || (focused == Some(true) && self.was_focused == Some(false)))
+        {
+            self.minimised = false;
+        }
+        self.was_focused = focused;
     }
 
     /// Resize the viewport when the user flips between Pro and Lite, or opens a pane.
@@ -1134,7 +1288,12 @@ impl<'a> Shell<'a> {
         let presets = &app.state.presets;
 
         if self.menu.editor.as_ref().is_some_and(|editor| {
-            !editor.still_applies(app.state.direction, can_save_new, can_rename)
+            !editor.still_applies(
+                app.state.direction,
+                preset.map(|p| p.name.as_str()),
+                can_save_new,
+                can_rename,
+            )
         }) {
             self.menu.editor = None;
         }
@@ -1251,19 +1410,36 @@ impl<'a> Shell<'a> {
         self.menu.just_opened = false;
 
         if let Some((purpose, name)) = committed {
+            let opened_for = self
+                .menu
+                .editor
+                .as_ref()
+                .map(|editor| (editor.lane, editor.preset.clone()));
             self.menu.close();
             match purpose {
                 EditorPurpose::SaveNew => self.rt.app.handle(&[UiAction::SavePresetAs(name)]),
-                EditorPurpose::Rename => self.rt.app.rename_preset(&name),
+                // For the preset the editor was opened on, if it is still the one selected and
+                // still one the menu would offer to rename: the answer comes a frame or many
+                // after the offer, as the Delete question's does.
+                EditorPurpose::Rename => {
+                    if let Some((lane, Some(old))) = opened_for {
+                        self.rt.app.rename_preset_opened_for(lane, &old, &name);
+                    }
+                }
             }
             return;
         }
         match chosen {
             Some(MenuChoice::Editor(purpose)) => {
                 // Clicking the row again folds the editor back up.
+                let app = &self.rt.app;
                 self.menu.editor = match self.menu.editor.take() {
                     Some(editor) if editor.purpose == purpose => None,
-                    _ => Some(NameEditor::new(purpose, self.rt.app.state.direction)),
+                    _ => Some(NameEditor::new(
+                        purpose,
+                        app.state.direction,
+                        app.state.preset().map(|p| p.name.as_str()),
+                    )),
                 };
             }
             Some(choice) => {
@@ -1575,6 +1751,12 @@ impl eframe::App for Shell<'_> {
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // A start in the tray that found no tray icon: minimised where the compositor has such a
+        // thing, or into the tray after all should an icon have come up since.
+        if std::mem::take(&mut self.rt.start_minimised) {
+            self.minimise(ctx);
+        }
+        self.follow_minimised(ctx);
         let request = self.rt.tick();
         if std::mem::take(&mut self.rt.settings_requested) {
             self.open_settings();
@@ -1840,6 +2022,9 @@ struct NameEditor {
     purpose: EditorPurpose,
     /// The lane it was opened for: the editor closes when the window moves to the other one.
     lane: fxsound_core::DeviceDirection,
+    /// The preset selected when it was opened. A rename is that preset's: the editor closes when
+    /// another is selected, and Enter renames nothing else (0.4.0 review FA).
+    preset: Option<String>,
     text: String,
     /// Focus is requested once, on the first frame — not on every paint as the original does
     /// (`docs/spec/03-controls.md` §11.4).
@@ -1847,30 +2032,38 @@ struct NameEditor {
 }
 
 impl NameEditor {
-    fn new(purpose: EditorPurpose, lane: fxsound_core::DeviceDirection) -> Self {
+    fn new(
+        purpose: EditorPurpose,
+        lane: fxsound_core::DeviceDirection,
+        preset: Option<&str>,
+    ) -> Self {
         Self {
             purpose,
             lane,
+            preset: preset.map(str::to_owned),
             text: String::new(),
             focused: false,
         }
     }
 
-    /// Whether the editor still has something to do with the window editing `lane`, and its
-    /// item's enablement. One whose item has since gone grey has nothing left to do; nor has one
-    /// opened for the other lane, which the tray, a keybind or D-Bus has moved the window off
-    /// since: the name typed was for that lane's controls and list, and committed now it would
-    /// save or rename the lane the menu shows instead.
+    /// Whether the editor still has something to do with the window editing `lane` with the
+    /// preset `selected`, and its item's enablement. One whose item has since gone grey has
+    /// nothing left to do; nor has one opened for the other lane, which the tray, a keybind or
+    /// D-Bus has moved the window off since: the name typed was for that lane's controls and
+    /// list, and committed now it would save or rename the lane the menu shows instead. Nor has
+    /// a Rename opened for a preset that is no longer the one selected — a headphone plugged in
+    /// brings back its own, a keybind steps to the next — which the new name was never for.
     fn still_applies(
         &self,
         lane: fxsound_core::DeviceDirection,
+        selected: Option<&str>,
         can_save_new: bool,
         can_rename: bool,
     ) -> bool {
         self.lane == lane
             && match self.purpose {
                 EditorPurpose::SaveNew => can_save_new,
-                EditorPurpose::Rename => can_rename,
+                EditorPurpose::Rename => can_rename && self.preset.as_deref() == selected,
             }
     }
 }
@@ -2128,6 +2321,9 @@ mod runtime_tests {
             signals: None,
             panes: Panes::default(),
             waiting_for_devices: Vec::new(),
+            tray_wait: None,
+            start_minimised: false,
+            reopening: false,
         }
     }
 
@@ -2306,6 +2502,34 @@ mod runtime_tests {
             "and the one-time tip was shown"
         );
         assert_eq!(next_line(&mut runtime, &lines), "window visible=false");
+    }
+
+    #[test]
+    fn a_window_reopened_for_show_is_no_hide_and_its_successor_is_no_news() {
+        // FA: on Wayland `--show` replaces a minimised window with a fresh one. That is not a
+        // hide: no tip, no `run_minimized`, no `window visible=false` between the two.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        with_a_window_up(&mut runtime);
+        runtime.exit = WindowExit::Reopen;
+
+        assert_eq!(runtime.window_closed(true), WindowExit::Reopen);
+        assert!(!runtime.app.settings_run_minimized());
+        assert!(!runtime.app.tray_tip_shown());
+        assert!(runtime.reopening, "the next window is not announced again");
+    }
+
+    #[test]
+    fn a_start_in_the_tray_with_no_tray_icon_comes_up_minimised_once_its_wait_is_over() {
+        // FA: with no tray icon a start from a line that only sets something would run with
+        // nothing on screen to reach it by.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        runtime.tray_wait = Some(Instant::now() + Duration::from_millis(100));
+        let started = Instant::now();
+        assert_eq!(runtime.run_headless(), HeadlessExit::ShowMinimised);
+        assert!(started.elapsed() >= Duration::from_millis(90), "it waited");
+        assert!(runtime.tray_wait.is_none());
     }
 
     #[test]
@@ -2663,6 +2887,9 @@ mod calibration_tests {
             signals: None,
             panes: Panes::default(),
             waiting_for_devices: Vec::new(),
+            tray_wait: None,
+            start_minimised: false,
+            reopening: false,
         }
     }
 
@@ -2853,6 +3080,66 @@ mod minimise_tests {
         assert_eq!(minimise_action(true), MinimiseAction::HideToTray);
         assert_eq!(minimise_action(false), MinimiseAction::Minimise);
     }
+
+    #[test]
+    fn show_brings_a_minimised_window_back_on_x11_and_maps_a_fresh_one_on_wayland() {
+        // FA: `--show` sent a Focus alone, which winit ignores for an iconic X11 window and on
+        // Wayland altogether, so a window minimised with no tray stayed minimised.
+        assert_eq!(show_action(false, false), ShowAction::Focus);
+        assert_eq!(show_action(false, true), ShowAction::Focus);
+        assert_eq!(show_action(true, false), ShowAction::Restore);
+        assert_eq!(show_action(true, true), ShowAction::Reopen);
+    }
+
+    #[test]
+    fn a_session_is_wayland_as_winit_reads_it() {
+        let vars = |set: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                set.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
+            }
+        };
+        assert!(wayland_session(vars(&[("WAYLAND_DISPLAY", "wayland-1")])));
+        assert!(wayland_session(vars(&[("WAYLAND_SOCKET", "5")])));
+        assert!(!wayland_session(vars(&[
+            ("WAYLAND_DISPLAY", ""),
+            ("DISPLAY", ":0")
+        ])));
+        assert!(!wayland_session(vars(&[("DISPLAY", ":0")])));
+    }
+
+    #[test]
+    fn a_cold_start_from_a_line_that_only_sets_something_begins_in_the_tray() {
+        // FA: R11 kept a running instance's window down for `fxsound --preset=Gaming`; a cold
+        // start from the same keybinding opened and focused the window over the game.
+        use WindowVisibility::{Hidden, Shown};
+        // (hide, show, run_minimized, only_sets_things)
+        assert_eq!(cold_start_visibility(false, false, false, true), Hidden);
+        assert_eq!(cold_start_visibility(false, false, false, false), Shown);
+        assert_eq!(cold_start_visibility(false, false, true, false), Hidden);
+        assert_eq!(cold_start_visibility(false, true, true, false), Shown);
+        assert_eq!(cold_start_visibility(true, false, false, false), Hidden);
+        let line = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("fxsound").chain(args.iter().copied()))
+                .expect("parses")
+                .only_sets_things()
+        };
+        assert_eq!(
+            cold_start_visibility(false, false, false, line(&["--preset=Gaming"])),
+            Hidden
+        );
+        assert_eq!(
+            cold_start_visibility(false, false, false, line(&["--toggle-power"])),
+            Hidden
+        );
+        assert_eq!(cold_start_visibility(false, false, false, line(&[])), Shown);
+        assert_eq!(
+            cold_start_visibility(false, false, false, line(&["--view=2"])),
+            Shown,
+            "--view asks for the window"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3013,6 +3300,9 @@ mod confirmation_tests {
             signals: None,
             panes: Panes::default(),
             waiting_for_devices: Vec::new(),
+            tray_wait: None,
+            start_minimised: false,
+            reopening: false,
         }
     }
 
@@ -3150,20 +3440,33 @@ mod name_editor_tests {
     fn an_editor_opened_for_one_lane_closes_when_the_window_moves_to_the_other() {
         // Save New Preset typed on the speakers, then `fxsound --edit=input` from a keybind: the
         // name was for the speakers' controls and list, and must not save the microphone's.
-        let editor = NameEditor::new(EditorPurpose::SaveNew, Output);
-        assert!(editor.still_applies(Output, true, true));
-        assert!(!editor.still_applies(Input, true, true));
-        let rename = NameEditor::new(EditorPurpose::Rename, Input);
-        assert!(rename.still_applies(Input, false, true));
-        assert!(!rename.still_applies(Output, false, true));
+        let editor = NameEditor::new(EditorPurpose::SaveNew, Output, Some("A"));
+        assert!(editor.still_applies(Output, Some("A"), true, true));
+        assert!(!editor.still_applies(Input, Some("A"), true, true));
+        let rename = NameEditor::new(EditorPurpose::Rename, Input, Some("A"));
+        assert!(rename.still_applies(Input, Some("A"), false, true));
+        assert!(!rename.still_applies(Output, Some("A"), false, true));
     }
 
     #[test]
     fn an_editor_whose_item_went_grey_closes() {
-        let editor = NameEditor::new(EditorPurpose::SaveNew, Output);
-        assert!(!editor.still_applies(Output, false, true));
-        let rename = NameEditor::new(EditorPurpose::Rename, Output);
-        assert!(!rename.still_applies(Output, true, false));
+        let editor = NameEditor::new(EditorPurpose::SaveNew, Output, Some("A"));
+        assert!(!editor.still_applies(Output, Some("A"), false, true));
+        let rename = NameEditor::new(EditorPurpose::Rename, Output, Some("A"));
+        assert!(!rename.still_applies(Output, Some("A"), true, false));
+    }
+
+    #[test]
+    fn a_rename_editor_closes_when_another_preset_is_selected_under_it() {
+        // FA: a headphone plugged in brought back its preset B while A's new name was typed, and
+        // Enter renamed B.
+        let rename = NameEditor::new(EditorPurpose::Rename, Output, Some("A"));
+        assert!(rename.still_applies(Output, Some("A"), true, true));
+        assert!(!rename.still_applies(Output, Some("B"), true, true));
+        assert!(!rename.still_applies(Output, None, true, true));
+        // Save New Preset saves the controls on screen, whichever preset they came from.
+        let save = NameEditor::new(EditorPurpose::SaveNew, Output, Some("A"));
+        assert!(save.still_applies(Output, Some("B"), true, true));
     }
 }
 
@@ -3202,7 +3505,17 @@ mod forget_device_tests {
             "",
             DeviceDirection::Output,
         );
-        let presets = PresetStore::with_dirs(Vec::new(), dir.join("presets"));
+        // Two presets for a line to pick, as a script and a keybind might.
+        for name in ["Day", "Night"] {
+            let preset = fxsound_core::Preset {
+                name: name.to_owned(),
+                ..fxsound_core::Preset::default()
+            };
+            fxsound_preset::save(&preset, &dir.join("presets").join(format!("{name}.fac")))
+                .expect("a preset");
+        }
+        let mut presets = PresetStore::with_dirs(Vec::new(), dir.join("presets"));
+        presets.rescan();
         let voices = InputPresetStore::with_dirs(Vec::new(), dir.join("presets").join("Input"));
         let app = App::start_for_tests(settings, presets, voices, &engine);
         let (_tray_tx, tray_rx) = crossbeam_channel::unbounded();
@@ -3222,6 +3535,9 @@ mod forget_device_tests {
             signals: None,
             panes: Panes::default(),
             waiting_for_devices: Vec::new(),
+            tray_wait: None,
+            start_minimised: false,
+            reopening: false,
         };
         (runtime, engine)
     }
@@ -3257,6 +3573,62 @@ mod forget_device_tests {
             runtime.wait(Duration::from_millis(50));
             runtime.tick();
         }
+    }
+
+    #[test]
+    fn a_line_forwarded_after_one_that_waits_for_the_device_list_runs_after_it() {
+        // FA: the keybind's `--preset=Day`, sent after a script's held line, ran at once, and the
+        // held `--preset=Night` undid it when the device list came.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut runtime, engine) = young_runtime(dir.path());
+        let script = forward(&runtime, &["--forget-device=USB Dock", "--preset=Night"]);
+        until_it_waits(&mut runtime);
+        let keybind = forward(&runtime, &["--preset=Day"]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.waiting_for_devices.len() < 2 {
+            assert!(Instant::now() < deadline, "the second line never arrived");
+            runtime.wait(Duration::from_millis(50));
+            runtime.tick();
+        }
+        runtime.tick();
+        assert!(!keybind.is_finished(), "it waits its turn");
+
+        engine.feed(AudioToUi::Devices(vec![speakers()]));
+        runtime.tick();
+        assert!(runtime.waiting_for_devices.is_empty());
+        for client in [script, keybind] {
+            let answer = client.join().expect("client").expect("answered");
+            assert!(answer.ok, "{}", answer.stderr);
+        }
+        assert_eq!(
+            runtime.app.state.preset().map(|p| p.name.as_str()),
+            Some("Day"),
+            "the last word was the keybind's"
+        );
+    }
+
+    #[test]
+    fn a_line_behind_a_waiting_one_is_answered_once_that_ones_wait_is_over() {
+        // No device list at all: the held line is refused when its wait is over, and the one
+        // behind it runs right after, well within its own caller's patience.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (mut runtime, _engine) = young_runtime(dir.path());
+        let script = forward(&runtime, &["--forget-device=USB Dock"]);
+        until_it_waits(&mut runtime);
+        let keybind = forward(&runtime, &["--preset=Day"]);
+        let deadline = Instant::now() + commands::DEVICE_LIST_WAIT + Duration::from_secs(2);
+        while !(script.is_finished() && keybind.is_finished()) {
+            assert!(Instant::now() < deadline, "never answered");
+            runtime.wait(runtime.pump_interval(Instant::now()));
+            runtime.tick();
+        }
+        assert!(!script.join().expect("client").expect("answered").ok);
+        let answer = keybind.join().expect("client").expect("answered");
+        assert!(answer.ok, "{}", answer.stderr);
+        assert_eq!(
+            runtime.app.state.preset().map(|p| p.name.as_str()),
+            Some("Day")
+        );
     }
 
     #[test]

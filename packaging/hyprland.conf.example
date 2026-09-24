@@ -39,7 +39,8 @@ windowrule {
 # A Wayland client cannot grab global shortcuts the way the Windows build does.
 # Bind them in the compositor instead; each one is forwarded over FxSound's
 # control socket to the running instance, and none of them raises the window
-# (only --toggle-window, --show and --view do). The bind syntax has not changed.
+# (only --toggle-window, --show and --view do); one that starts FxSound starts
+# it in the tray. The bind syntax has not changed.
 # Super+Alt because few desktops and no applications use it: a compositor bind
 # takes its keys from every application, and the Windows build's own chords
 # collide - Ctrl+Shift+Q, its power toggle, is how Chromium quits.

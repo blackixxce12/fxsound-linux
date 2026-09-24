@@ -1583,8 +1583,8 @@ mod tests {
     }
 
     #[test]
-    fn with_the_power_off_the_band_gains_stay_on_screen_at_half_alpha() {
-        // 0.4.0 audit #42, the equalizer's half.
+    fn with_the_power_off_the_band_gains_stay_on_screen_greyed_and_readable() {
+        // 0.4.0 audit #42, the equalizer's half; greyed to 3:1 on the panel (review FA).
         use crate::widgets::equalizer::{EqLayout, gain_label, gain_label_colour};
         let mut state = state();
         state.eq_bands[3].boost_db = 5.0;
@@ -1616,11 +1616,20 @@ mod tests {
                     "{mode:?} band {band}"
                 );
             }
-            assert_eq!(
+            assert_ne!(
                 gain_label_colour(palette, false),
-                palette.color_alpha(FxColor::DefaultText, 0.5)
+                gain_label_colour(palette, true),
+                "{mode:?}: drawn as disabled"
             );
         }
+        assert_eq!(
+            gain_label_colour(Palette::new(ThemeMode::Dark), false),
+            Palette::new(ThemeMode::Dark).color_alpha(FxColor::DefaultText, 0.5)
+        );
+        assert_eq!(
+            gain_label_colour(Palette::new(ThemeMode::Light), false),
+            egui::Color32::from_gray(crate::theme::LIGHT_GREY_LIMIT)
+        );
     }
 
     #[test]

@@ -75,12 +75,18 @@ pub const AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// it is not blank and no preset already has it, compared case-insensitively.
 #[must_use]
 pub fn preset_name_available(existing: &[PresetEntry], name: &str) -> bool {
+    name_available_among(existing.iter().map(|p| p.name.as_str()), name)
+}
+
+/// [`preset_name_available`] over any list of names: a store's own entries, which an import
+/// asks after every file it adds, rather than the list the picker last showed.
+fn name_available_among<'a>(existing: impl IntoIterator<Item = &'a str>, name: &str) -> bool {
     let wanted = name.trim();
     if wanted.is_empty() {
         return false;
     }
     let wanted = wanted.to_lowercase();
-    !existing.iter().any(|p| p.name.to_lowercase() == wanted)
+    !existing.into_iter().any(|p| p.to_lowercase() == wanted)
 }
 
 /// [`preset_name_available`] for renaming the preset `old`: the preset does not stand in its own
@@ -1392,10 +1398,7 @@ impl App {
                 self.tray_stale = true;
             }
 
-            UiAction::SelectPreset(index) => {
-                self.select_preset(index);
-                self.hold_picked_preset();
-            }
+            UiAction::SelectPreset(index) => self.pick_preset(index),
             UiAction::SavePreset => self.save_preset(None),
             UiAction::SavePresetAs(name) => self.save_preset(Some(name)),
             UiAction::UndoPresetChanges => self.undo_preset_changes(),
@@ -1509,9 +1512,28 @@ impl App {
             self.state.previous_preset()
         };
         if let Some(index) = next {
-            self.select_preset(index);
-            self.hold_picked_preset();
+            self.pick_preset(index);
         }
+    }
+
+    /// A preset the user picked — in the window's list, the tray, `--preset`, D-Bus `Select` or
+    /// a step with `--next-preset` — as opposed to one the controller loads for its own reasons.
+    ///
+    /// Picking the preset that is already selected changes nothing, as the original's combo box,
+    /// which fires nothing for the item already picked. It used to load the preset again from
+    /// its store (0.4.0 review FA): the stash that keeps unsaved edits runs only when the name
+    /// changes, so every edit since the last stash was dropped without a word, and with no
+    /// autosave yet the `*` went with them. What a pick means besides the load still holds: the
+    /// device playing now remembers the preset, and a device still waiting for the list keeps it.
+    fn pick_preset(&mut self, index: usize) {
+        if self.state.selected_preset == Some(index) {
+            if let Some(name) = self.state.preset().map(|p| p.name.clone()) {
+                self.remember_preset_for_selected_device(&name);
+            }
+        } else {
+            self.select_preset(index);
+        }
+        self.hold_picked_preset();
     }
 
     /// Rebuild the list the picker shows, from the edit direction's store.
@@ -3611,6 +3633,12 @@ impl App {
     ///
     /// Everything that named the preset follows it: the lane's saved preset and every device that
     /// remembers it, so plugging one back in does not look for a name that no longer exists.
+    ///
+    /// A preset with unsaved changes is not renamed, whoever asks (0.4.0 review FA): the edits
+    /// that are only in the window have no autosave for the rename to move, and the list read
+    /// back from the store afterwards would drop their `*`, so the next switch would neither
+    /// stash them nor ask. The menu and the command line never offer it; this is for a preset
+    /// edited from elsewhere between the offer and the answer.
     pub fn rename_preset(&mut self, new_name: &str) {
         let new_name = fxsound_preset::new_preset_name(new_name);
         let new_name = new_name.as_str();
@@ -3622,6 +3650,11 @@ impl App {
             return;
         }
         let old = entry.name.clone();
+        if entry.modified {
+            log::info!("not renaming {old}: it has unsaved changes");
+            self.raise_notice(tr_args("Could not rename %s", &[old.as_str()]));
+            return;
+        }
         if new_name.is_empty() || new_name == old {
             return;
         }
@@ -3664,6 +3697,38 @@ impl App {
         self.raise_notice(tr_args("Renamed %s to %s", &[old.as_str(), new_name]));
         // Direct callers (the menu) do not go through `handle`, so flush here.
         self.handle(&[]);
+    }
+
+    /// The Rename editor's Enter: rename the preset `old` on `lane`, which is the one the editor
+    /// was opened for, to `new_name` — if it is still the preset the window has selected on that
+    /// lane and the menu would still offer Rename for it ([`App::preset_command_allowed`]), as
+    /// the Delete question checks when it is answered (0.4.0 review FA). A headphone plugged in
+    /// meanwhile brings back its own preset, and a keybind steps to the next one: renamed as
+    /// whatever was selected when Enter came, that one would have taken the name, its
+    /// application rules and its devices with it. Returns whether the rename went ahead;
+    /// otherwise the window says it could not rename `old`.
+    pub fn rename_preset_opened_for(
+        &mut self,
+        lane: DeviceDirection,
+        old: &str,
+        new_name: &str,
+    ) -> bool {
+        let refused =
+            if self.state.direction != lane || self.state.preset().is_none_or(|p| p.name != old) {
+                Some(format!("{old} is no longer the selected preset"))
+            } else {
+                self.preset_command_allowed(&PresetCommand::Rename(new_name.to_owned()))
+                    .err()
+                    .map(|refusal| refusal.to_string())
+            };
+        if let Some(why) = refused {
+            log::info!("not renaming {old}: {why}");
+            self.raise_notice(tr_args("Could not rename %s", &[old]));
+            self.handle(&[]);
+            return false;
+        }
+        self.rename_preset(new_name);
+        true
     }
 
     /// `FxController::importPresets()` (`FxController.cpp:1419-1458`) over the non-recursive
@@ -3723,8 +3788,13 @@ impl App {
                 .and_then(|s| s.to_str())
                 .map_or_else(|| path.display().to_string(), str::to_owned);
             // `Store::import` names the preset after the file, as a new name, so that is the name
-            // to check.
-            if !self.is_preset_name_available(&fxsound_preset::new_preset_name(&stem)) {
+            // to check — against the store as it is now, not the list the picker last showed,
+            // which is only rebuilt after the loop: two files that come out as one name (long
+            // names cut to the same 64 characters, `Rock.fac` beside `rock.fac`) would otherwise
+            // both pass, and the second would be saved over the first.
+            let name = fxsound_preset::new_preset_name(&stem);
+            let taken = self.store(lane).entries().iter().map(|e| e.name.as_str());
+            if !name_available_among(taken, &name) {
                 summary.skipped.push(stem);
                 continue;
             }
@@ -7626,6 +7696,110 @@ mod tests {
     }
 
     #[test]
+    fn the_rename_editor_renames_the_preset_it_was_opened_for_and_nothing_else() {
+        // FA: Enter renamed whatever was selected by then — a headphone's preset brought back,
+        // the next one a keybind stepped to.
+        let (mut app, dir) = with_store();
+        add_user_preset(&mut app, "A");
+        add_user_preset(&mut app, "B");
+        app.handle(&[UiAction::SelectPreset(at(&app, "A"))]);
+        app.handle(&[UiAction::SelectPreset(at(&app, "B"))]);
+
+        assert!(!app.rename_preset_opened_for(DeviceDirection::Output, "A", "Renamed"));
+        assert_eq!(names(&app), ["A", "B"], "B is not renamed in A's place");
+        assert!(app.state.notification.is_some(), "the window says so");
+        assert!(!app.rename_preset_opened_for(DeviceDirection::Input, "B", "Renamed"));
+        assert_eq!(names(&app), ["A", "B"], "nor on another lane");
+
+        assert!(app.rename_preset_opened_for(DeviceDirection::Output, "B", "Renamed"));
+        assert_eq!(names(&app), ["A", "Renamed"]);
+        assert!(dir.path().join("user/Renamed.fac").is_file());
+    }
+
+    #[test]
+    fn a_preset_edited_while_its_new_name_was_typed_is_not_renamed_and_keeps_its_mark() {
+        // FA: a `--set-band-gain` from a script between the offer and Enter; the rename found no
+        // autosave to move, the list read back dropped the `*`, and the edit was lost.
+        let (mut app, dir) = with_store();
+        add_user_preset(&mut app, "A");
+        app.handle(&[UiAction::SelectPreset(at(&app, "A"))]);
+        app.handle(&[UiAction::SetBandGain(2, 5.0)]);
+        let edited = gains(&app);
+
+        assert!(!app.rename_preset_opened_for(DeviceDirection::Output, "A", "Renamed"));
+        assert_eq!(names(&app), ["A"]);
+        assert!(app.state.presets[0].modified, "the edit keeps its mark");
+        assert_eq!(gains(&app), edited);
+
+        // Straight through `rename_preset` too, which the command line reaches after its check.
+        app.rename_preset("Renamed");
+        assert_eq!(names(&app), ["A"]);
+        assert!(app.state.presets[0].modified);
+        assert!(!dir.path().join("user/Renamed.fac").exists());
+    }
+
+    #[test]
+    fn picking_the_selected_preset_again_keeps_its_unsaved_edits_and_its_mark() {
+        // FA: the combo, the tray, `--preset` and D-Bus all pick the ticked row again; that
+        // reloaded it from its file, and with no autosave yet the edits and the `*` were gone.
+        let (mut app, dir) = with_store();
+        add_user_preset(&mut app, "Mine");
+        let mine = at(&app, "Mine");
+        app.handle(&[UiAction::SelectPreset(mine)]);
+        app.handle(&[
+            UiAction::SetBandGain(1, 4.0),
+            UiAction::SetBandGain(3, -5.0),
+            UiAction::SetBandGain(6, 7.0),
+        ]);
+        assert!(app.state.presets[mine].modified);
+        assert!(
+            music_autosaves(&dir).is_empty(),
+            "the scenario: no stash yet"
+        );
+        let edited = gains(&app);
+
+        app.handle(&[UiAction::SelectPreset(mine)]);
+        assert_eq!(gains(&app), edited, "the window's pick");
+        assert!(app.state.presets[mine].modified, "still marked");
+
+        app.handle_tray(crate::tray::TrayCommand::SelectPreset {
+            direction: DeviceDirection::Output,
+            name: "Mine".to_owned(),
+        });
+        app.cycle_preset(true);
+        let outcome = crate::commands::run(
+            &mut app,
+            &[crate::cli::Command::Preset(PresetCommand::Select(
+                "Mine".to_owned(),
+            ))],
+        );
+        assert!(!outcome.failed, "{outcome:?}");
+        assert_eq!(
+            gains(&app),
+            edited,
+            "the tray, a lone --next-preset and --preset"
+        );
+        assert!(app.state.presets[mine].modified);
+        assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Mine"));
+    }
+
+    #[test]
+    fn picking_another_preset_after_editing_one_still_stashes_the_edits() {
+        let (mut app, dir) = with_store();
+        add_user_preset(&mut app, "Mine");
+        add_user_preset(&mut app, "Other");
+        app.handle(&[UiAction::SelectPreset(at(&app, "Mine"))]);
+        app.handle(&[UiAction::SetBandGain(2, 6.0)]);
+        let edited = gains(&app);
+
+        app.handle(&[UiAction::SelectPreset(at(&app, "Other"))]);
+        assert_eq!(music_autosaves(&dir), ["Mine.fac"]);
+        app.handle(&[UiAction::SelectPreset(at(&app, "Mine"))]);
+        assert_eq!(gains(&app), edited);
+        assert!(app.state.presets[at(&app, "Mine")].modified);
+    }
+
+    #[test]
     fn importing_a_folder_copies_new_presets_and_skips_taken_names() {
         let (mut app, dir) = with_store();
         add_user_preset(&mut app, "Mine");
@@ -7656,6 +7830,51 @@ mod tests {
         assert_eq!(app.state.preset().map(|p| p.name.as_str()), Some("Mine"));
         assert!(dir.path().join("user/Fresh.fac").is_file());
         assert!(app.handle_import(&PresetsAction::CloseImport, &mut state));
+    }
+
+    #[test]
+    fn two_files_in_one_import_that_come_out_as_one_name_import_the_first_and_skip_the_second() {
+        // FA: the names were checked against the list the picker showed before the import, so
+        // the second file passed and was saved over the first.
+        let (mut app, dir) = with_store();
+        let incoming = dir.path().join("incoming");
+        std::fs::create_dir_all(&incoming).unwrap();
+        let long = "Rock Ballad Extended Night Mix For The Living Room Speakers 2026";
+        let stems = [
+            format!("{long} v1"),
+            format!("{long} v2"),
+            "Rock".to_owned(),
+            "rock".to_owned(),
+        ];
+        for (gain, stem) in stems.iter().enumerate() {
+            let preset = Preset {
+                name: stem.clone(),
+                main_midi: [u8::try_from(gain + 1).unwrap(), 0, 0, 0, 0, 0],
+                ..Preset::default()
+            };
+            fxsound_preset::save(&preset, &incoming.join(format!("{stem}.fac"))).unwrap();
+        }
+        let cut = fxsound_preset::new_preset_name(&stems[0]);
+        assert_eq!(cut, fxsound_preset::new_preset_name(&stems[1]), "one name");
+
+        let mut summary = app.import_presets(&incoming).expect("import ran");
+        summary.imported.sort();
+        summary.skipped.sort();
+
+        assert_eq!(summary.imported, ["Rock", cut.as_str()]);
+        assert_eq!(summary.skipped, [stems[1].as_str(), "rock"]);
+        assert_eq!(names(&app), ["Rock", cut.as_str()]);
+        let (kept, _) = app.presets.load(&cut).expect("load");
+        assert_eq!(
+            kept.main_midi[0], 1,
+            "the first file's preset, not the second's"
+        );
+        let backups = std::fs::read_dir(dir.path().join("user"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().to_string_lossy().ends_with(".bak"))
+            .count();
+        assert_eq!(backups, 0, "nothing was overwritten");
     }
 
     #[test]
@@ -8662,6 +8881,63 @@ mod tests {
     }
 
     #[test]
+    fn a_band_dragged_during_a_solo_edits_nothing_of_the_curve_that_came_from_outside() {
+        // FA: the test above holds the pointer still. Dragged a little first — an edit, as a
+        // drag during a solo is — the press went on writing the pointer's gain into the same
+        // band of the preset, the ladder or the lane that came from outside meanwhile.
+        use eframe::egui::{Event, pos2};
+        use fxsound_ui::widgets::equalizer::EqLayout;
+        type Outside = (&'static str, fn(&mut App));
+        let outside: [Outside; 3] = [
+            ("a preset from the tray", |app| {
+                let at = app
+                    .state
+                    .presets
+                    .iter()
+                    .position(|p| p.name == "Alpha")
+                    .expect("listed");
+                app.handle(&[UiAction::SelectPreset(at)]);
+            }),
+            ("a band count from the command line", |app| {
+                app.handle(&[UiAction::SetBandCount(15)]);
+            }),
+            ("the microphone from D-Bus", |app| {
+                app.handle(&[UiAction::SetEditDirection(IN)]);
+            }),
+        ];
+        for (what, from_outside) in outside {
+            let (mut app, _engine, _dir) = started_with(saved_settings(OUT));
+            app.handle(&[UiAction::SetBandGain(4, 5.0)]);
+            let mut window = Window::new(&mut app);
+            window.solo(&mut app, 4);
+            let layout = EqLayout::new(app.state.eq_bands.len());
+            let thumb = fxsound_ui::layout::pro::equalizer().min
+                + pos2(layout.center_x(4), layout.gain_to_y(5.0)).to_vec2();
+            let up = thumb - eframe::egui::vec2(0.0, 13.0);
+            window.frame(&mut app, vec![Event::PointerMoved(up)]);
+            assert_ne!(
+                app.state.eq_bands[4].boost_db, 5.0,
+                "{what}: the drag is an edit"
+            );
+
+            from_outside(&mut app);
+            let loaded = curve_gains(&app);
+            let modified = app.state.preset().is_some_and(|p| p.modified);
+            window.frame(&mut app, Vec::new());
+            for dy in [20.0, 40.0] {
+                let moved = up - eframe::egui::vec2(0.0, dy);
+                window.frame(&mut app, vec![Event::PointerMoved(moved)]);
+            }
+            assert_eq!(curve_gains(&app), loaded, "{what}: no band of it was set");
+            assert_eq!(
+                app.state.preset().is_some_and(|p| p.modified),
+                modified,
+                "{what}: nor was its preset marked"
+            );
+        }
+    }
+
+    #[test]
     fn the_application_tells_the_window_each_time_it_ends_a_solo_and_only_then() {
         let (mut app, _engine, _dir) = started_with(saved_settings(OUT));
         let at_start = app.state.eq_solo_generation;
@@ -9537,11 +9813,13 @@ mod tests {
         let published = |engine: &FakeEngine| engine.params().expect("published").master_gain_db;
         assert_eq!(published(&engine), 4.0);
 
-        app.handle(&[UiAction::SetMasterGain(12.0), UiAction::SelectPreset(0)]);
+        // Undone rather than picked again: picking the selected preset changes nothing (review
+        // FA), where it used to read the preset again and drop the edit.
+        app.handle(&[UiAction::SetMasterGain(12.0), UiAction::UndoPresetChanges]);
         assert_eq!(
             engine.input_params().expect("published").makeup_db,
             9.0,
-            "Loud picked again"
+            "Loud read again"
         );
         app.handle(&[UiAction::SetMasterGain(12.0)]);
         assert_eq!(engine.input_params().expect("published").makeup_db, 12.0);

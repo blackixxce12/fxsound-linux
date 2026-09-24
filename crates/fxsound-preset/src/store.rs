@@ -430,7 +430,9 @@ impl<F: PresetFile> Store<F> {
     /// A name that would take another listed preset's file is refused, as [`Store::save_as`]
     /// refuses it; the preset's own file is not another's, so a change of case alone is allowed.
     /// An unlisted file already under the new name is set aside as `<file>.1.bak` or the next free
-    /// number ([`trash::set_aside`]), never over a `.bak` already there.
+    /// number ([`trash::set_aside`]), never over a `.bak` already there. An autosave already under
+    /// the new name, when the preset brings none of its own, goes to the trash the way a deleted
+    /// preset's does: it holds another preset's edits, never this one's.
     ///
     /// # Errors
     /// `old` is not a user preset, `new` leaves nothing to file it under or is another preset's
@@ -466,8 +468,8 @@ impl<F: PresetFile> Store<F> {
         std::fs::rename(&from, &to)?;
 
         let old_autosave = self.autosave_path(old);
+        let new_autosave = self.autosave_dir.join(&file);
         if old_autosave.is_file() {
-            let new_autosave = self.autosave_dir.join(&file);
             let moved = F::load(&old_autosave).and_then(|mut stash| {
                 stash.set_name(new);
                 stash.save(&old_autosave)?;
@@ -476,6 +478,19 @@ impl<F: PresetFile> Store<F> {
             });
             if let Err(err) = moved {
                 log::warn!("{}: {err}", old_autosave.display());
+            }
+        } else if new_autosave.is_file() {
+            // An autosave already under the new name is not this preset's: a 0.3.0 microphone
+            // curve stashed under a voice preset's name, the edits of a preset deleted by hand or
+            // one whose autosave the trash would not take. Left there, it would be read as the
+            // renamed preset's unsaved changes — the `*` on a preset that had none, and its curve
+            // loaded in place of the file's on the next pick or start (0.4.0 review FA). It goes
+            // where a deleted preset's edits go, not over them.
+            if let Err(err) = self.discard(&new_autosave) {
+                log::warn!("{}: {err}; removing it", new_autosave.display());
+                if let Err(err) = std::fs::remove_file(&new_autosave) {
+                    log::warn!("{}: {err}", new_autosave.display());
+                }
             }
         }
         self.rescan();
@@ -490,9 +505,17 @@ impl<F: PresetFile> Store<F> {
     /// copy too (0.4.0 audit #15): a file called `a:b.fac` used to be imported as `ab.fac` with
     /// `a:b` inside it, a name the Windows build could never file.
     ///
+    /// An import adds a preset and never replaces one of the user's: a name a user preset already
+    /// has, or a file already in the user directory — which on a filesystem that folds case is
+    /// also `rock.fac` when `Rock.fac` is there — is refused rather than handed to
+    /// [`Store::save_as`], whose overwrite would leave the earlier preset only in a `.bak` the
+    /// list does not show. A factory preset's name can still be taken, as a save can take it: the
+    /// user's copy then stands in for the factory one. The controller refuses that too, and any
+    /// name already listed in another case, before it asks.
+    ///
     /// # Errors
-    /// The file does not parse, its name leaves nothing to file it under, or it cannot be saved
-    /// into the user directory.
+    /// The file does not parse, its name leaves nothing to file it under, is a user preset's or
+    /// another listed preset's file, or the copy cannot be saved into the user directory.
     pub fn import(&mut self, source: &Path) -> Result<String, F::Error> {
         let preset = F::load(source)?;
         let name = new_preset_name(
@@ -501,6 +524,18 @@ impl<F: PresetFile> Store<F> {
                 .and_then(|s| s.to_str())
                 .unwrap_or_else(|| preset.name()),
         );
+        let to = self.user_dir.join(Self::file_name(&name)?);
+        if self
+            .find(&name)
+            .is_some_and(|entry| entry.source == PresetSource::User)
+            || to.exists()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{name}: {} is already there", to.display()),
+            )
+            .into());
+        }
         self.save_as(&preset, &name)?;
         Ok(name)
     }
@@ -1417,6 +1452,42 @@ mod tests {
     }
 
     #[test]
+    fn a_rename_onto_a_name_with_a_leftover_autosave_leaves_the_preset_unmodified() {
+        // FA: 0.3.0 stashed microphone curves as `.fac` autosaves under voice preset names; a
+        // clean preset renamed to one of them inherited it as its own unsaved changes.
+        let tmp = tempdir("rename-leftover-autosave");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let preset = Preset {
+            name: "My EQ".into(),
+            main_midi: [10, 0, 0, 0, 0, 0],
+            ..Preset::default()
+        };
+        store.save_as(&preset, "My EQ").expect("save");
+        let leftover = Preset {
+            name: "Podcast".into(),
+            main_midi: [77, 0, 0, 0, 0, 0],
+            ..Preset::default()
+        };
+        store.autosave(&leftover).expect("the leftover");
+        store.rescan();
+        assert!(!store.find("My EQ").expect("listed").modified);
+
+        store.rename("My EQ", "Podcast").expect("rename");
+
+        let entry = store.find("Podcast").expect("listed");
+        assert!(!entry.modified, "no unsaved changes came from the leftover");
+        assert!(!store.autosave_path("Podcast").exists());
+        let (loaded, from_autosave) = store.load("Podcast").expect("load");
+        assert!(!from_autosave);
+        assert_eq!(loaded.main_midi, preset.main_midi, "the preset's own curve");
+        let trashed = tmp.join("user/.Trash/files");
+        assert!(
+            std::fs::read_dir(&trashed).is_ok_and(|mut files| files.next().is_some()),
+            "the leftover went to the trash, not nowhere"
+        );
+    }
+
+    #[test]
     fn a_rename_onto_another_presets_file_is_refused_and_changes_nothing() {
         let tmp = tempdir("rename-shared");
         let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
@@ -1439,6 +1510,76 @@ mod tests {
         // A factory preset has no file of the user's to rename.
         let mut with_factory = store_in(&tmp.join("factory-case"));
         assert!(with_factory.rename("Jazz", "Jazz 2").is_err());
+    }
+
+    #[test]
+    fn an_import_never_writes_over_a_user_preset_or_a_file_already_in_the_user_directory() {
+        // FA: two files that come out as one new name went through `save_as`'s overwrite, and the
+        // second replaced the first, which was left only in a `.bak` the list does not show.
+        let tmp = tempdir("import-never-over");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let from = tmp.join("from");
+        std::fs::create_dir_all(from.join("again")).expect("mkdir");
+        let first = Preset {
+            name: "first".into(),
+            main_midi: [10, 0, 0, 0, 0, 0],
+            ..Preset::default()
+        };
+        let second = Preset {
+            name: "second".into(),
+            main_midi: [20, 0, 0, 0, 0, 0],
+            ..Preset::default()
+        };
+        crate::save(&first, &from.join("Night.fac")).expect("write the first");
+        crate::save(&second, &from.join("again/Night.fac")).expect("write the second");
+
+        assert_eq!(
+            store.import(&from.join("Night.fac")).expect("import"),
+            "Night"
+        );
+        let err = store.import(&from.join("again/Night.fac")).unwrap_err();
+        assert!(
+            matches!(&err, PresetError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists),
+            "{err}"
+        );
+        let (kept, _) = store.load("Night").expect("load");
+        assert_eq!(kept.main_midi, first.main_midi, "the first import stays");
+        assert!(
+            !tmp.join("user/Night.fac.bak").exists(),
+            "nothing was set aside"
+        );
+
+        // A file in the user directory the list does not hold is not written over either.
+        std::fs::write(tmp.join("user/Loose.fac"), "not a preset").expect("write");
+        store.rescan();
+        crate::save(&first, &from.join("Loose.fac")).expect("write the source");
+        assert!(store.import(&from.join("Loose.fac")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("user/Loose.fac")).expect("read"),
+            "not a preset"
+        );
+    }
+
+    #[test]
+    fn an_import_may_still_stand_in_for_a_factory_preset_of_the_same_name() {
+        let tmp = tempdir("import-over-factory");
+        let mut store = store_in(&tmp);
+        assert_eq!(
+            store.find("Jazz").expect("listed").source,
+            PresetSource::Factory
+        );
+        let source_dir = tmp.join("from");
+        std::fs::create_dir_all(&source_dir).expect("mkdir");
+        crate::save(&Preset::default(), &source_dir.join("Jazz.fac")).expect("write the source");
+
+        assert_eq!(
+            store.import(&source_dir.join("Jazz.fac")).expect("import"),
+            "Jazz"
+        );
+        assert_eq!(
+            store.find("Jazz").expect("listed").source,
+            PresetSource::User
+        );
     }
 
     #[test]

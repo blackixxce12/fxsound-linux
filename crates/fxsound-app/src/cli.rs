@@ -31,8 +31,11 @@
 //!    command line but `--status` shows and raises the window (`FxController.cpp:523-531`), so a
 //!    keybind that runs `fxsound --preset=Gaming` pulled the window over the game each time. Here
 //!    an option that sets something — a preset, the power, a device, an effect, a band, a level,
-//!    the language — does it silently; `--show`, `--view` and a line with no options at all raise
-//!    the window, `--toggle-window` toggles it and `--hide` hides it ([`Cli::window_command`]).
+//!    the language — does it silently, and a line of nothing else that starts FxSound starts it in
+//!    the tray ([`Cli::only_sets_things`]); `--show`, `--view` and a line with no options at all
+//!    raise the window, `--toggle-window` toggles it and `--hide` hides it
+//!    ([`Cli::window_command`]). At a start `--view` sets the layout and the window follows the
+//!    remembered tray state, unless `--show` is given too ([`Cli::cold_start_commands`]).
 //! 5. **One preset option per line** (audit #30). Windows takes the first of `--preset`,
 //!    `--save_preset`, `--overwrite_preset`, `--undo_preset`, `--rename_preset` and
 //!    `--delete_preset` and silently drops the rest (`FxController.cpp:393-448`); here a second one
@@ -209,12 +212,14 @@ pub struct Cli {
     ///
     /// Linux addition (0.4.0 audit #34). By `node.name` or description, playback devices and
     /// microphones alike; a device that is connected is refused, since FxSound would learn it
-    /// again at once.
+    /// again at once. Not with `--status`, `--watch`, `--self-test` or `--list-apps`: a report
+    /// runs alone, and the device would not be forgotten.
     #[arg(
         long = "forget-device",
         alias = "forget_device",
         value_name = "DEVICE",
-        value_parser = parse_device_name
+        value_parser = parse_device_name,
+        conflicts_with = "report"
     )]
     pub forget_device: Option<String>,
 
@@ -847,6 +852,16 @@ impl Cli {
             .collect()
     }
 
+    /// `true` for a line that sets something and says nothing about the window: no `--show`,
+    /// `--view`, `--hide`, `--toggle-window` or `--run_minimized`, no question, and not a bare
+    /// `fxsound` ([`Cli::window_command`] is `None` for it). A running instance leaves its window
+    /// alone for such a line (0.4.0 audit R11), and a cold start from one starts in the tray
+    /// rather than putting a window over the game whose keybinding ran it (review FA).
+    #[must_use]
+    pub fn only_sets_things(&self) -> bool {
+        !self.is_query() && self.window_command().is_none()
+    }
+
     /// `true` when this invocation only asks for state and must not disturb the window.
     #[must_use]
     pub const fn is_status(&self) -> bool {
@@ -1029,7 +1044,7 @@ fn parse_app_rule(value: &str) -> Result<AppRuleArg, String> {
 
 /// `--preset`'s value: a name, which has to be there. 0.3.0 and the original took `--preset=` as no
 /// command at all and exited 0 (`FxController.cpp:397`); D-Bus's `SetPreset` already refused it.
-fn parse_preset_name(value: &str) -> Result<String, String> {
+pub(crate) fn parse_preset_name(value: &str) -> Result<String, String> {
     if value.trim().is_empty() {
         Err("a preset name cannot be empty".to_owned())
     } else {
@@ -1741,6 +1756,40 @@ mod tests {
             assert!(
                 !commands.iter().any(|c| matches!(c, Command::Window(_))),
                 "{quiet:?} must not touch the window: {commands:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_that_only_sets_something_starts_fxsound_in_the_tray_and_the_rest_do_not() {
+        // FA: R11 covered a running instance; a cold start from `fxsound --preset=Gaming` still
+        // opened and focused the window over the game.
+        for quiet in [
+            &["--preset=Gaming"][..],
+            &["--toggle-power"][..],
+            &["--power=toggle"][..],
+            &["--next-preset"][..],
+            &["--output=Speakers"][..],
+            &["--forget-device=Old Dock", "--preset=Night"][..],
+            &["--edit=input", "--noise-suppression=strong"][..],
+        ] {
+            assert!(parse(quiet).only_sets_things(), "{quiet:?}");
+        }
+        for about_the_window in [
+            &[][..],
+            &["--show"][..],
+            &["--view=2"][..],
+            &["--preset=Gaming", "--show"][..],
+            &["--hide"][..],
+            &["--run_minimized"][..],
+            &["--toggle-window"][..],
+            &["--activated"][..],
+            &["--status"][..],
+            &["--output="][..],
+        ] {
+            assert!(
+                !parse(about_the_window).only_sets_things(),
+                "{about_the_window:?}"
             );
         }
     }

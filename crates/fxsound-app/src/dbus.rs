@@ -218,12 +218,11 @@ impl Call {
             })],
             Self::NextPreset => vec![Command::Preset(PresetCommand::Next)],
             Self::PrevPreset => vec![Command::Preset(PresetCommand::Previous)],
-            Self::SetPreset(name) => {
-                if name.is_empty() {
-                    return Err("a preset name cannot be empty".to_owned());
-                }
-                vec![Command::Preset(PresetCommand::Select(name.clone()))]
-            }
+            // Read as `--preset` reads its value: a name that is only blanks is as empty as none,
+            // and an invalid argument there too rather than an unknown preset (0.4.0 review FA).
+            Self::SetPreset(name) => vec![Command::Preset(PresetCommand::Select(
+                cli::parse_preset_name(name)?,
+            ))],
             Self::GetPreset | Self::GetStatus | Self::ListPresets | Self::ListDevices => {
                 vec![status()]
             }
@@ -1479,6 +1478,23 @@ mod tests {
     fn set_preset_with_an_empty_name_is_an_invalid_argument_rather_than_nothing() {
         let why = Call::SetPreset(String::new()).commands().unwrap_err();
         assert!(why.contains("empty"), "{why}");
+    }
+
+    #[test]
+    fn set_preset_with_a_name_of_blanks_is_an_invalid_argument_as_preset_says() {
+        // FA: `SetPreset(" ")` went to the instance and came back `Error.Refused`, "no preset
+        // called", where `fxsound --preset=" "` is a bad argument.
+        for blank in [" ", "   ", "\t"] {
+            let why = Call::SetPreset(blank.to_owned()).commands().unwrap_err();
+            assert!(
+                why.contains("a preset name cannot be empty"),
+                "{blank:?}: {why}"
+            );
+        }
+        let parsed = Cli::try_parse_from(["fxsound", "--preset", " "])
+            .unwrap_err()
+            .to_string();
+        assert!(parsed.contains("a preset name cannot be empty"), "{parsed}");
     }
 
     #[test]

@@ -687,11 +687,15 @@ pub const NOT_RUNNING: &str = "FxSound is not running";
 /// * `--status` and `--watch` have nobody to ask, and starting FxSound to answer would be the
 ///   opposite of what was asked: [`NOT_RUNNING`], and a failure.
 /// * `--quit` has nothing to stop: [`NOT_RUNNING`] too, but what was asked for is true already,
-///   so not a failure. The rest of that line is not carried out.
+///   so not a failure. A `--forget-device` on that line is still done to the settings file, as a
+///   running FxSound forgets the device before it quits (0.4.0 review FA), and its refusal is
+///   the line's; the rest of the line is not carried out.
 /// * `--forget-device` alone is done to the settings file at `settings`
 ///   ([`forget_in_the_settings_file`]), and nothing starts: the script or keybind that ran it
 ///   hears whether it worked and goes on, rather than becoming FxSound. Beside options that
-///   start FxSound it is done the same way before they do (`main`), so it is not here.
+///   start FxSound it is done the same way before they do (`main`), so it is not here. Beside
+///   `--status`, `--watch`, `--self-test` or `--list-apps` it is a parse error, since a report
+///   runs alone and would drop it (`Cli`).
 ///
 /// `--self-test` is not here: `main` answers it before it tries the lock at all.
 #[must_use]
@@ -703,10 +707,19 @@ pub fn answer_without_an_instance(
     match commands {
         [Command::ListApps { json }] => Some(store_listing(store, *json)),
         [Command::Status { .. } | Command::Watch { .. }] => Some(Outcome::refused(NOT_RUNNING)),
-        _ if commands.contains(&Command::Quit) => Some(Outcome {
-            stderr: NOT_RUNNING.to_owned(),
-            ..Outcome::default()
-        }),
+        _ if commands.contains(&Command::Quit) => {
+            let forgotten = forget_in_the_settings_file(commands, settings);
+            let stderr = if forgotten.stderr.is_empty() {
+                NOT_RUNNING.to_owned()
+            } else {
+                format!("{}\n{NOT_RUNNING}", forgotten.stderr)
+            };
+            Some(Outcome {
+                stderr,
+                failed: forgotten.failed,
+                ..Outcome::default()
+            })
+        }
         [_, ..]
             if commands
                 .iter()
@@ -4378,18 +4391,51 @@ mod tests {
     }
 
     #[test]
-    fn quit_beside_forget_device_without_an_instance_says_not_running_and_forgets_nothing() {
+    fn quit_beside_forget_device_without_an_instance_forgets_the_device_and_says_not_running() {
+        // FA: a running FxSound forgets the device and then quits; with none running the line
+        // was answered by `--quit` alone, exit 0, and the device stayed in the settings file.
         let dir = tempfile::tempdir().expect("scratch directory");
         let path = dir.path().join("settings.toml");
         settings_with_a_dock(&path);
-        let answer = forget_without_an_instance(&["--quit", "--forget-device=USB Dock"], &path)
+        let answer = forget_without_an_instance(&["--forget-device=USB Dock", "--quit"], &path)
             .expect("answered, nothing started");
         assert_eq!(answer.stderr, NOT_RUNNING);
+        assert!(!answer.failed);
         assert_eq!(
-            remembered(&path).len(),
-            3,
-            "the rest of the line is not carried out"
+            remembered(&path),
+            [("alsa_output.speakers".to_owned(), OUT)],
+            "forgotten from the file, as the running instance would have"
         );
+    }
+
+    #[test]
+    fn quit_beside_a_forget_device_the_settings_file_refuses_fails_with_both_words() {
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let path = dir.path().join("settings.toml");
+        settings_with_a_dock(&path);
+        let answer = forget_without_an_instance(&["--forget-device=Nothing Here", "--quit"], &path)
+            .expect("answered, nothing started");
+        assert!(answer.failed, "the refusal is the line's");
+        assert!(
+            answer
+                .stderr
+                .contains("neither device priority list has a device called"),
+            "{}",
+            answer.stderr
+        );
+        assert!(answer.stderr.ends_with(NOT_RUNNING), "{}", answer.stderr);
+        assert_eq!(remembered(&path).len(), 3);
+    }
+
+    #[test]
+    fn a_report_beside_forget_device_is_a_parse_error_rather_than_a_silent_drop() {
+        // FA: `--status --forget-device=Dock` printed the status, exit 0, and forgot nothing.
+        for report in ["--status", "--watch", "--list-apps", "--self-test"] {
+            let parsed =
+                crate::cli::Cli::try_parse_from(["fxsound", report, "--forget-device=Dock"]);
+            let err = parsed.expect_err(report);
+            assert_eq!(err.exit_code(), 2, "{report}: {err}");
+        }
     }
 
     #[test]

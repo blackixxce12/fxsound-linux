@@ -61,17 +61,24 @@ a way to drive an instance that is already running.
 .PP
 Only what asks for the window brings it up: a command line with no options, as
 a launcher runs it,
-.B \-\-show
+.BR \-\-show ,
 and
-.BR \-\-view .
+.B \-\-view
+for a running instance.
 Every option that sets something \(en a preset, the power, a device, an effect,
 a band, a level, the language \(en does it without raising the window, so a
 keybinding that runs
 .B fxsound \-\-preset=Gaming
 leaves the game in front; add
 .B \-\-show
-to have the window too. The Windows build raises its window for every option
-but
+to have the window too. When such a command line is what starts FxSound, it
+starts in the tray; with no tray icon after a few seconds (GNOME without an
+AppIndicator extension) the window comes up minimised instead, so that FxSound
+is not left running with nothing on screen. At a start,
+.B \-\-view
+sets the layout and the window follows the remembered tray state, unless
+.B \-\-show
+is given too. The Windows build raises its window for every option but
 .BR \-\-status .
 .BR \-\-status ", " \-\-watch " and " \-\-list\-apps
 print and exit without touching the window, and
@@ -296,7 +303,12 @@ devices, and refuses it only if no list comes.
 With no FxSound running, the device is forgotten from the settings file and
 nothing starts, and the exit status says whether it was: nothing is attached
 to any device then, so none counts as connected. Beside options that start
-FxSound, it is done the same way before they are.
+FxSound, it is done the same way before they are, and beside
+.B \-\-quit
+too, as a running FxSound forgets the device before it quits. It cannot be
+combined with
+.BR \-\-status ", " \-\-watch ", " \-\-self\-test " or " \-\-list\-apps ,
+which run alone; such a command line is an error.
 .TP
 .BI \-\-edit= output|input
 Choose the edit direction: the lane the window shows and the preset and effect
@@ -309,7 +321,13 @@ overrides. Without either, a forwarded command line acts on whichever direction
 the instance is already editing.
 .TP
 .BI \-\-view= 1|2
-Switch the window between the Lite (1) and Pro (2) layouts, and show it.
+Switch the window between the Lite (1) and Pro (2) layouts. A running
+instance shows its window too; at a start, the window follows the remembered
+tray state (see
+.BR \-\-run_minimized )
+unless
+.B \-\-show
+is given.
 .TP
 .BI \-\-language= CODE|system
 Display language:
@@ -341,8 +359,9 @@ file invoke, so that a bus call arriving while an instance started from the
 launcher is still starting does not hide its window.
 .TP
 .B \-\-show
-Show and raise the window of the running instance, or, starting FxSound, show
-the window even though it was in the tray when FxSound was last quit.
+Show and raise the window of the running instance \(en a minimised one
+included \(en or, starting FxSound, show the window even though it was in the
+tray when FxSound was last quit.
 .SS Applications
 .PP
 Every application that plays or records through FxSound is remembered, and
@@ -584,12 +603,20 @@ found at least one failing check,
 .B \-\-list\-apps
 with no FxSound running found a store it could not read,
 .B \-\-forget\-device
-on its own with no FxSound running found no such device or a settings file it
-could not read or write, or FxSound itself could not start.
+with no FxSound running (on its own or beside
+.BR \-\-quit )
+found no such device or a settings file it could not read or write, or FxSound
+itself could not start.
 .TP
 .B 2
 The command line could not be parsed \(en an unknown option, a value outside
-its range, an unknown language, two preset options, or an empty preset name.
+its range, an unknown language, two preset options, an empty preset name, an
+empty device name for
+.BR \-\-forget\-device ,
+or
+.B \-\-forget\-device
+beside
+.BR \-\-status ", " \-\-watch ", " \-\-self\-test " or " \-\-list\-apps .
 .SH STATUS DOCUMENT
 .B \-\-status \-\-json
 prints one JSON object. D-Bus
@@ -1124,9 +1151,11 @@ are the ways out. With a tray icon on screen the minimise button hides the
 window into the tray as well; without one \(en GNOME without an AppIndicator
 extension \(en it minimises the window, as the Windows build's does, so that
 the window cannot vanish with nothing left to bring it back. Where a window was
-hidden with no tray icon,
+hidden or minimised with no tray icon,
 .B fxsound \-\-show
-or launching FxSound again brings it back. The tray menu lists the playback
+or launching FxSound again brings it back; on Wayland, where an application
+cannot take its own window out of the minimised state, as a fresh window in its
+place. The tray menu lists the playback
 devices under
 .B Playback Device Select
 and the microphones under
