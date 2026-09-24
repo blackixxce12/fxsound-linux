@@ -35,6 +35,10 @@ NEW_PRESET_DIR="${FXSV_NEW_PRESETS:-$REPO_ROOT/assets/presets/BonusPresets}"
 OLD_REF="${FXSV_OLD_REF:-10b3d14^}"
 
 PROCESS_WAV="${FXSV_PROCESS_WAV:-$REPO_ROOT/target/release/examples/process_wav}"
+# The renderer for the "old" variant. The same one by default, which compares two
+# preset sets through one engine; point it at a process_wav built from an older
+# commit to compare two engines on one preset set instead (README: "Two engines").
+OLD_PROCESS_WAV="${FXSV_OLD_PROCESS_WAV:-$PROCESS_WAV}"
 
 # Where in the source track the excerpt starts, and how long it runs. Pick a busy
 # passage, not an intro. Per-genre overrides go in $MATERIAL_DIR/excerpts.csv as
