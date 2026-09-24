@@ -322,6 +322,66 @@ fn the_music_engine_allocates_nothing_whatever_the_power_and_equalizer_switches_
 }
 
 #[test]
+fn crossfading_a_new_band_count_or_the_equalizer_switch_allocates_nothing() {
+    // Audit #11: once audio has passed, a new band count plays the old ladder out beside the new
+    // one, a second new count in the middle of that moves the new ladder section by section, the
+    // equalizer's switch fades the block through a dry copy of the buffer, and a stage left out
+    // with the power off lands its crossfades. Each of those paths runs here, mid-fade, in blocks
+    // larger than the dry copy holds, on the data thread.
+    let mut engine = Engine::new(FS, 4_096, 6);
+    let input: Vec<f32> = stereo_fixture(4_096 * 3)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|pair| [pair[0], pair[1], pair[0], pair[1], pair[0], pair[1]])
+        .collect();
+    let curve = |bands: usize, boost: f32| -> Vec<EqBand> {
+        (0..bands)
+            .map(|band| EqBand::new(30.0 * 1.25_f32.powi(band as i32), boost))
+            .collect()
+    };
+    let snapshot = |bands: usize, boost: f32, power: bool, eq_on: bool| {
+        let mut params = DspParams {
+            power,
+            eq_on,
+            master_gain_db: -3.0,
+            volume_leveling_db: 2.0,
+            ..DspParams::default()
+        };
+        params.set_bands(&curve(bands, boost));
+        params.sanitise();
+        params
+    };
+    // Each snapshot is followed by 64 frames, which leave its fades running; `true` adds one
+    // large block, which ends them. So the second band count arrives mid-crossfade and the
+    // equalizer is switched back on while it is still fading out.
+    let snapshots = [
+        (snapshot(10, 6.0, true, true), true),
+        (snapshot(31, 6.0, true, true), false),
+        (snapshot(10, -3.0, true, true), true),
+        (snapshot(10, -3.0, true, false), false),
+        (snapshot(10, -3.0, true, true), true),
+        (snapshot(20, 4.0, true, true), false),
+        (snapshot(10, 2.0, false, true), true),
+        (snapshot(31, 2.0, false, false), false),
+        (snapshot(31, 2.0, true, true), true),
+    ];
+    let mut block = input.clone();
+    let n = allocations_on_a_fresh_thread(|| {
+        for (params, then_a_large_block) in &snapshots {
+            engine.apply(params);
+            block.copy_from_slice(&input);
+            let (head, tail) = block.split_at_mut(64 * 6);
+            engine.process(head, 6);
+            if *then_a_large_block {
+                engine.process(tail, 6);
+            }
+        }
+    });
+    assert_eq!(n, 0, "the crossfades allocated {n} times on the audio path");
+}
+
+#[test]
 fn switching_effects_off_and_on_and_naming_the_sides_allocates_nothing() {
     // An effect coming back from zero is cleared on the data thread — the reverb's tank on the
     // first block it runs — and a layout's sides can arrive between blocks; none of it may

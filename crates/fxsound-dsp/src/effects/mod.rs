@@ -78,17 +78,27 @@ pub trait Effect {
     /// The original carries this value as a 0..10 slider in the GUI and as MIDI 0..127 in presets
     /// and in the engine; both normalise to this range, and the conversion happens once, at the
     /// edges of the system.
+    ///
+    /// The effect glides to the new amount over [`crate::smooth::GLIDE_SECONDS`] rather than
+    /// jumping to it (audit report #11), and one taken to zero stays active until it has faded out.
+    /// [`Effect::settle`] lands it at once.
     fn set_amount(&mut self, amount: Real);
+
+    /// Finish every glide at once, as if it had already run: for a stage nobody has heard yet,
+    /// where there is nothing to glide from. [`Chain`] calls it until audio has gone through.
+    fn settle(&mut self);
 
     fn amount(&self) -> Real;
 
     /// When `false`, [`Chain`] skips [`Effect::process`] entirely.
     ///
     /// The original bypasses each effect at a value of exactly zero by clearing its `*_on` flag
-    /// (`DfxDspPrivate.cpp:295-302`), which is a true bypass rather than a unity-gain pass.
+    /// (`DfxDspPrivate.cpp:295-302`), which is a true bypass rather than a unity-gain pass. Here
+    /// that bypass waits for the fade to zero to finish.
     fn is_active(&self) -> bool;
 
-    /// Clear all history without changing the design.
+    /// Clear all history without changing the design. A glide under way is history too: the
+    /// effect lands on its amount.
     fn reset(&mut self);
 
     /// Interleaved, in place, nominal range ±1.0.
@@ -110,6 +120,11 @@ pub struct Chain {
     dynamic_boost: DynamicBoost,
     sample_rate: Real,
     power: bool,
+    /// Audio has gone through since the chain was built or last cleared. Until it has, a new
+    /// amount lands at once (see [`crate::smooth`]). The chain keeps this rather than each effect,
+    /// because an effect switched off is heard too, as the signal it lets through, and only the
+    /// chain sees that.
+    heard: bool,
 }
 
 impl Chain {
@@ -124,6 +139,7 @@ impl Chain {
             dynamic_boost: DynamicBoost::new(sample_rate),
             sample_rate,
             power: true,
+            heard: false,
         }
     }
 
@@ -176,15 +192,20 @@ impl Chain {
         self.dynamic_boost.set_sample_rate(sample_rate);
     }
 
-    /// Set one effect from the GUI-facing enum.
+    /// Set one effect from the GUI-facing enum: gliding to the amount once the chain has been
+    /// heard, at once before.
     pub fn set_effect(&mut self, effect: EffectId, amount: Real) {
         let amount = amount.clamp(0.0, 1.0);
-        match effect {
-            EffectId::Fidelity => self.fidelity.set_amount(amount),
-            EffectId::Ambience => self.ambience.set_amount(amount),
-            EffectId::Surround => self.surround.set_amount(amount),
-            EffectId::DynamicBoost => self.dynamic_boost.set_amount(amount),
-            EffectId::Bass => self.bass.set_amount(amount),
+        let stage: &mut dyn Effect = match effect {
+            EffectId::Fidelity => &mut self.fidelity,
+            EffectId::Ambience => &mut self.ambience,
+            EffectId::Surround => &mut self.surround,
+            EffectId::DynamicBoost => &mut self.dynamic_boost,
+            EffectId::Bass => &mut self.bass,
+        };
+        stage.set_amount(amount);
+        if !self.heard {
+            stage.settle();
         }
     }
 
@@ -207,13 +228,14 @@ impl Chain {
         }
     }
 
-    /// Clear every effect's history.
+    /// Clear every effect's history. Until audio goes through again, a new amount lands at once.
     pub fn reset(&mut self) {
         self.fidelity.reset();
         self.ambience.reset();
         self.surround.reset();
         self.bass.reset();
         self.dynamic_boost.reset();
+        self.heard = false;
     }
 
     /// Total added latency. Only the limiter's look-ahead contributes.
@@ -231,6 +253,9 @@ impl Chain {
         if !self.power {
             // A true bypass: the original leaves the buffer untouched (`Play32.c:436-440`).
             return;
+        }
+        if !buffer.is_empty() {
+            self.heard = true;
         }
         if self.fidelity.is_active() {
             self.fidelity.process(buffer, channels);

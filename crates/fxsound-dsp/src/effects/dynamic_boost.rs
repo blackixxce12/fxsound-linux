@@ -83,6 +83,7 @@
 use super::Effect;
 use crate::biquad::{MAX_CHANNELS, Real};
 use crate::input::LookaheadLimiter;
+use crate::smooth::{Ramp, glide_frames};
 
 /// The permanent output ceiling, `MAXIMIZE_MAX_OUTPUT` (`Maxi32.c:91`, `Play32.c:411`).
 ///
@@ -171,8 +172,11 @@ const FALLBACK_SAMPLE_RATE: Real = 48_000.0;
 pub struct DynamicBoost {
     sample_rate: Real,
     amount: Real,
-    /// `s->gain_boost` — the static boost before any back-off.
-    gain_boost: Real,
+    /// `s->gain_boost` — the static boost before any back-off, gliding to a new amount over
+    /// [`crate::smooth::GLIDE_SECONDS`] (audit report #11). The original writes it between two
+    /// samples, so taking the slider from 0 to 6 stepped every sample by +11.6 dB at once and
+    /// handed the limiter a wall to catch.
+    gain_boost: Ramp,
     /// `s->max_delay` — look-ahead length in frames, and therefore the reported latency.
     max_delay: usize,
     /// `s->release_time_beta`.
@@ -198,7 +202,7 @@ impl DynamicBoost {
         let mut effect = Self {
             sample_rate: FALLBACK_SAMPLE_RATE,
             amount: 0.0,
-            gain_boost: 1.0,
+            gain_boost: Ramp::new(1.0),
             max_delay: 1,
             release_time_beta: 0.0,
             level: 0.0,
@@ -216,13 +220,14 @@ impl DynamicBoost {
         effect
     }
 
-    /// The static boost, linear, before the auto-gain backs it off — `s->gain_boost`.
+    /// The static boost, linear, before the auto-gain backs it off — `s->gain_boost`. Where a
+    /// glide is heading, when one runs.
     ///
     /// 1.0 at slider 0 and 3.8019 (+11.6 dB) from slider 6 upwards; see
     /// [`gain_boost_for_amount`].
     #[must_use]
     pub const fn gain_boost(&self) -> Real {
-        self.gain_boost
+        self.gain_boost.target()
     }
 
     /// The current level estimate as an RMS, `sqrt(s->level)`.
@@ -300,9 +305,10 @@ impl DynamicBoost {
     /// One sample of the level estimator plus the auto-gain back-off (`Maxi32.c:258-294`).
     ///
     /// `in_sqr` is the frame's detector power, [`detector_power`]: the mean square of the front
-    /// pair, where the original took the left channel alone.
+    /// pair, where the original took the left channel alone. `gain_boost` is this frame's static
+    /// boost, from the glide.
     #[inline]
-    fn update_gain(&mut self, in_sqr: Real) -> Real {
+    fn update_gain(&mut self, in_sqr: Real, gain_boost: Real) -> Real {
         // `level` is a one-pole recursion with no upper bound, and the floor below is a `<`
         // comparison — false for both NaN and `+inf`, so either value latches for the rest of the
         // session. With NaN the back-off never engages again; with `+inf` it pins the gain at
@@ -324,7 +330,7 @@ impl DynamicBoost {
         }
 
         let rms = self.level.sqrt() as Real;
-        if self.gain_boost * rms > TARGET_LEVEL {
+        if gain_boost * rms > TARGET_LEVEL {
             // `rms` is necessarily above `TARGET_LEVEL / gain_boost` to get here, so it is far
             // from zero and this division is safe.
             let backed_off = TARGET_LEVEL / rms;
@@ -333,14 +339,14 @@ impl DynamicBoost {
             // 4 — there is nothing to remove, so the floor is the static boost: the original's
             // flat 1.06 lifted loud material by half a decibel at a setting that promises none,
             // and stepped there the moment the level crossed −10 dBFS RMS.
-            let floor = MIN_BACKOFF_GAIN.min(self.gain_boost);
+            let floor = MIN_BACKOFF_GAIN.min(gain_boost);
             if backed_off < floor {
                 floor
             } else {
                 backed_off
             }
         } else {
-            self.gain_boost
+            gain_boost
         }
     }
 }
@@ -430,7 +436,10 @@ impl Effect for DynamicBoost {
 
     fn set_amount(&mut self, amount: Real) {
         self.amount = amount.clamp(0.0, 1.0);
-        self.gain_boost = gain_boost_for_amount(self.amount);
+        self.gain_boost.glide_to(
+            gain_boost_for_amount(self.amount),
+            glide_frames(self.sample_rate),
+        );
     }
 
     fn amount(&self) -> Real {
@@ -446,9 +455,14 @@ impl Effect for DynamicBoost {
         true
     }
 
+    fn settle(&mut self) {
+        self.gain_boost.settle();
+    }
+
     fn reset(&mut self) {
         self.limiter.reset();
         self.level = 0.0;
+        self.gain_boost.settle();
     }
 
     /// `Maxi32.c:237-482`, one frame at a time, in place.
@@ -468,7 +482,8 @@ impl Effect for DynamicBoost {
         for frame in buffer.chunks_exact_mut(channels) {
             // The auto-gain, and the permanent ceiling, folded into one multiply before the frame
             // reaches the delay line — exactly where `Maxi32.c:296-301` applies them.
-            let boost = self.update_gain(detector_power(frame)) * MAX_OUTPUT;
+            let gain_boost = self.gain_boost.advance();
+            let boost = self.update_gain(detector_power(frame), gain_boost) * MAX_OUTPUT;
             // Only as far as the limiter reaches. A channel past `MAX_CHANNELS` has no delay
             // line and no envelope, so boosting it would hand it an unlimited gain — it passes
             // through untouched instead, which is what the original's per-pair host guarantees and
@@ -1297,6 +1312,9 @@ mod tests {
     fn resetting_returns_the_effect_to_its_initial_response() {
         let mut boost = DynamicBoost::new(FS);
         boost.set_amount(0.4);
+        // Landed, as a chain that has not been heard lands it: the initial response is the
+        // amount's, not the 20 ms glide to it from 0 (audit report #11).
+        boost.settle();
 
         let input = sine(1_024, 2, 0.3, 700.0);
         let mut first = input.clone();
@@ -1398,5 +1416,32 @@ mod tests {
         }
 
         assert_eq!(whole, piecewise);
+    }
+
+    #[test]
+    fn a_new_amount_glides_to_its_boost_over_twenty_milliseconds() {
+        // Audit report #11. Slider 0 → 6 used to put the full +11.6 dB on the very next sample;
+        // the static boost now climbs to it in a straight line over 960 frames at 48 kHz, and is
+        // there, exactly, on the last of them. A quiet tone keeps the back-off and the limiter
+        // out of it, so the output follows the boost itself.
+        let mut boost = DynamicBoost::new(FS);
+        let mut quiet = sine(4_800, 2, 0.01, 50.0);
+        boost.process(&mut quiet, 2);
+        boost.set_amount(0.6);
+        assert!(
+            (boost.gain_boost() - 3.8019).abs() < 1e-3,
+            "the design moved at once"
+        );
+        let mut gains = Vec::new();
+        for _ in 0..960 {
+            gains.push(boost.gain_boost.advance());
+        }
+        assert!(
+            gains.windows(2).all(|pair| pair[1] > pair[0]),
+            "not a climb"
+        );
+        assert!(gains[0] < 1.01, "the first frame jumped to {}", gains[0]);
+        assert_eq!(gains[959].to_bits(), boost.gain_boost().to_bits());
+        assert!(!boost.gain_boost.is_gliding());
     }
 }

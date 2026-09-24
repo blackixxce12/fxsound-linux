@@ -65,6 +65,16 @@
 //!   high-pass and the tone splitters decay into the subnormal range and stay there, because a
 //!   one-pole's step rounds to nothing before the state reaches zero. Their state is flushed to zero
 //!   below [`DENORMAL_FLUSH`].
+//! * **#11 — switching the stage off lets the gain down over 20 ms.** The original clears the
+//!   state machine the moment the amount reaches 0 (`SosSet.cpp:281-340`) and the next buffer goes
+//!   through untouched, so a quiet passage lifted by 13 dB fell by 13 dB between one sample and
+//!   the next: a click, as a Master Gain step is. The gain being played now glides back to unity
+//!   over [`crate::smooth::GLIDE_SECONDS`] first; the state machine is cleared at once, as
+//!   before, and the buffers after the glide are untouched, as before. A stage its owner has
+//!   stopped running (FxSound or the equalizer switched off: [`VolumeLeveller::sit_out`]) is heard
+//!   by nobody, so switched off then it lets go at once, as before, and a glide it had started is
+//!   dropped: played when the stage came back, it would lift the level for 20 ms that the listener
+//!   last heard unlevelled.
 //!
 //! The original's RMS normaliser, which sat in front of this stage in `sosProcessBuffer`
 //! (`SosProcess.cpp:678-724`), is not ported: it runs only while `setNormalization` has moved its
@@ -85,6 +95,7 @@
 //! `GraphicEqSet.cpp:76-89`).
 
 use crate::biquad::{MAX_CHANNELS, Real};
+use crate::smooth::{Ramp, glide_frames};
 
 // ---------------------------------------------------------------------------------------------
 // The constant table, `SosProcess.cpp:38-76`.
@@ -654,6 +665,16 @@ pub struct VolumeLeveller {
     quiet_peak_bucket_seconds: Real,
     quiet_peak_history_index: usize,
     quiet_peak_history_count: usize,
+
+    /// The gain being played when the stage was switched off, gliding back to unity (audit #11).
+    /// Unity, and still, whenever the stage is on or has finished letting go.
+    release: Ramp,
+    /// The ceiling the stage was holding when it was switched off, which the glide keeps to.
+    release_ceiling: Real,
+    /// The stage has been run since it was built or its owner last left it out
+    /// ([`VolumeLeveller::sit_out`]): only then is the gain it holds the one being heard, and
+    /// only then does switching it off glide.
+    heard: bool,
 }
 
 impl VolumeLeveller {
@@ -701,6 +722,10 @@ impl VolumeLeveller {
             quiet_peak_bucket_seconds: 0.0,
             quiet_peak_history_index: 0,
             quiet_peak_history_count: 0,
+
+            release: Ramp::new(1.0),
+            release_ceiling: CEILING,
+            heard: false,
         }
     }
 
@@ -718,11 +743,32 @@ impl VolumeLeveller {
     /// `GraphicEqSetVolumeLeveling` (`GraphicEqSet.cpp:76-89`) clamps and scales, and
     /// `sosSetVolumeLeveling` (`SosSet.cpp:281-340`) clears the whole state machine when the
     /// resulting target is zero.
+    ///
+    /// The gain being played is not dropped with it (audit #11): it glides back to unity over
+    /// [`crate::smooth::GLIDE_SECONDS`], and only then is the stage the exact bypass it is at 0.
+    /// Switched back on before that, the stage starts from where the glide had got to. A stage
+    /// that is not being heard ([`VolumeLeveller::sit_out`]) has no gain being played to let
+    /// down, and is cleared at once, as the original clears it.
     pub fn set_amount(&mut self, amount: Real) {
+        let was_enabled = self.is_enabled();
         self.amount = clamp_real(amount, 0.0, MAX_AMOUNT);
         self.target_rms = target_rms_for_amount(self.amount);
         if self.target_rms <= 0.0 {
-            self.reset();
+            if was_enabled && !self.heard {
+                self.reset();
+            } else if was_enabled {
+                let playing = self.ramp.at(0);
+                let ceiling = self.effective_ceiling;
+                self.reset();
+                self.release_ceiling = ceiling;
+                self.release = Ramp::new(playing);
+                self.release.glide_to(1.0, glide_frames(self.sample_rate));
+            }
+        } else if self.release.is_gliding() {
+            let playing = self.release.value();
+            self.release = Ramp::new(1.0);
+            self.gain = playing;
+            self.ramp = GainRamp::hold(playing);
         }
     }
 
@@ -743,6 +789,21 @@ impl VolumeLeveller {
     #[must_use]
     pub const fn gain(&self) -> Real {
         self.gain
+    }
+
+    /// Tell the stage its owner ran a block without it: FxSound or the equalizer's block is
+    /// switched off, and the stage's state stands still until it is run again, as the original's
+    /// does (`dfxpProcessReal.cpp:143-157`).
+    ///
+    /// Only [`VolumeLeveller::process`] plays the glide that lets the gain down after the stage is
+    /// switched off, so a glide started while the stage is left out would wait for it to come
+    /// back and then lift 20 ms of audio the listener last heard unlevelled: at Volume Leveling 4
+    /// on a −34 dBFS tone, set to 0 with FxSound off, switching back on played 0.087 for a
+    /// steady 0.019, a 13 dB burst. So a stage left out drops any glide it had, and until it is run
+    /// again, switching it off clears it at once, as before audit #11.
+    pub fn sit_out(&mut self) {
+        self.release = Ramp::new(1.0);
+        self.heard = false;
     }
 
     /// Clear the state machine without changing the amount (`SosSet.cpp:292-320`).
@@ -781,6 +842,8 @@ impl VolumeLeveller {
         self.quiet_peak_bucket_seconds = 0.0;
         self.quiet_peak_history_index = 0;
         self.quiet_peak_history_count = 0;
+
+        self.release = Ramp::new(1.0);
     }
 
     /// Level one interleaved buffer in place.
@@ -817,7 +880,13 @@ impl VolumeLeveller {
         channels: usize,
         lfe_channel: Option<usize>,
     ) {
+        if channels > 0 && !buffer.is_empty() {
+            self.heard = true;
+        }
         if self.target_rms <= 0.0 || channels == 0 {
+            if self.release.is_gliding() && channels > 0 {
+                self.let_go(buffer, channels);
+            }
             return;
         }
         let frames = buffer.len() / channels;
@@ -876,6 +945,24 @@ impl VolumeLeveller {
                 return;
             }
             rest = tail;
+        }
+    }
+
+    /// The glide back to unity after the stage is switched off, on every channel the gain reached,
+    /// under the ceiling the stage was holding.
+    fn let_go(&mut self, buffer: &mut [Real], channels: usize) {
+        let ceiling = self.release_ceiling;
+        for frame in buffer.chunks_exact_mut(channels) {
+            let gain = self.release.advance();
+            for value in frame.iter_mut() {
+                // Compared rather than `clamp`ed, which panics on a NaN bound.
+                *value *= gain;
+                if *value > ceiling {
+                    *value = ceiling;
+                } else if *value < -ceiling {
+                    *value = -ceiling;
+                }
+            }
         }
     }
 
@@ -2973,5 +3060,99 @@ mod tests {
         assert_eq!(frames_in(96_000.0, SUB_BLOCK_SECONDS), 960);
         assert_eq!(frames_in(48_000.0, PEAK_RAMP_SECONDS), 96);
         assert!((HISTORY_SIZE as Real * SUB_BLOCK_SECONDS - POWER_HISTORY_SECONDS).abs() < 1e-6);
+    }
+
+    #[test]
+    fn switched_back_on_mid_release_the_stage_carries_on_from_where_the_release_had_got_to() {
+        // Audit #11: switched off, the gain being played glides back to unity over 20 ms; brought
+        // back before that, the stage starts from wherever the glide had got to rather than from
+        // unity, which would be the step down the glide exists to avoid.
+        let mut leveller = VolumeLeveller::new(48_000.0);
+        leveller.set_amount(4.0);
+        let quiet = |frames: usize| -> Vec<Real> {
+            (0..frames)
+                .flat_map(|n| {
+                    let s = (n as Real * 300.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.02;
+                    [s, s]
+                })
+                .collect()
+        };
+        for _ in 0..200 {
+            let mut block = quiet(480);
+            leveller.process(&mut block, 2);
+        }
+        let lifted = leveller.ramp.at(0);
+        assert!(lifted > 3.0, "the fixture was not lifted: {lifted}");
+
+        leveller.set_amount(0.0);
+        let mut releasing = quiet(480);
+        leveller.process(&mut releasing, 2);
+        let halfway = leveller.release.value();
+        assert!(halfway > 1.0 && halfway < lifted, "{halfway}");
+
+        leveller.set_amount(4.0);
+        assert!(!leveller.release.is_gliding());
+        assert_eq!(leveller.ramp.at(0).to_bits(), halfway.to_bits());
+        let input = quiet(480);
+        let mut resumed = input.clone();
+        leveller.process(&mut resumed, 2);
+        // Frame 20, a quarter of the way up the tone's first cycle, is still played at the
+        // release's gain, not at unity and not back at the full lift.
+        let gain = resumed[40] / input[40];
+        assert!(
+            (gain - halfway).abs() < 0.05 * halfway,
+            "the stage started from {gain}, not {halfway}"
+        );
+    }
+
+    #[test]
+    fn a_stage_its_owner_leaves_out_is_switched_off_at_once_and_drops_its_let_down() {
+        // Audit #11: the let-down that switching the stage off starts is played by `process`
+        // alone, so a stage its owner is not running (FxSound or the equalizer off) must not keep
+        // one for when it comes back, and switched off while it is left out it is cleared at
+        // once, as the original clears it: from then on it is the exact bypass.
+        let quiet = |frames: usize| -> Vec<Real> {
+            (0..frames)
+                .flat_map(|n| {
+                    let s = (n as Real * 300.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.02;
+                    [s, s]
+                })
+                .collect()
+        };
+        let lifted = || {
+            let mut leveller = VolumeLeveller::new(48_000.0);
+            leveller.set_amount(4.0);
+            for _ in 0..200 {
+                leveller.process(&mut quiet(480), 2);
+            }
+            assert!(leveller.ramp.at(0) > 3.0, "the fixture was not lifted");
+            leveller
+        };
+
+        // Left out, then switched off.
+        let mut leveller = lifted();
+        leveller.sit_out();
+        leveller.set_amount(0.0);
+        assert!(!leveller.release.is_gliding());
+        let input = quiet(480);
+        let mut block = input.clone();
+        leveller.process(&mut block, 2);
+        assert_eq!(
+            block, input,
+            "a stage switched off while left out touched the audio"
+        );
+
+        // Switched off, then left out before the let-down could play.
+        let mut leveller = lifted();
+        leveller.set_amount(0.0);
+        assert!(leveller.release.is_gliding());
+        leveller.sit_out();
+        assert!(!leveller.release.is_gliding());
+        let mut block = input.clone();
+        leveller.process(&mut block, 2);
+        assert_eq!(
+            block, input,
+            "the let-down waited for the stage to come back"
+        );
     }
 }

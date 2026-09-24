@@ -1585,6 +1585,24 @@ impl DspProcessor {
    Volume leveling is the only stage that ramps within a buffer
    (`SosProcess.cpp:376-379`); add a short ramp on `master_gain` and `balance` too,
    because the original steps them and the GUI slider will zipper.
+   **Done in 0.4.0** (audit #11), wider than this asks: every gain the user moves — master
+   gain, balance, the effects' gains, Dynamic Boost's target, and levelling switched off —
+   glides over 20 ms, and the equalizer bands and Bass crossfade between designs
+   (`crates/fxsound-dsp/src/smooth.rs`; `10-dsp-effects.md` open question 7 has the choice).
+   A 2 dB master-gain step under a 50 Hz tone at −6 dBFS moved the waveform 0.099 in one
+   sample; no step is now larger than the tone's own, 0.0032. Until audio has passed, a new
+   snapshot lands at once, so a stream starts on its parameters. The equalizer's own switch
+   fades the whole GraphicEq block (filters, master gain, balance, levelling) in or out over
+   the same 20 ms, mixing its output with its input: with 62.5 Hz at +6 dB under a 50 Hz tone
+   at 0.3, switching the equalizer off moved the waveform 0.143 in one sample, and now no more
+   than the tone does on its own. A new band count crossfades the whole old curve into the new
+   one (`09-dsp-eq.md` §18, point 3). A stage that is left out — the equalizer and the leveller
+   while power is off, the GraphicEq block once it has faded out — lands every glide and takes
+   the next change at once (`GraphicEq::sit_out`, `VolumeLeveller::sit_out`), so switching
+   back on never plays 20 ms of what was set before the switch. The power switch is the one
+   control that still acts between two samples: it is the listener's A/B against the dry
+   sound, and a faded bypass would mix the processed signal, a look-ahead behind, with the dry
+   one.
 
 Non-RT-safe surface, clearly separated: `DspEngine::new`, `DspEngine::prepare`,
 everything in `DspHandle`, preset load/save, and config persistence.

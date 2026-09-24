@@ -1770,6 +1770,24 @@ pub fn calc_rounded_value(v: Real, delta: Real, out_min: Real, out_max: Real) ->
    62.5 Hz after loud bass used to ring at −17.5 dBFS into silence. The whole equalizer coming
    back on starts every section from rest too (`GraphicEq::set_enabled`): switched off and on
    under the same bass, it rang at −16.8 dBFS. The slider-drag click is audit #11, not this.
+   **Also done in 0.4.0** (audit #11): a band that is moved crossfades from its old design to
+   its new one over 20 ms (`crates/fxsound-dsp/src/smooth.rs`, `FadingSection`), one that goes
+   to or comes back from exactly 0 dB fades out to or in from the bypass, and a design asked for
+   mid-fade waits for the fade to end. Dragging the 62.5 Hz band 0 → +12 dB at the GUI's rate
+   under a 25 Hz tone put a buzz above 80 Hz at −57.3 dBFS RMS; it is −66.9 now. While no band is
+   fading the cascade is the one above, sample for sample. A new band count, whose sections do
+   not line up with the old ones, crossfades the whole ladder instead (`GraphicEq::relayout`):
+   the old sections play on in a second bank, as they were, while the new ladder starts from rest,
+   and the output moves from one cascade to the other over the same 20 ms; the second bank runs
+   only then. Ten bands with 62.5 Hz at +6 dB changed to 31 with 63 Hz at +6 dB under a 50 Hz
+   tone at 0.3 moved the waveform by 0.143 in one sample, with a click above 300 Hz at
+   −18.4 dBFS; now no step is larger than the tone's own and the peak there is −67.8 dBFS. A band
+   count asked for while that crossfade runs moves the new ladder's sections to the newest one
+   section by section, those past its end fading out (that ten-band curve remapped to 31 bands
+   and back to ten 10 ms later: 0.444 and −8.4 dBFS before, 0.0044 and −59.6 now). The equalizer's switch is the GraphicEq
+   block's, and the engine fades that block (`08-dsp-api.md` §15.4, point 7); a band moved while
+   the equalizer is left out, with power off, lands at once (`GraphicEq::sit_out`) instead of
+   crossfading when power comes back.
 
 4. **`GraphicEqSetNumBands` does not resize the SOS.** It sets `num_bands`
    (`GraphicEqSet.cpp:151`) and calls `GraphicEqReSetAllBandFreqs` + `GraphicEq_InitSections`, but

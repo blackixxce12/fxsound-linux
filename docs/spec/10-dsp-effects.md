@@ -385,6 +385,15 @@ no atomicity — a torn parameter update is possible in principle. See
 > buffer or `ArcSwap<Params>`) plus per-buffer coefficient interpolation for the
 > gains that are audible when stepped (Aural drive, Lex wet/dry, Wide intensity,
 > Maxi gain_boost).
+>
+> **Done in 0.4.0** (audit #11), per sample rather than per buffer: every gain
+> the user moves glides to its new value in a straight line over 20 ms
+> (`crates/fxsound-dsp/src/smooth.rs`, `Ramp`) — Aural drive, Lex wet, dry,
+> decay and diffuser coefficient, Wide side and mid gains, Maxi `gain_boost`,
+> and the master gain, balance and levelling release in front of them — and the
+> Bass biquad crossfades from its old design to its new one over the same 20 ms
+> (`FadingSection`). Open question 7 has why a crossfade and not interpolated
+> coefficients.
 
 ### 3.6 Which parameters are *never* written from the host
 
@@ -2130,6 +2139,22 @@ bypassed it. The Maximizer is unconditional; "off" is expressed as
    is a genuine click source. **Recommend a 10–20 ms linear ramp on gains and a
    full-coefficient-set swap with a short crossfade for the biquad, and verify
    no one relies on instantaneous response.**
+
+   **Done in 0.4.0** (audit #11), as recommended, at 20 ms. Gains ramp linearly;
+   the Bass section and every equalizer band run the old and the new design side
+   by side and crossfade their outputs, a new design that arrives mid-fade
+   waiting for the fade to finish. Interpolated coefficients were measured and
+   refused: in the transposed direct form a pole pair near `z = 1` turns the
+   error a moving coefficient leaves in the state into a transient, so a 62.5 Hz
+   band (one section, prototyped) dragged 0 → +12 dB under a 25 Hz tone
+   overshot the tone by 2 dB and put more buzz above 80 Hz than no smoothing at
+   all (−51.7 against −55.4 dB RMS), where the crossfade took it to −67.2; in
+   the whole engine the same drag went from −57.3 to −66.9. Nothing relies on
+   the instantaneous response: a stage nobody has heard yet — a new stream, a
+   format change, a reset — lands its parameters at once, so every golden
+   vector, which builds its stage, applies and only then processes, is
+   unchanged. An effect set to 0 runs until its fade out ends and is then the
+   exact bypass it was.
 
 8. **Denormal handling on aarch64.** The `1.0e-30`/`1.0e-36` biases were tuned
    for x87/SSE. On ARM with FZ set they are harmless but also unnecessary; on

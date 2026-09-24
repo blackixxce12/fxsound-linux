@@ -7,8 +7,9 @@
 //! so changing the band count, the sample rate or a preset never allocates on the audio thread.
 
 use crate::biquad::{
-    BiquadCoeffs, MAX_BOOST_OR_CUT_DB, Real, SOS_MAX_SECTIONS, Section, calc_parametric, magnitude,
+    BiquadCoeffs, MAX_BOOST_OR_CUT_DB, Real, SOS_MAX_SECTIONS, calc_parametric, magnitude,
 };
+use crate::smooth::{FadingSection, Ramp, glide_frames};
 
 /// `GraphicEqInit.cpp:49` — the Q multiplier before the user touches the filter-width knob.
 pub const DEFAULT_Q_MULTIPLIER: Real = 1.0;
@@ -491,9 +492,30 @@ fn solve(mut matrix: Vec<Vec<f64>>) -> Option<Vec<f64>> {
 }
 
 /// The graphic equalizer: a cascade of peaking sections, one per band.
+///
+/// A band that is moved crossfades from its old design to its new one over
+/// [`crate::smooth::GLIDE_SECONDS`] rather than switching between two samples (audit report #11;
+/// [`crate::smooth`] has why a crossfade), and a band that goes to or comes back from exactly
+/// 0 dB fades out to, or in from, the bypass. A new band count crossfades the whole curve: the
+/// old ladder plays on beside the new one for the same 20 ms, and the output moves from one to the
+/// other. Until the equalizer has processed audio since it was built or cleared, or since its
+/// owner last left it out ([`GraphicEq::sit_out`]), a change lands at once: there is nothing heard
+/// to fade from.
 #[derive(Clone, Debug)]
 pub struct GraphicEq {
-    sections: [Section; SOS_MAX_SECTIONS],
+    sections: [FadingSection; SOS_MAX_SECTIONS],
+    /// One bit per section that is crossfading, so a block with none runs the plain cascade. A
+    /// section past the live bands can have one: see [`GraphicEq::span`].
+    fading: u32,
+    /// Audio has gone through since the equalizer was built, last cleared or last left out.
+    heard: bool,
+    /// The ladder a new band count replaced, playing on while the new one fades in: its first
+    /// `outgoing_bands` sections run, and none once the crossfade is over.
+    outgoing: [FadingSection; SOS_MAX_SECTIONS],
+    outgoing_bands: usize,
+    /// The new ladder's share of the output while the old one fades out, 0 to 1; still at 1
+    /// whenever no ladder is being replaced.
+    ladder_fade: Ramp,
     center_hz: [Real; SOS_MAX_SECTIONS],
     /// The boost last *installed* into each section. The original compares against this with exact
     /// float equality to skip redundant redesigns, and so does this.
@@ -514,7 +536,12 @@ impl GraphicEq {
     #[must_use]
     pub fn new() -> Self {
         let mut eq = Self {
-            sections: [Section::new(); SOS_MAX_SECTIONS],
+            sections: [FadingSection::new(); SOS_MAX_SECTIONS],
+            fading: 0,
+            heard: false,
+            outgoing: [FadingSection::new(); SOS_MAX_SECTIONS],
+            outgoing_bands: 0,
+            ladder_fade: Ramp::new(1.0),
             center_hz: [0.0; SOS_MAX_SECTIONS],
             installed_boost_db: [0.0; SOS_MAX_SECTIONS],
             requested_boost_db: [0.0; SOS_MAX_SECTIONS],
@@ -597,8 +624,43 @@ impl GraphicEq {
     /// since 182a329: the one caller on the audio thread is [`GraphicEq::set_bands`], which
     /// installs the caller's gains straight afterwards, and the curve a user sees survive a band
     /// count change is remapped where the settings live, with [`remap_band_gains`].
+    ///
+    /// Once the equalizer has been heard, the old curve fades out to the flat one over
+    /// [`crate::smooth::GLIDE_SECONDS`] rather than vanishing between two samples.
     pub fn set_num_bands(&mut self, num_bands: usize) {
+        self.relayout(num_bands);
+        for band in 0..self.num_bands {
+            self.install(band, BiquadCoeffs::UNITY);
+        }
+    }
+
+    /// Lay out a new band count, every band flat, and hand the sections over to it.
+    ///
+    /// The original, and this port before audit #11, cleared every section here, so a preset
+    /// change from a ten-band curve to a 31-band one, or the user changing the band count, dropped
+    /// the old curve in one sample and brought the new one in from rest in the next: ten bands
+    /// with 62.5 Hz at +6 dB changed to 31 with 63 Hz at +6 dB under a 50 Hz tone at 0.3 moved the
+    /// waveform by 0.143 between two samples, and the click reached −18.4 dBFS above 300 Hz, the
+    /// same click a changed curve at a fixed band count made before its bands crossfaded.
+    ///
+    /// The band counts do not line up section for section, so the sections cannot crossfade one
+    /// by one as a moved band does; the whole ladder does instead. The old sections move to a
+    /// second bank that plays on, as they were, while the new ladder starts from rest — as a band
+    /// that comes back from the bypass does, and as the original starts every section here — and
+    /// [`GraphicEq::process`] crossfades from the old cascade's output to the new one's over
+    /// [`crate::smooth::GLIDE_SECONDS`]. The second bank runs only for those 20 ms. The same
+    /// change now moves the waveform by no more than the tone does on its own, 0.0030, and above
+    /// 300 Hz peaks at −67.8 dBFS.
+    ///
+    /// A band count asked for while that crossfade runs cannot take the old bank, which is still
+    /// fading out, so the new ladder's sections move to the newest one section by section instead,
+    /// each crossfading from its design to the one it has in the newest ladder, and those past the
+    /// newest's end fading out to the bypass: a curve that morphs for 20 ms instead of one that
+    /// crossfades, but never a step. A ladder nobody has heard yet, because no audio has gone
+    /// through since it went in, is simply replaced.
+    fn relayout(&mut self, num_bands: usize) {
         let num_bands = num_bands.clamp(1, SOS_MAX_SECTIONS);
+        let old_span = self.span();
         self.num_bands = num_bands;
 
         if let Some((table, min_hz, max_hz)) = band_table(num_bands) {
@@ -612,12 +674,45 @@ impl GraphicEq {
         }
 
         self.recompute_q();
-        for band in 0..num_bands {
-            self.requested_boost_db[band] = 0.0;
-            self.installed_boost_db[band] = 0.0;
-            self.sections[band].coeffs = BiquadCoeffs::UNITY;
-            self.sections[band].reset();
+        self.requested_boost_db.fill(0.0);
+        self.installed_boost_db.fill(0.0);
+
+        if !self.heard || self.new_ladder_unheard() {
+            // Nothing to fade from, or only a ladder nobody has heard: start from rest, at once.
+            self.sections = [FadingSection::new(); SOS_MAX_SECTIONS];
+            self.fading = 0;
+        } else if !self.ladder_fade.is_gliding() {
+            self.outgoing = self.sections;
+            self.outgoing_bands = old_span;
+            self.sections = [FadingSection::new(); SOS_MAX_SECTIONS];
+            self.fading = 0;
+            self.ladder_fade = Ramp::new(0.0);
+            self.ladder_fade
+                .glide_to(1.0, glide_frames(self.sample_rate));
+        } else {
+            for band in num_bands..SOS_MAX_SECTIONS {
+                self.install(band, BiquadCoeffs::UNITY);
+            }
         }
+    }
+
+    /// The new ladder has not played a frame since a band count change put it in: its designs
+    /// land at once, from rest, while the old ladder carries the sound.
+    fn new_ladder_unheard(&self) -> bool {
+        self.ladder_fade.is_gliding() && self.ladder_fade.value() == 0.0
+    }
+
+    /// How many sections [`GraphicEq::process`] runs: the live bands, and any past them still
+    /// fading out after a band count changed in the middle of a crossfade.
+    fn span(&self) -> usize {
+        let highest_fading = (u32::BITS - self.fading.leading_zeros()) as usize;
+        self.num_bands.max(highest_fading)
+    }
+
+    /// End a ladder crossfade at once: the old ladder stops playing.
+    fn drop_outgoing(&mut self) {
+        self.outgoing_bands = 0;
+        self.ladder_fade = Ramp::new(1.0);
     }
 
     /// Set the filter-width multiplier.
@@ -664,7 +759,7 @@ impl GraphicEq {
         // is `2*f0 >= fs`, not `f0 >= fs/2` — at 44.1 kHz a 20 kHz band survives, at 40 kHz it
         // does not.
         if boost_db == 0.0 || f0 * 2.0 >= self.sample_rate {
-            self.sections[band].coeffs = BiquadCoeffs::UNITY;
+            self.install(band, BiquadCoeffs::UNITY);
             self.installed_boost_db[band] = 0.0;
             return;
         }
@@ -673,27 +768,46 @@ impl GraphicEq {
         if clamped == self.installed_boost_db[band] {
             return;
         }
-        let was_running = self.sections[band].coeffs.on;
-        self.sections[band].coeffs = calc_parametric(self.sample_rate, f0, clamped, self.q);
+        self.install(band, calc_parametric(self.sample_rate, f0, clamped, self.q));
         self.installed_boost_db[band] = clamped;
-        // A bypassed section is skipped by `process`, so its history is whatever it held the
-        // moment it went to exactly 0 dB — perhaps minutes of music ago. The original resumes
-        // from it (`GraphicEqSet.cpp:288-295`, `SosProcess.cpp:567-571`), and a band that comes
-        // back from 0 dB on a preset change or Restore Defaults rings that old state out as a
-        // low thump: 62.5 Hz taken +3 → 0 → −1 dB after loud bass rang at −17.5 dBFS into
-        // silence (audit report #10). A section that starts from rest starts clean. A running
-        // section keeps its state through a redesign, as it always has, so moving a live band
-        // does not click either.
-        if !was_running && self.sections[band].coeffs.on {
-            self.sections[band].reset();
+    }
+
+    /// Hand a band its new design: crossfaded once the equalizer has been heard, at once before.
+    ///
+    /// A bypassed section is skipped by `process`, so its history is whatever it held the moment it
+    /// went to exactly 0 dB — perhaps minutes of music ago. The original resumes from it
+    /// (`GraphicEqSet.cpp:288-295`, `SosProcess.cpp:567-571`), and a band that comes back from
+    /// 0 dB on a preset change or Restore Defaults rang that old state out as a low thump: 62.5 Hz
+    /// taken +3 → 0 → −1 dB after loud bass rang at −17.5 dBFS into silence (audit report #10).
+    /// [`FadingSection`] brings a section back from the bypass from rest, and fades it in. A
+    /// running section carries its history into the new design, so moving a live band does not
+    /// click either.
+    fn install(&mut self, band: usize, design: BiquadCoeffs) {
+        let at_once = !self.heard || self.new_ladder_unheard();
+        let section = &mut self.sections[band];
+        section.set_design(design, glide_frames(self.sample_rate));
+        if at_once {
+            section.settle();
+        }
+        let bit = 1_u32 << band;
+        if section.is_fading() {
+            self.fading |= bit;
+        } else {
+            self.fading &= !bit;
         }
     }
 
     /// Apply a whole curve at once — the preset-load path.
+    ///
+    /// A curve with a new band count replaces the ladder, the whole old curve crossfading into
+    /// the new one over [`crate::smooth::GLIDE_SECONDS`] once the equalizer has been heard; one
+    /// with the same count moves each band that changed, as [`GraphicEq::set_band_boost`] does.
     pub fn set_bands(&mut self, centers_hz: &[Real], boosts_db: &[Real]) {
         let count = centers_hz.len().min(boosts_db.len());
         if count != self.num_bands {
-            self.set_num_bands(count);
+            // Not `set_num_bands`: flattening first would send every band through the bypass on
+            // its way to the new curve.
+            self.relayout(count);
         }
         let live = self.num_bands;
         for (slot, center) in self.center_hz[..live].iter_mut().zip(centers_hz) {
@@ -718,10 +832,40 @@ impl GraphicEq {
     }
 
     /// Clear the filter history without touching the design.
+    ///
+    /// A crossfade under way is history too: every band lands on its newest design, a ladder
+    /// being replaced stops playing, and until audio goes through again a change lands at once.
     pub fn reset(&mut self) {
-        for section in &mut self.sections[..self.num_bands] {
+        for section in &mut self.sections {
             section.reset();
         }
+        self.fading = 0;
+        self.drop_outgoing();
+        self.heard = false;
+    }
+
+    /// Tell the equalizer its owner ran a block without it: FxSound is switched off, and the
+    /// sections stand still until it comes back, as the original's do
+    /// (`dfxpProcessReal.cpp:143-157`).
+    ///
+    /// Only [`GraphicEq::process`] plays a crossfade, so one that started, or was waiting, while
+    /// the equalizer was left out would play when it came back: 20 ms of a curve the listener
+    /// last heard before switching off. With 31.25 Hz at +12 dB under a tone there at 0.05, the
+    /// band set to 0 dB with FxSound off, switching back on played 0.134 for a steady 0.048. So
+    /// every band lands on its newest design, a ladder being replaced stops playing, and until
+    /// audio goes through again a change lands at once, as it does before the first block. The
+    /// filters keep their history, as they do across the switch.
+    pub fn sit_out(&mut self) {
+        if !self.heard {
+            // Never heard, cleared or already left out: every change since landed at once.
+            return;
+        }
+        for section in &mut self.sections {
+            section.settle();
+        }
+        self.fading = 0;
+        self.drop_outgoing();
+        self.heard = false;
     }
 
     fn recompute_q(&mut self) {
@@ -746,20 +890,66 @@ impl GraphicEq {
     ///
     /// Allocation-free and branch-light: bypassed sections are skipped entirely, which is also
     /// what the original does — and why a section that gets switched off keeps stale state, which
-    /// [`GraphicEq::set_band_boost`] clears when the section comes back, and
-    /// [`GraphicEq::set_enabled`] when the whole equalizer does.
+    /// [`FadingSection`] leaves behind when the section comes back, and [`GraphicEq::set_enabled`]
+    /// clears when the whole equalizer does.
+    ///
+    /// While no band is crossfading this is the cascade the equalizer always ran, sample for
+    /// sample; a block with a fade in it takes the slower path for all of it, and costs a second
+    /// section per fading band, and the whole old ladder while a new band count fades in.
     pub fn process(&mut self, buffer: &mut [Real], channels: usize) {
         if !self.enabled || channels == 0 || channels > crate::biquad::MAX_CHANNELS {
             return;
         }
+        if !buffer.is_empty() {
+            self.heard = true;
+        }
+        if self.fading == 0 && self.outgoing_bands == 0 {
+            for frame in buffer.chunks_exact_mut(channels) {
+                for section in &mut self.sections[..self.num_bands] {
+                    let section = section.steady();
+                    if !section.coeffs.on {
+                        continue;
+                    }
+                    for (channel, sample) in frame.iter_mut().enumerate() {
+                        *sample = section.tick(channel, *sample);
+                    }
+                }
+            }
+            return;
+        }
+        let span = self.span();
         for frame in buffer.chunks_exact_mut(channels) {
-            for section in &mut self.sections[..self.num_bands] {
-                if !section.coeffs.on {
-                    continue;
+            if self.outgoing_bands == 0 {
+                for section in &mut self.sections[..span] {
+                    section.process_frame(frame);
                 }
-                for (channel, sample) in frame.iter_mut().enumerate() {
-                    *sample = section.tick(channel, *sample);
+                continue;
+            }
+            let mut old = [0.0; crate::biquad::MAX_CHANNELS];
+            let old = &mut old[..channels];
+            old.copy_from_slice(frame);
+            for section in &mut self.outgoing[..self.outgoing_bands] {
+                section.process_frame(old);
+            }
+            for section in &mut self.sections[..span] {
+                section.process_frame(frame);
+            }
+            // Linear, for the reason `FadingSection::process_frame` gives: the two ladders hear
+            // the same input and answer it much alike. The last frame of the fade is the new
+            // ladder's own output, and from the next the old one is not run.
+            let share = self.ladder_fade.advance();
+            if self.ladder_fade.is_gliding() {
+                for (sample, old) in frame.iter_mut().zip(old.iter()) {
+                    *sample = old + share * (*sample - old);
                 }
+            } else {
+                self.outgoing_bands = 0;
+            }
+        }
+        self.fading = 0;
+        for (band, section) in self.sections[..span].iter().enumerate() {
+            if section.is_fading() {
+                self.fading |= 1 << band;
             }
         }
     }
@@ -773,8 +963,10 @@ impl GraphicEq {
         let f = freq_hz / self.sample_rate;
         let mut mag = 1.0;
         for section in &self.sections[..self.num_bands] {
-            if section.coeffs.on {
-                mag *= magnitude(&section.coeffs, f);
+            // What the user set, not where a crossfade has got to.
+            let design = section.design();
+            if design.on {
+                mag *= magnitude(&design, f);
             }
         }
         20.0 * mag.log10()
@@ -1791,5 +1983,251 @@ mod tests {
         );
         assert_eq!(wild.len(), 10);
         assert!(wild.iter().all(|g| g.is_finite()), "{wild:?}");
+    }
+
+    // --- Crossfaded redesigns (audit report #11) -----------------------------------------------
+
+    fn low_tone(frames: usize, hz: Real, amplitude: Real) -> Vec<Real> {
+        low_tone_from(0, frames, hz, amplitude)
+    }
+
+    /// [`low_tone`] from frame `start` on, so that two calls join without a jump.
+    fn low_tone_from(start: usize, frames: usize, hz: Real, amplitude: Real) -> Vec<Real> {
+        (start..start + frames)
+            .flat_map(|n| {
+                let s = (n as Real * hz * std::f32::consts::TAU / 48_000.0).sin() * amplitude;
+                [s, s]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_band_taken_to_zero_fades_out_and_is_then_an_exact_bypass() {
+        // The section runs on through its 20 ms fade to the bypass, and from there the equalizer
+        // is as transparent as one that was never touched.
+        let mut eq = GraphicEq::new();
+        eq.set_band_boost(0, 6.0);
+        let mut bass = low_tone(4_800, 62.5, 0.3);
+        eq.process(&mut bass, 2);
+        eq.set_band_boost(0, 0.0);
+        let mut fading = low_tone(960, 62.5, 0.3);
+        eq.process(&mut fading, 2);
+        assert_eq!(eq.fading, 0, "the fade did not finish in 20 ms");
+
+        let input = low_tone(4_800, 62.5, 0.3);
+        let mut after = input.clone();
+        eq.process(&mut after, 2);
+        assert_eq!(after, input, "a flat equalizer touched the signal");
+    }
+
+    #[test]
+    fn a_dragged_band_settles_on_the_output_of_the_curve_it_ends_on() {
+        // After a drag the section runs exactly the design the drag ended on, so what it plays
+        // comes to equal what an equalizer set to that curve from the start plays: the crossfade
+        // leaves nothing behind. "Equal" to within the filter's own rounding: two transposed
+        // direct forms at 62.5 Hz that heard different pasts wander a rounding error apart, about
+        // 6e-5 RMS on this 0.85 tone, for seconds, faded or not — two equalizers never touched
+        // but started 100 frames apart do the same — until their states meet (here after 16 s,
+        // from when on they agree bit for bit). In the second after the drag they are still up
+        // to 4.3e-2 apart, the last crossfade's and the band's own decay.
+        let mut dragged = GraphicEq::new();
+        let mut fixed = GraphicEq::new();
+        fixed.set_band_boost(0, 9.0);
+        let mut position = 0;
+        let next = |eq: &mut GraphicEq, frames: usize, start: usize| {
+            let mut block: Vec<Real> = (start..start + frames)
+                .flat_map(|n| {
+                    let s = (n as Real * 62.5 * std::f32::consts::TAU / 48_000.0).sin() * 0.3;
+                    [s, s]
+                })
+                .collect();
+            eq.process(&mut block, 2);
+            block
+        };
+        for step in 0..=9 {
+            if step > 0 {
+                dragged.set_band_boost(0, step as Real);
+            }
+            next(&mut dragged, 800, position);
+            next(&mut fixed, 800, position);
+            position += 800;
+        }
+        // The first second after the drag lets the last crossfade and the decay behind it run.
+        next(&mut dragged, 48_000, position);
+        next(&mut fixed, 48_000, position);
+        position += 48_000;
+        let a = next(&mut dragged, 48_000, position);
+        let b = next(&mut fixed, 48_000, position);
+        let differences: Vec<f64> = a.iter().zip(&b).map(|(x, y)| f64::from(x - y)).collect();
+        let largest = differences.iter().fold(0.0_f64, |acc, d| acc.max(d.abs()));
+        let rms =
+            (differences.iter().map(|d| d * d).sum::<f64>() / differences.len() as f64).sqrt();
+        assert!(
+            rms < 1e-4 && largest < 5e-4,
+            "{rms} RMS, {largest} at most, away from the curve it ended on"
+        );
+    }
+
+    #[test]
+    fn an_equalizer_redesigned_before_every_block_stays_bounded() {
+        // Thirty-one bands at the narrowest width, every band given a new gain at random between
+        // −20 and +20 dB before every 64-frame block for ten seconds, under noise at 0.1: faster
+        // than any crossfade finishes, so every band always has one running and one waiting.
+        // Every design is stable and a crossfade only ever mixes two of them, so nothing can
+        // grow: the loudest sample is 1.6, where the same curves switched in at once, from rest,
+        // reach 1.9.
+        let mut eq = GraphicEq::new();
+        eq.set_num_bands(31);
+        eq.set_q_multiplier(MAX_Q_MULTIPLIER);
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut random = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as Real / 16_777_216.0
+        };
+        let mut warm = vec![0.0; 2 * 64];
+        eq.process(&mut warm, 2);
+        let mut loudest = 0.0_f32;
+        for _ in 0..(10 * 48_000 / 64) {
+            for band in 0..31 {
+                eq.set_band_boost(band, -20.0 + 40.0 * random());
+            }
+            let mut block: Vec<Real> = (0..2 * 64).map(|_| 0.1 * (2.0 * random() - 1.0)).collect();
+            eq.process(&mut block, 2);
+            assert!(block.iter().all(|s| s.is_finite()));
+            loudest = block.iter().fold(loudest, |acc, s| acc.max(s.abs()));
+        }
+        assert!(loudest < 4.0, "the cascade grew to {loudest}");
+    }
+
+    // --- A new band count (audit report #11) ---------------------------------------------------
+
+    /// The largest change between two neighbouring samples of the left channel.
+    fn largest_left_step(interleaved: &[Real]) -> Real {
+        let left: Vec<Real> = interleaved.iter().step_by(2).copied().collect();
+        left.windows(2)
+            .fold(0.0, |acc, pair| acc.max((pair[1] - pair[0]).abs()))
+    }
+
+    #[test]
+    fn a_new_band_count_plays_the_old_curve_out_and_is_then_the_new_curve_exactly() {
+        // Ten bands with 62.5 Hz at +6 dB, then that curve remapped to 31 bands under a 50 Hz
+        // tone at 0.3. The new ladder starts from rest at the change and runs on its own; the old
+        // one only adds to the output while it fades. So from the last frame of the 20 ms
+        // crossfade on, the equalizer hands back exactly what one given the new curve at the
+        // moment of the change does, bit for bit, and it runs the plain cascade again. On the way
+        // nothing moves further between two samples than the louder curve's tone does.
+        let (ten, _, _) = band_table(10).expect("ten bands");
+        let (thirty_one, _, _) = band_table(31).expect("31 bands");
+        let mut ten_gains = [0.0; 10];
+        ten_gains[0] = 6.0;
+        let gains = remap_band_gains(&ten_gains, 31);
+
+        let mut eq = GraphicEq::new();
+        eq.set_bands(ten, &ten_gains);
+        let mut before = low_tone_from(0, 4_800, 50.0, 0.3);
+        eq.process(&mut before, 2);
+        eq.set_bands(thirty_one, &gains);
+        assert_eq!(eq.outgoing_bands, 10, "the old ladder is not playing out");
+
+        let mut fresh = GraphicEq::new();
+        fresh.set_bands(thirty_one, &gains);
+        let input = low_tone_from(4_800, 4_800, 50.0, 0.3);
+        let mut crossfaded = input.clone();
+        eq.process(&mut crossfaded, 2);
+        let mut reference = input;
+        fresh.process(&mut reference, 2);
+
+        assert_eq!(eq.outgoing_bands, 0, "the crossfade did not end in 20 ms");
+        assert_eq!(eq.fading, 0);
+        assert_eq!(
+            &crossfaded[2 * 959..],
+            &reference[2 * 959..],
+            "after the crossfade the equalizer is not the new curve"
+        );
+        let mut joined = before;
+        joined.extend_from_slice(&crossfaded);
+        let steepest = largest_left_step(&joined[2 * 480..]);
+        let louder = reference.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        let own = louder * std::f32::consts::TAU * 50.0 / 48_000.0;
+        assert!(
+            steepest < own * 1.1,
+            "a step of {steepest} where the tone moves {own}"
+        );
+    }
+
+    #[test]
+    fn a_band_count_asked_for_mid_crossfade_moves_the_new_ladder_there_section_by_section() {
+        // Ten bands to 31, and to ten again 10 ms later with the curve moved, while the old ten
+        // still fade out: the newest ladder cannot take the old bank, so the 31 new sections move
+        // to it one by one, the 21 past the tenth fading out to the bypass. Nothing steps on the
+        // way, and once every fade is over the equalizer runs ten bands on the plain cascade, with
+        // the newest curve.
+        let (ten, _, _) = band_table(10).expect("ten bands");
+        let (thirty_one, _, _) = band_table(31).expect("31 bands");
+        let mut first = [3.0; 10];
+        first[0] = 6.0;
+        let mut last = first;
+        last[1] = -6.0;
+
+        let mut eq = GraphicEq::new();
+        eq.set_bands(ten, &first);
+        let mut rendered = low_tone_from(0, 4_800, 50.0, 0.3);
+        eq.process(&mut rendered, 2);
+        eq.set_bands(thirty_one, &remap_band_gains(&first, 31));
+        let mut block = low_tone_from(4_800, 480, 50.0, 0.3);
+        eq.process(&mut block, 2);
+        rendered.extend_from_slice(&block);
+        eq.set_bands(ten, &last);
+        assert_eq!(
+            eq.span(),
+            31,
+            "the sections past the tenth are not fading out"
+        );
+
+        let mut block = low_tone_from(5_280, 4_800, 50.0, 0.3);
+        eq.process(&mut block, 2);
+        rendered.extend_from_slice(&block);
+        assert_eq!((eq.fading, eq.outgoing_bands, eq.span()), (0, 0, 10));
+
+        let mut fresh = GraphicEq::new();
+        fresh.set_bands(ten, &last);
+        for hz in [31.0, 62.5, 115.0, 1_000.0, 10_000.0] {
+            assert_eq!(eq.response_db(hz), fresh.response_db(hz), "{hz} Hz");
+        }
+        let steepest = largest_left_step(&rendered[2 * 480..]);
+        assert!(steepest < 0.01, "a step of {steepest}");
+    }
+
+    #[test]
+    fn an_equalizer_left_out_lands_its_crossfades_and_takes_the_next_change_at_once() {
+        // `sit_out`: a block went by without the equalizer. Whatever crossfade was running or
+        // waiting lands, a ladder being replaced stops playing, and until audio goes through
+        // again a change lands at once, so the curve that plays when the equalizer comes back is
+        // the one that was set.
+        let mut eq = GraphicEq::new();
+        eq.set_band_boost(0, 12.0);
+        eq.process(&mut low_tone(4_800, 62.5, 0.3), 2);
+        eq.set_band_boost(0, 0.0);
+        eq.set_band_boost(1, 6.0);
+        assert_ne!(eq.fading, 0, "the fixture is not fading");
+        eq.sit_out();
+        assert_eq!(eq.fading, 0);
+        assert!(!eq.sections[0].is_active());
+        assert!(eq.sections[1].is_active() && !eq.sections[1].is_fading());
+        eq.set_band_boost(2, -6.0);
+        assert_eq!(eq.fading, 0, "a change while left out did not land at once");
+
+        eq.process(&mut low_tone(4_800, 62.5, 0.3), 2);
+        let (thirty_one, _, _) = band_table(31).expect("31 bands");
+        eq.set_bands(thirty_one, &[3.0; 31]);
+        assert_ne!(
+            eq.outgoing_bands, 0,
+            "the fixture is not replacing its ladder"
+        );
+        eq.sit_out();
+        assert_eq!(eq.outgoing_bands, 0);
+        assert!(!eq.ladder_fade.is_gliding());
     }
 }

@@ -44,6 +44,18 @@
 //! The sides come from [`Engine::set_channel_sides`] when the layout is known and are inferred
 //! from the channel count, the front pair and the subwoofer otherwise ([`default_sides`]).
 //!
+//! A new master gain or balance glides there over [`crate::smooth::GLIDE_SECONDS`] instead of
+//! stepping between two samples, as every other gain and filter the user can move does (audit
+//! report #11, [`crate::smooth`]): the original writes the gain straight into the float the audio
+//! thread multiplies by, so a 2 dB step on the slider was a 2 dB step in the waveform, and a click.
+//! The equalizer's switch fades the whole GraphicEq block in or out over the same 20 ms, mixing
+//! its output with the audio it was given, for the same reason: with 62.5 Hz at +6 dB under a
+//! 50 Hz tone at 0.3, switching the equalizer off moved the waveform by 0.143 between two samples,
+//! and now by no more than the tone moves on its own.
+//! The power switch is the one control that still acts between two samples: it is the listener's
+//! A/B against the unprocessed sound, and a bypass that faded would mix the processed signal, a
+//! look-ahead behind, with the dry one for 20 ms.
+//!
 //! Everything after construction is allocation-free. [`Engine::process`] is the only method the
 //! real-time thread calls per buffer; the others are called from the same thread in response to a
 //! parameter snapshot, and none of them allocate either.
@@ -52,6 +64,7 @@ use crate::biquad::Real;
 use crate::effects::{Chain, MAX_BLOCK_FRAMES};
 use crate::eq::GraphicEq;
 use crate::leveller::VolumeLeveller;
+use crate::smooth::{Ramp, glide_frames};
 use crate::spectrum::SpectrumAnalyser;
 use fxsound_core::messages::{DspEvent, DspParams, Meters};
 
@@ -140,11 +153,17 @@ pub struct Engine {
     sample_rate: Real,
     channels: usize,
 
-    /// `10^(dB/20)`, applied per sample (`GraphicEqSet.cpp:101`).
-    master_gain: Real,
-    /// Attenuation applied to each channel; balance never boosts (`GraphicEqSet.cpp:38-59`).
-    balance_left: Real,
-    balance_right: Real,
+    /// The gain stage: the master gain on every channel, with the balance's attenuation folded in
+    /// on each side, and the glide to a new setting.
+    gains: SideGains,
+    /// Audio has gone through since the engine was built or last cleared. Until it has, a new
+    /// master gain or balance lands at once: there is nothing to glide from.
+    heard: bool,
+    /// The GraphicEq block's share of the output: 1 while the equalizer is on, 0 while it is off,
+    /// and a glide between the two when the switch moves.
+    eq_block: Ramp,
+    /// The audio a block the equalizer's switch is fading came in as, to mix its output with.
+    dry: DryCopy,
 
     /// Cached so a snapshot that did not change a value does not force a redesign.
     applied: DspParams,
@@ -182,9 +201,10 @@ impl Engine {
             spectrum: SpectrumAnalyser::new(sample_rate, max_block_frames),
             sample_rate,
             channels: channels.clamp(1, crate::biquad::MAX_CHANNELS),
-            master_gain: 1.0,
-            balance_left: 1.0,
-            balance_right: 1.0,
+            gains: SideGains::unity(),
+            heard: false,
+            eq_block: Ramp::new(1.0),
+            dry: DryCopy::new(),
             applied: DspParams::default(),
             processed_samples: 0,
             peak_left: 0.0,
@@ -290,7 +310,17 @@ impl Engine {
     fn apply_unconditionally(&mut self, params: &DspParams) {
         self.chain.apply(params);
 
-        self.eq.set_enabled(params.eq_on);
+        // The equalizer's switch fades the GraphicEq block in or out (see the module
+        // documentation); the filters stay on until it has faded out, and come back on from rest
+        // (`GraphicEq::set_enabled`) as it starts to fade in.
+        self.eq_block.glide_to(
+            if params.eq_on { 1.0 } else { 0.0 },
+            glide_frames(self.sample_rate),
+        );
+        if !self.heard {
+            self.eq_block.settle();
+        }
+        self.eq.set_enabled(self.eq_block_runs());
         self.eq.set_q_multiplier(params.filter_q);
         let (centers, boosts) = params.bands();
         if centers != self.eq.center_frequencies() || boosts != self.eq.boosts_db() {
@@ -301,10 +331,19 @@ impl Engine {
         // decibels (`docs/spec/08-dsp-api.md` §8.4).
         self.leveller.set_amount(params.volume_leveling_db);
 
-        self.master_gain = db_to_linear(params.master_gain_db);
+        // `10^(dB/20)`, applied per sample (`GraphicEqSet.cpp:101`); the balance attenuates one
+        // side and never boosts the other (`GraphicEqSet.cpp:38-59`).
+        let master = db_to_linear(params.master_gain_db);
         let (left, right) = balance_gains(params.balance);
-        self.balance_left = left;
-        self.balance_right = right;
+        self.gains.glide_to(
+            master * left,
+            master * right,
+            master,
+            glide_frames(self.sample_rate),
+        );
+        if !self.heard {
+            self.gains.settle();
+        }
 
         self.applied = *params;
     }
@@ -324,7 +363,8 @@ impl Engine {
         }
     }
 
-    /// Clear every filter's history.
+    /// Clear every filter's history. A glide under way lands, and until audio goes through again
+    /// a new value lands at once.
     pub fn reset(&mut self) {
         self.eq.reset();
         self.leveller.reset();
@@ -332,6 +372,10 @@ impl Engine {
         self.spectrum.reset();
         self.peak_left = 0.0;
         self.peak_right = 0.0;
+        self.gains.settle();
+        self.eq_block.settle();
+        self.eq.set_enabled(self.eq_block_runs());
+        self.heard = false;
     }
 
     /// Latency the chain adds, in frames. Only the limiter's look-ahead contributes.
@@ -361,29 +405,35 @@ impl Engine {
                 *sample = 0.0;
             }
         }
+        self.heard = true;
 
+        let block_runs = self.eq_block_runs();
         if self.applied.power {
-            // The GraphicEq block, whole or not at all (`dfxpProcessReal.cpp:143-157`). While it
-            // is skipped the equalizer's and the leveller's state stand still, as the original's
-            // do, rather than being reset.
-            if self.applied.eq_on {
-                self.eq.process(buffer, channels);
-                self.apply_gain_stage(buffer, channels);
-                // The subwoofer is levelled with every other channel but kept out of the level
-                // analysis: it carries a deliberately enormous share of the programme's energy,
-                // so letting it into the statistics would pull the gain down on bass-heavy
-                // material for reasons that have nothing to do with how loud the programme
-                // actually is. The stage keeps its own 10 ms clock, whatever the quantum.
-                self.leveller
-                    .process_with_lfe(buffer, channels, self.lfe_channel);
+            // The GraphicEq block, whole or not at all (`dfxpProcessReal.cpp:143-157`), faded in
+            // or out when the equalizer's switch moves. While it is skipped the equalizer's and
+            // the leveller's state stand still, as the original's do, rather than being reset.
+            if block_runs {
+                self.run_eq_block(buffer, channels, true);
+            } else {
+                self.sit_out_eq_block();
             }
             self.chain.process(buffer, channels);
-        } else if self.applied.eq_on {
+        } else {
             // Bypassed, the gain stage is the one that survives, and all of it: the master gain
             // and the balance (audit report R3). It survives exactly where the powered branch
             // above plays it, behind the equalizer's switch, so the power switch never moves the
             // level; the module documentation has the original's version and why it is not this.
-            self.apply_gain_stage(buffer, channels);
+            // The filters and the leveller stand still.
+            self.eq.sit_out();
+            self.leveller.sit_out();
+            if block_runs {
+                self.run_eq_block(buffer, channels, false);
+            } else {
+                self.gains.settle();
+            }
+        }
+        if !self.eq_block_runs() {
+            self.eq.set_enabled(false);
         }
 
         // A block that went in finite can still come out non-finite if a stage's own state has
@@ -401,25 +451,124 @@ impl Engine {
         self.measure(buffer, channels);
     }
 
+    /// Whether the GraphicEq block plays: the equalizer is on, or its switch is still fading the
+    /// block out.
+    fn eq_block_runs(&self) -> bool {
+        self.eq_block.target() > 0.0 || self.eq_block.value() > 0.0
+    }
+
+    /// A block the GraphicEq block does not play in: nothing hears its stages move.
+    ///
+    /// Each stage settles what it was gliding towards, so that when the block comes back it
+    /// starts where it was set rather than playing out a glide the listener did not hear begin:
+    /// the gain stage its gains, the equalizer its crossfades, and the leveller the let-down it
+    /// starts when it is switched off (`GraphicEq::sit_out`, `VolumeLeveller::sit_out`).
+    fn sit_out_eq_block(&mut self) {
+        self.eq.sit_out();
+        self.leveller.sit_out();
+        self.gains.settle();
+    }
+
+    /// The GraphicEq block over one buffer — the equalizer, the gain stage and the leveller, or
+    /// with FxSound off the gain stage alone — and while the equalizer's switch is fading, its
+    /// output mixed with the audio it was given.
+    ///
+    /// The mix is linear, as every crossfade here is ([`crate::smooth::FadingSection`]). The dry
+    /// copy holds a bounded stretch, so a buffer larger than that is taken a stretch at a time
+    /// while the fade runs: 2 048 frames of stereo, 512 of 7.1. The leveller then sees those
+    /// stretches as buffers, which only matters to how far ahead of a hit it can dip (its
+    /// module documentation, audit #4), and only for the 20 ms of the fade.
+    fn run_eq_block(&mut self, buffer: &mut [f32], channels: usize, filters: bool) {
+        if !self.eq_block.is_gliding() {
+            self.eq_block_pass(buffer, channels, filters);
+            return;
+        }
+        let stretch = (self.dry.0.len() / channels).max(1) * channels;
+        for part in buffer.chunks_mut(stretch) {
+            self.dry.0[..part.len()].copy_from_slice(part);
+            self.eq_block_pass(part, channels, filters);
+            for (frame, dry) in part
+                .chunks_exact_mut(channels)
+                .zip(self.dry.0.chunks_exact(channels))
+            {
+                let share = self.eq_block.advance();
+                // At 1 the frame is the block's own output, untouched; at 0 it is the input.
+                if share < 1.0 {
+                    for (sample, dry) in frame.iter_mut().zip(dry) {
+                        *sample = dry + share * (*sample - dry);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The GraphicEq block's stages, in order, at full strength.
+    fn eq_block_pass(&mut self, buffer: &mut [f32], channels: usize, filters: bool) {
+        if filters {
+            self.eq.process(buffer, channels);
+        }
+        self.apply_gain_stage(buffer, channels);
+        if filters {
+            // The subwoofer is levelled with every other channel but kept out of the level
+            // analysis: it carries a deliberately enormous share of the programme's energy, so
+            // letting it into the statistics would pull the gain down on bass-heavy material for
+            // reasons that have nothing to do with how loud the programme actually is. The stage
+            // keeps its own 10 ms clock, whatever the quantum.
+            self.leveller
+                .process_with_lfe(buffer, channels, self.lfe_channel);
+        }
+    }
+
     /// The master gain and the balance attenuation, folded into one pass.
     ///
     /// Every channel takes the master gain; a left-hand one takes the left attenuation with it and
     /// a right-hand one the right (see the module documentation). Mono has no sides and takes the
     /// master gain alone. On stereo this is the gain stage the original folds into
     /// `sosProcessBuffer` (`SosProcess.cpp:583`, `:630-631`), and it is what this did before.
-    fn apply_gain_stage(&self, buffer: &mut [f32], channels: usize) {
-        if self.master_gain == 1.0 && self.balance_left == 1.0 && self.balance_right == 1.0 {
+    ///
+    /// While a glide runs each frame takes its own step of it; otherwise the factors are the
+    /// constants they always were.
+    fn apply_gain_stage(&mut self, buffer: &mut [f32], channels: usize) {
+        if !self.gains.is_gliding() {
+            self.apply_steady_gain_stage(buffer, channels);
+            return;
+        }
+        let sides = if channels == self.channels {
+            self.sides
+        } else {
+            standard_sides(channels)
+        };
+        for frame in buffer.chunks_exact_mut(channels) {
+            let [left, right, centre] = self.gains.advance();
+            if channels < 2 {
+                for sample in frame.iter_mut() {
+                    *sample *= centre;
+                }
+                continue;
+            }
+            for (sample, side) in frame.iter_mut().zip(sides) {
+                *sample *= match side {
+                    ChannelSide::Left => left,
+                    ChannelSide::Right => right,
+                    ChannelSide::Centre => centre,
+                };
+            }
+        }
+    }
+
+    /// [`Engine::apply_gain_stage`] with nothing moving.
+    fn apply_steady_gain_stage(&self, buffer: &mut [f32], channels: usize) {
+        let [left, right, master] = self.gains.values();
+        if master == 1.0 && left == 1.0 && right == 1.0 {
             return;
         }
         if channels < 2 {
             for sample in buffer.iter_mut() {
-                *sample *= self.master_gain;
+                *sample *= master;
             }
             return;
         }
 
-        let left = self.master_gain * self.balance_left;
-        let right = self.master_gain * self.balance_right;
         // A block in a format the engine was not told about (`process` clamps rather than
         // refuses) is balanced by the count's default layout.
         let sides = if channels == self.channels {
@@ -427,12 +576,12 @@ impl Engine {
         } else {
             standard_sides(channels)
         };
-        let mut gains = [self.master_gain; crate::biquad::MAX_CHANNELS];
+        let mut gains = [master; crate::biquad::MAX_CHANNELS];
         for (gain, side) in gains.iter_mut().zip(sides).take(channels) {
             *gain = match side {
                 ChannelSide::Left => left,
                 ChannelSide::Right => right,
-                ChannelSide::Centre => self.master_gain,
+                ChannelSide::Centre => master,
             };
         }
 
@@ -511,6 +660,74 @@ impl Engine {
     #[must_use]
     pub const fn equalizer(&self) -> &GraphicEq {
         &self.eq
+    }
+}
+
+/// How many samples of a block the equalizer's switch is fading are kept dry at a time.
+const DRY_SAMPLES: usize = 4_096;
+
+/// The dry copy [`Engine::run_eq_block`] mixes with, allocated with the engine. Its own type so
+/// that the engine's `Debug` does not print four thousand zeros.
+struct DryCopy(Box<[f32]>);
+
+impl DryCopy {
+    fn new() -> Self {
+        Self(vec![0.0; DRY_SAMPLES].into_boxed_slice())
+    }
+}
+
+impl std::fmt::Debug for DryCopy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "DryCopy({} samples)", self.0.len())
+    }
+}
+
+/// The gain stage's factor for each side of the room, gliding together: the master gain times the
+/// balance's attenuation for that side, folded once when a snapshot arrives, so a glide lands on
+/// exactly the factors a stage that never glided multiplies by. The centre's is the master gain.
+#[derive(Clone, Copy, Debug)]
+struct SideGains {
+    left: Ramp,
+    right: Ramp,
+    centre: Ramp,
+}
+
+impl SideGains {
+    const fn unity() -> Self {
+        Self {
+            left: Ramp::new(1.0),
+            right: Ramp::new(1.0),
+            centre: Ramp::new(1.0),
+        }
+    }
+
+    fn glide_to(&mut self, left: Real, right: Real, centre: Real, frames: u32) {
+        self.left.glide_to(left, frames);
+        self.right.glide_to(right, frames);
+        self.centre.glide_to(centre, frames);
+    }
+
+    const fn is_gliding(&self) -> bool {
+        self.left.is_gliding() || self.right.is_gliding() || self.centre.is_gliding()
+    }
+
+    const fn settle(&mut self) {
+        self.left.settle();
+        self.right.settle();
+        self.centre.settle();
+    }
+
+    #[inline(always)]
+    fn advance(&mut self) -> [Real; 3] {
+        [
+            self.left.advance(),
+            self.right.advance(),
+            self.centre.advance(),
+        ]
+    }
+
+    const fn values(&self) -> [Real; 3] {
+        [self.left.value(), self.right.value(), self.centre.value()]
     }
 }
 
@@ -1794,5 +2011,611 @@ mod tests {
             (got - want).abs() < want * 0.01,
             "the auto-gain did not come back: {got} against {want}"
         );
+    }
+
+    // --- Parameter glides (audit report #11) ----------------------------------------------------
+    //
+    // Each scenario was measured on the engine as it stood before the glides (0.4.0 up to c4c40fa),
+    // and the comments quote those numbers beside what the engine does now: 48 kHz stereo, the
+    // default snapshot except for what the test moves.
+
+    /// A cosine, phase-continuous across calls, at `amplitude` on the left and
+    /// `amplitude · right_gain` on the right. At 50 Hz and 480-frame blocks every block starts on a
+    /// crest, so a step at a block boundary lands where the waveform is largest.
+    fn crest_aligned(
+        start_frame: usize,
+        frames: usize,
+        hz: f64,
+        amplitude: f32,
+        right_gain: f32,
+    ) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|i| {
+                let n = (start_frame + i) as f64;
+                let value = (f64::from(amplitude)
+                    * (std::f64::consts::TAU * hz * n / 48_000.0).cos())
+                    as f32;
+                [value, value * right_gain]
+            })
+            .collect()
+    }
+
+    /// What a fresh stereo engine hands back when `params_for(block)` is applied before each block.
+    fn render_moving(
+        block: usize,
+        blocks: usize,
+        tone: (f64, f32, f32),
+        params_for: impl Fn(usize) -> DspParams,
+    ) -> Vec<f32> {
+        let (hz, amplitude, right_gain) = tone;
+        let mut engine = Engine::new(48_000.0, block, 2);
+        let mut rendered = Vec::with_capacity(block * blocks * 2);
+        for index in 0..blocks {
+            engine.apply(&params_for(index));
+            let mut buffer = crest_aligned(index * block, block, hz, amplitude, right_gain);
+            engine.process(&mut buffer, 2);
+            rendered.extend_from_slice(&buffer);
+        }
+        rendered
+    }
+
+    fn left_channel(interleaved: &[f32]) -> Vec<f32> {
+        interleaved.iter().step_by(2).copied().collect()
+    }
+
+    /// The largest change between two neighbouring samples.
+    fn largest_step(signal: &[f32]) -> f32 {
+        signal
+            .windows(2)
+            .fold(0.0_f32, |acc, pair| acc.max((pair[1] - pair[0]).abs()))
+    }
+
+    /// RMS and peak, in dBFS, of what lies above `corner_hz`, from frame `skip` on: a 12th-order
+    /// Butterworth high-pass, six of the crate's own sections. A parameter moving smoothly under a
+    /// low tone puts next to nothing up there; a step puts a click there.
+    fn above(signal: &[f32], corner_hz: f32, skip: usize) -> (f32, f32) {
+        let design = crate::biquad::calc_butterworth_highpass(48_000.0, corner_hz);
+        let mut sections = [crate::biquad::Section::new(); 6];
+        for section in &mut sections {
+            section.coeffs = design;
+        }
+        let (mut sum, mut peak) = (0.0_f64, 0.0_f32);
+        for (index, &sample) in signal.iter().enumerate() {
+            let filtered = sections
+                .iter_mut()
+                .fold(sample, |x, section| section.tick_general(0, x));
+            if index >= skip {
+                sum += f64::from(filtered) * f64::from(filtered);
+                peak = peak.max(filtered.abs());
+            }
+        }
+        let rms = (sum / (signal.len() - skip) as f64).sqrt() as f32;
+        (
+            20.0 * rms.max(1e-12).log10(),
+            20.0 * peak.max(1e-12).log10(),
+        )
+    }
+
+    /// The steepest a cosine of this amplitude and frequency gets on its own, after Dynamic
+    /// Boost's ceiling, with a hair of headroom for rounding: no glide may step further than this.
+    fn own_slope(amplitude: f32, hz: f32) -> f32 {
+        amplitude * crate::effects::dynamic_boost::MAX_OUTPUT * std::f32::consts::TAU * hz
+            / 48_000.0
+            * 1.1
+    }
+
+    #[test]
+    fn a_two_decibel_master_gain_step_is_a_glide_and_not_a_click() {
+        // The audit's scenario: Master Gain 0 → −2 dB under a 50 Hz tone at −6 dBFS. It used to
+        // move the waveform by 0.0993 between two samples, a click whose part above 1 kHz peaked
+        // at −24.9 dBFS; now no step is larger than the tone's own, 0.0032, and above 1 kHz the
+        // peak is −81.5 dBFS.
+        let rendered = render_moving(480, 40, (50.0, 0.5, 1.0), |block| DspParams {
+            master_gain_db: if block >= 20 { -2.0 } else { 0.0 },
+            ..DspParams::default()
+        });
+        let left = left_channel(&rendered);
+        let steepest = largest_step(&left[4_800..]);
+        assert!(
+            steepest < own_slope(0.5, 50.0),
+            "the gain stepped by {steepest}"
+        );
+        let (_, peak) = above(&left, 1_000.0, 4_800);
+        assert!(peak < -70.0, "a click above 1 kHz at {peak} dBFS");
+    }
+
+    #[test]
+    fn a_balance_step_is_a_glide_and_not_a_click() {
+        // Balance 0 → +6 dB: the left side fell by 0.241 in one sample (−17.2 dBFS above 1 kHz);
+        // now by no more than the tone's own 0.0032 (−73.9 dBFS).
+        let rendered = render_moving(480, 40, (50.0, 0.5, 1.0), |block| DspParams {
+            balance: if block >= 20 { 6.0 } else { 0.0 },
+            ..DspParams::default()
+        });
+        let left = left_channel(&rendered);
+        let steepest = largest_step(&left[4_800..]);
+        assert!(
+            steepest < own_slope(0.5, 50.0),
+            "the balance stepped by {steepest}"
+        );
+        let (_, peak) = above(&left, 1_000.0, 4_800);
+        assert!(peak < -65.0, "a click above 1 kHz at {peak} dBFS");
+    }
+
+    #[test]
+    fn a_gain_glide_lands_on_exactly_what_a_stage_that_never_glided_plays() {
+        // Bypassed with the equalizer on, the engine is the gain stage and nothing else, so once
+        // the 20 ms glide has run the output must be the stage's own, bit for bit — and on the
+        // way it moves one way only, from the old gain to the new.
+        let before = DspParams {
+            power: false,
+            ..DspParams::default()
+        };
+        let after = DspParams {
+            power: false,
+            master_gain_db: -6.0,
+            balance: 20.0,
+            ..DspParams::default()
+        };
+        let mut engine = Engine::new(48_000.0, 480, 2);
+        engine.apply(&before);
+        let mut warm = vec![0.5_f32; 960];
+        engine.process(&mut warm, 2);
+        engine.apply(&after);
+
+        let input = vec![0.5_f32; 2 * 960];
+        let mut gliding = input.clone();
+        engine.process(&mut gliding, 2);
+        let left = left_channel(&gliding);
+        assert!(
+            left.windows(2).all(|pair| pair[1] <= pair[0]),
+            "the glide turned back on itself"
+        );
+        assert!(left[0] > 0.49, "the glide skipped its start: {}", left[0]);
+
+        for _ in 0..3 {
+            let mut settled = input.clone();
+            engine.process(&mut settled, 2);
+            assert_same_bits(
+                &settled,
+                &gain_stage_reference(&input, &after),
+                "after the glide",
+            );
+        }
+    }
+
+    #[test]
+    fn a_snapshot_lands_at_once_on_an_engine_nobody_has_heard_yet() {
+        // A glide hides a change from a listener; before the first sample there is no listener
+        // and nothing to glide from, so the first snapshot of a stream, and the first after a
+        // format change, play from their first sample. Once audio has gone through, a change
+        // glides.
+        let gain = |db: f32| DspParams {
+            power: false,
+            master_gain_db: db,
+            ..DspParams::default()
+        };
+        let mut engine = Engine::new(48_000.0, 256, 2);
+        engine.apply(&gain(-6.0));
+        let mut block = vec![1.0_f32; 16];
+        engine.process(&mut block, 2);
+        assert_eq!(block[0].to_bits(), db_to_linear(-6.0).to_bits());
+
+        engine.apply(&gain(-12.0));
+        let mut block = vec![1.0_f32; 16];
+        engine.process(&mut block, 2);
+        assert!(
+            block[0] > db_to_linear(-6.5),
+            "a heard engine jumped: {}",
+            block[0]
+        );
+
+        engine.set_format(96_000.0, 2);
+        engine.apply(&gain(-18.0));
+        let mut block = vec![1.0_f32; 16];
+        engine.process(&mut block, 2);
+        assert_eq!(block[0].to_bits(), db_to_linear(-18.0).to_bits());
+    }
+
+    /// A 62.5 Hz band dragged from 0 to +12 dB a decibel at a time, at the GUI's 60 frames a
+    /// second (every 800 frames, as two 400-frame blocks).
+    fn band_drag(block: usize) -> DspParams {
+        let mut params = DspParams::default();
+        params.band_boost_db[0] = (block.saturating_sub(10) / 2).min(12) as f32;
+        params
+    }
+
+    #[test]
+    fn dragging_an_equalizer_band_leaves_no_zipper_on_the_bass() {
+        // Under a 25 Hz tone, every redesign of the band stepped the filter and the steps came out
+        // as a buzz above 80 Hz, where the tone has nothing: −57.3 dBFS RMS, peaks of −43.7. The
+        // crossfade takes that to −66.9 and −55.7.
+        let rendered = render_moving(400, 60, (25.0, 0.3, 1.0), band_drag);
+        let (rms, peak) = above(&left_channel(&rendered), 80.0, 4_000);
+        assert!(
+            rms < -63.0 && peak < -52.0,
+            "zipper at {rms} dBFS RMS, {peak} peak"
+        );
+
+        // On the band's own frequency, what lands above 300 Hz: −84.0 RMS and −66.6 peak before,
+        // −95.1 and −74.7 now.
+        let rendered = render_moving(400, 60, (62.5, 0.15, 1.0), band_drag);
+        let (rms, peak) = above(&left_channel(&rendered), 300.0, 4_000);
+        assert!(
+            rms < -90.0 && peak < -71.0,
+            "zipper at {rms} dBFS RMS, {peak} peak"
+        );
+    }
+
+    #[test]
+    fn dragging_bass_leaves_no_zipper_under_it() {
+        // Bass dragged from 0 to 10 a position at a time at the GUI's rate. Under a 30 Hz tone the
+        // buzz above 100 Hz was −55.2 dBFS RMS with peaks of −40.3; it is −71.2 and −56.7 now. On
+        // 90 Hz, above 300 Hz: −85.0 and −65.3 before, −100.0 and −78.5 now.
+        let bass_drag = |block: usize| {
+            let mut params = DspParams::default();
+            let position = (block.saturating_sub(10) / 2).min(10);
+            params.set_effect(EffectId::Bass, position as f32 / 10.0);
+            params
+        };
+        let rendered = render_moving(400, 60, (30.0, 0.2, 1.0), bass_drag);
+        let (rms, peak) = above(&left_channel(&rendered), 100.0, 4_000);
+        assert!(
+            rms < -66.0 && peak < -52.0,
+            "zipper at {rms} dBFS RMS, {peak} peak"
+        );
+
+        let rendered = render_moving(400, 60, (90.0, 0.05, 1.0), bass_drag);
+        let (rms, peak) = above(&left_channel(&rendered), 300.0, 4_000);
+        assert!(
+            rms < -95.0 && peak < -74.0,
+            "zipper at {rms} dBFS RMS, {peak} peak"
+        );
+    }
+
+    #[test]
+    fn an_effect_switched_on_or_off_glides_instead_of_stepping() {
+        // Each effect taken from 0 to its top position at block 20 under a 50 Hz tone, and back
+        // to 0 at block 40. The largest step between two samples before the glides, on the way
+        // up: Dynamic Boost 0.135 (+11.6 dB at once), Surround 0.294, Ambience 0.0497, Fidelity
+        // 0.505. Now none moves further than the tone does on its own, at the level the effect
+        // takes it to: +11.6 dB for Dynamic Boost, and ×2.52 for a left channel at 0.2 beside a
+        // right at −0.1 that Surround widens.
+        for (effect, amplitude, right_gain, settled_gain) in [
+            (EffectId::DynamicBoost, 0.05, 1.0, 3.81),
+            (EffectId::Surround, 0.2, -0.5, 2.53),
+            (EffectId::Ambience, 0.5, 1.0, 1.0),
+            (EffectId::Fidelity, 0.5, 1.0, 1.0),
+        ] {
+            let top = if effect == EffectId::DynamicBoost {
+                0.6
+            } else {
+                1.0
+            };
+            let rendered = render_moving(480, 60, (50.0, amplitude, right_gain), |block| {
+                let mut params = DspParams::default();
+                params.set_effect(effect, if (20..40).contains(&block) { top } else { 0.0 });
+                params
+            });
+            let left = left_channel(&rendered);
+            let steepest = largest_step(&left[4_800..]);
+            let bound = own_slope(amplitude * settled_gain, 50.0);
+            assert!(
+                steepest < bound,
+                "{effect:?} stepped by {steepest}, more than the tone's own {bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_volume_leveling_off_lets_the_lift_down_gently() {
+        // A −34 dBFS tone lifted by 13.1 dB, then Volume Leveling 4 → 0: the level fell from
+        // 0.087 to 0.019 between two samples (a step of 0.068). It now glides down over 20 ms, no
+        // step larger than the tone's own, and settles on the same unlevelled 0.019.
+        let rendered = render_moving(480, 220, (300.0, 0.02, 1.0), |block| DspParams {
+            volume_leveling_db: if block >= 200 { 0.0 } else { 4.0 },
+            ..DspParams::default()
+        });
+        let left = left_channel(&rendered);
+        let lifted = left[199 * 480..200 * 480]
+            .iter()
+            .fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        assert!(lifted > 0.08, "the fixture was not lifted: {lifted}");
+        let steepest = largest_step(&left[190 * 480..]);
+        assert!(
+            steepest < own_slope(lifted, 300.0),
+            "the level fell by {steepest} in one sample"
+        );
+        let settled = left[210 * 480..]
+            .iter()
+            .fold(0.0_f32, |acc, s| acc.max(s.abs()));
+        assert!(
+            (settled - 0.02 * crate::effects::dynamic_boost::MAX_OUTPUT).abs() < 1e-4,
+            "the stage did not let go: {settled}"
+        );
+    }
+
+    /// The loudest sample of one 480-frame block of a mono signal.
+    fn block_peak(signal: &[f32], block: usize) -> f32 {
+        signal[block * 480..(block + 1) * 480]
+            .iter()
+            .fold(0.0_f32, |acc, s| acc.max(s.abs()))
+    }
+
+    #[test]
+    fn levelling_switched_off_while_its_stage_is_left_out_does_not_burst_when_it_comes_back() {
+        // The same −34 dBFS tone lifted by 13 dB; FxSound, or the equalizer, switched off at
+        // block 200, Volume Leveling 4 → 0 while it is off or in the snapshot that switches it
+        // back on, and the switch back on at block 220. The glide that lets the lift down only
+        // plays while the stage runs, so it waited for the switch-on and played the old lift into
+        // audio the listener had last heard unlevelled: 0.087, then 0.053, for a steady 0.019.
+        // A stage left out now drops the glide and is switched off at once, as before the glides,
+        // so the switch-on plays 0.019. (Switching FxSound off still drops the lift at once, as it
+        // always has; the equalizer's switch fades it, which the test below measures.)
+        for switch_is_power in [true, false] {
+            for with_the_switch_on in [false, true] {
+                let rendered = render_moving(480, 230, (300.0, 0.02, 1.0), |block| {
+                    let off = (200..220).contains(&block);
+                    let levelling_off = if with_the_switch_on {
+                        block >= 220
+                    } else {
+                        block >= 205
+                    };
+                    DspParams {
+                        power: !(off && switch_is_power),
+                        eq_on: !(off && !switch_is_power),
+                        volume_leveling_db: if levelling_off { 0.0 } else { 4.0 },
+                        ..DspParams::default()
+                    }
+                });
+                let left = left_channel(&rendered);
+                let what = format!(
+                    "{} switched, levelling off {}",
+                    if switch_is_power {
+                        "power"
+                    } else {
+                        "equalizer"
+                    },
+                    if with_the_switch_on {
+                        "with the switch-on"
+                    } else {
+                        "while off"
+                    }
+                );
+                assert!(
+                    block_peak(&left, 199) > 0.08,
+                    "{what}: the fixture was not lifted"
+                );
+                let loudest = (220..230)
+                    .map(|block| block_peak(&left, block))
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    loudest < 0.0205,
+                    "{what}: the switch-on played {loudest} for a steady 0.0193"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_band_moved_while_fxsound_is_off_does_not_replay_the_old_curve_when_it_comes_back_on() {
+        // A band at 31.25 Hz, +12 dB, under a tone there at 0.05; FxSound switched off at block 20,
+        // the band set to 0 dB while it is off or in the snapshot that switches it back on, and
+        // FxSound back on at block 40. The equalizer does not run while FxSound is off, so the
+        // crossfade the change started waited for it and played 20 ms of the +12 dB curve at the
+        // switch-on: 0.134, where before the glides it played 0.048. A change made while nobody
+        // hears the equalizer now lands at once, and the switch-on plays 0.048 again.
+        for with_the_switch_on in [false, true] {
+            let rendered = render_moving(480, 50, (31.25, 0.05, 1.0), |block| {
+                let mut params = DspParams {
+                    power: !(20..40).contains(&block),
+                    ..DspParams::default()
+                };
+                params.band_center_hz[0] = 31.25;
+                let flat = if with_the_switch_on {
+                    block >= 40
+                } else {
+                    block >= 25
+                };
+                params.band_boost_db[0] = if flat { 0.0 } else { 12.0 };
+                params
+            });
+            let left = left_channel(&rendered);
+            assert!(block_peak(&left, 19) > 0.1, "the fixture was not boosted");
+            let loudest = (40..50)
+                .map(|block| block_peak(&left, block))
+                .fold(0.0_f32, f32::max);
+            assert!(
+                loudest < 0.05,
+                "band flattened {}: the switch-on played {loudest}",
+                if with_the_switch_on {
+                    "with the switch-on"
+                } else {
+                    "while off"
+                }
+            );
+        }
+    }
+
+    /// The default ten-band snapshot with 62.5 Hz at +6 dB.
+    fn ten_bands_with_62_hz_up() -> DspParams {
+        let mut params = DspParams::default();
+        params.band_boost_db[0] = 6.0;
+        params
+    }
+
+    /// The 31-band ladder with 63 Hz, its band nearest 62.5 Hz, at +6 dB.
+    fn thirty_one_bands_with_63_hz_up() -> DspParams {
+        let (centres, _, _) = crate::eq::band_table(31).expect("the 31-band ladder");
+        let mut params = DspParams {
+            num_bands: 31,
+            ..DspParams::default()
+        };
+        params.band_center_hz[..31].copy_from_slice(centres);
+        params.band_boost_db = [0.0; 32];
+        params.band_boost_db[5] = 6.0;
+        params
+    }
+
+    #[test]
+    fn a_new_band_count_crossfades_the_whole_curve_instead_of_clicking() {
+        // Ten bands with 62.5 Hz at +6 dB, then 31 with 63 Hz at +6 dB — a preset for the other
+        // band count, or the user changing it — under a 50 Hz tone at 0.3. Every section used to
+        // be cleared, so the old curve went between two samples and the new one started from
+        // rest: a step of 0.143 and a click above 300 Hz peaking at −18.4 dBFS. The old ladder now
+        // plays out beside the new one for 20 ms: no step larger than the tone's own, 0.0030, and
+        // −67.8 dBFS. Back and forth, the ten-band curve remapped to 31 bands at block 20
+        // (`remap_band_gains`, as the settings remap it) and ten again at block 21, 10 ms into the
+        // first crossfade, the second change moves the new ladder to the newest section by
+        // section: 0.444 and −8.4 dBFS before, 0.0044 and −59.6 dBFS now.
+        let rendered = render_moving(480, 40, (50.0, 0.3, 1.0), |block| {
+            if block >= 20 {
+                thirty_one_bands_with_63_hz_up()
+            } else {
+                ten_bands_with_62_hz_up()
+            }
+        });
+        let left = left_channel(&rendered);
+        let steepest = largest_step(&left[4_800..]);
+        assert!(
+            steepest < own_slope(0.3 * 1.6, 50.0),
+            "ten bands to 31 stepped by {steepest}"
+        );
+        let (_, peak) = above(&left, 300.0, 4_800);
+        assert!(peak < -62.0, "ten bands to 31: a click at {peak} dBFS");
+
+        let (centres, _, _) = crate::eq::band_table(31).expect("the 31-band ladder");
+        let remapped = {
+            let ten = ten_bands_with_62_hz_up();
+            let gains = crate::eq::remap_band_gains(ten.bands().1, 31);
+            let mut params = DspParams {
+                num_bands: 31,
+                ..ten
+            };
+            params.band_center_hz[..31].copy_from_slice(centres);
+            params.band_boost_db[..31].copy_from_slice(&gains);
+            params
+        };
+        let rendered = render_moving(480, 40, (50.0, 0.3, 1.0), |block| {
+            if block == 20 {
+                remapped
+            } else {
+                ten_bands_with_62_hz_up()
+            }
+        });
+        let left = left_channel(&rendered);
+        let steepest = largest_step(&left[4_800..]);
+        assert!(steepest < 0.01, "there and back stepped by {steepest}");
+        let (_, peak) = above(&left, 300.0, 4_800);
+        assert!(peak < -55.0, "there and back: a click at {peak} dBFS");
+    }
+
+    #[test]
+    fn switching_the_equalizer_off_or_on_fades_instead_of_stepping() {
+        // 62.5 Hz at +6 dB under a 50 Hz tone at 0.3, the equalizer switched off at block 20 and
+        // back on at block 40. Off, the curve went between two samples, a step of 0.1435 and a
+        // click above 300 Hz at −18.4 dBFS; now the block fades out over 20 ms, no step larger
+        // than the tone's own and −67.8 dBFS. Back on, it came in from rest already, −51.0 dBFS;
+        // the fade takes that to −66.0.
+        let mut engine = Engine::new(48_000.0, 480, 2);
+        let mut rendered = Vec::new();
+        for block in 0..60 {
+            let mut params = ten_bands_with_62_hz_up();
+            params.eq_on = !(20..40).contains(&block);
+            engine.apply(&params);
+            let mut buffer = crest_aligned(block * 480, 480, 50.0, 0.3, 1.0);
+            engine.process(&mut buffer, 2);
+            rendered.extend_from_slice(&buffer);
+            if block == 22 {
+                // Faded out, the block is out: the filters are switched off.
+                assert!(!engine.equalizer().is_enabled());
+            }
+        }
+        let left = left_channel(&rendered);
+        let steepest = largest_step(&left[4_800..]);
+        assert!(
+            steepest < own_slope(0.3 * 1.6, 50.0),
+            "the switch stepped by {steepest}"
+        );
+        let (_, off) = above(&left[..40 * 480], 300.0, 4_800);
+        let (_, on) = above(&left, 300.0, 30 * 480);
+        assert!(
+            off < -62.0 && on < -62.0,
+            "a click above 300 Hz at {off} dBFS switching off, {on} dBFS switching on"
+        );
+
+        // With the whole block busy — master gain −6 dB, balance +6 dB and Volume Leveling 2
+        // beside the curve — under 50 Hz at 0.1, the switch moved the waveform by 0.0418 in one
+        // sample; now by no more than the tone's own 0.0006.
+        let rendered = render_moving(480, 260, (50.0, 0.1, 1.0), |block| {
+            let mut params = ten_bands_with_62_hz_up();
+            params.master_gain_db = -6.0;
+            params.balance = 6.0;
+            params.volume_leveling_db = 2.0;
+            params.eq_on = !(220..240).contains(&block);
+            params
+        });
+        let steepest = largest_step(&left_channel(&rendered)[210 * 480..]);
+        assert!(
+            steepest < own_slope(0.1, 50.0),
+            "the busy block stepped by {steepest}"
+        );
+    }
+
+    /// A xorshift for the stress tests: deterministic, and no dependency.
+    struct Noise(u64);
+
+    impl Noise {
+        fn next(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 40) as f32 / 16_777_216.0
+        }
+
+        fn between(&mut self, low: f32, high: f32) -> f32 {
+            low + (high - low) * self.next()
+        }
+    }
+
+    #[test]
+    fn parameters_changing_every_block_never_break_the_ceiling() {
+        // Every parameter moved at random before every 64-frame block for five seconds — faster
+        // than any glide can finish, so every stage is always mid-glide and every design waits its
+        // turn — on stereo and on 5.1. Nothing may go non-finite and nothing may leave the
+        // chain above Dynamic Boost's ceiling.
+        for channels in [2_usize, 6] {
+            let mut engine = Engine::new(48_000.0, 64, channels);
+            let mut random = Noise(0x9e37_79b9_7f4a_7c15 ^ channels as u64);
+            let mut loudest = 0.0_f32;
+            for _ in 0..(5 * 48_000 / 64) {
+                let mut params = DspParams {
+                    master_gain_db: random.between(-20.0, 20.0),
+                    balance: random.between(-20.0, 20.0),
+                    volume_leveling_db: random.between(0.0, 4.0),
+                    filter_q: random.between(1.0, 3.0),
+                    eq_on: random.next() > 0.1,
+                    ..DspParams::default()
+                };
+                for band in 0..10 {
+                    params.band_boost_db[band] = random.between(-12.0, 12.0);
+                }
+                for effect in EffectId::ALL {
+                    params.set_effect(effect, random.next());
+                }
+                params.sanitise();
+                engine.apply(&params);
+                let mut block: Vec<f32> = (0..64 * channels)
+                    .map(|_| random.between(-0.7, 0.7))
+                    .collect();
+                engine.process(&mut block, channels);
+                assert!(block.iter().all(|s| s.is_finite()), "{channels} channels");
+                loudest = block.iter().fold(loudest, |acc, s| acc.max(s.abs()));
+            }
+            assert!(
+                loudest <= crate::effects::dynamic_boost::MAX_OUTPUT + 1e-6,
+                "{channels} channels reached {loudest}"
+            );
+        }
     }
 }

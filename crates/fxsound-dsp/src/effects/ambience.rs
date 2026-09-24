@@ -26,6 +26,7 @@
 
 use super::{Effect, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
 use crate::biquad::Real;
+use crate::smooth::{Ramp, glide_frames};
 use std::fmt;
 
 // ---------------------------------------------------------------------------------------------
@@ -370,6 +371,12 @@ pub struct Ambience {
     lat6_coeff: Real,
     wet_gain: Real,
     dry_gain: Real,
+    /// What the tank and the mix run on: the four values above, or a glide towards them over
+    /// [`crate::smooth::GLIDE_SECONDS`] (audit report #11). The original steps them between two
+    /// samples, so a slider move stepped the reverb's level and its decay mid-tail.
+    glide: Glide,
+    /// Glide length at the stream's rate.
+    glide_frames: u32,
 
     bandwidth_z: Real,
     damp1_z: Real,
@@ -416,6 +423,8 @@ impl Ambience {
             lat6_coeff: 0.25,
             wet_gain: 0.0,
             dry_gain: 1.0,
+            glide: Glide::at(0.0, 0.25, 0.0, 1.0),
+            glide_frames: glide_frames(clamp_rate(sample_rate)),
             bandwidth_z: 0.0,
             damp1_z: 0.0,
             damp2_z: 0.0,
@@ -606,7 +615,9 @@ impl Ambience {
         let input_diffuser_out = self.allpass(LAT4, tmp_b, LAT3_COEFF);
 
         // ---- Tank branch A. Fed by branch B's tail through `d4_out`. ----
-        tmp_b = input_diffuser_out + self.decay * self.d4_out;
+        let decay = self.glide.decay.value();
+        let lat6_coeff = self.glide.lat6.value();
+        tmp_b = input_diffuser_out + decay * self.d4_out;
         tmp_a = self.decay_diffuser(LAT5, tmp_b, self.lat5_delay);
 
         let taps = self.d1_taps;
@@ -616,10 +627,10 @@ impl Ambience {
 
         tmp_a = tap4 * self.one_minus_damping + self.damping * self.damp1_z;
         self.damp1_z = tmp_a;
-        tmp_a *= self.decay;
+        tmp_a *= decay;
 
         let taps = self.lat6_taps;
-        let (y, tap1, tap2) = self.allpass_tapped(LAT6, tmp_a, self.lat6_coeff, taps);
+        let (y, tap1, tap2) = self.allpass_tapped(LAT6, tmp_a, lat6_coeff, taps);
         out1 -= tap1;
         out2 -= tap2;
 
@@ -629,7 +640,7 @@ impl Ambience {
         out2 += tap2;
 
         // ---- Tank branch B. Fed by branch A's tail through D2's longest tap. ----
-        tmp_b = input_diffuser_out + self.decay * tap3;
+        tmp_b = input_diffuser_out + decay * tap3;
         tmp_a = self.decay_diffuser(LAT7, tmp_b, self.lat7_delay);
 
         let taps = self.d3_taps;
@@ -639,10 +650,10 @@ impl Ambience {
 
         tmp_a = tap4 * self.one_minus_damping + self.damping * self.damp2_z;
         self.damp2_z = tmp_a;
-        tmp_a *= self.decay;
+        tmp_a *= decay;
 
         let taps = self.lat8_taps;
-        let (y, tap1, tap2) = self.allpass_tapped(LAT8, tmp_a, self.lat6_coeff, taps);
+        let (y, tap1, tap2) = self.allpass_tapped(LAT8, tmp_a, lat6_coeff, taps);
         out1 -= tap2;
         out2 -= tap1;
 
@@ -653,6 +664,55 @@ impl Ambience {
         self.d4_out = tap3;
 
         (out1 * OUTPUT_SCALE, out2 * OUTPUT_SCALE)
+    }
+}
+
+/// The values the tank and the mix run on, each gliding on its own ramp.
+#[derive(Clone, Copy, Debug)]
+struct Glide {
+    decay: Ramp,
+    lat6: Ramp,
+    wet: Ramp,
+    dry: Ramp,
+    /// How much of the input reaches the tank: 1.0, except while the music fades into a tank
+    /// that has just been emptied.
+    feed: Ramp,
+}
+
+impl Glide {
+    const fn at(decay: Real, lat6: Real, wet: Real, dry: Real) -> Self {
+        Self {
+            decay: Ramp::new(decay),
+            lat6: Ramp::new(lat6),
+            wet: Ramp::new(wet),
+            dry: Ramp::new(dry),
+            feed: Ramp::new(1.0),
+        }
+    }
+
+    const fn is_gliding(&self) -> bool {
+        self.decay.is_gliding()
+            || self.lat6.is_gliding()
+            || self.wet.is_gliding()
+            || self.dry.is_gliding()
+            || self.feed.is_gliding()
+    }
+
+    #[inline(always)]
+    fn advance(&mut self) {
+        self.decay.advance();
+        self.lat6.advance();
+        self.wet.advance();
+        self.dry.advance();
+        self.feed.advance();
+    }
+
+    const fn settle(&mut self) {
+        self.decay.settle();
+        self.lat6.settle();
+        self.wet.settle();
+        self.dry.settle();
+        self.feed.settle();
     }
 }
 
@@ -681,6 +741,7 @@ impl Effect for Ambience {
             return;
         }
         self.sample_rate = sample_rate;
+        self.glide_frames = glide_frames(sample_rate);
         self.design();
         self.reset();
     }
@@ -698,8 +759,15 @@ impl Effect for Ambience {
     /// Ambience, the stale tail reached −15.3 dBFS in pure silence (audit report #9). The fill is
     /// left to [`Effect::process`] so that it happens once, on the frame the tank is about to
     /// hear, however many snapshots arrive in between.
+    ///
+    /// The new values are glided to rather than jumped to (audit report #11): the wet and dry
+    /// gains fade the reverb in from the bypass, out to it, and between two amounts; the decay
+    /// and the diffusers' coefficient glide with them, except into an emptied tank, which has
+    /// nothing to glide over — there the music fades into the tank instead, so the first
+    /// reflections do not start on a step. A stage taken to zero keeps running until its fade out
+    /// is done, and one brought back before then never stopped, so its tank is not emptied.
     fn set_amount(&mut self, amount: Real) {
-        let was_active = self.active;
+        let was_active = self.is_active();
         self.amount = amount.clamp(0.0, 1.0);
 
         let midi = i32::from(fxsound_core::scale::value_to_midi(self.amount));
@@ -731,14 +799,37 @@ impl Effect for Ambience {
             self.wet_gain = (t * f64::from(wet_at_39)) as Real;
             self.dry_gain = (1.0 + t * (f64::from(dry_at_39) - 1.0)) as Real;
         }
+
+        let frames = self.glide_frames;
+        if !self.active && !was_active {
+            // Bypassed before and after: nothing is heard to glide.
+            self.glide = Glide::at(self.decay, self.lat6_coeff, self.wet_gain, self.dry_gain);
+            return;
+        }
+        if self.active && !was_active {
+            self.glide.decay = Ramp::new(self.decay);
+            self.glide.lat6 = Ramp::new(self.lat6_coeff);
+            self.glide.feed = Ramp::new(0.0);
+            self.glide.feed.glide_to(1.0, frames);
+        } else {
+            self.glide.decay.glide_to(self.decay, frames);
+            self.glide.lat6.glide_to(self.lat6_coeff, frames);
+        }
+        self.glide.wet.glide_to(self.wet_gain, frames);
+        self.glide.dry.glide_to(self.dry_gain, frames);
     }
 
     fn amount(&self) -> Real {
         self.amount
     }
 
+    /// Switched on, or still fading out after being switched off.
     fn is_active(&self) -> bool {
-        self.active
+        self.active || self.glide.is_gliding()
+    }
+
+    fn settle(&mut self) {
+        self.glide.settle();
     }
 
     /// Clears the tank.
@@ -750,6 +841,7 @@ impl Effect for Ambience {
     fn reset(&mut self) {
         self.arena.fill(0.0);
         self.clear_state();
+        self.glide.settle();
     }
 
     /// Interleaved, in place.
@@ -758,21 +850,30 @@ impl Effect for Ambience {
     /// instance per output pair (`dfxpComm.cpp:88-111`) and forces the subwoofer's off entirely,
     /// so mixing surround channels into one tank would be a new effect, not this one.
     fn process(&mut self, buffer: &mut [Real], channels: usize) {
-        if !self.active || channels == 0 {
+        if !self.is_active() || channels == 0 {
             return;
         }
         if self.clear_pending {
             self.clear_tank();
         }
+        // Checked once a block; a glide that ends mid-block holds its last value, the design,
+        // exactly, for the rest of it.
+        let gliding = self.glide.is_gliding();
 
         if channels == 1 {
             // `Lex32.c:670-675`: the mono path zeroes the second input, halves both wet outputs
             // and sums them into the single output sample (`dutio.h:414-426`).
             for sample in buffer.iter_mut() {
+                if gliding {
+                    self.glide.advance();
+                }
+                let (wet_gain, dry_gain) = (self.glide.wet.value(), self.glide.dry.value());
                 let dry = *sample + DENORM_BIAS;
-                let (wet1, wet2) = self.tick(dry, dry);
-                let out1 = wet1 * 0.5 * self.wet_gain + self.dry_gain * dry;
-                let out2 = wet2 * 0.5 * self.wet_gain;
+                // Exactly `dry` whenever no fade into the tank runs.
+                let fed = dry * self.glide.feed.value();
+                let (wet1, wet2) = self.tick(fed, fed);
+                let out1 = wet1 * 0.5 * wet_gain + dry_gain * dry;
+                let out2 = wet2 * 0.5 * wet_gain;
                 *sample = out1 + out2;
             }
             return;
@@ -783,12 +884,18 @@ impl Effect for Ambience {
             let Some((left, right)) = super::pair_mut(frame, li, ri) else {
                 continue;
             };
+            if gliding {
+                self.glide.advance();
+            }
+            let (wet_gain, dry_gain) = (self.glide.wet.value(), self.glide.dry.value());
             let in1 = *left + DENORM_BIAS;
             let in2 = *right + DENORM_BIAS;
-            let (wet1, wet2) = self.tick(in1, in2);
+            // Exactly the inputs whenever no fade into the tank runs.
+            let feed = self.glide.feed.value();
+            let (wet1, wet2) = self.tick(in1 * feed, in2 * feed);
             // `kerWetDry` (`kerdelay.h:205-210`): the master gain is already folded into the pair.
-            *left = wet1 * self.wet_gain + self.dry_gain * in1;
-            *right = wet2 * self.wet_gain + self.dry_gain * in2;
+            *left = wet1 * wet_gain + dry_gain * in1;
+            *right = wet2 * wet_gain + dry_gain * in2;
         }
     }
 }
@@ -815,9 +922,13 @@ mod tests {
     use fxsound_core::scale::slider_to_value;
 
     /// Feed one stereo impulse and return `frames` frames of interleaved output.
+    ///
+    /// The amount is landed, as a chain that has not been heard lands it: the response is the
+    /// amount's, not the 20 ms fade in from the bypass (audit report #11).
     fn impulse_response(amount: Real, sample_rate: Real, frames: usize) -> Vec<Real> {
         let mut reverb = Ambience::new(sample_rate);
         reverb.set_amount(amount);
+        reverb.settle();
         let mut buffer = vec![0.0; frames * 2];
         buffer[0] = 1.0;
         buffer[1] = 1.0;
@@ -1011,8 +1122,11 @@ mod tests {
             reverb.set_amount(slider_to_value(slider as Real));
             assert!(reverb.is_active(), "slider {slider} should be active");
         }
-        // The threshold itself is the original's: stored 12 is off, 13 is on.
+        // The threshold itself is the original's: stored 12 is off, 13 is on — off once the fade
+        // out has run (audit report #11), which `settle` stands in for.
         reverb.set_amount(fxsound_core::scale::midi_to_value(12));
+        assert!(reverb.is_active(), "switched off, it fades out first");
+        reverb.settle();
         assert!(!reverb.is_active());
         reverb.set_amount(fxsound_core::scale::midi_to_value(13));
         assert!(reverb.is_active());
@@ -1126,7 +1240,12 @@ mod tests {
         assert!(off.is_infinite() && off < 0.0, "{off}");
     }
 
-    /// A reverb that has heard a second of a loud tone, then been switched off and back on.
+    /// A reverb that has heard a second of a loud tone, then been set to `off_amount` for
+    /// 100 ms more of it and back to full.
+    ///
+    /// The 100 ms are there since audit report #11: a reverb taken to zero fades out over 20 ms,
+    /// so one set to zero and straight back never stopped — it is the tank that sat bypassed while
+    /// the music played on that #9 is about.
     fn switched_off_and_on_after_a_loud_passage(off_amount: Real) -> Ambience {
         let mut reverb = Ambience::new(48_000.0);
         reverb.set_amount(1.0);
@@ -1138,6 +1257,7 @@ mod tests {
             .collect();
         reverb.process(&mut loud, 2);
         reverb.set_amount(off_amount);
+        reverb.process(&mut loud[..2 * 4_800], 2);
         reverb.set_amount(1.0);
         reverb
     }
@@ -1200,6 +1320,8 @@ mod tests {
         let mut loud = vec![0.5; 2 * 48_000];
         reverb.process(&mut loud, 2);
         reverb.set_amount(0.0);
+        // Long enough for the fade out to finish and the tank to stop (audit report #11).
+        reverb.process(&mut loud[..2 * 4_800], 2);
         reverb.set_amount(1.0);
         let mut block = vec![0.0; 2];
         reverb.process(&mut block, 2);
@@ -1410,6 +1532,8 @@ mod tests {
         let frames = 4096;
         let mut mono_reverb = Ambience::new(rate);
         mono_reverb.set_amount(1.0);
+        // Landed, as `impulse_response` lands it (audit report #11).
+        mono_reverb.settle();
         let mut mono = vec![0.0; frames];
         mono[0] = 1.0;
         mono_reverb.process(&mut mono, 1);
@@ -1622,5 +1746,32 @@ mod tests {
         let text = format!("{reverb:?}");
         assert!(text.len() < 400, "Debug printed {} bytes", text.len());
         assert!(text.contains("arena_floats"));
+    }
+
+    #[test]
+    fn taken_to_zero_ambience_fades_out_over_twenty_milliseconds_and_is_then_bypassed_exactly() {
+        // Audit report #11: the stage runs on through its fade to zero, then the chain skips it
+        // and it touches nothing, as it did the moment it reached zero before.
+        let mut stage = Ambience::new(48_000.0);
+        stage.set_amount(1.0);
+        stage.settle();
+        let tone = |frames: usize| -> Vec<Real> {
+            (0..frames)
+                .flat_map(|n| {
+                    let s = (n as Real * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.3;
+                    [s, -0.5 * s]
+                })
+                .collect()
+        };
+        let mut playing = tone(4_800);
+        stage.process(&mut playing, 2);
+        stage.set_amount(0.0);
+        assert!(stage.is_active(), "switched off, it went silent at once");
+        let mut fading = tone(959);
+        stage.process(&mut fading, 2);
+        assert!(stage.is_active(), "the fade ended early");
+        let mut last = tone(1);
+        stage.process(&mut last, 2);
+        assert!(!stage.is_active(), "the fade did not end after 20 ms");
     }
 }
