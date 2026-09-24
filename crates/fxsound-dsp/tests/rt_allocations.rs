@@ -1,4 +1,6 @@
-//! Nothing on the audio path allocates, held by a counting allocator.
+//! Nothing on the audio path allocates, held by a counting allocator — and, in silence, nothing on
+//! it works on subnormals, held by the processor's own sticky exception flags (see
+//! [`subnormal_arithmetic_in`]).
 //!
 //! The crate's contract — "nothing in this crate allocates, locks or blocks once constructed" —
 //! was a comment in 0.3.0, and one path broke it unseen: `Denoiser::reset` rebuilt eight network
@@ -433,4 +435,165 @@ fn switching_effects_off_and_on_and_naming_the_sides_allocates_nothing() {
         n, 0,
         "switching effects and naming sides allocated {n} times"
     );
+}
+
+/// The SSE status register's sticky flags for an arithmetic operand that was subnormal (DE, bit 1)
+/// and for a result that underflowed (UE, bit 4). Each one set is an operation that took the slow
+/// path: a microcode assist on many x86 parts, tens to hundreds of cycles, on the audio thread.
+#[cfg(target_arch = "x86_64")]
+const SUBNORMAL_FLAGS: u32 = (1 << 1) | (1 << 4);
+
+#[cfg(target_arch = "x86_64")]
+fn sse_status() -> u32 {
+    let mut status = 0_u32;
+    // SAFETY: `stmxcsr` stores the thread's own SSE control and status register into the `u32`
+    // it is pointed at, which lives on this stack frame for the whole instruction.
+    unsafe {
+        core::arch::asm!(
+            "stmxcsr [{}]",
+            in(reg) &raw mut status,
+            options(nostack, preserves_flags)
+        );
+    }
+    status
+}
+
+/// Runs `work` and says whether any of it did arithmetic on a subnormal or underflowed into one.
+///
+/// Only the six sticky exception flags are cleared first — the rounding mode, the exception masks
+/// and flush-to-zero are left as they are — and they belong to this thread alone. Flags are the
+/// only measure of this that does not depend on how fast the machine is or how busy it is: a
+/// timing comparison against flush-to-zero says the same thing on a quiet machine and nothing on
+/// a loaded one.
+#[cfg(target_arch = "x86_64")]
+fn subnormal_arithmetic_in(work: impl FnOnce()) -> bool {
+    let cleared = sse_status() & !0x3f;
+    // SAFETY: `ldmxcsr` loads the thread's SSE register from the `u32` it is pointed at; the value
+    // is the register's own with only its sticky exception flags cleared, so nothing about how
+    // later arithmetic rounds or traps changes.
+    unsafe {
+        core::arch::asm!(
+            "ldmxcsr [{}]",
+            in(reg) &raw const cleared,
+            options(nostack, readonly, preserves_flags)
+        );
+    }
+    work();
+    sse_status() & SUBNORMAL_FLAGS != 0
+}
+
+/// A ten-band curve alternating +4 and -3 dB, the report's: every band live, so every band leaves
+/// its bias residue in silence.
+fn boosted_equalizer() -> fxsound_dsp::GraphicEq {
+    let mut eq = fxsound_dsp::GraphicEq::new();
+    eq.set_sample_rate(FS);
+    let centres = eq.center_frequencies().to_vec();
+    let gains: Vec<f32> = (0..centres.len())
+        .map(|band| if band % 2 == 0 { 4.0 } else { -3.0 })
+        .collect();
+    eq.set_bands(&centres, &gains);
+    eq
+}
+
+/// Whether `stage` does subnormal arithmetic on the silence `filter` hands it.
+///
+/// Two seconds of music through both, as a listener's session would have, then two of digital
+/// silence to let every tail die and every detector settle, and then one more second of `filter`'s
+/// silence — its bias residue, around 1e-30, not zeros — to `stage` alone, with the flags watched.
+/// 480-frame blocks.
+#[cfg(target_arch = "x86_64")]
+fn subnormal_arithmetic_behind(
+    filter: &mut dyn FnMut(&mut [f32]),
+    stage: &mut dyn FnMut(&mut [f32]),
+) -> bool {
+    let music = stereo_fixture(96_000);
+    let mut block = vec![0.0_f32; 960];
+    for chunk in music.as_chunks::<960>().0 {
+        block.copy_from_slice(chunk);
+        filter(&mut block);
+        stage(&mut block);
+    }
+    for _ in 0..200 {
+        block.fill(0.0);
+        filter(&mut block);
+        stage(&mut block);
+    }
+    let mut residue: Vec<Vec<f32>> = (0..100)
+        .map(|_| {
+            block.fill(0.0);
+            filter(&mut block);
+            block.clone()
+        })
+        .collect();
+    let largest = residue
+        .iter()
+        .flatten()
+        .fold(0.0_f32, |most, sample| most.max(sample.abs()));
+    assert!(
+        largest > 0.0 && largest < 1e-20,
+        "the filter should hand on bias residue in silence, not {largest:e}"
+    );
+    let slow = subnormal_arithmetic_in(|| {
+        for block in &mut residue {
+            stage(block);
+        }
+    });
+    std::hint::black_box(&residue);
+    slow
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn the_leveller_behind_a_boosted_equalizer_does_no_subnormal_arithmetic_in_silence() {
+    // Audit #5, the half its first fix missed. The detector's filter state was flushed, but the
+    // "silence" the stage is handed behind any live equalizer band is the bands' bias residue,
+    // around 1e-30, and the detector and the post-gain statistics squared it on every sample: an
+    // underflow each time. Behind this curve at Volume Leveling 2, with everything else off, the
+    // engine on stereo cost 96.5 ns a frame in silence against 60.6 on music, and 53.4 with the
+    // processor flushing subnormals itself (48 kHz, 480-frame blocks, best of seven release runs
+    // on a Ryzen 7 6800H). The stage now reads a sample that small as zero before it squares
+    // anything, and silence costs 45.6.
+    let mut eq = boosted_equalizer();
+    let mut leveller = fxsound_dsp::VolumeLeveller::new(FS);
+    leveller.set_amount(2.0);
+    assert!(
+        !subnormal_arithmetic_behind(&mut |block| eq.process(block, 2), &mut |block| leveller
+            .process(block, 2),),
+        "the leveller did subnormal arithmetic on a second of the equalizer's silence"
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn dynamic_boost_behind_bass_does_no_subnormal_arithmetic_in_silence() {
+    // Audit #7's estimator squares the front pair in f32, and behind any stage that leaves bias
+    // residue in silence — Bass, the equalizer, Fidelity, Ambience — both squares underflowed on
+    // every frame. The stage is never bypassed, so that cost every preset with anything switched
+    // on: with Bass at 0.6 and everything else off, the engine on stereo cost 40.7 ns a frame in
+    // silence against 30.6 on music, and 24.1 with the processor flushing subnormals itself
+    // (measured as above). A pair that small now reads as silence without being squared, and
+    // silence costs 21.9.
+    use fxsound_dsp::effects::{Bass, DynamicBoost, Effect as _};
+    let mut bass = Bass::new(FS);
+    bass.set_amount(0.6);
+    bass.settle();
+    let mut eq = boosted_equalizer();
+    for amount in [0.0, 0.6, 1.0] {
+        let mut boost = DynamicBoost::new(FS);
+        boost.set_amount(amount);
+        boost.settle();
+        assert!(
+            !subnormal_arithmetic_behind(&mut |block| bass.process(block, 2), &mut |block| boost
+                .process(block, 2),),
+            "Dynamic Boost at {amount} did subnormal arithmetic on a second of Bass's silence"
+        );
+        let mut boost = DynamicBoost::new(FS);
+        boost.set_amount(amount);
+        boost.settle();
+        assert!(
+            !subnormal_arithmetic_behind(&mut |block| eq.process(block, 2), &mut |block| boost
+                .process(block, 2),),
+            "Dynamic Boost at {amount} did subnormal arithmetic on the equalizer's silence"
+        );
+    }
 }

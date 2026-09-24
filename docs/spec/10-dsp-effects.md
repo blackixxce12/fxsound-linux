@@ -1586,11 +1586,16 @@ all three (its hold and its linking were decided with tests of their own).
   where quiet material gets −0.3 dB — and stepped there as the level crossed the threshold. Now
   loud material at slider 0 is −0.3 dB like everything else. At every boosted setting the floor
   is unchanged.
-* **#7 — the level estimator hears `(L² + R²)/2` of the front pair** (channels 0 and 1; `M²` for
-  mono). A mix quiet on the left and loud on the right used to get the full +11.6 dB at slider 10
-  with the right channel 5.5 dB into the limiter; it now backs off like any other. For centred
+* **#7 — the level estimator hears `(L² + R²)/2` of the front pair** (channels 0 and 1 unless the
+  layout names another pair, `DynamicBoost::set_front_pair` through `Chain::set_front_pair`; `M²`
+  for mono). A mix quiet on the left and loud on the right used to get the full +11.6 dB at slider
+  10 with the right channel 5.5 dB into the limiter; it now backs off like any other. For centred
   material the two estimates are bit-identical. On 5.1/7.1 the centre, LFE and surrounds still do
-  not steer the level.
+  not steer the level, whatever order the device puts them in. A block whose front pair is all
+  under `1.1e-19` — the bias residue every stage with a biquad leaves in silence — is heard as
+  silence without being squared: each square underflowed, and silence cost more than music
+  (through the engine on stereo with Bass at 0.6 and everything else off, 40.7 against 30.6 ns a
+  frame; 21.9 now; 48 kHz, 480-frame blocks, best of seven release runs on a Ryzen 7 6800H).
 * **#8 — the attack ramp is clamped to its peak.** After `env += delta` the envelope is clamped to
   `max(max_abs, held)` (`held` ≥ `|dly_out|`, below), so a slope kept steep from an earlier
   retarget cannot carry it past the peak it aims at. A 50 Hz sine at twice the ceiling drove the
@@ -1603,10 +1608,26 @@ all three (its hold and its linking were decided with tests of their own).
   3 dB into the limiter. Held, a steady tone from 25 Hz up has none (20 Hz: 0.7 %). A lone
   transient now keeps the level down for the hold, then releases at the original 10 ms rate (fully
   off 33 ms after it has left, from 11.5), and a synthetic kick-and-hats mix at slider 10 comes
-  out 0.6 dB quieter (0.9 dB against #8 alone).
-* **R2 — one envelope for every channel.** The envelope follows the loudest channel and one gain
-  goes to all of them, so a peak on one side (Surround 10, hard panning) no longer shifts the image
-  by up to 5.6 dB. Each channel keeps its own delay line.
+  out 0.6 dB quieter (0.9 dB against #8 alone). A steady bass note driven into the limiter comes
+  out clean and at the same peak but 0.8–0.9 dB lower in RMS than the original's distorted one
+  (50 Hz at twice the ceiling: −2.47 → −3.31 dBFS; 40 Hz: −2.40 → −3.31): the gain that breathed
+  inside every cycle and raised the RMS was the distortion. A kick train at slider 10 came out
+  1.03 dB quieter in the audit's measurement.
+* **R2 — one envelope for both sides of the pair.** The envelope follows the louder channel of the
+  stereo pair and one gain goes to both, so a peak on one side (Surround 10, hard panning) no
+  longer shifts the image by up to 5.6 dB. On surround every speaker either side of the listener
+  (front, side, rear) shares the envelope and the centre and the subwoofer each keep their own
+  (`Chain::set_channel_sides`); with the sides unknown only the front pair is linked. The first
+  cut linked all channels, and since the auto-gain listens to the front pair alone, a quiet 5.1
+  bed at slider 10 took the full +11.6 dB and then swung 12 dB on every subwoofer boom (4 dB under
+  a shouting centre), where the original's per-channel envelopes had moved it not at all. Each
+  channel keeps its own delay line. The limiter runs each envelope over the whole block
+  (`LookaheadLimiter::process`), so the linking costs no more than the original's envelope per
+  channel did: Dynamic Boost alone at slider 10 costs 20.0 ns a frame on 5.1 and 22.4 on 7.1,
+  against the original's 20.8 and 30.3 (23.7 against 20.6 on 5.1 with only the front pair known;
+  white noise at ±0.3, measured as above). The whole engine on 5.1, every effect at 0.6, a
+  ten-band curve and Volume Leveling 2, costs 169.4 ns a frame on music, against 171.1 before
+  these fixes.
 
 ---
 
@@ -1959,7 +1980,7 @@ record it.
 5. **Maximizer level estimate uses the left channel only** (`Maxi32.c:258-259`).
    Recommend: use `max(|L|,|R|)²` or `(L²+R²)/2` and document the change; the
    current behaviour mis-tracks hard-panned material.
-   **Done in 0.4.0** (audit #7): `(L²+R²)/2` of the front pair, §8.9.
+   **Done in 0.4.0** (audit #7): `(L²+R²)/2` of the front pair, wherever the layout puts it, §8.9.
 6. **`s->level` must be `f64`.** (§8.2) Using `f32` with a pole of 0.99998575
    silently freezes the estimator.
 7. **The reverb has no modulation in this build.** (§1.2) If you re-enable it

@@ -54,7 +54,10 @@
 //! and now by no more than the tone moves on its own.
 //! The power switch is the one control that still acts between two samples: it is the listener's
 //! A/B against the unprocessed sound, and a bypass that faded would mix the processed signal, a
-//! look-ahead behind, with the dry one for 20 ms.
+//! look-ahead behind, with the dry one for 20 ms. Switched back on, the equalizer starts from
+//! rest, as it does when its own switch comes back on and as the effects do (audit report #10):
+//! its sections stood still while FxSound was off, and resuming them played what they held from
+//! before into whatever came next. The leveller resumes its gain, as the original's does.
 //!
 //! Everything after construction is allocation-free. [`Engine::process`] is the only method the
 //! real-time thread calls per buffer; the others are called from the same thread in response to a
@@ -259,7 +262,8 @@ impl Engine {
         self.refresh_sides();
     }
 
-    /// Name the front pair, so the two stereo-by-nature stages run over the right channels.
+    /// Name the front pair, so the two stereo-by-nature stages run over the right channels and
+    /// Dynamic Boost's level estimator hears the right two (audit #7).
     ///
     /// `None` keeps the historical behaviour of using the first two, which is correct for every
     /// layout that starts `FL, FR` — that is, all the standard ones.
@@ -270,7 +274,9 @@ impl Engine {
     }
 
     /// Name the side of every channel, from the device's own channel positions, so the balance
-    /// turns down the speakers on one side of the room and nothing else.
+    /// turns down the speakers on one side of the room and nothing else, and Dynamic Boost's
+    /// limiter turns the speakers either side of the listener down together and the centre and the
+    /// subwoofer each on their own (audit R2).
     ///
     /// One entry per channel, in the device's order. `None`, or a list that does not have one
     /// entry per channel of the current format, leaves the engine to infer the sides
@@ -297,6 +303,8 @@ impl Engine {
             Some((named, len)) if len == self.channels => named,
             _ => default_sides(self.channels, self.lfe_channel, self.front_pair),
         };
+        // Dynamic Boost's limiter links by the same sides (audit R2).
+        self.chain.set_channel_sides(&self.sides[..self.channels]);
     }
 
     /// Adopt a parameter snapshot, skipping anything that has not changed.
@@ -308,6 +316,8 @@ impl Engine {
     }
 
     fn apply_unconditionally(&mut self, params: &DspParams) {
+        // The power switch's rising edge. `applied` still holds the snapshot before this one.
+        let powering_on = params.power && !self.applied.power;
         self.chain.apply(params);
 
         // The equalizer's switch fades the GraphicEq block in or out (see the module
@@ -321,6 +331,21 @@ impl Engine {
             self.eq_block.settle();
         }
         self.eq.set_enabled(self.eq_block_runs());
+        if powering_on {
+            // FxSound back on: the equalizer starts from rest, as it does when its own switch
+            // comes back on (`GraphicEq::set_enabled`, audit report #10). While FxSound was off
+            // its sections stood still holding what they heard before, perhaps minutes ago, and
+            // resumed from it: with 62.5 Hz at +3 dB under loud bass, silence after switching
+            // back on rang at −12.8 dBFS. The effects start from rest for the same reason
+            // (`Chain::set_power`). The leveller does not: what it holds is a gain and slow
+            // statistics, not a filter ringing, and resuming them is the original's behaviour on
+            // either switch; its peak safety keeps whatever it resumes with under the ceiling.
+            // The application's power button has always followed the switch with
+            // `ResetFilterState`, which clears the equalizer and the leveller both, so a listener
+            // heard this ring for one buffer at most, when a buffer fell between the two
+            // messages: the engine now starts clean without relying on every caller to send it.
+            self.eq.reset();
+        }
         self.eq.set_q_multiplier(params.filter_q);
         let (centers, boosts) = params.bands();
         if centers != self.eq.center_frequencies() || boosts != self.eq.boosts_db() {
@@ -2617,5 +2642,47 @@ mod tests {
                 "{channels} channels reached {loudest}"
             );
         }
+    }
+
+    #[test]
+    fn switching_fxsound_back_on_starts_the_equalizer_from_rest() {
+        // Audit report #10 through the power button, the switch listeners use most. The
+        // equalizer's own switch already starts every band from rest on the way back in; the
+        // power button froze the sections while FxSound was off and resumed them from what they
+        // held, perhaps minutes old. 62.5 Hz at +3 dB under a 50 Hz tone at 0.9 for a second,
+        // FxSound off for a second, back on into digital silence: the old state rang out at
+        // 0.230, −12.8 dBFS. Now it is silence, as through the equalizer's switch.
+        let mut on = DspParams::default();
+        on.band_boost_db[0] = 3.0;
+        let off = DspParams { power: false, ..on };
+        let w = std::f32::consts::TAU * 50.0 / 48_000.0;
+        let bass = |start: usize| -> Vec<f32> {
+            (start..start + 480)
+                .flat_map(|n| {
+                    let s = 0.9 * (w * n as f32).sin();
+                    [s, s]
+                })
+                .collect()
+        };
+        let mut engine = Engine::new(48_000.0, 4096, 2);
+        engine.apply(&on);
+        for block in 0..100 {
+            engine.process(&mut bass(block * 480), 2);
+        }
+        engine.apply(&off);
+        for block in 100..200 {
+            engine.process(&mut bass(block * 480), 2);
+        }
+        engine.apply(&on);
+        let mut loudest = 0.0_f32;
+        for _ in 0..20 {
+            let mut silence = vec![0.0_f32; 960];
+            engine.process(&mut silence, 2);
+            loudest = silence.iter().fold(loudest, |most, s| most.max(s.abs()));
+        }
+        assert!(
+            loudest < 1e-6,
+            "the old state rang out at {loudest}, was 0.230"
+        );
     }
 }

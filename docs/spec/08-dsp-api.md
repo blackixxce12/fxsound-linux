@@ -768,8 +768,14 @@ only while levelling is on; `crates/fxsound-dsp/src/leveller.rs` has the detail)
   call — about one hit in eleven at a 1024-frame quantum, one in five at 480 — and every hit at a
   quantum of 96 frames or less (at 64 frames, 2.8 dB in one sample 8 frames into a call, 1.5 dB
   16 frames in).
-* **#5** — the detector's filter state is flushed to zero below `1e-20`, so digital silence does
-  not leave it running on subnormals.
+* **#5** — the detector does no subnormal arithmetic in digital silence. Its filter state is
+  flushed to zero below `DENORMAL_FLUSH` (`1.1e-19`, just above `sqrt(f32::MIN_POSITIVE)`), and a
+  stretch whose every sample is below that — the bias residue, around 1e-30, that any live
+  equalizer band hands on in silence — is read as zeros by the detector and is not squared into
+  the post-gain statistics, in loops that have no such square in them. Behind a ten-band curve at
+  Volume Leveling 2 with everything else off, silence cost the engine on stereo 96.5 ns a frame
+  against 60.6 on music (53.4 with FTZ/DAZ); now 45.6 (48 kHz, 480-frame blocks, best of seven
+  release runs on a Ryzen 7 6800H).
 
 ### 8.5 `setFilterQ(float q_multiplier)`
 
@@ -1042,13 +1048,18 @@ detail):
 
 * **#6** — the anti-pumping floor is `min(1.06, gain_boost)`, so slider 0 never lifts loud
   material by +0.5 dB; at every boosted setting it is unchanged.
-* **#7** — the detector is `(L² + R²)/2` of the front pair (channels 0 and 1; `M²` for mono), not
-  `in_L²`. Centred material gives the identical estimate.
+* **#7** — the detector is `(L² + R²)/2` of the front pair (channels 0 and 1 unless the layout
+  names others through `Chain::set_front_pair`; `M²` for mono), not `in_L²`. Centred material
+  gives the identical estimate. A block whose front pair is all under `1.1e-19` (bias residue in
+  silence) is heard as silence without being squared: every square of it underflowed.
 * **#8** — the envelope is clamped to its ramp's peak after `env += delta`, so it no longer
   overshoots (a 50 Hz sine at 2× the ceiling: 2.26 → 2.00).
 * **R1** — the envelope holds the loudest leaving sample of the last ~20 ms before
   `release_time_beta` applies (a limited 40 Hz sine: 15.6 % → 0 % THD+N).
-* **R2** — one envelope, from the loudest channel, for every channel.
+* **R2** — one envelope, from the loudest of them, for both channels of a stereo pair, and on
+  surround for every speaker either side of the listener; the centre and the subwoofer each have
+  their own (`Chain::set_channel_sides`, which `Engine` feeds with the sides it balances by). The
+  microphone chain's limiter links every channel.
 
 The limiter is `crates/fxsound-dsp/src/input/limiter.rs`, shared with the microphone chain, whose
 limiter takes #8, the hold and the linking as well.
@@ -1590,19 +1601,21 @@ impl DspProcessor {
    glides over 20 ms, and the equalizer bands and Bass crossfade between designs
    (`crates/fxsound-dsp/src/smooth.rs`; `10-dsp-effects.md` open question 7 has the choice).
    A 2 dB master-gain step under a 50 Hz tone at −6 dBFS moved the waveform 0.099 in one
-   sample; no step is now larger than the tone's own, 0.0032. Until audio has passed, a new
-   snapshot lands at once, so a stream starts on its parameters. The equalizer's own switch
-   fades the whole GraphicEq block (filters, master gain, balance, levelling) in or out over
-   the same 20 ms, mixing its output with its input: with 62.5 Hz at +6 dB under a 50 Hz tone
-   at 0.3, switching the equalizer off moved the waveform 0.143 in one sample, and now no more
-   than the tone does on its own. A new band count crossfades the whole old curve into the new
-   one (`09-dsp-eq.md` §18, point 3). A stage that is left out — the equalizer and the leveller
-   while power is off, the GraphicEq block once it has faded out — lands every glide and takes
-   the next change at once (`GraphicEq::sit_out`, `VolumeLeveller::sit_out`), so switching
-   back on never plays 20 ms of what was set before the switch. The power switch is the one
-   control that still acts between two samples: it is the listener's A/B against the dry
-   sound, and a faded bypass would mix the processed signal, a look-ahead behind, with the dry
-   one.
+   sample; no step is now larger than the tone's own, 0.0032. Levelling switched off lets its
+   lift down under the peak safety of the running stage: a loud onset in those 20 ms is faded
+   under the ceiling over the 2 ms before it rather than hard-clipped (a ×4.7 lift let down into
+   a 440 Hz tone at 0.5 flattened 772 samples at the ceiling; none now). Until audio has passed,
+   a new snapshot lands at once, so a stream starts on its parameters. The equalizer's own switch
+   fades the whole GraphicEq block (filters, master gain, balance, levelling) in or out over the
+   same 20 ms, mixing its output with its input: with 62.5 Hz at +6 dB under a 50 Hz tone at 0.3,
+   switching the equalizer off moved the waveform 0.143 in one sample, and now no more than the
+   tone does on its own. A new band count crossfades the whole old curve into the new one
+   (`09-dsp-eq.md` §18, point 3). A stage that is left out — the equalizer and the leveller while
+   power is off, the GraphicEq block once it has faded out — lands every glide and takes the next
+   change at once (`GraphicEq::sit_out`, `VolumeLeveller::sit_out`), so switching back on never
+   plays 20 ms of what was set before the switch. The power switch is the one control that still
+   acts between two samples: it is the listener's A/B against the dry sound, and a faded bypass
+   would mix the processed signal, a look-ahead behind, with the dry one.
 
 Non-RT-safe surface, clearly separated: `DspEngine::new`, `DspEngine::prepare`,
 everything in `DspHandle`, preset load/save, and config persistence.

@@ -162,21 +162,34 @@ impl Chain {
         self.sample_rate
     }
 
-    /// Tell the two stereo-by-nature stages which channels are the front pair.
+    /// Tell the stages that care which channels are the front pair: the two stereo-by-nature ones,
+    /// and Dynamic Boost, whose level estimator listens to the pair and whose limiter turns both
+    /// sides of it down together (audit #7 and R2).
     ///
     /// `None` means the layout does not name one, in which case they fall back to the first two
     /// channels, which is what they always did.
     pub fn set_front_pair(&mut self, pair: Option<(usize, usize)>) {
         self.surround.set_front_pair(pair);
         self.ambience.set_front_pair(pair);
+        self.dynamic_boost.set_front_pair(pair);
     }
 
     /// Tell the stages that must not touch the subwoofer which channel it is.
     ///
     /// Only Fidelity acts on this today; Ambience and Surround already confine themselves to the
-    /// first two channels, and Bass and Dynamic Boost are meant to reach every channel.
+    /// front pair, and Bass and Dynamic Boost are meant to reach every channel. Dynamic Boost
+    /// limits the subwoofer on an envelope of its own, which it learns from the channel sides
+    /// ([`Chain::set_channel_sides`]).
     pub fn set_lfe_channel(&mut self, channel: Option<usize>) {
         self.fidelity.set_lfe_channel(channel);
+    }
+
+    /// Tell Dynamic Boost which side of the room each channel stands on, so that its limiter
+    /// turns every speaker either side of the listener down together and the centre and the
+    /// subwoofer each on their own (audit R2, [`DynamicBoost::set_channel_sides`]). The engine
+    /// passes the sides it balances by.
+    pub fn set_channel_sides(&mut self, sides: &[crate::engine::ChannelSide]) {
+        self.dynamic_boost.set_channel_sides(Some(sides));
     }
 
     pub fn set_sample_rate(&mut self, sample_rate: Real) {
@@ -393,5 +406,39 @@ mod tests {
         assert_eq!(chain.sample_rate(), MIN_SAMPLE_RATE);
         chain.set_sample_rate(384_000.0);
         assert_eq!(chain.sample_rate(), MAX_SAMPLE_RATE);
+    }
+
+    #[test]
+    fn dynamic_boost_hears_the_front_pair_the_chain_is_told_about() {
+        // Audit #7 through the path the engine takes: a device ordered [FC, FL, FR], a mix loud
+        // only on the right, slider 10. Told the pair, Dynamic Boost backs off as it does on plain
+        // stereo and the right peaks near 0.62; hearing the centre and the left instead, it gave
+        // the full +11.6 dB and the right sat on the ceiling, 5.6 dB into the limiter.
+        let run = |pair: Option<(usize, usize)>| {
+            let mut chain = Chain::new(48_000.0);
+            chain.set_effect(EffectId::DynamicBoost, 1.0);
+            chain.set_front_pair(pair);
+            let frames = 480_000;
+            let mut buffer = vec![0.0; frames * 3];
+            for (n, frame) in buffer.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let t = n as Real / 48_000.0;
+                frame[0] = 0.05 * (std::f32::consts::TAU * 220.0 * t).sin();
+                frame[1] = 0.05 * (std::f32::consts::TAU * 440.0 * t).sin();
+                frame[2] = 0.5 * (std::f32::consts::TAU * 660.0 * t).sin();
+            }
+            chain.process(&mut buffer, 3);
+            buffer[(frames - 48_000) * 3..]
+                .iter()
+                .skip(2)
+                .step_by(3)
+                .fold(0.0, |m: Real, s| m.max(s.abs()))
+        };
+        let told = run(Some((1, 2)));
+        let not_told = run(None);
+        assert!(told < 0.63, "the right peaks at {told}");
+        assert!(
+            not_told > 0.95,
+            "the fixture should show the defect: {not_told}"
+        );
     }
 }

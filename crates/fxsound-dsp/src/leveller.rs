@@ -61,20 +61,39 @@
 //!   48 kHz that is the first 96 frames of every call: about one hit in eleven at a 1024-frame
 //!   quantum, one in five at 480, and every hit at 96 frames or less, where the fade is cut short
 //!   by the call (at 64 frames, a hit 8 frames into its call still falls 2.8 dB in its last step).
-//! * **#5 — the detector filters do not idle in subnormals.** In digital silence the side-chain
-//!   high-pass and the tone splitters decay into the subnormal range and stay there, because a
-//!   one-pole's step rounds to nothing before the state reaches zero. Their state is flushed to zero
-//!   below [`DENORMAL_FLUSH`].
+//! * **#5 — the detector does no subnormal arithmetic in silence.** In digital silence the
+//!   side-chain high-pass and the tone splitters decay into the subnormal range and stay there,
+//!   because a one-pole's step rounds to nothing before the state reaches zero. Their state is
+//!   flushed to zero below [`DENORMAL_FLUSH`]. That alone was half of it: the "silence" this stage
+//!   is handed is rarely zero. Every biquad in front of it — any equalizer band not at 0 dB, and
+//!   every band's crossfade — leaves its bias residue, around 1e-30, and the squares the detector
+//!   and the post-gain statistics take of that underflow on every sample, each one a microcode
+//!   assist on many x86 parts: behind a ten-band curve at Volume Leveling 2, with everything else
+//!   off, silence cost the engine on stereo 96.5 ns a frame against 60.6 on music (48 kHz,
+//!   480-frame blocks, best of seven release runs on a Ryzen 7 6800H). So a stretch whose every
+//!   sample is under the same threshold is read as the zeros it stands for, and not squared once
+//!   levelled: the square of anything that small is subnormal or zero anyway, and no sum of
+//!   normal numbers can hold it. It is done a stretch at a time, in loops that have no such square
+//!   in them, because a compiler is free to square a sample first and test it after. Silence now
+//!   costs 45.6 ns a frame, less than music and what it costs with the processor flushing
+//!   subnormals itself (45.4).
 //! * **#11 — switching the stage off lets the gain down over 20 ms.** The original clears the
 //!   state machine the moment the amount reaches 0 (`SosSet.cpp:281-340`) and the next buffer goes
 //!   through untouched, so a quiet passage lifted by 13 dB fell by 13 dB between one sample and
 //!   the next: a click, as a Master Gain step is. The gain being played now glides back to unity
 //!   over [`crate::smooth::GLIDE_SECONDS`] first; the state machine is cleared at once, as
-//!   before, and the buffers after the glide are untouched, as before. A stage its owner has
-//!   stopped running (FxSound or the equalizer switched off: [`VolumeLeveller::sit_out`]) is heard
-//!   by nobody, so switched off then it lets go at once, as before, and a glide it had started is
-//!   dropped: played when the stage came back, it would lift the level for 20 ms that the listener
-//!   last heard unlevelled.
+//!   before, and the buffers after the glide are untouched, as before. The glide keeps the peak
+//!   safety of the running stage: where it would carry the audio past the ceiling — the song
+//!   coming in just after a lifted, quiet intro, the moment a listener reaches for the switch — it
+//!   is faded down under it over [`PEAK_RAMP_SECONDS`] before the first sample that needs it, as
+//!   #4 fades the running gain. The first cut glided under a hard clip alone, and a loud onset in
+//!   those 20 ms came out square: 8 ms of it flattened at the ceiling after a lift of x4.7, where
+//!   dropping the gain at once had clicked but clipped nothing. A transient in the first 2 ms of a
+//!   call is faded over only the frames of the call before it, as in the running stage. A stage
+//!   its owner has stopped running (FxSound or the equalizer switched off:
+//!   [`VolumeLeveller::sit_out`]) is heard by nobody, so switched off then it lets go at once, as
+//!   before, and a glide it had started is dropped: played when the stage came back, it would
+//!   lift the level for 20 ms that the listener last heard unlevelled.
 //!
 //! The original's RMS normaliser, which sat in front of this stage in `sosProcessBuffer`
 //! (`SosProcess.cpp:678-724`), is not ported: it runs only while `setNormalization` has moved its
@@ -396,11 +415,17 @@ pub const POWER_HISTORY_SECONDS: Real = 0.060;
 /// less than this far into a call is faded over only the frames of the call before it.
 pub const PEAK_RAMP_SECONDS: Real = 0.002;
 
-/// Detector filter state below this is flushed to zero after every stretch of audio (audit #5):
-/// some 8.5 × 10^17 times the smallest normal `f32`, so it catches every state on its way down
-/// long before it could settle in the subnormal range, and 400 dB below full scale, so nothing
-/// the detector could measure is lost.
-pub const DENORMAL_FLUSH: Real = 1e-20;
+/// The smallest magnitude the detector works with (audit #5). Its filter state is flushed to zero
+/// below this after every stretch of audio, and a stretch whose every sample is below it — digital
+/// silence as a biquad in front hands it on — is read as zeros by the detector and is not squared
+/// into the post-gain statistics once levelled.
+///
+/// Just above `sqrt(f32::MIN_POSITIVE)`, 1.08e-19, so anything smaller squares to a subnormal or
+/// to zero through one: an underflow, a microcode assist per sample on many x86 parts, and a
+/// result no sum of normal numbers can hold. Some 9 × 10^18 times the smallest normal `f32`, so
+/// it catches every state on its way down long before it could settle in the subnormal range,
+/// and 379 dB below full scale, so nothing the detector could measure is lost.
+pub const DENORMAL_FLUSH: Real = 1.1e-19;
 
 /// `seconds` of audio at `sample_rate`, in whole frames. Worked in `f64` so that 10 ms at 48 kHz is
 /// exactly 480 and not 479.99998 rounded; saturating, so a non-finite rate cannot wrap.
@@ -585,6 +610,49 @@ fn first_crossing(
                 .any(|value| (value * gain).abs() > ceiling)
                 .then_some(index)
         })
+}
+
+/// Pass 2's per-sample work over one stretch at the gain `gain` gives each frame: the gain, the
+/// post-gain statistics of the analysed channels, and the hard clip kept as the last guard
+/// (`SosProcess.cpp:371-400`).
+///
+/// `SQUARES` false leaves the post-gain sum of squares alone, for a stretch that is levelled
+/// silence (audit #5): a separate instance of the loop rather than a test inside it, because a
+/// compiler may square first and test after.
+#[inline(always)]
+fn level_frames<const SQUARES: bool>(
+    segment: &mut [Real],
+    layout: &Layout,
+    stats: &mut StepStats,
+    ceiling: Real,
+    gain: impl Fn(usize) -> Real,
+) {
+    let near_ceiling = ceiling * HEADROOM_NEAR_CEILING_THRESHOLD;
+    for (index, frame) in segment.chunks_exact_mut(layout.channels).enumerate() {
+        let gain = gain(index);
+        for (channel, value) in frame.iter_mut().enumerate() {
+            *value *= gain;
+
+            if layout.is_analysed(channel) {
+                let post_gain_abs = value.abs();
+                if SQUARES {
+                    stats.post_gain_sum_squares += *value * *value;
+                }
+                if post_gain_abs > stats.post_gain_peak_abs {
+                    stats.post_gain_peak_abs = post_gain_abs;
+                }
+                if post_gain_abs >= near_ceiling {
+                    stats.ceiling_hit_count += 1;
+                }
+            }
+
+            if *value > ceiling {
+                *value = ceiling;
+            } else if *value < -ceiling {
+                *value = -ceiling;
+            }
+        }
+    }
 }
 
 /// What a finished step decided, with the values the bookkeeping after the gain pass reads.
@@ -949,11 +1017,55 @@ impl VolumeLeveller {
     }
 
     /// The glide back to unity after the stage is switched off, on every channel the gain reached,
-    /// under the ceiling the stage was holding.
+    /// faded under the ceiling the stage was holding wherever the audio needs it (audit #11).
+    ///
+    /// The running stage never lets a sample past the ceiling: its peak safety fades the gain down
+    /// ahead of the first one that would cross it ([`PeakGuard`], audit #4). The let-down keeps
+    /// that promise the same way, over the call in hand, and then carries on down the glide from
+    /// wherever the fade left it. Only the glide's own frames are touched; from the first frame
+    /// after it the stage is the exact bypass it is at 0. The hard clip stays, as the last guard
+    /// against rounding.
+    ///
+    /// Audio that is itself over the ceiling — an equalizer boost that took it past full scale —
+    /// is held under it until the glide ends and then passes untouched, as it does through a stage
+    /// that is off; the running stage held it the same way, so the step back up to unity at the
+    /// end is the one the original took at once when the stage was switched off.
     fn let_go(&mut self, buffer: &mut [Real], channels: usize) {
         let ceiling = self.release_ceiling;
-        for frame in buffer.chunks_exact_mut(channels) {
-            let gain = self.release.advance();
+        let frames = buffer.len() / channels;
+        let gliding = (self.release.frames_left() as usize).min(frames);
+        let Some(glide) = buffer.get_mut(..gliding * channels) else {
+            return;
+        };
+        let release = self.release;
+        // Frame `index` of this call plays the glide's `index + 1`-th step.
+        let gain_at =
+            |index: usize| release.value_after(u32::try_from(index + 1).unwrap_or(u32::MAX));
+
+        // The glide is a straight line, so if neither end of it carries the peak past the ceiling
+        // no frame does, and the search below runs only when a loud onset meets the let-down.
+        let peak = peak_magnitude(glide);
+        let mut guard = None;
+        if peak > TINY && gliding > 0 {
+            let safe_gain = ceiling / peak;
+            if gain_at(0).max(gain_at(gliding - 1)) > safe_gain
+                && let Some(crossing) = first_crossing(glide, channels, gain_at, ceiling)
+            {
+                let start = crossing.saturating_sub(self.peak_ramp_frames);
+                guard = Some(PeakGuard {
+                    start,
+                    crossing,
+                    start_gain: gain_at(start),
+                    safe_gain,
+                });
+            }
+        }
+
+        let mut played = self.release.value();
+        for (index, frame) in glide.chunks_exact_mut(channels).enumerate() {
+            let glide_gain = self.release.advance();
+            let gain = guard.map_or(glide_gain, |guard| glide_gain.min(guard.limit(index)));
+            played = gain;
             for value in frame.iter_mut() {
                 // Compared rather than `clamp`ed, which panics on a NaN bound.
                 *value *= gain;
@@ -963,6 +1075,14 @@ impl VolumeLeveller {
                     *value = -ceiling;
                 }
             }
+        }
+
+        // Carry on from where the fade left the gain, over what is left of the glide, rather than
+        // jumping back up to where the glide had got to.
+        if guard.is_some() && self.release.is_gliding() && played < self.release.value() {
+            let left = self.release.frames_left();
+            self.release = Ramp::new(played);
+            self.release.glide_to(1.0, left);
         }
     }
 
@@ -1048,39 +1168,30 @@ impl VolumeLeveller {
         let segment_peak = peak_magnitude(segment);
 
         let mut stats = self.step;
-        for frame in segment.chunks_exact(layout.channels) {
-            for (channel, &value) in frame.iter().enumerate().take(layout.detector_channels) {
-                if Some(channel) == layout.lfe_channel {
-                    continue;
+        if segment_peak < DENORMAL_FLUSH {
+            // Digital silence, or what a biquad in front of the stage leaves of it: its bias
+            // residue, around 1e-30 (audit #5). Every square below would underflow on every
+            // sample, so the stretch is read as the zeros it stands for, in a loop of its own
+            // that multiplies nothing but the detector's own state as it decays — a loop that
+            // only picked zero for each sample would still square the sample, since a compiler is
+            // free to multiply first and pick after. Once the flush after this stretch has set the
+            // state to zero there is nothing left to do at all, and silence costs less than music.
+            if !self.detector_at_rest(layout) {
+                for _ in 0..segment.len() / layout.channels {
+                    for channel in 0..layout.detector_channels {
+                        if Some(channel) != layout.lfe_channel {
+                            self.detect(&mut stats, channel, 0.0);
+                        }
+                    }
                 }
-
-                let sc_prev_in = self.sc_prev_in[channel];
-                let sc_prev_out = self.sc_prev_out[channel];
-                let sc_value = self.sc_hpf_alpha * (sc_prev_out + value - sc_prev_in);
-                self.sc_prev_in[channel] = value;
-                self.sc_prev_out[channel] = sc_value;
-
-                stats.sum_squares += sc_value * sc_value;
-
-                let abs_value = sc_value.abs();
-                if abs_value > stats.sidechain_peak {
-                    stats.sidechain_peak = abs_value;
+            }
+        } else {
+            for frame in segment.chunks_exact(layout.channels) {
+                for (channel, &value) in frame.iter().enumerate().take(layout.detector_channels) {
+                    if Some(channel) != layout.lfe_channel {
+                        self.detect(&mut stats, channel, value);
+                    }
                 }
-
-                let tone_state = &mut self.tone_lp_state[channel];
-                tone_state[0] += self.tone_low_alpha * (value - tone_state[0]);
-                tone_state[1] += self.tone_body_alpha * (value - tone_state[1]);
-                tone_state[2] += self.tone_presence_alpha * (value - tone_state[2]);
-
-                let low_band = tone_state[0];
-                let body_band = tone_state[1] - tone_state[0];
-                let presence_band = tone_state[2] - tone_state[1];
-                let air_band = value - tone_state[2];
-
-                stats.low_energy += low_band * low_band;
-                stats.body_energy += body_band * body_band;
-                stats.presence_energy += presence_band * presence_band;
-                stats.air_energy += air_band * air_band;
             }
         }
 
@@ -1091,6 +1202,51 @@ impl VolumeLeveller {
         }
         self.step = stats;
         segment_peak
+    }
+
+    /// One sample of one channel through the side-chain high-pass and the tone splitters, folded
+    /// into `stats` (`SosProcess.cpp:166-203`).
+    #[inline(always)]
+    fn detect(&mut self, stats: &mut StepStats, channel: usize, value: Real) {
+        let sc_prev_in = self.sc_prev_in[channel];
+        let sc_prev_out = self.sc_prev_out[channel];
+        let sc_value = self.sc_hpf_alpha * (sc_prev_out + value - sc_prev_in);
+        self.sc_prev_in[channel] = value;
+        self.sc_prev_out[channel] = sc_value;
+
+        stats.sum_squares += sc_value * sc_value;
+
+        let abs_value = sc_value.abs();
+        if abs_value > stats.sidechain_peak {
+            stats.sidechain_peak = abs_value;
+        }
+
+        let tone_state = &mut self.tone_lp_state[channel];
+        tone_state[0] += self.tone_low_alpha * (value - tone_state[0]);
+        tone_state[1] += self.tone_body_alpha * (value - tone_state[1]);
+        tone_state[2] += self.tone_presence_alpha * (value - tone_state[2]);
+
+        let low_band = tone_state[0];
+        let body_band = tone_state[1] - tone_state[0];
+        let presence_band = tone_state[2] - tone_state[1];
+        let air_band = value - tone_state[2];
+
+        stats.low_energy += low_band * low_band;
+        stats.body_energy += body_band * body_band;
+        stats.presence_energy += presence_band * presence_band;
+        stats.air_energy += air_band * air_band;
+    }
+
+    /// Whether every analysed channel's detector state is exactly zero, so that zeros in leave it
+    /// there and add nothing to any statistic.
+    fn detector_at_rest(&self, layout: &Layout) -> bool {
+        (0..layout.detector_channels)
+            .filter(|channel| Some(*channel) != layout.lfe_channel)
+            .all(|channel| {
+                self.sc_prev_in[channel] == 0.0
+                    && self.sc_prev_out[channel] == 0.0
+                    && self.tone_lp_state[channel] == [0.0; 3]
+            })
     }
 
     /// Flush the detector's filter state to zero once it has decayed below [`DENORMAL_FLUSH`]
@@ -1320,7 +1476,6 @@ impl VolumeLeveller {
         let channels = layout.channels;
         let frames = segment.len() / channels;
         let ceiling = self.effective_ceiling;
-        let near_ceiling = ceiling * HEADROOM_NEAR_CEILING_THRESHOLD;
         let ramp = self.ramp;
 
         // The ramp is a straight line, so if neither end of this stretch of it carries the peak
@@ -1350,36 +1505,26 @@ impl VolumeLeveller {
             own.min(next)
         };
 
+        // Levelled silence is levelled bias residue, and squared into the statistics it would
+        // underflow on every sample too (audit #5). A stretch that stays under DENORMAL_FLUSH
+        // after the gain is levelled by an instance of the loop that squares nothing: the gain is
+        // a straight line, held under it by the guards, so its larger end bounds every frame's.
+        let squares =
+            segment_peak * ramp.at(0).max(ramp.at(frames.saturating_sub(1))) >= DENORMAL_FLUSH;
         let mut stats = self.step;
-        let mut level = |frame: &mut [Real], gain: Real| {
-            for (channel, value) in frame.iter_mut().enumerate() {
-                *value *= gain;
-
-                if layout.is_analysed(channel) {
-                    let post_gain_abs = value.abs();
-                    stats.post_gain_sum_squares += *value * *value;
-                    if post_gain_abs > stats.post_gain_peak_abs {
-                        stats.post_gain_peak_abs = post_gain_abs;
-                    }
-                    if post_gain_abs >= near_ceiling {
-                        stats.ceiling_hit_count += 1;
-                    }
-                }
-
-                if *value > ceiling {
-                    *value = ceiling;
-                } else if *value < -ceiling {
-                    *value = -ceiling;
-                }
+        let guarded_gain = |index: usize| ramp.at(index).min(limit(index));
+        let ramp_gain = |index: usize| ramp.at(index);
+        match (guarded, squares) {
+            (true, true) => {
+                level_frames::<true>(segment, layout, &mut stats, ceiling, guarded_gain)
             }
-        };
-        let frames_iter = segment.chunks_exact_mut(channels).enumerate();
-        if guarded {
-            frames_iter.for_each(|(index, frame)| {
-                level(frame, ramp.at(index).min(limit(index)));
-            });
-        } else {
-            frames_iter.for_each(|(index, frame)| level(frame, ramp.at(index)));
+            (true, false) => {
+                level_frames::<false>(segment, layout, &mut stats, ceiling, guarded_gain);
+            }
+            (false, true) => level_frames::<true>(segment, layout, &mut stats, ceiling, ramp_gain),
+            (false, false) => {
+                level_frames::<false>(segment, layout, &mut stats, ceiling, ramp_gain)
+            }
         }
         self.step = stats;
 
@@ -2892,7 +3037,7 @@ mod tests {
         // Audit report #5. In the original, 0.1 s of digital silence after a tone left 6 of the 40
         // detector states subnormal, and 8 from 0.5 s on, for as long as the silence lasted: a
         // one-pole's step rounds to nothing before the state reaches zero. They are flushed to
-        // zero once below 1e-20, so none is ever subnormal when a buffer is done.
+        // zero once below `DENORMAL_FLUSH`, so none is ever subnormal when a buffer is done.
         let (mut leveller, _) = warmed_up(300.0, 0.05, 400);
         let mut buffer = vec![0.0 as Real; BLOCK * 2];
         for block in 0..200 {
@@ -3154,5 +3299,143 @@ mod tests {
             block, input,
             "the let-down waited for the stage to come back"
         );
+    }
+
+    /// How a stretch of levelled audio meets `ceiling`: the samples at it, and the samples in a
+    /// flat top — two or more in a row at it on one channel, which is what a clip leaves. A sine
+    /// under the ceiling touches it at most on its crest sample: at 48 kHz a 1 kHz crest's
+    /// neighbours sit 0.9 % below it and a 440 Hz crest's 0.17 %.
+    fn against_the_ceiling(interleaved: &[Real], ceiling: Real) -> (usize, usize) {
+        let at = |value: Real| value.abs() >= ceiling * (1.0 - 1e-6);
+        let mut touching = 0;
+        let mut flat = 0;
+        for channel in 0..2 {
+            let samples: Vec<Real> = interleaved
+                .iter()
+                .skip(channel)
+                .step_by(2)
+                .copied()
+                .collect();
+            for (n, value) in samples.iter().enumerate() {
+                if !at(*value) {
+                    continue;
+                }
+                touching += 1;
+                let before = n > 0 && at(samples[n - 1]);
+                let after = samples.get(n + 1).is_some_and(|next| at(*next));
+                if before || after {
+                    flat += 1;
+                }
+            }
+        }
+        (touching, flat)
+    }
+
+    /// A stereo sine at `quiet` that jumps to `loud` at frame `onset`, phase continuous, starting
+    /// at frame `start` of the tone.
+    fn onset(
+        frames: usize,
+        freq: Real,
+        quiet: Real,
+        loud: Real,
+        onset: usize,
+        start: usize,
+    ) -> Vec<Real> {
+        let mut buffer = vec![0.0 as Real; frames * 2];
+        for (i, frame) in buffer.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let n = (start + i) as f64;
+            let phase = core::f64::consts::TAU * f64::from(freq) * n / f64::from(FS);
+            let amp = if i < onset { quiet } else { loud };
+            let value = (f64::from(amp) * phase.sin()) as Real;
+            *frame = [value, value];
+        }
+        buffer
+    }
+
+    #[test]
+    fn a_loud_onset_while_volume_leveling_lets_go_is_faded_under_the_ceiling_not_clipped() {
+        // Audit #11's let-down, the review's scenario: a 440 Hz tone at 0.02 lifted for 30 s at
+        // Volume Leveling 4, the stage switched off, and the tone jumping to 0.5 at frame `k` of
+        // the next 1920, in one call or in four. The let-down glided the lift of x4.7 back to
+        // unity under a hard clip alone, so a loud onset in its 20 ms came out square: 772
+        // samples of the two channels flattened at the ceiling at k = 0 (8 ms), 448 at 240, 152
+        // at 480, none at 900. It now fades under the ceiling ahead of the onset, as the running
+        // stage's peak safety does: at most a crest sample touches the ceiling, and none is
+        // flattened.
+        for k in [0, 240, 480, 900] {
+            for quantum in [1920, 480] {
+                let mut frame = 0;
+                let mut leveller = VolumeLeveller::new(FS);
+                leveller.set_amount(MAX_AMOUNT);
+                run_sine(&mut leveller, 3000, 440.0, 0.02, &mut frame);
+                let lifted = leveller.gain();
+                assert!(lifted > 4.5, "the fixture was lifted by only {lifted}");
+                let ceiling = leveller.effective_ceiling;
+                leveller.set_amount(0.0);
+                let mut out = onset(1920, 440.0, 0.02, 0.5, k, frame);
+                for call in out.chunks_mut(quantum * 2) {
+                    leveller.process(call, 2);
+                }
+                let (touching, flat) = against_the_ceiling(&out, ceiling);
+                let peak = out.iter().fold(0.0 as Real, |most, s| most.max(s.abs()));
+                assert_eq!(
+                    flat, 0,
+                    "k = {k}, {quantum}-frame calls: {touching} samples at the ceiling"
+                );
+                assert!(touching <= 2, "k = {k}, {quantum}-frame calls: {touching}");
+                assert!(peak <= ceiling, "k = {k}: {peak}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_hit_five_milliseconds_after_switching_volume_leveling_off_clips_no_sample() {
+        // Audit #11's let-down, the second review's scenario: a 1 kHz tone at 0.005 lifted for
+        // 15 s at Volume Leveling 4 (about x9), the stage switched off, and the tone at 0.5 from
+        // 0, 5, 10 or 15 ms later, in 480-frame calls. Under the hard clip alone that was 593,
+        // 390, 203 and 46 samples clipped on each channel, where dropping the gain at once,
+        // before the let-down, had clipped none. Now none is, and a hit 5 or 15 ms in is faded
+        // into over the 2 ms before it: the gain moves by at most 0.06 between two loud samples,
+        // where the clip moved it by 1.72 and 0.31. The hit at 10 ms lands on the first frame of
+        // a call, and like any transient there it can only fall at once (the module
+        // documentation, #4) — onto a waveform that starts from zero, and still flattening
+        // nothing.
+        for delay_ms in [0, 5, 10, 15] {
+            let mut frame = 0;
+            let mut leveller = VolumeLeveller::new(FS);
+            leveller.set_amount(MAX_AMOUNT);
+            run_sine(&mut leveller, 1500, 1000.0, 0.005, &mut frame);
+            let lifted = leveller.gain();
+            assert!(lifted > 8.0, "the fixture was lifted by only {lifted}");
+            let ceiling = leveller.effective_ceiling;
+            leveller.set_amount(0.0);
+            let hit = delay_ms * 48;
+            let input = onset(1920, 1000.0, 0.005, 0.5, hit, frame);
+            let mut out = input.clone();
+            for call in out.chunks_mut(BLOCK * 2) {
+                leveller.process(call, 2);
+            }
+            let (touching, flat) = against_the_ceiling(&out, ceiling);
+            let peak = out.iter().fold(0.0 as Real, |most, s| most.max(s.abs()));
+            // The largest step the gain takes between two loud samples: a clip is a fall of the
+            // gain at the crest and a rise after it within a quarter cycle.
+            let gains: Vec<Real> = out
+                .iter()
+                .zip(&input)
+                .step_by(2)
+                .map(|(o, i)| if i.abs() > 0.1 { o / i } else { Real::NAN })
+                .collect();
+            let jump = gains
+                .windows(2)
+                .filter(|pair| pair[0].is_finite() && pair[1].is_finite())
+                .fold(0.0 as Real, |most, pair| {
+                    most.max((pair[1] - pair[0]).abs())
+                });
+            assert_eq!(flat, 0, "{delay_ms} ms: {touching} samples at the ceiling");
+            assert!(peak <= ceiling, "{delay_ms} ms: {peak}");
+            if delay_ms != 10 {
+                assert!(jump < 0.1, "{delay_ms} ms: the gain stepped by {jump}");
+            }
+        }
     }
 }

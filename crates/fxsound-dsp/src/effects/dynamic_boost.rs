@@ -15,12 +15,15 @@
 //!              │      if gain_boost·rms > 0.32 { gain = max(0.32/rms, min(1.06, gain_boost)) }
 //!              │      else { gain_boost }
 //!              ▼
-//!  in[ch] ──► delay line, max_delay frames ──► one env follower ──► ×(max_output/env) when env > ceiling
-//!             write: gain·max_output·in[ch]     for every channel, on the loudest of them:
-//!             read : the frame from max_delay   linear attack ramp over max_delay frames, stopping
-//!                    frames ago                 at its peak; hold 20 ms; exponential release β
-//!                                               (τ ≈ 10.18 ms)
+//!  in[ch] ──► delay line, max_delay frames ──► env follower ──► ×(max_output/env) when env > ceiling
+//!             write: gain·max_output·in[ch]     one for the speakers either side, on the loudest,
+//!             read : the frame from max_delay   one each for the centre and the subwoofer: linear
+//!                    frames ago                 attack ramp over max_delay frames, stopping at its
+//!                                               peak; hold 20 ms; exponential release β (≈10.18 ms)
 //! ```
+//!
+//! `in[0], in[1]` is the front pair: the first two channels unless the layout names others
+//! ([`DynamicBoost::set_front_pair`]).
 //!
 //! Two properties fall out of that and are what the tests pin down:
 //!
@@ -60,15 +63,20 @@
 //! * **#7 — the level is the front pair's.** The estimator heard the left channel alone
 //!   (`Maxi32.c:258-259`); it hears the mean square of left and right now. See
 //!   [`detector_power`].
-//! * **R2 — one envelope for every channel**, **#8 — the attack stops at its peak**, and **R1 —
-//!   a 20 ms hold before the release**: all three live in the limiter this effect drives, and are
-//!   described there ([`crate::input::limiter`]). Together they keep a one-sided peak from
-//!   shifting the stereo image by up to 5.6 dB, take off the reduction the attack's overshoot
-//!   added to every bass note and kick the limiter catches (a decibel on a steady 50 Hz sine at
-//!   twice the ceiling; on a kick it depends on the kick), and take the limiter's own distortion
-//!   of a limited bass line from 15.6 % THD+N (40 Hz, 3 dB into it) to nothing. What they cost:
-//!   a lone transient keeps the level down about 20 ms longer, and a kick-heavy mix at slider 10
-//!   comes out a little less dense (0.6 dB quieter on the synthetic one).
+//! * **R2 — one envelope for both sides of the stereo pair** (and on surround for every speaker
+//!   either side of the listener, the centre and the subwoofer each on their own), **#8 — the
+//!   attack stops at its peak**, and **R1 — a 20 ms hold before the release**: all three live in
+//!   the limiter this effect drives, and are described there ([`crate::input::limiter`]).
+//!   Together they keep a one-sided peak from shifting the stereo image by up to 5.6 dB, take
+//!   off the reduction the attack's overshoot added to every bass note and kick the limiter
+//!   catches (a decibel of envelope on a steady 50 Hz sine at twice the ceiling; on a kick it
+//!   depends on the kick), and take the limiter's own distortion of a limited bass line from
+//!   15.6 % THD+N (40 Hz, 3 dB into it) to nothing. What they cost: a lone transient keeps the
+//!   level down about 20 ms longer, and bass driven into the limiter, now clean and at the same
+//!   peak, comes out 0.8 to 0.9 dB lower in RMS — −3.31 against −2.47 dBFS for a 50 Hz sine at
+//!   twice the ceiling, −3.31 against −2.40 at 40 Hz, because the gain that breathed inside every
+//!   cycle and raised the RMS was the distortion — so a kick-heavy mix at sliders 6 to 10 comes
+//!   out 0.6 to 1 dB less loud.
 //!
 //! # What is not ported
 //!
@@ -82,6 +90,7 @@
 
 use super::Effect;
 use crate::biquad::{MAX_CHANNELS, Real};
+use crate::engine::ChannelSide;
 use crate::input::LookaheadLimiter;
 use crate::smooth::{Ramp, glide_frames};
 
@@ -128,6 +137,11 @@ const TWO_PI: f64 = 6.283_185;
 
 /// Below this the level estimate is flushed to zero — see [`DynamicBoost::update_gain`].
 const LEVEL_FLOOR: f64 = 1.0e-30;
+
+/// A block whose front pair stays under this is not squared: `sqrt(f32::MIN_POSITIVE)` is
+/// 1.08e-19, so every square would be subnormal, or zero reached through a subnormal — see
+/// [`detector_power`].
+const SQUARE_FLOOR: Real = 1.1e-19;
 
 /// `DFXP_MUSIC_MODE2_DYNAMIC_BOOST_FACTOR` (`dfxpDefs.h:129`), applied at `dfxpComm.cpp:709-717`.
 ///
@@ -191,6 +205,12 @@ pub struct DynamicBoost {
     /// the same one. Driven here with the original's fixed ceiling, look-ahead and release; the
     /// auto-gain above it is what makes this effect Dynamic Boost rather than a limiter.
     limiter: LookaheadLimiter,
+    /// The channels the level estimator hears: the layout's front pair, or the first two channels
+    /// when it names none.
+    front_pair: (usize, usize),
+    /// The side of the room each channel stands on, and for how many, once the owner has said:
+    /// what decides which channels the limiter turns down together.
+    sides: Option<([ChannelSide; MAX_CHANNELS], usize)>,
 }
 
 impl DynamicBoost {
@@ -214,10 +234,71 @@ impl DynamicBoost {
                 LOOK_AHEAD_SECONDS * 1000.0,
                 10.0,
             ),
+            front_pair: DEFAULT_FRONT_PAIR,
+            sides: None,
         };
+        effect.set_front_pair(None);
         effect.set_sample_rate(sample_rate);
         effect.set_amount(0.0);
         effect
+    }
+
+    /// Name the front pair: the two channels whose level sets the auto-gain and which the limiter
+    /// turns down together (audit #7 and R2). `None`, or a pair that is not two different channels
+    /// this effect reaches, means the first two, which is where every standard layout puts them.
+    ///
+    /// A device is free to order its channels otherwise, and some do; hard-wired to channels 0
+    /// and 1, the estimator would hear the centre or the subwoofer beside one front speaker, and
+    /// the loudness of dialogue or bass rather than of the music would set the boost.
+    pub fn set_front_pair(&mut self, pair: Option<(usize, usize)>) {
+        self.front_pair = pair
+            .filter(|(left, right)| left != right && *left < MAX_CHANNELS && *right < MAX_CHANNELS)
+            .unwrap_or(DEFAULT_FRONT_PAIR);
+        self.relink();
+    }
+
+    /// Say which side of the room each channel stands on, one entry per channel in the stream's
+    /// order — the sides the engine balances by ([`crate::Engine::channel_sides`]). `None` forgets
+    /// them.
+    ///
+    /// The limiter turns every speaker to the listener's left or right down together, the front
+    /// pair among them, so a peak on one of them moves no source panned between them (audit R2);
+    /// the centre and the subwoofer are each limited on their own. The first cut linked all eight
+    /// channels, and with the auto-gain listening to the front pair alone, a quiet bed took the
+    /// full +11.6 dB at slider 10 and every subwoofer boom then ducked the whole room by 12 dB, a
+    /// shout in the centre by 4. Until the sides are known, only the front pair is linked.
+    pub fn set_channel_sides(&mut self, sides: Option<&[ChannelSide]>) {
+        self.sides = sides.map(|sides| {
+            let mut named = [ChannelSide::Centre; MAX_CHANNELS];
+            let len = sides.len().min(MAX_CHANNELS);
+            named[..len].copy_from_slice(&sides[..len]);
+            (named, len)
+        });
+        self.relink();
+    }
+
+    /// Tell the limiter which channels share an envelope: the front pair and every channel on
+    /// either side of the room, and every other channel one of its own.
+    fn relink(&mut self) {
+        let mut linked = [false; MAX_CHANNELS];
+        if let Some((sides, len)) = &self.sides {
+            for (link, side) in linked.iter_mut().zip(sides).take(*len) {
+                *link = *side != ChannelSide::Centre;
+            }
+        }
+        let (left, right) = self.front_pair;
+        for channel in [left, right] {
+            if let Some(link) = linked.get_mut(channel) {
+                *link = true;
+            }
+        }
+        self.limiter.set_linked(&linked);
+    }
+
+    /// The front pair the estimator hears, as `(left, right)`.
+    #[must_use]
+    pub const fn front_pair(&self) -> (usize, usize) {
+        self.front_pair
     }
 
     /// The static boost, linear, before the auto-gain backs it off — `s->gain_boost`. Where a
@@ -240,8 +321,9 @@ impl DynamicBoost {
         self.level.sqrt() as Real
     }
 
-    /// The peak envelope for one channel, or 0.0 for a channel this instance does not track. Every
-    /// channel it tracks reads the same envelope: the limiter is linked.
+    /// The peak envelope for one channel, or 0.0 for a channel this instance does not track. The
+    /// front pair and the speakers either side of the room read one envelope; the centre and the
+    /// subwoofer each have their own ([`DynamicBoost::set_channel_sides`]).
     ///
     /// Gain reduction in dB is `20·log10(MAX_OUTPUT / env)` while `env > MAX_OUTPUT`, and zero
     /// otherwise.
@@ -351,6 +433,27 @@ impl DynamicBoost {
     }
 }
 
+/// The front pair when no layout names one.
+const DEFAULT_FRONT_PAIR: (usize, usize) = (0, 1);
+
+/// Whether every sample of the front pair in a block is under [`SQUARE_FLOOR`] — the pair
+/// [`detector_power`] reads, which on a stream of one or two channels is every sample. Stops at
+/// the first that is not, so on music it costs a compare.
+fn front_pair_is_quiet(buffer: &[Real], channels: usize, (left, right): (usize, usize)) -> bool {
+    let quiet = |sample: &Real| sample.abs() < SQUARE_FLOOR;
+    if channels <= 2 {
+        return buffer.iter().all(quiet);
+    }
+    let (left, right) = if left < channels && right < channels {
+        (left, right)
+    } else {
+        DEFAULT_FRONT_PAIR
+    };
+    buffer
+        .chunks_exact(channels)
+        .all(|frame| quiet(&frame[left]) && quiet(&frame[right]))
+}
+
 /// What the level estimator hears of one frame: `(L² + R²) / 2` of the front pair, `M²` for mono.
 ///
 /// Audit #7. The original listens to the left channel only (`Maxi32.c:258-259`, *"Use just left
@@ -359,17 +462,35 @@ impl DynamicBoost {
 /// and on 5.1 the front-left speaker alone set the gain for the room. The mean of the two squares
 /// is the pair's power, and for centred material — `L = R` — it is `L²` to the last bit (the sum
 /// doubles exactly and the halving is exact), so everything the original got right it still
-/// does. On 5.1 and 7.1 the front pair is channels 0 and 1 in every layout PipeWire hands over;
-/// the centre, the LFE and the surrounds do not steer the music's level, as they did not before.
+/// does. The pair is `pair`, the one [`DynamicBoost::set_front_pair`] was given, or the first two
+/// channels of a frame too narrow for it; the centre, the LFE and the surrounds do not steer the
+/// music's level, as they did not before.
 ///
-/// Squared in f32 and only then widened, as `float in_sqr = in1 * in1;` was, so a −190 dBFS
-/// input squares to zero here exactly as it does in the original.
+/// Squared in f32 and only then widened, as `float in_sqr = in1 * in1;` was, so every square is
+/// the original's bit for bit. A block whose front pair is all under [`SQUARE_FLOOR`] never gets
+/// here: [`Effect::process`] hears it as silence, in a loop that has no square in it. Its squares
+/// would underflow, and an underflow is not free: each one takes a microcode assist on many x86
+/// parts, and this stage is never bypassed, so behind any filter that leaves its bias residue in
+/// digital silence (the equalizer, Bass, Fidelity, Ambience: around 1e-30) every frame of silence
+/// paid two, and silence cost more than music: 40.7 against 30.6 ns a frame through the engine on
+/// stereo with Bass at 0.6 and everything else off (48 kHz, 480-frame blocks, best of seven
+/// release runs on a Ryzen 7 6800H). It costs 21.9 now.
+///
+/// What is skipped is a power under `SQUARE_FLOOR²`, 1.2e-38, some 79 dB under the estimator's
+/// own [`LEVEL_FLOOR`]. Scaled by the estimator's filter gain and added in, it could move the
+/// level only in its last bits, and only while the level is itself under about 1.4e-27 — within
+/// 32 dB of that floor, decaying to be flushed, and 278 dB under the least level at which the
+/// auto-gain backs off (7.1e-3, at slider 10). The gain the estimator produces is the same either
+/// way.
 #[inline]
-fn detector_power(frame: &[Real]) -> Real {
-    match frame {
-        [left, right, ..] => (left * left + right * right) * 0.5,
-        [mono] => mono * mono,
-        [] => 0.0,
+fn detector_power(frame: &[Real], (left, right): (usize, usize)) -> Real {
+    match (frame.get(left), frame.get(right)) {
+        (Some(left), Some(right)) => (left * left + right * right) * 0.5,
+        _ => match frame {
+            [left, right, ..] => (left * left + right * right) * 0.5,
+            [mono] => mono * mono,
+            [] => 0.0,
+        },
     }
 }
 
@@ -465,12 +586,16 @@ impl Effect for DynamicBoost {
         self.gain_boost.settle();
     }
 
-    /// `Maxi32.c:237-482`, one frame at a time, in place.
+    /// `Maxi32.c:237-482`, in place: the auto-gain a frame at a time, then the limiter over the
+    /// block. The original boosts and limits each frame before the next; the samples are the same,
+    /// because the gain is worked out from what arrives and never from what the limiter did (see
+    /// `process_frames`).
     ///
-    /// Nothing here is per channel any more but the delay lines. The front pair drives the level
-    /// estimator and the one gain it produces goes to every channel; the loudest channel drives the
-    /// one envelope and the one limiting gain it produces goes to every channel. The original ran
-    /// an envelope per channel from a left-only estimate (audit #7 and R2). On a stream with more
+    /// The front pair drives the level estimator and the one gain it produces goes to every
+    /// channel; the loudest of the speakers either side of the listener — on stereo, the louder
+    /// side — drives one envelope and the limiting gain it produces goes to all of them, and the
+    /// centre and the subwoofer are each limited on their own. The original ran an envelope per
+    /// channel from a left-only estimate (audit #7 and R2). On a stream with more
     /// than [`MAX_CHANNELS`] channels the extra channels are passed through untouched rather than
     /// panicking — the original never sees one, since its host splits multichannel streams into
     /// per-pair instances (spec §2).
@@ -479,19 +604,15 @@ impl Effect for DynamicBoost {
             return;
         }
 
-        for frame in buffer.chunks_exact_mut(channels) {
-            // The auto-gain, and the permanent ceiling, folded into one multiply before the frame
-            // reaches the delay line — exactly where `Maxi32.c:296-301` applies them.
-            let gain_boost = self.gain_boost.advance();
-            let boost = self.update_gain(detector_power(frame), gain_boost) * MAX_OUTPUT;
-            // Only as far as the limiter reaches. A channel past `MAX_CHANNELS` has no delay
-            // line and no envelope, so boosting it would hand it an unlimited gain — it passes
-            // through untouched instead, which is what the original's per-pair host guarantees and
-            // what the test below pins.
-            for sample in frame.iter_mut().take(MAX_CHANNELS) {
-                *sample *= boost;
-            }
-            self.limiter.process_frame(frame);
+        // A block whose front pair is all bias residue — digital silence behind any stage with a
+        // biquad in it — is heard as silence by an instance of the loop that squares nothing (see
+        // `detector_power`): a test inside the loop would not do, since a compiler may square
+        // first and test after.
+        let pair = self.front_pair;
+        if front_pair_is_quiet(buffer, channels, pair) {
+            self.process_frames(buffer, channels, |_| 0.0);
+        } else {
+            self.process_frames(buffer, channels, |frame| detector_power(frame, pair));
         }
     }
 
@@ -500,6 +621,37 @@ impl Effect for DynamicBoost {
     /// This is the chain's only latency, and it is present whenever the power is on.
     fn latency_frames(&self) -> usize {
         self.max_delay
+    }
+}
+
+impl DynamicBoost {
+    /// [`Effect::process`]'s loop, with the level estimator hearing `power` of each frame.
+    #[inline(always)]
+    fn process_frames(
+        &mut self,
+        buffer: &mut [Real],
+        channels: usize,
+        power: impl Fn(&[Real]) -> Real,
+    ) {
+        for frame in buffer.chunks_exact_mut(channels) {
+            // The auto-gain, and the permanent ceiling, folded into one multiply before the frame
+            // reaches the delay line — exactly where `Maxi32.c:296-301` applies them.
+            let gain_boost = self.gain_boost.advance();
+            let boost = self.update_gain(power(frame), gain_boost) * MAX_OUTPUT;
+            // Only as far as the limiter reaches. A channel past `MAX_CHANNELS` has no delay
+            // line and no envelope, so boosting it would hand it an unlimited gain — it passes
+            // through untouched instead, which is what the original's per-pair host guarantees and
+            // what the test below pins.
+            for sample in frame.iter_mut().take(MAX_CHANNELS) {
+                *sample *= boost;
+            }
+        }
+        // The gain is worked out from what arrives, never from what the limiter did, so the whole
+        // block can be boosted first and limited after: the same samples as boosting and limiting
+        // a frame at a time, and the limiter can run each envelope over the block in one go (audit
+        // R2's cost, see `LookaheadLimiter::process`). The two loops apart are cheaper on stereo
+        // too: 8.4 ns a frame at slider 10, where one loop doing both cost 13.4.
+        self.limiter.process(buffer, channels);
     }
 }
 
@@ -1443,5 +1595,232 @@ mod tests {
         assert!(gains[0] < 1.01, "the first frame jumped to {}", gains[0]);
         assert_eq!(gains[959].to_bits(), boost.gain_boost().to_bits());
         assert!(!boost.gain_boost.is_gliding());
+    }
+
+    /// The front-left bed's level, in dB, over 10 ms windows of a 5.1 render at slider 10: how far
+    /// it swings from its quietest window to its loudest. The bed is a steady 330 Hz at 0.05 on
+    /// the four speakers around the listener (FL, FR, SL, SR), and `extra` adds whatever the centre
+    /// (channel 2) and the subwoofer (channel 3) play at frame `n`. Six seconds, with the standard
+    /// layout's sides named or not.
+    fn bed_swing_db(sides: bool, extra: impl Fn(usize) -> (Real, Real)) -> Real {
+        const CHANNELS: usize = 6;
+        let mut boost = DynamicBoost::new(FS);
+        if sides {
+            boost.set_channel_sides(Some(&crate::engine::standard_sides(CHANNELS)[..CHANNELS]));
+        }
+        boost.set_amount(1.0);
+        boost.settle();
+        let frames = (FS * 6.0) as usize;
+        let w = std::f32::consts::TAU * 330.0 / FS;
+        let mut buffer = vec![0.0; frames * CHANNELS];
+        for (n, frame) in buffer.as_chunks_mut::<CHANNELS>().0.iter_mut().enumerate() {
+            let bed = 0.05 * (w * n as Real).sin();
+            let (centre, sub) = extra(n);
+            *frame = [bed, bed, centre, sub, bed, bed];
+        }
+        for block in buffer.chunks_mut(480 * CHANNELS) {
+            boost.process(block, CHANNELS);
+        }
+        let front_left: Vec<Real> = buffer.iter().step_by(CHANNELS).copied().collect();
+        let windows: Vec<Real> = front_left[(FS * 0.1) as usize..]
+            .as_chunks::<480>()
+            .0
+            .iter()
+            .map(|window| 20.0 * rms(window).log10())
+            .collect();
+        let (low, high) = windows
+            .iter()
+            .fold((Real::INFINITY, Real::NEG_INFINITY), |(low, high), db| {
+                (low.min(*db), high.max(*db))
+            });
+        high - low
+    }
+
+    /// A 40 Hz boom at full scale for 300 ms every two seconds, from half a second in.
+    fn booms(n: usize) -> Real {
+        let t = n as Real / FS;
+        if (t - 0.5).rem_euclid(2.0) < 0.3 && t >= 0.5 {
+            (std::f32::consts::TAU * 40.0 * t).sin()
+        } else {
+            0.0
+        }
+    }
+
+    /// Speech-like bursts: a 180 Hz voice with its harmonics at 0.5, 150 ms on and 150 ms off.
+    fn speech(n: usize) -> Real {
+        let t = n as Real / FS;
+        if ((t * 1000.0) as usize / 150).is_multiple_of(2) {
+            let w = std::f32::consts::TAU * 180.0 * t;
+            0.5 * (0.6 * w.sin() + 0.3 * (2.0 * w).sin() + 0.1 * (3.0 * w).sin())
+        } else {
+            0.0
+        }
+    }
+
+    #[test]
+    fn a_subwoofer_boom_or_a_shout_in_the_centre_does_not_duck_the_whole_room() {
+        // Audit R2 on 5.1. Its first cut linked the limiter across all eight channels, the centre
+        // and the subwoofer included, while the auto-gain listens to the front pair alone: a
+        // quiet bed took the full +11.6 dB, and every boom on the subwoofer then pulled the whole
+        // room into the limiter with it. Measured on the front-left bed, 10 ms windows over six
+        // seconds, against its 0.36 dB of window ripple: 11.96 dB of swing under the booms (the
+        // bed fell from −17.6 to −29.5 dB on every one), 4.06 dB under the centre's bursts, 7.53
+        // under both at 0.6, where the original, which ran a limiter per channel, moved it not at
+        // all. Only the front pair is linked now: the bed does not move.
+        for sides in [true, false] {
+            let quiet = bed_swing_db(sides, |_| (0.0, 0.0));
+            assert!(
+                (quiet - 0.36).abs() < 0.01,
+                "the window ripple is {quiet} dB"
+            );
+            for (what, swing, was) in [
+                (
+                    "subwoofer booms",
+                    bed_swing_db(sides, |n| (0.0, booms(n))),
+                    11.96,
+                ),
+                (
+                    "bursts in the centre",
+                    bed_swing_db(sides, |n| (speech(n), 0.0)),
+                    4.06,
+                ),
+                (
+                    "both",
+                    bed_swing_db(sides, |n| (0.6 * speech(n), 0.6 * booms(n))),
+                    7.53,
+                ),
+            ] {
+                assert!(
+                    swing < quiet + 0.05,
+                    "sides named {sides}: under {what} the bed swung {swing} dB, was {was}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn on_surround_the_speakers_either_side_turn_down_together_and_the_centre_and_sub_alone() {
+        // Audit R2 on 5.1 once the sides are known: a 200 ms peak on the side-left speaker, 10 dB
+        // over the ceiling, over a steady tone everywhere. The four speakers around the listener
+        // leave with one gain, so nothing panned between them moves; the centre and the subwoofer
+        // are not touched by it.
+        const CHANNELS: usize = 6;
+        let mut boost = DynamicBoost::new(FS);
+        boost.set_channel_sides(Some(&crate::engine::standard_sides(CHANNELS)[..CHANNELS]));
+        boost.set_amount(0.0);
+        let frames = FS as usize;
+        let burst = (FS * 0.5) as usize..(FS * 0.7) as usize;
+        let w = std::f32::consts::TAU * 1_000.0 / FS;
+        let input: Vec<[Real; CHANNELS]> = (0..frames)
+            .map(|n| {
+                let s = 0.3 * (w * n as Real).sin();
+                let side_left = if burst.contains(&n) { 10.0 * s } else { s };
+                [s, s, s, s, side_left, s]
+            })
+            .collect();
+        let mut buffer: Vec<Real> = input.iter().flatten().copied().collect();
+        boost.process(&mut buffer, CHANNELS);
+
+        let delay = boost.latency_frames();
+        let mut deepest: Real = 1.0;
+        for (n, out) in buffer
+            .as_chunks::<CHANNELS>()
+            .0
+            .iter()
+            .enumerate()
+            .skip(delay)
+        {
+            let arrived = input[n - delay];
+            if arrived[0].abs() < 0.1 {
+                continue;
+            }
+            let gain = |channel: usize| out[channel] / (arrived[channel] * MAX_OUTPUT);
+            for channel in [1, 4, 5] {
+                assert!(
+                    (gain(channel) - gain(0)).abs() < 1e-4,
+                    "frame {n}: channel {channel} left at {}, the front left at {}",
+                    gain(channel),
+                    gain(0)
+                );
+            }
+            for channel in [2, 3] {
+                assert!(
+                    (gain(channel) - 1.0).abs() < 1e-4,
+                    "frame {n}: channel {channel} was turned down to {}",
+                    gain(channel)
+                );
+            }
+            deepest = deepest.min(gain(0));
+        }
+        assert!(
+            deepest < 0.4,
+            "the front left should have come down: {deepest}"
+        );
+    }
+
+    /// Ten seconds at slider 10 of a quiet 440 Hz on the front left and a loud 660 Hz on the front
+    /// right, laid out on `channels` with the pair at `pair` and `other` on every other channel:
+    /// the level estimate and the front right's peak over the last second.
+    fn front_pair_render(
+        channels: usize,
+        pair: (usize, usize),
+        named: Option<(usize, usize)>,
+        other: Real,
+    ) -> (Real, Real) {
+        let mut boost = DynamicBoost::new(FS);
+        boost.set_front_pair(named);
+        boost.set_amount(1.0);
+        boost.settle();
+        let frames = (FS * 10.0) as usize;
+        let w_left = std::f32::consts::TAU * 440.0 / FS;
+        let w_right = std::f32::consts::TAU * 660.0 / FS;
+        let w_other = std::f32::consts::TAU * 55.0 / FS;
+        let mut buffer = vec![0.0; frames * channels];
+        for (n, frame) in buffer.chunks_exact_mut(channels).enumerate() {
+            frame.fill(other * (w_other * n as Real).sin());
+            frame[pair.0] = 0.05 * (w_left * n as Real).sin();
+            frame[pair.1] = 0.5 * (w_right * n as Real).sin();
+        }
+        boost.process(&mut buffer, channels);
+        let right: Vec<Real> = buffer
+            .iter()
+            .skip(pair.1)
+            .step_by(channels)
+            .skip(frames - FS as usize)
+            .copied()
+            .collect();
+        (boost.level_rms(), peak(&right))
+    }
+
+    #[test]
+    fn a_named_front_pair_drives_the_level_estimator_wherever_the_device_puts_it() {
+        // Audit #7 on a device that orders its channels its own way. The estimator was wired to
+        // channels 0 and 1, so on [FC, FL, FR] it heard the centre and the front left: a mix loud
+        // only on the right got the full +11.6 dB and the right sat 5.6 dB deep in the limiter,
+        // the very case #7 set out to fix. Named, the pair is heard wherever it sits, and reads
+        // exactly what the same two channels read as plain stereo.
+        let (stereo_level, stereo_right) = front_pair_render(2, (0, 1), None, 0.0);
+        assert!(stereo_right < 0.63, "{stereo_right}");
+
+        let (unnamed_level, unnamed_right) = front_pair_render(3, (1, 2), None, 0.05);
+        assert!(
+            unnamed_level < 0.05 && unnamed_right > MAX_OUTPUT * 0.99,
+            "the fixture should show the defect: {unnamed_level}, {unnamed_right}"
+        );
+
+        let (named_level, named_right) = front_pair_render(3, (1, 2), Some((1, 2)), 0.05);
+        assert_eq!(named_level, stereo_level, "[FC, FL, FR]");
+        assert!(named_right < 0.63, "the right peaks at {named_right}");
+
+        // A subwoofer between the two, and a loud one, steers nothing either.
+        let (between, _) = front_pair_render(3, (0, 2), Some((0, 2)), 0.9);
+        assert_eq!(between, stereo_level, "[FL, LFE, FR]");
+
+        // A pair that names one channel twice, or one past the arena, is no pair: the first two.
+        let mut boost = DynamicBoost::new(FS);
+        for nonsense in [Some((1, 1)), Some((0, MAX_CHANNELS)), None] {
+            boost.set_front_pair(nonsense);
+            assert_eq!(boost.front_pair(), (0, 1), "{nonsense:?}");
+        }
     }
 }

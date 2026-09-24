@@ -159,6 +159,25 @@ impl Ramp {
         self.left > 0
     }
 
+    /// How many more calls to [`Ramp::advance`] the glide takes; the last of them returns the
+    /// target. Zero when nothing is moving.
+    #[must_use]
+    pub const fn frames_left(&self) -> u32 {
+        self.left
+    }
+
+    /// What the `frames`-th call to [`Ramp::advance`] from now will return, give or take the
+    /// rounding of the steps it adds one at a time: for a caller that has to look along the glide
+    /// before it plays it.
+    #[must_use]
+    pub fn value_after(&self, frames: u32) -> Real {
+        if frames >= self.left {
+            self.target
+        } else {
+            self.value + self.step * frames as Real
+        }
+    }
+
     /// The value the last frame played.
     #[must_use]
     pub const fn value(&self) -> Real {

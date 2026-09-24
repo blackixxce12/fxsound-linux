@@ -1284,20 +1284,47 @@ ten-band +6 dB at 62.5 Hz landed on thirty-one bands as +6 dB at 20 Hz and 0 dB 
 ten-band curve taken to thirty-one bands and back returned up to 2.4 dB away. Now:
 
 * **More bands:** each new band reads the old curve at its centre, linear in log-frequency
-  between the two old bands either side, and held flat past the old first and last band. The
-  62.5 Hz boost reads 5.92 dB at 63 Hz, 3.60 at 80 Hz, 1.42 at 100 Hz and 6 dB below 62.5 Hz.
+  between the two old bands either side. Past the old first and last band the end gain tapers to
+  0 dB over one old band spacing (from the end centre to its neighbour, in log-frequency), which
+  is roughly how far the end band's own skirt reaches. The 62.5 Hz boost reads 5.92 dB at 63 Hz,
+  3.60 at 80 Hz and 1.42 at 100 Hz, and below 62.5 Hz 3.83 dB at 50 Hz, 1.65 at 40 Hz and 0 from
+  31.5 Hz down.
+
+  **Changed on purpose (audit #13, held ends):** the first cut held the end gain flat past the
+  ends, 6 dB on all five thirty-one-band bands below 62.5 Hz. Each of those bands is a whole
+  peaking section and they add up, so the heard curve got a sub-bass shelf the preset never had,
+  peaking at +12.8 dB at 25 Hz where the ten-band curve itself plays +0.5 dB — the same slide to
+  the edge of hearing the frequency remap was meant to stop, and worse than the Windows position
+  remap (+9.7 dB at 25 Hz). Measured on `GraphicEq::response_db`: across the 32 shipped presets
+  with a curve, taken to thirty-one bands, the worst departure below 45 Hz from the preset's own
+  response fell from 25.3 dB (+10 dB at 62.5 Hz played +28.6 dB at 31.5 Hz) to 4.7 dB, on twenty
+  bands from 21.1 to 4.4, on fifteen from 13.5 to 4.4, and the mean RMS departure over
+  20 Hz–20 kHz on thirty-one bands from 2.6 to 1.0 dB. A single old band has no spacing and is
+  still a flat curve at its gain.
 * **Fewer bands:** if the old curve is exactly a reading of some curve on the new ladder, that
   curve comes back. The test is a least-squares fit that reproduces every old point to 1e-3 dB,
   rounded to 1e-5 dB so that zeros stay zeros. It is tried only where it cannot extrapolate. A
-  new band past the old curve's first or last band is held at the end gain, as a reading holds
-  it. Every other new band needs an old band on it, or one on each side of it before the next
-  new band. Without the first rule a seven-band tilt from 0 to +6 dB over 150 Hz–2 kHz came
-  back on five bands as −2.03, 1.18, 4.39, 7.61 and 6.00 dB. Without the second, 0 dB at 62.5 Hz
+  new band past the old curve's first or last band is held at what a reading gives it, the
+  tapered end gain. Every other new band needs an old band on it, or one on each side of it
+  before the next new band. An old band past the new ladder's ends is read the way a grow
+  would have written it — the new end band tapered over the new ladder's end spacing — so the
+  bands a grow tapered down to 20 Hz check the fit instead of contradicting it. Without the
+  first rule a seven-band tilt from 0 to +6 dB over 150 Hz–2 kHz came back on five bands as
+  −2.03, 1.18, 4.39, 7.61 and 6.00 dB. Without the second, 0 dB at 62.5 Hz
   and +3 dB at 90 Hz with nothing else below 1 kHz put +11.4 dB at 250 Hz on five bands. With
   both, a band solved from a slope always has an equation to spare that checks it, so a curve
   that is not a reading fails the fit. Any curve that fails is read at the new centres in the
   same way as when growing. A least-squares fit of detail finer than the new ladder would also
   ring: three +12 dB bands beside three −12 dB bands fitted to +16.5 dB.
+
+  A curve that fails also has the new ladder's end bands stand for what lies past them: of the
+  old bands beyond an end, each tapered over the new ladder's end spacing, the one furthest from
+  0 dB replaces the end band's own reading when it goes further from 0 dB the same way. So a
+  sub-bass boost the smaller ladder cannot reach is not simply dropped: +9 dB on thirty-one
+  bands' 20–40 Hz, which by frequency read 0 dB on every ten-band band, puts +2.5 dB on 62.5 Hz
+  (the thirty-one-band curve itself plays +4.1 dB there; its +22.4 dB at 31.5 Hz is out of ten
+  bands' reach, and the Windows position remap's +9 dB on 62.5 and 116 Hz overshot everything
+  from 50 Hz up to buy +3.3 dB of it).
 
   Round trips are exact when the larger ladder reaches as far as the smaller one at both ends
   and has a band on or between every two neighbouring bands of it. That holds for every pair of
@@ -1307,6 +1334,16 @@ ten-band curve taken to thirty-one bands and back returned up to 2.4 dB away. No
   the way up, but it stays inside the curve's range.
 * **Equal counts** copy, as before. A preset's centres are clamped to 10 Hz–21 kHz, and a NaN is
   read as 10 Hz, the way the equalizer would install them. Order does not matter.
+* **The live curve's own centres** (audit #13, second review): `remap_band_gains` takes gains
+  only and reads them on the standard ladder of their count, which is wrong for a curve that
+  sits elsewhere — a Windows twenty-band `.fac` or a twenty-band curve saved before 0.4.0, still
+  on `WINDOWS_TWENTY_BAND_CENTRES_HZ` (R4 keeps them), or a band dragged in the window.
+  `remap_curve(old_centres, old_gains, new_count)` reads the curve from its own centres onto the
+  standard ladder of the new count (`fit_preset_gains` onto `standard_centres(new_count)`): a
+  Windows twenty-band +6 dB at 10 kHz lands on thirty-one bands as 6.00 dB on the 10 kHz band,
+  where read as if on the standard ladder it gave 0.18/3.98/4.21 dB on 8/10/12.5 kHz and slid
+  the peak up to 11–12 kHz. A band-count change should use it whenever the live centres are at
+  hand; `remap_band_gains` is for curves on the standard ladder.
 
 Empty-EQ presets (`hp_graphicEq == NULL`) turn the EQ **on** and flatten every band
 (`DfxDspEq.cpp:144-158`).
@@ -1769,7 +1806,11 @@ pub fn calc_rounded_value(v: Real, delta: Real, out_min: Real, out_max: Real) ->
    running section keeps its state through a redesign. Coming back from +3 → 0 → −1 dB at
    62.5 Hz after loud bass used to ring at −17.5 dBFS into silence. The whole equalizer coming
    back on starts every section from rest too (`GraphicEq::set_enabled`): switched off and on
-   under the same bass, it rang at −16.8 dBFS. The slider-drag click is audit #11, not this.
+   under the same bass, it rang at −16.8 dBFS. So does FxSound's power switch coming back on
+   (`Engine::apply` resets the equalizer on the power's rising edge): with the power off the
+   sections stood still, and switched back on under the same 62.5 Hz at +3 dB after a second of a
+   50 Hz tone at 0.9 they rang at −12.8 dBFS into silence. The slider-drag click is audit #11,
+   not this.
    **Also done in 0.4.0** (audit #11): a band that is moved crossfades from its old design to
    its new one over 20 ms (`crates/fxsound-dsp/src/smooth.rs`, `FadingSection`), one that goes
    to or comes back from exactly 0 dB fades out to or in from the bypass, and a design asked for

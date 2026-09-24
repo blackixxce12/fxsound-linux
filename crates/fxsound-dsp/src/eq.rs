@@ -185,8 +185,15 @@ pub fn standard_centres(count: usize) -> Vec<Real> {
 /// Carry a curve over to a new band count by frequency, so the user's shape stays where it was
 /// instead of being wiped flat or slid along the ladder.
 ///
-/// Both ladders are the ones the counts get by default ([`standard_centres`]); the reading is
-/// [`fit_preset_gains`]'s, between them.
+/// **For a curve on the standard ladder of its count only.** Both ladders are the ones the counts
+/// get by default ([`standard_centres`]), and the reading is [`fit_preset_gains`]'s, between
+/// them: the gains alone do not say where the curve sits, so this assumes. A curve on centres of
+/// its own — a Windows twenty-band preset or a twenty-band curve saved before 0.4.0, still on
+/// [`WINDOWS_TWENTY_BAND_CENTRES_HZ`], or any curve with a band dragged in the window — is read at
+/// the wrong frequencies here, and a band-count change moves its boosts: a 10 kHz boost on the
+/// Windows ladder, read as if it sat at 11.3 kHz, came out on thirty-one bands as 3.98 dB at
+/// 10 kHz and 4.21 dB at 12.5 kHz. Carry such a curve with [`remap_curve`], which takes its
+/// centres.
 ///
 /// **Changed on purpose (audit report #13).** The original remaps by *position*
 /// (`GraphicEqSet.cpp:200-245`, upstream 182a329, which this function used to port line for
@@ -227,6 +234,28 @@ pub fn remap_band_gains(old: &[Real], new_count: usize) -> Vec<Real> {
     )
 }
 
+/// Carry a curve that sits on `old_centres` over to the standard ladder of `new_count` bands
+/// ([`standard_centres`]), by frequency: the gains [`remap_band_gains`] gives a curve on the
+/// standard ladder, for a curve on any ladder.
+///
+/// What a band-count change should use whenever the live curve's centres are at hand, since
+/// the live curve need not sit on the standard ladder of its count (audit report #13, second
+/// review): a Windows twenty-band preset keeps its own centres on purpose (R4), and a band dragged
+/// in the window keeps where it was dragged to. Read from its own centres, a Windows twenty-band
+/// curve's +6 dB at 10 kHz lands on thirty-one bands as 6.00 dB on the 10 kHz band, where read as
+/// if it sat on the standard ladder it gave 3.98 dB there and slid its peak up to 11-12 kHz.
+///
+/// The reading is [`fit_preset_gains`]'s, rules and all: an equal count copies the gains, band for
+/// band, which is also how a curve on the Windows twenty-band ladder moves to [`band_table`]'s —
+/// no centre moves by more than 0.17 of an octave. The result sits on the standard ladder of
+/// `new_count`, so from there on [`remap_band_gains`] carries it, and a trip up and back down
+/// returns to the standard ladder of the old count, not to the old centres. Allocates; call it off
+/// the audio thread.
+#[must_use]
+pub fn remap_curve(old_centres: &[Real], old_gains: &[Real], new_count: usize) -> Vec<Real> {
+    fit_preset_gains(old_centres, old_gains, &standard_centres(new_count))
+}
+
 /// The gains a preset's curve takes on the user's live band ladder.
 ///
 /// The port of `DfxDspPrivate::getGraphicEqInfoFromVals` (`DfxDspEq.cpp:127-247`, upstream
@@ -239,11 +268,16 @@ pub fn remap_band_gains(old: &[Real], new_count: usize) -> Vec<Real> {
 ///   from the preset's own centres, where the original reads them by position (**changed on
 ///   purpose, audit report #13**; see [`remap_band_gains`] for what position did to a curve):
 ///   - onto **more** bands, each live band takes the preset's curve at its centre, linear in
-///     log-frequency between the two preset bands either side and held flat past the preset's
-///     first and last band, which is how the curve is drawn;
+///     log-frequency between the two preset bands either side, and past the preset's first and
+///     last band tapering to 0 dB over one of the preset's own band spacings, which is roughly
+///     how far the end band's skirt reaches;
 ///   - onto **fewer** bands, a preset curve that is itself a reading of some curve on the live
 ///     ladder — ten bands taken to thirty-one, say — comes back as that curve, exactly; any other
-///     is read at the live centres the same way, and so is held flat past the preset's ends too.
+///     is read at the live centres the same way, tapered past the preset's ends too, and a live
+///     band at either end of its ladder also takes what lies beyond it: the preset's gains past
+///     it, tapered over one of the live ladder's spacings, when one of them goes further from
+///     0 dB the same way than the band's own reading, so that a sub-bass boost on thirty-one
+///     bands is not lost on ten, whose lowest band is 62.5 Hz.
 ///     The first is the least-squares fit of the live ladder to the preset's points, and it is
 ///     taken only where it can be trusted (see `exact_preimage`): the preset's ladder must be at
 ///     least as fine as the live one wherever they overlap, and the fit must reproduce every
@@ -252,6 +286,16 @@ pub fn remap_band_gains(old: &[Real], new_count: usize) -> Vec<Real> {
 ///     to ten bands at +16.5 dB. Past a preset's ends, or across a gap in its ladder, it
 ///     extrapolates: a seven-band tilt from 0 to +6 dB over 150 Hz–2 kHz fitted to five bands at
 ///     −2.0 dB at 62.5 Hz and +7.6 dB at 4 kHz.
+///
+///   **Changed on purpose (audit report #13, held ends).** Past the preset's ends the curve used
+///   to be held flat at its end gain. Every live band out there is a whole peaking section, and
+///   they add up: a ten-band +6 dB at 62.5 Hz copied onto the five thirty-one-band bands from
+///   20 to 50 Hz came out as a sub-bass shelf peaking at +12.8 dB at 25 Hz, where the preset's own
+///   response there is +0.5 dB — the bass boost slid to the edge of hearing again, the thing
+///   reading by frequency was for. Across the shipped presets on thirty-one bands, the worst
+///   departure from a preset's own response below 45 Hz fell from 25.3 dB to 4.7 dB with the
+///   taper. Shrinking the other way lost a boost the smaller ladder does not reach: +9 dB on
+///   thirty-one bands' 20-40 Hz came out on ten bands as 0 dB everywhere.
 /// - **Equal band counts:** the gains are copied as they are. The original also copies the
 ///   preset's centre frequencies onto the live ladder then (`DfxDspEq.cpp:229-241`); that half is
 ///   the caller's, since this returns gains only — pair the result with `preset_centres` when the
@@ -325,14 +369,73 @@ fn locate(ladder: &[(f64, f64)], x: f64) -> (usize, Option<(usize, f64)>) {
     (lower, Some((upper, fraction)))
 }
 
-/// The curve through `points` at `x`: linear between neighbours, flat past the ends.
-fn read_curve(points: &[(f64, f64)], x: f64) -> f64 {
-    match locate(points, x) {
-        (index, None) => points[index].1,
-        (lower, Some((upper, fraction))) => {
-            points[lower].1 + (points[upper].1 - points[lower].1) * fraction
-        }
+/// How far past each end of a sorted ladder its end band reaches: the distance, in log-frequency,
+/// to the nearest band above the first and below the last. Infinite for a ladder with one
+/// distinct centre, which has no spacing to go by.
+fn end_spans(ladder: &[(f64, f64)]) -> (f64, f64) {
+    let (first, last) = (ladder[0].0, ladder[ladder.len() - 1].0);
+    let low = ladder
+        .iter()
+        .find(|point| point.0 > first)
+        .map_or(f64::INFINITY, |point| point.0 - first);
+    let high = ladder
+        .iter()
+        .rev()
+        .find(|point| point.0 < last)
+        .map_or(f64::INFINITY, |point| last - point.0);
+    (low, high)
+}
+
+/// What is left of an end band's gain `distance` past it, over a reach of `span`: all of it at
+/// the band, none of it a whole span away, a straight line in log-frequency between.
+fn taper(distance: f64, span: f64) -> f64 {
+    (1.0 - distance / span).clamp(0.0, 1.0)
+}
+
+/// A reading of a sorted ladder at `x` as weights on at most two of its bands, the same weights
+/// whichever way the ladder is being read: between two bands, the straight line in log-frequency
+/// between them; past either end, the end band tapered to 0 dB over its spacing ([`end_spans`]),
+/// audit report #13's held ends.
+fn reading_weights(ladder: &[(f64, f64)], spans: (f64, f64), x: f64) -> [(usize, f64); 2] {
+    let (first, last) = (ladder[0].0, ladder[ladder.len() - 1].0);
+    match locate(ladder, x) {
+        (index, None) if index == 0 && x < first => [(0, taper(first - x, spans.0)), (0, 0.0)],
+        (index, None) if x > last => [(index, taper(x - last, spans.1)), (index, 0.0)],
+        (index, None) => [(index, 1.0), (index, 0.0)],
+        (lower, Some((upper, fraction))) => [(lower, 1.0 - fraction), (upper, fraction)],
     }
+}
+
+/// The curve through `points` at `x`: linear between neighbours, tapered to 0 dB past the ends.
+fn read_curve(points: &[(f64, f64)], spans: (f64, f64), x: f64) -> f64 {
+    reading_weights(points, spans, x)
+        .iter()
+        .map(|&(index, weight)| weight * points[index].1)
+        .sum()
+}
+
+/// What `points` has past the end of a live ladder that ends at `edge`, for the band there to
+/// take (see [`fit_preset_gains`]): each point beyond it, tapered over the live ladder's `span`,
+/// and of those the one furthest from 0 dB. Zero when nothing lies beyond, or when the live ladder
+/// has no spacing to reach by.
+fn beyond(points: &[(f64, f64)], edge: f64, span: f64, below: bool) -> f64 {
+    if !span.is_finite() {
+        return 0.0;
+    }
+    points
+        .iter()
+        .filter(|point| {
+            if below {
+                point.0 < edge
+            } else {
+                point.0 > edge
+            }
+        })
+        .map(|point| point.1 * taper((point.0 - edge).abs(), span))
+        .fold(
+            0.0,
+            |most: f64, gain| if gain.abs() > most.abs() { gain } else { most },
+        )
 }
 
 /// The remap both public functions share, for two ladders of different lengths.
@@ -341,8 +444,12 @@ fn remap_by_frequency(from_centres: &[Real], gains: &[Real], to_centres: &[Real]
         return vec![0.0; to_centres.len()];
     }
     let points = curve_points(from_centres, gains);
+    let spans = end_spans(&points);
     let targets: Vec<f64> = to_centres.iter().map(|hz| log_centre(*hz)).collect();
-    let read: Vec<f64> = targets.iter().map(|x| read_curve(&points, *x)).collect();
+    let mut read: Vec<f64> = targets
+        .iter()
+        .map(|x| read_curve(&points, spans, *x))
+        .collect();
     if targets.len() < points.len()
         && let Some(preimage) = exact_preimage(&points, &targets, &read)
     {
@@ -357,7 +464,28 @@ fn remap_by_frequency(from_centres: &[Real], gains: &[Real], to_centres: &[Real]
             .map(|gain| ((gain * 1e5).round() / 1e5 + 0.0) as Real)
             .collect();
     }
-    read.into_iter().map(|gain| gain as Real).collect()
+
+    // The live ladder's end bands also stand for what lies past them: a point beyond the lowest
+    // band, tapered over that band's reach, which goes further from 0 dB the same way than the
+    // band's own reading, is what the band takes. A reading is inside the curve's range and so
+    // is a tapered gain, so this invents nothing.
+    let mut sorted: Vec<(f64, f64)> = targets.iter().map(|x| (*x, 0.0)).collect();
+    sorted.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let live_spans = end_spans(&sorted);
+    let (lowest, highest) = (sorted[0].0, sorted[sorted.len() - 1].0);
+    for (x, gain) in targets.iter().zip(&mut read) {
+        let past = if *x == lowest {
+            beyond(&points, lowest, live_spans.0, true)
+        } else if *x == highest {
+            beyond(&points, highest, live_spans.1, false)
+        } else {
+            continue;
+        };
+        if past.abs() > gain.abs() && past * *gain >= 0.0 {
+            *gain = past;
+        }
+    }
+    read.into_iter().map(|gain| (gain + 0.0) as Real).collect()
 }
 
 /// The curve on the `targets` ladder whose reading at the old centres is the old curve, when there
@@ -366,10 +494,11 @@ fn remap_by_frequency(from_centres: &[Real], gains: &[Real], to_centres: &[Real]
 /// Least squares over the reading `A` (`AᵀA·x = Aᵀ·g`), with two rules first that keep it from
 /// inventing gain (audit report #13, second review):
 ///
-/// - **A live band past the old curve's first or last point is held**, at the end gain the plain
-///   reading gives it. Nothing on that side says what it was, and solving for it extrapolates the
-///   slope inside: a seven-band tilt from 0 to +6 dB over 150 Hz–2 kHz, fitted to five bands,
-///   came back as −2.03, 1.18, 4.39, 7.61 and 6.00 dB, a steeper tilt that bent back at 16 kHz.
+/// - **A live band past the old curve's first or last point is held**, at what the plain reading
+///   gives it: the end gain tapered over the old curve's end spacing. Nothing on that side says
+///   what it was, and solving for it extrapolates the slope inside: a seven-band tilt from 0 to
+///   +6 dB over 150 Hz–2 kHz, fitted to five bands, came back as −2.03, 1.18, 4.39, 7.61 and
+///   6.00 dB, a steeper tilt that bent back at 16 kHz.
 /// - **Every other live band must have an old point on it or on each side of it before the next
 ///   live band.** A band with points on one side only is extrapolated just the same, from inside
 ///   the curve: a preset with +3 dB at 90 Hz, 0 dB at 62.5 Hz and nothing else below 1 kHz,
@@ -380,7 +509,9 @@ fn remap_by_frequency(from_centres: &[Real], gains: &[Real], to_centres: &[Real]
 ///
 /// A curve grown from this ladder on its way back meets both rules for every pair of the window's
 /// counts, since each larger ladder reaches as far at both ends and has a band on or between
-/// every two neighbours of the smaller.
+/// every two neighbours of the smaller. An old point past this ladder's ends is read the way the
+/// grow wrote it, as this ladder's end band tapered over its spacing ([`reading_weights`]), so
+/// the bands a grow tapered out to 20 Hz check the answer rather than contradict it.
 /// The answer is kept only if it reproduces every old point to a thousandth of a decibel;
 /// otherwise the curve is read (see [`fit_preset_gains`] for why).
 fn exact_preimage(points: &[(f64, f64)], targets: &[f64], read: &[f64]) -> Option<Vec<f64>> {
@@ -412,15 +543,11 @@ fn exact_preimage(points: &[(f64, f64)], targets: &[f64], read: &[f64]) -> Optio
         }
     }
 
-    // Each old point as weights on at most two live bands.
+    // Each old point as weights on at most two live bands: the reading of the live ladder there.
+    let spans = end_spans(&ladder);
     let rows: Vec<[(usize, f64); 2]> = points
         .iter()
-        .map(|point| match locate(&ladder, point.0) {
-            (index, None) => [(order[index], 1.0), (order[index], 0.0)],
-            (lower, Some((upper, fraction))) => {
-                [(order[lower], 1.0 - fraction), (order[upper], fraction)]
-            }
-        })
+        .map(|point| reading_weights(&ladder, spans, point.0).map(|(at, w)| (order[at], w)))
         .collect();
 
     // A held band is a known, so its row says so and its share of a point moves to the right-hand
@@ -1439,16 +1566,26 @@ mod tests {
         }
     }
 
-    /// The curve through `(centres, gains)` read at `hz` — linear in log-frequency, held past the
-    /// ends — worked independently of the code under test, for centres in ascending order.
+    /// The curve through `(centres, gains)` read at `hz` — linear in log-frequency, and past the
+    /// ends the end gain tapered to 0 dB over the end spacing — worked independently of the code
+    /// under test, for distinct centres in ascending order.
+    ///
+    /// Changed on purpose: audit report #13 (held ends). Past the ends the curve was held at its
+    /// end gain, which piled a sub-bass shelf the preset never had onto every band out there.
     fn reading(centres: &[Real], gains: &[Real], hz: Real) -> Real {
         let x = f64::from(hz).ln();
         let xs: Vec<f64> = centres.iter().map(|c| f64::from(*c).ln()).collect();
-        if x <= xs[0] {
+        let last = xs.len() - 1;
+        if last == 0 {
             return gains[0];
         }
-        if x >= xs[xs.len() - 1] {
-            return gains[gains.len() - 1];
+        if x <= xs[0] {
+            let left = 1.0 - (xs[0] - x) / (xs[1] - xs[0]);
+            return (f64::from(gains[0]) * left.max(0.0)) as Real;
+        }
+        if x >= xs[last] {
+            let left = 1.0 - (x - xs[last]) / (xs[last] - xs[last - 1]);
+            return (f64::from(gains[last]) * left.max(0.0)) as Real;
         }
         let upper = xs.iter().position(|c| *c > x).expect("inside the ladder");
         let t = (x - xs[upper - 1]) / (xs[upper] - xs[upper - 1]);
@@ -1476,12 +1613,153 @@ mod tests {
             "80 Hz, part of the way down the slope",
         );
         assert_close(remapped[7], 1.422_993, "100 Hz");
-        // Below the ten-band ladder the lowest band's gain is held, as the curve is drawn.
+        // Changed on purpose: audit report #13 (held ends). Below the ten-band ladder the lowest
+        // band's gain was held on all five bands from 20 to 50 Hz, which added up to a sub-bass
+        // shelf peaking at +12.8 dB at 25 Hz. It now tapers to 0 dB over the ladder's first
+        // spacing, 62.5 to 115.7 Hz, which is roughly how far the band's own skirt reaches.
+        let spacing = (115.734_f64 / 62.5).ln();
         for band in 0..5 {
-            assert_eq!(remapped[band], 6.0, "{} Hz", thirty_one[band]);
+            let below = (62.5 / f64::from(thirty_one[band])).ln();
+            let tapered = 6.0 * (1.0 - below / spacing).max(0.0);
+            assert_close(
+                remapped[band],
+                tapered as Real,
+                &format!("{} Hz", thirty_one[band]),
+            );
         }
+        assert_eq!(&remapped[..3], [0.0; 3], "20 to 31.5 Hz are past the reach");
+        assert!((1.6..1.7).contains(&remapped[3]), "40 Hz: {}", remapped[3]);
+        assert!((3.8..3.9).contains(&remapped[4]), "50 Hz: {}", remapped[4]);
         // From 125 Hz up, both neighbours are flat.
         assert!(remapped[8..].iter().all(|g| *g == 0.0), "{remapped:?}");
+    }
+
+    /// An equalizer holding `gains` on `centres` at 48 kHz, for its response.
+    fn equalizer(centres: &[Real], gains: &[Real]) -> GraphicEq {
+        let mut eq = GraphicEq::new();
+        eq.set_sample_rate(48_000.0);
+        eq.set_bands(centres, gains);
+        eq
+    }
+
+    #[test]
+    fn a_ten_band_bass_boost_on_thirty_one_bands_sounds_within_2_db_of_itself_below_45_hz() {
+        // Audit report #13 (held ends), by the response rather than the gains, which is what the
+        // gain tests could not see. +6 dB at 62.5 Hz on ten bands is +0.5 dB at 25 Hz and +1.9 dB
+        // at 40 Hz as ten bands play it. Held on thirty-one bands' five bands from 20 to 50 Hz,
+        // it played +12.7 dB at 25 Hz and +11.3 dB at 40 Hz, and the curve peaked at +12.8 dB at
+        // 25.5 Hz. Tapered, it plays 0.2 and 2.9 dB there.
+        let mut bass = [0.0; 10];
+        bass[0] = 6.0;
+        let own = equalizer(&ladder(10), &bass);
+        let there = equalizer(&ladder(31), &remap_band_gains(&bass, 31));
+        for step in 0..=40 {
+            let hz = 20.0 * (45.0_f32 / 20.0).powf(step as Real / 40.0);
+            let (want, got) = (own.response_db(hz), there.response_db(hz));
+            assert!(
+                (got - want).abs() < 2.0,
+                "{hz} Hz: {got} dB on thirty-one bands, {want} dB on ten"
+            );
+        }
+        // And the boost is still where it was: the loudest point of the curve is near 63 Hz, not
+        // down at the edge of hearing.
+        let loudest = (0..=200)
+            .map(|step| 20.0 * 1000.0_f32.powf(step as Real / 200.0))
+            .max_by(|a, b| there.response_db(*a).total_cmp(&there.response_db(*b)))
+            .expect("points");
+        assert!(
+            (55.0..75.0).contains(&loudest),
+            "the curve peaks at {loudest} Hz"
+        );
+    }
+
+    #[test]
+    fn a_windows_twenty_band_curves_ten_kilohertz_boost_stays_at_ten_kilohertz_on_thirty_one_bands()
+    {
+        // Audit report #13, second review. A Windows twenty-band `.fac` keeps its own centres (R4)
+        // — 8, 10 and 16 kHz at the top — and a band-count change read it as if it sat on the
+        // standard ladder, where its 10 kHz band is 11.3 kHz: on thirty-one bands, 0.18, 3.98 and
+        // 4.21 dB on the 8, 10 and 12.5 kHz bands, 5.2 dB at 10 kHz and the peak slid to 11-12 kHz.
+        // Read from its own centres it is 6.00 dB on the 10 kHz band.
+        let mut treble = [0.0; 20];
+        treble[18] = 6.0;
+        let by_centres = remap_curve(&WINDOWS_TWENTY_BAND_CENTRES_HZ, &treble, 31);
+        assert_eq!(ladder(31)[27], 10_000.0);
+        assert_eq!(&by_centres[..27], [0.0; 27]);
+        assert_eq!(by_centres[27], 6.0, "the 10 kHz band");
+        assert_close(
+            by_centres[28],
+            reading(&WINDOWS_TWENTY_BAND_CENTRES_HZ, &treble, 12_500.0),
+            "12.5 kHz, on the way down to 16 kHz",
+        );
+        let standard = remap_band_gains(&treble, 31);
+        assert!((3.9..4.0).contains(&standard[27]), "{standard:?}");
+        let own = equalizer(&WINDOWS_TWENTY_BAND_CENTRES_HZ, &treble);
+        let there = equalizer(&ladder(31), &by_centres);
+        assert!(
+            (there.response_db(10_000.0) - own.response_db(10_000.0)).abs() < 1.0,
+            "{} dB at 10 kHz, {} on the Windows ladder",
+            there.response_db(10_000.0),
+            own.response_db(10_000.0)
+        );
+        assert!(there.response_db(10_000.0) > there.response_db(12_000.0));
+
+        // The same at the bottom: +6 dB on the 31.5 Hz band stays on the 31.5 Hz band.
+        let mut sub = [0.0; 20];
+        sub[1] = 6.0;
+        let sub = remap_curve(&WINDOWS_TWENTY_BAND_CENTRES_HZ, &sub, 31);
+        assert_eq!((sub[2], sub[3]), (6.0, 0.0), "31.5 and 40 Hz: {sub:?}");
+
+        // And a band dragged in the window: ten bands with the first moved up to 85 Hz and at
+        // +6 dB. Read as if it sat at 62.5 Hz, the curve peaked there, 0.44 of an octave low.
+        let mut dragged_centres = ladder(10);
+        dragged_centres[0] = 85.0;
+        let mut dragged = [0.0; 10];
+        dragged[0] = 6.0;
+        let peak_of = |eq: &GraphicEq| {
+            (0..=200)
+                .map(|step| 20.0 * 1000.0_f32.powf(step as Real / 200.0))
+                .max_by(|a, b| eq.response_db(*a).total_cmp(&eq.response_db(*b)))
+                .expect("points")
+        };
+        let read_as_standard = equalizer(&ladder(31), &remap_band_gains(&dragged, 31));
+        let read_from_centres =
+            equalizer(&ladder(31), &remap_curve(&dragged_centres, &dragged, 31));
+        assert!(peak_of(&read_as_standard) < 70.0);
+        assert!(
+            (75.0..95.0).contains(&peak_of(&read_from_centres)),
+            "{} Hz",
+            peak_of(&read_from_centres)
+        );
+    }
+
+    #[test]
+    fn a_sub_bass_boost_on_thirty_one_bands_is_not_lost_on_ten() {
+        // Audit report #13 (held ends), the shrink. +9 dB on thirty-one bands' 20 to 40 Hz lies
+        // wholly below ten bands' lowest centre, 62.5 Hz, and the reading at the ten centres found
+        // 0 dB everywhere: the boost vanished. The lowest band now also takes what lies within its
+        // reach below it, the 40 Hz band's +9 dB tapered over its spacing: +2.5 dB, which ten
+        // bands play as +2.5 dB at 62.5 Hz — the thirty-one-band curve's own is +4.1 there — and
+        // +0.4 dB at 31.5 Hz, where no ten-band curve reaches the +22.4 dB of its own.
+        let mut sub = [0.0; 31];
+        sub[..4].fill(9.0);
+        let ten = remap_band_gains(&sub, 10);
+        let expected = 9.0 * (1.0 - (62.5_f64 / 40.0).ln() / (115.734_f64 / 62.5).ln());
+        assert_close(ten[0], expected as Real, "62.5 Hz");
+        assert!(ten[0] > 2.4, "{ten:?}");
+        assert_eq!(&ten[1..], [0.0; 9]);
+        let there = equalizer(&ladder(10), &ten);
+        assert!(there.response_db(62.5) > 2.4 && there.response_db(31.5) > 0.3);
+
+        // A cut goes the same way, and a band whose own reading goes further, or the other way,
+        // keeps it.
+        let cut: Vec<Real> = sub.iter().map(|gain| -gain).collect();
+        assert_close(remap_band_gains(&cut, 10)[0], -expected as Real, "a cut");
+        let mut against = sub;
+        against[5] = -3.0;
+        against[4] = -3.0;
+        let kept = remap_band_gains(&against, 10);
+        assert!(kept[0] < 0.0, "the band's own reading is a cut: {kept:?}");
     }
 
     #[test]
@@ -1589,25 +1867,31 @@ mod tests {
     }
 
     #[test]
-    fn a_tilt_with_more_bands_than_the_live_ladder_stays_monotonic_and_within_its_own_range() {
+    fn a_tilt_with_more_bands_than_the_live_ladder_is_read_along_itself_and_stays_in_its_range() {
         // Audit report #13, second review. A seven-band tilt from 0 to +6 dB over 150 Hz-2 kHz
         // fitted to five bands came back as -2.03, 1.18, 4.39, 7.61 and 6.00 dB: the fit
         // extrapolated past the preset's ends, inventing 2 dB of cut at 62.5 Hz and 1.6 dB of
-        // boost at 4 kHz, and bent back down at 16 kHz. Past its ends the tilt is now held.
+        // boost at 4 kHz, and bent back down at 16 kHz. Past its ends the tilt is read, not
+        // solved for.
+        //
+        // Changed on purpose: audit report #13 (held ends). The reading past the ends held the
+        // end gain, so 4 and 16 kHz both took +6 dB, which the tilt's own response only has at
+        // 2 kHz; this was `..._stays_monotonic_and_within_its_own_range`. They now take the taper
+        // from 2 kHz over the tilt's own spacing, which has run out an octave up.
         let seven: Vec<Real> = (0..7)
             .map(|band| (150.0 * (2000.0_f64 / 150.0).powf(f64::from(band) / 6.0)) as Real)
             .collect();
         let rising: Vec<Real> = (0..7).map(|band| band as Real).collect();
         let five = fit_preset_gains(&seven, &rising, &ladder(5));
-        assert!(rises(&five), "{five:?}");
         assert!(five.iter().all(|g| (0.0..=6.0).contains(g)), "{five:?}");
-        assert_eq!((five[0], five[3], five[4]), (0.0, 6.0, 6.0), "{five:?}");
-        for (gain, hz) in five.iter().zip(ladder(5)).skip(1).take(2) {
-            assert_close(*gain, reading(&seven, &rising, hz), "read inside the tilt");
+        assert_eq!((five[0], five[3], five[4]), (0.0, 0.0, 0.0), "{five:?}");
+        assert!(rises(&five[..3]), "{five:?}");
+        for (gain, hz) in five.iter().zip(ladder(5)) {
+            assert_close(*gain, reading(&seven, &rising, hz), "read along the tilt");
         }
 
         // Twelve bands from 0 to +6 dB over 200 Hz-8 kHz on ten: the fit dipped to -0.89 dB at
-        // 116 Hz and rose past +6 dB at 8.6 kHz.
+        // 116 Hz and rose past +6 dB at 8.6 kHz. 8.6 kHz is a quarter of a spacing past 8 kHz.
         let twelve: Vec<Real> = (0..12)
             .map(|band| (200.0 * 40.0_f64.powf(f64::from(band) / 11.0)) as Real)
             .collect();
@@ -1615,9 +1899,13 @@ mod tests {
             .map(|band| (6.0 * f64::from(band) / 11.0) as Real)
             .collect();
         let ten = fit_preset_gains(&twelve, &rising, &ladder(10));
-        assert!(rises(&ten), "{ten:?}");
         assert!(ten.iter().all(|g| (0.0..=6.0).contains(g)), "{ten:?}");
-        assert_eq!((ten[0], ten[1], ten[8], ten[9]), (0.0, 0.0, 6.0, 6.0));
+        assert!(rises(&ten[..8]), "{ten:?}");
+        assert_eq!((ten[0], ten[1], ten[9]), (0.0, 0.0, 0.0));
+        for (gain, hz) in ten.iter().zip(ladder(10)) {
+            assert_close(*gain, reading(&twelve, &rising, hz), "read along the tilt");
+        }
+        assert!((4.5..4.7).contains(&ten[8]), "{ten:?}");
     }
 
     #[test]
@@ -1689,6 +1977,10 @@ mod tests {
                 .fold((Real::INFINITY, Real::NEG_INFINITY), |(lo, hi), g| {
                     (lo.min(*g), hi.max(*g))
                 });
+            // Changed on purpose: audit report #13 (held ends). Past the preset's ends its curve
+            // tapers to 0 dB rather than holding its end gain, so 0 dB is inside the range too:
+            // no gain, not an invented one.
+            let (lowest, highest) = (lowest.min(0.0), highest.max(0.0));
             for (band, gain) in fit_preset_gains(&centres, &gains, &live).iter().enumerate() {
                 assert!(
                     (lowest - 1e-4..=highest + 1e-4).contains(gain),
@@ -1787,20 +2079,23 @@ mod tests {
     }
 
     #[test]
-    fn every_pair_of_band_counts_holds_the_ends_and_invents_no_gain() {
+    fn every_pair_of_band_counts_tapers_past_the_ends_and_invents_no_gain() {
         // Changed on purpose: audit report #13. By position, the first band always landed on the
         // first and the last on the last, whatever their frequencies; by frequency the ends that
-        // are held are the ends of the old curve's *range*. Every count the engine can hold, both
+        // count are the ends of the old curve's *range*. Every count the engine can hold, both
         // ways, as a proof that no pair of counts makes the remap panic.
+        //
+        // Changed on purpose: audit report #13 (held ends). A band past those ends held the end
+        // gain, and this was `every_pair_of_band_counts_holds_the_ends_and_invents_no_gain`. It
+        // now takes the end gain tapered to 0 dB over the old ladder's end spacing, so 0 dB is
+        // inside the range too.
         for old_count in 1..=SOS_MAX_SECTIONS {
             let old: Vec<Real> = (0..old_count)
                 .map(|band| ((band * 7 % 11) as Real - 5.0) * 2.0)
                 .collect();
-            let (low, high) = old
-                .iter()
-                .fold((Real::INFINITY, Real::NEG_INFINITY), |(lo, hi), g| {
-                    (lo.min(*g), hi.max(*g))
-                });
+            let (low, high) = old.iter().fold((0.0 as Real, 0.0 as Real), |(lo, hi), g| {
+                (lo.min(*g), hi.max(*g))
+            });
             let from = ladder(old_count);
             for new_count in 0..=SOS_MAX_SECTIONS {
                 let remapped = remap_band_gains(&old, new_count);
@@ -1810,14 +2105,12 @@ mod tests {
                         (low..=high).contains(gain),
                         "{old_count} -> {new_count}: band {band} is {gain}, outside {low}..={high}"
                     );
-                    if old_count != new_count && hz <= from[0] {
-                        assert_eq!(*gain, old[0], "{old_count} -> {new_count}: {hz} Hz");
-                    }
-                    if old_count != new_count && hz >= from[old_count - 1] {
-                        assert_eq!(
-                            *gain,
-                            old[old_count - 1],
-                            "{old_count} -> {new_count}: {hz} Hz"
+                    let past_an_end = hz <= from[0] || hz >= from[old_count - 1];
+                    if old_count != new_count && past_an_end {
+                        assert!(
+                            (*gain - reading(&from, &old, hz)).abs() < 1e-4,
+                            "{old_count} -> {new_count}: {hz} Hz is {gain}, the taper {}",
+                            reading(&from, &old, hz)
                         );
                     }
                 }
@@ -1826,8 +2119,14 @@ mod tests {
     }
 
     #[test]
-    fn a_flat_curve_stays_flat_and_a_constant_one_stays_constant_at_any_count() {
+    fn a_flat_curve_stays_flat_and_a_constant_one_stays_constant_over_its_own_range() {
+        // Changed on purpose: audit report #13 (held ends). A constant curve stayed constant on
+        // every band of any count, including bands past the old ladder's ends, where it was held
+        // (this was `..._stays_constant_at_any_count`). Past the ends it now tapers like any
+        // other curve: ten bands at +3.5 dB are a curve that falls away below 62.5 Hz, and
+        // thirty-one bands down to 20 Hz draw it that way.
         for old_count in 1..=SOS_MAX_SECTIONS {
+            let from = ladder(old_count);
             for new_count in 1..=SOS_MAX_SECTIONS {
                 assert!(
                     remap_band_gains(&vec![0.0; old_count], new_count)
@@ -1835,12 +2134,19 @@ mod tests {
                         .all(|g| g.to_bits() == 0.0_f32.to_bits()),
                     "{old_count} -> {new_count}"
                 );
-                assert!(
-                    remap_band_gains(&vec![3.5; old_count], new_count)
-                        .iter()
-                        .all(|g| *g == 3.5),
-                    "{old_count} -> {new_count}"
-                );
+                let constant = remap_band_gains(&vec![3.5; old_count], new_count);
+                for (gain, hz) in constant.iter().zip(ladder(new_count)) {
+                    let inside = hz >= from[0] && hz <= from[old_count - 1];
+                    if inside || old_count == 1 || old_count == new_count {
+                        assert_eq!(*gain, 3.5, "{old_count} -> {new_count}: {hz} Hz");
+                    } else {
+                        let tapered = reading(&from, &vec![3.5; old_count], hz);
+                        assert!(
+                            (*gain - tapered).abs() < 1e-4 && (0.0..3.5).contains(gain),
+                            "{old_count} -> {new_count}: {hz} Hz is {gain}, tapered {tapered}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1927,8 +2233,17 @@ mod tests {
             assert_close(low[band], reading(&low_ladder, &FIVE, *hz), "low ladder");
             assert_close(wide[band], reading(&wide_ladder, &FIVE, *hz), "wide ladder");
         }
-        assert_eq!(low[0], -6.0, "25 Hz, below the low ladder");
-        assert!(low[7..].iter().all(|g| *g == -1.5), "above 480 Hz: {low:?}");
+        // Changed on purpose: audit report #13 (held ends). Past the low ladder's ends its end
+        // gains were held — -6 dB at 25 Hz, -1.5 dB on every band from 630 Hz up — and now taper
+        // over its octave spacing: a sixth of an octave below 30 Hz keeps most of the -6 dB, and
+        // from an octave above 480 Hz the -1.5 dB has run out.
+        assert!(
+            (-4.5..-4.3).contains(&low[0]),
+            "25 Hz, below the low ladder: {}",
+            low[0]
+        );
+        assert!((-1.0..-0.8).contains(&low[7]), "630 Hz: {}", low[7]);
+        assert!(low[8..].iter().all(|g| *g == 0.0), "from 1 kHz up: {low:?}");
         assert_eq!(wide[11], 9.0, "4 kHz, on the wide ladder's fourth band");
     }
 
@@ -1943,10 +2258,17 @@ mod tests {
         assert_eq!(fit_preset_gains(ten_centres, &eleven_gains, live), TEN);
 
         // Nine centres make a nine-band preset. Its bands sit exactly on the first nine live
-        // ones, and the tenth, at 16 kHz, is past its last and holds it.
+        // ones, and the tenth, at 16 kHz, is past its last. Changed on purpose: audit report #13
+        // (held ends): it held the last gain, and now takes it tapered over the nine bands' last
+        // spacing, which 16 kHz is one whole spacing past — nothing is left.
         let mut expected = TEN;
-        expected[9] = TEN[8];
-        assert_eq!(fit_preset_gains(&ten_centres[..9], &TEN, live), expected);
+        expected[9] = 0.0;
+        assert_all_close(
+            &fit_preset_gains(&ten_centres[..9], &TEN, live),
+            &expected,
+            1e-5,
+            "nine bands on ten",
+        );
     }
 
     #[test]

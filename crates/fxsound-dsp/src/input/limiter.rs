@@ -18,12 +18,17 @@
 //! Three changes, each one a defect of the original that the 0.4.0 audit of what the port copied
 //! found audible, and each one shared by both limiters that use this type:
 //!
-//! * **One envelope for every channel** (audit R2). The original runs an envelope per channel, so
-//!   a peak on one side — hard-panned material, or Surround at 10 — pulls that side down by up to
-//!   6 dB and leaves the other alone, and the stereo image lurches towards the quiet side for as
-//!   long as the limiter works. Here the envelope follows the loudest channel and every channel
-//!   gets the same gain, which is what a limiter behind a mix is expected to do: the balance the
-//!   mix had is the balance it keeps. Each channel still has its own delay line.
+//! * **One envelope for both sides of a pair** (audit R2). The original runs an envelope per
+//!   channel, so a peak on one side — hard-panned material, or Surround at 10 — pulls that side
+//!   down by up to 6 dB and leaves the other alone, and the stereo image lurches towards the quiet
+//!   side for as long as the limiter works. Here the channels a caller links share one envelope,
+//!   which follows the loudest of them, and get the same gain, which is what a limiter behind a
+//!   mix is expected to do: the balance the mix had is the balance it keeps. Unless told
+//!   otherwise every channel is linked, which is what a stereo or a mono stream wants and what the
+//!   microphone chain uses. Dynamic Boost links the speakers either side of the listener and
+//!   leaves the centre and the subwoofer an envelope each ([`LookaheadLimiter::set_linked`]): on
+//!   5.1 and 7.1 one envelope for all eight channels let a subwoofer boom duck every speaker by
+//!   12 dB. Each channel still has its own delay line.
 //! * **The attack ramp stops at the peak it is aiming for** (audit #8). The original only ever
 //!   steepens a ramp, so a run of rising samples — the front of any low sine — leaves it climbing
 //!   at the steepest slope it saw until the countdown ends, past the peak. A 50 Hz sine at twice
@@ -84,8 +89,8 @@ const HOLD_SEGMENTS: usize = 8;
 /// Keeps the release recursion out of denormals — `MAXI_ENVELOPE_BIAS` (`c_max.h:48`).
 const ENVELOPE_BIAS: Real = 1.0e-24;
 
-/// The envelope (`c_max.h:101-112`, one of the `_l`/`_r` pairs — there is one now, not one per
-/// channel).
+/// The envelope (`c_max.h:101-112`, one of the `_l`/`_r` pairs — one per group of linked
+/// channels now, not one per channel).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Envelope {
     /// The peak envelope.
@@ -111,7 +116,9 @@ impl Envelope {
 /// The loudest sample to leave the delay line over roughly the last hold time.
 ///
 /// Kept as [`HOLD_SEGMENTS`] closed segments and one open one, each remembering only its own
-/// maximum, so the window slides a segment at a time and nothing is ever searched per frame.
+/// maximum, so the window slides a segment at a time and nothing is ever searched per frame. The
+/// closed segments' maxima are kept apart, in a [`HoldRing`] that only a closing segment touches,
+/// so what every frame reads and writes is four numbers a loop can hold in registers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PeakHold {
     /// Frames per segment. Zero means no hold: the window is the current frame alone.
@@ -120,11 +127,23 @@ struct PeakHold {
     filled: usize,
     /// The open segment's maximum.
     open: Real,
-    /// The closed segments' maxima, a ring whose next slot to overwrite is `oldest`.
+    /// The maximum of the closed segments, recomputed only when a segment closes.
+    closed_max: Real,
+}
+
+/// The closed segments of a [`PeakHold`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HoldRing {
+    /// Their maxima, a ring whose next slot to overwrite is `oldest`.
     closed: [Real; HOLD_SEGMENTS],
     oldest: usize,
-    /// The maximum of `closed`, recomputed only when a segment closes.
-    closed_max: Real,
+}
+
+impl HoldRing {
+    const EMPTY: Self = Self {
+        closed: [0.0; HOLD_SEGMENTS],
+        oldest: 0,
+    };
 }
 
 impl PeakHold {
@@ -133,15 +152,14 @@ impl PeakHold {
             segment_len,
             filled: 0,
             open: 0.0,
-            closed: [0.0; HOLD_SEGMENTS],
-            oldest: 0,
             closed_max: 0.0,
         }
     }
 
     /// Forget every peak, keep the length.
-    fn clear(&mut self) {
+    fn clear(&mut self, ring: &mut HoldRing) {
         *self = Self::new(self.segment_len);
+        *ring = HoldRing::EMPTY;
     }
 
     /// Take one frame's leaving peak and return the loudest the window holds, that one included.
@@ -149,7 +167,7 @@ impl PeakHold {
     /// Comparisons rather than `max`, so a NaN is simply never the larger: it cannot get into the
     /// window, and an infinity falls out of it with the segment it arrived in.
     #[inline]
-    fn push(&mut self, value: Real) -> Real {
+    fn push(&mut self, ring: &mut HoldRing, value: Real) -> Real {
         if self.segment_len == 0 {
             return value;
         }
@@ -163,11 +181,11 @@ impl PeakHold {
         };
         self.filled += 1;
         if self.filled >= self.segment_len {
-            if let Some(slot) = self.closed.get_mut(self.oldest) {
+            if let Some(slot) = ring.closed.get_mut(ring.oldest) {
                 *slot = self.open;
             }
-            self.oldest = (self.oldest + 1) % HOLD_SEGMENTS;
-            self.closed_max = self.closed.iter().fold(
+            ring.oldest = (ring.oldest + 1) % HOLD_SEGMENTS;
+            self.closed_max = ring.closed.iter().fold(
                 0.0,
                 |most: Real, &peak| if peak > most { peak } else { most },
             );
@@ -178,13 +196,28 @@ impl PeakHold {
     }
 }
 
+/// Every channel linked, one bit per channel: the default.
+const ALL_LINKED: u32 = (1 << MAX_CHANNELS) - 1;
+const _: () = assert!(MAX_CHANNELS < 32, "one bit per channel in a u32");
+
 pub struct LookaheadLimiter {
     delay: Box<[Real]>,
     /// Index of the delay-line slot written next. Every channel is written every frame, so one
     /// index serves every line.
     write: usize,
-    envelope: Envelope,
-    hold: PeakHold,
+    /// One envelope and one hold window for the linked channels, kept in the slot of the lowest
+    /// of them, and one for each channel of its own, in its own slot. Slot 0 is the only one in
+    /// use while every channel is linked.
+    envelopes: [Envelope; MAX_CHANNELS],
+    holds: [PeakHold; MAX_CHANNELS],
+    rings: [HoldRing; MAX_CHANNELS],
+    /// One bit per channel that shares the linked envelope.
+    linked_mask: u32,
+    /// The slot the linked envelope is kept in: the lowest linked channel.
+    linked_slot: usize,
+    /// How many leading channels are all linked: a frame no wider than this takes the
+    /// one-envelope path, which is all a stereo or mono stream ever takes.
+    linked: usize,
     sample_rate: Real,
     /// Look-ahead in frames at the current rate, at least one.
     lookahead: usize,
@@ -217,8 +250,12 @@ impl LookaheadLimiter {
         let mut limiter = Self {
             delay: vec![0.0; MAX_CHANNELS * MAX_LOOKAHEAD_FRAMES].into_boxed_slice(),
             write: 0,
-            envelope: Envelope::SILENT,
-            hold: PeakHold::new(0),
+            envelopes: [Envelope::SILENT; MAX_CHANNELS],
+            holds: [PeakHold::new(0); MAX_CHANNELS],
+            rings: [HoldRing::EMPTY; MAX_CHANNELS],
+            linked_mask: ALL_LINKED,
+            linked_slot: 0,
+            linked: MAX_CHANNELS,
             sample_rate: sample_rate.max(1.0),
             lookahead: 1,
             lookahead_ms,
@@ -298,7 +335,9 @@ impl LookaheadLimiter {
         self.release_beta = beta;
         // `design` only rebuilds the window when its segment length changes; a hold that moves
         // by less than a segment keeps the length, so forget the peaks here, as the doc promises.
-        self.hold.clear();
+        for (hold, ring) in self.holds.iter_mut().zip(&mut self.rings) {
+            hold.clear(ring);
+        }
     }
 
     /// The hold, in milliseconds, as set.
@@ -338,8 +377,67 @@ impl LookaheadLimiter {
         // than asked for.
         let hold_frames = (self.sample_rate * self.hold_ms / 1000.0).round() as usize;
         let segment_len = hold_frames.div_ceil(HOLD_SEGMENTS);
-        if segment_len != self.hold.segment_len {
-            self.hold = PeakHold::new(segment_len);
+        if segment_len != self.holds[0].segment_len {
+            self.holds = [PeakHold::new(segment_len); MAX_CHANNELS];
+            self.rings = [HoldRing::EMPTY; MAX_CHANNELS];
+        }
+    }
+
+    /// Link every channel to one envelope: the loudest of them sets the gain for all. The default,
+    /// and what a stereo or mono stream wants.
+    pub fn link_all(&mut self) {
+        self.set_linked(&[true; MAX_CHANNELS]);
+    }
+
+    /// Say which channels share an envelope: every channel `c` with `linked[c]` set is limited
+    /// together with the others set, on the loudest of them, and every other channel on an
+    /// envelope of its own. A channel past the end of `linked` is on its own, so `&[true, true]`
+    /// links the first two channels and leaves the rest alone.
+    ///
+    /// Dynamic Boost links the speakers either side of the listener and gives the centre and the
+    /// subwoofer one each (audit R2). One linked set is all that asks for, and it keeps the
+    /// bookkeeping to a bit per channel: the first cut took any grouping and walked it group by
+    /// group, and on 5.1 cost half as much again as the original's envelope per channel.
+    /// Allocation-free; a change starts every envelope from the one reducing the most, so no
+    /// channel's gain jumps up at the change and the limiter lets go at its own release from
+    /// there.
+    pub fn set_linked(&mut self, linked: &[bool]) {
+        let mask = linked
+            .iter()
+            .take(MAX_CHANNELS)
+            .enumerate()
+            .filter(|(_, linked)| **linked)
+            .fold(0, |mask, (channel, _)| mask | 1 << channel);
+        if mask == self.linked_mask {
+            return;
+        }
+        self.linked_mask = mask;
+        // With nothing linked the slot is never used: every channel reads its own.
+        self.linked_slot = (mask.trailing_zeros() as usize).min(MAX_CHANNELS - 1);
+        self.linked = (mask.trailing_ones() as usize).min(MAX_CHANNELS);
+        let loudest = (0..MAX_CHANNELS).fold(0, |most, slot| {
+            if self.envelopes[slot].env > self.envelopes[most].env {
+                slot
+            } else {
+                most
+            }
+        });
+        let (envelope, hold, ring) = (
+            self.envelopes[loudest],
+            self.holds[loudest],
+            self.rings[loudest],
+        );
+        self.envelopes = [envelope; MAX_CHANNELS];
+        self.holds = [hold; MAX_CHANNELS];
+        self.rings = [ring; MAX_CHANNELS];
+    }
+
+    /// The slot of the envelope `channel` is limited by.
+    const fn slot(&self, channel: usize) -> usize {
+        if self.linked_mask & (1 << channel) != 0 {
+            self.linked_slot
+        } else {
+            channel
         }
     }
 
@@ -350,15 +448,18 @@ impl LookaheadLimiter {
         self.lookahead
     }
 
-    /// The peak envelope every channel is limited by, which is what a gain-reduction meter shows.
-    /// Zero for a channel the limiter does not reach.
+    /// The peak envelope `channel` is limited by — its group's, shared by every channel linked to
+    /// it — which is what a gain-reduction meter shows. Zero for a channel the limiter does not
+    /// reach.
     ///
     /// Reduction in dB is `20·log10(ceiling / envelope)` while the envelope is above the ceiling,
     /// and zero otherwise.
     #[must_use]
     pub fn envelope(&self, channel: usize) -> Real {
         if channel < MAX_CHANNELS {
-            self.envelope.env
+            self.envelopes
+                .get(self.slot(channel))
+                .map_or(0.0, |envelope| envelope.env)
         } else {
             0.0
         }
@@ -379,16 +480,22 @@ impl LookaheadLimiter {
     pub fn reset(&mut self) {
         self.delay.fill(0.0);
         self.write = 0;
-        self.envelope = Envelope::SILENT;
-        self.hold.clear();
+        self.envelopes = [Envelope::SILENT; MAX_CHANNELS];
+        for (hold, ring) in self.holds.iter_mut().zip(&mut self.rings) {
+            hold.clear(ring);
+        }
     }
 
-    /// One interleaved frame, in place.
+    /// One interleaved frame, in place, exactly as [`Self::process`] would limit it.
     ///
-    /// Separate from [`Self::process`] because a caller whose gain changes per frame — Dynamic
-    /// Boost's auto-gain does — has to apply that gain between frames.
+    /// For a caller that has to act between frames. [`Self::process`] is the cheaper on a stream
+    /// whose channels are not all linked, since it runs each envelope over the whole block.
     #[inline]
     pub fn process_frame(&mut self, frame: &mut [Real]) {
+        if frame.len().min(MAX_CHANNELS) > self.linked {
+            self.process_grouped(frame, frame.len());
+            return;
+        }
         let lookahead = self.lookahead.max(1);
         let write = self.write;
 
@@ -420,7 +527,15 @@ impl LookaheadLimiter {
         }
         self.write = if write + 1 >= lookahead { 0 } else { write + 1 };
 
-        let env = self.update_envelope(new_abs, abs_out, lookahead);
+        let env = Self::update_envelope(
+            &mut self.envelopes[0],
+            &mut self.holds[0],
+            &mut self.rings[0],
+            self.release_beta,
+            new_abs,
+            abs_out,
+            lookahead,
+        );
 
         // `env >= |delayed|` for every channel after the update, so this is a true brick wall
         // (`Maxi32.c:366-386`). `env > ceiling > 0` guards the division.
@@ -432,10 +547,153 @@ impl LookaheadLimiter {
         }
     }
 
-    /// The envelope, one frame on: `new_abs` is the loudest sample just written, `abs_out` the
-    /// loudest one just read (`Maxi32.c:304-362`, with the three departures above).
-    #[inline]
-    fn update_envelope(&mut self, new_abs: Real, abs_out: Real, lookahead: usize) -> Real {
+    /// [`Self::process`] for a stream whose channels are not all linked: the same delay, and the
+    /// same envelope arithmetic once for the linked channels, on the loudest of them, and once for
+    /// each channel of its own, on its own samples.
+    ///
+    /// The envelopes never meet, so each is run over the whole block before the next, with its
+    /// state in registers: a channel of its own in a loop of its own, the linked ones a frame at a
+    /// time. The output is the one frame-by-frame processing gives, to the bit. Dynamic Boost
+    /// alone at slider 10, on white noise at ±0.3 in 480-frame blocks at 48 kHz (best of seven
+    /// release runs on a Ryzen 7 6800H), costs 20.0 ns a frame on 5.1 with its sides named and
+    /// 22.4 on 7.1, where the original's envelope per channel cost 20.8 and 30.3 and one envelope
+    /// for every channel 15.4 and 17.7. With only the front pair known, 5.1 costs 23.7 against the
+    /// original's 20.6: four channels of their own, each paying for the hold and the clamp the
+    /// original's envelope did without. The first cut ran any grouping a frame at a time, group by
+    /// group, and cost 33.6 on 5.1 and 39.4 on 7.1.
+    fn process_grouped(&mut self, buffer: &mut [Real], channels: usize) {
+        let lookahead = self.lookahead.max(1);
+        let ceiling = self.ceiling;
+        let release_beta = self.release_beta;
+        let present = channels.min(MAX_CHANNELS);
+        let all = (1_u32 << present) - 1;
+        let linked = self.linked_mask & all;
+        let linked_slot = self.linked_slot;
+        let start = self.write;
+        // Where the write index ends up, stepped as every loop below steps it.
+        let mut end = start;
+
+        let Self {
+            delay,
+            envelopes,
+            holds,
+            rings,
+            ..
+        } = self;
+        let (lines, _) = delay.as_chunks_mut::<MAX_LOOKAHEAD_FRAMES>();
+
+        for (channel, (((line, state), hold), ring)) in lines
+            .iter_mut()
+            .zip(envelopes.iter_mut())
+            .zip(holds.iter_mut())
+            .zip(rings.iter_mut())
+            .enumerate()
+            .take(present)
+        {
+            if linked & (1 << channel) != 0 {
+                continue;
+            }
+            let (mut env_state, mut hold_state) = (*state, *hold);
+            let mut write = start;
+            for frame in buffer.chunks_exact_mut(channels) {
+                let step = if write + 1 >= lookahead { 0 } else { write + 1 };
+                let (Some(sample), Some(slot)) = (frame.get_mut(channel), line.get_mut(write))
+                else {
+                    write = step;
+                    continue;
+                };
+                write = step;
+                let delayed = *slot;
+                *slot = *sample;
+                let env = Self::update_envelope(
+                    &mut env_state,
+                    &mut hold_state,
+                    ring,
+                    release_beta,
+                    sample.abs(),
+                    delayed.abs(),
+                    lookahead,
+                );
+                // `env >= |delayed|`, as on the linked path.
+                *sample = if env > ceiling {
+                    delayed * ceiling / env
+                } else {
+                    delayed
+                };
+            }
+            (*state, *hold) = (env_state, hold_state);
+            end = write;
+        }
+
+        if let (true, Some(state), Some(hold), Some(ring)) = (
+            linked != 0,
+            envelopes.get_mut(linked_slot),
+            holds.get_mut(linked_slot),
+            rings.get_mut(linked_slot),
+        ) {
+            let (mut env_state, mut hold_state) = (*state, *hold);
+            let mut write = start;
+            for frame in buffer.chunks_exact_mut(channels) {
+                // Comparisons, not `max`: a NaN is never the larger.
+                let mut new_abs: Real = 0.0;
+                let mut abs_out: Real = 0.0;
+                for (channel, (line, sample)) in lines.iter_mut().zip(frame.iter_mut()).enumerate()
+                {
+                    if linked & (1 << channel) == 0 {
+                        continue;
+                    }
+                    let Some(slot) = line.get_mut(write) else {
+                        continue;
+                    };
+                    let delayed = *slot;
+                    *slot = *sample;
+                    let arriving = sample.abs();
+                    if arriving > new_abs {
+                        new_abs = arriving;
+                    }
+                    let leaving = delayed.abs();
+                    if leaving > abs_out {
+                        abs_out = leaving;
+                    }
+                    *sample = delayed;
+                }
+                write = if write + 1 >= lookahead { 0 } else { write + 1 };
+                let env = Self::update_envelope(
+                    &mut env_state,
+                    &mut hold_state,
+                    ring,
+                    release_beta,
+                    new_abs,
+                    abs_out,
+                    lookahead,
+                );
+                if env > ceiling {
+                    for (channel, sample) in frame.iter_mut().enumerate().take(MAX_CHANNELS) {
+                        if linked & (1 << channel) != 0 {
+                            *sample = *sample * ceiling / env;
+                        }
+                    }
+                }
+            }
+            (*state, *hold) = (env_state, hold_state);
+            end = write;
+        }
+        self.write = end;
+    }
+
+    /// The envelope `state`, with its hold window `hold`, one frame on: `new_abs` is the loudest
+    /// sample of its channels just written, `abs_out` the loudest one just read (`Maxi32.c:304-362`,
+    /// with the three departures above).
+    #[inline(always)]
+    fn update_envelope(
+        state: &mut Envelope,
+        hold: &mut PeakHold,
+        ring: &mut HoldRing,
+        release_beta: Real,
+        new_abs: Real,
+        abs_out: Real,
+        lookahead: usize,
+    ) -> Real {
         // "Note that since envelope ramping starts immediately on this sample, divisor of delta
         // calc is delay plus one" (`Maxi32.c:323-326`). Off by one here and the ramp lands early
         // or late, so the gain still steps at the transient instead of arriving already reduced —
@@ -443,8 +701,7 @@ impl LookaheadLimiter {
         let ramp_divisor = lookahead as Real + 1.0;
         // The loudest sample to leave in the hold window, this frame's included, so never below
         // `abs_out`: every "at least what is leaving" below can use it instead.
-        let held = self.hold.push(abs_out);
-        let state = &mut self.envelope;
+        let held = hold.push(ring, abs_out);
 
         if state.ramp_count != 0 {
             // Attack ramp in progress (`Maxi32.c:304-336`).
@@ -482,7 +739,7 @@ impl LookaheadLimiter {
             // loudest rather than past it. With no hold `held` is `abs_out`, which is the
             // original's "raise the envelope to what is leaving" exactly. The bias keeps the
             // recursion off denormals.
-            let decayed = state.env * self.release_beta + ENVELOPE_BIAS;
+            let decayed = state.env * release_beta + ENVELOPE_BIAS;
             // An infinity decays to itself, so one non-finite sample would otherwise hold the gain
             // at zero for good. It is let go here, once it has also left the hold window.
             let decayed = if decayed.is_finite() { decayed } else { 0.0 };
@@ -501,6 +758,10 @@ impl LookaheadLimiter {
     /// A whole interleaved block, in place.
     pub fn process(&mut self, buffer: &mut [Real], channels: usize) {
         if channels == 0 || buffer.is_empty() {
+            return;
+        }
+        if channels.min(MAX_CHANNELS) > self.linked {
+            self.process_grouped(buffer, channels);
             return;
         }
         for frame in buffer.chunks_exact_mut(channels) {
@@ -882,5 +1143,142 @@ mod tests {
             "the envelope stayed at {} after the hold changed",
             l.envelope(0)
         );
+    }
+
+    #[test]
+    fn only_the_channels_linked_together_share_a_gain() {
+        // Audit R2 as Dynamic Boost uses it on surround before it knows the sides: the front pair
+        // linked, every other channel on an envelope of its own. A burst on channel 2 is limited
+        // on channel 2 alone; one on channel 1 turns channels 0 and 1 down by the same ratio and
+        // nothing else. Nothing leaves above the ceiling on any channel, and linking everything
+        // again gives back the one envelope.
+        let mut l = LookaheadLimiter::new(FS, 1.0, 1.0, 80.0);
+        l.set_linked(&[true, true]);
+        let delay = l.latency_frames();
+        let w = std::f32::consts::TAU * 440.0 / FS;
+        let burst_on_2 = 4_800..9_600;
+        let burst_on_1 = 19_200..24_000;
+        let mut arrived: Vec<[Real; 4]> = Vec::new();
+        let mut deepest_on_0: Real = 1.0;
+        for n in 0..36_000_usize {
+            let s = (w * n as Real).sin();
+            let mut frame = [0.5 * s; 4];
+            if burst_on_2.contains(&n) {
+                frame[2] = 3.0 * s;
+            }
+            if burst_on_1.contains(&n) {
+                frame[1] = 2.0 * s;
+            }
+            arrived.push(frame);
+            l.process_frame(&mut frame);
+            assert!(
+                frame.iter().all(|x| x.abs() <= 1.000_001),
+                "frame {n}: {frame:?}"
+            );
+            let Some(input) = n.checked_sub(delay).map(|at| arrived[at]) else {
+                continue;
+            };
+            if input[0].abs() < 0.1 {
+                continue;
+            }
+            let gains: Vec<Real> = frame.iter().zip(input).map(|(o, i)| o / i).collect();
+            // Channel 3 is never linked to anything loud: untouched throughout.
+            assert!((gains[3] - 1.0).abs() < 1e-5, "frame {n}: {gains:?}");
+            // The pair always leaves with one gain.
+            assert!((gains[0] - gains[1]).abs() < 1e-5, "frame {n}: {gains:?}");
+            if burst_on_2.contains(&(n - delay)) {
+                assert!((gains[0] - 1.0).abs() < 1e-5, "frame {n}: {gains:?}");
+            }
+            deepest_on_0 = deepest_on_0.min(gains[0]);
+        }
+        assert!(
+            deepest_on_0 < 0.55,
+            "channel 0 should have come down with channel 1: {deepest_on_0}"
+        );
+        assert_eq!(l.envelope(0), l.envelope(1), "the pair reads one envelope");
+
+        l.link_all();
+        for channel in 1..MAX_CHANNELS {
+            assert_eq!(l.envelope(channel), l.envelope(0), "channel {channel}");
+        }
+    }
+
+    #[test]
+    fn a_block_limits_every_linking_to_the_bit_as_frames_one_at_a_time_do() {
+        // Audit R2's cost. With the channels not all linked, `process` runs each envelope over the
+        // whole block in turn rather than every envelope a frame at a time, which took Dynamic
+        // Boost on 5.1 from 33.6 ns a frame back to 20.0, where the original's envelope per
+        // channel had it at 20.8. Nothing may change for it: every sample and every envelope is
+        // what `process_frame` gives, frame after frame, for the linkings Dynamic Boost asks for,
+        // for none at all, and for a stream wider than the arena, across blocks of any length and
+        // a change of rate.
+        let linkings: [(usize, &[bool]); 5] = [
+            (6, &[true, true, false, false, true, true]),
+            (6, &[true, true]),
+            (8, &[true, true, false, false, true, true, true, true]),
+            (10, &[false, true, true]),
+            (3, &[]),
+        ];
+        for (channels, linked) in linkings {
+            let mut by_block = LookaheadLimiter::new(FS, 1.0, 1.0, 80.0);
+            let mut by_frame = LookaheadLimiter::new(FS, 1.0, 1.0, 80.0);
+            by_block.set_linked(linked);
+            by_frame.set_linked(linked);
+            let mut seed = 0x2545_f491_u32;
+            let mut noise = move || {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 8) as Real / 16_777_216.0 - 0.5
+            };
+            let mut n = 0_usize;
+            for (block, frames) in [97_usize, 480, 1, 33, 480, 480, 200]
+                .into_iter()
+                .enumerate()
+            {
+                if block == 4 {
+                    by_block.set_sample_rate(44_100.0);
+                    by_frame.set_sample_rate(44_100.0);
+                }
+                let mut input = vec![0.0; frames * channels];
+                for frame in input.chunks_exact_mut(channels) {
+                    for (channel, sample) in frame.iter_mut().enumerate() {
+                        // Each channel over the ceiling at times of its own, and one burst of
+                        // 4x on channel 3 alone.
+                        let hz = 60.0 + 70.0 * channel as Real;
+                        let tone = (std::f32::consts::TAU * hz * n as Real / FS).sin();
+                        let burst = if channel == 3 && (700..900).contains(&n) {
+                            4.0
+                        } else {
+                            1.0
+                        };
+                        *sample = burst * (1.3 * tone + noise());
+                    }
+                    n += 1;
+                }
+                let mut blocked = input.clone();
+                by_block.process(&mut blocked, channels);
+                let mut framed = input;
+                for frame in framed.chunks_exact_mut(channels) {
+                    by_frame.process_frame(frame);
+                }
+                for (at, (a, b)) in blocked.iter().zip(&framed).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "{channels} channels linked {linked:?}: block {block}, sample {at}"
+                    );
+                }
+                for channel in 0..=MAX_CHANNELS {
+                    assert_eq!(
+                        by_block.envelope(channel).to_bits(),
+                        by_frame.envelope(channel).to_bits(),
+                        "{channels} channels linked {linked:?}: block {block}, channel {channel}"
+                    );
+                }
+            }
+            assert!(
+                (0..channels.min(MAX_CHANNELS)).any(|channel| by_block.envelope(channel) > 1.0),
+                "the fixture should keep the limiter working"
+            );
+        }
     }
 }

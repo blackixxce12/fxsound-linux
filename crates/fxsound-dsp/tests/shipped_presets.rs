@@ -339,3 +339,60 @@ fn a_saturated_dynamic_boost_is_reported() {
         );
     }
 }
+
+#[test]
+fn every_shipped_preset_keeps_its_own_bass_on_a_ladder_that_reaches_lower() {
+    // Audit report #13 (held ends). The shipped presets are ten-band curves from 62.5 Hz up; on
+    // fifteen, twenty or thirty-one bands, which reach down to 25 or 20 Hz, their lowest gain
+    // used to be copied onto every band below 62.5 Hz, and those sections added up to a sub-bass
+    // shelf none of them has. Measured against each preset's own ten-band response, 241 points
+    // from 20 Hz to 20 kHz: below 45 Hz the worst was 25.3 dB off on thirty-one bands ("Life
+    // (Quizal)", +10 dB at 62.5 Hz, played +28.6 dB at 31.5 Hz), 21.1 on twenty and 13.5 on
+    // fifteen, and the mean RMS departure on thirty-one bands was 2.6 dB. Tapered past the ends,
+    // the worst is 4.7, 4.4 and 4.4 dB and the mean 1.0 dB.
+    use fxsound_dsp::eq::{fit_preset_gains, standard_centres};
+    let points: Vec<f32> = (0..=240)
+        .map(|step| 20.0 * 1000.0_f32.powf(step as f32 / 240.0))
+        .collect();
+    let presets: Vec<(String, Preset)> = shipped()
+        .into_iter()
+        .filter(|(_, preset)| preset.eq_bands.iter().any(|band| band.boost_db != 0.0))
+        .collect();
+    for (count, worst_allowed, was) in [(31, 5.0, 25.3), (20, 5.0, 21.1), (15, 5.0, 13.5)] {
+        let live = standard_centres(count);
+        let mut worst = (0.0_f32, String::new());
+        let mut rms_total = 0.0_f32;
+        for (name, preset) in &presets {
+            let centres: Vec<f32> = preset.eq_bands.iter().map(|b| b.center_hz).collect();
+            let gains: Vec<f32> = preset.eq_bands.iter().map(|b| b.boost_db).collect();
+            let mut own = GraphicEq::new();
+            own.set_sample_rate(48_000.0);
+            own.set_bands(&centres, &gains);
+            let mut there = GraphicEq::new();
+            there.set_sample_rate(48_000.0);
+            there.set_bands(&live, &fit_preset_gains(&centres, &gains, &live));
+            let mut squares = 0.0;
+            for hz in &points {
+                let off = there.response_db(*hz) - own.response_db(*hz);
+                squares += off * off;
+                if *hz < 45.0 && off.abs() > worst.0 {
+                    worst = (off.abs(), name.clone());
+                }
+            }
+            rms_total += (squares / points.len() as f32).sqrt();
+        }
+        assert!(
+            worst.0 < worst_allowed,
+            "{count} bands: {} is {:.2} dB off its own response below 45 Hz, was {was} dB",
+            worst.1,
+            worst.0
+        );
+        let mean_rms = rms_total / presets.len() as f32;
+        if count == 31 {
+            assert!(
+                mean_rms < 1.1,
+                "{count} bands: mean RMS departure {mean_rms:.2} dB, was 2.6"
+            );
+        }
+    }
+}

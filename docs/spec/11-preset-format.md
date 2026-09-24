@@ -415,6 +415,31 @@ volume levelling `0.5`, filter Q `0.5` (`FxAudioControls.cpp:312, 330, 348`).
   `source = 1 + (int)((i-1)*(nB-1)/(live-1) + 0.5)` (`DfxDspEq.cpp:214-218`).
 * equal counts -> gains **and** frequencies copied verbatim (`DfxDspEq.cpp:230-241`).
 
+**The port departs (0.4.0 audit #13):** a preset of another band count is read *by frequency*,
+not by position — `fxsound_dsp::eq::fit_preset_gains(preset_centres, preset_gains,
+live_centres)`, with the rules in `09-dsp-eq.md` §14. By position, a ten-band +6 dB at 62.5 Hz
+landed on thirty-one bands at 20 Hz, where the engine installs the band list it is given; by
+frequency it lands at 63 Hz. In short:
+
+* the live ladder is kept and only the gains move, read from the preset's **own** centres, not
+  from the standard ladder of its count;
+* onto more bands, each live band reads the preset's curve at its centre, linear in
+  log-frequency between the preset bands either side; past the preset's first and last band the
+  end gain tapers to 0 dB over one of the preset's own band spacings (it is not held flat: held,
+  a ten-band bass boost on thirty-one bands piled up into a sub-bass shelf of +12.8 dB at 25 Hz);
+* onto fewer bands, a preset curve that is exactly a reading of some curve on the live ladder
+  comes back as that curve (least squares, only where it cannot extrapolate — every pair of the
+  window's counts 5/10/15/20/31 qualifies when the larger is at least as fine); any other is
+  read at the live centres the same way, and a live end band also takes a boost or cut that lies
+  past it, tapered over the live ladder's end spacing, when that goes further from 0 dB the same
+  way than its own reading;
+* equal counts copy the gains **and** the preset's centres, as on Windows; the centres half is
+  the caller's.
+
+A tool that must reproduce what FxSound for Linux installs should call `fit_preset_gains`
+rather than re-implement the positional formula above, which is kept here as the record of what
+Windows does.
+
 `float f_bass_boost_value;` at `dsp/DfxDspEq.cpp:134` is declared and never used - dead.
 
 ---
@@ -1380,10 +1405,18 @@ GUI spec, but the *states* the preset subsystem must expose are:
    Two coincident peaking filters at the same frequency and gain are a legitimate
    (if odd) 12 dB shelf; the sound of those presets depends on it.
 
-10. **Band-count remapping is lossy and asymmetric** (linear interpolation upward,
+10. **Band-count remapping is lossy and asymmetric on Windows** (linear interpolation upward,
     nearest-pick downward, §3.7). A user who switches 10 -> 31 -> 10 bands does **not** get
     their original curve back. Consider keeping the preset's authored band table
     untouched in the model and only remapping at DSP-apply time.
+    **The port departs (0.4.0 audit #13):** remapping is by frequency (§3.7), and a round trip
+    between any two of the window's counts (5, 10, 15, 20, 31) comes back exactly, since each
+    larger ladder reaches as far at both ends and has a band on or between every two neighbours
+    of the smaller. A pair that is not like that is still lossy: 14 -> 15 -> 14 comes back as a
+    reading of the fifteen-band curve, because fifteen bands have only thirteen in the range
+    fourteen cover. A curve that sits on centres of its own (a Windows twenty-band preset, a
+    dragged band) must be remapped from those centres (`fxsound_dsp::eq::remap_curve`), not as
+    if it sat on the standard ladder.
 
 11. **`FxController::setPreset()` calls the band setters with 0-based indices**
     (`FxController.cpp:1092-1095`) while `GraphicEqSetBandFreq()` rejects `0`
