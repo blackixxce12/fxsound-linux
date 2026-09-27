@@ -18,11 +18,17 @@ pub(crate) struct App {
 }
 
 impl PrivateGraph {
-    /// Start `pw-cat` in `mode` — `--playback` from `/dev/zero`, or `--record` into `/dev/null` —
-    /// with `properties` for its stream and `extra` arguments after them, and wait until its node,
-    /// named `node_name` in `properties`, is in the graph. The socket is on its command line and in
-    /// its own environment, and nowhere else. `None` when it could not be started or its node
-    /// never appeared.
+    /// Start `pw-cat` in `mode` — `--playback` of endless silence, or `--record` into
+    /// `/dev/null` — with `properties` for its stream and `extra` arguments after them, and wait
+    /// until its node, named `node_name` in `properties`, is in the graph. The socket is on its
+    /// command line and in its own environment, and nowhere else. `None` when it could not be
+    /// started or its node never appeared.
+    ///
+    /// No `--raw`: the `pw-cat` of PipeWire 1.0, which Ubuntu 24.04 ships and CI runs, has no such
+    /// option and exits at once when given it. So what it plays is a file libsndfile
+    /// reads without being told its format — a Sun AU stream of unknown length on its standard
+    /// input ([`feed_silence`]), which never ends as `/dev/zero` never did — and what it records
+    /// goes to `/dev/null` as whatever format that name gives, which nobody reads.
     pub(crate) fn pw_cat(
         &self,
         mode: &str,
@@ -30,11 +36,7 @@ impl PrivateGraph {
         properties: &str,
         extra: &[&str],
     ) -> Option<App> {
-        let file = if mode == "--playback" {
-            "/dev/zero"
-        } else {
-            "/dev/null"
-        };
+        let playback = mode == "--playback";
         let mut player = support::command("pw-cat");
         player
             .arg("--remote")
@@ -44,10 +46,14 @@ impl PrivateGraph {
                 "--properties={{ node.name = {node_name} {properties} }}"
             ))
             .args(extra)
-            .args(["--raw", file])
+            .arg(if playback { "-" } else { "/dev/null" })
             .env("XDG_RUNTIME_DIR", self.dir.join("run"))
             .env("PIPEWIRE_REMOTE", self.socket())
-            .stdin(Stdio::null())
+            .stdin(if playback {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::null());
         let log = self.stderr_log(&mut player, node_name);
         let mut child = match support::spawn(player) {
@@ -57,6 +63,9 @@ impl PrivateGraph {
                 return None;
             }
         };
+        if let Some(stdin) = child.take_stdin() {
+            feed_silence(stdin);
+        }
         let deadline = Instant::now() + PATIENCE;
         while self.node_id(node_name).is_none() {
             if Instant::now() >= deadline {
@@ -70,6 +79,25 @@ impl PrivateGraph {
         }
         Some(App { _child: child })
     }
+}
+
+/// Write silence into `stdin` from a thread of its own until the pipe breaks — when the player
+/// reading it has been killed — as a Sun AU stream: a header saying 16-bit stereo at 48 kHz, of
+/// unknown length, which libsndfile reads from a pipe, and then zeros. The player's own pace, not
+/// this thread's, sets how fast it goes: the pipe fills and the writes wait.
+fn feed_silence(mut stdin: std::process::ChildStdin) {
+    const AU_UNKNOWN_SIZE: u32 = u32::MAX;
+    const AU_PCM_16: u32 = 3;
+    let mut header = b".snd".to_vec();
+    for word in [24, AU_UNKNOWN_SIZE, AU_PCM_16, 48_000, 2] {
+        header.extend_from_slice(&u32::to_be_bytes(word));
+    }
+    std::thread::spawn(move || {
+        let silence = [0_u8; 16 * 1024];
+        if stdin.write_all(&header).is_ok() {
+            while stdin.write_all(&silence).is_ok() {}
+        }
+    });
 }
 
 /// Start an engine on `graph` and wait until it has listed the graph's devices: connected, with

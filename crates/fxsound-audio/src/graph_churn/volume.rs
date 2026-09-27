@@ -144,6 +144,8 @@ impl PrivateGraph {
     /// the recorder never appeared, could not be linked, or wrote nothing.
     fn record(&self, from: &str, seconds: f32) -> Option<Vec<f32>> {
         let name = "t_rec";
+        // `.raw`: libsndfile's header-less format, which `pw-record` picks by the name, as
+        // `record_from` explains.
         let file = self.dir.join("rec.raw");
         let _ = std::fs::remove_file(&file);
         let frames = ((RATE as f32) * seconds) as u32;
@@ -156,7 +158,6 @@ impl PrivateGraph {
                 "0",
                 "-P",
                 &props,
-                "--raw",
                 "--format",
                 "f32",
                 "--rate",

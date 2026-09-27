@@ -565,6 +565,10 @@ impl PrivateGraph {
     /// outputs, as everything on this graph is linked. It writes what it hears to a file of its own
     /// as raw interleaved stereo `f32` ([`Recorder::peak_since`]). `None` when it never appeared or
     /// could not be linked.
+    ///
+    /// Raw because the file's name ends in `.raw`, which is libsndfile's header-less format, and
+    /// not through `--raw`, which the `pw-record` of PipeWire 1.0 — Ubuntu 24.04's, where CI runs —
+    /// does not have.
     pub(crate) fn record_from(&self, from: &str, name: &str) -> Option<Recorder> {
         let file = self.dir.join(format!("{name}.raw"));
         let props = format!("{{ node.name = {name} }}");
@@ -572,7 +576,7 @@ impl PrivateGraph {
         recorder
             .arg("--remote")
             .arg(self.socket())
-            .args(["--target", "0", "-P", &props, "--raw", "--format", "f32"])
+            .args(["--target", "0", "-P", &props, "--format", "f32"])
             .args(["--rate", "48000", "--channels", "2"])
             .arg(&file)
             .env("XDG_RUNTIME_DIR", self.dir.join("run"))

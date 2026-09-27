@@ -177,6 +177,12 @@ impl Guarded {
         self.child.stdin.as_mut()
     }
 
+    /// The child's standard input, when it was piped and has not been taken yet: for a thread of
+    /// its own to feed, which finds the pipe broken once the child has been killed.
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
     /// The child's standard output, when it was piped and has not been taken yet.
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.stdout.take()
