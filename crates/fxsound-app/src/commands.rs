@@ -221,7 +221,9 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
         // word, and one with fewer set what it could and passed the rest to a setter that ignores
         // them, also without a word.
         Command::BandFrequencies(pairs) => {
-            if let Err(refusal) = bands_exist(app, "--set_band_freq", pairs) {
+            if let Err(refusal) = bands_exist(app, "--set_band_freq", pairs)
+                .and_then(|()| frequencies_in_range(app, pairs))
+            {
                 return refusal;
             }
             let actions: Vec<_> = pairs
@@ -280,6 +282,38 @@ fn bands_exist(app: &App, option: &str, pairs: &[(usize, f32)]) -> Result<(), Ou
         "{option}: the equalizer has {count} bands, 0 to {last}, so there is no {bands} {named}; \
          nothing on the list was changed (--num_bands on the same line sets the count first)",
         last = count.saturating_sub(1),
+    )))
+}
+
+/// `Ok` when every centre `pairs` sets lies in its band's tuning range, the one the window's
+/// wheel turns that band over ([`fxsound_core::eq::band_frequency_range`]); otherwise the refusal
+/// `--set_band_freq` fails with, naming each band, its range and the frequency asked for.
+///
+/// The whole list is refused, as a band the equalizer does not have refuses it ([`bands_exist`]).
+/// The original checks the same range in `FxController::setEqBandFrequency`
+/// (`FxController.cpp:1849-1866`) and drops a frequency outside it without a word.
+fn frequencies_in_range(app: &App, pairs: &[(usize, f32)]) -> Result<(), Outcome> {
+    let count = app.state.eq_bands.len();
+    let outside: Vec<String> = pairs
+        .iter()
+        .filter_map(|&(band, hz)| {
+            let (low, high) = fxsound_core::eq::band_frequency_range(band, count);
+            (!(low..=high).contains(&hz)).then(|| {
+                format!(
+                    "band {band} is tuned from {} to {} Hz, not {} Hz",
+                    exact(low),
+                    exact(high),
+                    exact(hz)
+                )
+            })
+        })
+        .collect();
+    if outside.is_empty() {
+        return Ok(());
+    }
+    Err(Outcome::refused(format!(
+        "--set_band_freq: on {count} bands, {}; nothing on the list was changed",
+        outside.join(", ")
     )))
 }
 
@@ -690,6 +724,11 @@ pub const NOT_RUNNING: &str = "FxSound is not running";
 ///   so not a failure. A `--forget-device` on that line is still done to the settings file, as a
 ///   running FxSound forgets the device before it quits (0.4.0 review FA), and its refusal is
 ///   the line's; the rest of the line is not carried out.
+/// * `--next-output` and `--next-input` step a lane from the device it is on, and a start has
+///   none: the lane attaches to its device only once PipeWire has listed them, and to which one
+///   is the lane's own rules' call, so "the next one" is not known. The line is refused, with
+///   what to run instead, and nothing on it is done or started. Every other option that sets
+///   something is carried out by the start (`Command::honoured_at_cold_start`).
 /// * `--forget-device` alone is done to the settings file at `settings`
 ///   ([`forget_in_the_settings_file`]), and nothing starts: the script or keybind that ran it
 ///   hears whether it worked and goes on, rather than becoming FxSound. Beside options that
@@ -727,7 +766,18 @@ pub fn answer_without_an_instance(
         {
             Some(forget_in_the_settings_file(commands, settings))
         }
-        _ => None,
+        _ => commands.iter().find_map(|command| {
+            let (option, pick) = match command {
+                Command::Output(DeviceCommand::Next) => ("--next-output", "--output=NAME"),
+                Command::Input(DeviceCommand::Next) => ("--next-input", "--input=NAME"),
+                _ => return None,
+            };
+            Some(Outcome::refused(format!(
+                "{NOT_RUNNING}, so {option} has no device to step from; nothing on the command \
+                 line was done and nothing was started (start FxSound first, or name the \
+                 device with {pick})"
+            )))
+        }),
     }
 }
 
@@ -1576,6 +1626,48 @@ mod tests {
         assert_eq!(a.state.eq_bands.len(), 31);
         assert_eq!(a.state.eq_bands[0].boost_db, 6.0);
         assert_eq!(a.state.eq_bands[30].boost_db, 6.0);
+    }
+
+    #[test]
+    fn a_band_frequency_outside_the_bands_range_is_refused_whole_with_the_range_named() {
+        // The manual page said the running instance enforces each band's range; it took any
+        // 20-20000 Hz for any band, so band 0 of ten could be sent to 10 kHz, past all the others.
+        let mut a = app();
+        assert_eq!(a.state.eq_bands.len(), 10);
+        assert_eq!(fxsound_core::eq::band_frequency_range(0, 10), (46.0, 85.0));
+        let centres: Vec<f32> = a.state.eq_bands.iter().map(|b| b.center_hz).collect();
+        let outcome = run(
+            &mut a,
+            &[Command::BandFrequencies(vec![(1, 150.0), (0, 10_000.0)])],
+        );
+        assert!(outcome.failed, "a script has to be able to tell");
+        assert!(
+            outcome.stderr.contains("--set_band_freq")
+                && outcome
+                    .stderr
+                    .contains("band 0 is tuned from 46 to 85 Hz, not 10000 Hz"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(!outcome.stderr.contains("band 1"), "{}", outcome.stderr);
+        let after: Vec<f32> = a.state.eq_bands.iter().map(|b| b.center_hz).collect();
+        assert_eq!(
+            after, centres,
+            "nothing on the list is set, band 1 included"
+        );
+
+        // Each end of a range is in it, and a list inside the ranges goes through, saying nothing.
+        let outcome = run(
+            &mut a,
+            &[Command::BandFrequencies(vec![(0, 46.0), (9, 20_000.0)])],
+        );
+        assert!(
+            !outcome.failed && outcome.stderr.is_empty(),
+            "{}",
+            outcome.stderr
+        );
+        assert_eq!(a.state.eq_bands[0].center_hz, 46.0);
+        assert_eq!(a.state.eq_bands[9].center_hz, 20_000.0);
     }
 
     #[test]
@@ -4509,8 +4601,72 @@ mod tests {
             &["--power=on", "--preset=Gaming"][..],
             &["--app-preset=bf6.exe=Gaming"][..],
             &["--activated"][..],
+            &["--next-preset"][..],
+            &["--set_band_gain=0:3", "--set_effect=bass:5"][..],
+            &["--toggle-window"][..],
         ] {
             assert!(without_an_instance(args, path).is_none(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn next_output_or_next_input_with_no_fxsound_running_is_refused_and_starts_nothing() {
+        // A start has no device to step from: its lanes attach once PipeWire has listed the
+        // devices, to the device their own rules pick. The line used to start FxSound and drop the
+        // step without a word.
+        let path = Path::new("/nonexistent/apps.toml");
+        for (args, option, pick) in [
+            (&["--next-output"][..], "--next-output", "--output=NAME"),
+            (&["--next-input"][..], "--next-input", "--input=NAME"),
+            (
+                &["--next-output", "--preset=Gaming"][..],
+                "--next-output",
+                "--output=NAME",
+            ),
+            (
+                &["--forget-device=Old Dock", "--next-input"][..],
+                "--next-input",
+                "--input=NAME",
+            ),
+        ] {
+            let answer = without_an_instance(args, path).expect("answered, nothing started");
+            assert!(answer.failed, "{args:?}");
+            assert!(
+                answer.stderr.starts_with(NOT_RUNNING)
+                    && answer.stderr.contains(option)
+                    && answer.stderr.contains(pick)
+                    && answer.stderr.contains("nothing was started"),
+                "{args:?}: {}",
+                answer.stderr
+            );
+            assert!(answer.stdout.is_empty(), "{args:?}");
+            assert!(answer.window.is_empty(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_start_carries_out_the_band_lists_the_effects_and_the_preset_commands() {
+        // What `main` runs in step 4 for a keybind's `fxsound --next-preset --set_band_gain=0:3
+        // --set_effect=bass:5` that finds no FxSound running, on the preset the start selected.
+        // The Windows build's `initConfig` drops all three without a word, and so did this port.
+        let mut a = app_with_presets("cold-start");
+        run(
+            &mut a,
+            &[Command::Preset(PresetCommand::Select("Alpha".to_owned()))],
+        );
+        let cli = crate::cli::Cli::try_parse_from([
+            "fxsound",
+            "--next-preset",
+            "--set_band_gain=0:3",
+            "--set_effect=bass:5",
+        ])
+        .expect("parses");
+        let outcome = run(&mut a, &cli.cold_start_commands());
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        let preset = a.state.preset().expect("a preset is selected");
+        assert_eq!(preset.name, "Beta");
+        assert!(preset.modified, "the band and the effect are edits to it");
+        assert_eq!(a.state.eq_bands[0].boost_db, 3.0);
+        assert_eq!(a.state.effect(Effect::Bass), 5.0);
     }
 }

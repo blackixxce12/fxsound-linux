@@ -1285,8 +1285,12 @@ ignored by default; `--ignored --nocapture` prints the numbers). RMS drops behin
 | Chain | Programme | 0.3.0: adapter applies the volume | 0.4.0: the lane applies it after the chain |
 | --- | --- | --- | --- |
 | bypassed (`power = false`) | pink, −20 dBFS RMS | 19.9 dB | 19.9 dB |
-| volume leveller at 4 | pink, −20 dBFS RMS | 19.6 / 19.7 / 19.0 dB at 0–3 / 7–10 / 17–20 s | 19.9 / 20.3 / 19.9 dB |
-| volume leveller at 4 | pink, −12 dBFS RMS | **12.5 / 12.3 / 11.7 dB** | 20.0 / 20.3 / 19.7 dB |
+| volume leveller at 4 | pink, −20 dBFS RMS | 19.6 / 19.7 / 19.0 dB at 0–3 / 7–10 / 17–20 s | 20.0 / 20.3 / 19.8 dB |
+| volume leveller at 4 | pink, −12 dBFS RMS | **12.5 / 12.3 / 11.7 dB** | 20.1 / 20.0 / 19.6 dB |
+
+The 0.4.0 column was measured again on 2026-09-27 with the leveller as 0.4.0 ships it (audit
+#1–#5: bass no longer lifted past full scale, the same speed at any buffer size); it moved by at
+most 0.3 dB, and the bypassed row not at all.
 
 The bypassed row settles where the volume is applied: NODE 2's own volume is untouched and nothing in `process()` applied
 a volume, so the 20 dB were applied by NODE 1's adapter, on the way *into* `process()` — a sink's
@@ -1401,6 +1405,21 @@ Windows stops the render client when the ring empties, "to allow PC to sleep"
 `idle` and then `suspended` per `suspend-node` / `session.suspend-timeout-seconds` (WirePlumber
 default 5 s). Do **not** fight it. Set `node.always-process = false` (the default) so our sink can
 suspend; set it to `true` only if you observe first-sound truncation on a specific device.
+
+**0.4.0: the speakers sleep too** (`docs/0.4.0-design.md` §12). "A sink with no active links"
+was never FxSound's case in 0.3.0: NODE 2's link to the real speakers is always there, and a
+linked stream keeps its device running, so the speakers, the graph and both process callbacks ran
+for as long as FxSound was open, playing silence. Where the server runs a `node.link-group`
+together (PipeWire 0.3.68 and later), NODE 2 is now `node.passive` (§20): its link no longer keeps
+the speakers awake, it runs in the same cycle as NODE 1 whenever an application's link makes
+NODE 1 run, and with nothing playing into FxSound both nodes and the speakers go idle and suspend
+as above. On an older server NODE 2 stays an ordinary stream, which the main loop pauses once
+NODE 1 has been paused for `SLEEP_AFTER` and resumes the moment it streams again
+(`SecondNodePace`, `docs/0.4.0-design.md` §1.3). Either way the ring primes again before the
+next sound; a passive NODE 2 stops with the ring's last block and a half still in it, so NODE 1's
+`Paused` marks the ring stale and NODE 2's first pop after it skips that tail rather than play it
+in front of the next sound (`SampleRing::mark_stale`, the "Idle" section of
+`crates/fxsound-audio/src/engine.rs`).
 
 **0.4.0: the microphone sleeps too** (`docs/0.4.0-upstream.md` U19). The input lane's capture
 stream is passive where the server runs a link-group together (28.2), so the microphone, its

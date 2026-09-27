@@ -620,7 +620,12 @@ Disabled rendering rules:
 
 egui equivalent: `ui.add_enabled_ui(power_on, |ui| ...)` plus explicit desaturated colour
 substitution — egui's default "greyed out" tint is a multiply toward the background, which is not
-the same as `withSaturation(0.0)`. Implement saturation removal in HSL space to match.
+the same as `withSaturation(0.0)`. `withSaturation` works in **HSB** and keeps the brightness, the
+brightest channel (`02-theme.md`); an earlier revision of this line said HSL, and the port's
+sliders took the channels' midpoint from it until 0.4.0. As built they grey through
+`Palette::greyed`, as the equalizer and the visualizer do (`crates/fxsound-ui/src/theme.rs`): the
+brightest channel in the dark palette, and in the light one a grey that still reads on the window
+(0.4.0 audit #24).
 
 ---
 

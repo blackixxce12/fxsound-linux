@@ -13,17 +13,21 @@
 //!    `fxsound --next-preset` usable as a compositor keybind. `--watch` subscribes instead and
 //!    prints the running instance's events until it quits. `--quit`, `--status` and `--watch`
 //!    with nobody to forward to report that FxSound is not running and stop right here, before
-//!    step 3 could claim the session default sink; `--list-apps` is answered from the store on
-//!    disk and stops here too.
+//!    step 3 could claim the session default sink, and so do `--next-output` and `--next-input`;
+//!    `--list-apps` is answered from the store on disk and stops here too.
 //! 3. Start the audio engine. A missing or broken PipeWire is **not** fatal: the window still
 //!    opens and says so. The Windows build quits hard when its driver is missing; on Linux the
 //!    same conditions are routine and recoverable (`docs/spec/00-architecture.md` §10, open
 //!    question 6).
-//! 4. Apply the cold-start options, register the tray, then alternate between the two states
-//!    below until something asks to quit. A line that only sets something — `fxsound
-//!    --preset=Gaming` from a keybinding — starts in the tray, as a running FxSound leaves its
-//!    window alone for it (0.4.0 audit R11); with no tray icon after a few seconds the window
-//!    comes up minimised instead ([`TRAY_WAIT`]).
+//! 4. Apply the cold-start options — every option that sets something, where the Windows build
+//!    drops the band lists, the effects and the preset management at a start — register the
+//!    tray, then alternate between the two states below until something asks to quit. A line
+//!    that only sets something — `fxsound --preset=Gaming` from a keybinding — starts in the
+//!    tray, as a running FxSound leaves its window alone for it (0.4.0 audit R11); with no tray
+//!    icon after a few seconds the window comes up minimised instead ([`TRAY_WAIT`]), and so it
+//!    does for a start the remembered tray state put in the tray ([`waits_for_a_tray`]).
+//!    `--next-output` and `--next-input` have no device to step from at a start: step 2 refuses
+//!    a line with one, as it refuses `--status`.
 //! 5. Just before that loop, start the D-Bus service (`fxsound_app::dbus`) on its own thread. It
 //!    carries its calls to the same control channel the socket uses, so they are answered by the
 //!    pump like a forwarded command line; no session bus, or its name taken, is a log line and
@@ -201,9 +205,11 @@ fn main() -> eframe::Result<()> {
     // `--list-apps` is answered from the store on disk instead, which is the way to look up a
     // name for `--app-preset` before FxSound runs, and a `--forget-device` on its own is done to
     // the settings file, so the script that ran it gets its exit status rather than becoming
-    // FxSound. Which of them a line is, the same `commands()` decides that a running instance
-    // runs, so `--watch --list-apps` lists here as it does there
-    // (`commands::answer_without_an_instance`). Dropping `server` unlinks the socket again.
+    // FxSound. `--next-output` and `--next-input` have no device to step from until FxSound has
+    // started and attached its lanes, so a line with one is refused and starts nothing. Which of
+    // them a line is, the same `commands()` decides that a running instance runs, so `--watch
+    // --list-apps` lists here as it does there (`commands::answer_without_an_instance`). Dropping
+    // `server` unlinks the socket again.
     if let Some(answer) = commands::answer_without_an_instance(
         &cli.commands(),
         &fxsound_core::AppRules::config_path(),
@@ -251,7 +257,9 @@ fn main() -> eframe::Result<()> {
 
     let mut app = App::new(engine, &waker);
 
-    // Step 4: the options a cold start honours, before anything is drawn. No application stream
+    // Step 4: the options a cold start honours — every one that sets something, the band lists,
+    // the effects and the preset management included (`Command::honoured_at_cold_start`) — before
+    // anything is drawn, on the presets `App::new` has read. No application stream
     // has been reported yet, so a preset named for an application the store does not know is held
     // until the engine has said which applications play and record: the game that was started
     // before FxSound is then reached by its own streams, as a running FxSound would reach it.
@@ -267,12 +275,13 @@ fn main() -> eframe::Result<()> {
     }
     // `--hide` and the saved "start minimised" preference start in the tray-only state; there is
     // no such thing as a hidden window here (see the module docs). An explicit `--show` overrides
-    // the preference, as `--hide` overrides it the other way (`Cli::cold_start_commands`). So does
-    // a line that only sets something, which starts in the tray too (`cold_start_visibility`).
+    // the preference, as `--hide` overrides it the other way (`Cli::cold_start_commands`), and so
+    // does `--toggle-window`, since the window it toggles is not up yet. A line that only sets
+    // something starts in the tray too (`cold_start_visibility`).
     let quiet = cli.only_sets_things();
     let mut visibility = cold_start_visibility(
         cold.window.hide,
-        cold.window.show,
+        cold.window.show || cold.window.toggle,
         app.settings_run_minimized(),
         quiet,
     );
@@ -345,9 +354,9 @@ fn main() -> eframe::Result<()> {
         signals,
         panes: Panes::default(),
         waiting_for_devices: Vec::new(),
-        // A start from a line that only sets something is in the tray, if a tray icon comes up
-        // to be in; with none after `TRAY_WAIT`, the window comes up minimised instead.
-        tray_wait: (quiet && visibility == WindowVisibility::Hidden)
+        // A start in the tray that nobody asked for with `--hide` is in the tray only if a tray
+        // icon comes up to be in; with none after `TRAY_WAIT`, the window comes up minimised.
+        tray_wait: waits_for_a_tray(visibility, cold.window.hide)
             .then(|| Instant::now() + TRAY_WAIT),
         start_minimised: false,
         reopening: false,
@@ -407,12 +416,24 @@ enum HeadlessExit {
     Quit,
 }
 
-/// How long a start from a line that only sets something waits for a tray icon to come up
-/// before it brings the window up minimised instead — on GNOME without the AppIndicator
-/// extension there is none, and FxSound would run with nothing on screen to reach it by. A panel
+/// How long a start in the tray waits for a tray icon to come up before it brings the window up
+/// minimised instead ([`waits_for_a_tray`]) — on GNOME without the AppIndicator extension there
+/// is none, and FxSound would run with nothing on screen to reach it by. A panel
 /// that is there registers the icon well within it; one that starts later still finds FxSound in
 /// the tray.
 const TRAY_WAIT: Duration = Duration::from_secs(3);
+
+/// Whether a start in the tray waits [`TRAY_WAIT`] for a tray icon and, with none by then, brings
+/// the window up minimised: every start in the tray but one `--hide` or `--activated` asked for.
+///
+/// That is a line that only sets something (0.4.0 audit R11, review FA), and a start the
+/// remembered tray state put there: FxSound quit in the tray on a desktop that had one and
+/// launched again on one that has none (GNOME without an AppIndicator extension), where it would
+/// otherwise run with nothing on screen to reach it by. The autostart entry's `--hide` and the
+/// bus's and the user unit's `--activated` asked for no window, and get none.
+const fn waits_for_a_tray(visibility: WindowVisibility, hide: bool) -> bool {
+    matches!(visibility, WindowVisibility::Hidden) && !hide
+}
 
 /// Where a cold start begins (0.4.0 audit R11, review FA): in the tray for `--hide`, for the
 /// remembered `run_minimized` unless `--show` overrides it, and for a line that only sets
@@ -2517,6 +2538,23 @@ mod runtime_tests {
         assert!(!runtime.app.settings_run_minimized());
         assert!(!runtime.app.tray_tip_shown());
         assert!(runtime.reopening, "the next window is not announced again");
+    }
+
+    #[test]
+    fn a_start_in_the_tray_waits_for_a_tray_icon_unless_hide_or_activated_asked_for_it() {
+        use WindowVisibility::{Hidden, Shown};
+        // A line that only sets something, and the remembered tray state of a bare `fxsound`
+        // from a launcher: both hidden with no `--hide`, and both would otherwise run with
+        // nothing on screen on a desktop with no tray icon.
+        let quiet = cold_start_visibility(false, false, false, true);
+        let remembered = cold_start_visibility(false, false, true, false);
+        assert_eq!((quiet, remembered), (Hidden, Hidden));
+        assert!(waits_for_a_tray(quiet, false));
+        assert!(waits_for_a_tray(remembered, false));
+        // The autostart entry's `--hide` and the bus's `--activated` asked for no window.
+        let asked = cold_start_visibility(true, false, false, false);
+        assert!(!waits_for_a_tray(asked, true));
+        assert!(!waits_for_a_tray(Shown, false));
     }
 
     #[test]

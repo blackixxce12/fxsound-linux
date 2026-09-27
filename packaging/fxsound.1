@@ -57,7 +57,13 @@ process does not start a second instance: it forwards its command line to the
 first over a control socket in
 .I $XDG_RUNTIME_DIR/fxsound
 and exits. Every option below therefore works both as a startup option and as
-a way to drive an instance that is already running.
+a way to drive an instance that is already running. A start carries out the
+band lists, the effects and the preset commands too, on the preset it
+selects, where the Windows build drops them at a start without a word. The one
+exception is
+.BR \-\-next\-output " and " \-\-next\-input :
+they step a lane from the device it is on, which a start does not have yet, so
+with no FxSound running such a command line is refused and nothing starts.
 .PP
 Only what asks for the window brings it up: a command line with no options, as
 a launcher runs it,
@@ -132,8 +138,14 @@ is.
 .TP
 .BI \-\-set_band_freq= BAND:HZ[,BAND:HZ...]
 Move band centre frequencies. Band indices are 0-based. The outer bound is
-20\(en20000 Hz; the usable range for any one band also depends on its
-neighbours and is enforced by the running instance.
+20\(en20000 Hz; each band also has its own range, the one its wheel in the
+window turns over, which
+.B \-\-status \-\-json
+reports as each band's
+.BR min_frequency " and " max_frequency .
+A frequency outside its band's range refuses the whole list, as a band the
+equalizer does not have does (below), where the Windows build drops that pair
+without a word.
 .TP
 .BI \-\-set_band_gain= BAND:DB[,BAND:DB...]
 Set band gains in dB, 0-based band indices, gain
@@ -202,7 +214,11 @@ a note saying which
 .B \-\-edit
 reaches it. A device named on the same command line is selected first, so
 .B \-\-input=...\& \-\-preset=...
-finds the preset in the microphone's list.
+finds the preset in the microphone's list. Naming the preset that is already
+selected changes nothing, as picking it again in the window does, and keeps
+its unsaved changes;
+.B \-\-undo_preset
+reads it back from its file.
 .TP
 .BI \-\-save_preset= NAME
 Save the current settings as a new user preset: its unsaved changes, or a copy
@@ -348,7 +364,8 @@ quietly shows another language.
 Start without showing the window, or hide the window of a running instance.
 This is what the autostart entry invokes. Without either, a start shows the
 window unless FxSound was last quit with its window hidden to the tray, as the
-Windows build does.
+Windows build does; such a start with no tray icon to be in after a few seconds
+(GNOME without an AppIndicator extension) brings the window up minimised.
 .TP
 .B \-\-activated
 Start without showing the window, as
@@ -451,7 +468,10 @@ does.
 .TP
 .B \-\-toggle\-window
 Show the window if it is hidden, hide it if it is showing \(en the same toggle
-a left click on the tray icon performs.
+a left click on the tray icon performs. Starting FxSound, it shows the window,
+as
+.B \-\-show
+does.
 .TP
 .B \-\-next\-preset
 Select the next preset of the edit direction, wrapping.
@@ -462,12 +482,18 @@ Select the previous preset of the edit direction, wrapping.
 .B \-\-next\-output
 Cycle the output lane to the next usable playback device, wrapping, in the
 order of the device priority list (Settings \(-> Audio). Playback devices only:
-it never crosses into the microphones.
+it never crosses into the microphones. With no FxSound running there is no
+device to step from: the command line is refused (exit status 1) and nothing
+on it is done or started;
+.BI \-\-output= NAME
+starts FxSound on a device.
 .TP
 .B \-\-next\-input
 Cycle the microphone lane to the next usable capture device, wrapping, in the
 order of the microphones' priority list (Settings \(-> Microphone). Capture
-devices only.
+devices only. With no FxSound running it is refused as
+.B \-\-next\-output
+is.
 .SS Control
 .TP
 .B \-\-status
@@ -593,7 +619,9 @@ overwrite, a band the equalizer does not have, or a device to forget that is
 connected, for example) or could
 not be reached, there is no running instance for
 .BR \-\-status " or " \-\-watch
-to ask, the
+to ask or for
+.BR \-\-next\-output " or " \-\-next\-input
+to step, the
 .B \-\-watch
 stream was cut off without the instance's
 .B quit
@@ -937,7 +965,13 @@ and hands the start to the systemd user unit,
 .IR fxsound.service ,
 or runs
 .B fxsound \-\-activated
-itself where the bus has no systemd. A started FxSound takes over the
+itself where the bus has no systemd. A
+.BR NextOutput " or " NextInput
+call that starts FxSound this way steps nowhere, since the new instance has no
+device list yet to step through, and it still succeeds; with no FxSound
+running,
+.BR \-\-next\-output " and " \-\-next\-input
+are refused instead. A started FxSound takes over the
 session's default devices, so anything that only reads or polls \(en a status
 bar module above all \(en must ask the bus not to start it, or it will bring
 FxSound back seconds after the user quit it:

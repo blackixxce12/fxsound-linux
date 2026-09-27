@@ -45,11 +45,18 @@
 //! 6. **A band list with a band the equalizer does not have is refused, with a message** (audit
 //!    #51): Windows drops such a list without a word when it has more pairs than bands, and sets
 //!    whatever it can otherwise; here nothing of it is set, and the command fails naming the bands
-//!    that are not there (`crate::commands`).
+//!    that are not there (`crate::commands`). So is a `--set_band_freq` list with a frequency
+//!    outside its band's range, a pair Windows drops alone and without a word.
 //! 7. **An unknown `--language` is an error** (audit #28): Windows saves any code and shows the
 //!    language whose name it starts with, or English. The table's own codes are taken in any case,
 //!    and so are the ISO codes it spells otherwise (`uk`, `bs`, `nb`, `nn`) and locales
 //!    (`ru_RU.UTF-8`), through [`fxsound_core::i18n::canonical_code`].
+//! 8. **Every option works at a start too.** `initConfig` reads ten options and never sees the
+//!    band lists, `--set_effect` or the preset management, so a line of them that starts the
+//!    Windows build is dropped without a word. Here a start carries them out once the presets are
+//!    read ([`Command::honoured_at_cold_start`]). `--next-output` and `--next-input` step from the
+//!    device a lane is on, and a start has none yet: a line with one is refused and starts nothing
+//!    (`crate::commands::answer_without_an_instance`).
 //!
 //! Rounding is *not* a departure: `--balance` and `--master_gain` round to the nearest whole
 //! number (`FxController.cpp:1803`, `:1815`) and `--filter_q` and `--volume_leveling` to the
@@ -831,12 +838,14 @@ impl Cli {
         commands
     }
 
-    /// The subset of [`Cli::commands`] a *cold start* honours — the C column of
-    /// `docs/spec/07-startup-tray.md` §4.2, i.e. what `initConfig` reads (`:225-234`).
+    /// The subset of [`Cli::commands`] a *cold start* carries out, in step 4 of `main`, once the
+    /// presets are read ([`Command::honoured_at_cold_start`]).
     ///
-    /// `initConfig` never sees `--status`, the preset-management commands, `--set_band_*` or
-    /// `--set_effect`: at that point in startup there is no preset list, no audio and no window
-    /// (`Main.cpp:67` runs it two lines before `AudioPassthru` exists).
+    /// The C column of `docs/spec/07-startup-tray.md` §4.2 is narrower: `initConfig` never sees
+    /// the preset-management commands, `--set_band_*` or `--set_effect`, because at that point in
+    /// its startup there is no preset list, no audio and no window (`Main.cpp:67` runs it two
+    /// lines before `AudioPassthru` exists), and it drops them without a word. Here the list is
+    /// there by step 4, so they are carried out as a running instance carries them out.
     ///
     /// An explicit `--show` is kept: it is how a start overrides the remembered "start hidden"
     /// (`run_minimized`, written again since 0.4.0 audit #35), as `--hide` overrides the other way.
@@ -953,9 +962,15 @@ impl Cli {
 }
 
 impl Command {
-    /// Whether `initConfig` would act on this command, as opposed to `applyConfig` only.
+    /// Whether a cold start carries this command out, in step 4 of `main`.
     ///
-    /// The list is `docs/spec/07-startup-tray.md` §4.3 verbatim. [`WindowCommand::Show`] is
+    /// Every command that sets something is carried out, where `initConfig` acts only on the ten
+    /// of `docs/spec/07-startup-tray.md` §4.3 and drops the band lists, `--set_effect` and the
+    /// preset management without a word. Not on the list: what a start has nothing for. The
+    /// questions are answered by `main` before the engine starts, `--forget-device` is done to the
+    /// settings file there, and `--next-output` / `--next-input` step from the device a lane is on,
+    /// which a start does not have yet, so `main` refuses a line with one
+    /// (`crate::commands::answer_without_an_instance`). [`WindowCommand::Show`] is
     /// pointedly *not* on it: a plain `fxsound` emits one (see `Cli::window_command`), and
     /// honouring it at startup would override the persisted `run_minimized` on every launch and
     /// break "quit with the window hidden, start hidden next time" (§7.1). A cold start's
@@ -977,9 +992,15 @@ impl Command {
             | Self::MasterGain(_)
             | Self::View(_)
             | Self::Language(_) => true,
-            Self::Preset(preset) => matches!(preset, PresetCommand::Select(_)),
+            // Past §4.3: the presets are read by step 4, so the band lists, the effects and every
+            // preset command work on the preset the start has selected, as they would a moment
+            // later on the running instance — where `initConfig` drops them without a word.
+            Self::BandFrequencies(_) | Self::BandGains(_) | Self::Effects(_) | Self::Preset(_) => {
+                true
+            }
             // `--output` is on §4.3's list, `--input` is its twin, and `off` is a choice of
-            // device like any other. Cycling is a hotkey's, and a cold start has no hotkeys.
+            // device like any other. Cycling steps from the device a lane is on, and a start has
+            // none yet: `main` refuses the line before anything starts.
             Self::Output(device) | Self::Input(device) => {
                 matches!(device, DeviceCommand::Select(_) | DeviceCommand::Detach)
             }
@@ -991,16 +1012,14 @@ impl Command {
             // application's preset is one too, and like `--preset` it is chosen once the preset
             // lists are read, so a name neither list has is still refused, on stderr.
             Self::EditDirection(_) | Self::NoiseSuppression(_) | Self::AppPreset { .. } => true,
-            Self::Window(window) => matches!(window, WindowCommand::Hide),
+            // A toggle of a window that is not there yet brings it up: `main` reads it as `--show`.
+            Self::Window(window) => matches!(window, WindowCommand::Hide | WindowCommand::Toggle),
             // Questions for a running instance, which a cold start proves there is not; `main`
             // answers all four before the engine starts — `--list-apps` from the store.
             Self::Status { .. }
             | Self::Watch { .. }
             | Self::SelfTest { .. }
             | Self::ListApps { .. }
-            | Self::BandFrequencies(_)
-            | Self::BandGains(_)
-            | Self::Effects(_)
             | Self::Quit => false,
         }
     }
@@ -1861,7 +1880,47 @@ mod tests {
     }
 
     #[test]
-    fn cold_start_honours_only_the_options_init_config_reads() {
+    fn cold_start_carries_out_the_band_lists_the_effects_and_every_preset_command() {
+        // None of these exist in `initConfig` (`FxController.cpp:225-234`), which drops them at a
+        // start without a word; the manual page says every option works as a startup option.
+        let cli = parse(&[
+            "--overwrite_preset",
+            "--set_band_gain=0:3",
+            "--set_band_freq=0:60",
+            "--set_effect=bass:5",
+        ]);
+        assert_eq!(
+            cli.cold_start_commands(),
+            vec![
+                Command::Preset(PresetCommand::Overwrite),
+                Command::BandFrequencies(vec![(0, 60.0)]),
+                Command::BandGains(vec![(0, 3.0)]),
+                Command::Effects(vec![(Effect::Bass, 5.0)]),
+            ]
+        );
+        for preset in [
+            &["--save_preset=Mine"][..],
+            &["--undo_preset"][..],
+            &["--rename_preset=Mine"][..],
+            &["--delete_preset"][..],
+            &["--next-preset"][..],
+            &["--prev-preset"][..],
+        ] {
+            let cold = parse(preset).cold_start_commands();
+            assert!(
+                matches!(cold.as_slice(), [Command::Preset(_)]),
+                "{preset:?}: {cold:?}"
+            );
+        }
+        // A toggle of the window a start has not put up yet: `main` reads it as `--show`.
+        assert_eq!(
+            parse(&["--toggle-window"]).cold_start_commands(),
+            vec![Command::Window(WindowCommand::Toggle)]
+        );
+    }
+
+    #[test]
+    fn cold_start_honours_the_options_init_config_reads() {
         let cli = parse(&[
             "--power=1",
             "--preset=Rock",
@@ -1894,13 +1953,6 @@ mod tests {
                 .any(|c| matches!(c, Command::Window(_)))
         );
 
-        // None of these exist in `initConfig` (`FxController.cpp:225-234`).
-        let running_only = parse(&[
-            "--overwrite_preset",
-            "--set_band_gain=0:3",
-            "--set_effect=bass:5",
-        ]);
-        assert!(running_only.cold_start_commands().is_empty());
         assert!(parse(&["--status"]).cold_start_commands().is_empty());
         // `--quit` with no instance to quit is decided in `main` before the engine starts; it
         // must not slip through here and start one.
@@ -2220,7 +2272,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_start_honours_the_lane_options_but_not_cycling_or_questions() {
+    fn cold_start_honours_the_lane_options_but_leaves_cycling_and_questions_to_main() {
         let cli = parse(&[
             "--input=Mic",
             "--output=off",

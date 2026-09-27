@@ -1346,15 +1346,14 @@ fn choosing_other_speakers_rebuilds_the_output_pair_and_leaves_the_microphone_pa
     });
     assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
     assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
-    let Some(before) = unless_skipped(
+    // Which pair the server rebuilt is `pw-dump`'s to say. Without it that is skipped, and only
+    // that: what the engine says about both lanes is checked all the same.
+    let before = unless_skipped(
         graph.settles_on(&LANE_NODE_NAMES),
         "pw-dump",
         "which pair a change of speakers rebuilds",
-    ) else {
-        handle.shutdown();
-        return;
-    };
-    let before = before.expect("both pairs should be in the graph at once");
+    )
+    .map(|settled| settled.expect("both pairs should be in the graph at once"));
     let heard_before = said.0.len();
 
     // Stereo to 7.1: a new channel count, so the output pair cannot be kept and must be rebuilt.
@@ -1371,28 +1370,30 @@ fn choosing_other_speakers_rebuilds_the_output_pair_and_leaves_the_microphone_pa
         "the new layout is reported, and as the output lane's"
     );
 
-    let after = graph
-        .nodes_until(|nodes| {
-            nodes.len() == LANE_NODE_NAMES.len()
-                && [SINK_NODE_NAME, OUTPUT_NODE_NAME]
-                    .into_iter()
-                    .all(|node| serial_of(nodes, node) != serial_of(&before, node))
-        })
-        .expect("pw-dump answered a moment ago")
-        .expect("the output pair should have been rebuilt beside the microphone's");
-    for node in [CAPTURE_NODE_NAME, SOURCE_NODE_NAME] {
-        assert_eq!(
-            serial_of(&after, node),
-            serial_of(&before, node),
-            "{node} was rebuilt for a change of speakers"
-        );
-    }
-    for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME] {
-        assert_eq!(
-            graph.node_format(node).flatten(),
-            Some((48_000, 8)),
-            "{node} should hold the 7.1 layout"
-        );
+    if let Some(before) = before {
+        let after = graph
+            .nodes_until(|nodes| {
+                nodes.len() == LANE_NODE_NAMES.len()
+                    && [SINK_NODE_NAME, OUTPUT_NODE_NAME]
+                        .into_iter()
+                        .all(|node| serial_of(nodes, node) != serial_of(&before, node))
+            })
+            .expect("pw-dump answered a moment ago")
+            .expect("the output pair should have been rebuilt beside the microphone's");
+        for node in [CAPTURE_NODE_NAME, SOURCE_NODE_NAME] {
+            assert_eq!(
+                serial_of(&after, node),
+                serial_of(&before, node),
+                "{node} was rebuilt for a change of speakers"
+            );
+        }
+        for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME] {
+            assert_eq!(
+                graph.node_format(node).flatten(),
+                Some((48_000, 8)),
+                "{node} should hold the 7.1 layout"
+            );
+        }
     }
     // The sink came back under its old name, so the claim on it stands; the source's was never
     // in question.
@@ -1577,11 +1578,11 @@ fn both_defaults_are_handed_back_when_the_engine_stops() {
 /// remembers when it claims its own — even when the settings file remembers something else.
 ///
 /// The settings file's copy, [`UiToAudio::SeedRememberedDefaults`], names `t_stereo` here, and the
-/// session's default sink is `t_71`. Both are real sinks, so every check below says which of the two
-/// the engine listened to. The seed fills the memory's empty slots, so the output lane's choice is
-/// no longer the first-run rule: were the session's default sink not read by then, the rules would
-/// walk the remembered devices and land on `t_stereo`. The input seed names a microphone that is
-/// not in this graph at all, as one unplugged since the last session would be.
+/// session's default sink is `t_71`. Both are real sinks, so every check below says which of the
+/// two the engine listened to. The seed fills the memory's empty slots, so the output lane's choice
+/// is no longer the first-run rule: were the session's default sink not read by then, the rules
+/// would walk the remembered devices and land on `t_stereo`. The input seed names a microphone that
+/// is not in this graph at all, as one unplugged since the last session would be.
 ///
 /// The exit check proves less than the rest: only that both keys go back to real devices rather
 /// than to our nodes. What it hands back to is the device each lane last used — `t_71` because the
@@ -1794,7 +1795,8 @@ fn a_claim_left_behind_by_a_killed_run_is_handed_back_to_the_seeded_devices() {
     assert!(
         !said.0.iter().any(|m| matches!(
             m,
-            AudioToUi::RememberedDefault { node_name, .. } if OUR_NODE_NAMES.contains(&node_name.as_str())
+            AudioToUi::RememberedDefault { node_name, .. }
+                if OUR_NODE_NAMES.contains(&node_name.as_str())
         )),
         "a stale claim was remembered as the default from before FxSound"
     );
@@ -1857,9 +1859,10 @@ fn a_claim_left_behind_for_a_lane_that_stays_detached_is_handed_back_while_the_e
 
     // Plugged in.
     if graph.add_tone("t_tone").is_none() {
-        skip(
-            "the tone never appeared (is audiotestsrc installed?), so the hand-back was not checked",
-        );
+        skip(concat!(
+            "the tone never appeared (is audiotestsrc installed?), ",
+            "so the hand-back was not checked"
+        ));
         handle.shutdown();
         return;
     }
@@ -1888,7 +1891,8 @@ fn a_claim_left_behind_for_a_lane_that_stays_detached_is_handed_back_while_the_e
     assert!(
         !said.0.iter().any(|m| matches!(
             m,
-            AudioToUi::RememberedDefault { node_name, .. } if OUR_NODE_NAMES.contains(&node_name.as_str())
+            AudioToUi::RememberedDefault { node_name, .. }
+                if OUR_NODE_NAMES.contains(&node_name.as_str())
         )),
         "a stale claim was remembered as the default from before FxSound"
     );
@@ -1964,16 +1968,32 @@ fn a_restart_rebuilds_every_lane_that_was_running() {
     assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
     assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
 
+    // Each lane has to be heard going and coming back after the restart. The attachment from
+    // before it is still the last one in the transcript until the lane's detach is read, so
+    // asking for it alone would pass on what the engine said before the restart.
+    let restarted_at = said.0.len();
     handle.send(UiToAudio::Restart);
-    assert!(
-        said.attached(&handle, DeviceDirection::Input, None),
-        "the pair went with the socket"
-    );
-    assert!(
-        said.attached(&handle, DeviceDirection::Input, Some("t_mic")),
-        "…and the reconnect rebuilt it, because the lane was still enabled"
-    );
-    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    for (direction, device) in [
+        (DeviceDirection::Input, "t_mic"),
+        (DeviceDirection::Output, "t_stereo"),
+    ] {
+        assert!(
+            said.heard_since(
+                &handle,
+                restarted_at,
+                &format!("the {} lane's detach", direction.key()),
+                |m| matches!(m, AudioToUi::Attached { direction: d, node_name: None }
+                    if *d == direction)
+            ),
+            "the {} pair went with the socket",
+            direction.key()
+        );
+        assert!(
+            said.attached(&handle, direction, Some(device)),
+            "…and the reconnect rebuilt the {} pair, because the lane was still enabled",
+            direction.key()
+        );
+    }
     if let Some(settled) = unless_skipped(
         graph.settles_on(&LANE_NODE_NAMES),
         "pw-dump",
@@ -1988,15 +2008,15 @@ fn a_restart_rebuilds_every_lane_that_was_running() {
 /// picked as the microphone, into the capture stream; the same tone into the sink, standing in for
 /// an application playing; the output stream into the stereo sink.
 ///
-/// Wired one lane at a time and checked in both after each step. The server drives the members of
-/// a `node.link-group` together, and each lane's pair now has a group of its own — `fxsound`,
-/// `fxsound-input` — so linking the microphone alone schedules the input pair and nothing else:
-/// the output lane must not so much as report `processing` until something plays into the sink.
-/// (With one group for all four nodes, as an earlier revision of `docs/spec/12-audio-io.md` §29.2
-/// had it, PipeWire 1.6.8 ran the output pair the moment the microphone was linked.) The meters are still what shows each
-/// lane is *fed*, because being scheduled is not being fed: the tone reaches the voice chain's
-/// with the music chain's still silent, and the music chain's only once something plays into the
-/// sink.
+/// Wired one lane at a time and checked in both after each step. The server drives the members of a
+/// `node.link-group` together, and each lane's pair now has a group of its own — `fxsound`,
+/// `fxsound-input` — so linking the microphone alone schedules the input pair and nothing else: the
+/// output lane must not so much as report `processing` until something plays into the sink. (With
+/// one group for all four nodes, as an earlier revision of `docs/spec/12-audio-io.md` §29.2 had it,
+/// PipeWire 1.6.8 ran the output pair the moment the microphone was linked.) The meters are still
+/// what shows each lane is *fed*, because being scheduled is not being fed: the tone reaches the
+/// voice chain's with the music chain's still silent, and the music chain's only once something
+/// plays into the sink.
 #[test]
 fn a_tone_driven_through_each_lane_reaches_that_lane_and_no_other() {
     let Some(graph) = PrivateGraph::start("flow") else {
@@ -3487,12 +3507,12 @@ fn a_headset_between_profiles_keeps_the_output_lane_and_its_sink_is_linked_again
     let gap = gone.elapsed();
     println!("the headset's sink was away for {gap:?}, re-added after {readded:?}");
     // The gap as seen from here is held to the lane's wait and not to 500 ms, on purpose. On top of
-    // the re-add it counts `pw-cli` starting and `pw-dump` polling until the sink is listed, which a
-    // loaded runner slows by more than the 100 ms left — and a longer blink only makes the lane
+    // the re-add it counts `pw-cli` starting and `pw-dump` polling until the sink is listed, which
+    // a loaded runner slows by more than the 100 ms left — and a longer blink only makes the lane
     // wait longer, which is harder to pass, never easier: every way this test fails on a broken
     // engine (a move to the speakers, a pair kept on the old serial) shows at any gap. What a slow
-    // runner can make is a gap the lane is right to give up on, which would fail below for a
-    // reason that is no bug; this says so instead.
+    // runner can make is a gap the lane is right to give up on, which would fail below for a reason
+    // that is no bug; this says so instead.
     assert!(
         gap >= 2 * crate::engine::SUPERVISOR_PERIOD,
         "the sink was away for {gap:?}, too short for a supervisor tick to have seen it gone"

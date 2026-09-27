@@ -483,14 +483,27 @@ pub fn balance_gradient_end(rect: Rect, track: Rect, fidelity: Fidelity) -> f32 
     }
 }
 
+/// The track's colour: `SliderTrack`, greyed while the slider is not lit, as the original's
+/// `withSaturation(0.0)` greys it (`FxTheme.cpp:222-225`, `:231-234`, `FxBalanceSlider.cpp:83-87`).
+///
+/// Greyed as the equalizer's curve and the visualizer grey theirs ([`Palette::greyed`]): in the
+/// dark palette the colour's brightest channel, which is what `withSaturation` keeps, and in the
+/// light one a grey that still reads on the window (0.4.0 audit #24). Before 0.4.0 the sliders
+/// took the midpoint of the channels instead, so a power-off slider was a darker grey than the
+/// equalizer beside it (`#8b8b8b` against the original's `#e3e3e3` in the dark palette).
+#[must_use]
+pub fn track_colour(palette: Palette, lit: bool) -> egui::Color32 {
+    let colour = palette.color(FxColor::SliderTrack);
+    if lit { colour } else { palette.greyed(colour) }
+}
+
 /// The balance bar's two end colours for a value at proportion `t` of the range: `SliderTrack` at
 /// `1 − t` alpha on the left and at `t` on the right (`FxBalanceSlider.cpp:79-82`), both grey while
-/// the slider is not lit (`:83-87`).
+/// the slider is not lit (`:83-87`, [`track_colour`]).
 #[must_use]
 pub fn balance_colours(palette: Palette, t: f32, lit: bool) -> (egui::Color32, egui::Color32) {
     let t = t.clamp(0.0, 1.0);
-    let base = palette.color(FxColor::SliderTrack);
-    let base = if lit { base } else { desaturate(base) };
+    let base = track_colour(palette, lit);
     (with_alpha(base, 1.0 - t), with_alpha(base, t))
 }
 
@@ -515,12 +528,7 @@ fn paint(
     let thumb_x = track.left() + track.width() * t;
 
     let corner = CornerRadius::same(TRACK_CORNER_RADIUS as u8);
-    let track_colour = palette.color(FxColor::SliderTrack);
-    let track_colour = if lit {
-        track_colour
-    } else {
-        desaturate(track_colour)
-    };
+    let track_colour = track_colour(palette, lit);
 
     match style {
         Track::Filled => {
@@ -608,18 +616,6 @@ fn with_alpha(colour: egui::Color32, alpha: f32) -> egui::Color32 {
         colour.b(),
         (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
     )
-}
-
-/// JUCE's `Colour::withSaturation(0.0)`: keep the luminance, drop the hue.
-fn desaturate(colour: egui::Color32) -> egui::Color32 {
-    // JUCE's HSL luminance is the midpoint of the channel extremes.
-    let (r, g, b) = (
-        f32::from(colour.r()),
-        f32::from(colour.g()),
-        f32::from(colour.b()),
-    );
-    let luminance = ((r.max(g).max(b) + r.min(g).min(b)) / 2.0).round() as u8;
-    egui::Color32::from_rgba_unmultiplied(luminance, luminance, luminance, colour.a())
 }
 
 #[cfg(test)]
@@ -1114,15 +1110,28 @@ mod tests {
     }
 
     #[test]
-    fn desaturation_keeps_the_juce_luminance() {
-        // JUCE's HSL lightness is (max + min) / 2 of the channels.
-        let red = egui::Color32::from_rgb(0xd5, 0x15, 0x35);
-        let grey = desaturate(red);
-        let expected = ((0xd5 as f32 + 0x15 as f32) / 2.0).round() as u8;
+    fn an_unlit_track_and_balance_bar_are_the_grey_the_equalizer_and_the_visualizer_use() {
+        // `withSaturation(0.0)` keeps HSB brightness, the brightest channel: the dark
+        // `SliderTrack`, #e33250, greys to #e3e3e3 (docs/spec/04-equalizer-visualizer.md §A8),
+        // where the midpoint of the channels this used to take gave #8b8b8b.
+        let dark = Palette::new(ThemeMode::Dark);
         assert_eq!(
-            (grey.r(), grey.g(), grey.b()),
-            (expected, expected, expected)
+            track_colour(dark, false),
+            egui::Color32::from_rgb(0xe3, 0xe3, 0xe3)
         );
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let palette = Palette::new(mode);
+            let lit = palette.color(FxColor::SliderTrack);
+            assert_eq!(track_colour(palette, true), lit, "{mode:?}");
+            let grey = palette.greyed(lit);
+            assert_eq!(track_colour(palette, false), grey, "{mode:?}");
+            let (left, right) = balance_colours(palette, 0.25, false);
+            assert_eq!(
+                (left, right),
+                (with_alpha(grey, 0.75), with_alpha(grey, 0.25)),
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

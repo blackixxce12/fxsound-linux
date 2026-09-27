@@ -17,8 +17,9 @@ use super::*;
 use std::collections::HashSet;
 
 /// The microphone of these tests when it stands in for a headset's: named and marked as
-/// WirePlumber 0.5 makes a headset's loopback microphone (`monitors/bluez/create-loopback-node.lua`),
-/// on a card id no card here has. A tone behind it, so that it has something to say.
+/// WirePlumber 0.5 makes a headset's loopback microphone
+/// (`monitors/bluez/create-loopback-node.lua`), on a card id no card here has. A tone behind it, so
+/// that it has something to say.
 const LOOPBACK: &str = "bluez_input.00:11:22:33:44:55";
 
 /// How much a recorder has to have written while the system sleeps before what it heard counts as

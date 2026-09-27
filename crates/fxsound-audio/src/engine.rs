@@ -6909,10 +6909,15 @@ mod tests {
     }
 
     /// The mark records a position, not "whatever is in the ring": a pair that stopped with the
-    /// ring already dry, or whose `Paused` reaches the main loop only after the new sound has
-    /// started, loses nothing of the new sound to it.
+    /// ring already dry loses nothing of the next sound to it, and a mark taken late skips only
+    /// what was pushed before it, never a block pushed after it.
+    ///
+    /// A late mark does cost the new sound what it had pushed by then: when NODE 1's `Paused`
+    /// reaches the main loop only after the next sound has started, the blocks of that sound
+    /// already in the ring are skipped with the old tail, since the ring cannot tell the two
+    /// apart. This pins the bound on that, not its absence.
     #[test]
-    fn a_stale_mark_never_costs_the_next_sound_a_sample() {
+    fn a_stale_mark_skips_nothing_pushed_after_it() {
         let ring = ring_for(2, 4); // target fill = 6 frames = 12 samples
         let mut out = [0.0_f32; 8];
         ring.push(&[0.5; 12]);
@@ -6980,41 +6985,78 @@ mod tests {
         assert_eq!(ring.fill_frames(), 1);
     }
 
+    /// Every sample the producer pushes is its own index in the stream, so a frame always starts
+    /// on an even one: a consumer that ever read from the middle of a frame — after a skip, a
+    /// resync or a wrap — would see an odd sample where a frame's first belongs, or two samples of
+    /// one frame that are not neighbours. Neither thread waits for the other at any point, which
+    /// is the "neither block" half: the test finishes.
+    ///
+    /// The consumer runs until the producer is done and the ring is dry, not for a fixed number of
+    /// pops, so a loaded machine that schedules it before the producer starts still sees audio.
     #[test]
     fn a_producer_and_a_consumer_on_two_threads_neither_block_nor_lose_alignment() {
+        use std::sync::atomic::AtomicBool;
+
         let ring = Arc::new(ring_for(2, 8));
+        let done = Arc::new(AtomicBool::new(false));
         let producer = {
             let ring = Arc::clone(&ring);
+            let done = Arc::clone(&done);
             std::thread::spawn(move || {
                 let mut next = 0.0_f32;
                 for _ in 0..2_000 {
                     let block: Vec<f32> = (0..64).map(|i| next + i as f32).collect();
                     let pushed = ring.push(&block);
                     next += pushed as f32;
+                    if pushed < block.len() {
+                        // Full: let the consumer in, rather than dropping every later block too.
+                        std::thread::yield_now();
+                    }
                 }
+                done.store(true, Ordering::Release);
                 next
             })
         };
         let consumer = {
             let ring = Arc::clone(&ring);
+            let done = Arc::clone(&done);
             std::thread::spawn(move || {
                 let mut out = vec![0.0_f32; 64];
                 let mut total = 0_usize;
-                for _ in 0..4_000 {
-                    total += ring.pop(&mut out);
+                let mut misaligned = Vec::new();
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    let finished = done.load(Ordering::Acquire);
+                    let got = ring.pop(&mut out);
+                    for &[first, second] in out[..got].as_chunks::<2>().0 {
+                        if first % 2.0 != 0.0 || second != first + 1.0 {
+                            misaligned.push((first, second));
+                        }
+                    }
+                    total += got;
+                    if (finished && got == 0) || Instant::now() > deadline {
+                        break;
+                    }
+                    if got == 0 {
+                        std::thread::yield_now();
+                    }
                 }
-                total
+                (total, misaligned)
             })
         };
         let produced = producer.join().expect("producer");
-        let consumed = consumer.join().expect("consumer");
+        let (consumed, misaligned) = consumer.join().expect("consumer");
         assert!(consumed > 0, "the consumer must have seen real audio");
+        assert_eq!(consumed % 2, 0, "only whole frames are handed over");
         assert!(
             produced >= consumed as f32,
             "the consumer cannot have read more than was written"
         );
-        // Whatever the interleaving, the cursors stay frame-aligned and sane.
-        assert_eq!(ring.fill_frames() * 2 % 2, 0);
+        assert!(
+            misaligned.is_empty(),
+            "frames read from the middle: {:?}",
+            &misaligned[..misaligned.len().min(8)]
+        );
         assert!(ring.fill_frames() * 2 <= ring.slots.len());
     }
 

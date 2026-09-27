@@ -174,7 +174,8 @@ in); on a desktop with no tray, such as GNOME without an AppIndicator extension,
 window as the Windows build does, instead of making it vanish, and `fxsound --show` or launching
 FxSound again brings a minimised window back (on Wayland as a fresh window in its place, since an
 application cannot take its own window out of the minimised state there). FxSound quit with its
-window in the tray starts in the tray next time, unless it is started with `--show`.
+window in the tray starts in the tray next time, unless it is started with `--show` or no tray icon
+comes up to be in, when the window comes up minimised after a few seconds.
 
 Fullscreen (Hyprland's `fullscreen` dispatcher, Super+F in many configurations) and maximised
 windows scale the fixed design up to fit the monitor and centre it; the app never draws into a
@@ -418,8 +419,14 @@ Each of these is a considered decision, not an oversight:
   --preset=B`, which Windows reads as `--preset=B` alone), a new preset name that is nothing once the
   characters a `.fac` name cannot hold are gone, and a `--language` FxSound has no translation for
   are parse errors; a band list naming a band the equalizer does not have (`--set_band_gain=12:2` on
-  ten bands) is refused whole with the band named. Windows ignores all of them without a word.
-  `--language` also takes the ISO codes Windows spells its own way (`uk`, `bs`, `nb`) and locales.
+  ten bands), or a `--set_band_freq` outside the band's range, is refused whole with the band named.
+  Windows ignores all of them without a word. `--language` also takes the ISO codes Windows spells
+  its own way (`uk`, `bs`, `nb`) and locales.
+- **Every option works when it starts FxSound.** Windows drops the band lists, `--set_effect` and
+  the preset commands (`--next-preset` from a keybind included) when there is no FxSound running
+  for them; here the start carries them out on the preset it selects. `--next-output` and
+  `--next-input` have no device to step from until FxSound runs, so with none running they are
+  refused and nothing starts.
 - **Two device menus in the tray.** The playback devices are under *Playback Device Select* and the
   microphones under *Recording Device Select*, and a long device name is shortened in its middle,
   where Windows cut every name after 30 characters and PipeWire's names of one card's outputs all
