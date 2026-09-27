@@ -79,8 +79,14 @@ const GAIN_ATTACK: Real = 0.25;
 const GAIN_RELEASE: Real = 0.4;
 /// The reduction meter's time constant, in hops: 100 ms.
 const METER_HOPS: Real = 20.0;
+/// A smoothed reduction under this reads as none, a millionth of a decibel, and is flushed to zero.
+const METER_FLOOR_DB: Real = 1.0e-6;
 /// Keeps the ratio `R/|Y|²` defined in silence.
 const EPSILON: Real = 1.0e-12;
+/// A bin's smoothed power under this is silence and is flushed to zero: some 240 dB under what a
+/// full-scale sine puts in its bin, and far enough over the subnormals that the recursion never
+/// reaches them.
+const PSD_FLOOR: Real = 1.0e-20;
 
 /// One channel's transform state.
 struct Channel {
@@ -352,7 +358,11 @@ impl Dereverb {
                 let power = bin.norm_sqr();
                 let psd = &mut state.psd[k];
                 *psd += self.psd_coeff * (power - *psd);
-                if !psd.is_finite() {
+                // A muted microphone decays the recursion toward zero without ever reaching it:
+                // it stops a few steps above the smallest subnormal, where `0.12 · psd` rounds
+                // away, and every hop after that did subnormal arithmetic in every bin, through
+                // the history and the tail estimate, for as long as the silence lasted.
+                if !psd.is_finite() || *psd < PSD_FLOOR {
                     *psd = 0.0;
                 }
                 let tail = self.decay * state.history[previous][k];
@@ -423,7 +433,9 @@ impl Dereverb {
             0.0
         };
         self.reduction_db += (target - self.reduction_db) / METER_HOPS;
-        if !self.reduction_db.is_finite() {
+        // Flushed once it has fallen to nothing: left to itself on a muted microphone the
+        // recursion decays into the subnormals and stays there, a slow operation every frame.
+        if !self.reduction_db.is_finite() || self.reduction_db < METER_FLOOR_DB {
             self.reduction_db = 0.0;
         }
     }

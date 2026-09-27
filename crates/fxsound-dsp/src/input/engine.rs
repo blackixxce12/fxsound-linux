@@ -29,6 +29,11 @@ const FLOOR_RISE_DB_PER_SECOND: f32 = 0.5;
 const FLOOR_MIN_DB: f32 = -100.0;
 /// How fast the held input peak decays, per block.
 const PEAK_DECAY: f32 = 0.85;
+/// A held peak that has decayed under this is flushed to zero, 180 dB under full scale. On a muted
+/// microphone the decay otherwise runs into the subnormals and sticks at the smallest of them,
+/// where `0.85 ·` rounds back to itself — a slow multiplication on every block for as long as the
+/// microphone stays muted.
+const PEAK_FLOOR: f32 = 1.0e-9;
 /// A sample at or above this counts as clipped: full scale less a hair, because a driver that
 /// clips hands over `0.99997` as often as `1.0`.
 const CLIP_LEVEL: f32 = 0.999;
@@ -65,6 +70,8 @@ pub struct InputEngine {
     capture_sum_squares: f64,
     capture_peak: f32,
     capture_clipped: u64,
+    /// The quietest block with anything in it since the reset, dBFS; `+inf` until there is one.
+    capture_floor_db: f32,
 }
 
 impl InputEngine {
@@ -105,6 +112,7 @@ impl InputEngine {
             capture_sum_squares: 0.0,
             capture_peak: 0.0,
             capture_clipped: 0,
+            capture_floor_db: f32::INFINITY,
         };
         let params = engine.applied;
         engine.chain.apply(&params);
@@ -204,13 +212,15 @@ impl InputEngine {
         }
     }
 
-    /// Zero the four cumulative counters. The wizard sends this on entering each phase; the
-    /// floor and the peak are left alone, because they describe the microphone and not a phase.
+    /// Zero the cumulative counters and forget the phase's quietest block. The wizard sends this
+    /// on entering each phase; the running floor and the held peak are left alone, because they
+    /// describe the microphone and not a phase.
     pub fn reset_capture_stats(&mut self) {
         self.capture_frames = 0;
         self.capture_sum_squares = 0.0;
         self.capture_peak = 0.0;
         self.capture_clipped = 0;
+        self.capture_floor_db = f32::INFINITY;
     }
 
     /// Clear every filter's history.
@@ -325,7 +335,7 @@ impl InputEngine {
         self.capture_frames = self.capture_frames.saturating_add(frames);
         self.capture_clipped = self.capture_clipped.saturating_add(clipped);
         self.capture_peak = self.capture_peak.max(peak);
-        self.input_peak = peak.max(self.input_peak * PEAK_DECAY);
+        self.input_peak = held_peak(peak, self.input_peak);
         if !self.capture_sum_squares.is_finite() {
             self.capture_sum_squares = 0.0;
         }
@@ -344,6 +354,11 @@ impl InputEngine {
         }
         .clamp(FLOOR_MIN_DB, 0.0);
         self.input_rms_db = rms_db;
+        // A block of exact zeros is a microphone not delivering — a Bluetooth headset before its
+        // profile switch, a hardware mute — and says nothing about the room.
+        if mean_sq > 0.0 {
+            self.capture_floor_db = self.capture_floor_db.min(rms_db);
+        }
 
         if rms_db < self.noise_floor_db {
             self.noise_floor_db = rms_db;
@@ -374,8 +389,8 @@ impl InputEngine {
             peak_right = peak_left;
         }
 
-        self.peak_left = peak_left.max(self.peak_left * PEAK_DECAY);
-        self.peak_right = peak_right.max(self.peak_right * PEAK_DECAY);
+        self.peak_left = held_peak(peak_left, self.peak_left);
+        self.peak_right = held_peak(peak_right, self.peak_right);
         self.active = peak_left > 1e-6 || peak_right > 1e-6;
     }
 
@@ -411,6 +426,11 @@ impl InputEngine {
             capture_sum_squares: self.capture_sum_squares,
             capture_peak: self.capture_peak,
             capture_clipped: self.capture_clipped,
+            capture_floor_db: if self.capture_floor_db.is_finite() {
+                self.capture_floor_db
+            } else {
+                FLOOR_MIN_DB
+            },
         }
     }
 
@@ -425,6 +445,13 @@ impl InputEngine {
     pub const fn chain(&self) -> &InputChain {
         &self.chain
     }
+}
+
+/// A block's peak against the one held from before, decayed by a block: the larger of the two,
+/// and nothing once the held one has fallen under [`PEAK_FLOOR`].
+fn held_peak(peak: f32, held: f32) -> f32 {
+    let held = peak.max(held * PEAK_DECAY);
+    if held < PEAK_FLOOR { 0.0 } else { held }
 }
 
 /// Ten milliseconds at a rate, at least one frame.
@@ -910,6 +937,62 @@ mod tests {
         assert_eq!(meters.noise_floor_db, FLOOR_MIN_DB);
         assert_eq!(meters.input_rms_db, FLOOR_MIN_DB);
         assert_eq!(meters.input_peak, 0.0);
+        assert_eq!(meters.capture_floor_db, FLOOR_MIN_DB);
+    }
+
+    #[test]
+    fn the_capture_floor_is_the_phases_quietest_block_and_digital_zeros_are_not_a_room() {
+        // What the calibration's silence phase reads its floor from. A Bluetooth headset hands
+        // over zeros until it has switched profile, and the running floor follows them to the
+        // bottom and climbs back at half a decibel a second, so three seconds after a −60 dBFS
+        // room arrives it still reads −98 — the wizard took that for the room. The phase's own
+        // quietest block leaves the zeros out, and starts afresh with each phase.
+        let mut engine = InputEngine::new(FS, 1_024, 1);
+        run(&mut engine, &noise(-30.0, FS as usize), 1);
+        engine.handle_event(DspEvent::ResetCaptureStats);
+        assert_eq!(
+            engine.meters().capture_floor_db,
+            FLOOR_MIN_DB,
+            "nothing yet"
+        );
+
+        run(&mut engine, &vec![0.0; FS as usize * 3 / 2], 1);
+        assert_eq!(
+            engine.meters().capture_floor_db,
+            FLOOR_MIN_DB,
+            "zeros alone are no floor"
+        );
+        run(&mut engine, &noise(-60.0, FS as usize * 3 / 2), 1);
+        let meters = engine.meters();
+        assert!(
+            meters.noise_floor_db < -95.0,
+            "premise: the running floor is still climbing, at {}",
+            meters.noise_floor_db
+        );
+        assert!(
+            (meters.capture_floor_db + 60.0).abs() < 1.5,
+            "the phase's quietest block reads {} against a −60 dBFS room",
+            meters.capture_floor_db
+        );
+
+        // A louder phase does not inherit the quieter one's floor.
+        engine.handle_event(DspEvent::ResetCaptureStats);
+        run(&mut engine, &noise(-40.0, FS as usize), 1);
+        let floor = engine.meters().capture_floor_db;
+        assert!((floor + 40.0).abs() < 1.5, "the next phase reads {floor}");
+    }
+
+    #[test]
+    fn a_held_peak_falls_to_zero_rather_than_into_the_subnormals() {
+        // Decaying by 0.85 a block from a talker's peak, the held input peak reached the
+        // subnormals after about five seconds of a muted microphone and stuck at the smallest of
+        // them, where `0.85 ·` rounds back to itself: a slow multiplication on every block.
+        let mut engine = InputEngine::new(FS, 480, 2);
+        run(&mut engine, &voice(-6.0, 9_600), 2);
+        run(&mut engine, &vec![0.0; FS as usize * 2 * 8], 2);
+        let meters = engine.meters();
+        assert_eq!(meters.input_peak, 0.0);
+        assert_eq!((meters.peak_left, meters.peak_right), (0.0, 0.0));
     }
 
     #[test]

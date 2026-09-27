@@ -64,6 +64,12 @@ where
         .map(|(x, (y, z))| (x, y, z))
 }
 
+// fxsound: what `Biquad::filter` flushes its state to zero under.
+/// A filter state smaller than this is flushed to zero at the end of [`Biquad::filter`]. In the
+/// library's 16-bit range it is 690 dB under full scale, so nothing that can be heard is touched;
+/// what it stops is the high-pass's decay into a limit cycle on digital silence (see `filter`).
+const STATE_FLUSH: f32 = 1.0e-30;
+
 /// A basic high-pass filter.
 pub const BIQUAD_HP: Biquad = Biquad {
     a: [-1.99599, 0.99600],
@@ -92,6 +98,14 @@ impl Biquad {
     /// call this function multiple times with the same `mem` buffer, the output will be as though
     /// you had called it once with a longer `input`. The first time you call `filter` on a given
     /// signal, `mem` should be zero.
+    ///
+    /// A state that has decayed under `1e-30` is flushed to zero at the end of each call. Upstream
+    /// has no such step, and on digital silence — a microphone muted in hardware — its high-pass
+    /// never reaches zero: the poles sit at a radius of 0.998, the state is rounded to `f32` after
+    /// every step, and once it is subnormal the rounding holds it in a limit cycle around `5e-43`
+    /// for good. Every frame after that windowed, transformed and pitch-searched subnormal data
+    /// before the silence check skipped the network, per channel, for as long as the microphone
+    /// stayed muted. So silence is no longer upstream's bit for bit; audio is.
     pub fn filter(&self, output: &mut [f32], mem: &mut [f32; 2], input: &[f32]) {
         let a0 = self.a[0] as f64;
         let a1 = self.a[1] as f64;
@@ -103,6 +117,12 @@ impl Biquad {
             mem[0] = (mem[1] as f64 + (b0 * x64 - a0 * y64)) as f32;
             mem[1] = (b1 * x64 - a1 * y64) as f32;
             *y = y64 as f32;
+        }
+        // fxsound: flush a state that has decayed to nothing, before it can become subnormal.
+        for state in mem.iter_mut() {
+            if state.abs() < STATE_FLUSH {
+                *state = 0.0;
+            }
         }
     }
 
@@ -123,6 +143,68 @@ impl Biquad {
             mem[0] = (mem[1] as f64 + (b0 * x64 - a0 * y64)) as f32;
             mem[1] = (b1 * x64 - a1 * y64) as f32;
             *x = y64 as f32;
+        }
+    }
+}
+
+// fxsound: the registry crate had no tests here.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_high_pass_comes_to_rest_at_zero_on_digital_silence() {
+        // Upstream's filter, with its state rounded to `f32` after every step, decays into the
+        // subnormals on a muted microphone and circles there around 5e-43 for good. A second
+        // of a loud tone, then three of zeros: the state has to be exactly zero, and so does
+        // what the filter hands on, from then on.
+        let mut mem = [0.0; 2];
+        let tone: Vec<f32> = (0..48_000)
+            .map(|n| (n as f32 * std::f32::consts::TAU * 300.0 / 48_000.0).sin() * 16_000.0)
+            .collect();
+        let mut out = vec![0.0; 480];
+        for frame in tone.chunks_exact(480) {
+            BIQUAD_HP.filter(&mut out, &mut mem, frame);
+        }
+        let zeros = [0.0; 480];
+        for _ in 0..300 {
+            BIQUAD_HP.filter(&mut out, &mut mem, &zeros);
+        }
+        assert_eq!(mem, [0.0, 0.0]);
+        BIQUAD_HP.filter(&mut out, &mut mem, &zeros);
+        assert!(out.iter().all(|y| *y == 0.0));
+    }
+
+    #[test]
+    fn a_signal_is_filtered_exactly_as_upstream_filters_it() {
+        // The flush is for a state that has decayed to nothing; anything that can be heard runs
+        // upstream's arithmetic unchanged. Upstream's loop, verbatim, as the reference.
+        let upstream = |output: &mut [f32], mem: &mut [f32; 2], input: &[f32]| {
+            let (a0, a1) = (BIQUAD_HP.a[0] as f64, BIQUAD_HP.a[1] as f64);
+            let (b0, b1) = (BIQUAD_HP.b[0] as f64, BIQUAD_HP.b[1] as f64);
+            for (&x, y) in input.iter().zip(output) {
+                let x64 = x as f64;
+                let y64 = x64 + mem[0] as f64;
+                mem[0] = (mem[1] as f64 + (b0 * x64 - a0 * y64)) as f32;
+                mem[1] = (b1 * x64 - a1 * y64) as f32;
+                *y = y64 as f32;
+            }
+        };
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let hiss: Vec<f32> = (0..48_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as f32 / 8_388_608.0 - 1.0) * 3.0
+            })
+            .collect();
+        let (mut ours, mut theirs) = ([0.0; 2], [0.0; 2]);
+        let (mut got, mut want) = (vec![0.0; 480], vec![0.0; 480]);
+        for frame in hiss.chunks_exact(480) {
+            BIQUAD_HP.filter(&mut got, &mut ours, frame);
+            upstream(&mut want, &mut theirs, frame);
+            assert_eq!(got, want);
         }
     }
 }

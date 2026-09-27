@@ -18,7 +18,9 @@ contract.
 
 The rule for this copy: the source stays as close to upstream as it can, so that a future upstream
 diff still applies, and **every change is marked `// fxsound:` in the source**. Nothing the
-original computed was changed; the tests at the end of this file hold it to that.
+original computed on audio was changed; the tests at the end of this file hold it to that. The
+one arithmetic change is on digital silence, where the input high-pass now comes to rest at zero
+instead of in a subnormal limit cycle (*Changed inside*, `util.rs`).
 
 ## Changes from nnnoiseless 0.5.2
 
@@ -84,6 +86,15 @@ below and nothing else, apart from rustfmt collapsing three one-line `if … els
 
 ### Changed inside
 
+- `util.rs` `Biquad::filter` flushes each of its two state values to zero at the end of a call
+  once it has decayed under `1e-30` (a new private constant, `STATE_FLUSH`). Upstream's input
+  high-pass has its poles at a radius of 0.998 and rounds its state to `f32` after every step, so
+  on digital silence — a microphone muted in hardware — it decays into the subnormals and circles
+  there, around `5e-43`, for good; every frame after that windowed, transformed and pitch-searched
+  subnormal data before the silence check skipped the network, per channel and again in each
+  `Stft`. `1e-30` is 690 dB under full scale in the library's 16-bit range, so what can be heard
+  is filtered exactly as upstream filters it, and silence reaches exact zeros; the one thing that
+  differs from upstream is the last few frames of a decay into silence.
 - `lib.rs` `common()`: `OnceCell::get_or_init` in place of a `get().is_none()` probe, a `set` and
   a `get().unwrap()`. The same tables, built once, without an `unwrap` on the audio path.
 - `pitch.rs` `PitchFinder::new`: the run-time `assert!` on four constants is a `const _: () =
@@ -155,6 +166,10 @@ the cost of one more hunk against upstream; it has not been, because it does not
 in `src/stft.rs`: `with_unity_gains_it_is_an_identity_delayed_by_one_frame`,
 `a_zero_gain_takes_the_band_out`, `a_reset_transform_starts_from_silence`;
 
+in `src/util.rs`: `the_high_pass_comes_to_rest_at_zero_on_digital_silence` and
+`a_signal_is_filtered_exactly_as_upstream_filters_it` (upstream's loop, verbatim, as the
+reference);
+
 and in `src/fft.rs`: `the_forward_transform_is_easyffts_bit_for_bit`,
 `the_inverse_transform_is_easyffts_bit_for_bit` and
 `the_frequency_bins_are_the_range_upstreams_pitch_filter_was_written_against`.
@@ -162,7 +177,9 @@ and in `src/fft.rs`: `the_forward_transform_is_easyffts_bit_for_bit`,
 Over in `fxsound-dsp`, `tests/rt_allocations.rs` builds the denoiser on one thread and runs it
 on another that has never run it, in every channel mode, under a counting allocator, and holds
 it — and so `reset`, `analyse`, `synthesise` and `Stft` — to zero allocations from the very first
-frame. With `easyfft`'s thread-local transforms, that first frame allocated 48 times.
+frame. With `easyfft`'s thread-local transforms, that first frame allocated 48 times. The same
+file holds the denoiser, in every mode, to no subnormal arithmetic on a muted microphone, read
+from the processor's own sticky flags.
 
 ## Taking a newer upstream
 

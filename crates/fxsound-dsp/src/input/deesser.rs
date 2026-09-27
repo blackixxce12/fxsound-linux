@@ -30,10 +30,10 @@
 //! `min(requested, bandwidth / 4)`, so that headset still gets a de-esser at 4 kHz instead of a
 //! stage that says it is unavailable; below 12 kHz of bandwidth there is no sibilance band left
 //! to split off and the stage stands aside. Moving the corner moves the band the threshold is
-//! measured in, so the threshold is offset by the change in the band's *relative* width — a
-//! band that covers more of the spectrum collects more of a broadband sibilant and would trip
-//! earlier at the same number. `Classic` carries no offset, so a preset means in 0.4.0 exactly
-//! what it meant in 0.3.0.
+//! measured in, so the threshold is offset by the change in the band's *relative* width — its
+//! share of the spectrum the source carries, not of the stream's — since a band that covers
+//! more of the spectrum collects more of a broadband sibilant and would trip earlier at the same
+//! number. `Classic` carries no offset, so a preset means in 0.4.0 exactly what it meant in 0.3.0.
 //!
 //! Real-time safe: four sections and a compressor, all fixed, none of it allocating.
 
@@ -258,8 +258,8 @@ impl DeEsser {
     }
 
     /// What the adaptive mode added to the threshold, in dB: `10·log10` of the ratio between the
-    /// band's relative width as built and as the preset meant it at 48 kHz. Zero in the classic
-    /// mode.
+    /// band's relative width as built — its share of the source's bandwidth, `min(stream rate,
+    /// source rate)` — and as the preset meant it at 48 kHz. Zero in the classic mode.
     #[must_use]
     pub const fn threshold_offset_db(&self) -> Real {
         self.offset_db
@@ -270,15 +270,15 @@ impl DeEsser {
         self.realised = 0.0;
         self.offset_db = 0.0;
 
+        // What the source can carry: the stream's rate, or a narrower source's own — a 16 kHz
+        // Bluetooth microphone on the 48 kHz stream the engine asks for.
+        let bandwidth = self
+            .source_rate
+            .map_or(self.sample_rate, |rate| rate.min(self.sample_rate));
         let corner = match self.mode {
             DeEsserMode::Classic => Some(self.frequency),
-            DeEsserMode::Adaptive => {
-                let bandwidth = self
-                    .source_rate
-                    .map_or(self.sample_rate, |rate| rate.min(self.sample_rate));
-                (bandwidth >= MIN_ADAPTIVE_BANDWIDTH)
-                    .then(|| self.frequency.min(ADAPTIVE_FRACTION * bandwidth))
-            }
+            DeEsserMode::Adaptive => (bandwidth >= MIN_ADAPTIVE_BANDWIDTH)
+                .then(|| self.frequency.min(ADAPTIVE_FRACTION * bandwidth)),
         };
         let Some((corner, request)) =
             corner.and_then(|corner| prewarped(self.sample_rate, corner).map(|r| (corner, r)))
@@ -289,7 +289,11 @@ impl DeEsser {
         self.active = true;
         self.realised = corner;
         if self.mode == DeEsserMode::Adaptive {
-            let built = (self.sample_rate / 2.0 - corner) / (self.sample_rate / 2.0);
+            // The band's share of the spectrum the source has, not of the stream's: a 16 kHz
+            // source on a 48 kHz stream puts nothing above 8 kHz, so a band from 4 kHz holds half
+            // of what there is. Measured against the stream's Nyquist it read as five sixths,
+            // and the threshold came out 2.2 dB too high on exactly the headsets this mode is for.
+            let built = (bandwidth / 2.0 - corner) / (bandwidth / 2.0);
             let meant = (REFERENCE_RATE / 2.0 - self.frequency) / (REFERENCE_RATE / 2.0);
             if built > 0.0 && meant > 0.0 {
                 let offset = 10.0 * (built / meant).log10();
@@ -717,9 +721,63 @@ mod tests {
             deesser.threshold_offset_db()
         );
         assert!(want < 0.0 && want > -3.0, "{want}");
+        // The production case: a 16 kHz Bluetooth source on the 48 kHz stream the engine asks
+        // for. Its band is the same [4 kHz, 8 kHz] of the same 8 kHz the source carries, so it
+        // is the same offset — not the +0.46 dB the stream's own Nyquist made of it, which read
+        // the band as [4 kHz, 24 kHz].
+        let deesser = adaptive(48_000.0, Some(16_000.0), 5_500.0);
+        assert!(
+            (deesser.threshold_offset_db() - want).abs() < 1.0e-4,
+            "48 kHz stream, 16 kHz source: {} against {want}",
+            deesser.threshold_offset_db()
+        );
         // Where nothing moved, nothing is offset.
         let deesser = adaptive(48_000.0, None, 5_500.0);
         assert_eq!(deesser.threshold_offset_db(), 0.0);
+        let deesser = adaptive(48_000.0, Some(48_000.0), 5_500.0);
+        assert_eq!(deesser.threshold_offset_db(), 0.0);
+    }
+
+    /// White noise at `rate`, deterministic, with an RMS of `rms_db`.
+    fn white(rate: Real, seconds: Real, rms_db: Real) -> Vec<Real> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let amplitude = db_to_linear(rms_db) * 3.0_f32.sqrt();
+        (0..(rate * seconds) as usize)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 40) as Real / 8_388_608.0 - 1.0) * amplitude
+            })
+            .collect()
+    }
+
+    /// `signal` at three times its rate: what a 16 kHz Bluetooth microphone looks like on the
+    /// 48 kHz stream the engine asks for — nothing above 8 kHz, the same power. A Blackman-windowed
+    /// sinc over 64 of the source's samples each side, interpolating, so every third sample is the
+    /// source's own.
+    fn upsampled_by_three(signal: &[Real]) -> Vec<Real> {
+        const REACH: isize = 192;
+        let tap = |m: isize| -> f64 {
+            if m == 0 {
+                return 1.0;
+            }
+            let x = std::f64::consts::PI * m as f64 / 3.0;
+            let window = 0.42
+                + 0.5 * (std::f64::consts::PI * m as f64 / REACH as f64).cos()
+                + 0.08 * (2.0 * std::f64::consts::PI * m as f64 / REACH as f64).cos();
+            x.sin() / x * window
+        };
+        let len = signal.len() as isize;
+        (0..len * 3)
+            .map(|j| {
+                let first = (j - REACH).div_euclid(3).max(0);
+                let last = (j + REACH).div_euclid(3).min(len - 1);
+                (first..=last)
+                    .map(|n| f64::from(signal[n as usize]) * tap(j - 3 * n))
+                    .sum::<f64>() as Real
+            })
+            .collect()
     }
 
     #[test]
@@ -728,22 +786,28 @@ mod tests {
         // and at 16 kHz through the adaptive one has to draw the same reduction to within a
         // decibel: the band at 16 kHz holds less of the noise, and the offset is what makes up
         // the difference. Read from the band compressor's own gain, averaged over the last half
-        // second, so the crossover's leak is not in the figure.
-        let settled_reduction = |rate: Real, mode: DeEsserMode| {
+        // second, so the crossover's leak is not in the figure. The last row is the case the
+        // adaptive mode exists for, a 16 kHz headset on a 48 kHz stream: measured against the
+        // stream's bandwidth rather than the source's, its threshold sat 2.2 dB too high and it
+        // drew 4.0 dB where the preset asks for 6.5. It draws 5.8 now; the rest is the
+        // crossover at 48 kHz against the one at 16.
+        let settled_reduction = |rate: Real, source: Option<Real>, mode: DeEsserMode| {
             let mut deesser = DeEsser::new(rate);
             deesser.set_frequency(5500.0);
             deesser.set_threshold_db(-22.0);
             deesser.set_mode(mode);
-            let mut state = 0x2545_f491_4f6c_dd1d_u64;
-            let frames = rate as usize * 2;
-            let amplitude = db_to_linear(-12.0) * 3.0_f32.sqrt();
+            deesser.set_source_rate(source);
+            let fixture = match source {
+                Some(narrow) if narrow < rate => {
+                    assert_eq!(rate, narrow * 3.0, "the fixture is upsampled by three");
+                    upsampled_by_three(&white(narrow, 2.0, -12.0))
+                }
+                _ => white(rate, 2.0, -12.0),
+            };
+            let frames = fixture.len();
             let mut sum = 0.0;
             let mut count = 0.0;
-            for n in 0..frames {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                let x = ((state >> 40) as Real / 8_388_608.0 - 1.0) * amplitude;
+            for (n, &x) in fixture.iter().enumerate() {
                 let mut frame = [x];
                 deesser.process_frame(&mut frame);
                 if n > frames * 3 / 4 {
@@ -751,19 +815,22 @@ mod tests {
                     count += 1.0;
                 }
             }
-            assert!(deesser.is_active(), "{rate} Hz {mode:?}");
+            assert!(deesser.is_active(), "{rate} Hz {source:?} {mode:?}");
             sum / count
         };
-        let reference = settled_reduction(48_000.0, DeEsserMode::Classic);
-        let adapted = settled_reduction(16_000.0, DeEsserMode::Adaptive);
+        let reference = settled_reduction(48_000.0, None, DeEsserMode::Classic);
         assert!(
             reference > 3.0,
             "premise: the fixture drives the stage, {reference}"
         );
-        assert!(
-            (reference - adapted).abs() < 1.0,
-            "48 kHz classic draws {reference:.2} dB, 16 kHz adaptive {adapted:.2}"
-        );
+        for (rate, source) in [(16_000.0, None), (48_000.0, Some(16_000.0))] {
+            let adapted = settled_reduction(rate, source, DeEsserMode::Adaptive);
+            assert!(
+                (reference - adapted).abs() < 1.0,
+                "48 kHz classic draws {reference:.2} dB, {rate} Hz adaptive with source \
+                 {source:?} {adapted:.2}"
+            );
+        }
     }
 
     #[test]

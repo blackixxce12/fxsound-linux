@@ -30,10 +30,12 @@
 //! channel. One thing was replaced: the FFT is planned by each state when it is built
 //! ([`Spectrum`] and `src/fft.rs`) rather than through `easyfft`'s per-thread cache on the first
 //! frame, so that nothing a state does after its constructor allocates — its first frame on a
-//! real-time thread included. Nothing the original computed was changed: `process_frame` is held
-//! to the original arithmetic sample for sample by a test, and the new transforms to `easyfft`'s
-//! bit for bit. `README.md` lists every change file by file, with what was dropped and the one
-//! `unsafe` block that stays.
+//! real-time thread included. Nothing the original computed on audio was changed: `process_frame`
+//! is held to the original arithmetic sample for sample by a test, and the new transforms to
+//! `easyfft`'s bit for bit. The one arithmetic change is on digital silence: the input high-pass
+//! flushes a state that has decayed under `1e-30` to zero, where upstream's settled into a
+//! subnormal limit cycle for good (`Biquad::filter`, in `util.rs`). `README.md` lists every change
+//! file by file, with what was dropped and the one `unsafe` block that stays.
 
 use once_cell::sync::OnceCell;
 

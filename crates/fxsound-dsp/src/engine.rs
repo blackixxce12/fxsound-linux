@@ -666,6 +666,7 @@ impl Engine {
             capture_sum_squares: 0.0,
             capture_peak: 0.0,
             capture_clipped: 0,
+            capture_floor_db: 0.0,
         }
     }
 

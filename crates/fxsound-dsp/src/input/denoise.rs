@@ -60,6 +60,18 @@
 //! network, the most expensive thing in the chain, on every chain that has it off, which is most
 //! of them. Two tests pin both halves: the cost is exactly the latency and not a sample more,
 //! and the toggle that is undone in time costs nothing.
+//!
+//! **A change of channel mode is not a restart either**, and it must not bring anything back.
+//! Each mode leaves part of the stage idle — the networks past the first outside the independent
+//! mode, the per-channel transforms outside the linked one — and an idle network or transform
+//! still holds its input window and its overlap-add tail. Taken back into use as they stood, they
+//! played the last ten or twenty milliseconds they had heard, however long ago that was: speech
+//! from before a switch to linked came out of a muted microphone at −8 dBFS on the switch back.
+//! So whatever a mode takes into use that the frame before did not use is started afresh and
+//! primed with that frame's input, and the one network every mode shares keeps its synthesis
+//! current in the linked mode, where only its analysis is heard. The first frame in the new mode
+//! is then complete — no replay, and no ten-millisecond gap where a cold transform has nothing to
+//! overlap-add — and a mode switch undone before the next frame is never noticed.
 
 use crate::biquad::{MAX_CHANNELS, Real};
 use crate::input::processor::{AudioProcessor, ProcessContext, StageMeter};
@@ -81,6 +93,8 @@ const SCALE: Real = 32_768.0;
 const VAD_ATTENUATION_FRAMES: Real = 5.0;
 /// The reduction meter's time constant, in frames: 100 ms, a readout rather than a waveform.
 const METER_FRAMES: Real = 10.0;
+/// A smoothed reduction under this reads as none, a millionth of a decibel, and is flushed to zero.
+const METER_FLOOR_DB: Real = 1.0e-6;
 
 pub struct Denoiser {
     /// One network state per channel: RNNoise is mono, and a stereo microphone's two sides are
@@ -98,6 +112,18 @@ pub struct Denoiser {
     /// Scratch in the library's 16-bit range: the downmix, and one channel at a time.
     downmix: [Real; FRAME],
     scratch: [Real; FRAME],
+    /// Where a synthesis that is run only to keep a network or a transform current puts the
+    /// frame nobody hears.
+    unheard: [Real; FRAME],
+    /// The band gains the first network's frame was synthesised with, shaped: in the downmix
+    /// modes, what every channel was given. A network brought in on the way into the
+    /// independent mode completes its first frame with them, so that frame carries on from the
+    /// mask the channel had.
+    shared_gains: [Real; NB_BANDS],
+    /// The mode the last frame was denoised in, and `None` since a reset — when nothing is idle,
+    /// because everything was cleared. A frame in another mode brings in what that mode uses and
+    /// this one did not; see the module documentation.
+    ran: Option<DenoiseChannelMode>,
     /// Shared across channels, because every channel receives exactly the same number of samples.
     fill: usize,
     read: usize,
@@ -161,6 +187,9 @@ impl Denoiser {
             previous: vec![[0.0; FRAME]; MAX_CHANNELS].into_boxed_slice(),
             downmix: [0.0; FRAME],
             scratch: [0.0; FRAME],
+            unheard: [0.0; FRAME],
+            shared_gains: [1.0; NB_BANDS],
+            ran: None,
             fill: 0,
             // Empty: the first 480 frames out are silence, which is what a ten-millisecond
             // look-behind costs and is why the latency is reported.
@@ -208,15 +237,12 @@ impl Denoiser {
     }
 
     /// One network per channel, one on a downmix copied to every channel, or one on a downmix
-    /// whose gains are applied to each channel's own spectrum. Switching clears the per-channel
-    /// transforms — in place — so the linked mode never overlap-adds a tail it did not synthesise.
+    /// whose gains are applied to each channel's own spectrum. Nothing is restarted here: the
+    /// next frame denoised brings in, afresh and primed, whatever the new mode uses that the last
+    /// frame did not, so no idle network or transform plays back what it heard before an earlier
+    /// switch, and a switch undone before then costs nothing.
     pub fn set_channels(&mut self, mode: DenoiseChannelMode) {
-        if mode != self.mode {
-            self.mode = mode;
-            for stft in &mut self.stfts {
-                stft.reset();
-            }
-        }
+        self.mode = mode;
     }
 
     /// The control surface itself, for a preset that carries a row of its own instead of a
@@ -282,16 +308,25 @@ impl Denoiser {
     /// The last frame's voice probability, `0.0..=1.0`, as the network reports it — for channel
     /// zero in the independent mode and for the downmix otherwise. The gate reads it as a
     /// side-chain when a preset asks (`vad_gate`).
+    ///
+    /// Zero whenever the stage is not running, from the moment it is switched off: the network
+    /// is not listening, so it hears no voice. A probability left standing from the last frame
+    /// it heard re-armed a `vad_gate` gate's hold on every block and kept it open on the room
+    /// until the denoiser came back.
     #[must_use]
-    pub const fn voice_probability(&self) -> Real {
-        self.vad
+    pub fn voice_probability(&self) -> Real {
+        if self.is_active() { self.vad } else { 0.0 }
     }
 
     /// What a meter shows: decibels the stage is taking away, `20·log10(rms_in / rms_out)` per
     /// frame on channel zero, smoothed over about a hundred milliseconds. Zero when inactive.
     #[must_use]
-    pub const fn reduction_db(&self) -> Real {
-        self.reduction_db
+    pub fn reduction_db(&self) -> Real {
+        if self.is_active() {
+            self.reduction_db
+        } else {
+            0.0
+        }
     }
 
     /// Forget everything, in place. Allocates nothing: the network states are zeroed where they
@@ -309,6 +344,7 @@ impl Denoiser {
             stft.reset();
         }
         self.clear_bridge();
+        self.ran = None;
         self.primed = self.is_active();
     }
 
@@ -324,6 +360,7 @@ impl Denoiser {
         }
         self.fill = 0;
         self.read = FRAME;
+        self.shared_gains = [1.0; NB_BANDS];
         self.vad = 0.0;
         self.attenuation = [1.0; MAX_CHANNELS];
         self.reduction_db = 0.0;
@@ -337,7 +374,12 @@ impl Denoiser {
     /// Delaying eight channels by twenty milliseconds and not the ninth would tear the frame apart.
     pub fn process(&mut self, buffer: &mut [Real], channels: usize) {
         if !self.is_active() || channels == 0 || channels > MAX_CHANNELS || buffer.is_empty() {
+            // Standing aside: nothing is heard, so nothing is reported as heard. The voice
+            // probability in particular is a side-chain the gate acts on, not only a meter.
             self.primed = false;
+            self.vad = 0.0;
+            self.reduction_db = 0.0;
+            self.attenuation = [1.0; MAX_CHANNELS];
             return;
         }
         if !self.primed {
@@ -385,17 +427,56 @@ impl Denoiser {
     /// One 480-sample frame per channel, through the network and the control surface.
     fn denoise(&mut self, channels: usize) {
         let channels = channels.min(MAX_CHANNELS);
+        // A mode other than the last frame's: what it uses that the last frame did not has sat
+        // idle since it was last used, and is brought in afresh.
+        let switched = self.ran.is_some_and(|ran| ran != self.mode);
         match self.mode {
-            DenoiseChannelMode::Independent => self.denoise_independent(channels),
-            DenoiseChannelMode::Mono => self.denoise_downmixed(channels, false),
-            DenoiseChannelMode::Linked => self.denoise_downmixed(channels, true),
+            DenoiseChannelMode::Independent => {
+                if switched {
+                    self.bring_in_networks(channels);
+                }
+                self.denoise_independent(channels);
+            }
+            DenoiseChannelMode::Mono => self.denoise_downmixed(channels, false, false),
+            DenoiseChannelMode::Linked => self.denoise_downmixed(channels, true, switched),
         }
+        self.ran = Some(self.mode);
 
         // The dry frame that lines up with what was just synthesised is the one *before* the
         // frame just analysed, because the library's output is a frame late.
         self.mix_and_meter(channels);
         for channel in 0..channels {
             self.previous[channel] = self.pending[channel];
+        }
+    }
+
+    /// On the way into the independent mode: the networks past the first have been idle since
+    /// the stage last ran in it, holding the window and the tail of whatever they heard then.
+    /// Each is reset in place and primed with the frame before this one — the dry frame the
+    /// output is aligned with — so that this frame's synthesis completes it, as it would have if
+    /// the network had been running all along. The priming frame is synthesised with the gains
+    /// the channel was given last frame, not with a cold network's first opinion. The first
+    /// network is the downmix modes' own and was never idle; its window holds the downmix rather
+    /// than the channel, for one frame.
+    fn bring_in_networks(&mut self, channels: usize) {
+        let attenuation = self.attenuation[0];
+        for channel in 1..channels {
+            let (Some(state), Some(previous)) =
+                (self.states.get_mut(channel), self.previous.get(channel))
+            else {
+                continue;
+            };
+            state.reset();
+            for (dst, src) in self.scratch.iter_mut().zip(previous) {
+                *dst = src * SCALE;
+            }
+            state.analyse(&self.scratch);
+            state.synthesise(&self.shared_gains, &mut self.unheard);
+            // The downmix modes kept one attenuation for every channel; each channel carries on
+            // from it rather than from where it stood when this mode was last left.
+            if let Some(slot) = self.attenuation.get_mut(channel) {
+                *slot = attenuation;
+            }
         }
     }
 
@@ -428,6 +509,7 @@ impl Denoiser {
             unscale(ready);
             if channel == 0 {
                 self.vad = vad;
+                self.shared_gains = gains;
             }
         }
     }
@@ -435,7 +517,10 @@ impl Denoiser {
     /// The two downmix modes: one network on the mean of the first two channels, then either
     /// the network's own output to every channel (`Mono`) or its gains through each channel's
     /// own transform (`Linked`). Channels beyond the first two share the pair's gains.
-    fn denoise_downmixed(&mut self, channels: usize, linked: bool) {
+    ///
+    /// `bring_in` says the linked mode's transforms have been idle — the last frame was denoised
+    /// in another mode — and are started afresh here, primed with the frame before this one.
+    fn denoise_downmixed(&mut self, channels: usize, linked: bool, bring_in: bool) {
         let analysed = channels.min(2);
         let weight = SCALE / analysed as Real;
         self.downmix.fill(0.0);
@@ -456,16 +541,33 @@ impl Denoiser {
         let vad = sane_vad(vad);
         shape_gains(&mut gains, vad, &self.control, &mut self.attenuation[0]);
         self.vad = vad;
+        self.shared_gains = gains;
 
         if linked {
+            // Only the network's analysis is heard in this mode, but its synthesis is kept
+            // running into a frame nobody hears: the other two modes synthesise through it, and
+            // a tail left standing here would be played on the way into either of them.
+            state.synthesise(&gains, &mut self.unheard);
             for channel in 0..channels {
-                let (Some(stft), Some(pending), Some(ready)) = (
+                let (Some(stft), Some(pending), Some(previous), Some(ready)) = (
                     self.stfts.get_mut(channel),
                     self.pending.get(channel),
+                    self.previous.get(channel),
                     self.ready.get_mut(channel),
                 ) else {
                     continue;
                 };
+                if bring_in {
+                    // The window a running transform would hold is the frame before this one;
+                    // with it in, this frame's synthesis completes that frame instead of
+                    // overlap-adding onto nothing — which was ten milliseconds of silence.
+                    stft.reset();
+                    for (dst, src) in self.scratch.iter_mut().zip(previous) {
+                        *dst = src * SCALE;
+                    }
+                    stft.push(&self.scratch);
+                    stft.synthesise(&gains, &mut self.unheard);
+                }
                 for (dst, src) in self.scratch.iter_mut().zip(pending) {
                     *dst = src * SCALE;
                 }
@@ -527,7 +629,9 @@ impl Denoiser {
             0.0
         };
         self.reduction_db += (target - self.reduction_db) / METER_FRAMES;
-        if !self.reduction_db.is_finite() {
+        // Flushed once it has fallen to nothing: left to itself on a muted microphone the
+        // recursion decays into the subnormals and stays there, a slow operation every frame.
+        if !self.reduction_db.is_finite() || self.reduction_db < METER_FLOOR_DB {
             self.reduction_db = 0.0;
         }
     }
@@ -537,9 +641,9 @@ impl Denoiser {
     #[must_use]
     pub fn meter(&self) -> StageMeter {
         StageMeter {
-            reduction_db: self.reduction_db,
+            reduction_db: self.reduction_db(),
             running: self.is_active(),
-            aux: self.vad,
+            aux: self.voice_probability(),
         }
     }
 }
@@ -1031,6 +1135,147 @@ mod tests {
             rms(&block[LATENCY * 2..]) > 1.0e-3,
             "and something came through"
         );
+    }
+
+    /// A talker on both sides of a stereo microphone, each side with its own noise.
+    fn stereo_speech(frames: usize) -> Vec<Real> {
+        stereo_fixture()
+            .iter()
+            .copied()
+            .cycle()
+            .take(frames * 2)
+            .collect()
+    }
+
+    fn peak(samples: &[Real]) -> Real {
+        samples.iter().fold(0.0, |most, x| most.max(x.abs()))
+    }
+
+    #[test]
+    fn silence_in_after_a_mode_round_trip_gives_silence_out() {
+        // The idle half of each mode kept what it had heard: the networks past the first outside
+        // the independent mode, the first network's synthesis in the linked one. Speech, a
+        // switch, a second of a muted microphone, the switch back — and the first frames after
+        // it played the speech from before the first switch: at −8 dBFS for speech peaking at
+        // 0.5 (a 0.40 peak on one side and 0.36 on the other from the independent mode through
+        // the linked one and back; 0.38 from mono through linked). Every mode, both ways round.
+        for from in DenoiseChannelMode::ALL {
+            for through in DenoiseChannelMode::ALL {
+                if from == through {
+                    continue;
+                }
+                let mut d = with_level(DenoiseLevel::Light);
+                d.set_channels(from);
+                let mut block = stereo_speech(FRAME * 50);
+                d.process(&mut block, 2);
+                d.set_channels(through);
+                let mut block = vec![0.0; FRAME * 100 * 2];
+                d.process(&mut block, 2);
+                d.set_channels(from);
+                let mut block = vec![0.0; FRAME * 20 * 2];
+                d.process(&mut block, 2);
+                assert!(
+                    peak(&block) < 1.0e-6,
+                    "{from:?} → {through:?} → {from:?}: a muted microphone played {} back",
+                    peak(&block)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_mode_switch_in_the_middle_of_a_sentence_neither_drops_nor_replays_a_frame() {
+        // The other way into the linked mode, before the fix: its transforms were cleared on the
+        // switch and the first frame out overlap-added onto nothing, ten milliseconds of silence
+        // in the middle of a word. Here every gain is held at unity — a pinned voice probability
+        // and full preservation — so each mode is a delay of the input, and every frame around a
+        // switch has to be the input's frame, in level and in shape. The same signal on both
+        // sides, so that the mono mode's downmix is that signal too. White noise, and so a
+        // steady 0.9 of its shape and 0.8 dB under its level in every mode: the library zeroes
+        // what is above 20 kHz. The frame a mode brings a network in on reads 0.90 and −1.3 dB.
+        let control = DenoiseControl {
+            voice_preservation: 1.0,
+            ..DenoiseLevel::Medium.control()
+        };
+        let frames = FRAME * 40;
+        let mono = noise(frames, 0.1);
+        let input: Vec<Real> = mono.iter().flat_map(|&x| [x, x]).collect();
+        for from in DenoiseChannelMode::ALL {
+            for to in DenoiseChannelMode::ALL {
+                if from == to {
+                    continue;
+                }
+                let mut d = with_level(DenoiseLevel::Medium);
+                d.set_control(control);
+                d.vad_override = Some(1.0);
+                d.set_channels(from);
+                let split = FRAME * 20 * 2;
+                let mut out = input.clone();
+                d.process(&mut out[..split], 2);
+                d.set_channels(to);
+                d.process(&mut out[split..], 2);
+
+                // From a few frames before the switch reaches the output to a few after it.
+                for k in 16..28 {
+                    for channel in 0..2 {
+                        let at = |signal: &[Real], start: usize| -> Vec<Real> {
+                            (start..start + FRAME)
+                                .map(|n| signal[n * 2 + channel])
+                                .collect()
+                        };
+                        let dry = at(&input, k * FRAME);
+                        let wet = at(&out, k * FRAME + LATENCY);
+                        let correlation = dry.iter().zip(&wet).map(|(a, b)| a * b).sum::<Real>()
+                            / (rms(&dry) * rms(&wet) * FRAME as Real).max(1.0e-12);
+                        let level = 20.0 * (rms(&wet).max(1.0e-9) / rms(&dry)).log10();
+                        assert!(
+                            correlation > 0.85 && level.abs() < 2.0,
+                            "{from:?} → {to:?}, frame {k} channel {channel}: {correlation:.3} \
+                             of the input's shape, at {level:.1} dB of its level"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switched_off_it_hears_no_voice_and_takes_nothing_away() {
+        // The voice probability is the gate's side-chain as well as a meter. Left at the last
+        // frame's 0.9 when the stage stood aside, it held a `vad_gate` gate open on the room for
+        // as long as the denoiser stayed off, and the meters went on reporting a voice and a
+        // reduction next to `denoiser_running = false`. Three ways to stand aside, each read
+        // before the next block and after it.
+        type Way = (&'static str, fn(&mut Denoiser));
+        let ways: [Way; 3] = [
+            ("switched off", |d| d.set_enabled(false)),
+            ("set to Off", |d| d.set_level(DenoiseLevel::Off)),
+            ("mixed fully dry", |d| {
+                d.set_control(DenoiseControl {
+                    wet_dry: 0.0,
+                    ..DenoiseLevel::Strong.control()
+                });
+            }),
+        ];
+        for (way, stand_aside) in ways {
+            let mut d = with_level(DenoiseLevel::Strong);
+            d.vad_override = Some(0.9);
+            let mut block = hum_and_hiss(FRAME * 60);
+            d.process(&mut block, 1);
+            assert_eq!(d.voice_probability(), 0.9, "premise");
+            assert!(d.reduction_db() > 10.0, "premise: {}", d.reduction_db());
+
+            stand_aside(&mut d);
+            assert!(!d.is_active());
+            for when in ["at once", "after a block"] {
+                assert_eq!(d.voice_probability(), 0.0, "{way}, {when}");
+                assert_eq!(d.reduction_db(), 0.0, "{way}, {when}");
+                let meter = d.meter();
+                assert_eq!((meter.aux, meter.reduction_db), (0.0, 0.0), "{way}, {when}");
+                let mut block = hum_and_hiss(FRAME * 4);
+                d.process(&mut block, 1);
+            }
+        }
     }
 
     #[test]

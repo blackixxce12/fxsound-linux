@@ -4,7 +4,7 @@
 //! what the input lane measured into a voice preset:
 //!
 //! ```text
-//! Intro ─Start─► Waking ─processing─► Silence 3 s ─► Speech 5 s ─► Loud 2 s ─► Analysing ─► Result
+//! Intro ─Start─► Waking ─delivering─► Silence 3 s ─► Speech 5 s ─► Loud 2 s ─► Analysing ─► Result
 //!                  │ 5 s                 │               │             │                      │
 //!                  └───────────────────► Failed ◄────────┴─────────────┘      Retry ◄─────────┘
 //! ```
@@ -12,13 +12,15 @@
 //! **Waking.** Start asks the engine to hold the microphone open ([`Command::KeepInputAwake`]):
 //! the input lane's capture is passive while nobody records from FxSound (Input), and a Bluetooth
 //! headset only switches to its microphone profile when something does. Nothing is measured until
-//! the lane is attached to a microphone and processing; five seconds without that is a failure
-//! that says which of the two was missing.
+//! the lane is attached to a microphone and processing — and a Bluetooth microphone until it
+//! delivers something other than digital zeros, which its loopback carries until the profile
+//! switch has finished; five seconds without that is a failure that says what was missing.
 //!
 //! **Measuring.** Each timed phase zeroes the input lane's capture accumulators on entry
 //! ([`Command::ResetCaptureStats`]) and reads them on exit — frames, sum of squares, peak and
 //! clipped samples, all taken *before* the voice chain, so the preset running now does not colour
-//! the measurement. The silence phase also reads the noise-floor estimator and averages the lane's
+//! the measurement. The silence phase's floor is its quietest ten-millisecond block, digital zeros
+//! left out, which the lane also restarts on each reset; the phase also averages the lane's
 //! spectrum for the high-pass choice.
 //!
 //! **Release.** The microphone is let go as soon as nothing more is to be measured: on the way to
@@ -56,14 +58,14 @@ pub const ANALYSIS_TIME: Duration = Duration::from_millis(500);
 /// silent phase is a number the formulas and the settings file can carry rather than `-inf`.
 pub const SILENT_DB: f32 = -120.0;
 
-/// A silence phase whose floor is under this heard digital zeros, not a room. The input lane's
-/// own floor estimator stops at −100 dBFS, so only a capture of exact zeros gets below it.
+/// A level at or under this is digital zeros, not a room: the input lane's levels stop at
+/// −100 dBFS, so only a capture of exact zeros gets there.
 pub const DIGITAL_SILENCE_DB: f32 = -100.0;
 
-/// How far under the silence phase's RMS the floor may be put. The estimator is a minimum tracker
-/// that rises at 0.5 dB/s: a reading further down than this is the estimator still climbing out
-/// of an earlier silence — a Bluetooth microphone that was delivering zeros until the headset
-/// switched profile — rather than the room.
+/// How far under the silence phase's RMS the floor may be put. The floor is the phase's quietest
+/// ten-millisecond block, and in a steady room every block is within a decibel or two of the RMS:
+/// one further down than this is a quiet moment in a room that is not steady — a fan between
+/// cycles — rather than the room a gate has to stay closed on.
 pub const FLOOR_SPREAD_DB: f32 = 6.0;
 
 /// How far over the floor the speech phase has to be for there to have been speech in it. Its
@@ -166,7 +168,8 @@ pub enum Failure {
     /// Attached, but nothing flowed through the lane in the wake-up's five seconds.
     NotStarted,
     /// A phase captured nothing, or the lane stopped, or a Bluetooth microphone handed over
-    /// digital zeros — a headset still in its music profile.
+    /// nothing but digital zeros — a headset still in its music profile — through the wake-up
+    /// or the silence.
     NoSignal,
     /// The speech phase was no louder than the silence.
     NoSpeech,
@@ -202,8 +205,9 @@ pub struct Reading {
     pub peak_db: f32,
     /// Samples (not frames) at full scale.
     pub clipped: u64,
-    /// The noise-floor estimator at the end of the phase, dBFS.
-    pub estimator_db: f32,
+    /// The phase's quietest ten-millisecond block with anything in it, RMS in dBFS; −100 when
+    /// every block was digital zeros.
+    pub quietest_db: f32,
 }
 
 impl Reading {
@@ -220,7 +224,7 @@ impl Reading {
             rms_db,
             peak_db: amplitude_db(meters.capture_peak),
             clipped: meters.capture_clipped,
-            estimator_db: meters.noise_floor_db,
+            quietest_db: meters.capture_floor_db,
         }
     }
 }
@@ -239,20 +243,23 @@ fn amplitude_db(amplitude: f32) -> f32 {
     power_db(f64::from(amplitude) * f64::from(amplitude))
 }
 
-/// The room's floor from the silence phase: the estimator's reading, held between the phase's
-/// RMS and [`FLOOR_SPREAD_DB`] under it.
+/// The room's floor from the silence phase: its quietest block, held between the phase's RMS and
+/// [`FLOOR_SPREAD_DB`] under it.
 ///
-/// The RMS alone would take a cough in the silence for the room, and the estimator — a minimum
-/// tracker, deaf to a cough — alone can still be climbing out of an earlier silence at half a
-/// decibel a second. Each covers the other's blind spot.
+/// The RMS alone would take a cough in the silence for the room, and the quietest block — deaf
+/// to a cough — alone would take one quiet moment of an unsteady room for all of it. Each covers
+/// the other's blind spot. The block is the phase's own: the lane's running floor estimator,
+/// which this used to read, is still climbing out of whatever silence came before the phase at
+/// half a decibel a second — a Bluetooth headset's zeros before its profile switch, a hardware
+/// mute lifted just before Start — and put the floor the whole six decibels under the room.
 #[must_use]
 pub fn floor_db(silence: &Reading) -> f32 {
-    let estimator = if silence.estimator_db.is_finite() {
-        silence.estimator_db
+    let quietest = if silence.quietest_db.is_finite() {
+        silence.quietest_db
     } else {
         silence.rms_db
     };
-    estimator
+    quietest
         .max(silence.rms_db - FLOOR_SPREAD_DB)
         .min(silence.rms_db)
 }
@@ -717,6 +724,18 @@ impl CalibrationState {
                 if lane.processing
                     && let Some(microphone) = lane.microphone()
                 {
+                    // A Bluetooth headset's loopback runs before the headset has switched to its
+                    // hands-free profile, and carries digital zeros until it has: a silence phase
+                    // begun then averaged a second or two of them into the room and read the
+                    // floor up to eleven decibels low. It begins with the first sound instead.
+                    let sounding = lane.meters.input_rms_db > DIGITAL_SILENCE_DB;
+                    if microphone.is_bluetooth() && !sounding {
+                        return if elapsed >= WAKE_TIMEOUT {
+                            self.fail(Failure::NoSignal)
+                        } else {
+                            Vec::new()
+                        };
+                    }
                     self.microphone = microphone;
                     self.enter(Stage::Silence, now);
                     vec![Command::ResetCaptureStats]
@@ -878,8 +897,8 @@ mod tests {
     const HEADPHONES: (&str, &str) = ("bluez_input.00:11:22:33:44:55", "WH-1000XM4");
 
     /// What the input lane's accumulators hold after `seconds` of a signal at `rms_db` RMS
-    /// peaking at `peak_db`, with `clipped` samples at full scale, at 48 kHz — and the floor
-    /// estimator reading `floor_db`.
+    /// peaking at `peak_db`, with `clipped` samples at full scale, at 48 kHz — its quietest block
+    /// at `floor_db`, and the lane's running floor estimator settled there too.
     fn counted(seconds: f32, rms_db: f32, peak_db: f32, clipped: u64, floor_db: f32) -> Meters {
         let frames = (seconds * 48_000.0) as u64;
         Meters {
@@ -887,13 +906,14 @@ mod tests {
             capture_sum_squares: 10_f64.powf(f64::from(rms_db) / 10.0) * frames as f64,
             capture_peak: 10_f32.powf(peak_db / 20.0),
             capture_clipped: clipped,
+            capture_floor_db: floor_db,
             noise_floor_db: floor_db,
             input_rms_db: rms_db,
             ..Meters::default()
         }
     }
 
-    /// A quiet home office: a −55 dBFS room, the estimator a couple of decibels under it.
+    /// A quiet home office: a −55 dBFS room, its quietest block a couple of decibels under it.
     fn quiet_room() -> Meters {
         counted(3.0, -55.0, -40.0, 0, -57.0)
     }
@@ -989,7 +1009,7 @@ mod tests {
         assert!((m.silence_rms_db + 55.0).abs() < 0.01, "{m:?}");
         assert!(
             (m.floor_db + 57.0).abs() < 0.01,
-            "the estimator, two under the RMS: {m:?}"
+            "the quietest block, two under the RMS: {m:?}"
         );
         assert!((m.speech_rms_db + 28.0).abs() < 0.01, "{m:?}");
         assert!((m.speech_peak_db + 8.0).abs() < 0.01, "{m:?}");
@@ -1127,13 +1147,116 @@ mod tests {
 
     #[test]
     fn a_bluetooth_microphone_whose_floor_estimator_is_still_climbing_is_not_taken_for_silence() {
-        // The headset delivered zeros until it switched profile, so the estimator is still near
-        // its bottom; the phase's own RMS says there was a room.
-        let climbing = counted(3.0, -62.0, -50.0, 0, -99.0);
+        // The headset delivered zeros until it switched profile, so the lane's running estimator
+        // is still near its bottom; the phase's own blocks say there was a room.
+        let climbing = Meters {
+            noise_floor_db: -99.0,
+            ..counted(3.0, -62.0, -50.0, 0, -63.0)
+        };
         let t0 = Instant::now();
         let (mut wizard, _) = measuring(HEADPHONES, t0);
         wizard.tick(at(t0, 3.0), &lane(Some(HEADPHONES), &climbing));
         assert_eq!(wizard.phase(), CalibrationPhase::Speech);
+    }
+
+    #[test]
+    fn a_bluetooth_headset_is_measured_from_its_first_sound_and_not_through_its_profile_switch() {
+        // Start holds the microphone open, WirePlumber switches the headset to its hands-free
+        // profile, and the loopback carries digital zeros until the switch is done — processing,
+        // as far as the lane is concerned. The silence phase used to begin at once and average
+        // a second and a half of those zeros into a −58 dBFS room, with the running estimator
+        // pulled to its bottom by them: a floor of −67 where the room is −59, denoising Off
+        // instead of Light and a gate under the room's own level. It waits for the first sound.
+        let t0 = Instant::now();
+        let idle = Meters::default();
+        let mut wizard = CalibrationState::open(&lane(Some(HEADPHONES), &idle), t0);
+        assert_eq!(wizard.start(t0), [Command::KeepInputAwake(true)]);
+        let switching = Meters {
+            input_rms_db: DIGITAL_SILENCE_DB,
+            noise_floor_db: DIGITAL_SILENCE_DB,
+            ..Meters::default()
+        };
+        for seconds in [0.1, 0.8, 1.5] {
+            assert!(
+                wizard
+                    .tick(at(t0, seconds), &lane(Some(HEADPHONES), &switching))
+                    .is_empty(),
+                "at {seconds} s the headset is still switching"
+            );
+            let view = wizard.view(at(t0, seconds));
+            assert_eq!(view.phase, CalibrationPhase::Silence);
+            assert_eq!(view.seconds_left, 3.0, "the countdown waits");
+        }
+        let arriving = Meters {
+            input_rms_db: -58.0,
+            noise_floor_db: -99.5,
+            ..Meters::default()
+        };
+        assert_eq!(
+            wizard.tick(at(t0, 1.5), &lane(Some(HEADPHONES), &arriving)),
+            [Command::ResetCaptureStats],
+            "the phase starts with the first sound"
+        );
+
+        // Three seconds of the room itself, the estimator still climbing out of the zeros.
+        let room = Meters {
+            noise_floor_db: -98.0,
+            ..counted(3.0, -58.0, -46.0, 0, -59.0)
+        };
+        wizard.tick(at(t0, 4.5), &lane(Some(HEADPHONES), &room));
+        wizard.tick(at(t0, 9.5), &lane(Some(HEADPHONES), &talking()));
+        wizard.tick(at(t0, 11.5), &lane(Some(HEADPHONES), &shouting()));
+        wizard.tick(at(t0, 12.0), &lane(Some(HEADPHONES), &shouting()));
+        let result = wizard.result().expect("a result");
+        assert_eq!(result.measurement.floor_db, -59.0, "{result:?}");
+        assert_eq!(result.recommendation.denoise, DenoiseLevel::Light);
+        assert_eq!(result.recommendation.gate_threshold_db, -51.0);
+    }
+
+    #[test]
+    fn a_bluetooth_headset_that_sends_only_zeros_through_the_wake_up_delivered_no_signal() {
+        let t0 = Instant::now();
+        let idle = Meters::default();
+        let mut wizard = CalibrationState::open(&lane(Some(HEADPHONES), &idle), t0);
+        wizard.start(t0);
+        let zeros = Meters {
+            input_rms_db: DIGITAL_SILENCE_DB,
+            ..Meters::default()
+        };
+        assert!(
+            wizard
+                .tick(at(t0, 4.9), &lane(Some(HEADPHONES), &zeros))
+                .is_empty()
+        );
+        assert_eq!(
+            wizard.tick(at(t0, 5.0), &lane(Some(HEADPHONES), &zeros)),
+            [Command::KeepInputAwake(false)]
+        );
+        assert_eq!(wizard.failure(), Some(Failure::NoSignal));
+
+        // A wired microphone's zeros are a silent room, and the phase begins with them.
+        let mut wired = CalibrationState::open(&lane(Some(MIC), &idle), t0);
+        wired.start(t0);
+        assert_eq!(
+            wired.tick(at(t0, 0.1), &lane(Some(MIC), &zeros)),
+            [Command::ResetCaptureStats]
+        );
+    }
+
+    #[test]
+    fn a_hardware_mute_lifted_just_before_start_does_not_pull_the_floor_down() {
+        // A wired microphone muted on its own switch until a moment before Start: the lane's
+        // running estimator followed the mute to −100 dBFS and climbs back at half a decibel a
+        // second, so at the end of the silence it still reads −95 against a −55 dBFS room. The
+        // floor used to come out six under the room's RMS on that account; the phase's own
+        // quietest block is the room.
+        let unmuted = Meters {
+            noise_floor_db: -95.0,
+            ..counted(3.0, -55.0, -40.0, 0, -56.0)
+        };
+        let (wizard, _) = run(MIC, &unmuted, &talking(), &shouting());
+        let result = wizard.result().expect("a result");
+        assert_eq!(result.measurement.floor_db, -56.0, "{result:?}");
     }
 
     #[test]
@@ -1494,20 +1617,21 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_is_the_estimator_held_between_the_silences_rms_and_six_under_it() {
-        let reading = |rms_db: f32, estimator_db: f32| Reading {
+    fn the_floor_is_the_quietest_block_held_between_the_silences_rms_and_six_under_it() {
+        let reading = |rms_db: f32, quietest_db: f32| Reading {
             frames: 1,
             rms_db,
             peak_db: rms_db,
             clipped: 0,
-            estimator_db,
+            quietest_db,
         };
         assert_eq!(floor_db(&reading(-50.0, -53.0)), -53.0);
-        // A cough in the silence: the RMS rose, the estimator did not.
+        // A cough in the silence: the RMS rose, the quietest block did not.
         assert_eq!(floor_db(&reading(-40.0, -53.0)), -46.0);
-        // The estimator still climbing out of an earlier silence.
+        // One quiet moment in a room that is not steady.
         assert_eq!(floor_db(&reading(-60.0, -100.0)), -66.0);
-        // An estimator over the RMS is not believed either.
+        // A block over the RMS — the phase's zeros left out of one and not the other — is not
+        // believed either.
         assert_eq!(floor_db(&reading(-60.0, -58.0)), -60.0);
         assert_eq!(floor_db(&reading(-60.0, f32::NAN)), -60.0);
     }

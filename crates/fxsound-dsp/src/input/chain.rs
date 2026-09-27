@@ -336,7 +336,8 @@ impl InputChain {
     /// Run the chain over one interleaved block, in place.
     ///
     /// The denoiser's voice probability, once it has run, rides along in the context for the
-    /// stages after it; a chain without a denoiser hands them zero.
+    /// stages after it; a chain without a denoiser hands them zero, and so does one whose
+    /// denoiser is standing aside ([`Denoiser::voice_probability`]).
     pub fn process(&mut self, buffer: &mut [Real], channels: usize) {
         if !self.power || channels == 0 || buffer.is_empty() {
             return;
@@ -999,6 +1000,56 @@ mod tests {
             "without the side-chain the pause should close it: {}",
             held_gain(false)
         );
+    }
+
+    #[test]
+    fn a_vad_gate_chain_whose_denoiser_is_switched_off_mid_speech_closes_its_gate() {
+        // The other half of the side-chain: when the network stops listening, the gate stops
+        // being held. Gaming Headset, Noisy Room and Mechanical Keyboard run `vad_gate`, and
+        // switching noise suppression off in the middle of a sentence left the last frame's 0.9
+        // in the context: the gate re-armed its hold on every block and let the keyboard and the
+        // room through, 0 dB of reduction where 20 was due, until something reset the chain.
+        // Through a snapshot, the way the settings and `--noise-suppression` get there, for each
+        // of the ways the stage can stand aside.
+        type Way = (&'static str, fn(&mut InputDspParams));
+        let ways: [Way; 3] = [
+            ("unticked", |p| p.rnnoise = false),
+            ("set to Off", |p| p.denoise_level = DenoiseLevel::Off),
+            ("mixed fully dry", |p| p.denoise_control.wet_dry = 0.0),
+        ];
+        for (way, stand_aside) in ways {
+            let mut chain = InputChain::new(FS);
+            let mut params = InputDspParams {
+                rnnoise: true,
+                denoise_level: DenoiseLevel::Medium,
+                denoise_control: DenoiseLevel::Medium.control(),
+                gate_on: true,
+                gate_threshold_db: -30.0,
+                gate_range_db: -40.0,
+                vad_gate: true,
+                ..InputDspParams::default()
+            };
+            params.sanitise();
+            chain.apply(&params);
+            chain.denoiser_mut().expect("denoiser").vad_override = Some(0.9);
+            let mut speech = tone(300.0, db_to_linear(-20.0), 48_000);
+            chain.process(&mut speech, 1);
+            assert_eq!(chain.meter(StageKind::Denoise).aux, 0.9, "premise");
+
+            stand_aside(&mut params);
+            params.sanitise();
+            chain.apply(&params);
+            assert!(!chain.denoiser().expect("denoiser").is_active(), "{way}");
+            let mut room = tone(300.0, db_to_linear(-50.0), 3 * 48_000);
+            chain.process(&mut room, 1);
+            let reduction = chain.meter(StageKind::Gate).reduction_db;
+            assert!(
+                reduction > 15.0,
+                "{way}: the gate stayed open on a room 20 dB under its threshold, taking \
+                 {reduction:.2} dB off"
+            );
+            assert_eq!(chain.meter(StageKind::Denoise).aux, 0.0, "{way}");
+        }
     }
 
     #[test]

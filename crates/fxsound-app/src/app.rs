@@ -10819,13 +10819,14 @@ mod tests {
     }
 
     /// The input lane's accumulators after `seconds` at `rms_db` RMS with peaks at `peak_db`, at
-    /// 48 kHz, and the floor estimator at `floor_db`.
+    /// 48 kHz, their quietest block and the lane's running floor estimator at `floor_db`.
     fn capture(seconds: f32, rms_db: f32, peak_db: f32, floor_db: f32) -> Meters {
         let frames = (seconds * 48_000.0) as u64;
         Meters {
             capture_frames: frames,
             capture_sum_squares: 10_f64.powf(f64::from(rms_db) / 10.0) * frames as f64,
             capture_peak: 10_f32.powf(peak_db / 20.0),
+            capture_floor_db: floor_db,
             noise_floor_db: floor_db,
             input_rms_db: rms_db,
             ..Meters::default()
@@ -10837,7 +10838,8 @@ mod tests {
     }
 
     /// The meter feed of one run, a reading per phase with the time it is handed over: a −55 dBFS
-    /// room (the estimator at −57), speech at −28 RMS peaking at −8, loud speech that never clips.
+    /// room (its quietest block at −57), speech at −28 RMS peaking at −8, loud speech that never
+    /// clips.
     fn script() -> [(f32, Meters); 4] {
         [
             (3.0, capture(3.0, -55.0, -40.0, -57.0)),
@@ -10848,8 +10850,8 @@ mod tests {
     }
 
     /// A second sitting that measures differently at every number the recommendation turns on,
-    /// and still lands on Clean Voice: a −50 dBFS room (the estimator at −52), speech at −22 RMS
-    /// peaking at −2. The gate comes to −44, the compressor to −28 and the makeup to +8, where
+    /// and still lands on Clean Voice: a −50 dBFS room (its quietest block at −52), speech at −22
+    /// RMS peaking at −2. The gate comes to −44, the compressor to −28 and the makeup to +8, where
     /// [`script`] gives −49, −34 and +14.
     fn nearer_script() -> [(f32, Meters); 4] {
         [

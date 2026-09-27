@@ -732,11 +732,14 @@ for its device.
 .TP
 .BR input_meters ", " echo_cancel
 The microphone's telemetry
-.RB ( voice_probability ", " noise_floor_db ,
+.RB ( voice_probability ,
+0 while the denoiser is not running;
+.BR noise_floor_db ,
 .B null
-until measured, the
+until measured; the
 .B _reduction_db
-of the denoiser, gate, compressor and de-esser, and whether the denoiser and
+of the denoiser, gate, compressor and de-esser, the denoiser's 0 while it is
+not running; and whether the denoiser and
 the de-esser are running), and the echo canceller's
 .BR on " and " running .
 .TP

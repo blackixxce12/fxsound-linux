@@ -555,6 +555,13 @@ pub struct Meters {
     pub capture_peak: f32,
     /// Samples with `|x| >= 0.999` since the reset.
     pub capture_clipped: u64,
+    /// The quietest ten-millisecond block since the reset, RMS in dBFS, blocks of digital zeros
+    /// left out; −100 until a block with anything in it has closed. The calibration wizard's
+    /// floor: unlike `noise_floor_db` it starts afresh with the phase, so a room is not read
+    /// through a microphone's earlier silence — a Bluetooth headset's zeros before its profile
+    /// switch, a hardware mute lifted just before Start — that the running floor is still
+    /// climbing out of at half a decibel a second.
+    pub capture_floor_db: f32,
 }
 
 impl Default for Meters {
@@ -583,6 +590,7 @@ impl Default for Meters {
             capture_sum_squares: 0.0,
             capture_peak: 0.0,
             capture_clipped: 0,
+            capture_floor_db: 0.0,
         }
     }
 }

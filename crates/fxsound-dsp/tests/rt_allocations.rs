@@ -597,3 +597,111 @@ fn dynamic_boost_behind_bass_does_no_subnormal_arithmetic_in_silence() {
         );
     }
 }
+
+/// Whether `stage` does subnormal arithmetic on a muted microphone.
+///
+/// Two seconds of a talker in a room, then `muted` seconds of digital zeros — a USB microphone
+/// muted in hardware, or a capture switch turned off — for every recursion to decay as far as it
+/// is going to, and then one more second of zeros with the flags watched. 480-frame blocks,
+/// stereo. The zeros are exact: in front of the microphone chain there is no filter to leave a
+/// bias residue, which is why its own recursions have to stop somewhere of their own accord.
+#[cfg(target_arch = "x86_64")]
+fn subnormal_arithmetic_on_a_muted_microphone(
+    stage: &mut dyn FnMut(&mut [f32]),
+    muted: usize,
+) -> bool {
+    let talker = stereo_fixture(96_000);
+    let mut block = vec![0.0_f32; 960];
+    for chunk in talker.as_chunks::<960>().0 {
+        block.copy_from_slice(chunk);
+        stage(&mut block);
+    }
+    for _ in 0..muted * 100 {
+        block.fill(0.0);
+        stage(&mut block);
+    }
+    let slow = subnormal_arithmetic_in(|| {
+        for _ in 0..100 {
+            block.fill(0.0);
+            stage(&mut block);
+        }
+    });
+    std::hint::black_box(&block);
+    slow
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_muted_microphone_leaves_the_denoiser_no_subnormal_arithmetic_in_any_mode() {
+    // RNNoise's input high-pass has its poles at a radius of 0.998 and rounds its state to f32
+    // after every step, so on digital silence it decays into the subnormals and settles there in
+    // a limit cycle around 5e-43, for good: every frame after that ran the window, two 960-point
+    // transforms, the band correlations and the pitch search on subnormal data before the
+    // silence check skipped the network — per channel, and again in each linked transform. The
+    // stage's reduction meter decayed the same way.
+    for mode in DenoiseChannelMode::ALL {
+        let mut d = Denoiser::new(FS);
+        d.set_enabled(true);
+        d.set_level(DenoiseLevel::Medium);
+        d.set_control(DenoiseLevel::Medium.control());
+        d.set_channels(mode);
+        assert!(
+            !subnormal_arithmetic_on_a_muted_microphone(&mut |block| d.process(block, 2), 3),
+            "the denoiser in {mode:?} mode did subnormal arithmetic on a muted microphone"
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_muted_microphone_leaves_the_de_reverb_no_subnormal_arithmetic() {
+    // The per-bin power recursion `psd += 0.12·(power − psd)` had no floor: on digital silence it
+    // decayed until `0.12·psd` rounded away a few steps above the smallest subnormal and stopped
+    // there, and every hop after that did subnormal arithmetic in all 241 bins of every channel,
+    // through the history ring and the tail estimate. About four seconds of zeros get it there.
+    let mut d = Dereverb::new(FS);
+    d.set_level(DereverbLevel::Medium);
+    assert!(
+        !subnormal_arithmetic_on_a_muted_microphone(&mut |block| d.process(block, 2), 8),
+        "the de-reverb did subnormal arithmetic on a muted microphone"
+    );
+}
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_muted_microphone_leaves_the_whole_voice_chain_no_subnormal_arithmetic() {
+    // Every stage at once, as a preset runs them, and the engine's own meters around them. Behind
+    // the high-pass, whose bias residue is what "silence" is from there on, the gate's, the
+    // de-esser's and the compressor's detectors squared about 1e-30 on every sample and
+    // underflowed each time; the held input peak decayed into the subnormals and stuck at the
+    // smallest one. With the two tests above, that made the voice chain — stereo, Medium
+    // denoising and Medium de-reverb — cost 0.0182 CPU-seconds per second of a muted microphone
+    // against 0.0125 with the processor flushing subnormals itself (release build, 480-frame
+    // blocks, best of seven runs on a Ryzen 7 6800H; parts that take a microcode assist for each
+    // subnormal operand pay far more). It costs 0.0126 now.
+    let mut band_boost_db = [0.0; fxsound_core::eq::MAX_BANDS];
+    for (band, boost) in band_boost_db.iter_mut().enumerate().take(10) {
+        *boost = if band % 2 == 0 { 4.0 } else { -3.0 };
+    }
+    for mode in DenoiseChannelMode::ALL {
+        let mut params = InputDspParams {
+            rnnoise: true,
+            denoise_level: DenoiseLevel::Medium,
+            denoise_control: DenoiseLevel::Medium.control(),
+            denoise_channels: mode,
+            dereverb: DereverbLevel::Medium,
+            vad_gate: true,
+            band_boost_db,
+            ..InputDspParams::default()
+        };
+        params.sanitise();
+        let mut engine = InputEngine::new(FS, 480, 2);
+        engine.apply(&params);
+        assert!(
+            !subnormal_arithmetic_on_a_muted_microphone(&mut |block| engine.process(block, 2), 8),
+            "the voice chain with {mode:?} denoising did subnormal arithmetic on a muted \
+             microphone"
+        );
+        std::hint::black_box(engine.meters());
+    }
+}
