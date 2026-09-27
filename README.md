@@ -80,8 +80,9 @@ sudo pacman -U fxsound-linux-0.4.0-1-x86_64.pkg.tar.zst
 
 `makepkg` runs the whole test suite as part of the build; pass `--nocheck` to skip it.
 
-From the AUR, two packages: **`fxsound-linux-bin`** installs the prebuilt release tarball and needs
-no Rust toolchain, and **`fxsound-linux-git`** builds the current `main` from source.
+For the AUR there is one recipe, **`fxsound-linux-bin`** (`packaging/aur/fxsound-linux-bin/`): it
+installs the prebuilt release tarball and needs no Rust toolchain. To build from source, use
+`packaging/PKGBUILD` above.
 
 ### Debian and Ubuntu
 

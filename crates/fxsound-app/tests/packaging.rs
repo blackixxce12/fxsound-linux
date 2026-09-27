@@ -366,29 +366,6 @@ fn the_arch_package_installs_the_notices_of_rnnoise_and_noto_beside_its_licence(
     assert_declares_the_notices(&declared, "packaging/PKGBUILD");
 }
 
-#[test]
-fn the_git_package_installs_the_notices_of_rnnoise_and_noto_beside_its_licence() {
-    let tree = Tree::new("git-notices");
-    tree.leave_binary(TREE_VERSION, "built from this tree");
-    // makepkg clones into $srcdir/fxsound-linux.
-    let srcdir = tree.scratch.join("src");
-    fs::create_dir_all(&srcdir).expect("srcdir is made");
-    symlink(tree.root(), srcdir.join("fxsound-linux")).expect("the clone is linked");
-
-    let (pkgdir, declared) = tree.run_package(
-        &repo().join("packaging/aur/fxsound-linux-git/PKGBUILD"),
-        &srcdir,
-        &srcdir,
-        ("", Path::new("")),
-    );
-
-    assert_notices_in(
-        &pkgdir.join("usr/share/licenses/fxsound-linux"),
-        "fxsound-linux-git",
-    );
-    assert_declares_the_notices(&declared, "fxsound-linux-git");
-}
-
 /// The body of the spec section that starts with `header` (`%install`, `%files`): up to the next
 /// line that starts a section.
 fn spec_section<'a>(spec: &'a str, header: &str) -> Vec<&'a str> {

@@ -74,10 +74,6 @@ jobs:
             "$(sed -n 's/^pkgver=//p' packaging/PKGBUILD)"
           check "packaging/aur/fxsound-linux-bin/PKGBUILD pkgver" \
             "$(sed -n 's/^pkgver=//p' packaging/aur/fxsound-linux-bin/PKGBUILD)"
-          # pkgver() recomputes this one from Cargo.toml at build time, so the placeholder can
-          # only mislead — it is what the AUR page shows — which is reason enough to keep it true.
-          check "packaging/aur/fxsound-linux-git/PKGBUILD pkgver" \
-            "$(sed -n 's/^pkgver=\([0-9]*\.[0-9]*\.[0-9]*\).*/\1/p' packaging/aur/fxsound-linux-git/PKGBUILD)"
           # This line, not Cargo.toml, names the .deb.
           deb=$(sed -n '1s/^[^ ]* *(\([^)]*\)).*/\1/p' packaging/debian/changelog)
           check "packaging/debian/changelog head (upstream part)" "${deb%-*}"

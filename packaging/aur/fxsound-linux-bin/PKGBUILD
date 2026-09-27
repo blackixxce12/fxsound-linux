@@ -6,8 +6,8 @@
 # The binary in that tarball is linked against the glibc of the container that built it —
 # debian:bookworm's 2.36, chosen in `.github/workflows/packages.yml` as the oldest worth
 # supporting, so the binary runs on anything newer. This package declares that dependency
-# honestly rather than pretending to be portable: on anything older, build `fxsound-linux-git`
-# from source instead.
+# honestly rather than pretending to be portable: on anything older, build from source with
+# packaging/PKGBUILD in the repository instead.
 
 pkgname=fxsound-linux-bin
 _pkgname=fxsound-linux
@@ -26,7 +26,7 @@ optdepends=(
   'libnotify: desktop notifications'
 )
 provides=("${_pkgname}" 'fxsound')
-conflicts=("${_pkgname}" 'fxsound' 'fxsound-linux-git')
+conflicts=("${_pkgname}" 'fxsound')
 options=('!strip')   # the release build is already stripped of what it can spare
 source=("${url}/releases/download/v${pkgver}/${_pkgname}-${pkgver}-x86_64.tar.gz")
 # Replace on every version bump with the tarball's line from the release's SHA256SUMS — the
