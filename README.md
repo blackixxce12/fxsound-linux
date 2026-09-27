@@ -209,7 +209,14 @@ comes up to be in, when the window comes up minimised after a few seconds.
 
 Fullscreen (Hyprland's `fullscreen` dispatcher, Super+F in many configurations) and maximised
 windows scale the fixed design up to fit the monitor and centre it; the app never draws into a
-corner of an oversized surface.
+corner of an oversized surface. A tile narrower or shorter than the design — a tiling
+compositor's column, such as niri's default half-screen one — scales it down to fit instead of
+cutting it off, to half size at the least. The hamburger menu and the drop-down lists are drawn
+inside the window, and the window does not grow for them: the menu scrolls under the hamburger,
+and a list scrolls between the title bar and the window's bottom edge, over its own box when there
+is no room under it — in the Lite view, four rows of the menu and two and a half of a list show at
+a time. FxSound gives the compositor each view's size as the window's smallest and largest, so
+flipping between Pro and Lite and opening Settings resize a floating window on Hyprland too.
 
 Global shortcuts are the one feature that cannot work the way it does on Windows. A Wayland client
 is not allowed to grab keys it does not have focus for — that is a deliberate security property of
@@ -618,7 +625,9 @@ Each of these is a considered decision, not an oversight:
   manager. The Windows keys for the update check, the hotkey chords, the window position and
   always-on-top are read from an older `settings.toml` without complaint and no longer written back.
 - **Deterministic preset ordering.** The original lists presets in filesystem-glob order, which is
-  arbitrary. This port sorts factory presets numerically and the rest by name.
+  arbitrary. This port lists the factory presets first, the numbered ones in the vendor's order and
+  the rest by name, then the user's own presets by name; a user's copy of a factory preset keeps
+  the factory one's place.
 - **Frame-rate-independent visualizer decay.** The original decays its bars once per timer tick;
   this port decays by elapsed time, so the animation looks the same at 60 and 165 Hz.
 - **Q multiplier no longer resets the band layout.** Changing the filter width in the original

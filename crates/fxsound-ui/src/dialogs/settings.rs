@@ -1788,8 +1788,9 @@ fn general_pane(
         hotkey_note_rect(pane),
     );
 
+    let names = hotkey_name_font(ui.ctx());
     for (index, command) in HotkeyCommand::ALL.into_iter().enumerate() {
-        hotkey_row(ui, hotkey_row_rect(pane, index), command, palette);
+        hotkey_row(ui, hotkey_row_rect(pane, index), command, &names, palette);
     }
 
     if link(
@@ -1806,6 +1807,25 @@ fn general_pane(
     }
 }
 
+/// The font the hotkey table's names are set in: the small font, or the size down to
+/// [`super::MIN_FIT_SCALE`] of it the longest name needs to fit its column — one size for the
+/// five, so the column reads as one. Russian "Использовать предыдущий шаблон" and German
+/// "Vorherige Voreinstellung verwenden" were cut at the small font's size (E6b).
+#[must_use]
+pub fn hotkey_name_font(ctx: &Context) -> egui::FontId {
+    let names = HotkeyCommand::ALL.map(|command| tr(command.label()));
+    hotkey_names_font(ctx, &names)
+}
+
+/// [`hotkey_name_font`] for these five names.
+fn hotkey_names_font(ctx: &Context, names: &[String]) -> egui::FontId {
+    names
+        .iter()
+        .map(|name| super::fitted_font(ctx, name, small_font(), general::HOTKEY_NAME_WIDTH))
+        .min_by(|a, b| a.size.total_cmp(&b.size))
+        .unwrap_or_else(small_font)
+}
+
 /// One row of the hotkey reference table.
 ///
 /// `FxHotkeyLabel` puts a 170-point name beside a 120-point `FxHotkeyEditor` — a focusable text
@@ -1813,12 +1833,18 @@ fn general_pane(
 /// (`FxHotkeyLabel.cpp:56-222`). None of that is drawn here: the field cannot accept a binding on
 /// Wayland, and a bordered box that takes focus and then refuses to do anything is worse than no
 /// box at all. What is left is two columns of text — the command and the command line to bind.
-fn hotkey_row(ui: &mut Ui, rect: Rect, command: HotkeyCommand, palette: Palette) {
+fn hotkey_row(
+    ui: &mut Ui,
+    rect: Rect,
+    command: HotkeyCommand,
+    name_font: &egui::FontId,
+    palette: Palette,
+) {
     let name = Rect::from_min_size(rect.min, vec2(general::HOTKEY_NAME_WIDTH, rect.height()));
     draw_truncated(
         ui.painter(),
         &tr(command.label()),
-        small_font(),
+        name_font.clone(),
         palette.color(FxColor::DefaultText),
         name,
         Align2::LEFT_CENTER,
@@ -2988,6 +3014,40 @@ mod tests {
         );
         // While the system decides, where a new device goes decides nothing.
         assert!(click_settings(&state, prioritize).is_empty());
+    }
+
+    #[test]
+    fn every_languages_hotkey_names_fit_their_column_set_no_smaller_than_seven_tenths() {
+        // E6b: Russian "Использовать следующий шаблон" and German "Nächste Voreinstellung
+        // verwenden" were cut to "Использовать следующий ш…" and "Nächste Voreinstellung verwe…".
+        let ctx = test_context();
+        let mut problems = Vec::new();
+        let per_command = HotkeyCommand::ALL.map(|command| every_translation(command.label()));
+        frame(&ctx, |ui| {
+            for language in 0..per_command[0].len() {
+                let code = per_command[0][language].0;
+                let names: Vec<String> = per_command
+                    .iter()
+                    .map(|all| all[language].1.clone())
+                    .collect();
+                let font = hotkey_names_font(ui.ctx(), &names);
+                for name in &names {
+                    let used = ui
+                        .painter()
+                        .layout_no_wrap(name.clone(), font.clone(), Color32::PLACEHOLDER)
+                        .size()
+                        .x;
+                    if used > general::HOTKEY_NAME_WIDTH {
+                        problems.push(format!("{code}: {name:?} is {used:.0} at {}", font.size));
+                    }
+                }
+                // One size for the column; the small font wherever every name fits it.
+                if code == "en" {
+                    assert_eq!(font, small_font());
+                }
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 
     #[test]
@@ -5189,7 +5249,8 @@ mod tests {
 
     #[test]
     fn the_english_follow_entry_the_captions_and_the_examples_names_fit_whole() {
-        // Measured with the real faces. A translation may be elided; the source language must not.
+        // Measured with the real faces. A translation may be elided, but only one listed in
+        // `FOLLOW_PRESET_ELIDED`; the source language must not.
         let ctx = test_context();
         let line = app_line_rect(app_row(&apps_state(), 0), 0);
         frame(&ctx, |ui| {
@@ -5215,6 +5276,46 @@ mod tests {
                 assert!(used <= room, "{name:?} is {used} in {room}");
             }
         });
+    }
+
+    /// The languages whose FxSound's-preset entry is cut with `…` in the Applications page's
+    /// combos, as the original's combos cut any label too long for them (`FxTheme.cpp:130`), in
+    /// the tables' order. Held exactly: a language that comes to fit leaves the list, and every
+    /// other one must be shown whole.
+    const FOLLOW_PRESET_ELIDED: &[&str] = &[
+        "es", "fr", "it", "nl", "no", "pt", "pt-br", "sl", "fi", "sv", "vi", "tr", "bg", "ar",
+        "fa", "th", "ja",
+    ];
+
+    #[test]
+    fn every_languages_follow_entry_is_shown_whole_in_the_applications_combo_but_the_listed_ones() {
+        // E6b: German "Preset von FxSound" was cut to "Preset von FxSo…"; it is "Wie FxSound" now.
+        // Russian "Шаблон FxSound" measures 113.3 in 113 points and is still drawn whole, egui
+        // letting a line run half a point past its room — so this asks the combo's own layout.
+        let ctx = test_context();
+        let combo = app_combo_rect(app_line_rect(app_row(&apps_state(), 0), 0));
+        let font = crate::theme::semibold(crate::widgets::combo::font_size(combo.height()));
+        let room = crate::widgets::combo::text_box(combo).width();
+        let mut elided = Vec::new();
+        frame(&ctx, |ui| {
+            for (code, text) in every_translation(FOLLOW_PRESET) {
+                if !crate::widgets::combo::shows_whole(ui.painter(), &text, font.clone(), room) {
+                    elided.push(format!("{code}: {text:?}"));
+                }
+            }
+        });
+        for code in ["en", "de", "ru"] {
+            let prefix = format!("{code}: ");
+            assert!(
+                !elided.iter().any(|entry| entry.starts_with(&prefix)),
+                "{code} is cut: {elided:?}"
+            );
+        }
+        let codes: Vec<&str> = elided
+            .iter()
+            .map(|entry| entry.split(':').next().unwrap_or_default())
+            .collect();
+        assert_eq!(codes, FOLLOW_PRESET_ELIDED, "{}", elided.join("\n"));
     }
 
     /// Every translation of `key`, in `font`, that is wider than `room`.

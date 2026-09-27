@@ -51,10 +51,12 @@
 //!
 //! ## Deviations from the original
 //!
-//! * **The popup opens below the box**, using [`egui::Popup`]'s own flip-when-it-does-not-fit
-//!   logic. JUCE positions a `ComboBox` menu so that the *selected* row covers the box, which on a
-//!   120-entry preset list means the menu opens under the pointer with the list scrolled to the
-//!   selection. Reproducing that needs a scroll offset egui's `Popup` does not expose.
+//! * **The popup opens below the box**, over it when it fits there instead, and over the box
+//!   only when neither leaves room for three rows ([`place_list`]), always inside the bounds the
+//!   window sets ([`set_popup_bounds`]). JUCE positions a `ComboBox` menu so that the *selected*
+//!   row covers the box, which on a 120-entry preset list means the menu opens under the pointer
+//!   with the list scrolled to the selection. Reproducing that needs a scroll offset egui's
+//!   `Popup` does not expose.
 //! * **Long lists scroll with a scrollbar**, not with JUCE's top/bottom scroll arrows. The menu
 //!   therefore closes on a click *outside* it or on a picked item, not on any click at all: a
 //!   click on the scrollbar, a separator or a section header leaves it open, which is also what a
@@ -239,6 +241,73 @@ pub fn popup_header_height(row_height: f32) -> f32 {
 #[must_use]
 pub fn popup_header_font_size(row_height: f32) -> f32 {
     popup_font_size(row_height) * HEADER_FONT_RATIO
+}
+
+/// How tall a drop-down's list is with every row showing: its items, its section titles and its
+/// separator, plus the one-point border above and below.
+#[must_use]
+pub fn popup_list_height(items: usize, headers: usize, separator: bool, row_height: f32) -> f32 {
+    items as f32 * row_height
+        + headers as f32 * popup_header_height(row_height)
+        + if separator {
+            popup_separator_height(row_height)
+        } else {
+            0.0
+        }
+        + 2.0
+}
+
+/// How far above the window's bottom edge an open list stops.
+pub const POPUP_WINDOW_MARGIN: f32 = 4.0;
+
+fn popup_bounds_id() -> Id {
+    Id::new("fx_combo_popup_bounds")
+}
+
+/// Where an open list may hang, in points: under the title bar and down to the window's bottom
+/// edge. The window sets it every frame before it draws; without it a list may use all of the
+/// window.
+///
+/// A drop-down cannot leave the window it is drawn in, where the original's `PopupMenu` is a
+/// window of its own, and the window does not grow for it: the Lite window's two lists scroll in
+/// the 128 points under its title bar ([`place_list`]).
+pub fn set_popup_bounds(ctx: &egui::Context, bounds: Rect) {
+    ctx.data_mut(|data| data.insert_temp(popup_bounds_id(), bounds));
+}
+
+fn popup_bounds(ctx: &egui::Context) -> Rect {
+    ctx.data(|data| data.get_temp::<Rect>(popup_bounds_id()))
+        .unwrap_or_else(|| {
+            let window = ctx.content_rect();
+            window.with_max_y(window.bottom() - POPUP_WINDOW_MARGIN)
+        })
+}
+
+/// How many rows a list shows at the least under its box before it goes over the box instead.
+const MIN_ROWS_BELOW: f32 = 3.0;
+
+/// Where a list `list` points tall hangs from the box at `anchor`, inside `bounds`: its top and
+/// its height.
+///
+/// Under the box when all of it fits there, and over the box when all of it fits there instead,
+/// as egui's own popup flips. A longer list scrolls: under the box while [`MIN_ROWS_BELOW`] rows
+/// fit there, and otherwise from as low as it goes in the bounds, over the box, the way a JUCE
+/// menu covers its box. That is the Lite window's two lists: 34 points under their boxes, and
+/// never over the title bar, where egui had pushed them (E6b).
+#[must_use]
+pub fn place_list(anchor: Rect, list: f32, bounds: Rect, row_height: f32) -> (f32, f32) {
+    let below = (bounds.bottom() - anchor.bottom()).max(0.0);
+    let above = (anchor.top() - bounds.top()).max(0.0);
+    if list <= below {
+        (anchor.bottom(), list)
+    } else if list <= above {
+        (anchor.top() - list, list)
+    } else if below >= MIN_ROWS_BELOW * row_height + 2.0 {
+        (anchor.bottom(), below)
+    } else {
+        let height = list.min(bounds.height().max(0.0));
+        ((bounds.bottom() - height).max(bounds.top()), height)
+    }
 }
 
 /// `(row height - 2) / 1.3`, the one quantity both the popup font and the icon column derive from.
@@ -665,9 +734,18 @@ fn popup(
     } else {
         rect.width()
     };
+    let titles = headers
+        .iter()
+        .filter(|header| header.before < items.len())
+        .count();
+    let rule = separator_before.is_some_and(|index| index < items.len());
+    let list = popup_list_height(items.len(), titles, rule, row_height);
     // JUCE keeps the menu on screen by scrolling it; this keeps it on screen by scrolling it too,
-    // just with a scrollbar instead of arrows.
-    let max_height = (ui.ctx().content_rect().height() - rect.height()).max(row_height);
+    // just with a scrollbar instead of arrows. Placed by hand rather than by egui, which pushed a
+    // list that fitted neither under nor over its box up over the title bar ([`place_list`]).
+    let (top, height) = place_list(rect, list, popup_bounds(ui.ctx()), row_height);
+    // Inside the one-point border above and below.
+    let scroll = (height - 2.0).max(1.0);
 
     let frame = egui::Frame::NONE
         .fill(palette.color(FxColor::DefaultFill))
@@ -684,13 +762,17 @@ fn popup(
         // menu stays. `CloseOnClick` would close on every one of those, so the picked row closes
         // the menu itself (`Ui::close`) and only an outside click is left to egui.
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .anchor(egui::PopupAnchor::Position(egui::pos2(rect.left(), top)))
+        .align(egui::RectAlign::BOTTOM_START)
+        .align_alternatives(&[])
         .gap(0.0)
         .width(width)
         .frame(frame)
         .show(|ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             egui::ScrollArea::vertical()
-                .max_height(max_height)
+                .max_height(scroll)
+                .min_scrolled_height(scroll)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for (index, item) in items.iter().enumerate() {
@@ -820,14 +902,7 @@ fn draw_truncated(
     center_y: f32,
 ) {
     let room = (right - left).max(0.0);
-    let line = |text: &str, room: f32| {
-        let mut job = LayoutJob::single_section(
-            text.to_owned(),
-            egui::TextFormat::simple(font.clone(), colour),
-        );
-        job.wrap = TextWrapping::truncate_at_width(room);
-        painter.layout_job(job)
-    };
+    let line = |text: &str, room: f32| truncated_line(painter, text, font.clone(), colour, room);
     let galley = line(text, room);
     if galley.elided
         && !keep.is_empty()
@@ -842,6 +917,31 @@ fn draw_truncated(
     }
     let y = center_y - galley.size().y / 2.0;
     painter.galley(pos2(left, y), galley, colour);
+}
+
+/// `text` on one line in `font`, cut with `…` where it passes `room`: the layout
+/// [`draw_truncated`] draws and [`shows_whole`] asks about.
+fn truncated_line(
+    painter: &egui::Painter,
+    text: &str,
+    font: FontId,
+    colour: Color32,
+    room: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job =
+        LayoutJob::single_section(text.to_owned(), egui::TextFormat::simple(font, colour));
+    job.wrap = TextWrapping::truncate_at_width(room);
+    painter.layout_job(job)
+}
+
+/// Whether a box drawing `text` in `font` across `room` points shows it whole, with no `…`.
+///
+/// Asked of the layout the box draws rather than of a measured width: egui lets a line run half a
+/// point past its room before cutting it, so a label measured a fraction wider than `room` is
+/// still drawn whole.
+#[must_use]
+pub fn shows_whole(painter: &egui::Painter, text: &str, font: FontId, room: f32) -> bool {
+    !truncated_line(painter, text, font, Color32::PLACEHOLDER, room).elided
 }
 
 #[cfg(test)]
@@ -859,6 +959,50 @@ mod tests {
     /// The EQ band-count combo (`FxAudioControls.cpp:436`).
     fn band_combo() -> Rect {
         Rect::from_min_size(pos2(8.0, 28.0), vec2(152.0, 20.0))
+    }
+
+    #[test]
+    fn a_list_hangs_under_its_box_when_it_fits_there_and_over_it_when_it_fits_there_instead() {
+        let bounds = Rect::from_min_max(pos2(0.0, 57.0), pos2(1040.0, 584.0));
+        let row = popup_row_height(40.0);
+        let high = Rect::from_min_size(pos2(40.0, 80.0), vec2(300.0, 40.0));
+        assert_eq!(place_list(high, 200.0, bounds, row), (120.0, 200.0));
+        let low = Rect::from_min_size(pos2(40.0, 500.0), vec2(300.0, 40.0));
+        assert_eq!(place_list(low, 200.0, bounds, row), (300.0, 200.0));
+    }
+
+    #[test]
+    fn a_long_list_scrolls_under_its_box_where_three_rows_fit_there() {
+        // The Pro preset list: egui pushed it up over the title bar.
+        let bounds = Rect::from_min_max(pos2(0.0, 57.0), pos2(1040.0, 584.0));
+        let combo = Rect::from_min_size(pos2(40.0, 80.0), vec2(470.0, 40.0));
+        let row = popup_row_height(combo.height());
+        let (top, height) = place_list(combo, 40.0 * row + 2.0, bounds, row);
+        assert_eq!(
+            (top, height),
+            (combo.bottom(), bounds.bottom() - combo.bottom())
+        );
+    }
+
+    #[test]
+    fn a_lite_list_in_a_window_that_does_not_grow_scrolls_over_its_box_and_never_over_the_title_bar()
+     {
+        // E6b, on Hyprland: 34 points under the box, and egui put the list over the title bar.
+        let bounds = Rect::from_min_max(pos2(0.0, 57.0), pos2(550.0, 185.0));
+        let combo = Rect::from_min_size(pos2(40.0, 99.0), vec2(225.0, 50.0));
+        let row = popup_row_height(combo.height());
+        let list = popup_list_height(5, 0, false, row);
+        let (top, height) = place_list(combo, list, bounds, row);
+        assert_eq!(top, bounds.top());
+        assert_eq!(height, bounds.height());
+        // A list short enough to fit is as short as its rows, still clear of the title bar.
+        let short = popup_list_height(2, 0, false, row);
+        let (top, height) = place_list(combo, short, bounds, row);
+        assert_eq!(height, short);
+        assert!(
+            top >= bounds.top() && top + height <= bounds.bottom(),
+            "{top} {height}"
+        );
     }
 
     #[test]
@@ -1547,6 +1691,60 @@ mod tests {
             }
             picks
         }
+    }
+
+    #[test]
+    fn an_open_list_is_painted_under_its_box_as_tall_as_its_rows_where_they_fit() {
+        let mut menu = DeviceMenu::devices();
+        let shapes = menu.open();
+        let combo = pro_combo();
+        let row = popup_row_height(combo.height());
+        let rows = 3.0 * row + 2.0 * popup_header_height(row) + popup_separator_height(row) + 2.0;
+        assert!((popup_list_height(3, 2, true, row) - rows).abs() < 1e-3);
+        let painted = menu_frame(&shapes, combo, DeviceMenu::PALETTE);
+        assert!((painted.top() - combo.bottom()).abs() <= 1.0, "{painted:?}");
+        assert!((painted.height() - rows).abs() <= 1.0, "{painted:?}");
+    }
+
+    #[test]
+    fn a_label_is_shown_whole_in_its_own_width_and_cut_three_points_short_of_it() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(theme::font_definitions());
+        ctx.run_ui(Default::default(), |ui| {
+            let font = theme::semibold(FONT);
+            let text = "FxSound's preset";
+            let width = ui
+                .painter()
+                .layout_no_wrap(text.to_owned(), font.clone(), Color32::PLACEHOLDER)
+                .size()
+                .x;
+            assert!(shows_whole(ui.painter(), text, font.clone(), width));
+            assert!(!shows_whole(ui.painter(), text, font, width - 3.0));
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn an_open_list_stays_inside_the_bounds_the_window_sets_and_scrolls_there() {
+        let mut menu = DeviceMenu::devices();
+        let combo = pro_combo();
+        let row = popup_row_height(combo.height());
+        let bounds = Rect::from_min_max(
+            pos2(0.0, combo.top() - 20.0),
+            pos2(1000.0, combo.bottom() + 3.0 * row + 12.0),
+        );
+        set_popup_bounds(&menu.ctx, bounds);
+        let shapes = menu.open();
+        let painted = menu_frame(&shapes, combo, DeviceMenu::PALETTE);
+        assert!((painted.top() - combo.bottom()).abs() <= 1.0, "{painted:?}");
+        assert!(
+            painted.bottom() <= bounds.bottom() + 1.0,
+            "{painted:?} {bounds:?}"
+        );
+        assert!(
+            painted.height() < popup_list_height(3, 2, true, row),
+            "{painted:?}"
+        );
     }
 
     #[test]

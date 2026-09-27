@@ -295,6 +295,39 @@ All notable changes to the FxSound Linux port. The format follows
   have; a test now holds it to the characters they do.
 - `packaging/build-tarball.sh` packed whatever binary was left in `target/release`; it now builds
   the tree it sits in first and refuses a binary of another version.
+- In the Lite view the hamburger menu lost Export Presets, Import Presets and Theme below the
+  window's 189-point edge and was pushed up over the title bar, and the preset and device lists
+  showed three rows with a cut edge. The menu now hangs under the hamburger and scrolls inside
+  the window, and a list scrolls between the title bar and the window's bottom edge, over its own
+  box when there is no room under it. The window does not grow for them: a compositor that draws
+  round or behind a window draws round the grown, transparent part too (niri filled it with its
+  focus ring's colour), and Hyprland does not let a floating window grow at all.
+- On Hyprland the floating window stayed at the size it was started at: flipping between Pro and
+  Lite or opening Settings from the Lite view left the view cut off. The window now gives the
+  compositor each view's size as its smallest and largest, which Hyprland holds a floating window
+  to.
+- A long preset list in the Pro view was pushed up over the title bar; it now hangs under its box
+  and scrolls there.
+- The hamburger menu kept a fixed width, and a long item ran over its edge — German
+  "Voreinstellungs-Änderung verwerfen", English "Overwrite Existing Preset - My Preset"; it is as
+  wide as its longest item now, and the name field under Save New Preset and Rename Preset shows
+  its hint whole.
+- A dialog button's label one word too long for it was broken over two lines and out of the button
+  (German "Exportieren", Russian "Сохранить" under Export Presets); it is set smaller instead, and
+  so are the Import and Export dialogs' headings and Settings > General's hotkey names where a
+  translation is long, rather than cut off with an ellipsis.
+- The user's presets were sorted in among the unnumbered factory presets, so the list's rule
+  between factory and user presets fell among factory ones and the window's list read otherwise
+  than the tray's; the user's presets now follow all the factory ones, by name.
+- The folder picker for Import Presets was titled in English whatever the window's language.
+- A tiling compositor's column narrower than the window (niri's default half-screen one) cut the
+  Pro view off on both sides; the window is scaled down to fit instead, and a size asked for while
+  scaled no longer comes out scaled too.
+- The German and Russian texts FxSound added called a preset "Preset" or "пресет" where the rest
+  of the window says "Voreinstellung" or "шаблон", and German Settings > Apps cut "Preset von
+  FxSound" to "Preset von FxSo…"; it reads "Wie FxSound".
+- The Russian question before exporting over several existing preset files read "2 файлов
+  шаблонов…", the number before a noun it does not agree with; it now gives the number at the end.
 
 ### Removed
 - The tray's *Always On Top* item, which winit cannot honour on Wayland.

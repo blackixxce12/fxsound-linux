@@ -181,8 +181,8 @@ mod tests {
     }
 
     #[test]
-    fn voice_presets_are_listed_by_name_ignoring_case() {
-        // No numbered files on this side, so the whole list is the alphabetical rest.
+    fn voice_presets_are_listed_by_name_ignoring_case_the_factory_ones_first() {
+        // No numbered files on this side: the factory voices by name, then the user's by name.
         let tmp = tempdir("ordering");
         let mut store = store_in(&tmp);
         named("aardvark")
@@ -191,16 +191,21 @@ mod tests {
         named("Zebra").save(&tmp.join("Zebra.toml")).expect("write");
         store.rescan();
 
-        let names: Vec<String> = store
+        let sorted = |entries: &[&crate::PresetEntry]| {
+            let names: Vec<String> = entries.iter().map(|e| e.name.to_lowercase()).collect();
+            let mut sorted = names.clone();
+            sorted.sort();
+            names == sorted
+        };
+        let (factory, user): (Vec<_>, Vec<_>) = store
             .entries()
             .iter()
-            .map(|e| e.name.to_lowercase())
-            .collect();
-        let mut sorted = names.clone();
-        sorted.sort();
-        assert_eq!(names, sorted);
-        assert_eq!(names.first().map(String::as_str), Some("aardvark"));
-        assert_eq!(names.last().map(String::as_str), Some("zebra"));
+            .partition(|e| e.source == crate::PresetSource::Factory);
+        assert!(!factory.is_empty());
+        assert!(sorted(&factory), "the factory voices by name");
+        assert!(sorted(&user), "the user's voices by name");
+        let names: Vec<&str> = store.entries().iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(&names[names.len() - 2..], ["aardvark", "Zebra"]);
     }
 
     #[test]

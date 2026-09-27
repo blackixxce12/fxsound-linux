@@ -32,7 +32,9 @@
 //! with dismissal cancelling the export outright.
 
 use super::message::{ConfirmChoice, MessageBox, message_with_name};
-use super::{DialogChrome, DialogResponse, TextButton, draw_truncated, normal_font, small_font};
+use super::{
+    DialogChrome, DialogResponse, TextButton, draw_fitted, draw_truncated, normal_font, small_font,
+};
 use crate::assets::AssetCache;
 use crate::theme::{FxColor, Palette};
 use egui::{
@@ -286,7 +288,7 @@ impl<'a> ImportDialog<'a> {
         id: Id,
         response: &mut DialogResponse<PresetsAction>,
     ) {
-        draw_truncated(
+        draw_fitted(
             ui.painter(),
             &tr(SELECT_FOLDER_LABEL),
             normal_font(),
@@ -347,7 +349,7 @@ impl<'a> ImportDialog<'a> {
         .into_iter()
         .enumerate()
         {
-            draw_truncated(
+            draw_fitted(
                 ui.painter(),
                 &label,
                 normal_font(),
@@ -633,7 +635,7 @@ impl<'a> ExportDialog<'a> {
         response.push_if(chrome.close_clicked, PresetsAction::CloseExport);
         let content = chrome.content;
 
-        draw_truncated(
+        draw_fitted(
             ui.painter(),
             &tr(SELECT_PRESETS_LABEL),
             normal_font(),
@@ -879,6 +881,45 @@ mod tests {
 
     fn local(content: Rect, r: Rect) -> Rect {
         r.translate(-content.min.to_vec2())
+    }
+
+    #[test]
+    fn every_languages_headings_fit_their_line_set_no_smaller_than_seven_tenths() {
+        // E6b: German "Wählen Sie die zu exportierenden Voreinstellungen..." lost its end.
+        use super::super::fitted_font;
+        use super::super::tests::every_translation;
+        let ctx = test_context();
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            for (key, rect) in [
+                (SELECT_PRESETS_LABEL, export_label_rect(export_content())),
+                (SELECT_FOLDER_LABEL, label_rect(import_content())),
+                (IMPORTED_LABEL, summary_label_rect(summary_content(), 0)),
+                (SKIPPED_LABEL, summary_label_rect(summary_content(), 1)),
+            ] {
+                for (code, text) in every_translation(key) {
+                    // The one the original's own table makes too long even for JUCE's squeeze
+                    // (57 characters): it is elided at seven tenths here as it would be there.
+                    if (code, key) == ("pl", SKIPPED_LABEL) {
+                        continue;
+                    }
+                    let font = fitted_font(ui.ctx(), &text, normal_font(), rect.width());
+                    let used = ui
+                        .painter()
+                        .layout_no_wrap(text.clone(), font.clone(), egui::Color32::PLACEHOLDER)
+                        .size()
+                        .x;
+                    if used > rect.width() {
+                        problems.push(format!(
+                            "{code}: {text:?} is {used:.0} in {:.0} at {}",
+                            rect.width(),
+                            font.size
+                        ));
+                    }
+                }
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 
     #[test]

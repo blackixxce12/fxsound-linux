@@ -5,8 +5,8 @@
 //! both noted in `docs/spec/11-preset-format.md`:
 //!
 //! * the original lists presets in filesystem-glob order, which is effectively arbitrary; this
-//!   port sorts deterministically — factory presets in their numeric order, then everything else
-//!   by name;
+//!   port sorts deterministically — factory presets in their numeric order, the rest of the
+//!   factory presets by name, then the user's by name;
 //! * paths follow the XDG base directory specification instead of `%APPDATA%`.
 //!
 //! The store is generic over the file it holds. 0.4.0 has two kinds of preset — the `.fac` set
@@ -678,24 +678,32 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// The order the list is in: numbered factory files first, by number; everything else by name.
+/// The order the list is in: numbered factory files first, by number; the rest of the factory
+/// presets by name; then the user's own, by name.
 type SortKey = (u8, u32, String);
 
-/// Factory presets first in the order the vendor numbered their files, then everything else by
-/// name.
+/// Factory presets first — in the order the vendor numbered their files, then the unnumbered rest
+/// by name — and the user's presets after all of them, by name.
 ///
 /// The numbering is the only record of the intended order — `1.fac` is General, `2.fac` is Music —
 /// and it is more useful than sorting those twelve alphabetically. The original lists presets in
-/// filesystem-glob order, which is arbitrary; this is the deterministic version of the same intent.
+/// filesystem-glob order, which is arbitrary, one directory after the other: the application's
+/// presets, then the user's; this is the deterministic version of the same intent.
+///
+/// The user's used to be sorted in among the unnumbered factory presets, so "My Preset" sat
+/// between "Modern Rock" and "Panserotaliya", the window's rule between factory and user presets
+/// (`FxView.cpp:205-225`) fell in the middle of factory ones, and the list read otherwise than the
+/// tray's, which groups them (E6b).
 fn sort_key(entry: &PresetEntry) -> SortKey {
     let numbered_file = entry
         .path
         .file_stem()
         .and_then(|s| s.to_str())
         .and_then(|s| s.parse::<u32>().ok());
-    match numbered_file {
-        Some(n) if entry.source == PresetSource::Factory => (0, n, String::new()),
-        _ => (1, 0, entry.name.to_lowercase()),
+    match (numbered_file, entry.source) {
+        (Some(n), PresetSource::Factory) => (0, n, String::new()),
+        (None, PresetSource::Factory) => (1, 0, entry.name.to_lowercase()),
+        (_, PresetSource::User) => (2, 0, entry.name.to_lowercase()),
     }
 }
 
@@ -891,6 +899,35 @@ mod tests {
         let mut sorted = rest.clone();
         sorted.sort();
         assert_eq!(rest, sorted, "the rest of the list must be alphabetical");
+    }
+
+    #[test]
+    fn the_users_presets_come_after_every_factory_one_by_name() {
+        // E6b: "My Preset" was listed between "Modern Rock" and "Panserotaliya (Quizal)", so the
+        // window's rule between factory and user presets fell among factory ones.
+        let tmp = tempdir("user-after-factory");
+        let mut store = store_in(&tmp);
+        let (general, _) = store.load("General").expect("load General");
+        for name in ["My Preset", "aardvark", "Zebra"] {
+            store.save_as(&general, name).expect("save");
+        }
+        let entries = store.entries();
+        let first_user = entries
+            .iter()
+            .position(|e| e.source == PresetSource::User)
+            .expect("the user's presets are listed");
+        assert!(
+            entries[first_user..]
+                .iter()
+                .all(|e| e.source == PresetSource::User),
+            "a factory preset after the first user one: {:?}",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+        let users: Vec<&str> = entries[first_user..]
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(users, ["aardvark", "My Preset", "Zebra"]);
     }
 
     #[test]

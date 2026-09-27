@@ -112,6 +112,7 @@ use fxsound_ui::{
     state::PresetEntry,
     theme,
     views::ViewScratch,
+    widgets::combo,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1004,6 +1005,11 @@ struct Shell<'a> {
     /// Where the design-size content starts this frame: the viewport's origin, or the centred
     /// offset when the surface is larger than the design (see [`fit_zoom`]).
     content_origin: egui::Pos2,
+    /// When the window last asked the compositor for a size of its own.
+    resized_at: Option<Instant>,
+    /// The compositor keeps the window at a size of its own — fullscreen, maximised, tiled — and
+    /// not at the one asked for ([`fit_zoom`]).
+    compositor_sized: bool,
     /// A question the window is asking before it does something that cannot be taken back from
     /// inside FxSound: deleting a preset, discarding every unsaved change.
     confirm: Option<Confirm>,
@@ -1129,6 +1135,8 @@ impl<'a> Shell<'a> {
             changelog,
             calibration: None,
             content_origin: egui::Pos2::ZERO,
+            resized_at: None,
+            compositor_sized: false,
             confirm: None,
             minimised: false,
             was_focused: None,
@@ -1196,13 +1204,28 @@ impl<'a> Shell<'a> {
     }
 
     /// Resize the viewport when the user flips between Pro and Lite, or opens a pane.
+    ///
+    /// The size also goes out as the window's smallest and largest: the window is not
+    /// resizable, and winit gives the compositor the size it was *created* at as both. Hyprland
+    /// holds a floating window to those, so flipping to Pro left it at 550 × 189 with the Pro
+    /// view cut, and opening Settings from Lite did the same (E6b).
     fn sync_view_size(&mut self, ctx: &egui::Context) {
         let wanted = self.window_size();
         if self.applied_size == Some(wanted) {
             return;
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+        let request = inner_size_request(wanted, ctx.zoom_factor());
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(request));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(request));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(request));
         self.applied_size = Some(wanted);
+        self.resized_at = Some(Instant::now());
+    }
+
+    /// Whether a size the window asked for may still be on its way to the surface.
+    fn resize_in_flight(&self) -> bool {
+        self.resized_at
+            .is_some_and(|asked| asked.elapsed() < RESIZE_SETTLE)
     }
 
     /// Re-install fonts and visuals after a theme change.
@@ -1213,6 +1236,25 @@ impl<'a> Shell<'a> {
         }
         theme::apply(ctx, palette);
         self.applied_theme = palette.mode();
+    }
+
+    /// Where an open menu or drop-down may hang this frame, in `screen`'s points: under the title
+    /// bar, and down to the window's bottom edge.
+    ///
+    /// Both are drawn inside the window, where the original's were windows of their own, and
+    /// the window does not grow for them: it did in E6b, and a compositor that draws round or
+    /// behind a window drew round the transparent part too — niri filled it with its focus
+    /// ring's colour, Hyprland put its border round it and moved the window up by half the
+    /// growth — while Hyprland would not let the floating window grow at all. So the menu
+    /// scrolls under the hamburger and a list between the title bar and this bottom edge
+    /// ([`combo::place_list`]).
+    fn popup_bounds(&self, screen: egui::Rect) -> egui::Rect {
+        let top =
+            self.content_origin.y + layout::TITLE_BAR_HEIGHT + layout::TITLE_BAR_DIVIDER_HEIGHT;
+        egui::Rect::from_min_max(
+            egui::pos2(screen.left(), top),
+            egui::pos2(screen.right(), screen.bottom() - POPUP_MARGIN),
+        )
     }
 
     /// The window size the viewport should have right now: the view's own, grown to fit
@@ -1313,9 +1355,11 @@ impl<'a> Shell<'a> {
     /// Wayland backend ignores window levels, and a control that does nothing is worse than
     /// none). Save New Preset and Rename Preset open the original's inline name editor
     /// (`FxPresetMenuItem`, `FxMainWindow.cpp:27-176`) under their row instead of in a submenu.
-    fn show_menu(&mut self, ctx: &egui::Context, palette: Palette) {
+    ///
+    /// Returns what the open menu covers, window-local.
+    fn show_menu(&mut self, ctx: &egui::Context, palette: Palette) -> Option<egui::Rect> {
         if !self.menu.open {
-            return;
+            return None;
         }
 
         let app = &self.rt.app;
@@ -1350,6 +1394,23 @@ impl<'a> Shell<'a> {
         };
         let dark = palette.is_dark();
         let presets = &app.state.presets;
+        let width = menu_width(
+            ctx,
+            &[
+                (tr("Settings"), false),
+                (tr("Save New Preset"), true),
+                (overwrite_label.clone(), false),
+                (tr("Undo Preset Changes"), false),
+                (tr("Rename Preset"), true),
+                (tr("Delete Preset"), false),
+                (tr("Export Presets"), false),
+                (tr("Import Presets"), false),
+                (tr("Theme"), false),
+                (tr("Dark"), false),
+                (tr("Light"), false),
+            ],
+            &[tr(SAVE_NEW_HINT), tr(RENAME_HINT)],
+        );
 
         if self.menu.editor.as_ref().is_some_and(|editor| {
             !editor.still_applies(
@@ -1361,6 +1422,12 @@ impl<'a> Shell<'a> {
         }) {
             self.menu.editor = None;
         }
+        // Anchored under the hamburger, and scrolling in what there is under it: in the Lite
+        // window four of its eleven rows, where Delete, Export, Import and Theme had been cut
+        // off at the window's edge and the menu pushed up over the title bar (E6b).
+        let top = anchor.bottom() + 4.0;
+        let room = (self.popup_bounds(ctx.content_rect()).bottom() - top - MENU_CHROME)
+            .max(MENU_ROW_HEIGHT);
         let just_opened = self.menu.just_opened;
         let editor = &mut self.menu.editor;
 
@@ -1368,8 +1435,11 @@ impl<'a> Shell<'a> {
         let mut committed: Option<(EditorPurpose, String)> = None;
         let mut close = false;
 
-        egui::Area::new(egui::Id::new("fxsound.menu"))
-            .fixed_pos(egui::pos2(anchor.left(), anchor.bottom() + 4.0))
+        let area = egui::Area::new(egui::Id::new("fxsound.menu"))
+            .fixed_pos(egui::pos2(anchor.left(), top))
+            // It fits where it is by construction ([`MENU_MAX_WIDTH`], `room`); egui would move it
+            // up to the window's top on the frame it opens, before it knows the menu's size.
+            .constrain(false)
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 egui::Frame::NONE
@@ -1378,83 +1448,131 @@ impl<'a> Shell<'a> {
                     .corner_radius(egui::CornerRadius::same(8))
                     .inner_margin(egui::Margin::symmetric(8, 8))
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                        let mut rows = egui::ScrollArea::vertical()
+                            .max_height(room)
+                            .auto_shrink([true, true]);
+                        // Opened at its top, wherever it was last scrolled to.
+                        if just_opened {
+                            rows = rows.vertical_scroll_offset(0.0);
+                        }
+                        rows.show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
 
-                        if menu_row(ui, &tr("Settings"), true, Mark::None, palette) {
-                            chosen = Some(MenuChoice::Settings);
-                        }
-                        menu_separator(ui, palette);
+                            if menu_row(ui, &tr("Settings"), true, Mark::None, palette, width) {
+                                chosen = Some(MenuChoice::Settings);
+                            }
+                            menu_separator(ui, palette, width);
 
-                        let saving = editor
-                            .as_ref()
-                            .is_some_and(|e| e.purpose == EditorPurpose::SaveNew);
-                        let mark = Mark::Submenu { expanded: saving };
-                        if menu_row(ui, &tr("Save New Preset"), can_save_new, mark, palette) {
-                            chosen = Some(MenuChoice::Editor(EditorPurpose::SaveNew));
-                        }
-                        if saving
-                            && let Some(editor) = editor.as_mut()
-                            && let Some(name) = name_editor(ui, editor, presets, None, palette)
-                        {
-                            committed = Some((EditorPurpose::SaveNew, name));
-                        }
-
-                        if menu_row(ui, &overwrite_label, can_overwrite, Mark::None, palette) {
-                            chosen = Some(MenuChoice::Overwrite);
-                        }
-                        if menu_row(
-                            ui,
-                            &tr("Undo Preset Changes"),
-                            can_undo,
-                            Mark::None,
-                            palette,
-                        ) {
-                            chosen = Some(MenuChoice::Undo);
-                        }
-
-                        let renaming = editor
-                            .as_ref()
-                            .is_some_and(|e| e.purpose == EditorPurpose::Rename);
-                        let mark = Mark::Submenu { expanded: renaming };
-                        if menu_row(ui, &tr("Rename Preset"), can_rename, mark, palette) {
-                            chosen = Some(MenuChoice::Editor(EditorPurpose::Rename));
-                        }
-                        if renaming
-                            && let Some(editor) = editor.as_mut()
-                            && let Some(name) = name_editor(
+                            let saving = editor
+                                .as_ref()
+                                .is_some_and(|e| e.purpose == EditorPurpose::SaveNew);
+                            let mark = Mark::Submenu { expanded: saving };
+                            if menu_row(
                                 ui,
-                                editor,
-                                presets,
-                                preset.map(|p| p.name.as_str()),
+                                &tr("Save New Preset"),
+                                can_save_new,
+                                mark,
                                 palette,
-                            )
-                        {
-                            committed = Some((EditorPurpose::Rename, name));
-                        }
+                                width,
+                            ) {
+                                chosen = Some(MenuChoice::Editor(EditorPurpose::SaveNew));
+                            }
+                            if saving
+                                && let Some(editor) = editor.as_mut()
+                                && let Some(name) =
+                                    name_editor(ui, editor, presets, None, palette, width)
+                            {
+                                committed = Some((EditorPurpose::SaveNew, name));
+                            }
 
-                        if menu_row(ui, &tr("Delete Preset"), can_delete, Mark::None, palette) {
-                            chosen = Some(MenuChoice::Delete);
-                        }
-                        menu_separator(ui, palette);
+                            if menu_row(
+                                ui,
+                                &overwrite_label,
+                                can_overwrite,
+                                Mark::None,
+                                palette,
+                                width,
+                            ) {
+                                chosen = Some(MenuChoice::Overwrite);
+                            }
+                            if menu_row(
+                                ui,
+                                &tr("Undo Preset Changes"),
+                                can_undo,
+                                Mark::None,
+                                palette,
+                                width,
+                            ) {
+                                chosen = Some(MenuChoice::Undo);
+                            }
 
-                        if menu_row(ui, &tr("Export Presets"), can_export, Mark::None, palette) {
-                            chosen = Some(MenuChoice::Export);
-                        }
-                        if menu_row(ui, &tr("Import Presets"), can_import, Mark::None, palette) {
-                            chosen = Some(MenuChoice::Import);
-                        }
-                        menu_separator(ui, palette);
+                            let renaming = editor
+                                .as_ref()
+                                .is_some_and(|e| e.purpose == EditorPurpose::Rename);
+                            let mark = Mark::Submenu { expanded: renaming };
+                            if menu_row(ui, &tr("Rename Preset"), can_rename, mark, palette, width)
+                            {
+                                chosen = Some(MenuChoice::Editor(EditorPurpose::Rename));
+                            }
+                            if renaming
+                                && let Some(editor) = editor.as_mut()
+                                && let Some(name) = name_editor(
+                                    ui,
+                                    editor,
+                                    presets,
+                                    preset.map(|p| p.name.as_str()),
+                                    palette,
+                                    width,
+                                )
+                            {
+                                committed = Some((EditorPurpose::Rename, name));
+                            }
 
-                        // `Theme ▸ Dark / Light`, ticked by the current mode, flattened into the
-                        // menu under a heading.
-                        menu_row(ui, &tr("Theme"), false, Mark::None, palette);
-                        let tick = |on: bool| if on { Mark::Tick } else { Mark::None };
-                        if menu_row(ui, &tr("Dark"), true, tick(dark), palette) {
-                            chosen = Some(MenuChoice::Theme(ThemeMode::Dark));
-                        }
-                        if menu_row(ui, &tr("Light"), true, tick(!dark), palette) {
-                            chosen = Some(MenuChoice::Theme(ThemeMode::Light));
-                        }
+                            if menu_row(
+                                ui,
+                                &tr("Delete Preset"),
+                                can_delete,
+                                Mark::None,
+                                palette,
+                                width,
+                            ) {
+                                chosen = Some(MenuChoice::Delete);
+                            }
+                            menu_separator(ui, palette, width);
+
+                            if menu_row(
+                                ui,
+                                &tr("Export Presets"),
+                                can_export,
+                                Mark::None,
+                                palette,
+                                width,
+                            ) {
+                                chosen = Some(MenuChoice::Export);
+                            }
+                            if menu_row(
+                                ui,
+                                &tr("Import Presets"),
+                                can_import,
+                                Mark::None,
+                                palette,
+                                width,
+                            ) {
+                                chosen = Some(MenuChoice::Import);
+                            }
+                            menu_separator(ui, palette, width);
+
+                            // `Theme ▸ Dark / Light`, ticked by the current mode, flattened into the
+                            // menu under a heading.
+                            menu_row(ui, &tr("Theme"), false, Mark::None, palette, width);
+                            let tick = |on: bool| if on { Mark::Tick } else { Mark::None };
+                            if menu_row(ui, &tr("Dark"), true, tick(dark), palette, width) {
+                                chosen = Some(MenuChoice::Theme(ThemeMode::Dark));
+                            }
+                            if menu_row(ui, &tr("Light"), true, tick(!dark), palette, width) {
+                                chosen = Some(MenuChoice::Theme(ThemeMode::Light));
+                            }
+                        });
                     });
 
                 // A click anywhere else closes the menu — except the click that opened it, which
@@ -1466,6 +1584,7 @@ impl<'a> Shell<'a> {
                     close = true;
                 }
             });
+        let covers = area.response.rect.translate(-self.content_origin.to_vec2());
 
         // Escape closes the menu, and cancels the editor with it (`FxMainWindow.cpp:63-66`).
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -1491,7 +1610,7 @@ impl<'a> Shell<'a> {
                     }
                 }
             }
-            return;
+            return Some(covers);
         }
         match chosen {
             Some(MenuChoice::Editor(purpose)) => {
@@ -1513,6 +1632,7 @@ impl<'a> Shell<'a> {
             None if close => self.menu.close(),
             None => {}
         }
+        Some(covers)
     }
 
     fn act_on_menu(&mut self, choice: MenuChoice) {
@@ -1760,13 +1880,13 @@ impl<'a> Shell<'a> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         // JUCE's browser starts in the documents folder (`FxPresetImportDialog.cpp`).
         let start = dirs::document_dir().or_else(dirs::home_dir);
+        let title = folder_picker_title(tr);
         // The answer wakes the window, or the headless pump if the window was hidden meanwhile.
         let waker = self.rt.waker.clone();
         let spawned = std::thread::Builder::new()
             .name("fxsound-folder-picker".into())
             .spawn(move || {
-                let mut dialog =
-                    rfd::FileDialog::new().set_title(dialogs::presets::SELECT_FOLDER_LABEL);
+                let mut dialog = rfd::FileDialog::new().set_title(title);
                 if let Some(start) = start {
                     dialog = dialog.set_directory(start);
                 }
@@ -1838,27 +1958,38 @@ impl eframe::App for Shell<'_> {
         // The wizard as the tick left it, before anything sizes the window for it.
         self.calibration = self.rt.app.calibration_view();
         self.sync_theme(&ctx);
-        self.sync_view_size(&ctx);
 
         let palette = self.rt.app.palette();
 
         // Fullscreen or maximised: the compositor hands over a surface larger than the design
         // size (1040×588 Pro, 550×189 Lite). Scale the design up to fit and centre it, rather
         // than drawing into a corner of the surface with the desktop showing through the rest.
-        let design = self.window_size();
         let native_ppp = ctx
             .input(|i| i.viewport().native_pixels_per_point)
             .unwrap_or(1.0);
         let surface_px = ui.max_rect().size() * ctx.pixels_per_point();
-        let zoom = fit_zoom(surface_px, design, native_ppp);
+        // In points at the native scale, whatever zoom is in effect: a zoom that fits the design
+        // must not make the surface look like the size the window asked for.
+        let surface = surface_px / native_ppp.max(f32::EPSILON);
+        self.compositor_sized =
+            compositor_sized(surface, self.applied_size, self.resize_in_flight());
+        let design = self.window_size();
+        let zoom = fit_zoom(surface_px, design, native_ppp, self.compositor_sized);
         if (zoom - ctx.zoom_factor()).abs() > ZOOM_TOLERANCE {
             // Applies at the start of the next pass; ask for it now rather than at the tick.
             ctx.set_zoom_factor(zoom);
             ctx.request_repaint();
         }
+        // After the zoom is settled: the size goes out scaled by the zoom in effect at the end of
+        // the pass ([`inner_size_request`]).
+        self.sync_view_size(&ctx);
         let screen = ui.max_rect();
+        // A surface still the size of a pane that has just closed, or of the Pro view flipped to
+        // Lite, whose smaller size is on its way: drawn where the view is about to be, not centred
+        // in the old size for a frame.
+        let shrinking = zoom <= 1.0 && self.resize_in_flight();
         let larger_than_design =
-            screen.width() > design.x + 1.0 || screen.height() > design.y + 1.0;
+            !shrinking && (screen.width() > design.x + 1.0 || screen.height() > design.y + 1.0);
         let content = if larger_than_design {
             // Opaque behind the centred content: the transparent rounded corners only make sense
             // when the surface *is* the window.
@@ -1872,6 +2003,7 @@ impl eframe::App for Shell<'_> {
             screen
         };
         self.content_origin = content.min;
+        combo::set_popup_bounds(&ctx, self.popup_bounds(screen));
         let mut content_ui = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(content)
@@ -2007,9 +2139,33 @@ fn frame_interval(pacing: &Pacing) -> Option<Duration> {
     (moving && !pacing.out_of_sight).then_some(FRAME_INTERVAL)
 }
 
+/// The folder picker's title: the Import pane's heading, in the window's language as `translate`
+/// has it. It was the English heading whatever the language, over a picker the desktop sets in
+/// its own (E6b).
+fn folder_picker_title(translate: impl Fn(&str) -> String) -> String {
+    translate(dialogs::presets::SELECT_FOLDER_LABEL)
+}
+
 /// `size` grown to fit `pane`.
 fn grown(size: egui::Vec2, pane: egui::Vec2) -> egui::Vec2 {
     egui::vec2(size.x.max(pane.x), size.y.max(pane.y))
+}
+
+/// How far above the window's bottom edge an open menu or drop-down stops.
+const POPUP_MARGIN: f32 = combo::POPUP_WINDOW_MARGIN;
+
+/// How long a size the window asked for is taken to be on its way: after that, a surface of
+/// another size is the compositor's own doing.
+const RESIZE_SETTLE: Duration = Duration::from_millis(250);
+
+/// Whether the compositor has the window at a size of its own rather than the `asked` one: a
+/// `surface` another size once no request of the window's is `in_flight` any more — fullscreen,
+/// maximised or tiled.
+fn compositor_sized(surface: egui::Vec2, asked: Option<egui::Vec2>, in_flight: bool) -> bool {
+    !in_flight
+        && asked.is_some_and(|asked| {
+            (surface.x - asked.x).abs() > 1.0 || (surface.y - asked.y).abs() > 1.0
+        })
 }
 
 /// Dim what is behind a pane, so it reads as modal the way the original's dialogs did — inside
@@ -2034,15 +2190,30 @@ fn dim_backdrop(ui: &egui::Ui, window: egui::Rect, pane: &str) {
 // Menu widgets
 // =============================================================================================
 
-/// Row width inside the menu frame. Wide enough for the 200 px name editor at its indent and for
-/// `"Overwrite Existing Preset - <name>"` with a typical name.
+/// Row width inside the menu frame, at the least. Wide enough for the 200 px name editor at its
+/// indent and for the English items; [`menu_width`] widens it for longer ones.
 const MENU_WIDTH: f32 = 244.0;
+/// The widest the menu grows: its frame then ends 10 points inside the Lite window, whose menu
+/// hangs from the same hamburger as the Pro one's.
+const MENU_MAX_WIDTH: f32 = 360.0;
 const MENU_ROW_HEIGHT: f32 = 26.0;
+/// What the menu's frame adds to its rows' height: eight points of margin and a point of outline,
+/// above and below.
+const MENU_CHROME: f32 = 2.0 * (8.0 + 1.0);
 /// Text starts past a gutter that holds the theme ticks.
 const MENU_TEXT_INSET: f32 = 26.0;
+/// What a row keeps clear at its right end: room for the submenu triangle, and a margin for
+/// the rows without one.
+const MENU_MARK_ROOM: f32 = 22.0;
+const MENU_TEXT_END: f32 = 8.0;
+/// The menu's text: `regular` 14.
+const MENU_FONT: f32 = 14.0;
 const MENU_SEPARATOR_HEIGHT: f32 = 9.0;
 /// `FxPresetMenuItem::WIDTH` × `HEIGHT` (`FxMainWindow.cpp:96-97`).
 const NAME_EDITOR_SIZE: egui::Vec2 = egui::vec2(200.0, 30.0);
+/// The name editors' hints (§11.3).
+const SAVE_NEW_HINT: &str = "Enter your preset name";
+const RENAME_HINT: &str = "Enter new preset name";
 
 /// The hamburger menu's per-window state.
 #[derive(Default)]
@@ -2157,14 +2328,67 @@ enum Mark {
     },
 }
 
-/// One menu row. Returns `true` when it was clicked; a disabled row is drawn grey and inert.
-fn menu_row(ui: &mut egui::Ui, label: &str, enabled: bool, mark: Mark, palette: Palette) -> bool {
+/// How much of a row's right end its text leaves clear: the triangle's room on a row that
+/// unfolds an editor.
+fn menu_text_end(submenu: bool) -> f32 {
+    if submenu {
+        MENU_MARK_ROOM
+    } else {
+        MENU_TEXT_END
+    }
+}
+
+/// The menu's row width for these rows (`(label, unfolds an editor)`): [`MENU_WIDTH`], or wider
+/// where a row's text needs it, up to [`MENU_MAX_WIDTH`].
+///
+/// The original's menu is a `PopupMenu`, which is as wide as its widest item; this one was 244
+/// points whatever it held, and German "Voreinstellungs-Änderung verwerfen" and English
+/// "Overwrite Existing Preset - My Preset" ran over its right edge (E6b). A row still too long
+/// at the widest — a long preset name after Overwrite — is set smaller and then cut by
+/// [`menu_row`].
+///
+/// `hints` are the two name editors' hints: the menu is also wide enough for the field to show
+/// each whole at [`dialogs::MIN_FIT_SCALE`] of its size ([`name_editor_width`]).
+fn menu_width(ctx: &egui::Context, rows: &[(String, bool)], hints: &[String]) -> f32 {
+    let measure = |text: &str, font: egui::FontId| {
+        ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(text.to_owned(), font, egui::Color32::PLACEHOLDER)
+                .size()
+                .x
+                .ceil()
+        })
+    };
+    let for_rows = rows.iter().map(|(label, submenu)| {
+        MENU_TEXT_INSET + measure(label, theme::regular(MENU_FONT)) + menu_text_end(*submenu)
+    });
+    let smallest_hint = (NAME_EDITOR_FONT * dialogs::MIN_FIT_SCALE * 2.0).ceil() / 2.0;
+    let for_hints = hints.iter().map(|hint| {
+        let field = measure(hint, theme::semibold(smallest_hint)) + NAME_EDITOR_TEXT_PADDING;
+        MENU_WIDTH + (field - NAME_EDITOR_SIZE.x).max(0.0)
+    });
+    for_rows
+        .chain(for_hints)
+        .fold(MENU_WIDTH, f32::max)
+        .min(MENU_MAX_WIDTH)
+}
+
+/// One menu row, `width` wide. Returns `true` when it was clicked; a disabled row is drawn grey
+/// and inert.
+fn menu_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    enabled: bool,
+    mark: Mark,
+    palette: Palette,
+    width: f32,
+) -> bool {
     let sense = if enabled {
         egui::Sense::click()
     } else {
         egui::Sense::hover()
     };
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(MENU_WIDTH, MENU_ROW_HEIGHT), sense);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, MENU_ROW_HEIGHT), sense);
     if !ui.is_rect_visible(rect) {
         return false;
     }
@@ -2183,12 +2407,20 @@ fn menu_row(ui: &mut egui::Ui, label: &str, enabled: bool, mark: Mark, palette: 
         (true, true) => FxColor::MenuText,
         (true, false) => FxColor::DefaultText,
     });
-    painter.text(
-        egui::pos2(rect.left() + MENU_TEXT_INSET, rect.center().y),
-        egui::Align2::LEFT_CENTER,
+    let text = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + MENU_TEXT_INSET, rect.top()),
+        egui::pos2(
+            rect.right() - menu_text_end(matches!(mark, Mark::Submenu { .. })),
+            rect.bottom(),
+        ),
+    );
+    dialogs::draw_fitted(
+        painter,
         label,
-        theme::regular(14.0),
+        theme::regular(MENU_FONT),
         color,
+        text,
+        egui::Align2::LEFT_CENTER,
     );
 
     // Painted rather than typed: the app's font has no guarantee of ✓ or ▸ glyphs.
@@ -2232,9 +2464,9 @@ fn menu_row(ui: &mut egui::Ui, label: &str, enabled: bool, mark: Mark, palette: 
     enabled && response.clicked()
 }
 
-fn menu_separator(ui: &mut egui::Ui, palette: Palette) {
+fn menu_separator(ui: &mut egui::Ui, palette: Palette, width: f32) {
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(MENU_WIDTH, MENU_SEPARATOR_HEIGHT),
+        egui::vec2(width, MENU_SEPARATOR_HEIGHT),
         egui::Sense::hover(),
     );
     ui.painter().hline(
@@ -2242,6 +2474,26 @@ fn menu_separator(ui: &mut egui::Ui, palette: Palette) {
         rect.center().y,
         egui::Stroke::new(1.0, palette.divider()),
     );
+}
+
+/// The name editor's type: semibold 17, its text and its hint alike (§11.4).
+const NAME_EDITOR_FONT: f32 = 17.0;
+/// What the field keeps from its text: its 2-point border and the text edit's 4-point margins,
+/// on both sides.
+const NAME_EDITOR_TEXT_PADDING: f32 = 4.0 + 8.0;
+
+/// The name editor field's width in a menu `menu_width` wide: [`NAME_EDITOR_SIZE`]'s 200 points,
+/// wider by as much as the menu is wider than [`MENU_WIDTH`].
+fn name_editor_width(menu_width: f32) -> f32 {
+    NAME_EDITOR_SIZE.x + (menu_width - MENU_WIDTH).max(0.0)
+}
+
+/// The font the name editor's hint is set in: [`NAME_EDITOR_FONT`], or smaller down to
+/// [`dialogs::MIN_FIT_SCALE`] of it where the hint is longer than the field of a menu
+/// `menu_width` wide.
+fn name_editor_hint_font(ctx: &egui::Context, hint: &str, menu_width: f32) -> egui::FontId {
+    let room = name_editor_width(menu_width) - NAME_EDITOR_TEXT_PADDING;
+    dialogs::fitted_font(ctx, hint, theme::semibold(NAME_EDITOR_FONT), room)
 }
 
 /// The inline preset-name editor (`FxPresetMenuItem`, `docs/spec/03-controls.md` §11).
@@ -2259,17 +2511,20 @@ fn name_editor(
     presets: &[PresetEntry],
     renaming: Option<&str>,
     palette: Palette,
+    width: f32,
 ) -> Option<String> {
     let (row, _) = ui.allocate_exact_size(
-        egui::vec2(MENU_WIDTH, NAME_EDITOR_SIZE.y + 4.0),
+        egui::vec2(width, NAME_EDITOR_SIZE.y + 4.0),
         egui::Sense::hover(),
     );
-    let field =
-        egui::Rect::from_min_size(row.min + egui::vec2(MENU_TEXT_INSET, 2.0), NAME_EDITOR_SIZE);
-    let hint = tr(match editor.purpose {
-        EditorPurpose::SaveNew => "Enter your preset name",
-        EditorPurpose::Rename => "Enter new preset name",
-    });
+    let field = egui::Rect::from_min_size(
+        row.min + egui::vec2(MENU_TEXT_INSET, 2.0),
+        egui::vec2(name_editor_width(width), NAME_EDITOR_SIZE.y),
+    );
+    let hint = match editor.purpose {
+        EditorPurpose::SaveNew => tr(SAVE_NEW_HINT),
+        EditorPurpose::Rename => tr(RENAME_HINT),
+    };
 
     // Square corners, `DefaultFill` (§11.4). Painted first so the text lands on top of it.
     ui.painter().rect_filled(
@@ -2279,15 +2534,18 @@ fn name_editor(
     );
 
     let inner = field.shrink(2.0);
+    // The hint is set smaller where it is longer than the field, as JUCE squeezes
+    // `textToShowWhenEmpty`: German "Neuer Name der Voreinstellung" lost its end (E6b).
+    let hint_font = name_editor_hint_font(ui.ctx(), &hint, width);
     let response = ui.place(
         inner,
         egui::TextEdit::singleline(&mut editor.text)
             .id(egui::Id::new("fxsound.menu.name_editor"))
-            .font(theme::semibold(17.0))
+            .font(theme::semibold(NAME_EDITOR_FONT))
             .text_color(palette.color(FxColor::DefaultText))
             .hint_text(
                 egui::RichText::new(hint)
-                    .font(theme::semibold(17.0))
+                    .font(hint_font)
                     .color(palette.color(FxColor::HintText)),
             )
             .char_limit(MAX_PRESET_NAME_CHARS)
@@ -2940,17 +3198,50 @@ mod runtime_tests {
 }
 
 /// The zoom factor that fits `design` (points) into a surface of `surface_px` physical pixels
-/// at the compositor's `native_ppp`, never below 1.0: a surface *smaller* than the design is
-/// clipped rather than shrunk, and one exactly the design size draws at the native scale.
-fn fit_zoom(surface_px: egui::Vec2, design: egui::Vec2, native_ppp: f32) -> f32 {
+/// at the compositor's `native_ppp`. One exactly the design size draws at the native scale.
+///
+/// A surface *smaller* than the design is shrunk into only while `compositor_sized`: a tiling
+/// compositor's column or a screen too small for the window, where 0.4.0 cut the design off on
+/// both sides — niri's default half-screen column is 936 points wide, and the Pro view lost its
+/// logo and its close button (E6b). Not while a size the window asked for is on its way, which
+/// is smaller for a frame or two whenever a pane opens; and never below [`MIN_FIT_ZOOM`], under
+/// which the text could not be read anyway.
+fn fit_zoom(
+    surface_px: egui::Vec2,
+    design: egui::Vec2,
+    native_ppp: f32,
+    compositor_sized: bool,
+) -> f32 {
     if design.x <= 0.0 || design.y <= 0.0 || native_ppp <= 0.0 {
         return 1.0;
     }
     let zoom = (surface_px.x / (design.x * native_ppp)).min(surface_px.y / (design.y * native_ppp));
-    if zoom.is_finite() && zoom > 1.0 + ZOOM_TOLERANCE {
+    if !zoom.is_finite() {
+        1.0
+    } else if zoom > 1.0 + ZOOM_TOLERANCE {
         zoom
+    } else if compositor_sized && zoom < 1.0 - ZOOM_TOLERANCE {
+        zoom.max(MIN_FIT_ZOOM)
     } else {
         1.0
+    }
+}
+
+/// The smallest a compositor-sized window is shrunk to ([`fit_zoom`]).
+const MIN_FIT_ZOOM: f32 = 0.5;
+
+/// What to put in `ViewportCommand::InnerSize` for a window `wanted` points big at the
+/// compositor's own scale, under the egui `zoom` in effect.
+///
+/// egui-winit multiplies the size by the zoom as well as by the compositor's scale. A size
+/// asked for while [`fit_zoom`] had the view shrunk into a tile, or scaled up in fullscreen, came
+/// out that much smaller or larger: on niri, flipping to Lite in a column the Pro view had been
+/// shrunk into asked for 495 × 170 instead of 550 × 189, and stayed shrunk (E6b).
+fn inner_size_request(wanted: egui::Vec2, zoom: f32) -> egui::Vec2 {
+    if zoom.is_finite() && zoom > 0.0 {
+        wanted / zoom
+    } else {
+        wanted
     }
 }
 
@@ -2969,7 +3260,7 @@ mod calibration_tests {
 
     /// A runtime serving the socket in `dir`, around a controller started against a stand-in
     /// engine whose input lane is attached to the fifine when `with_microphone`.
-    fn runtime(dir: &std::path::Path, with_microphone: bool) -> Runtime {
+    pub(super) fn runtime(dir: &std::path::Path, with_microphone: bool) -> Runtime {
         let Instance::Primary(listener) = Instance::acquire_in(dir).expect("acquire") else {
             panic!("expected to be primary");
         };
@@ -3278,9 +3569,47 @@ mod zoom_tests {
     use super::*;
 
     #[test]
+    fn a_size_asked_for_under_a_zoom_is_the_design_size_at_the_compositors_scale() {
+        let lite = layout::lite::WINDOW_SIZE;
+        // egui-winit multiplies by the zoom again, so what reaches the compositor is `lite`.
+        for zoom in [0.9_f32, 1.0, 1.5306] {
+            let sent = inner_size_request(lite, zoom);
+            assert!((sent * zoom - lite).length() < 1e-3, "{zoom}: {sent:?}");
+        }
+        assert_eq!(inner_size_request(lite, 0.0), lite);
+    }
+
+    #[test]
+    fn a_tile_narrower_than_the_pro_window_shrinks_it_to_fit_rather_than_cutting_it() {
+        // E6b: niri's default column, 936 × 1048 points at scale 1, cut the Pro view's logo and
+        // close button off.
+        let zoom = fit_zoom(
+            egui::vec2(936.0, 1048.0),
+            egui::vec2(1040.0, 588.0),
+            1.0,
+            true,
+        );
+        assert!((zoom - 0.9).abs() < 1e-3, "{zoom}");
+        assert!(1040.0 * zoom <= 936.0 + 0.5);
+        // Not below half size: past that it is cut again rather than unreadable.
+        let tiny = fit_zoom(
+            egui::vec2(300.0, 1048.0),
+            egui::vec2(1040.0, 588.0),
+            1.0,
+            true,
+        );
+        assert_eq!(tiny, MIN_FIT_ZOOM);
+    }
+
+    #[test]
     fn fullscreen_on_the_reference_monitor_scales_the_pro_window_to_the_height() {
         // 2560×1440 physical at scale 1.6, Pro design 1040×588 points.
-        let zoom = fit_zoom(egui::vec2(2560.0, 1440.0), egui::vec2(1040.0, 588.0), 1.6);
+        let zoom = fit_zoom(
+            egui::vec2(2560.0, 1440.0),
+            egui::vec2(1040.0, 588.0),
+            1.6,
+            true,
+        );
         // 1440 / (588 · 1.6) = 1.5306 is the limiting axis; the width would allow 1.5385.
         assert!((zoom - 1.5306).abs() < 1e-3, "{zoom}");
         // The scaled design fits: 588 · 1.6 · zoom ≈ 1440 and 1040 · 1.6 · zoom < 2560.
@@ -3290,21 +3619,33 @@ mod zoom_tests {
 
     #[test]
     fn the_lite_window_scales_further_and_a_normal_window_does_not_scale_at_all() {
-        let lite = fit_zoom(egui::vec2(2560.0, 1440.0), egui::vec2(550.0, 189.0), 1.6);
+        let lite = fit_zoom(
+            egui::vec2(2560.0, 1440.0),
+            egui::vec2(550.0, 189.0),
+            1.6,
+            true,
+        );
         assert!(lite > 2.9 && lite < 2.91, "{lite}");
         // The window at its own design size, in physical pixels.
         let exact = fit_zoom(
             egui::vec2(1040.0 * 1.6, 588.0 * 1.6),
             egui::vec2(1040.0, 588.0),
             1.6,
+            false,
         );
         assert_eq!(exact, 1.0);
-        // A surface smaller than the design is never shrunk.
-        let small = fit_zoom(egui::vec2(800.0, 400.0), egui::vec2(1040.0, 588.0), 1.6);
+        // A surface smaller than the design only for as long as a size the window asked for is
+        // on its way is not shrunk.
+        let small = fit_zoom(
+            egui::vec2(800.0, 400.0),
+            egui::vec2(1040.0, 588.0),
+            1.6,
+            false,
+        );
         assert_eq!(small, 1.0);
         // Garbage in, native scale out.
         assert_eq!(
-            fit_zoom(egui::vec2(0.0, 0.0), egui::vec2(1040.0, 588.0), 0.0),
+            fit_zoom(egui::vec2(0.0, 0.0), egui::vec2(1040.0, 588.0), 0.0, true),
             1.0
         );
     }
@@ -3867,5 +4208,334 @@ mod forget_device_tests {
         let answer = client.join().expect("client").expect("answered");
         assert!(!answer.ok);
         assert!(answer.stderr.contains("shutting down"), "{}", answer.stderr);
+    }
+}
+
+#[cfg(test)]
+mod popup_tests {
+    use super::*;
+    use egui::{Pos2, RawInput, Rect, vec2};
+    use fxsound_core::i18n::{Catalogue, LANGUAGES};
+
+    fn context() -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(theme::font_definitions());
+        ctx
+    }
+
+    /// `key` in English and in every language's table.
+    fn every_translation(key: &str) -> Vec<(&'static str, String)> {
+        let mut all = vec![("en", key.to_owned())];
+        for language in &LANGUAGES[1..] {
+            let table = Catalogue::for_language(language);
+            all.push((language.code, table.get(key).unwrap_or(key).to_owned()));
+        }
+        all
+    }
+
+    /// One frame on a surface of `size` points, as the window's own frame goes about it: take
+    /// in the surface, ask for a size, draw the menu. What the menu covered, if it was open, and
+    /// what the frame asked the viewport to do.
+    fn sized_frame(
+        shell: &mut Shell<'_>,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+    ) -> (Option<Rect>, Vec<egui::ViewportCommand>) {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+            ..RawInput::default()
+        };
+        let palette = shell.rt.app.palette();
+        let mut menu = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            shell.compositor_sized =
+                compositor_sized(size, shell.applied_size, shell.resize_in_flight());
+            shell.sync_view_size(ui.ctx());
+            menu = shell.show_menu(ui.ctx(), palette);
+        });
+        let commands = output
+            .viewport_output
+            .remove(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands)
+            .unwrap_or_default();
+        output.drop_without_applying_deltas();
+        (menu, commands)
+    }
+
+    fn inner_sizes(commands: &[egui::ViewportCommand]) -> Vec<egui::Vec2> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                egui::ViewportCommand::InnerSize(size) => Some(*size),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Let a size the window asked for have had all the time it gets to land.
+    fn settle(shell: &mut Shell<'_>) {
+        shell.resized_at = Instant::now().checked_sub(RESIZE_SETTLE + Duration::from_millis(10));
+    }
+
+    #[test]
+    fn the_menu_open_in_the_lite_window_scrolls_inside_it_under_the_hamburger_and_asks_for_no_size()
+    {
+        // E6b: in the 189-point Lite window the menu lost Export, Import and Theme below the
+        // window's edge and was pushed up over the title bar. Growing the window for it then
+        // kept Hyprland asking and refusing, niri filled the grown part with its focus ring's
+        // colour, and the menu was cut at Rename Preset whenever the window was not grown.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = calibration_tests::runtime(dir.path(), false);
+        rt.app.state.view = ViewMode::Lite;
+        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let lite = layout::lite::WINDOW_SIZE;
+        let ctx = context();
+
+        let (shut, commands) = sized_frame(&mut shell, &ctx, lite);
+        assert_eq!(shut, None);
+        assert_eq!(inner_sizes(&commands), vec![lite]);
+        settle(&mut shell);
+
+        shell.menu.toggle();
+        let hamburger = layout::Chrome::LITE.menu.rect();
+        for frame in 0..8 {
+            if frame % 2 == 1 {
+                settle(&mut shell);
+            }
+            let (menu, commands) = sized_frame(&mut shell, &ctx, lite);
+            assert!(
+                inner_sizes(&commands).is_empty(),
+                "frame {frame}: {commands:?}"
+            );
+            assert!(!shell.compositor_sized, "frame {frame}");
+            let menu = menu.expect("the menu is open");
+            // Anchored under the hamburger, not pushed up over the title bar…
+            assert!(
+                (menu.top() - (hamburger.bottom() + 4.0)).abs() < 1e-3,
+                "{menu:?}"
+            );
+            // …and short of the window's bottom edge, its eleven rows scrolling.
+            assert!(menu.bottom() <= lite.y - POPUP_MARGIN + 1e-3, "{menu:?}");
+            assert!(menu.height() < 11.0 * MENU_ROW_HEIGHT, "{menu:?}");
+            assert!(menu.height() > 3.0 * MENU_ROW_HEIGHT, "{menu:?}");
+        }
+        assert_eq!(shell.window_size(), lite);
+    }
+
+    #[test]
+    fn flipping_the_view_gives_the_compositor_the_new_size_as_the_windows_smallest_and_largest() {
+        // E6b, on Hyprland: winit gives the size the window was created at as its smallest and
+        // largest, the compositor held the floating window to it, and Pro stayed 550 × 189.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = calibration_tests::runtime(dir.path(), false);
+        rt.app.state.view = ViewMode::Lite;
+        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let ctx = context();
+        let lite = layout::lite::WINDOW_SIZE;
+        let (_, commands) = sized_frame(&mut shell, &ctx, lite);
+        assert!(commands.contains(&egui::ViewportCommand::MinInnerSize(lite)));
+        assert!(commands.contains(&egui::ViewportCommand::MaxInnerSize(lite)));
+        settle(&mut shell);
+
+        shell.rt.app.state.view = ViewMode::Pro;
+        let pro = layout::pro::WINDOW_SIZE;
+        let (_, commands) = sized_frame(&mut shell, &ctx, lite);
+        assert!(
+            commands.contains(&egui::ViewportCommand::MinInnerSize(pro)),
+            "{commands:?}"
+        );
+        assert!(
+            commands.contains(&egui::ViewportCommand::MaxInnerSize(pro)),
+            "{commands:?}"
+        );
+        assert_eq!(inner_sizes(&commands), vec![pro]);
+        settle(&mut shell);
+        let (_, commands) = sized_frame(&mut shell, &ctx, pro);
+        assert!(commands.is_empty(), "{commands:?}");
+        assert!(!shell.compositor_sized);
+    }
+
+    #[test]
+    fn the_lite_lists_hang_under_the_title_bar_and_short_of_the_windows_bottom_edge() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = calibration_tests::runtime(dir.path(), false);
+        rt.app.state.view = ViewMode::Lite;
+        let shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let lite = layout::lite::WINDOW_SIZE;
+        let bounds = shell.popup_bounds(Rect::from_min_size(Pos2::ZERO, lite));
+        assert_eq!(
+            bounds.top(),
+            layout::TITLE_BAR_HEIGHT + layout::TITLE_BAR_DIVIDER_HEIGHT
+        );
+        assert_eq!(bounds.bottom(), lite.y - POPUP_MARGIN);
+        for combo in [layout::lite::preset_combo(), layout::lite::output_combo()] {
+            let row = combo::popup_row_height(combo.height());
+            for rows in [1, 2, 5, 40] {
+                let list = combo::popup_list_height(rows, 0, false, row);
+                let (top, height) = combo::place_list(combo, list, bounds, row);
+                assert!(
+                    top >= bounds.top() && top + height <= bounds.bottom() + 1e-3,
+                    "{rows} rows: {top} {height}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_surface_is_the_compositors_size_only_once_the_asked_size_has_had_time_to_land() {
+        let asked = Some(layout::lite::WINDOW_SIZE);
+        let fullscreen = vec2(1920.0, 1080.0);
+        assert!(compositor_sized(fullscreen, asked, false));
+        // Still on its way: not the compositor's doing yet.
+        assert!(!compositor_sized(fullscreen, asked, true));
+        // The size asked for, give or take a point of rounding.
+        assert!(!compositor_sized(
+            layout::lite::WINDOW_SIZE + vec2(0.5, -0.5),
+            asked,
+            false
+        ));
+        // Nothing asked for yet.
+        assert!(!compositor_sized(fullscreen, None, false));
+    }
+
+    #[test]
+    fn the_menu_is_as_wide_as_its_longest_item_in_every_language() {
+        // E6b: German "Voreinstellungs-Änderung verwerfen" ran over the 244-point menu's edge.
+        let ctx = context();
+        let keys = [
+            ("Settings", false),
+            ("Save New Preset", true),
+            ("Overwrite Existing Preset", false),
+            ("Undo Preset Changes", false),
+            ("Rename Preset", true),
+            ("Delete Preset", false),
+            ("Export Presets", false),
+            ("Import Presets", false),
+            ("Theme", false),
+            ("Dark", false),
+            ("Light", false),
+        ];
+        let mut problems = Vec::new();
+        ctx.run_ui(RawInput::default(), |ui| {
+            for (index, (code, _)) in every_translation("Settings").into_iter().enumerate() {
+                let rows: Vec<(String, bool)> = keys
+                    .iter()
+                    .map(|(key, submenu)| (every_translation(key)[index].1.clone(), *submenu))
+                    .collect();
+                let hints = [
+                    every_translation(SAVE_NEW_HINT)[index].1.clone(),
+                    every_translation(RENAME_HINT)[index].1.clone(),
+                ];
+                let width = menu_width(ui.ctx(), &rows, &hints);
+                assert!(
+                    (MENU_WIDTH..=MENU_MAX_WIDTH).contains(&width),
+                    "{code}: {width}"
+                );
+                for (label, submenu) in &rows {
+                    let text = ui
+                        .painter()
+                        .layout_no_wrap(
+                            label.clone(),
+                            theme::regular(MENU_FONT),
+                            egui::Color32::PLACEHOLDER,
+                        )
+                        .size()
+                        .x;
+                    let room = width - MENU_TEXT_INSET - menu_text_end(*submenu);
+                    if text > room {
+                        problems.push(format!("{code}: {label:?} is {text:.0} in {room:.0}"));
+                    }
+                }
+            }
+        })
+        .drop_without_applying_deltas();
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+        // The English menu keeps the original's width.
+        let english: Vec<(String, bool)> = keys
+            .iter()
+            .map(|(key, submenu)| ((*key).to_owned(), *submenu))
+            .collect();
+        let hints = [SAVE_NEW_HINT.to_owned(), RENAME_HINT.to_owned()];
+        ctx.run_ui(RawInput::default(), |ui| {
+            assert_eq!(menu_width(ui.ctx(), &english, &hints), MENU_WIDTH);
+            assert_eq!(name_editor_width(MENU_WIDTH), NAME_EDITOR_SIZE.x);
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn overwrite_with_a_long_preset_name_widens_the_menu_only_to_its_limit() {
+        let ctx = context();
+        ctx.run_ui(RawInput::default(), |ui| {
+            let typical = [("Overwrite Existing Preset - My Preset".to_owned(), false)];
+            let width = menu_width(ui.ctx(), &typical, &[]);
+            assert!(width > MENU_WIDTH, "{width}");
+            let long = [(
+                "Overwrite Existing Preset - Calibrated — HECATE G2000 Pro Mono Microphone"
+                    .to_owned(),
+                false,
+            )];
+            assert_eq!(menu_width(ui.ctx(), &long, &[]), MENU_MAX_WIDTH);
+        })
+        .drop_without_applying_deltas();
+        // At its widest the menu still ends inside the Lite window.
+        let frame = layout::Chrome::LITE.menu.rect().left() + MENU_MAX_WIDTH + 2.0 * 8.0 + 2.0;
+        assert!(
+            frame + POPUP_MARGIN <= layout::lite::WINDOW_SIZE.x,
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn the_folder_picker_is_titled_in_the_windows_language() {
+        // E6b: the portal's picker read "Select the folder which contains the presets..." over
+        // a German window.
+        let german = fxsound_core::i18n::language("de").expect("a German table");
+        let table = Catalogue::for_language(german);
+        let title = folder_picker_title(|key| table.get(key).unwrap_or(key).to_owned());
+        assert_eq!(
+            title,
+            "Wählen Sie den Ordner aus, der die Voreinstellungen enthält…"
+        );
+        assert_eq!(
+            folder_picker_title(str::to_owned),
+            dialogs::presets::SELECT_FOLDER_LABEL
+        );
+    }
+
+    #[test]
+    fn the_name_editors_hint_fits_its_field_in_every_language() {
+        // E6b: German "Neuer Name der Voreinstellung" lost its end in the 200-point field.
+        let ctx = context();
+        let mut problems = Vec::new();
+        ctx.run_ui(RawInput::default(), |ui| {
+            for key in [SAVE_NEW_HINT, RENAME_HINT] {
+                for (code, hint) in every_translation(key) {
+                    // The menu of that language, which widens for the longer hint of the two.
+                    let hints: Vec<String> = [SAVE_NEW_HINT, RENAME_HINT]
+                        .iter()
+                        .map(|key| {
+                            every_translation(key)
+                                .into_iter()
+                                .find(|(other, _)| *other == code)
+                                .map(|(_, text)| text)
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    let width = menu_width(ui.ctx(), &[], &hints);
+                    let font = name_editor_hint_font(ui.ctx(), &hint, width);
+                    let used = ui
+                        .painter()
+                        .layout_no_wrap(hint.clone(), font.clone(), egui::Color32::PLACEHOLDER)
+                        .size()
+                        .x;
+                    if used > name_editor_width(width) - NAME_EDITOR_TEXT_PADDING {
+                        problems.push(format!("{code}: {hint:?} is {used:.0} at {}", font.size));
+                    }
+                }
+            }
+        })
+        .drop_without_applying_deltas();
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 }

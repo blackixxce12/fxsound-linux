@@ -152,16 +152,17 @@ pub fn show(
 }
 
 /// Where `FxView::modelChanged` puts the preset list's one separator: at the factory→user boundary
-/// (`FxView.cpp:205-225`, `docs/spec/03-controls.md` §8.4 rule 3).
+/// (`FxView.cpp:205-225`, `docs/spec/03-controls.md` §8.4 rule 3) — above the run of the user's
+/// presets that ends the list.
 ///
-/// `None` when every preset is a factory one, and also when the very first entry is already a user
-/// preset — a rule above the top of the list would be a stray line.
+/// `None` when every preset is a factory one, and also when no factory preset comes before the
+/// user's — a rule above the top of the list would be a stray line. A user preset that took a
+/// factory one's name keeps that one's place among the factory presets, and gets no rule of its
+/// own there.
 #[must_use]
 pub fn first_user_preset(presets: &[PresetEntry]) -> Option<usize> {
-    presets
-        .iter()
-        .position(|preset| !preset.factory)
-        .filter(|&index| index > 0)
+    let first = presets.iter().rposition(|preset| preset.factory)? + 1;
+    (first < presets.len()).then_some(first)
 }
 
 /// How the device list is cut into its `Output` and `Input` runs **(port addition)**.
@@ -731,6 +732,25 @@ mod tests {
             preset("Late Night", false),
         ];
         assert_eq!(first_user_preset(&presets), Some(2));
+    }
+
+    #[test]
+    fn a_user_copy_of_a_factory_preset_keeps_its_place_without_a_rule_above_it() {
+        // The store keeps a user "General" where the factory one was; the rule still sits above
+        // the user's own presets at the end of the list.
+        let presets = [
+            preset("General", false),
+            preset("Music", true),
+            preset("Rock", true),
+            preset("My Mix", false),
+        ];
+        assert_eq!(first_user_preset(&presets), Some(3));
+        let shadow_only = [
+            preset("Flat", true),
+            preset("Rock", false),
+            preset("Jazz", true),
+        ];
+        assert_eq!(first_user_preset(&shadow_only), None);
     }
 
     #[test]
