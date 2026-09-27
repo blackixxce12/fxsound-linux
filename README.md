@@ -391,12 +391,21 @@ or quit, so a crash loses at most a minute. **Delete Preset** asks first and mov
 desktop's trash, where a file manager can restore it, and its unsaved edits with it: restore both
 and the preset is back with its `*`. **Save New Preset** also copies a preset with
 no unsaved changes. A new preset's name is cut to the 126 bytes a Windows FxSound reads a name in
-(63 Cyrillic letters). **Reset presets** in Settings asks first, then discards every unsaved change
-and keeps your saved presets. `max_user_presets` in the settings file allows 10 to 1000 presets.
+(63 Cyrillic letters), and a line break or a tab in it becomes a space. Saving over one of your
+presets writes the file it was listed from, whatever that file is called, so a preset 0.3.0 saved
+as `Rock:Live.fac` keeps its file, and the unsaved edits 0.3.0 left in `AutoSave/` come back with
+it. **Reset presets** in Settings asks first, then discards every unsaved change and keeps your
+saved presets. `max_user_presets` in the settings file allows 10 to 1000 presets.
 
 The settings file keeps the original's key names so it can be diffed against the Windows
 `FxSound.settings`. Settings and presets are written durably — temporary file, fsync, rename — so an
-interrupted save cannot truncate what was there.
+interrupted save cannot truncate what was there. A settings file that does not load (a typo, a
+comment saved in a legacy encoding, permissions) is moved aside to `settings.toml.bad`, or
+`settings.toml.2.bad` and so on, never over an earlier one, before the defaults are saved. A
+settings file or preset that is a symbolic link, as GNU Stow or chezmoi leave them, stays one: the
+file it points to is the one replaced. A link to a read-only file, or to one in a directory you may
+not write, is never saved through, so every save of that file fails. home-manager's default links
+into the Nix store are such links; link the file with `mkOutOfStoreSymlink` to let FxSound save it.
 
 ## Deliberate differences from the Windows build
 

@@ -1078,9 +1078,21 @@ pub(crate) fn parse_preset_name(value: &str) -> Result<String, String> {
 fn parse_new_preset_name(value: &str) -> Result<String, String> {
     if new_preset_name(value).is_empty() {
         let reserved: String = PRESET_NAME_RESERVED.iter().collect();
+        // A line break or a tab is shown as its escape, not as itself.
+        let shown: String = value
+            .chars()
+            .map(|c| {
+                if c.is_control() {
+                    c.escape_default().to_string()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
         Err(format!(
-            "`{value}` is no preset name: nothing is left of it once the characters a preset \
-             name cannot hold ({reserved}) and the spaces around them are taken out"
+            "`{shown}` is no preset name: nothing is left of it once the characters a preset \
+             name cannot hold ({reserved}), control characters such as a line break and the \
+             spaces around them are taken out"
         ))
     } else {
         Ok(value.to_owned())
@@ -1658,6 +1670,26 @@ mod tests {
     }
 
     #[test]
+    fn a_multi_line_preset_name_from_the_command_line_is_saved_on_one_line() {
+        // `fxsound --save_preset="$(xclip -o)"` with two lines selected: the `.fac` it saved could
+        // not be read back, and the preset vanished from the list.
+        let commands = parse(&["--save_preset=Line one\nLine two\n"]).commands();
+        assert_eq!(
+            commands,
+            vec![Command::Preset(PresetCommand::SaveAs(
+                "Line one Line two".to_owned()
+            ))]
+        );
+        let commands = parse(&["--rename_preset=Tab\there"]).commands();
+        assert_eq!(
+            commands,
+            vec![Command::Preset(PresetCommand::Rename(
+                "Tab here".to_owned()
+            ))]
+        );
+    }
+
+    #[test]
     fn a_new_preset_name_from_the_command_line_fits_what_windows_reads() {
         // 0.4.0 audit #15: sixty-four Cyrillic letters are 128 bytes, two more than the name line
         // a Windows FxSound reads.
@@ -1692,6 +1724,8 @@ mod tests {
             let message = error(&[args]);
             assert!(message.contains("is no preset name"), "{args}: {message}");
         }
+        let message = error(&["--save_preset=\n\t"]);
+        assert!(message.contains("`\\n\\t` is no preset name"), "{message}");
         assert!(error(&["--preset="]).contains("a preset name cannot be empty"));
         assert!(error(&["--preset", " "]).contains("a preset name cannot be empty"));
         // What sanitises to something is kept as typed and sanitised on its way into the command.

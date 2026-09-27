@@ -16,6 +16,7 @@
 //! replaces it with the version before, so a file set aside never goes there, and nothing set
 //! aside is ever written over.
 
+use fxsound_core::atomic::numbered;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -61,10 +62,8 @@ fn discard_to(path: &Path, trash: io::Result<PathBuf>) -> io::Result<Discarded> 
 /// Rename `path` to `<path>.1.bak` beside itself, or `<path>.2.bak` and so on when that is
 /// taken, and return the new path; whatever already has one of those names is left as it is.
 ///
-/// The rename cannot land on a file that appears under the name in the meantime either: the new
-/// name is made as a hard link, which fails rather than replace anything, and the old one then
-/// dropped. A filesystem without hard links (FAT, exFAT) gets a check for the name and then a
-/// plain rename.
+/// The rename cannot land on a file that appears under the name in the meantime either
+/// ([`fxsound_core::atomic::rename_to_free_name`]).
 ///
 /// # Errors
 /// The file could not be renamed, or a thousand names were taken; it is where it was.
@@ -74,28 +73,10 @@ pub fn set_aside(path: &Path) -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no file name"))?;
     let mut backup = name.to_owned();
     backup.push(".bak");
-    for n in 1..=1000_u32 {
-        let candidate = path.with_file_name(numbered(&backup, n));
-        match std::fs::hard_link(path, &candidate) {
-            Ok(()) => {
-                if let Err(err) = std::fs::remove_file(path) {
-                    let _ = std::fs::remove_file(&candidate);
-                    return Err(err);
-                }
-                return Ok(candidate);
-            }
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(_) if candidate.symlink_metadata().is_ok() => {}
-            Err(_) => {
-                std::fs::rename(path, &candidate)?;
-                return Ok(candidate);
-            }
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "no free .bak name",
-    ))
+    fxsound_core::atomic::rename_to_free_name(
+        path,
+        (1..=1000_u32).map(|n| path.with_file_name(numbered(&backup, n))),
+    )
 }
 
 /// `$XDG_DATA_HOME/Trash`, with the specification's fallback of `~/.local/share`.
@@ -192,25 +173,6 @@ fn move_to_trash(path: &Path, trash: &Path) -> io::Result<PathBuf> {
         io::ErrorKind::AlreadyExists,
         "no free name in the trash",
     ))
-}
-
-/// `Rock.fac` as the `n`th of its name in the trash: `Rock.n.fac`, the extension kept so that a
-/// file manager still knows what it is.
-fn numbered(name: &std::ffi::OsStr, n: u32) -> std::ffi::OsString {
-    let path = Path::new(name);
-    match (path.file_stem(), path.extension()) {
-        (Some(stem), Some(extension)) => {
-            let mut out = stem.to_owned();
-            out.push(format!(".{n}."));
-            out.push(extension);
-            out
-        }
-        _ => {
-            let mut out = name.to_owned();
-            out.push(format!(".{n}"));
-            out
-        }
-    }
 }
 
 /// The `Path=` value: the absolute path, URI-escaped byte by byte as RFC 2396 says, `/` kept.

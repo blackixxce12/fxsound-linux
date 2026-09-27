@@ -14,9 +14,10 @@
 //! know is skipped, and the next save leaves it out. `run_minimized`, which 0.3.0 read and never
 //! wrote, is written again whenever the window hides to the tray or shows.
 //!
-//! A file that does not parse is moved aside as `settings.toml.bad` and the defaults are used —
-//! never overwritten in place, so a hand edit that went wrong can still be read back by the
-//! person who made it.
+//! A file that does not load — it does not parse, it is not UTF-8, this user may not read it — is
+//! moved aside as `settings.toml.bad` (`settings.toml.2.bad` and so on when that is taken) and the
+//! defaults are used — never overwritten in place, so a hand edit that went wrong can still be
+//! read back by the person who made it.
 
 use std::path::Path;
 
@@ -329,21 +330,35 @@ impl Settings {
 
     /// [`Settings::load`] from an explicit path — the seam the migration tests use.
     ///
-    /// A file that does not parse is **moved aside**, to `<path>.bad`, before the defaults are
-    /// returned. Silently resetting was the 0.3.0 behaviour, and it had a cost that grew with
-    /// every key added: one typo in a hand edit — `power = "yes"` — and the next save wrote the
-    /// defaults over every device, preset and language the user had, with only a log line to say
-    /// so. Now the next save writes a fresh file beside the broken one, and the broken one is
-    /// there to be read back. A file that cannot be *read* (permissions, a directory in its place)
-    /// is left where it is: there is nothing to preserve that is not already preserved.
+    /// A file that is there but does not load is **moved aside**, to `<path>.bad`, before the
+    /// defaults are returned: one that does not parse, one that is not UTF-8 (a comment saved in
+    /// CP1251 or Latin-1 by an editor on a legacy encoding), one this user may not read (after a
+    /// `chmod`, or a copy root owns). Silently resetting was the 0.3.0 behaviour, and it had a
+    /// cost that grew with every key added: one typo in a hand edit — `power = "yes"` — and the
+    /// next save (a slider let go, a preset picked, the way out) renamed the defaults over every
+    /// device, preset and language the user had, with only a log line to say so. Now the next
+    /// save writes a fresh file beside the broken one, and the broken one is there to be read
+    /// back. An earlier `.bad` is never replaced: this one goes to `<path>.2.bad` or the next
+    /// free number ([`crate::atomic::aside_names`]), since the first is the one that held the
+    /// user's own settings.
+    ///
+    /// Two cases are left where they are, as [`crate::AppRules::load_from`] leaves them. A
+    /// missing file is simply the defaults. A directory in the file's place holds nothing a save
+    /// can destroy: a rename cannot replace a directory, so every save fails, loudly, until
+    /// someone removes it.
     #[must_use]
     pub fn load_from(path: &Path) -> Self {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Self::sanitised_default();
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::IsADirectory => {
+                log::warn!("{}: {err}; using defaults", path.display());
+                return Self::sanitised_default();
+            }
             Err(err) => {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    log::warn!("{}: {err}; using defaults", path.display());
-                }
+                Self::move_aside(path, &err);
                 return Self::sanitised_default();
             }
         };
@@ -353,25 +368,37 @@ impl Settings {
                 settings
             }
             Err(err) => {
-                let aside = Self::bad_path(path);
-                match std::fs::rename(path, &aside) {
-                    Ok(()) => log::warn!(
-                        "{}: {err}; moved aside as {} and using defaults",
-                        path.display(),
-                        aside.display()
-                    ),
-                    Err(rename_err) => log::warn!(
-                        "{}: {err}; could not move it aside ({rename_err}); using defaults",
-                        path.display()
-                    ),
-                }
+                Self::move_aside(path, &err);
                 Self::sanitised_default()
             }
         }
     }
 
-    /// Where [`Settings::load_from`] moves a file it could not parse: `settings.toml.bad` beside
-    /// `settings.toml`.
+    /// Rename a file that did not load to the first free name [`Settings::next_bad_path`] would
+    /// give, saying why in the log.
+    ///
+    /// When the rename itself fails the file stays where it is, and the log says so. What stops
+    /// this rename — a directory this user may not write, a read-only filesystem — stops the next
+    /// save's rename as well, so the file is still not replaced.
+    fn move_aside(path: &Path, why: &dyn std::fmt::Display) {
+        match crate::atomic::rename_to_free_name(
+            path,
+            crate::atomic::aside_names(Self::bad_path(path)),
+        ) {
+            Ok(aside) => log::warn!(
+                "{}: {why}; moved aside as {} and using defaults",
+                path.display(),
+                aside.display()
+            ),
+            Err(rename_err) => log::warn!(
+                "{}: {why}; could not move it aside ({rename_err}); using defaults",
+                path.display()
+            ),
+        }
+    }
+
+    /// Where [`Settings::load_from`] moves the first file it could not load: `settings.toml.bad`
+    /// beside `settings.toml`. A later one goes to `settings.toml.2.bad` and so on.
     #[must_use]
     pub fn bad_path(path: &Path) -> std::path::PathBuf {
         let mut name = path.file_name().map_or_else(
@@ -380,6 +407,14 @@ impl Settings {
         );
         name.push(".bad");
         path.with_file_name(name)
+    }
+
+    /// Where [`Settings::load_from`] would move a file that does not load now: the first of
+    /// `settings.toml.bad`, `settings.toml.2.bad`, … that nothing has. What `--self-test`, which
+    /// moves nothing, tells the user.
+    #[must_use]
+    pub fn next_bad_path(path: &Path) -> std::path::PathBuf {
+        crate::atomic::next_aside_name(Self::bad_path(path))
     }
 
     /// The defaults as the loader hands them out: with the migration rule already applied, so a
@@ -1227,6 +1262,144 @@ input_preset = \"Headset\"
             std::fs::read_to_string(&aside).expect("still there"),
             broken
         );
+    }
+
+    /// What [`Settings::load_from`] hands out for a file it could not use.
+    fn loaded_defaults() -> Settings {
+        let mut defaults = Settings::default();
+        defaults.sanitise();
+        defaults
+    }
+
+    #[test]
+    fn a_settings_file_that_is_not_utf8_is_moved_aside_rather_than_replaced_by_the_defaults() {
+        // A comment saved in CP1251 by an editor on a legacy encoding: `Звук` is four bytes there
+        // and none of them UTF-8. The file used to load as the defaults and stay where it was,
+        // and the next save renamed the defaults over it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let cp1251: &[u8] = b"# \xc7\xe2\xf3\xea\npower = false\noutput_preset = \"Rock\"\n";
+        std::fs::write(&path, cp1251).expect("write");
+
+        assert_eq!(Settings::load_from(&path), loaded_defaults());
+        let aside = Settings::bad_path(&path);
+        assert_eq!(
+            std::fs::read(&aside).expect("the file was moved aside"),
+            cp1251,
+            "byte for byte, so it can be saved again in UTF-8 and put back"
+        );
+        assert!(!path.exists(), "nothing is left to be overwritten in place");
+
+        // The save a slider or the way out makes cannot touch it now.
+        loaded_defaults().save_to(&path).expect("save");
+        assert_eq!(std::fs::read(&aside).expect("still there"), cp1251);
+    }
+
+    #[test]
+    fn a_settings_file_this_user_may_not_read_is_moved_aside_rather_than_replaced() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let text = "output_preset = \"Jazz\"\n";
+        std::fs::write(&path, text).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        if std::fs::read(&path).is_ok() {
+            // Root reads a mode-000 file anyway, so there is no unreadable file to test with.
+            return;
+        }
+
+        assert_eq!(Settings::load_from(&path), loaded_defaults());
+        let aside = Settings::bad_path(&path);
+        assert!(
+            !path.exists(),
+            "nothing is left for the next save to replace"
+        );
+
+        loaded_defaults().save_to(&path).expect("save");
+        std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        assert_eq!(
+            std::fs::read_to_string(&aside).expect("readable once allowed"),
+            text,
+            "the user's preset is still there once the permissions are fixed"
+        );
+    }
+
+    #[test]
+    fn a_directory_in_the_settings_files_place_is_left_where_it_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        std::fs::create_dir(&path).expect("create");
+        std::fs::write(path.join("notes"), "mine").expect("write");
+
+        assert_eq!(Settings::load_from(&path), loaded_defaults());
+        assert!(path.is_dir());
+        assert!(!Settings::bad_path(&path).exists());
+        // And no save can destroy it: a rename cannot replace a directory.
+        assert!(loaded_defaults().save_to(&path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(path.join("notes")).expect("still there"),
+            "mine"
+        );
+    }
+
+    #[test]
+    fn a_second_broken_settings_file_is_moved_aside_beside_the_first_never_over_it() {
+        // The first `.bad` is the one with the user's own settings in it; a later file that fails
+        // to load — a newer FxSound's value this one does not know, after a downgrade — is
+        // usually the defaults with one bad line, and must not take its place.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.toml");
+        let precious = "power = \"yes\"\noutput_preset = \"MyPrecious\"\n";
+        std::fs::write(&path, precious).expect("write");
+        assert_eq!(Settings::load_from(&path), loaded_defaults());
+        loaded_defaults().save_to(&path).expect("save");
+
+        std::fs::write(&path, "power = \"no\"\n").expect("write");
+        assert_eq!(
+            Settings::next_bad_path(&path),
+            dir.path().join("settings.toml.2.bad"),
+            "what the self-test would say"
+        );
+        assert_eq!(Settings::load_from(&path), loaded_defaults());
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("settings.toml.bad")).expect("first"),
+            precious
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("settings.toml.2.bad")).expect("second"),
+            "power = \"no\"\n"
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_settings_file_that_is_a_symbolic_link_stays_one_after_a_save() {
+        // GNU Stow and chezmoi's symlink mode keep the file as a link into the user's dotfiles;
+        // a save used to replace the link with a plain file, and every change after it was
+        // missing from the dotfiles.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("dotfiles-settings.toml");
+        let link = dir.path().join("settings.toml");
+        let mut original = loaded_defaults();
+        original.output_preset = "Rock".into();
+        original.save_to(&real).expect("save the dotfiles copy");
+        std::os::unix::fs::symlink(&real, &link).expect("link");
+
+        let mut settings = Settings::load_from(&link);
+        assert_eq!(settings.output_preset, "Rock");
+        settings.output_preset = "Jazz".into();
+        settings.save_to(&link).expect("save");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("there")
+                .file_type()
+                .is_symlink(),
+            "still a link"
+        );
+        assert_eq!(Settings::load_from(&real).output_preset, "Jazz");
     }
 
     #[test]

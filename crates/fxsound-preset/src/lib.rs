@@ -117,6 +117,13 @@ pub const MAX_PRESET_NAME_LEN: usize = 64;
 /// whitespace goes too, because a name that is only spaces is not a name and a trailing space is
 /// a filename nobody can see.
 ///
+/// Control characters — a line break, a tab, a carriage return — become a space, a run of them
+/// one space, the way the calibration wizard cleans the name it makes. A Windows text field
+/// cannot type them, so the original never had to; a pasted `--save_preset="$(xclip -o)"`, a
+/// D-Bus call or an imported file's name can. The `.fac` format keeps the name on a line of its
+/// own, so a line break in it wrote a file no reader could parse: the preset saved, vanished
+/// from the list and could be neither picked nor renamed nor deleted.
+///
 /// The one sanitiser for every route a name takes to disk. 0.3.0 had two — the command line
 /// stripped nine characters and the store replaced three with underscores — and a name typed
 /// with a `:` in the window became a file the Windows build could not open. Step 3, the
@@ -126,10 +133,22 @@ pub const MAX_PRESET_NAME_LEN: usize = 64;
 /// produces the collision (`docs/COMMAND_LINE_OPTIONS.md:52`).
 #[must_use]
 pub fn sanitise_preset_name(name: &str) -> String {
-    let stripped: String = name
-        .chars()
-        .filter(|c| *c != '\0' && !PRESET_NAME_RESERVED.contains(c))
-        .collect();
+    let mut stripped = String::with_capacity(name.len());
+    let mut after_control = false;
+    for c in name.chars() {
+        if c == '\0' || PRESET_NAME_RESERVED.contains(&c) {
+            continue;
+        }
+        if c.is_control() {
+            if !after_control {
+                stripped.push(' ');
+            }
+            after_control = true;
+        } else {
+            stripped.push(c);
+            after_control = false;
+        }
+    }
     let cut: String = stripped.trim().chars().take(MAX_PRESET_NAME_LEN).collect();
     cut.trim_end().to_owned()
 }
@@ -310,7 +329,7 @@ pub fn write(preset: &Preset) -> String {
 
     let _ = writeln!(out, "CLASS1 : Effect Type");
     let _ = writeln!(out, "{}: Version", format_g(VALS_FILE_VERSION));
-    let _ = writeln!(out, "{}", preset.name);
+    let _ = writeln!(out, "{}", one_line(&preset.name));
     let _ = writeln!(out, "0: Double Params Flag");
     let _ = writeln!(out, "1: Total number of elements");
 
@@ -342,6 +361,34 @@ pub fn write(preset: &Preset) -> String {
     }
 
     out
+}
+
+/// `name` as the one line the `.fac` format keeps it on: each run of line breaks a space, as
+/// [`sanitise_preset_name`] makes them.
+///
+/// A line break inside the name would end its line early — the rest of the name read as the
+/// double-params flag, and the file unreadable. Every route to a name cleans it first; this is
+/// the writer never producing a file it cannot read, whatever it is handed. Only line breaks: a
+/// tab a 0.3.0 name may hold reads back as it was written, and changing it would rename the
+/// preset under the settings that select it.
+fn one_line(name: &str) -> std::borrow::Cow<'_, str> {
+    if !name.contains(['\n', '\r']) {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut after_break = false;
+    for c in name.chars() {
+        if matches!(c, '\n' | '\r') {
+            if !after_break {
+                out.push(' ');
+            }
+            after_break = true;
+        } else {
+            out.push(c);
+            after_break = false;
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Read a preset from disk, taking the display name from the file stem when the file itself
@@ -780,6 +827,49 @@ Band 10
         // filesystem takes it, and `--save_preset` can be handed one by a script.
         assert_eq!(sanitise_preset_name("a\0b"), "ab");
         assert_eq!(sanitise_preset_name("\0"), "");
+    }
+
+    #[test]
+    fn control_characters_become_a_space_and_a_run_of_them_one_space() {
+        // A multi-line string pasted into `--save_preset="$(xclip -o)"` used to come through
+        // whole, and the `.fac` it was saved to could not be read back.
+        assert_eq!(
+            sanitise_preset_name("Line one\nLine two"),
+            "Line one Line two"
+        );
+        assert_eq!(
+            sanitise_preset_name("Line one\r\nLine two\n"),
+            "Line one Line two"
+        );
+        assert_eq!(sanitise_preset_name("\tRock\x7f"), "Rock");
+        assert_eq!(sanitise_preset_name("a\u{85}b"), "a b", "C1 controls too");
+        assert_eq!(sanitise_preset_name("\n\r\t"), "");
+        assert_eq!(new_preset_name("Line one\nLine two"), "Line one Line two");
+        // NUL is still stripped, not spaced: it never separated two words.
+        assert_eq!(sanitise_preset_name("a\0b"), "ab");
+    }
+
+    #[test]
+    fn a_name_with_a_line_break_is_written_as_a_file_that_reads_back() {
+        // Every route cleans a name first; the writer still never produces a file it cannot
+        // parse, whatever it is handed.
+        let preset = Preset {
+            name: "Line one\r\nLine two\r".into(),
+            ..Preset::default()
+        };
+        let again = parse(write(&preset).as_bytes()).expect("reparse what we just wrote");
+        assert_eq!(again.name, "Line one Line two");
+        // A tab is left as it is: it reads back, and a 0.3.0 name may hold one.
+        let tabbed = Preset {
+            name: "a\tb".into(),
+            ..Preset::default()
+        };
+        assert_eq!(
+            parse(write(&tabbed).as_bytes()).expect("reparse").name,
+            "a\tb"
+        );
+        assert_eq!(again.main_midi, preset.main_midi);
+        assert_eq!(again.eq_bands, preset.eq_bands);
     }
 
     #[test]

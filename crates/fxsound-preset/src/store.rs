@@ -313,29 +313,67 @@ impl<F: PresetFile> Store<F> {
         Ok(preset)
     }
 
-    /// Path of the autosave shadow copy for a preset.
+    /// Path of the autosave shadow copy for a preset: `AutoSave/` and the name's file
+    /// ([`Store::file_name`]), or where 0.3.0 kept it when only that is there.
+    ///
+    /// 0.3.0 filed an autosave under the name exactly as written — `AutoSave/Rock:Live.fac` — so
+    /// the unsaved edits it left of a preset whose name has a character a file name cannot keep
+    /// are found there until the next autosave or save moves them to the name's own file
+    /// ([`Store::autosave`], [`Store::clear_autosave`]). Without that they were orphaned: the
+    /// preset loaded as last saved, without its `*`, and the edits never came back.
     #[must_use]
     pub fn autosave_path(&self, name: &str) -> PathBuf {
+        let path = self.sanitised_autosave_path(name);
+        if !path.is_file()
+            && let Some(legacy) = self.legacy_autosave_path(name)
+            && legacy.is_file()
+        {
+            return legacy;
+        }
+        path
+    }
+
+    /// `AutoSave/` and the sanitised name: where an autosave is written.
+    fn sanitised_autosave_path(&self, name: &str) -> PathBuf {
         self.autosave_dir
             .join(format!("{}.{}", sanitise_preset_name(name), F::EXTENSION))
     }
 
+    /// `AutoSave/` and the name as written, where 0.3.0 kept a preset's autosave: `None` when that
+    /// is the sanitised path itself, or no file name at all (a `/` in the name).
+    ///
+    /// It is never another preset's autosave: a sanitised stem holds none of the characters, the
+    /// surrounding spaces or the length that make the name differ from it.
+    fn legacy_autosave_path(&self, name: &str) -> Option<PathBuf> {
+        if name.is_empty() || name.contains(['/', '\0']) {
+            return None;
+        }
+        let legacy = self.autosave_dir.join(format!("{name}.{}", F::EXTENSION));
+        (legacy != self.sanitised_autosave_path(name)).then_some(legacy)
+    }
+
     /// Stash the user's unsaved edits so they survive a preset switch or a restart.
+    ///
+    /// Written to the name's own file in `AutoSave/`; a 0.3.0 autosave of the same preset under
+    /// its name as written, whose edits these now carry, goes.
     ///
     /// # Errors
     /// The preset's name leaves nothing to file it under, or the file cannot be written.
     pub fn autosave(&self, preset: &F) -> Result<(), F::Error> {
         let path = self.autosave_dir.join(Self::file_name(preset.name())?);
-        preset.save(&path)
+        preset.save(&path)?;
+        if let Some(legacy) = self.legacy_autosave_path(preset.name()) {
+            remove_if_there(&legacy);
+        }
+        Ok(())
     }
 
-    /// Drop a preset's autosave, clearing its modified marker.
+    /// Drop a preset's autosave, clearing its modified marker: the one under its own file and any
+    /// 0.3.0 left under its name as written.
     pub fn clear_autosave(&mut self, name: &str) {
-        let path = self.autosave_path(name);
-        if path.exists()
-            && let Err(err) = std::fs::remove_file(&path)
-        {
-            log::warn!("{}: {err}", path.display());
+        remove_if_there(&self.sanitised_autosave_path(name));
+        if let Some(legacy) = self.legacy_autosave_path(name) {
+            remove_if_there(&legacy);
         }
         if let Some(entry) = self.entries.iter_mut().find(|e| e.name == name) {
             entry.modified = false;
@@ -350,17 +388,28 @@ impl<F: PresetFile> Store<F> {
     /// beside `Music` — is refused, because that overwrite is one the list could never show
     /// (`file_name` below says why one file can have two names).
     ///
+    /// A user preset is overwritten in the file it is listed from, whatever that file is called.
+    /// 0.3.0 filed a preset saved from the window under its name as written — `Rock:Live.fac` —
+    /// and a hand-copied file can be called anything; writing the name's own file instead
+    /// (`RockLive.fac`) left the list on the old one, which still won, so the save looked lost,
+    /// and its unsaved edits, cleared by the save, were gone with it.
+    ///
     /// # Errors
     /// The name leaves nothing to file it under, its file belongs to a preset of a different
     /// name, or the file cannot be written.
     pub fn save_as(&mut self, preset: &F, name: &str) -> Result<PathBuf, F::Error> {
-        let file = Self::file_name(name)?;
-        if let Some(other) = self.holder_of(&file, name) {
-            return Err(F::shared_file(name, &other.name, &file));
-        }
+        let path = match self.find(name) {
+            Some(entry) if entry.source == PresetSource::User => entry.path.clone(),
+            _ => {
+                let file = Self::file_name(name)?;
+                if let Some(other) = self.holder_of(&file, name) {
+                    return Err(F::shared_file(name, &other.name, &file));
+                }
+                self.user_dir.join(file)
+            }
+        };
         let mut to_save = preset.clone();
         to_save.set_name(name);
-        let path = self.user_dir.join(file);
         // The user-facing overwrite: worth keeping the previous version, unlike the autosave.
         to_save.save_with_backup(&path)?;
         self.clear_autosave(name);
@@ -395,8 +444,12 @@ impl<F: PresetFile> Store<F> {
         }
         let path = entry.path.clone();
         let discarded = self.discard(&path)?;
-        let autosave = self.autosave_path(name);
-        if autosave.is_file() {
+        // Its own autosave, and one 0.3.0 left under its name as written.
+        let autosaves = std::iter::once(self.sanitised_autosave_path(name))
+            .chain(self.legacy_autosave_path(name))
+            .filter(|autosave| autosave.is_file())
+            .collect::<Vec<_>>();
+        for autosave in autosaves {
             match self.discard(&autosave) {
                 Ok(Discarded::Trash(to) | Discarded::Backup(to)) => {
                     log::info!("{name}: its unsaved changes went to {}", to.display());
@@ -469,6 +522,14 @@ impl<F: PresetFile> Store<F> {
 
         let old_autosave = self.autosave_path(old);
         let new_autosave = self.autosave_dir.join(&file);
+        // An autosave already under the new name is not this preset's: a 0.3.0 microphone curve
+        // stashed under a voice preset's name, the edits of a preset deleted by hand or one whose
+        // autosave the trash would not take. Left there, it would be read as the renamed preset's
+        // unsaved changes — the `*` on a preset that had none, and its curve loaded in place of
+        // the file's on the next pick or start (0.4.0 review FA). It goes where a deleted preset's
+        // edits go, not over them; so does one 0.3.0 left under the new name as written, which
+        // [`Store::autosave_path`] would find the same way.
+        let mut leftovers = Vec::new();
         if old_autosave.is_file() {
             let moved = F::load(&old_autosave).and_then(|mut stash| {
                 stash.set_name(new);
@@ -479,17 +540,15 @@ impl<F: PresetFile> Store<F> {
             if let Err(err) = moved {
                 log::warn!("{}: {err}", old_autosave.display());
             }
-        } else if new_autosave.is_file() {
-            // An autosave already under the new name is not this preset's: a 0.3.0 microphone
-            // curve stashed under a voice preset's name, the edits of a preset deleted by hand or
-            // one whose autosave the trash would not take. Left there, it would be read as the
-            // renamed preset's unsaved changes — the `*` on a preset that had none, and its curve
-            // loaded in place of the file's on the next pick or start (0.4.0 review FA). It goes
-            // where a deleted preset's edits go, not over them.
-            if let Err(err) = self.discard(&new_autosave) {
-                log::warn!("{}: {err}; removing it", new_autosave.display());
-                if let Err(err) = std::fs::remove_file(&new_autosave) {
-                    log::warn!("{}: {err}", new_autosave.display());
+        } else {
+            leftovers.push(new_autosave);
+        }
+        leftovers.extend(self.legacy_autosave_path(new));
+        for leftover in leftovers.into_iter().filter(|leftover| leftover.is_file()) {
+            if let Err(err) = self.discard(&leftover) {
+                log::warn!("{}: {err}; removing it", leftover.display());
+                if let Err(err) = std::fs::remove_file(&leftover) {
+                    log::warn!("{}: {err}", leftover.display());
                 }
             }
         }
@@ -560,7 +619,9 @@ impl<F: PresetFile> Store<F> {
     ///
     /// Every route from a name to a filename goes through here and so through
     /// [`sanitise_preset_name`] — the same function the command line applies — which is what
-    /// keeps a preset saved from the window and one saved from a script in the same file.
+    /// keeps a preset saved from the window and one saved from a script in the same file. The
+    /// one exception is a user preset already listed, which [`Store::save_as`] saves over in the
+    /// file it is listed from, whatever that is called.
     ///
     /// The sanitiser is not one-to-one, and that is the cost of keeping the typed name inside
     /// the file: `Mu:sic` and `Music` are two names and one stem, so two listed presets can lay
@@ -595,6 +656,15 @@ impl<F: PresetFile> Store<F> {
         self.entries.iter().find(|entry| {
             entry.name != name && Self::file_name(&entry.name).is_ok_and(|held| held == file)
         })
+    }
+}
+
+/// Remove `path` when it is there, saying in the log when that fails.
+fn remove_if_there(path: &Path) {
+    if path.exists()
+        && let Err(err) = std::fs::remove_file(path)
+    {
+        log::warn!("{}: {err}", path.display());
     }
 }
 
@@ -1183,6 +1253,190 @@ mod tests {
         store.save_as(&mine, "Mine").expect("overwrite Mine");
         assert!(Path::new(&backup).is_file());
         assert_eq!(crate::load(&path).expect("reload").main_midi[0], 99);
+    }
+
+    /// A preset called `name` whose first main value is `main0`, written to `path` as it is.
+    fn preset_at(path: &Path, name: &str, main0: u8) -> Preset {
+        let mut preset = Preset {
+            name: name.into(),
+            ..Preset::default()
+        };
+        preset.main_midi[0] = main0;
+        crate::save(&preset, path).expect("write the preset");
+        preset
+    }
+
+    /// The user directory as 0.3.0 left a preset saved from its window: the file under the name
+    /// as written, `Rock:Live.fac`, and its unsaved edits under the same name in `AutoSave/`.
+    fn as_0_3_0_left_it(tag: &str) -> (ScratchDir, PresetStore) {
+        let tmp = tempdir(tag);
+        let user = tmp.join("user");
+        preset_at(&user.join("Rock:Live.fac"), "Rock:Live", 11);
+        preset_at(&user.join("AutoSave/Rock:Live.fac"), "Rock:Live", 77);
+        let mut store = PresetStore::with_dirs(Vec::new(), user).with_trash(tmp.join("Trash"));
+        store.rescan();
+        (tmp, store)
+    }
+
+    #[test]
+    fn the_unsaved_edits_0_3_0_kept_under_a_name_as_written_are_found() {
+        let (_tmp, store) = as_0_3_0_left_it("legacy-autosave-found");
+        assert!(
+            store.find("Rock:Live").expect("listed").modified,
+            "with its *"
+        );
+        let (loaded, from_autosave) = store.load("Rock:Live").expect("load");
+        assert!(from_autosave, "the edits, not the file as last saved");
+        assert_eq!(loaded.main_midi[0], 77);
+    }
+
+    #[test]
+    fn a_user_preset_is_saved_over_the_file_it_is_listed_from_whatever_that_is_called() {
+        // 0.3.0 filed "Rock:Live" as `Rock:Live.fac`. The save went to `RockLive.fac`, the list
+        // stayed on the old file — `:` sorts before letters — and the save looked lost, while
+        // the autosave holding the same edits had already been cleared.
+        let (tmp, mut store) = as_0_3_0_left_it("legacy-save");
+        let user = tmp.join("user");
+        let (mut edited, _) = store.load("Rock:Live").expect("load");
+        edited.main_midi[0] = 99;
+
+        let path = store.save_as(&edited, "Rock:Live").expect("save");
+
+        assert_eq!(path, user.join("Rock:Live.fac"));
+        assert!(!user.join("RockLive.fac").exists(), "no second file");
+        let (loaded, from_autosave) = store.load("Rock:Live").expect("load");
+        assert!(!from_autosave);
+        assert_eq!(loaded.main_midi[0], 99, "what was saved is what loads");
+        assert_eq!(
+            crate::load(&user.join("Rock:Live.fac.bak"))
+                .expect("the overwrite's backup")
+                .main_midi[0],
+            11
+        );
+        assert!(
+            !user.join("AutoSave/Rock:Live.fac").exists(),
+            "the save took in the edits, so they are not a change any more"
+        );
+        assert!(!store.find("Rock:Live").expect("listed").modified);
+        assert_eq!(store.entries().len(), 1);
+    }
+
+    #[test]
+    fn a_hand_copied_file_whose_stem_is_not_its_name_is_saved_over_in_place() {
+        let tmp = tempdir("hand-copied");
+        let user = tmp.join("user");
+        preset_at(&user.join("from a forum.fac"), "Evening Jazz", 5);
+        let mut store = PresetStore::with_dirs(Vec::new(), user.clone());
+        store.rescan();
+        let (mut edited, _) = store.load("Evening Jazz").expect("load");
+        edited.main_midi[0] = 6;
+
+        let path = store.save_as(&edited, "Evening Jazz").expect("save");
+
+        assert_eq!(path, user.join("from a forum.fac"));
+        assert!(!user.join("Evening Jazz.fac").exists());
+        assert_eq!(store.load("Evening Jazz").expect("load").0.main_midi[0], 6);
+    }
+
+    #[test]
+    fn the_next_autosave_moves_0_3_0_edits_to_the_names_own_file() {
+        let (tmp, store) = as_0_3_0_left_it("legacy-autosave-moves");
+        let autosaves = tmp.join("user/AutoSave");
+        let (mut edited, _) = store.load("Rock:Live").expect("load");
+        edited.main_midi[0] = 55;
+
+        store.autosave(&edited).expect("autosave");
+
+        assert!(
+            !autosaves.join("Rock:Live.fac").exists(),
+            "moved, not copied"
+        );
+        assert_eq!(
+            store.autosave_path("Rock:Live"),
+            autosaves.join("RockLive.fac")
+        );
+        let (loaded, from_autosave) = store.load("Rock:Live").expect("load");
+        assert!(from_autosave);
+        assert_eq!(loaded.main_midi[0], 55);
+    }
+
+    #[test]
+    fn undoing_or_deleting_a_preset_takes_its_0_3_0_edits_with_it() {
+        let (tmp, mut store) = as_0_3_0_left_it("legacy-autosave-clear");
+        let legacy = tmp.join("user/AutoSave/Rock:Live.fac");
+        store.clear_autosave("Rock:Live");
+        assert!(!legacy.exists(), "undone");
+        store.rescan();
+        assert!(!store.find("Rock:Live").expect("listed").modified);
+
+        let (tmp, mut store) = as_0_3_0_left_it("legacy-autosave-delete");
+        let legacy = tmp.join("user/AutoSave/Rock:Live.fac");
+        store
+            .delete("Rock:Live")
+            .expect("delete")
+            .expect("it was listed");
+        assert!(!legacy.exists(), "gone from the autosaves");
+        assert_eq!(
+            crate::load(&tmp.join("Trash/files/Rock:Live.2.fac"))
+                .expect("into the trash beside the preset")
+                .main_midi[0],
+            77
+        );
+    }
+
+    #[test]
+    fn a_rename_brings_the_0_3_0_edits_along_and_never_takes_over_another_names() {
+        let (tmp, mut store) = as_0_3_0_left_it("legacy-autosave-rename");
+        let autosaves = tmp.join("user/AutoSave");
+        // An orphan 0.3.0 left under a name the rename is about to take.
+        preset_at(&autosaves.join("Live?.fac"), "Live?", 33);
+        store.rename("Rock:Live", "Live?").expect("rename");
+
+        let (loaded, from_autosave) = store.load("Live?").expect("load");
+        assert!(from_autosave, "the preset's own edits came along");
+        assert_eq!(loaded.main_midi[0], 77);
+        assert!(!autosaves.join("Rock:Live.fac").exists());
+        assert!(
+            !autosaves.join("Live?.fac").exists(),
+            "the orphan went to the trash"
+        );
+
+        // Without edits of its own, a leftover under the new name must not become its `*`.
+        let (tmp, mut store) = as_0_3_0_left_it("legacy-autosave-rename-leftover");
+        let autosaves = tmp.join("user/AutoSave");
+        store.clear_autosave("Rock:Live");
+        preset_at(&autosaves.join("Live?.fac"), "Live?", 33);
+        store.rename("Rock:Live", "Live?").expect("rename");
+        assert!(!store.find("Live?").expect("listed").modified);
+        assert!(!autosaves.join("Live?.fac").exists(), "into the trash");
+    }
+
+    #[test]
+    fn a_name_with_a_line_break_is_saved_as_a_preset_the_list_still_shows() {
+        // `fxsound --save_preset="$(xclip -o)"` with a multi-line selection: the file was
+        // written with the break in its name line, did not parse, and the preset vanished.
+        let tmp = tempdir("line-break");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let preset = Preset::default();
+
+        let name = new_preset_name("Line one\nLine two");
+        store.save_as(&preset, &name).expect("save");
+        store.rescan();
+        assert_eq!(
+            store.find(&name).map(|entry| entry.name.as_str()),
+            Some("Line one Line two")
+        );
+        assert!(store.load(&name).is_ok());
+
+        // Handed to the store as it is, it is still a file the list reads back.
+        let path = store.save_as(&preset, "Carriage\r\nreturn").expect("save");
+        store.rescan();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("Carriage return.fac")
+        );
+        assert!(store.find("Carriage return").is_some());
+        assert_eq!(store.entries().len(), 2);
     }
 
     fn twenty_band_preset(name: &str, ladder: &[f32; 20]) -> Preset {

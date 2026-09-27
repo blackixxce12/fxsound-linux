@@ -410,7 +410,20 @@ fn check_settings(path: &Path) -> Check {
                 format!("{} does not exist yet; the defaults apply", path.display()),
             );
         }
-        Err(err) => return Check::fail(NAME, format!("{}: {err}", path.display())),
+        // A directory is left where it is, and every save fails until someone removes it.
+        Err(err) if err.kind() == io::ErrorKind::IsADirectory => {
+            return Check::fail(NAME, format!("{}: {err}", path.display()));
+        }
+        Err(err) => {
+            return Check::fail(
+                NAME,
+                format!(
+                    "{}: {err}; FxSound will move it aside as {} and start from the defaults",
+                    path.display(),
+                    Settings::next_bad_path(path).display()
+                ),
+            );
+        }
     };
     match toml::from_str::<Settings>(&text) {
         Ok(_) => Check::ok(NAME, path.display().to_string()),
@@ -425,7 +438,7 @@ fn check_settings(path: &Path) -> Check {
                     "{}:{at} {}; FxSound will move it aside as {} and start from the defaults",
                     path.display(),
                     err.message(),
-                    Settings::bad_path(path).display()
+                    Settings::next_bad_path(path).display()
                 ),
             )
         }
@@ -1415,6 +1428,25 @@ pub(crate) mod tests {
             !Settings::bad_path(&path).exists(),
             "the file was moved aside"
         );
+    }
+
+    #[test]
+    fn a_settings_file_that_is_not_utf8_fails_and_names_where_it_will_be_moved() {
+        // `Settings::load` moves it aside now, beside any `.bad` already there; the self-test
+        // says where, and moves nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.toml");
+        fs::write(&path, b"# \xc7\xe2\xf3\xea\npower = false\n").unwrap();
+        fs::write(Settings::bad_path(&path), "an earlier one").unwrap();
+        let settings = check_settings(&path);
+        assert_eq!(settings.status, Status::Fail);
+        assert!(
+            settings.detail.contains("settings.toml.2.bad"),
+            "{}",
+            settings.detail
+        );
+        assert!(path.is_file(), "the file was moved");
+        assert!(!tmp.path().join("settings.toml.2.bad").exists());
     }
 
     #[test]

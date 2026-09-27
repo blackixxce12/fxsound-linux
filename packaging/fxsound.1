@@ -278,12 +278,17 @@ A preset name becomes a
 filename, and preset files are meant to travel between Linux and Windows, so
 the Windows reserved characters
 .RB ( < " " > " " : " " \(dq " " / " " \e " " | " " ? " " * )
-are stripped from a name and the result is truncated to 64 characters. A new
+are stripped from a name, each run of control characters (a line break, a
+tab) becomes one space, and the result is truncated to 64 characters. A new
 name is also cut to 126 bytes, on a character boundary, since a Windows FxSound
 reads a preset's name in that many: 63 Cyrillic letters. Voice presets follow
 the same rule with a
 .I .toml
-extension.
+extension. A user preset saved over is written to the file it was listed
+from, whatever that file is called, such as one 0.3.0 saved under the name as
+written; its unsaved edits 0.3.0 kept in
+.I AutoSave/
+under that name are found there too.
 .SS Devices and directions
 .TP
 .BI \-\-output= DEVICE|off
@@ -1074,15 +1079,36 @@ Imported and user-saved presets; voice presets under
 .TP
 .I ~/.config/fxsound/settings.toml
 Settings. A corrupt file is never fatal: the defaults are used and the audio
-still comes up. The Windows keys FxSound does not use \(en the hotkey chords,
-the window position, always-on-top and the update check \(en are read from an
-older file without complaint and not written back.
+still comes up. One that does not load \(en it does not parse, is not UTF-8, or
+may not be read \(en is moved aside to
+.I settings.toml.bad
+first, or to
+.I settings.toml.2.bad
+and so on, never over an earlier one. The Windows keys FxSound does not use
+\(en the hotkey chords, the window position, always-on-top and the update
+check \(en are read from an older file without complaint and not written back.
+This file,
+.I apps.toml
+and a preset may be symbolic links, as a dotfile manager leaves them: a save
+replaces the file the link points to and keeps the link.
+A link to a read-only file, or to one in a directory the user may not write,
+is never saved through, so every save of that file fails; home-manager's
+default links into
+.I /nix/store
+are such links, and its
+.B \%mkOutOfStoreSymlink
+makes one FxSound can save through.
 .TP
 .I ~/.config/fxsound/apps.toml
 The applications FxSound remembers, at most 500, and the preset each has of
-its own. One that does not load is moved aside to
+its own. Past 500, those that only follow the lanes are forgotten first, seen
+longest ago first; one with a preset of its own goes only when there are more
+than 500 of those. One that does not load is moved aside to
 .I apps.toml.bad
-when FxSound starts, and the list starts empty.
+(or
+.I apps.toml.2.bad
+and so on, never over an earlier one) when FxSound starts, and the list starts
+empty.
 .TP
 .I $XDG_RUNTIME_DIR/fxsound/instance.lock
 Holds the running instance's pid under an exclusive

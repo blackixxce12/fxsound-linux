@@ -11,8 +11,8 @@
 //! application that ever played a sound, and a settings file that the window rewrites on every
 //! slider release is the wrong place for a list of five hundred entries. It is written the same
 //! way (`crate::atomic`), and a file that does not load — does not parse, is not UTF-8, may not
-//! be read — is moved aside to `apps.toml.bad`, so a hand edit gone wrong is never silently
-//! replaced.
+//! be read — is moved aside to `apps.toml.bad` (`apps.toml.2.bad` and so on when that is taken),
+//! so a hand edit gone wrong is never silently replaced.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -29,7 +29,9 @@ use crate::DeviceDirection;
 /// application whose route cannot be created stays on its lane, and the window says why.
 pub const MAX_ROUTES_PER_LANE: usize = 4;
 
-/// How many applications the store remembers before it forgets the one seen longest ago.
+/// How many applications the store remembers before it forgets the one seen longest ago —
+/// among those that only follow the lanes first, so a preset the user chose outlives every
+/// application that merely played a sound since.
 ///
 /// Every program that ever played a sound is remembered, so the Applications list can offer a
 /// preset for a game that is not running. That list is unbounded on a machine that lives for
@@ -316,6 +318,15 @@ impl AppRule {
     pub fn has_preset(&self, direction: DeviceDirection) -> bool {
         !self.preset(direction).trim().is_empty()
     }
+
+    /// Whether the rule gives either direction a preset of its own: a choice the user made,
+    /// rather than an application remembered because it played a sound.
+    #[must_use]
+    pub fn holds_a_preset(&self) -> bool {
+        DeviceDirection::ALL
+            .into_iter()
+            .any(|direction| self.has_preset(direction))
+    }
 }
 
 /// What a rule says for one application and direction, measured against the presets that exist.
@@ -363,14 +374,14 @@ impl AppRules {
     /// Load the store from `path`, empty when there is none.
     ///
     /// A file that is there but does not load — it does not parse, it is not UTF-8 (a hand edit
-    /// saved in Latin-1), or this user may not read it — is **moved aside**, to `apps.toml.bad`,
-    /// and the store starts empty. That is what the settings file does with one that does not
-    /// parse, and here it covers every file that fails to load, because the store is saved far
-    /// more often than the settings: the first application that plays a sound after this load
-    /// is remembered, and that save (`crate::atomic`) renames a fresh file over this path. A file
-    /// left in place would be replaced by an empty list — every choice the user made gone, with
-    /// only a log line to say so. Moved aside, the next save writes beside it and the file is
-    /// there to be read back.
+    /// saved in Latin-1), or this user may not read it — is **moved aside**, to `apps.toml.bad`
+    /// (or `apps.toml.2.bad` and so on, never over an earlier one, which is the one that held the
+    /// user's choices), and the store starts empty, as the settings file does
+    /// ([`crate::Settings::load_from`]). The store is saved far more often than the settings: the
+    /// first application that plays a sound after this load is remembered, and that save
+    /// (`crate::atomic`) renames a fresh file over this path. A file left in place would be
+    /// replaced by an empty list — every choice the user made gone, with only a log line to say
+    /// so. Moved aside, the next save writes beside it and the file is there to be read back.
     ///
     /// Two cases are left where they are. A missing file is simply an empty store. A directory
     /// in the file's place holds nothing a save can destroy: a rename cannot replace a directory,
@@ -403,15 +414,19 @@ impl AppRules {
         }
     }
 
-    /// Rename a store that did not load to [`AppRules::bad_path`], saying why in the log.
+    /// Rename a store that did not load to [`AppRules::bad_path`], or to `apps.toml.2.bad` or
+    /// the next free number when an earlier one is there ([`crate::atomic::aside_names`]),
+    /// saying why in the log.
     ///
     /// When the rename itself fails the file stays where it is, and the log says so. What stops
     /// this rename — a directory this user may not write, a read-only filesystem — stops the next
     /// save's rename as well, so the file is still not replaced.
     fn move_aside(path: &Path, why: &dyn std::fmt::Display) {
-        let aside = Self::bad_path(path);
-        match std::fs::rename(path, &aside) {
-            Ok(()) => log::warn!(
+        match crate::atomic::rename_to_free_name(
+            path,
+            crate::atomic::aside_names(Self::bad_path(path)),
+        ) {
+            Ok(aside) => log::warn!(
                 "{}: {why}; moved aside as {} and starting with no per-application presets",
                 path.display(),
                 aside.display()
@@ -423,8 +438,8 @@ impl AppRules {
         }
     }
 
-    /// Where [`AppRules::load_from`] moves a file it could not load: `apps.toml.bad` beside
-    /// `apps.toml`.
+    /// Where [`AppRules::load_from`] moves the first file it could not load: `apps.toml.bad`
+    /// beside `apps.toml`. A later one goes to `apps.toml.2.bad` and so on.
     #[must_use]
     pub fn bad_path(path: &Path) -> PathBuf {
         let mut name = path
@@ -458,7 +473,8 @@ impl AppRules {
     ///   the next save.
     /// - A `last_seen` past what a TOML integer holds is pulled back to the largest one, so the
     ///   save that follows cannot fail on it.
-    /// - Past the cap, the applications seen longest ago are forgotten.
+    /// - Past the cap, the applications seen longest ago are forgotten, those that only follow
+    ///   the lanes first.
     ///
     /// The order of what remains is the file's order.
     pub fn sanitise(&mut self) {
@@ -475,7 +491,7 @@ impl AppRules {
         for rule in &mut self.apps {
             rule.last_seen = rule.last_seen.min(TOML_INTEGER_MAX);
         }
-        self.enforce_cap(None);
+        self.enforce_cap(Keep::Nothing);
     }
 
     /// The rule for the application `key` names, if any: the one matching it most specifically.
@@ -554,7 +570,7 @@ impl AppRules {
         rule.set_preset(direction, preset);
         rule.last_seen = now;
         self.apps.push(rule);
-        self.enforce_cap(Some(self.apps.len() - 1));
+        self.enforce_cap(Keep::Chosen(self.apps.len() - 1));
         true
     }
 
@@ -564,7 +580,9 @@ impl AppRules {
     /// An application a rule already covers refreshes that rule's `last_seen`, and nothing else:
     /// a new entry of its own would match it more specifically than a general rule does, and
     /// would silently take the general rule's presets away from it. Anything else is added,
-    /// following both lanes, so the Applications list can offer it a preset after it has quit.
+    /// following both lanes, so the Applications list can offer it a preset after it has quit —
+    /// unless the store is full of applications with a preset of their own, none of which one
+    /// that holds no choice may push out ([`MAX_REMEMBERED_APPS`]).
     pub fn seen(&mut self, key: &AppKey, now: u64) -> bool {
         if key.is_empty() {
             return false;
@@ -578,13 +596,16 @@ impl AppRules {
             rule.last_seen = now;
             return true;
         }
+        let before = self.apps.len();
         self.apps.push(AppRule {
             key: key.clone(),
             last_seen: now,
             ..AppRule::default()
         });
-        self.enforce_cap(Some(self.apps.len() - 1));
-        true
+        self.enforce_cap(Keep::Seen(self.apps.len() - 1));
+        // The new rule is last when it stayed; when it went, the store changed only if the cap
+        // took something else with it.
+        self.apps.last().is_some_and(|rule| rule.key == *key) || self.apps.len() != before
     }
 
     /// Forget the rule [`AppRules::rule`] answers with for `key`. Returns whether anything was
@@ -621,37 +642,79 @@ impl AppRules {
         key.best_match(self.apps.iter().map(|rule| &rule.key))
     }
 
-    /// Keep at most [`MAX_REMEMBERED_APPS`] rules, forgetting the ones seen longest ago; between
-    /// two seen at the same second, the one listed later goes. `protect` is a rule that stays
-    /// whatever its `last_seen` says — the one the user has just set, which a clock that jumped
-    /// back must not make the first to go.
-    fn enforce_cap(&mut self, protect: Option<usize>) {
+    /// Keep at most [`MAX_REMEMBERED_APPS`] rules, forgetting first the ones that only follow the
+    /// lanes, seen longest ago first. A rule with a preset of its own, in either direction, goes
+    /// only when those alone cannot bring the count down to the cap — a hand-made file of more
+    /// than five hundred choices — and then too the one seen longest ago first. Between two alike
+    /// seen at the same second, the one listed later goes.
+    ///
+    /// Every application that plays a sound is remembered ([`AppRules::seen`]): Wine and Proton
+    /// executables, AppImages, scripts, each a key of its own. Five hundred of them in the months
+    /// a game is not played used to push out the rule that gave it "Gaming", deleted from
+    /// `apps.toml` without a word, while five hundred rules with no choice in them stayed.
+    ///
+    /// `keep` is a rule that stays whatever its `last_seen` says ([`Keep`]).
+    fn enforce_cap(&mut self, keep: Keep) {
         let count = self.apps.len();
         if count <= MAX_REMEMBERED_APPS {
             return;
         }
+        let rank = |index: usize| {
+            (
+                keep == Keep::Chosen(index),
+                self.apps[index].holds_a_preset(),
+                keep == Keep::Seen(index),
+            )
+        };
         let mut order: Vec<usize> = (0..count).collect();
         order.sort_by(|&a, &b| {
-            (Some(b) == protect)
-                .cmp(&(Some(a) == protect))
+            rank(b)
+                .cmp(&rank(a))
                 .then(self.apps[b].last_seen.cmp(&self.apps[a].last_seen))
                 .then(a.cmp(&b))
         });
-        let mut keep = vec![false; count];
+        let mut kept = vec![false; count];
         for &index in &order[..MAX_REMEMBERED_APPS] {
-            keep[index] = true;
+            kept[index] = true;
         }
+        let with_presets = order[MAX_REMEMBERED_APPS..]
+            .iter()
+            .filter(|&&index| self.apps[index].holds_a_preset())
+            .count();
         let mut index = 0;
         self.apps.retain(|_| {
-            let kept = keep[index];
+            let stays = kept[index];
             index += 1;
-            kept
+            stays
         });
-        log::info!(
-            "apps.toml: forgot the {} applications seen longest ago",
-            count - MAX_REMEMBERED_APPS
-        );
+        let following = count - MAX_REMEMBERED_APPS - with_presets;
+        if following > 0 {
+            log::info!(
+                "apps.toml: forgot the {following} applications seen longest ago that follow \
+                 the lanes"
+            );
+        }
+        if with_presets > 0 {
+            log::warn!(
+                "apps.toml: more than {MAX_REMEMBERED_APPS} applications have a preset of their \
+                 own; forgot the {with_presets} seen longest ago"
+            );
+        }
     }
+}
+
+/// Which rule [`AppRules::enforce_cap`] keeps whatever its `last_seen` says: a clock that jumped
+/// back must not make the rule just added the first to go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keep {
+    /// None: the store was loaded.
+    Nothing,
+    /// The rule the user has just set ([`AppRules::upsert`]). It stays, whatever it holds.
+    Chosen(usize),
+    /// The application just seen for the first time ([`AppRules::seen`]). It stays over every
+    /// other rule that only follows the lanes, as it holds no choice either, but never over one
+    /// that has a preset.
+    Seen(usize),
 }
 
 /// The largest value a TOML integer holds; a `last_seen` past it could not be saved.
@@ -1240,6 +1303,111 @@ last_seen = 40
             rules
                 .rule(&key(&format!("app{MAX_REMEMBERED_APPS}"), "", ""))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_rule_with_a_preset_outlives_five_hundred_applications_that_only_follow_the_lanes() {
+        // "Gaming" for a game not played for months, while Wine and Proton executables,
+        // AppImages and scripts each play a sound and are remembered: the rule the user set used
+        // to be the one seen longest ago, and went.
+        let mut rules = AppRules::default();
+        let game = key("bf6.exe", "Battlefield 6", "");
+        assert!(rules.upsert(&game, OUT, "Gaming", 1));
+        for n in 0..MAX_REMEMBERED_APPS {
+            assert!(rules.seen(&key(&format!("app{n}.exe"), "", ""), 100 + n as u64));
+        }
+
+        assert_eq!(rules.apps.len(), MAX_REMEMBERED_APPS);
+        assert_eq!(rules.preset_for(&game, OUT), Some("Gaming"));
+        assert!(
+            rules.rule(&key("app0.exe", "", "")).is_none(),
+            "the application that only followed, seen longest ago, went instead"
+        );
+        assert!(rules.rule(&key("app1.exe", "", "")).is_some());
+    }
+
+    #[test]
+    fn a_new_application_is_not_remembered_over_rules_that_all_have_a_preset() {
+        let mut rules = AppRules {
+            apps: (0..MAX_REMEMBERED_APPS)
+                .map(|n| rule(key(&format!("game{n}"), "", ""), "", "Headset", n as u64))
+                .collect(),
+        };
+        let before = rules.clone();
+        assert!(
+            !rules.seen(&key("new", "", ""), 1_000),
+            "nothing changed, so nothing to save"
+        );
+        assert_eq!(rules, before, "every choice is still there");
+    }
+
+    #[test]
+    fn a_new_application_stays_over_those_that_only_follow_whatever_the_clock_says() {
+        let mut rules = numbered(MAX_REMEMBERED_APPS);
+        for existing in &mut rules.apps {
+            existing.last_seen += 1_000;
+        }
+        // A clock that jumped back: the new application is the oldest by `last_seen`.
+        assert!(rules.seen(&key("new", "", ""), 5));
+        assert_eq!(rules.apps.len(), MAX_REMEMBERED_APPS);
+        assert!(rules.rule(&key("new", "", "")).is_some());
+        assert!(rules.rule(&key("app0", "", "")).is_none());
+    }
+
+    #[test]
+    fn rules_with_a_preset_go_only_when_those_that_follow_cannot_make_room() {
+        // A hand-made file with more choices than the cap: every rule that only follows goes,
+        // however recent, and then the choices seen longest ago.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("apps.toml");
+        let mut rules = AppRules {
+            apps: (0..MAX_REMEMBERED_APPS + 10)
+                .map(|n| {
+                    rule(
+                        key(&format!("game{n}"), "", ""),
+                        "Gaming",
+                        "",
+                        100 + n as u64,
+                    )
+                })
+                .collect(),
+        };
+        rules
+            .apps
+            .extend((0..5).map(|n| rule(key(&format!("tool{n}"), "", ""), "", "", 10_000)));
+        std::fs::write(&path, toml::to_string_pretty(&rules).expect("serialise")).expect("write");
+
+        let loaded = AppRules::load_from(&path);
+        assert_eq!(loaded.apps.len(), MAX_REMEMBERED_APPS);
+        assert!(loaded.apps.iter().all(AppRule::holds_a_preset));
+        assert!(
+            loaded.apps.iter().all(|rule| rule.last_seen >= 110),
+            "the ten choices seen longest ago went"
+        );
+    }
+
+    #[test]
+    fn a_second_apps_file_that_does_not_load_is_moved_aside_beside_the_first_never_over_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("apps.toml");
+        let first =
+            "[[app]]\nname = \"Discord\"\ninput_preset = \"Headset\"\nlast_seen = \"now\"\n";
+        std::fs::write(&path, first).expect("write");
+        assert_eq!(AppRules::load_from(&path), AppRules::default());
+
+        let second = "[[app]]\nname = 7\n";
+        std::fs::write(&path, second).expect("write");
+        assert_eq!(AppRules::load_from(&path), AppRules::default());
+
+        assert_eq!(
+            std::fs::read_to_string(AppRules::bad_path(&path)).expect("first"),
+            first,
+            "the file with the user's choices in it is still there"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("apps.toml.2.bad")).expect("second"),
+            second
         );
     }
 
