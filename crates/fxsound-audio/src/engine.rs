@@ -6456,6 +6456,12 @@ fn on_sink_param(_stream: &pw::stream::Stream, data: &mut SinkData, id: u32, par
 /// unity. Only the node's whole `Props` say it ([`on_own_props`]); a write that does move a
 /// bound changes them, and they come back through there.
 ///
+/// Nor is the volume taken from the adapter's own whole `Props` ([`PropsUpdate::whole`]), which no
+/// desktop writes: PipeWire 1.0's adapter hands them to the stream when it sets itself up, at
+/// unity and before [`publish_volume`] has written the level the pair starts at.
+/// Taken as a write, it put every new pair at unity and remembered unity for its device — a device
+/// change that turned FxSound all the way up, on Ubuntu 24.04 and every other 1.0 system.
+///
 /// Main loop. Only the lane's atomics are written, never the DSP's own state: unlike a format
 /// change, a volume change arrives while the data thread is processing.
 fn take_props(volume: &LaneVolume, id: u32, param: Option<&Pod>) {
@@ -6465,6 +6471,10 @@ fn take_props(volume: &LaneVolume, id: u32, param: Option<&Pod>) {
     let Some(update) = param.and_then(PropsUpdate::from_pod) else {
         return;
     };
+    if update.whole {
+        log::debug!("the virtual node's adapter described itself ({update:?}); not a volume write");
+        return;
+    }
     if volume.update(&update) {
         log::debug!("the virtual node's volume is now {:?}", volume.snapshot());
     }
