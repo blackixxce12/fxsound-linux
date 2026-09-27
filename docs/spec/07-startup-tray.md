@@ -872,6 +872,17 @@ schema change.
   when no instance is running (Windows silently no-ops — `fxmcp/internal/fxsound/running.go:41-49`).
 - `$XDG_RUNTIME_DIR` may be unset (cron, ssh without pam_systemd): fall back to
   `/tmp/fxsound-$UID` created 0700 with `O_NOFOLLOW`.
+- **As built (0.4.0): a cold start carries out every option that sets something**, not only
+  §4.3's ten. The band lists, `--set_effect` and the preset management (the ✘ rows of the C
+  column in §4.2) run once the presets are read, on the preset the start selected, where
+  `initConfig` drops them without a word; `--toggle-window` shows the window. `--next-output`
+  and `--next-input` step from the device a lane is on, which a start does not have yet, so a
+  line with one is refused (exit status 1) and nothing starts
+  (`crates/fxsound-app/src/cli.rs` `Command::honoured_at_cold_start`,
+  `crates/fxsound-app/src/commands.rs` `answer_without_an_instance`). D-Bus `NextOutput` and
+  `NextInput` cannot be refused that way: the bus starts FxSound first, and the call reaches an
+  instance with no device list yet, steps nowhere and succeeds (the man page says so; waiting
+  for the list, as `ForgetDevice` does, is left for 0.5.0).
 
 ---
 

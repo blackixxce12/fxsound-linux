@@ -185,8 +185,16 @@ pub fn calc_parametric(fs: Real, f0: Real, boost_db: Real, q: Real) -> BiquadCoe
 
     // Rule A: narrow filters at low frequencies ring, so cap Q as f0 approaches 20 Hz. At exactly
     // 20 Hz this yields Q = 1.0, which is why the golden vectors show 1.0 for the 20 Hz band.
+    //
+    // Below 20 Hz the original carries on down the same line (`FiltCalcBiqd.cpp:159-165`): the
+    // cap reaches zero at 17.9 Hz and goes negative under it, a negative Q is a negative
+    // bandwidth, and the "peak" it designs is a flat gain across the whole spectrum — a +6 dB band
+    // at 15 Hz in a hand-made `.fac` lifted 1 kHz and 10 kHz by the full 6 dB (audit report #12).
+    // Its own comment says what it meant, "limit to Q of 1 at 20 hz" (`:140-142`), and that floor
+    // is held below 20 Hz, so a band there is as wide as the 20 Hz band and stays in the
+    // sub-bass. At 20 Hz and above nothing changes: the line never goes under the floor there.
     if f0 < Q_UPPER_LIMIT_FREQ {
-        let max_q = (f0 - Q_LOWER_LIMIT_FREQ) * Q_LIMIT_SCALE + Q_LOWER_LIMIT;
+        let max_q = ((f0 - Q_LOWER_LIMIT_FREQ) * Q_LIMIT_SCALE + Q_LOWER_LIMIT).max(Q_LOWER_LIMIT);
         if q > max_q {
             q = max_q;
         }
@@ -288,6 +296,28 @@ impl Section {
         self.s1[channel] = self.coeffs.b1 * x - self.coeffs.a1 * y + self.s2[channel];
         self.s2[channel] = self.coeffs.b2 * x - self.coeffs.a2 * y;
         y
+    }
+
+    /// This section's history carried over to another design of the same form, for a crossfade
+    /// ([`crate::smooth::FadingSection`]).
+    ///
+    /// A transposed direct form's two state words mean different things under different
+    /// coefficients, so copying them as they are hands the new design a history it never had.
+    /// What is carried instead is what the history *does*: the new design gets the state whose
+    /// free response — the output with no more input — matches this one's for the two samples the
+    /// state reaches, `y₀ = s1` and `y₁ = s2 − a1·s1`. With the same `a1` that is a plain copy.
+    /// On a +12 → −12 dB jump at 62.5 Hz under a 62.5 Hz tone it keeps the crossfade's peak above
+    /// 300 Hz 6.6 dB lower than a copy does; on the drags and jumps measured beside it the two are
+    /// within 0.3 dB.
+    #[must_use]
+    pub fn continued_as(&self, coeffs: BiquadCoeffs) -> Self {
+        let shift = coeffs.a1 - self.coeffs.a1;
+        let mut next = *self;
+        next.coeffs = coeffs;
+        for (s2, s1) in next.s2.iter_mut().zip(self.s1) {
+            *s2 += shift * s1;
+        }
+        next
     }
 
     /// Clear the filter history. Call when the format changes or a preset rewrites the band layout.
@@ -577,6 +607,24 @@ mod tests {
         let wide = calc_parametric(48_000.0, 20.0, 6.0, 1.0);
         let narrow = calc_parametric(48_000.0, 20.0, 6.0, 4.333_365_4);
         assert_eq!(wide, narrow);
+    }
+
+    #[test]
+    fn below_20hz_the_q_limiter_holds_its_20hz_floor_instead_of_going_negative() {
+        // Audit report #12. The cap is `(f0 - 20)·0.475 + 1`: -1.375 at 15 Hz, which designed a
+        // flat +6 dB gain at every frequency. Held at the Q it gives at 20 Hz, a band under 20 Hz
+        // is as wide as the 20 Hz band and peaks where it says it does.
+        for f0 in [10.0, 15.0, 17.9, 19.99] {
+            let asked = calc_parametric(48_000.0, f0, 6.0, 4.333_365_4);
+            assert_eq!(asked, calc_parametric(48_000.0, f0, 6.0, 1.0), "{f0} Hz");
+            let at_centre = 20.0 * magnitude(&asked, f0 / 48_000.0).log10();
+            let far_away = 20.0 * magnitude(&asked, 1_000.0 / 48_000.0).log10();
+            assert!(
+                (at_centre - 6.0).abs() < 0.3,
+                "{f0} Hz: {at_centre} dB at the centre"
+            );
+            assert!(far_away.abs() < 0.05, "{f0} Hz: {far_away} dB at 1 kHz");
+        }
     }
 
     #[test]

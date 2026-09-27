@@ -27,9 +27,10 @@ pub const LOCALE_VARIABLES: [&str; 3] = ["LC_ALL", "LC_MESSAGES", "LANG"];
 /// a wrong translation there is worse than an English one, so only languages with an unambiguous
 /// everyday word for a sound *output* and *input* are listed. Anything else falls back to English,
 /// which is also what the UI itself speaks (`docs/spec/07-startup-tray.md` — only `en` ships).
-const WORDS: [(&str, &str, &str); 30] = [
+const WORDS: [(&str, &str, &str); 31] = [
     ("ru", "Вывод", "Ввод"),
     ("uk", "Вивід", "Ввід"),
+    ("bg", "Изход", "Вход"),
     ("de", "Ausgabe", "Eingabe"),
     ("fr", "Sortie", "Entrée"),
     ("es", "Salida", "Entrada"),
@@ -348,5 +349,14 @@ mod language_coverage {
             "Entrada"
         );
         assert_eq!(direction_word(DeviceDirection::Output, Some("ua")), "Вивід");
+        // Bulgarian (upstream 1.2.16.0) in the words its own table uses for "Output: ".
+        assert_eq!(
+            node_description(DeviceDirection::Output, Some("bg")),
+            "FxSound (Изход)"
+        );
+        assert_eq!(
+            node_description(DeviceDirection::Input, Some("bg")),
+            "FxSound (Вход)"
+        );
     }
 }

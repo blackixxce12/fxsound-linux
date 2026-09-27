@@ -8,6 +8,9 @@ description = "egui front end for the FxSound Linux port"
 
 [dependencies]
 fxsound-core = { workspace = true }
+# The equalizer's filter designs, so the window draws the curve the audio thread runs (0.4.0 audit
+# R8). A pure library: no PipeWire, no files, nothing that runs on its own.
+fxsound-dsp = { workspace = true }
 egui = { workspace = true }
 resvg = { workspace = true }
 usvg = { workspace = true }

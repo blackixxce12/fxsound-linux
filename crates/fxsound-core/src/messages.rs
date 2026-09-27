@@ -14,9 +14,13 @@
 //! Device switching, preset file IO and anything else that can block happens on the control
 //! thread and uses [`UiToAudio`] / [`AudioToUi`], which may allocate freely.
 
+use serde::{Deserialize, Serialize};
+
+use crate::apps::AppKey;
 use crate::{
-    AudioDevice, AudioStatus, Detection, DeviceDirection, Effect, EqBand, NUM_SPECTRUM_BARS,
-    SpectrumFrame, eq,
+    AudioDevice, AudioStatus, DeEsserMode, DenoiseChannelMode, DenoiseControl, DenoiseLevel,
+    DereverbLevel, Detection, DeviceDirection, Effect, EqBand, NUM_SPECTRUM_BARS, SpectrumFrame,
+    eq,
 };
 
 /// A complete, real-time-safe snapshot of everything the DSP engine needs.
@@ -25,11 +29,32 @@ use crate::{
 /// callback. Deliberately `Copy` and free of heap-owning fields.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DspParams {
-    /// Master bypass. When `false` the engine passes audio through untouched.
+    /// Master bypass. When `false` the engine skips everything but the master gain and the
+    /// balance, which it applies whatever `eq_on` says (0.4.0 audit R3), so the power button
+    /// changes the level only by what the effects, the bands and the leveller add. The original
+    /// kept the master gain alone on this path, and only while the equalizer was on
+    /// (`dfxpProcessReal.cpp:158-169`, `SosProcess.cpp:500-516`). On 5.1 and 7.1 the balance turns
+    /// down a whole side — front, side and rear — and leaves the centre and the subwoofer alone
+    /// (audit #44).
     pub power: bool,
+    /// Hand the device silence, whatever `power` says: the snapshot's mute, the app's to set.
+    ///
+    /// The engine silences a lane the same way on its own while the system sleeps (U13,
+    /// [`UiToAudio::SystemSleeping`]), so the last buffers before suspend and the first after
+    /// resume — stale filter state, a limiter that last saw a different world — never reach the
+    /// speakers; this flag need not be set for that.
+    ///
+    /// Silence *after* the chain rather than a bypass: the filters, the leveller and the
+    /// spectrum keep running on what comes in, so unmuting joins a chain that is already in step
+    /// with the programme instead of one that starts from whatever it held when the mute began.
+    pub mute: bool,
     /// The five effect knobs on the engine's `0.0..=1.0` scale, indexed by `Effect as usize`.
     pub effects: [f32; Effect::COUNT],
-    /// Whether the graphic equalizer contributes.
+    /// Whether the equalizer's bands and the volume levelling run, while the power is on. The
+    /// original switches the master gain and the balance with them as one block
+    /// (`dfxpProcessReal.cpp:143-157`, upstream aad64c1); this engine applies those two whatever
+    /// this says, powered or not (0.4.0 audit R3), so neither this switch nor the power button
+    /// moves the level by the master gain. The effects do not depend on it.
     pub eq_on: bool,
     /// How many entries of the band arrays are live.
     pub num_bands: u8,
@@ -43,8 +68,6 @@ pub struct DspParams {
     pub master_gain_db: f32,
     /// Left/right balance; negative is left, positive is right.
     pub balance: f32,
-    /// Peak-normalisation target in dB.
-    pub normalization_db: f32,
     /// Volume-levelling strength in dB.
     pub volume_leveling_db: f32,
 }
@@ -133,16 +156,13 @@ impl DspParams {
             default.master_gain_db,
         );
         self.balance = finite(self.balance, limits::BALANCE_DB, default.balance);
-        self.normalization_db = finite(
-            self.normalization_db,
-            limits::NORMALIZATION_DB,
-            default.normalization_db,
-        );
         self.volume_leveling_db = finite(
             self.volume_leveling_db,
             limits::VOLUME_LEVELING,
             default.volume_leveling_db,
         );
+        // `power`, `eq_on` and `mute` are left as they are: a `bool` has no value that means
+        // nothing, and a sleeping system's mute must survive the trip to the audio thread.
     }
 }
 
@@ -154,6 +174,7 @@ impl Default for DspParams {
         }
         Self {
             power: true,
+            mute: false,
             effects: [0.0; Effect::COUNT],
             eq_on: true,
             num_bands: eq::DEFAULT_BANDS as u8,
@@ -162,7 +183,6 @@ impl Default for DspParams {
             filter_q: 1.0,
             master_gain_db: 0.0,
             balance: 0.0,
-            normalization_db: 0.0,
             volume_leveling_db: 0.0,
         }
     }
@@ -181,6 +201,11 @@ impl Default for DspParams {
 pub struct InputDspParams {
     /// Master bypass. When `false` the chain passes audio through untouched.
     pub power: bool,
+    /// Hand whoever records from FxSound (Input) silence, whatever `power` says. The same flag
+    /// as [`DspParams::mute`], beside the same silence the engine sets itself while the system
+    /// sleeps, and applied the same way, after the chain, so the gate, the denoiser and the
+    /// calibration counters keep following the microphone.
+    pub mute: bool,
 
     /// High-pass corner in Hz, and its order — `0` for off, `2` or `4`.
     pub highpass_hz: f32,
@@ -193,7 +218,21 @@ pub struct InputDspParams {
     /// level. Whether it then runs also depends on the capture rate — RNNoise exists at 48 kHz
     /// and nowhere else — so a preset asking for it on a device that cannot have it gets a
     /// working chain and an interface that says which stages are running.
+    ///
+    /// Still the master switch. The three fields below shape what the network does once it is
+    /// on, and a 0.3.0 snapshot — which has none of them — reads as the level and mode that
+    /// version always used.
     pub rnnoise: bool,
+    /// How hard the denoiser may work. `Off` here and `rnnoise: true` is a stage that is on and
+    /// asked to do nothing, which the stage treats as off.
+    pub denoise_level: DenoiseLevel,
+    /// One network per channel, or one network on a downmix.
+    pub denoise_channels: DenoiseChannelMode,
+    /// The level's table row, unless a preset carries a row of its own. Whoever builds the
+    /// snapshot keeps this in step with `denoise_level`; the audio thread reads only this.
+    pub denoise_control: DenoiseControl,
+    /// Late-reverberation suppression, after the denoiser and before the high-pass.
+    pub dereverb: DereverbLevel,
 
     pub gate_on: bool,
     pub gate_threshold_db: f32,
@@ -207,6 +246,10 @@ pub struct InputDspParams {
     pub gate_release_ms: f32,
     pub gate_hold_ms: f32,
     pub gate_detection: Detection,
+    /// Let the denoiser's voice probability hold the gate open: a probability above one half arms
+    /// the hold timer as an above-threshold level would. A gate that closes on a quiet consonant
+    /// the network was sure about is a gate that swallows the ends of words.
+    pub vad_gate: bool,
 
     /// Whether the ten-band equalizer contributes. Its bands are the same ladder the output side
     /// uses — the same `GraphicEq`, with its own state.
@@ -221,6 +264,8 @@ pub struct InputDspParams {
     /// Measured **in the split band**, not in the whole signal, which is why it can sit at −22 dB
     /// without touching a voice that peaks at −6.
     pub deesser_threshold_db: f32,
+    /// Whether `deesser_hz` is a corner or a ceiling on one chosen from the source's bandwidth.
+    pub deesser_mode: DeEsserMode,
 
     pub compressor_on: bool,
     pub compressor_threshold_db: f32,
@@ -358,6 +403,12 @@ impl InputDspParams {
 
         self.makeup_db = finite(self.makeup_db, limits::MAKEUP_DB, default.makeup_db);
         self.ceiling_db = finite(self.ceiling_db, limits::CEILING_DB, default.ceiling_db);
+
+        // The control surface falls back to the *level's* row rather than to the default
+        // snapshot's: a corrupt override on a Strong preset should leave a Strong preset, not a
+        // Medium one. The enums cannot be corrupt — a `Copy` enum has no invalid value, and
+        // neither can the switches, `mute` among them.
+        self.denoise_control.sanitise(self.denoise_level.control());
     }
 }
 
@@ -370,9 +421,16 @@ impl Default for InputDspParams {
         }
         Self {
             power: true,
+            mute: false,
             highpass_hz: 80.0,
             highpass_order: 2,
             rnnoise: false,
+            // What `rnnoise = true` meant in 0.3.0: the Medium row, one network per channel, no
+            // de-reverb. A snapshot from that version says exactly what it said.
+            denoise_level: DenoiseLevel::Medium,
+            denoise_channels: DenoiseChannelMode::Independent,
+            denoise_control: DenoiseLevel::Medium.control(),
+            dereverb: DereverbLevel::Off,
             gate_on: true,
             gate_threshold_db: -45.0,
             gate_ratio: 2.0,
@@ -381,6 +439,7 @@ impl Default for InputDspParams {
             gate_release_ms: 150.0,
             gate_hold_ms: 200.0,
             gate_detection: Detection::Rms,
+            vad_gate: false,
             eq_on: true,
             num_bands: eq::DEFAULT_BANDS as u8,
             band_center_hz,
@@ -389,6 +448,7 @@ impl Default for InputDspParams {
             deesser_on: true,
             deesser_hz: 5_500.0,
             deesser_threshold_db: -22.0,
+            deesser_mode: DeEsserMode::Classic,
             compressor_on: true,
             compressor_threshold_db: -18.0,
             compressor_ratio: 3.0,
@@ -414,6 +474,13 @@ pub enum DspEvent {
     ResetSpectrum,
     /// Zero the processed-audio-time accumulator.
     ResetProcessedTime,
+    /// Zero the calibration accumulators in [`Meters`] (`capture_frames` and the three beside
+    /// it). The wizard sends one on entering each phase and reads the totals on leaving it; the
+    /// output engine, which has no capture statistics, ignores it.
+    ///
+    /// Events are routed to one lane by the engine handle rather than tagged here, so the enum
+    /// stays direction-free and an engine never has to check whether an event was meant for it.
+    ResetCaptureStats,
 }
 
 /// What the audio thread publishes for the GUI, once per process callback.
@@ -433,9 +500,10 @@ pub struct Meters {
     pub active: bool,
     /// Gain reduction of the three input stages, in dB, as positive numbers.
     ///
-    /// Zero in the output direction, which has none of these stages. They live on the shared
-    /// snapshot rather than on a second one because the transport carries exactly one meter
-    /// structure and splitting it would double the plumbing to save twelve bytes.
+    /// Zero on the output lane, which has none of these stages. One structure serves both lanes
+    /// — each lane has a transport of its own, and the engine that fills it — because the
+    /// visualizer, the peaks and the sample rate are the same on both, and a second type for the
+    /// microphone's extra fields would make every consumer switch on direction to read a peak.
     pub gate_reduction_db: f32,
     pub compressor_reduction_db: f32,
     pub deesser_reduction_db: f32,
@@ -450,6 +518,50 @@ pub struct Meters {
     /// The denoiser's opinion of whether the last frame was voice, `0.0..=1.0`. Zero when it is
     /// not running.
     pub voice_probability: f32,
+
+    // ---- microphone telemetry ------------------------------------------------------------
+    //
+    // Filled by the input engine and zero on the output engine. The peak holds and decays and
+    // the clip counter is monotonic, because the transport coalesces: a window reading at 60 Hz
+    // would otherwise miss a ten-millisecond buffer entirely.
+    /// Pre-chain peak, held and decaying, linear `0.0..=1.0`.
+    pub input_peak: f32,
+    /// Pre-chain short-window RMS, dBFS.
+    pub input_rms_db: f32,
+    /// Running minimum-statistics floor of the pre-chain signal, dBFS: falls at once, rises at
+    /// half a decibel a second. Published always; the readout strip draws it.
+    pub noise_floor_db: f32,
+    /// `RMS(in) − RMS(out)` across the denoiser, positive dB, smoothed.
+    pub denoise_reduction_db: f32,
+    /// The corner the de-esser actually built — the adaptive mode may have lowered it. Zero
+    /// when the stage is not running.
+    pub deesser_hz: f32,
+    /// Gain reduction of the de-reverb stage, positive dB.
+    pub dereverb_reduction_db: f32,
+    /// What the chain reports for its own delay, in frames at `sample_rate`. RNNoise is 960
+    /// (its bridge and the library's own synthesis delay), not the 480 a frame count suggests.
+    pub latency_frames: u32,
+
+    // ---- calibration accumulators ------------------------------------------------------------
+    //
+    // Cumulative since the last `DspEvent::ResetCaptureStats`, and read as deltas by the
+    // calibration wizard, which owns the state machine; the audio thread only counts.
+    /// Frames accumulated since the reset.
+    pub capture_frames: u64,
+    /// Sum of squared samples since the reset. `f64` so that five seconds at 48 kHz do not lose
+    /// precision to the running total.
+    pub capture_sum_squares: f64,
+    /// Largest `|x|` since the reset.
+    pub capture_peak: f32,
+    /// Samples with `|x| >= 0.999` since the reset.
+    pub capture_clipped: u64,
+    /// The quietest ten-millisecond block since the reset, RMS in dBFS, blocks of digital zeros
+    /// left out; −100 until a block with anything in it has closed. The calibration wizard's
+    /// floor: unlike `noise_floor_db` it starts afresh with the phase, so a room is not read
+    /// through a microphone's earlier silence — a Bluetooth headset's zeros before its profile
+    /// switch, a hardware mute lifted just before Start — that the running floor is still
+    /// climbing out of at half a decibel a second.
+    pub capture_floor_db: f32,
 }
 
 impl Default for Meters {
@@ -467,28 +579,247 @@ impl Default for Meters {
             deesser_running: false,
             denoiser_running: false,
             voice_probability: 0.0,
+            input_peak: 0.0,
+            input_rms_db: 0.0,
+            noise_floor_db: 0.0,
+            denoise_reduction_db: 0.0,
+            deesser_hz: 0.0,
+            dereverb_reduction_db: 0.0,
+            latency_frames: 0,
+            capture_frames: 0,
+            capture_sum_squares: 0.0,
+            capture_peak: 0.0,
+            capture_clipped: 0,
+            capture_floor_db: 0.0,
         }
+    }
+}
+
+/// The volume of FxSound's own virtual node while it was attached to one real device (U10).
+///
+/// FxSound (Output) is one node whatever it renders to, so a mixer shows one slider for it, and
+/// WirePlumber restores one volume for it: a level set for headphones was the level the laptop
+/// speakers got after an unplug — upstream's #615, and a hearing-safety bug rather than a
+/// preference. Remembering the node's volume *per target* is what lets a new pair come up at the
+/// level the user last chose for that device. The real device's own volume is never touched.
+///
+/// Travels both ways — reported by the engine as [`AudioToUi::TargetVolume`] when the node's
+/// `Props` change, handed back when the engine starts (`fxsound_audio::StartOptions`) — and is
+/// kept in the settings file (`Settings::device_volumes`), which is why it is plain data with serde.
+/// Every field defaults, so a hand edit that leaves an entry short costs that field and not the
+/// whole file.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TargetVolume {
+    /// Which lane's node: `fxsound_sink` for output, `fxsound_source` for input.
+    pub direction: DeviceDirection,
+    /// `node.name` of the real device the lane was attached to.
+    pub target: String,
+    /// The port the device was on: the name of its card's active route for the node
+    /// (`SPA_PARAM_Route`), such as `analog-output-headphones`. Empty for a device whose card
+    /// names none — a virtual sink, a card that has not said yet.
+    ///
+    /// One node can be two devices. On most desktops and many laptops (a plain HDA card, not a UCM
+    /// one) the speakers and the headphones are two ports of one sink, and plugging headphones in
+    /// only switches the port, so a volume kept per `node.name` alone was the speakers' level on
+    /// the headphones — upstream's #615 again, under another name. So the entry is one per target
+    /// *and* port, and the settings keep one per port too. Left out of the file when empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub port: String,
+    /// `channelVolumes` of FxSound's node, linear amplitude, one per channel in its own order.
+    pub channel_volumes: Vec<f32>,
+    /// The node's `mute`.
+    pub mute: bool,
+}
+
+impl TargetVolume {
+    /// Whether this is the entry for the lane of `direction` on `target`'s port `port` (empty for
+    /// a device with no port).
+    #[must_use]
+    pub fn is_for(&self, direction: DeviceDirection, target: &str, port: &str) -> bool {
+        self.direction == direction && self.target == target && self.port == port
+    }
+
+    /// Whether this and `other` are entries for the same lane, target and port — of which the
+    /// settings keep one.
+    #[must_use]
+    pub fn same_place(&self, other: &Self) -> bool {
+        other.is_for(self.direction, &self.target, &self.port)
+    }
+
+    /// The entry as it may be replayed onto a node, or `None` when it cannot be.
+    ///
+    /// A volume that is not a number, or is below zero, carries no level anyone set, and replaying
+    /// it — or a clamped reading of it — onto the node the user is listening through would be a
+    /// guess about their hearing; the entry goes, and the target is treated as one never seen,
+    /// which is the never-raise path. A finite volume above
+    /// [`limits::TARGET_VOLUME`](crate::limits::TARGET_VOLUME) is a level someone meant, too
+    /// loud, and is clamped. An entry with no target can match no node and goes too.
+    #[must_use]
+    pub fn sanitised(mut self) -> Option<Self> {
+        use crate::limits::{TARGET_VOLUME, TARGET_VOLUME_CHANNELS};
+
+        if self.target.is_empty()
+            || self
+                .channel_volumes
+                .iter()
+                .any(|volume| !volume.is_finite() || *volume < 0.0)
+        {
+            return None;
+        }
+        self.channel_volumes.truncate(TARGET_VOLUME_CHANNELS);
+        for volume in &mut self.channel_volumes {
+            *volume = volume.clamp(*TARGET_VOLUME.start(), *TARGET_VOLUME.end());
+        }
+        Some(self)
+    }
+}
+
+/// One application's stream, as the engine sees it in the graph (`docs/0.4.0-apps.md`,
+/// "Identifying an application").
+///
+/// A player's playback stream or a recorder's capture stream: a node whose media class is exactly
+/// `Stream/Output/Audio` or `Stream/Input/Audio`, and that is not FxSound's own — not a lane's,
+/// not a route's, not the echo canceller's. Of those, three kinds are not reported:
+///
+/// - a stream the engine has not finished reading: its own info, or its client's, has not arrived.
+///   Both follow within milliseconds, and the stream is reported then, once, under its whole key
+///   rather than first under a key that is about to change.
+/// - a stream that says nothing about who it is — no binary, no name, no Flatpak id, its own or its
+///   client's. The list could not name it, and no rule could match it.
+/// - a recorder of what a sink plays that does not record FxSound: a visualiser on the speakers'
+///   monitor records no microphone, and nothing of FxSound's either. One that does record FxSound
+///   is reported, as a recorder: one with `stream.capture.sink` that names one of FxSound's nodes
+///   as its target, or names none while FxSound's sink is the default sink; and one without the
+///   flag whose target is a node of FxSound's output lane the session manager links it to —
+///   FxSound's sink or a playback route's, named by `object.serial` or node id, whose monitor it
+///   records, or FxSound's playback stream or a route's, named any way.
+///
+/// A reported stream is not necessarily one the engine may move: one that says `node.dont-move`,
+/// one whose own properties name a target that is not FxSound's, and a recorder of FxSound are
+/// never moved onto a route, and stay on their lane with no [`route`](Self::route).
+///
+/// Reported in full ([`AudioToUi::AppStreams`]), which is what the Applications list shows as
+/// running and what the app matches its rules against. Plain data with serde, so the command
+/// line's `--list-apps --json` and D-Bus's `ListApps` can hand it on as it is.
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppStream {
+    /// PipeWire node id of the stream. Not stable across restarts of the application; the
+    /// subject the engine writes the stream's `target.object` for.
+    pub id: u32,
+    /// Playback (`Output`) or recording (`Input`), which is also the lane whose device it uses.
+    pub direction: DeviceDirection,
+    /// Who the stream belongs to.
+    pub app: AppKey,
+    /// The preset of the route the stream was moved onto, or `None` while it plays or records
+    /// through its lane's own chain — including when its rule asked for a route that could not
+    /// be made.
+    pub route: Option<String>,
+}
+
+/// The chain parameters a route runs: an output preset's for a playback route, an input
+/// preset's for a recording route.
+///
+/// `Copy`, like the snapshots it carries: the engine publishes it into the route's own triple
+/// buffer on the control thread, and the audio thread reads it from there, never from a message.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RouteParams {
+    /// For a route in front of the output lane's device.
+    Output(DspParams),
+    /// For a route behind the input lane's device.
+    Input(InputDspParams),
+}
+
+impl RouteParams {
+    /// The direction the parameters are for: the chain they can drive.
+    #[must_use]
+    pub const fn direction(&self) -> DeviceDirection {
+        match self {
+            Self::Output(_) => DeviceDirection::Output,
+            Self::Input(_) => DeviceDirection::Input,
+        }
+    }
+
+    /// Force the snapshot into the ranges its chain accepts: [`DspParams::sanitise`] or
+    /// [`InputDspParams::sanitise`].
+    pub fn sanitise(&mut self) {
+        match self {
+            Self::Output(params) => params.sanitise(),
+            Self::Input(params) => params.sanitise(),
+        }
+    }
+}
+
+/// One rule of the store as the engine acts on it: which applications of a lane run through
+/// which preset (`docs/0.4.0-apps.md`).
+///
+/// The app resolves every rule of the store (`crate::apps::AppRules`) that names a preset of its
+/// lane's to one of these — it owns the preset stores, so it is the one that can turn a preset's
+/// name into parameters — whether its application runs or not, and sends the whole set in
+/// [`UiToAudio::SetAppRoutes`]. A rule that follows the lane is sent too, with an empty `preset`,
+/// where it could outrank one that names a preset ([`crate::AppKey::may_outrank`]): the engine
+/// picks each stream's rule with [`crate::AppKey::best_match`] among these, as the store picks
+/// among all of its own. Routes are per preset, not per application: every entry of one lane
+/// naming the same preset shares one pair of nodes, up to
+/// [`MAX_ROUTES_PER_LANE`](crate::apps::MAX_ROUTES_PER_LANE) presets per lane.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppRoute {
+    /// The lane the application's stream belongs to.
+    pub direction: DeviceDirection,
+    /// The rule's own key: the streams it is the most specific match for are moved onto the
+    /// route.
+    pub app: AppKey,
+    /// The preset's name: what the route's node is called in a mixer, and how entries sharing a
+    /// route are grouped. Empty for a rule that follows the lane: its streams stay there, whatever
+    /// a more general rule says.
+    pub preset: String,
+    /// The preset resolved to chain parameters, for `direction`.
+    pub params: RouteParams,
+    /// The stage ordering an input route runs, by name, as in [`UiToAudio::SetInputChain`];
+    /// unused for an output route.
+    pub chain: String,
+}
+
+impl AppRoute {
+    /// Whether the parameters are for the route's own direction. A route that is not would hand
+    /// one chain the other's snapshot; the engine refuses it rather than guess which was meant.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.params.direction() == self.direction
     }
 }
 
 /// Control-thread requests. These may allocate and may block; they never reach the RT thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiToAudio {
-    /// Attach FxSound to this device (`node.name`): in front of an output as a virtual sink, or
-    /// behind an input as a virtual source. Changing direction tears the nodes down and rebuilds
-    /// them the other way round; FxSound runs in one direction at a time.
+    /// Attach the lane of `direction` to this device (`node.name`) and enable it: in front of an
+    /// output as a virtual sink, or behind an input as a virtual source. Never touches the other
+    /// lane — picking a microphone while the speakers are being processed leaves the speakers
+    /// exactly as they were.
     SelectDevice {
         node_name: String,
         direction: DeviceDirection,
     },
+    /// Hand the lane's session default back, destroy its nodes and disable it. The other lane is
+    /// untouched. Answered with [`AudioToUi::Attached`] carrying `None`.
+    DetachLane(DeviceDirection),
     /// Re-scan the PipeWire graph for devices.
     RescanDevices,
-    /// Make FxSound's virtual device the session default for its direction, or hand it back.
-    SetAsDefault(bool),
+    /// Make FxSound's virtual device the session default for this lane's direction, or hand it
+    /// back. Each lane holds its own claim.
+    SetAsDefault {
+        direction: DeviceDirection,
+        want: bool,
+    },
     /// Tear down and rebuild the PipeWire nodes, e.g. after the server restarted.
     Restart,
     /// Stop the audio engine and let the process exit.
     Shutdown,
+    /// Echo cancellation on or off for the input lane: PipeWire's `module-echo-cancel`, loaded
+    /// into FxSound's own context, with the capture stream retargeted to its cancelled source.
+    /// Answered with [`AudioToUi::EchoCancel`], which is also how a missing backend is reported.
+    SetEchoCancel(bool),
     /// What the session default was before FxSound last took it, one name per direction.
     ///
     /// Sent once at start-up, from the settings file. The audio thread keeps this memory on its
@@ -496,6 +827,76 @@ pub enum UiToAudio {
     /// it leaves behind is a session default naming FxSound's node, which no longer exists. No
     /// signal handler covers that case, because none of those three run one.
     SeedRememberedDefaults { output: String, input: String },
+    /// The stage ordering the input lane runs, by the name a voice preset gives it: `"voice"`,
+    /// `"podcast"`, `"broadcast"` or `"streaming"`.
+    ///
+    /// A name and not a chain: the specs live in the DSP crate, which this one does not depend
+    /// on, and the chain is built on the audio thread's main loop in any case — it allocates,
+    /// which is why it is a control message and not a field of [`InputDspParams`]. A name this
+    /// build does not know falls back to `"voice"` on the audio side, and says so, rather than
+    /// refusing a preset written for a later version.
+    SetInputChain(String),
+    /// The user's ranking of real devices for one lane, as `node.name`s, most preferred first
+    /// (U4). The device rules let a newly present device take the lane only when it is ranked
+    /// above the current one, and fall back down the list when the current one goes; unranked
+    /// devices come after every ranked one.
+    ///
+    /// Empty means "follow the system": no ranking, the session default decides — the app's
+    /// `follow_system_default` switch, and upstream's issue #629.
+    ///
+    /// `new_devices_first` says where a device the ranking does not name yet goes: before every
+    /// ranked device when `true`, after every one when `false` — the app's
+    /// `prioritize_new_output`, which puts a newly seen device at the front of its list or at the
+    /// back. The engine needs it because it decides on an arrival before the app's list that
+    /// ranks the newcomer can reach it; send it with every ranking, and again when the setting
+    /// changes.
+    SetDevicePriority {
+        direction: DeviceDirection,
+        names: Vec<String>,
+        new_devices_first: bool,
+    },
+    /// Every remembered per-target volume, from the settings file (U10), replacing the whole of
+    /// the engine's memory. The engine replays the matching one onto its own node when it attaches
+    /// a lane to that target.
+    ///
+    /// Not how the memory first reaches the engine: the output lane builds its first pair before a
+    /// message sent after start-up is sure to have arrived, so the app hands it over with the
+    /// engine (`fxsound_audio::StartOptions::target_volumes`). This is for a later replacement; a
+    /// pair up already whose volume nothing has moved is then given its target's level.
+    SeedTargetVolumes(Vec<TargetVolume>),
+    /// logind's `PrepareForSleep`: `true` when the system is about to sleep, `false` when it has
+    /// resumed (U13).
+    ///
+    /// The engine does the rest itself. On `true` both lanes fall silent after their chains and
+    /// their device rules stop. On `false` both chains' filter history is cleared, both lanes'
+    /// rules run again with a wait of up to 2.5 s for the devices they were on — Bluetooth
+    /// devices reconnect a few seconds after the system does, under new ids — and each lane is
+    /// heard again once it is attached, or after 2 s at the latest. The app need not touch the
+    /// snapshots' `mute` for it. A `true` that is never followed by a `false` is given up on after
+    /// a minute of the system being awake.
+    SystemSleeping(bool),
+    /// Hold the microphone open while `true`, even with nobody recording from FxSound (Input):
+    /// the calibration wizard and the microphone meters need a signal that the passive capture
+    /// stream would otherwise not have (U9, U19).
+    ///
+    /// The engine records its own virtual source while it is held, as an application would, which
+    /// runs the input lane and the microphone. That is also what switches a Bluetooth headset to
+    /// its call profile under WirePlumber 0.5, so a headset's microphone delivers audio too —
+    /// about a second after the message, once the profile has switched. Kept until `false`,
+    /// across devices and reconnects.
+    KeepInputAwake(bool),
+    /// Every rule that gives an application a preset of its own, both lanes at once, running or
+    /// not, and the rules that follow the lane where they outrank one of those
+    /// (`docs/0.4.0-apps.md`, [`AppRoute`]). The full set each time, never a change: the engine
+    /// compares it with what it runs, builds a route when a stream needs one, moves the streams,
+    /// and tears down what is no longer asked for. Empty means no application has a preset of its
+    /// own.
+    ///
+    /// Resent whenever a rule changes, a preset a rule uses is saved, renamed or deleted, or the
+    /// output levels every chain shares — master gain, balance, levelling, band count — change;
+    /// never because a stream came or went, so a route outlives its application's streams by the
+    /// engine's idle time, and a new stream finds its rule at once.
+    SetAppRoutes(Vec<AppRoute>),
 }
 
 /// Control-thread notifications for the GUI.
@@ -503,12 +904,27 @@ pub enum UiToAudio {
 pub enum AudioToUi {
     /// The set of selectable devices changed. Carries both directions; each entry says which.
     Devices(Vec<AudioDevice>),
-    /// The engine's connection state or negotiated format changed.
-    Status(AudioStatus),
+    /// One lane's connection state or negotiated format changed. `status.processing` and the
+    /// counters describe that lane only.
+    Status {
+        direction: DeviceDirection,
+        status: AudioStatus,
+    },
+    /// What the lane is actually attached to, or `None` when it has no nodes. Sent whenever it
+    /// changes. This is what the window shows as the selected device: the engine says what it
+    /// did, and nothing on the GUI side has to infer it from a device list.
+    Attached {
+        direction: DeviceDirection,
+        node_name: Option<String>,
+    },
     /// The PipeWire connection dropped; the control thread is retrying.
     Disconnected { reason: String },
-    /// Something the user needs to be told about, in already-translated text.
-    Error { message: String },
+    /// Something the user needs to be told about, in already-translated text. `direction` names
+    /// the lane it concerns, or `None` for the connection as a whole.
+    Error {
+        direction: Option<DeviceDirection>,
+        message: String,
+    },
     /// FxSound has taken the session default for this direction, and this is what it was before.
     ///
     /// Written to the settings file so the next start can repair a default that a kill left
@@ -517,6 +933,27 @@ pub enum AudioToUi {
         direction: DeviceDirection,
         node_name: String,
     },
+    /// Whether echo cancellation is running — the module loaded and its source present — and,
+    /// when it is not, why: the load error verbatim, so a missing `libspa-aec-webrtc` reads as
+    /// `Echo  unavailable` in the strip rather than as a stage that silently did nothing.
+    EchoCancel { running: bool, detail: String },
+    /// The volume of FxSound's own node changed while attached to this target (U10). The app
+    /// persists it in `Settings::device_volumes`, replacing the entry for the same direction and
+    /// target, so the next pair built for that device starts where the user left it.
+    TargetVolume(TargetVolume),
+    /// Something that works but that the user should know, in already-translated text: one
+    /// Bluetooth headset as the target of both lanes, which drops its music to call quality (U9).
+    /// Not an [`AudioToUi::Error`], because nothing failed. `direction` names the lane it
+    /// concerns, or `None` for both.
+    Warning {
+        direction: Option<DeviceDirection>,
+        message: String,
+    },
+    /// Every application stream in the graph, both directions, whenever the set or a stream's
+    /// route changes (`docs/0.4.0-apps.md`; [`AppStream`] says which streams count). The full
+    /// list each time, so the Applications list is always what the graph holds and never an
+    /// accumulation of changes.
+    AppStreams(Vec<AppStream>),
 }
 
 #[cfg(test)]
@@ -550,6 +987,13 @@ mod tests {
             ceiling_db: f32::NAN,
             band_center_hz: [f32::NAN; eq::MAX_BANDS],
             band_boost_db: [f32::INFINITY; eq::MAX_BANDS],
+            denoise_level: DenoiseLevel::Strong,
+            denoise_control: DenoiseControl {
+                max_suppression_db: f32::NAN,
+                vad_threshold: f32::INFINITY,
+                voice_preservation: f32::NEG_INFINITY,
+                wet_dry: f32::NAN,
+            },
             ..InputDspParams::default()
         };
         params.sanitise();
@@ -562,6 +1006,177 @@ mod tests {
         let (centers, boosts) = params.bands();
         assert!(centers.iter().all(|hz| hz.is_finite() && *hz > 0.0));
         assert!(boosts.iter().all(|db| db.is_finite()));
+        // The control surface falls back to the row of the level it was overriding — Strong —
+        // and not to the default snapshot's Medium.
+        assert_eq!(params.denoise_control, DenoiseLevel::Strong.control());
+    }
+
+    #[test]
+    fn the_denoise_control_surface_is_clamped_rather_than_replaced() {
+        let mut params = InputDspParams {
+            denoise_control: DenoiseControl {
+                max_suppression_db: 500.0,
+                vad_threshold: 3.0,
+                voice_preservation: -1.0,
+                wet_dry: 2.0,
+            },
+            ..InputDspParams::default()
+        };
+        params.sanitise();
+        assert_eq!(
+            params.denoise_control,
+            DenoiseControl {
+                max_suppression_db: *crate::limits::DENOISE_MAX_SUPPRESSION_DB.end(),
+                vad_threshold: 1.0,
+                voice_preservation: 0.0,
+                wet_dry: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_valid_control_surface_survives_sanitising_untouched() {
+        // A preset's own row, inside every range, is a value someone meant and must come out
+        // exactly as it went in — including one the level table would never produce.
+        let row = DenoiseControl {
+            max_suppression_db: 30.0,
+            vad_threshold: 0.2,
+            voice_preservation: 0.1,
+            wet_dry: 0.75,
+        };
+        let mut params = InputDspParams {
+            denoise_control: row,
+            ..InputDspParams::default()
+        };
+        params.sanitise();
+        assert_eq!(params.denoise_control, row);
+    }
+
+    #[test]
+    fn the_default_input_snapshot_means_what_a_0_3_0_snapshot_meant() {
+        // A snapshot from a version that had none of these fields must read as what that version
+        // always did: no denoiser unless asked, and when asked, the network as it then was — the
+        // Medium row — one network per channel, the corner the preset named, no de-reverb, and a
+        // gate that listens to level alone.
+        let default = InputDspParams::default();
+        assert!(!default.rnnoise);
+        assert_eq!(default.denoise_level, DenoiseLevel::Medium);
+        assert_eq!(default.denoise_channels, DenoiseChannelMode::Independent);
+        assert_eq!(default.denoise_control, DenoiseLevel::Medium.control());
+        assert_eq!(default.deesser_mode, DeEsserMode::Classic);
+        assert_eq!(default.dereverb, DereverbLevel::Off);
+        assert!(!default.vad_gate);
+        // And the default is already sane, so sanitising it changes nothing.
+        let mut checked = default;
+        checked.sanitise();
+        assert_eq!(checked, default);
+    }
+
+    #[test]
+    fn the_default_meters_are_all_zero_and_the_structure_stays_copy() {
+        // The transport is a triple buffer of `Copy` values; a field that owned heap memory
+        // would make the audio thread free an allocation. This is the same guard the audio crate
+        // keeps, repeated at the source so the type cannot drift away from it unnoticed.
+        const fn assert_copy<T: Copy>() {}
+        assert_copy::<Meters>();
+        assert_copy::<InputDspParams>();
+        assert_copy::<DspParams>();
+        assert_copy::<DspEvent>();
+
+        let meters = Meters::default();
+        assert_eq!(meters.input_peak, 0.0);
+        assert_eq!(meters.input_rms_db, 0.0);
+        assert_eq!(meters.noise_floor_db, 0.0);
+        assert_eq!(meters.denoise_reduction_db, 0.0);
+        assert_eq!(meters.deesser_hz, 0.0);
+        assert_eq!(meters.dereverb_reduction_db, 0.0);
+        assert_eq!(meters.latency_frames, 0);
+        assert_eq!(meters.capture_frames, 0);
+        assert_eq!(meters.capture_sum_squares, 0.0);
+        assert_eq!(meters.capture_peak, 0.0);
+        assert_eq!(meters.capture_clipped, 0);
+        assert!(!meters.active);
+        assert_eq!(meters.sample_rate, 48_000, "the rate the engine starts at");
+    }
+
+    #[test]
+    fn the_capture_accumulator_does_not_lose_precision_over_a_calibration_phase() {
+        // Five seconds at 48 kHz of a −20 dBFS tone summed in f32 drifts by parts in a thousand;
+        // the field is f64 so that it does not. Pin the type by using it as one.
+        let mut meters = Meters::default();
+        let amplitude = 0.1_f32;
+        let frames = 5 * 48_000_u64;
+        for _ in 0..frames {
+            meters.capture_frames += 1;
+            meters.capture_sum_squares += f64::from(amplitude * amplitude);
+        }
+        let rms = (meters.capture_sum_squares / meters.capture_frames as f64).sqrt();
+        assert!((rms - f64::from(amplitude)).abs() < 1e-6, "{rms}");
+    }
+
+    #[test]
+    fn the_control_messages_carry_their_lane() {
+        // Both lanes run at once, so every message that concerns one of them says which; a
+        // status without a direction would be a status the window cannot place.
+        let status = AudioToUi::Status {
+            direction: DeviceDirection::Input,
+            status: AudioStatus::default(),
+        };
+        assert!(matches!(
+            status,
+            AudioToUi::Status {
+                direction: DeviceDirection::Input,
+                ..
+            }
+        ));
+        let detached = AudioToUi::Attached {
+            direction: DeviceDirection::Output,
+            node_name: None,
+        };
+        assert_eq!(detached.clone(), detached, "messages compare by value");
+        let claim = UiToAudio::SetAsDefault {
+            direction: DeviceDirection::Input,
+            want: false,
+        };
+        assert_ne!(
+            claim,
+            UiToAudio::SetAsDefault {
+                direction: DeviceDirection::Output,
+                want: false,
+            }
+        );
+        // A connection-wide error has no lane.
+        let error = AudioToUi::Error {
+            direction: None,
+            message: "socket closed".to_owned(),
+        };
+        assert!(matches!(
+            error,
+            AudioToUi::Error {
+                direction: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            UiToAudio::DetachLane(DeviceDirection::Input),
+            UiToAudio::DetachLane(DeviceDirection::Input)
+        );
+        assert_ne!(
+            UiToAudio::SetEchoCancel(true),
+            UiToAudio::SetEchoCancel(false)
+        );
+        assert_eq!(
+            UiToAudio::SetInputChain("podcast".to_owned()),
+            UiToAudio::SetInputChain("podcast".to_owned())
+        );
+        let unavailable = AudioToUi::EchoCancel {
+            running: false,
+            detail: "libspa-aec-webrtc not found".to_owned(),
+        };
+        assert!(matches!(
+            unavailable,
+            AudioToUi::EchoCancel { running: false, .. }
+        ));
     }
 
     #[test]
@@ -593,6 +1208,381 @@ mod tests {
             params.sanitise();
             assert_eq!(params.highpass_order, built, "order {asked}");
         }
+    }
+
+    #[test]
+    fn neither_snapshot_starts_muted() {
+        // A fresh start is never asleep, and a snapshot from before the field existed must not
+        // silence anything.
+        assert!(!DspParams::default().mute);
+        assert!(!InputDspParams::default().mute);
+    }
+
+    #[test]
+    fn sanitising_keeps_a_sleeping_systems_mute() {
+        // The mute reaches the audio thread through `sanitise`, like every other field; a
+        // sanitiser that rebuilt the snapshot from defaults would wake the speakers mid-suspend.
+        let mut output = DspParams {
+            mute: true,
+            master_gain_db: f32::NAN,
+            ..DspParams::default()
+        };
+        output.sanitise();
+        assert!(output.mute);
+        assert_eq!(output.master_gain_db, DspParams::default().master_gain_db);
+
+        let mut input = InputDspParams {
+            mute: true,
+            ceiling_db: f32::NAN,
+            ..InputDspParams::default()
+        };
+        input.sanitise();
+        assert!(input.mute);
+        assert_eq!(input.ceiling_db, InputDspParams::default().ceiling_db);
+
+        // And the other way: sanitising never mutes.
+        let mut awake = DspParams::default();
+        awake.sanitise();
+        assert!(!awake.mute);
+        let mut awake = InputDspParams::default();
+        awake.sanitise();
+        assert!(!awake.mute);
+    }
+
+    #[test]
+    fn a_mute_is_a_change_of_snapshot() {
+        // The engines skip a snapshot equal to the one they applied; a mute that compared equal
+        // would never reach the lane.
+        let muted = DspParams {
+            mute: true,
+            ..DspParams::default()
+        };
+        assert_ne!(muted, DspParams::default());
+        let muted = InputDspParams {
+            mute: true,
+            ..InputDspParams::default()
+        };
+        assert_ne!(muted, InputDspParams::default());
+    }
+
+    fn headphones(volumes: &[f32]) -> TargetVolume {
+        TargetVolume {
+            direction: DeviceDirection::Output,
+            target: "alsa_output.usb-headphones".to_owned(),
+            port: String::new(),
+            channel_volumes: volumes.to_vec(),
+            mute: false,
+        }
+    }
+
+    #[test]
+    fn a_remembered_volume_inside_the_range_survives_sanitising_untouched() {
+        let entry = TargetVolume {
+            mute: true,
+            ..headphones(&[0.0, 0.25, 1.0, 4.0])
+        };
+        assert_eq!(entry.clone().sanitised(), Some(entry));
+        // No channels at all is still a remembered mute.
+        let bare = TargetVolume {
+            mute: true,
+            ..headphones(&[])
+        };
+        assert_eq!(bare.clone().sanitised(), Some(bare));
+    }
+
+    #[test]
+    fn a_remembered_volume_that_is_not_a_number_drops_the_entry() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(headphones(&[0.5, bad]).sanitised(), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_negative_remembered_volume_drops_the_entry_rather_than_reading_as_silence() {
+        // Clamping −0.5 to 0 would replay a mute nobody set; dropping it makes the device one
+        // never seen, which is the never-raise path.
+        assert_eq!(headphones(&[-0.5, 0.5]).sanitised(), None);
+    }
+
+    #[test]
+    fn a_remembered_volume_above_twelve_decibels_is_clamped_not_dropped() {
+        let loud = headphones(&[9.0, 4.5]).sanitised().expect("kept");
+        assert_eq!(loud.channel_volumes, [4.0, 4.0]);
+        assert_eq!(*crate::limits::TARGET_VOLUME.end(), 4.0);
+    }
+
+    #[test]
+    fn a_remembered_volume_without_a_target_is_dropped() {
+        let nameless = TargetVolume {
+            target: String::new(),
+            ..headphones(&[0.5, 0.5])
+        };
+        assert_eq!(nameless.sanitised(), None);
+    }
+
+    #[test]
+    fn a_remembered_volume_keeps_no_more_channels_than_a_props_can_carry() {
+        let wide = headphones(&[0.5; 200]).sanitised().expect("kept");
+        assert_eq!(
+            wide.channel_volumes.len(),
+            crate::limits::TARGET_VOLUME_CHANNELS
+        );
+    }
+
+    #[test]
+    fn a_target_volume_round_trips_through_toml_under_the_designed_keys() {
+        let entry = TargetVolume {
+            direction: DeviceDirection::Input,
+            target: "alsa_input.usb-fifine".to_owned(),
+            port: String::new(),
+            channel_volumes: vec![0.5, 0.75],
+            mute: true,
+        };
+        let text = toml::to_string(&entry).expect("serialise");
+        for line in [
+            "direction = \"input\"",
+            "target = \"alsa_input.usb-fifine\"",
+            "channel_volumes = [0.5, 0.75]",
+            "mute = true",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in:\n{text}");
+        }
+        let back: TargetVolume = toml::from_str(&text).expect("parse");
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn a_short_target_volume_entry_fills_in_its_missing_fields() {
+        // A hand edit that leaves out a key costs that key, not the settings file around it.
+        let parsed: TargetVolume = toml::from_str("target = \"alsa_output.pci\"\n").expect("parse");
+        assert_eq!(
+            parsed,
+            TargetVolume {
+                direction: DeviceDirection::Output,
+                target: "alsa_output.pci".to_owned(),
+                port: String::new(),
+                channel_volumes: Vec::new(),
+                mute: false,
+            }
+        );
+    }
+
+    #[test]
+    fn the_upstream_review_messages_carry_their_lane_and_compare_by_value() {
+        let priority = UiToAudio::SetDevicePriority {
+            direction: DeviceDirection::Output,
+            names: vec!["alsa_output.usb".to_owned(), "alsa_output.pci".to_owned()],
+            new_devices_first: false,
+        };
+        assert_eq!(priority.clone(), priority);
+        assert_ne!(
+            priority,
+            UiToAudio::SetDevicePriority {
+                direction: DeviceDirection::Input,
+                names: vec!["alsa_output.usb".to_owned(), "alsa_output.pci".to_owned()],
+                new_devices_first: false,
+            },
+            "one ranking per lane"
+        );
+        assert_ne!(
+            priority,
+            UiToAudio::SetDevicePriority {
+                direction: DeviceDirection::Output,
+                names: vec!["alsa_output.usb".to_owned(), "alsa_output.pci".to_owned()],
+                new_devices_first: true,
+            },
+            "where a device not ranked yet goes is part of the ranking"
+        );
+        // An empty ranking is a message of its own: follow the system.
+        let follow = UiToAudio::SetDevicePriority {
+            direction: DeviceDirection::Output,
+            names: Vec::new(),
+            new_devices_first: false,
+        };
+        assert_ne!(follow, priority);
+
+        let seed = UiToAudio::SeedTargetVolumes(vec![headphones(&[0.5, 0.5])]);
+        assert_eq!(seed.clone(), seed);
+        assert_ne!(
+            UiToAudio::SystemSleeping(true),
+            UiToAudio::SystemSleeping(false)
+        );
+        assert_ne!(
+            UiToAudio::KeepInputAwake(true),
+            UiToAudio::KeepInputAwake(false)
+        );
+
+        let report = AudioToUi::TargetVolume(headphones(&[0.3, 0.3]));
+        assert!(matches!(
+            &report,
+            AudioToUi::TargetVolume(TargetVolume {
+                direction: DeviceDirection::Output,
+                ..
+            })
+        ));
+        let warning = AudioToUi::Warning {
+            direction: None,
+            message: "call quality".to_owned(),
+        };
+        assert!(matches!(
+            warning,
+            AudioToUi::Warning {
+                direction: None,
+                ..
+            }
+        ));
+        assert_ne!(report, warning, "a warning is not a volume report");
+        // The same shape as an error, with the same text: still not one, so the window can show
+        // a warning without the red of a failure.
+        assert_ne!(
+            warning,
+            AudioToUi::Error {
+                direction: None,
+                message: "call quality".to_owned(),
+            },
+            "a warning is not an error, even with the same text"
+        );
+    }
+
+    fn battlefield() -> AppKey {
+        AppKey {
+            binary: "bf6.exe".to_owned(),
+            name: "Battlefield 6".to_owned(),
+            flatpak: String::new(),
+        }
+    }
+
+    #[test]
+    fn route_parameters_know_which_chain_they_drive() {
+        assert_eq!(
+            RouteParams::Output(DspParams::default()).direction(),
+            DeviceDirection::Output
+        );
+        assert_eq!(
+            RouteParams::Input(InputDspParams::default()).direction(),
+            DeviceDirection::Input
+        );
+    }
+
+    #[test]
+    fn route_parameters_are_sanitised_by_the_rules_of_their_own_chain() {
+        let mut output = RouteParams::Output(DspParams {
+            master_gain_db: f32::NAN,
+            ..DspParams::default()
+        });
+        output.sanitise();
+        let RouteParams::Output(params) = output else {
+            panic!("still an output snapshot");
+        };
+        assert_eq!(params.master_gain_db, DspParams::default().master_gain_db);
+
+        let mut input = RouteParams::Input(InputDspParams {
+            ceiling_db: f32::NAN,
+            ..InputDspParams::default()
+        });
+        input.sanitise();
+        let RouteParams::Input(params) = input else {
+            panic!("still an input snapshot");
+        };
+        assert_eq!(params.ceiling_db, InputDspParams::default().ceiling_db);
+    }
+
+    #[test]
+    fn a_route_is_consistent_only_when_its_parameters_are_for_its_own_lane() {
+        let mut route = AppRoute {
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            preset: "Gaming".to_owned(),
+            params: RouteParams::Output(DspParams::default()),
+            chain: String::new(),
+        };
+        assert!(route.is_consistent());
+        route.params = RouteParams::Input(InputDspParams::default());
+        assert!(
+            !route.is_consistent(),
+            "an input snapshot for a playback route"
+        );
+        route.direction = DeviceDirection::Input;
+        route.chain = "voice".to_owned();
+        assert!(route.is_consistent());
+    }
+
+    #[test]
+    fn the_route_set_compares_by_value_so_the_engine_can_diff_it() {
+        let route = AppRoute {
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            preset: "Gaming".to_owned(),
+            params: RouteParams::Output(DspParams::default()),
+            chain: String::new(),
+        };
+        let set = UiToAudio::SetAppRoutes(vec![route.clone()]);
+        assert_eq!(set.clone(), set);
+        let louder = AppRoute {
+            params: RouteParams::Output(DspParams {
+                master_gain_db: 3.0,
+                ..DspParams::default()
+            }),
+            ..route.clone()
+        };
+        assert_ne!(
+            set,
+            UiToAudio::SetAppRoutes(vec![louder]),
+            "a changed level is a changed set"
+        );
+        assert_ne!(set, UiToAudio::SetAppRoutes(Vec::new()));
+        let other_preset = AppRoute {
+            preset: "Movies".to_owned(),
+            ..route
+        };
+        assert_ne!(set, UiToAudio::SetAppRoutes(vec![other_preset]));
+    }
+
+    #[test]
+    fn an_app_stream_round_trips_through_toml_with_and_without_a_route() {
+        let routed = AppStream {
+            id: 87,
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            route: Some("Gaming".to_owned()),
+        };
+        let text = toml::to_string(&routed).expect("serialise");
+        for line in ["id = 87", "direction = \"output\"", "route = \"Gaming\""] {
+            assert!(text.contains(line), "missing {line:?} in:\n{text}");
+        }
+        assert_eq!(toml::from_str::<AppStream>(&text).expect("parse"), routed);
+
+        let on_its_lane = AppStream {
+            id: 91,
+            direction: DeviceDirection::Input,
+            app: AppKey {
+                binary: "discord".to_owned(),
+                name: "Discord".to_owned(),
+                flatpak: "com.discordapp.Discord".to_owned(),
+            },
+            route: None,
+        };
+        let text = toml::to_string(&on_its_lane).expect("serialise");
+        assert!(!text.contains("route"), "no route, no key: {text}");
+        assert_eq!(
+            toml::from_str::<AppStream>(&text).expect("parse"),
+            on_its_lane
+        );
+    }
+
+    #[test]
+    fn the_stream_report_is_its_own_message() {
+        let streams = AudioToUi::AppStreams(vec![AppStream {
+            id: 87,
+            direction: DeviceDirection::Output,
+            app: battlefield(),
+            route: None,
+        }]);
+        assert_eq!(streams.clone(), streams);
+        assert_ne!(streams, AudioToUi::AppStreams(Vec::new()));
+        assert!(
+            matches!(streams, AudioToUi::AppStreams(list) if list[0].app.display() == "Battlefield 6")
+        );
     }
 
     #[test]

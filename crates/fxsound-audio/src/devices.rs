@@ -13,10 +13,16 @@
 //! The Linux port adds one axis the Windows code never had: **direction**. The same rules run,
 //! unchanged, over `Audio/Source` nodes when FxSound sits behind a microphone
 //! (`docs/spec/12-audio-io.md` §28), with "the current default" then read from
-//! `default.audio.source`. The one deliberate difference is the mono guard: Windows refused mono
-//! *playback* devices because of a driver bug (`sndDevices.h:39`), but a mono microphone is the
-//! normal case and is accepted — the capture stream declares stereo and PipeWire's adapter
-//! up-mixes.
+//! `default.audio.source`.
+//!
+//! One branch of the Windows rules is deliberately not ported: the mono guard. Windows refused
+//! mono *playback* devices to work around a bug in its own driver (`sndDevices.h:32-39`,
+//! `SND_DEVICES_MONO_BUG_*`), and PipeWire has no such bug to work around. So no device is refused
+//! for its channel count, in either direction: a lane's pair always runs at least a stereo pair,
+//! and the adapter PipeWire puts in front of the real device converts — it up-mixes a mono
+//! microphone into the pair, and down-mixes the pair into a mono headset. That is what keeps the
+//! music playing in a Bluetooth headset that has just switched to its call profile, which is mono
+//! (`docs/spec/12-audio-io.md`, open question 6).
 //!
 //! Everything here is a pure function over property dictionaries. Nothing in this module talks to
 //! a PipeWire server, which is what lets the rules be tested against a captured `pw-dump` rather
@@ -24,13 +30,15 @@
 
 use fxsound_core::{AudioDevice, DeviceDirection};
 
-use crate::{AudioError, OUR_NODE_NAMES};
+use crate::{AudioError, is_fxsound_node};
 
 /// `SND_DEVICES_MIN_NUM_CHANS` (`audiopassthru/include/sndDevices.h:190`).
 ///
-/// A sink with fewer channels than this is refused rather than down-mixed, exactly as
-/// `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES` (`sndDevices.h:39`) makes Windows refuse it. A
-/// *source* with fewer channels is up-mixed instead; see [`DeviceInfo::is_refused_mono`].
+/// The fewest channels a lane's pair ever runs, not the fewest a device may have. A device with
+/// fewer is attached like any other and its adapter converts: a mono microphone is up-mixed into
+/// the pair and the pair is down-mixed into a mono headset (see [`DeviceInfo::clamped_channels`]).
+/// Windows refused such a *sink* instead (`SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES`,
+/// `sndDevices.h:39`), to work around a driver bug PipeWire does not have.
 pub const MIN_CHANNELS: u32 = 2;
 
 /// `SND_DEVICES_MAX_NUM_CHANS` (`sndDevices.h:191`).
@@ -38,6 +46,35 @@ pub const MAX_CHANNELS: u32 = 8;
 
 /// `SND_DEVICES_MAX_SAMP_FREQ` (`sndDevices.h:189`).
 pub const MAX_SAMPLE_RATE: u32 = 192_000;
+
+/// The rate a Bluetooth headset (HFP/HSP) link is taken to carry when nothing names its codec:
+/// mSBC's 16 kHz, the wide band nearly every headset of the last decade negotiates.
+///
+/// No headset figure is ever published as `audio.rate` — the node negotiates whatever the graph
+/// runs at and resamples inside bluez — so the codec, and failing that the profile, is the only
+/// place the link's real bandwidth shows. [`DeviceInfo::native_rate`] reports it so that the
+/// adaptive de-esser has something to adapt to (`docs/0.4.0-design.md` §6). WirePlumber 0.5's
+/// microphone names no codec at all ([`BluezFacts::loopback`]), so this is what it gets.
+pub const BLUEZ_HEADSET_RATE: u32 = 16_000;
+
+/// The rate a Bluetooth headset profile's codec carries, by the name PipeWire's bluez5 plugin
+/// writes into `api.bluez5.codec`; `None` for a codec that is not a headset codec (an A2DP node
+/// names `sbc`, `aac`, `ldac` and the like) or one this build does not know.
+///
+/// The four hands-free codecs PipeWire 1.6 ships
+/// (`/usr/lib/spa-0.2/bluez5/libspa-codec-bluez5-hfp-*`): CVSD, the narrow band every headset
+/// falls back to; mSBC, the wide band; LC3 at 24 kHz (`lc3_a127`, "LC3-24kHz"); and LC3-SWB, the
+/// super-wide band of HFP 1.9 (`hfp-codec-lc3-swb.c`, `lc3_frame_samples(7500, 32000)`).
+#[must_use]
+pub fn bluez_codec_rate(codec: &str) -> Option<u32> {
+    match codec {
+        "cvsd" => Some(8_000),
+        "msbc" => Some(16_000),
+        "lc3_a127" => Some(24_000),
+        "lc3_swb" => Some(32_000),
+        _ => None,
+    }
+}
 
 /// The `media.class` a node must carry to be a playback device we can render into.
 pub const SINK_MEDIA_CLASS: &str = "Audio/Sink";
@@ -168,22 +205,22 @@ impl FormFactor {
             }
         }
 
-        // Bluetooth: the profile says whether the microphone is in play.
-        if get("device.bus") == Some("bluetooth")
-            || get("api.bluez5.profile").is_some()
-            || get("api.bluez5.address").is_some()
-        {
-            return match get("api.bluez5.profile") {
-                Some(p) if p.starts_with("headset") || p.starts_with("hfp") => Self::Headset,
-                _ => Self::Headphones,
+        // Bluetooth: the profile says whether the microphone is in play, and WirePlumber 0.5's
+        // microphone, which names no profile, is a headset's by what it is. A node that is
+        // Bluetooth and says neither is a pair of headphones here; [`DeviceInfo::from_props`]
+        // knows its direction, and makes a microphone of that kind a headset's.
+        let bluez = BluezFacts::from_props(get);
+        if bluez.is_bluetooth() {
+            return if bluez.headset_profile.unwrap_or(bluez.loopback) {
+                Self::Headset
+            } else {
+                Self::Headphones
             };
         }
 
-        match get("device.api") {
-            // `raop`/`roc`/`pulse-tunnel` sinks all announce themselves through device.api.
-            Some("raop" | "roc" | "pulse-tunnel") => return Self::NetworkDevice,
-            Some("bluez5") => return Self::Headphones,
-            _ => {}
+        // `raop`/`roc`/`pulse-tunnel` sinks all announce themselves through device.api.
+        if let Some("raop" | "roc" | "pulse-tunnel") = get("device.api") {
+            return Self::NetworkDevice;
         }
         if get("node.network") == Some("true") {
             return Self::NetworkDevice;
@@ -196,6 +233,173 @@ impl FormFactor {
             Some(icon) if icon.contains("speaker") || icon.contains("audio-card") => Self::Speakers,
             _ => Self::Unknown,
         }
+    }
+}
+
+/// What a node's properties say about the Bluetooth link behind it — kept whole on the
+/// [`DeviceInfo`], rather than only the verdicts drawn from it, because the facts arrive in
+/// pieces and the verdicts are drawn again whenever one does.
+///
+/// The pieces: the node's registry global carries none of them (it is `node.name`,
+/// `node.description`, `media.class`, `device.id` and a few ids, nothing else); the node's own
+/// info carries the rest of its properties once the engine has bound it
+/// ([`DeviceInfo::learn_bluetooth`]); and whether its card is Bluetooth is a property of another
+/// object, the `Device` it names in `device.id` ([`DeviceInfo::on_bluetooth_card`]).
+///
+/// Two generations of WirePlumber make a headset's microphone differently, and both are read
+/// here. WirePlumber 0.4 lists the SCO source the bluez5 plugin emits, `bluez_input.<addr>.0`,
+/// with `api.bluez5.profile = headset-head-unit` and `api.bluez5.codec`. WirePlumber 0.5 marks
+/// that source `api.bluez5.internal` (`monitors/bluez/create-node.lua:31-36`) and puts a loopback
+/// in front of it for applications to record from: `bluez_input.<addr>`, with
+/// `bluez5.loopback = true`, `device.id` and no `api.bluez5.*` key at all
+/// (`monitors/bluez/create-loopback-node.lua:44-55`) — so it names neither a profile nor a codec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BluezFacts {
+    /// `api.bluez5.profile`, when the node names one: whether it is a headset profile
+    /// (`headset-head-unit`, `headset-audio-gateway`, or an `hfp-*` spelling) — the
+    /// one kind of Bluetooth profile with a microphone in play. What a node says of its own
+    /// profile outranks everything below: an A2DP sink on a headset's card is headphones.
+    pub headset_profile: Option<bool>,
+    /// `bluez5.loopback = true`: WirePlumber 0.5's Bluetooth microphone. It exists only for a
+    /// device with a headset profile (`create-loopback-node.lua:77-86`), so it is a headset's.
+    pub loopback: bool,
+    /// The node says it is Bluetooth itself: `device.api = bluez5`, `device.bus = bluetooth`, or
+    /// an `api.bluez5.profile`/`address`/`codec` of its own.
+    pub own: bool,
+    /// The card the node names in `device.id` is Bluetooth — its `Device` says
+    /// `device.api = bluez5`. Never read from the node's properties: the engine learns it from the
+    /// card and keeps it through the node's info ([`DeviceInfo::on_bluetooth_card`]).
+    pub card: bool,
+    /// The rate the node's headset codec carries ([`bluez_codec_rate`] of `api.bluez5.codec`),
+    /// when it names one.
+    pub codec_rate: Option<u32>,
+    /// `api.bluez5.internal = true`: one of WirePlumber 0.5's own SCO nodes, behind the loopback
+    /// microphone. Never a device: recording from it directly would bypass the loopback
+    /// WirePlumber switches the headset's profile through.
+    pub internal: bool,
+}
+
+impl BluezFacts {
+    /// Read the facts a node's own properties carry. [`Self::card`] is left `false`: it is a
+    /// property of another object.
+    #[must_use]
+    pub fn from_props<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> Self {
+        let profile = get("api.bluez5.profile");
+        let codec = get("api.bluez5.codec");
+        Self {
+            headset_profile: profile.map(|p| p.starts_with("headset") || p.starts_with("hfp")),
+            loopback: get("bluez5.loopback") == Some("true"),
+            own: get("device.api") == Some("bluez5")
+                || get("device.bus") == Some("bluetooth")
+                || profile.is_some()
+                || codec.is_some()
+                || get("api.bluez5.address").is_some(),
+            card: false,
+            codec_rate: codec.and_then(bluez_codec_rate),
+            internal: get("api.bluez5.internal") == Some("true"),
+        }
+    }
+
+    /// Whether anything says the node is Bluetooth: itself, its being WirePlumber's loopback, or
+    /// its card.
+    #[must_use]
+    pub const fn is_bluetooth(&self) -> bool {
+        self.own || self.loopback || self.card
+    }
+
+    /// Whether the node is a Bluetooth headset's end — a headset profile's sink or source, or a
+    /// headset's microphone.
+    ///
+    /// The profile decides whenever the node names one. A node that names none is a headset's
+    /// when it is WirePlumber 0.5's loopback, and when it is a Bluetooth *microphone*: the headset
+    /// profiles are the only ones that carry a headset's microphone, and every other profile with
+    /// a source in it (A2DP from a phone, LE audio) names itself. A Bluetooth sink that names no
+    /// profile is not assumed to be one — the A2DP sink's registry global names none either, and
+    /// would be taken for a call-quality link until its info arrived.
+    #[must_use]
+    pub const fn is_headset(&self, direction: DeviceDirection) -> bool {
+        match self.headset_profile {
+            Some(headset) => headset,
+            None => {
+                self.loopback
+                    || (matches!(direction, DeviceDirection::Input) && (self.own || self.card))
+            }
+        }
+    }
+}
+
+/// A form factor read from a node's properties, for a node of `direction`: an ALSA source carries
+/// its card's `audio-card` icon, which reads as speakers, and for a capture device the honest
+/// default is a microphone.
+const fn directed(direction: DeviceDirection, form_factor: FormFactor) -> FormFactor {
+    match (direction, form_factor) {
+        (DeviceDirection::Input, FormFactor::Speakers | FormFactor::Unknown) => {
+            FormFactor::Microphone
+        }
+        (_, form_factor) => form_factor,
+    }
+}
+
+/// `api.bluez5.address`, the one key a Bluetooth node and its card both carry, when it says
+/// anything.
+pub(crate) fn bluez_address<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> Option<String> {
+    get("api.bluez5.address")
+        .filter(|address| !address.is_empty())
+        .map(str::to_owned)
+}
+
+/// `card.profile.device`: which device of its card a node is ([`DeviceInfo::profile_device`]).
+pub(crate) fn profile_device<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> Option<u32> {
+    get("card.profile.device").and_then(|device| device.trim().parse().ok())
+}
+
+/// A PipeWire `Device` object: the sound card, or the Bluetooth headset, that nodes belong to —
+/// what WirePlumber names `alsa_card.*` and `bluez_card.*`.
+///
+/// Kept for one question: when the node a lane is attached to goes, did its card go with it? A
+/// card that stays is a card between profiles. WirePlumber 0.5.17 switches a headset to its call
+/// profile when something records from it, and back to A2DP when the recording ends
+/// (`device/autoswitch-bluetooth-profile.lua`), and every switch removes the headset's sink and
+/// adds it back under the same name about half a second later (`monitors/bluez/name-node.lua:52-55`
+/// names a Bluetooth node by address and node number, not by profile). An ALSA card switched to
+/// another profile does the same to its nodes. The engine waits for such a node rather than
+/// moving the music to the speakers for the length of the switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Card {
+    /// The registry global id: what a node names in `device.id`. Runtime only.
+    pub object_id: u32,
+    /// `api.bluez5.address`, for a Bluetooth card. Not in the registry global; the engine reads it
+    /// from the card's own info once it is bound.
+    pub bluez_address: Option<String>,
+    /// `device.api = bluez5` (or an address): a Bluetooth device. Unlike the address, the
+    /// registry global carries `device.api`, so this is known the moment the card is announced —
+    /// before the info of any node on it, which is what lets a node that names this card in
+    /// `device.id` count as Bluetooth from its own registry global on ([`BluezFacts::card`]).
+    pub bluetooth: bool,
+}
+
+impl Card {
+    /// Build a card from a `Device` object's property dictionary.
+    #[must_use]
+    pub fn from_props<'a>(object_id: u32, get: &impl Fn(&str) -> Option<&'a str>) -> Self {
+        let bluez_address = bluez_address(get);
+        Self {
+            object_id,
+            bluetooth: get("device.api") == Some("bluez5") || bluez_address.is_some(),
+            bluez_address,
+        }
+    }
+
+    /// Whether a node that names `card_id` in `device.id`, or carries `bluez_address`, belongs to
+    /// this card. Either is enough; neither is nothing — two unknowns are not the same card.
+    ///
+    /// Asked with the two keys of a node that has just gone ([`DeviceInfo::card_present`]), and
+    /// again, with the same two kept, when a card goes after it: a lane waiting for a node whose
+    /// card has gone too waits no more.
+    #[must_use]
+    pub fn owns(&self, card_id: Option<u32>, bluez_address: Option<&str>) -> bool {
+        card_id == Some(self.object_id)
+            || (bluez_address.is_some() && bluez_address == self.bluez_address.as_deref())
     }
 }
 
@@ -341,7 +545,6 @@ impl ChannelMap {
         }
     }
 
-    /// Truncate or pad the layout so it describes exactly `channels` channels.
     /// Index of the low-frequency-effects channel, if the layout has one.
     ///
     /// The stages that must not touch the subwoofer need a position, not an index: it sits at 3 in
@@ -373,6 +576,76 @@ impl ChannelMap {
         (left != right).then_some((left, right))
     }
 
+    /// Which side of the listener each channel stands on, for the balance and for Dynamic Boost's
+    /// linked limiter (0.4.0 audit #44, R2): every left-hand position — front, side, rear, wide,
+    /// high, top — is [`ChannelSide::Left`], every right-hand one [`ChannelSide::Right`], and the
+    /// centres, the subwoofers, mono and any position that is neither are
+    /// [`ChannelSide::Centre`]. One entry per channel, in the device's order, which is what
+    /// [`fxsound_dsp::Engine::set_channel_sides`] takes; without it the engine infers the sides
+    /// from the count, which balances only the front pair of a device that orders its channels
+    /// some other way, and turned down the centre and the rear centre of `FL,FR,FC,RC`.
+    ///
+    /// [`ChannelSide::Left`]: fxsound_dsp::ChannelSide::Left
+    /// [`ChannelSide::Right`]: fxsound_dsp::ChannelSide::Right
+    /// [`ChannelSide::Centre`]: fxsound_dsp::ChannelSide::Centre
+    #[must_use]
+    pub fn sides(&self) -> ([fxsound_dsp::ChannelSide; MAX_POSITIONS], usize) {
+        use fxsound_dsp::ChannelSide;
+        use libspa::sys::{
+            SPA_AUDIO_CHANNEL_BLC, SPA_AUDIO_CHANNEL_BRC, SPA_AUDIO_CHANNEL_FL,
+            SPA_AUDIO_CHANNEL_FLC, SPA_AUDIO_CHANNEL_FLH, SPA_AUDIO_CHANNEL_FLW,
+            SPA_AUDIO_CHANNEL_FR, SPA_AUDIO_CHANNEL_FRC, SPA_AUDIO_CHANNEL_FRH,
+            SPA_AUDIO_CHANNEL_FRW, SPA_AUDIO_CHANNEL_RL, SPA_AUDIO_CHANNEL_RLC,
+            SPA_AUDIO_CHANNEL_RR, SPA_AUDIO_CHANNEL_RRC, SPA_AUDIO_CHANNEL_SL,
+            SPA_AUDIO_CHANNEL_SR, SPA_AUDIO_CHANNEL_TFL, SPA_AUDIO_CHANNEL_TFLC,
+            SPA_AUDIO_CHANNEL_TFR, SPA_AUDIO_CHANNEL_TFRC, SPA_AUDIO_CHANNEL_TRL,
+            SPA_AUDIO_CHANNEL_TRR, SPA_AUDIO_CHANNEL_TSL, SPA_AUDIO_CHANNEL_TSR,
+        };
+        const LEFT: [u32; 12] = [
+            SPA_AUDIO_CHANNEL_FL,
+            SPA_AUDIO_CHANNEL_SL,
+            SPA_AUDIO_CHANNEL_RL,
+            SPA_AUDIO_CHANNEL_FLC,
+            SPA_AUDIO_CHANNEL_RLC,
+            SPA_AUDIO_CHANNEL_FLW,
+            SPA_AUDIO_CHANNEL_FLH,
+            SPA_AUDIO_CHANNEL_TFL,
+            SPA_AUDIO_CHANNEL_TFLC,
+            SPA_AUDIO_CHANNEL_TSL,
+            SPA_AUDIO_CHANNEL_TRL,
+            SPA_AUDIO_CHANNEL_BLC,
+        ];
+        const RIGHT: [u32; 12] = [
+            SPA_AUDIO_CHANNEL_FR,
+            SPA_AUDIO_CHANNEL_SR,
+            SPA_AUDIO_CHANNEL_RR,
+            SPA_AUDIO_CHANNEL_FRC,
+            SPA_AUDIO_CHANNEL_RRC,
+            SPA_AUDIO_CHANNEL_FRW,
+            SPA_AUDIO_CHANNEL_FRH,
+            SPA_AUDIO_CHANNEL_TFR,
+            SPA_AUDIO_CHANNEL_TFRC,
+            SPA_AUDIO_CHANNEL_TSR,
+            SPA_AUDIO_CHANNEL_TRR,
+            SPA_AUDIO_CHANNEL_BRC,
+        ];
+        let mut sides = [ChannelSide::Centre; MAX_POSITIONS];
+        for (side, id) in sides.iter_mut().zip(self.ids()) {
+            *side = if LEFT.contains(id) {
+                ChannelSide::Left
+            } else if RIGHT.contains(id) {
+                ChannelSide::Right
+            } else {
+                ChannelSide::Centre
+            };
+        }
+        (sides, self.len())
+    }
+
+    /// The layout for exactly `channels` channels: this one when it already has that many, and
+    /// PipeWire's default layout for the count when it does not — which is how a mono device's
+    /// `MONO` becomes the `FL,FR` its lane's pair runs, whichever way the adapter then converts.
+    #[must_use]
     pub fn resized(self, channels: u32) -> Self {
         if usize::from(self.len) == channels as usize {
             return self;
@@ -445,7 +718,32 @@ pub struct DeviceInfo {
     /// The registry global id. Runtime only.
     pub object_id: u32,
     /// `object.serial`, monotonic within one server lifetime. Runtime only.
+    ///
+    /// What tells this node from another that has since taken its name: the server hands a freed
+    /// id to the next object, but never a serial. A Bluetooth headset switching profile has its
+    /// sink removed and added back under the same `node.name` with a new serial, and a pair built
+    /// on the old one has to be rebuilt on the new one for anything to link to it again.
     pub object_serial: Option<u64>,
+    /// `device.id`: the [`Card`] — PipeWire's `Device` object, the sound card or the Bluetooth
+    /// headset — this node belongs to, when it belongs to one. Runtime only; a virtual sink has
+    /// none. The card outlives its nodes' comings and goings, which is what
+    /// [`DeviceInfo::card_present`] asks about.
+    pub card_id: Option<u32>,
+    /// `card.profile.device`: which of its card's devices — one path through the card's active
+    /// profile, the thing a card's route names — this node is. Runtime only. What ties the node to
+    /// the port behind it, and so to whether anything is plugged in there ([`Self::available`]).
+    /// Not in the registry global; the engine reads it from the node's info.
+    pub profile_device: Option<u32>,
+    /// Whether the node can be heard, as far as its card says: `false` only while the port behind
+    /// it reports nothing plugged in (`available = no`) — an HDMI sink with no monitor, a headset
+    /// jack with nothing in it (`crate::routes`). The rules pass over such a node whenever any
+    /// device of its direction can be heard ([`choose_device`]). `true` for a node on no card, and
+    /// until its card has said otherwise.
+    pub available: bool,
+    /// `api.bluez5.address`, on a node PipeWire's Bluetooth plugin made: the other way to tell
+    /// which [`Card`] it belongs to. The registry global does not carry it; the engine reads it
+    /// from the node's own info.
+    pub bluez_address: Option<String>,
     /// `node.name` — the stable identity, the analogue of the WASAPI endpoint id string.
     pub name: String,
     /// `node.description` — what the device picker shows (`deviceFriendlyName`).
@@ -456,6 +754,14 @@ pub struct DeviceInfo {
     pub channels: u32,
     /// `audio.rate` when the node publishes one. ALSA nodes usually do not.
     pub rate: Option<u32>,
+    /// Whether the node is a Bluetooth headset's end: a headset (HFP/HSP) profile's sink or source,
+    /// or WirePlumber 0.5's loopback microphone ([`BluezFacts::is_headset`]). Such a link carries
+    /// its codec's rate — [`BLUEZ_HEADSET_RATE`] when it names none — and never says so in
+    /// `audio.rate`; see [`DeviceInfo::native_rate`]. Drawn from [`DeviceInfo::bluez`], again
+    /// whenever that changes.
+    pub bluez_headset: bool,
+    /// What the node's properties, and its card, say about the Bluetooth link behind it.
+    pub bluez: BluezFacts,
     /// `audio.position`, or the default layout for [`DeviceInfo::channels`].
     pub positions: ChannelMap,
     /// What the GUI should draw next to it.
@@ -466,14 +772,15 @@ pub struct DeviceInfo {
 
 impl DeviceInfo {
     /// Build a device from a node's property dictionary, or `None` if the node is neither a sink
-    /// nor a source — or is one of FxSound's own four nodes, which must never be listed as a
-    /// device to attach to.
+    /// nor a source — or is one of FxSound's own nodes ([`is_fxsound_node`]), which must never be
+    /// listed as a device to attach to, or one of WirePlumber's internal Bluetooth nodes
+    /// ([`BluezFacts::internal`]).
     ///
     /// Mirrors pass 1 of `sndDevices_GetAll.cpp:141-267`, including its fallbacks: a node with no
     /// `node.description` is labelled with its `node.name` rather than being dropped (the Windows
     /// code wrote `L"Unknown"`, `:260-262`), and a node that does not publish a channel count gets
-    /// 0, which the mono guard in [`choose_device`] then treats the way Windows treated
-    /// `deviceNumChannel = 0`.
+    /// 0 — unknown, which [`DeviceInfo::clamped_channels`] runs as stereo until the node's own
+    /// info says otherwise.
     #[must_use]
     pub fn from_props<'a>(object_id: u32, get: &impl Fn(&str) -> Option<&'a str>) -> Option<Self> {
         let direction = direction_of_media_class(get("media.class")?)?;
@@ -483,7 +790,9 @@ impl DeviceInfo {
             // (`AudioPassthruPrivate.cpp:174`).
             return None;
         }
-        if OUR_NODE_NAMES.contains(&name.as_str()) {
+        // Ours by name, a per-application route's included: a route's sink is an `Audio/Sink` like
+        // any other, and offered as a device it would let a lane play into its own route.
+        if is_fxsound_node(&name) {
             return None;
         }
         let description = get("node.description")
@@ -500,31 +809,173 @@ impl DeviceInfo {
         let rate = get("audio.rate")
             .and_then(|r| r.parse::<u32>().ok())
             .filter(|&r| r > 0 && r <= MAX_SAMPLE_RATE);
+        let bluez = BluezFacts::from_props(get);
+        if bluez.internal {
+            return None;
+        }
         let positions = get("audio.position")
             .and_then(ChannelMap::parse)
             .filter(|map| map.len() == channels as usize)
             .unwrap_or_else(|| ChannelMap::default_for(channels));
-        let form_factor = match (direction, FormFactor::from_props(get)) {
-            // An ALSA source carries its card's `audio-card` icon, which reads as speakers; for a
-            // capture device the honest default is a microphone.
-            (DeviceDirection::Input, FormFactor::Speakers | FormFactor::Unknown) => {
-                FormFactor::Microphone
-            }
-            (_, form_factor) => form_factor,
-        };
+        let form_factor = directed(direction, FormFactor::from_props(get));
 
-        Some(Self {
+        let mut device = Self {
             object_id,
             object_serial: get("object.serial").and_then(|s| s.parse::<u64>().ok()),
+            card_id: get("device.id").and_then(|s| s.parse::<u32>().ok()),
+            profile_device: profile_device(get),
+            available: true,
+            bluez_address: bluez_address(get),
             name,
             description,
             nick,
             channels,
             rate,
+            bluez_headset: false,
+            bluez,
             positions,
             form_factor,
             direction,
+        };
+        device.classify_bluetooth();
+        Some(device)
+    }
+
+    /// Draw [`Self::bluez_headset`] and the Bluetooth part of [`Self::form_factor`] from
+    /// [`Self::bluez`]: a headset's end is a headset; any other Bluetooth node is a pair of
+    /// headphones, unless its properties said something more particular. The same verdicts
+    /// [`FormFactor::from_props`] draws from a node's own properties, plus what only the
+    /// direction and the card can add — a Bluetooth microphone that names no profile is a
+    /// headset's, and so is a node on a Bluetooth card that says nothing of itself.
+    fn classify_bluetooth(&mut self) {
+        self.bluez_headset = self.bluez.is_headset(self.direction);
+        if self.bluez_headset {
+            self.form_factor = FormFactor::Headset;
+        } else if self.bluez.is_bluetooth()
+            && matches!(
+                self.form_factor,
+                FormFactor::Unknown | FormFactor::Microphone
+            )
+        {
+            self.form_factor = FormFactor::Headphones;
+        }
+    }
+
+    /// Take what a node's own info says about its Bluetooth link — `bluez`, and `form_factor` as
+    /// [`FormFactor::from_props`] reads the same dictionary — and draw the verdicts again. Returns
+    /// whether any of them changed.
+    ///
+    /// Needed because the registry global the device was first built from carries none of it:
+    /// without this, WirePlumber 0.5's microphone was a plain microphone to the engine, and even
+    /// WirePlumber 0.4's SCO source, whose profile is only in its info, fed the de-esser as a
+    /// 48 kHz source (`docs/0.4.0-upstream.md` U9). What the card said ([`BluezFacts::card`]) is
+    /// kept: it is not a property of the node. For a node that is not Bluetooth at all the form
+    /// factor is left as the registry global had it — the icon of an ALSA device is not this
+    /// method's business.
+    ///
+    /// Only for an info that carries the node's properties: one that reports a state change
+    /// carries none, and would read as a node that is Bluetooth no more.
+    pub fn learn_bluetooth(&mut self, bluez: BluezFacts, form_factor: FormFactor) -> bool {
+        let before = (self.bluez, self.bluez_headset, self.form_factor);
+        self.bluez = BluezFacts {
+            card: self.bluez.card,
+            ..bluez
+        };
+        if self.bluez.is_bluetooth() {
+            self.form_factor = directed(self.direction, form_factor);
+        }
+        self.classify_bluetooth();
+        before != (self.bluez, self.bluez_headset, self.form_factor)
+    }
+
+    /// The card this node names in `device.id` is Bluetooth ([`Card::bluetooth`]). Returns whether
+    /// that is news.
+    ///
+    /// What makes WirePlumber 0.5's microphone a headset's from the moment its registry global is
+    /// announced, before its info says `bluez5.loopback`, and a microphone on a Bluetooth card that
+    /// never says anything of itself a headset's at all.
+    pub fn on_bluetooth_card(&mut self) -> bool {
+        if self.bluez.card {
+            return false;
+        }
+        let before = (self.bluez_headset, self.form_factor);
+        self.bluez.card = true;
+        self.classify_bluetooth();
+        before != (self.bluez_headset, self.form_factor)
+    }
+
+    /// Whether this node and `other` are two ends of the same Bluetooth device — its sink and its
+    /// microphone, as the two lanes see them.
+    ///
+    /// Both must be Bluetooth ([`BluezFacts::is_bluetooth`]): an ALSA card's speakers and
+    /// microphone name the same `device.id` too, and share nothing a lane could suffer from. Then
+    /// the same card by `device.id`, which WirePlumber puts on every node it makes for a headset —
+    /// the loopback microphone included, which carries no address (`create-loopback-node.lua:50`)
+    /// — or the same `api.bluez5.address`, a node's own or, for a node that names only its card,
+    /// the card's from `cards`.
+    #[must_use]
+    pub fn same_bluetooth_device(&self, other: &Self, cards: &[Card]) -> bool {
+        if !self.bluez.is_bluetooth() || !other.bluez.is_bluetooth() {
+            return false;
+        }
+        if self.card_id.is_some() && self.card_id == other.card_id {
+            return true;
+        }
+        let address = |device: &Self| {
+            device.bluez_address.clone().or_else(|| {
+                let id = device.card_id?;
+                cards
+                    .iter()
+                    .find(|card| card.object_id == id)?
+                    .bluez_address
+                    .clone()
+            })
+        };
+        address(self).is_some_and(|mine| address(other).as_ref() == Some(&mine))
+    }
+
+    /// The rate the device really runs at, as far as its properties say: `audio.rate` when the
+    /// node publishes one; for a Bluetooth headset, the rate its codec carries
+    /// ([`bluez_codec_rate`]: CVSD 8 kHz, mSBC 16 kHz, LC3 24 kHz, LC3-SWB 32 kHz), or
+    /// [`BLUEZ_HEADSET_RATE`] when it names none — which WirePlumber 0.5's loopback microphone
+    /// never does; and `None` when the stream rate is all there is to know.
+    ///
+    /// The capture stream asks for 48 kHz whatever the microphone runs at, so the negotiated
+    /// format cannot tell the voice chain how much bandwidth is in the signal — a resampled
+    /// 16 kHz headset arrives at 48 kHz with nothing above 8 kHz, and a de-esser built for a
+    /// 5500 Hz split would be working on silence. The audio crate hands this to
+    /// `InputEngine::set_source_rate` when it builds the input lane's nodes, and the adaptive
+    /// de-esser places its corner from it (`docs/0.4.0-design.md` §6).
+    #[must_use]
+    pub fn native_rate(&self) -> Option<f32> {
+        self.native_rate_hz().map(|rate| rate as f32)
+    }
+
+    /// [`Self::native_rate`], in whole hertz: what a pair keeps to tell whether it was built for
+    /// the device as it is now.
+    #[must_use]
+    pub fn native_rate_hz(&self) -> Option<u32> {
+        self.rate.or_else(|| {
+            self.bluez_headset
+                .then(|| self.bluez.codec_rate.unwrap_or(BLUEZ_HEADSET_RATE))
         })
+    }
+
+    /// Whether the card this node belongs to is among `cards`: the one it names in `device.id`,
+    /// or a card with its Bluetooth address.
+    ///
+    /// Asked about a node that has just gone. Yes means it went because its card is changing
+    /// profile, and a node of the same name is about to come back ([`Card`]); no — a node on no
+    /// card at all, like a virtual sink, or one whose card went too — means it is gone. The
+    /// address is the second way to ask because it is the one both sides of a Bluetooth pair are
+    /// known to carry, whatever made the node; WirePlumber also puts `device.id` on every node it
+    /// makes for a card, the loopback microphone included (`monitors/bluez/name-node.lua:34`,
+    /// `create-loopback-node.lua:50`).
+    #[must_use]
+    pub fn card_present(&self, cards: &[Card]) -> bool {
+        cards
+            .iter()
+            .any(|card| card.owns(self.card_id, self.bluez_address.as_deref()))
     }
 
     /// Project into the type the GUI consumes over [`fxsound_core::messages::AudioToUi`].
@@ -545,25 +996,13 @@ impl DeviceInfo {
 
     /// Whether the device *says* it has fewer than two channels.
     ///
-    /// Only a *known* channel count below two counts. PipeWire's registry globals do not carry
-    /// `audio.channels` — it lives in the node's info, which arrives only after binding to the
-    /// node — so a device discovered through the registry reports `0` here. Treating that as mono
-    /// refused every output on the system and left the engine with nothing to render to.
+    /// A description, never a verdict: nothing is refused for it, in either direction (module
+    /// docs). Only a *known* channel count below two counts. PipeWire's registry globals do not
+    /// carry `audio.channels` — it lives in the node's info, which arrives only after binding to
+    /// the node — so a device discovered through the registry reports `0` here until then.
     #[must_use]
     pub const fn is_mono(&self) -> bool {
         self.channels != 0 && self.channels < MIN_CHANNELS
-    }
-
-    /// Whether the rules must refuse this device for being mono
-    /// (`sndDevicesImplementDeviceRules.cpp:300`).
-    ///
-    /// Outputs only. `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES` (`sndDevices.h:39`) worked around a
-    /// *playback* driver bug; a mono microphone is what most microphones are, and the capture
-    /// stream declares [`MIN_CHANNELS`] regardless so PipeWire's adapter up-mixes it
-    /// (`docs/spec/12-audio-io.md` §28).
-    #[must_use]
-    pub const fn is_refused_mono(&self) -> bool {
-        matches!(self.direction, DeviceDirection::Output) && self.is_mono()
     }
 
     /// `true` when the node never told us how many channels it has.
@@ -573,8 +1012,13 @@ impl DeviceInfo {
     }
 
     /// The channel count FxSound will actually run, clamped to `2..=8`
-    /// (`sndDevices.h:190-191`; `docs/spec/12-audio-io.md` §19.3 keeps the clamp). For a mono
-    /// microphone this is the stereo pair PipeWire up-mixes it into.
+    /// (`sndDevices.h:190-191`; `docs/spec/12-audio-io.md` §19.3 keeps the clamp).
+    ///
+    /// For a mono device this is a stereo pair, in either direction: PipeWire's adapter up-mixes
+    /// a mono microphone into it, and down-mixes it into a mono headset — the playback stream
+    /// leaves `stream.dont-remix` off for exactly that. The same answer whether the device's
+    /// channel count is still unknown or has arrived as one, so a headset whose info comes in
+    /// after its pair was built is not rebuilt for it.
     #[must_use]
     pub const fn clamped_channels(&self) -> u32 {
         if self.channels < MIN_CHANNELS {
@@ -631,11 +1075,107 @@ fn find<'a>(devices: &'a [&DeviceInfo], name: &str) -> Option<&'a DeviceInfo> {
     devices.iter().copied().find(|s| s.name == name)
 }
 
-/// Pick the real device of one direction, reproducing `sndDevicesImplementDeviceRules()`.
+/// How the user wants one direction's device chosen, beside what the Windows rules remember
+/// (U4, `docs/0.4.0-upstream.md`): the device priority list of upstream's Settings ▸ Outputs.
+///
+/// Not a Windows registry slot, so not in [`SelectionMemory`]: upstream 1.2 keeps the list in its
+/// own settings (`DeviceConfig.cpp`), beside and not instead of the rules this crate ports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preference {
+    /// The user's ranking of real devices, as `node.name`s, most preferred first — what
+    /// [`UiToAudio::SetDevicePriority`] last sent. Empty means "follow the system": the Windows
+    /// rules decide exactly as they did before there was a ranking (upstream issue #629).
+    ///
+    /// [`UiToAudio::SetDevicePriority`]: fxsound_core::messages::UiToAudio::SetDevicePriority
+    pub ranking: Vec<String>,
+    /// The user has just picked [`SelectionMemory::user_selected`], and the lane's rules have not
+    /// run on it since — or they chose it, the pair they built on it failed, and the retry is to
+    /// choose it again. Any other run spends it, whatever it chose: a pick that is absent or unheard
+    /// when the rules run has lost to the ranking, and does not take the lane later just for
+    /// turning up.
+    ///
+    /// With a ranking, this is the one moment the pick outranks the ranking: upstream's menu sets
+    /// the output and leaves the list alone (`FxController::setOutput`), and from then on the pick
+    /// is simply the current device, kept until a better-ranked one arrives or it goes.
+    pub fresh_pick: bool,
+    /// Where a device the ranking does not name yet stands: before every ranked one when `true`,
+    /// after every one when `false` — the app's "prioritize new output devices"
+    /// (`prioritize_new_output`), sent with the ranking ([`UiToAudio::SetDevicePriority`]).
+    ///
+    /// A device the ranking does not name is one the app has not seen yet: it adds every device it
+    /// is told about to its list — at the front with this set, at the back without — and sends
+    /// the list again. That list comes after the rules have run on the arrival, and by then the
+    /// device is no longer new to them: ranked first, it would never take the lane from the device
+    /// it arrived beside. So the rules place it where the app is about to, the moment it arrives.
+    /// Upstream puts it in the list before it chooses the output (`FxController.cpp:2131-2133`,
+    /// then `:1540-1612`), and the new device wins there too.
+    ///
+    /// [`UiToAudio::SetDevicePriority`]: fxsound_core::messages::UiToAudio::SetDevicePriority
+    pub new_devices_first: bool,
+    /// The ranking has just come into force on a lane whose device the user did not pick — the
+    /// lane was following the system, or the ranking reached the engine only after the rules had
+    /// chosen by the system's default — and the next run of the rules takes the best device by rank
+    /// as if the lane had no current device. Any run spends it, and a pair that fails to be built
+    /// on its choice gives it back for the retry, as it does [`Self::fresh_pick`].
+    ///
+    /// Upstream starts on its preferred output whenever the saved one is absent
+    /// (`FxController.cpp:1516-1532`, `getPreferredOutput`). Without this, a device the Windows
+    /// rules chose before the ranking arrived — the session default, most often — would count as
+    /// the current one and keep the lane for as long as it is there, the ranking's first device
+    /// present beside it or not.
+    pub start_over: bool,
+}
+
+impl Preference {
+    /// Where `name` stands in the ranking: its place when it is ranked; and, when it is not, before
+    /// every ranked device or after every one, as [`Self::new_devices_first`] says. Equal places
+    /// keep the graph's order wherever this is used as a key.
+    #[must_use]
+    pub fn rank(&self, name: &str) -> usize {
+        let first = usize::from(self.new_devices_first);
+        match self.ranking.iter().position(|ranked| ranked == name) {
+            Some(place) => place + first,
+            None if self.new_devices_first => 0,
+            None => self.ranking.len(),
+        }
+    }
+}
+
+/// The devices of `direction` the rules choose among: every real one that can be heard — or, when
+/// none can, every real one there is.
+///
+/// A node whose card says nothing is plugged into the port behind it ([`DeviceInfo::available`]) is
+/// passed over for any that can be heard: ranked first, or reached by rule 7's "first device there
+/// is", it would take the lane and play into an empty jack (`docs/0.4.0-upstream.md` U4, and the
+/// review's correction to item 4). With nothing to be heard at all — a desktop whose only output is
+/// a sleeping monitor's — the rules run on what is there rather than end in "no devices": that
+/// would take FxSound's own node away and move every application off it, to come back when the
+/// monitor wakes, where a pair left on the silent port simply plays again. The contract records
+/// this as U4's one exception, for both directions.
+#[must_use]
+pub fn candidates<'a>(
+    devices: &'a [DeviceInfo],
+    direction: DeviceDirection,
+    our_node: &str,
+) -> Vec<&'a DeviceInfo> {
+    let real = devices
+        .iter()
+        .filter(move |d| d.direction == direction && d.name != our_node);
+    if real.clone().any(|d| d.available) {
+        real.filter(|d| d.available).collect()
+    } else {
+        real.collect()
+    }
+}
+
+/// Pick the real device of one direction, reproducing `sndDevicesImplementDeviceRules()` — or,
+/// when the user has ranked the direction's devices, upstream 1.2's priority list.
 ///
 /// `devices` may carry both directions; only those matching `direction` take part, and
-/// `our_node` — `fxsound_sink` or `fxsound_source` — is never a candidate. The branch order is
-/// the one drawn at `docs/spec/12-audio-io.md` §19.5, which is in turn the order of
+/// `our_node` — `fxsound_sink` or `fxsound_source` — is never a candidate. Nor is a device nothing
+/// is plugged into while another can be heard ([`candidates`]): "present" below means present and
+/// heard. With an empty [`Preference::ranking`] the branch order is the one drawn at
+/// `docs/spec/12-audio-io.md` §19.5, which is in turn the order of
 /// `sndDevicesImplementDeviceRules.cpp:97-284`:
 ///
 /// 1. no devices at all → [`AudioError::NoOutputDevices`] / [`AudioError::NoInputDevices`]
@@ -643,26 +1183,33 @@ fn find<'a>(devices: &'a [&DeviceInfo], name: &str) -> Option<&'a DeviceInfo> {
 /// 2. first run after install → whatever the session default is, if it is not us (`:146-167`) —
 ///    unless the user has already picked a device that is present, in which case rule 4 wins
 ///    (see the comment in the body);
-/// 3. exactly one device → that one, *without* skipping the mono check (`:172-183`);
+/// 3. exactly one device → that one (`:172-183`);
 /// 4. an explicit user choice that still exists (`:188-193`);
-/// 5. a device that appeared since the last enumeration, usable per the mono rule (`:197-231`);
+/// 5. a device whose name was not there at the last enumeration (`:197-231`), whether or not the
+///    number of devices grew — see the comment in the body;
 /// 6. the session default, if it is not us (`:237-249`);
 /// 7. otherwise the first of `most_recent_playback`, `most_recent_default`, `prior_default`,
 ///    `original_default` that is present, else the first device (`:257-284`).
 ///
-/// Then the mono guard of `:290-327`, **outputs only**: a mono target is retried as
-/// `most_recent_playback`, and if that is mono too the answer is
-/// [`AudioError::AskUserSelectOutput`] when some other sink is usable and
-/// [`AudioError::NoValidOutput`] when none is — `-58` and `-57` respectively. A mono microphone
-/// passes straight through ([`DeviceInfo::is_refused_mono`]).
+/// With a ranking, rules 2 to 7 give way to upstream 1.2's own (`choose_ranked`).
 ///
-/// `previous_names` is the snapshot of real device names of this direction from the previous
+/// The Windows rules then ran a mono guard (`:290-327`) that refused a mono playback device and
+/// ended in `-58` or `-57`. It is not ported: it worked around a Windows driver bug, and a mono
+/// device of either direction is attached like any other (module docs).
+///
+/// `previous_names` is the snapshot of [`candidates`] names of this direction from the previous
 /// enumeration, the equivalent of `pwszIDPreviousRealDevices` (`sndDevices.h:349`); pass an empty
-/// slice on the first call — and after a direction switch — so rule 5 cannot fire.
+/// slice on the first call — and on the first call after a lane is switched on again — so rule 5
+/// cannot fire. A device that becomes audible while another of its direction could already be
+/// heard is not in it, and so arrives as a new one: the monitor plugged in is the HDMI endpoint
+/// appearing, as it is on Windows. When nothing of the direction could be heard, [`candidates`]
+/// fell back to every node, so the snapshot already holds the silent ones and a port that wakes
+/// is not a newcomer — it is simply the only candidate left.
 ///
 /// # Errors
-/// Returns the same four states the Windows rules could end in, so the GUI's existing error
-/// surfaces port unchanged, plus the input-side twin of "no devices".
+/// [`AudioError::NoOutputDevices`] / [`AudioError::NoInputDevices`] when the direction has no real
+/// device at all — the one state of the Windows rules that survives the mono guard's removal, plus
+/// its input-side twin.
 pub fn choose_device(
     devices: &[DeviceInfo],
     direction: DeviceDirection,
@@ -670,16 +1217,19 @@ pub fn choose_device(
     current_default: Option<&str>,
     previous_names: &[String],
     memory: &SelectionMemory,
+    preference: &Preference,
 ) -> Result<Selection, AudioError> {
-    let real: Vec<&DeviceInfo> = devices
-        .iter()
-        .filter(|d| d.direction == direction && d.name != our_node)
-        .collect();
+    let real = candidates(devices, direction, our_node);
     if real.is_empty() {
         return Err(match direction {
             DeviceDirection::Output => AudioError::NoOutputDevices,
             DeviceDirection::Input => AudioError::NoInputDevices,
         });
+    }
+    if !preference.ranking.is_empty() {
+        // Never `None`: there is a device, and the last branch takes the best of them.
+        return choose_ranked(&real, previous_names, memory, preference)
+            .ok_or(AudioError::DeviceNotPresent);
     }
     // "The current default, unless the current default is us."
     let foreign_default = current_default.filter(|d| *d != our_node);
@@ -701,7 +1251,8 @@ pub fn choose_device(
         target = find(&real, default_name);
     }
 
-    // 3 — exactly one real device (`:172-183`).
+    // 3 — exactly one real device (`:172-183`). Windows checked it for being mono afterwards
+    // like every other branch; nothing here does.
     if target.is_none() && real.len() == 1 {
         target = Some(real[0]);
     }
@@ -711,13 +1262,26 @@ pub fn choose_device(
         target = find(&real, &memory.user_selected);
     }
 
-    // 5 — a device was just added (`:197-231`). Windows compared counts first; comparing the name
-    // sets directly is the same test without the off-by-one at `:223` (see spec §15).
-    if target.is_none() && !previous_names.is_empty() && real.len() > previous_names.len() {
+    // 5 — a device was just added (`:197-231`). Windows only looked for the new device when the
+    // count had grown (`:197`), and so missed it whenever something left in the same batch of
+    // registry events: a USB DAC swapped for another, a dock handing its outputs over, a device
+    // that changes its node name when it changes profile — an ALSA card going from stereo to 5.1.
+    // Upstream has an open PR for the same miss (#532, `reconnectedDeviceGuid`; Discussion #311).
+    // Here the name sets decide, whatever the counts did, which also drops the off-by-one at
+    // `:223` (see spec §15). A device that comes back under the name it left with — a Bluetooth
+    // headset between profiles — is not new when it comes back within the same run of the rules:
+    // the rules below find it again as what it was, the user's pick or the device we last played
+    // to. If its removal had a run of its own — the engine runs the rules from its supervisor tick,
+    // which a slow profile switch can straddle, and every run replaces `previous_names` — rule 5
+    // would take it back as new: the same device when the lane was on it, only with the remembered
+    // defaults written again, but a device the lane was *not* on would take the lane from the one
+    // it is on. So the engine keeps a node that went while its card stayed in `previous_names`
+    // until its wait for it is up (`Departure` in `crate::engine`), and it comes back as seen.
+    if target.is_none() && !previous_names.is_empty() {
         target = real
             .iter()
             .copied()
-            .find(|s| !previous_names.iter().any(|p| p == &s.name) && !s.is_refused_mono());
+            .find(|s| !previous_names.iter().any(|p| p == &s.name));
         write_previous_default = target.is_some();
     }
 
@@ -748,27 +1312,70 @@ pub fn choose_device(
         }
     }
 
-    let mut chosen = target.ok_or(AudioError::DeviceNotPresent)?;
-
-    // The mono guard (`:290-327`) — outputs only.
-    if chosen.is_refused_mono() {
-        match find(&real, &memory.most_recent_playback).filter(|s| !s.is_refused_mono()) {
-            Some(fallback) => chosen = fallback,
-            None => {
-                let usable = real.iter().filter(|s| !s.is_refused_mono()).count();
-                return Err(if usable >= 1 {
-                    AudioError::AskUserSelectOutput
-                } else {
-                    AudioError::NoValidOutput
-                });
-            }
-        }
-    }
+    // Rule 7 always ends in a device, so this cannot fail. `:290-327` would refuse it here for
+    // being mono; see the doc comment for why that is not ported.
+    let chosen = target.ok_or(AudioError::DeviceNotPresent)?;
 
     Ok(Selection {
         target: chosen.name.clone(),
         write_previous_default,
     })
+}
+
+/// [`choose_device`] for a direction the user has ranked: upstream 1.2's `updateOutputs`
+/// (`FxController.cpp:1540-1612`), for either direction.
+///
+/// 1. the device the user has just picked, when it is present ([`Preference::fresh_pick`]);
+/// 2. the current device — the one the lane last attached to — while it is present, unless a
+///    device that was not there at the last enumeration ranks above it (`:1558-1584`): a newcomer
+///    ranked below it never takes the lane from it. Not when the ranking has just come into force
+///    on a device the user did not pick ([`Preference::start_over`]): that device is no choice
+///    to keep;
+/// 3. once the current device has gone, the first present device by rank (`getPreferredOutput`,
+///    `:2677-2698`); unranked devices come after every ranked one — or before, while the app puts
+///    new devices first ([`Preference::new_devices_first`]) — in the graph's order
+///    (`sortByDeviceConfigPriority`, a stable sort, `:1714-1725`).
+///
+/// Upstream counted devices to tell that one had been added (`:1559`); that misses a device that
+/// arrives as another leaves, so a newcomer here is a name that was not in `previous_names`, as in
+/// rule 5 of the old rules. Taking one re-dates the remembered defaults, as rule 5 does; the rest
+/// do not.
+fn choose_ranked(
+    real: &[&DeviceInfo],
+    previous_names: &[String],
+    memory: &SelectionMemory,
+    preference: &Preference,
+) -> Option<Selection> {
+    let selection = |device: &DeviceInfo, write_previous_default| Selection {
+        target: device.name.clone(),
+        write_previous_default,
+    };
+    if preference.fresh_pick
+        && let Some(picked) = find(real, &memory.user_selected)
+    {
+        return Some(selection(picked, false));
+    }
+    let rank = |device: &&DeviceInfo| preference.rank(&device.name);
+    // `min_by_key` keeps the first of equals, so unranked devices stay in the graph's order.
+    let newcomer = if previous_names.is_empty() {
+        None
+    } else {
+        real.iter()
+            .copied()
+            .filter(|device| !previous_names.iter().any(|name| name == &device.name))
+            .min_by_key(rank)
+    };
+    if !preference.start_over
+        && let Some(current) = find(real, &memory.most_recent_playback)
+    {
+        return Some(match newcomer {
+            Some(newcomer) if rank(&newcomer) < rank(&current) => selection(newcomer, true),
+            _ => selection(current, false),
+        });
+    }
+    let best = real.iter().copied().min_by_key(rank)?;
+    let arrived = newcomer.is_some_and(|newcomer| newcomer.name == best.name);
+    Some(selection(best, arrived))
 }
 
 /// Record a committed selection, the equivalent of the registry writes at
@@ -801,27 +1408,36 @@ pub fn commit(memory: &mut SelectionMemory, selection: &Selection) {
 /// `original_default`, first one that is actually present *in that direction*. `None` means
 /// "nothing we remember is here any more", in which case the caller must leave the default alone
 /// and let WirePlumber pick.
+///
+/// A remembered device that can be heard comes before one that cannot ([`DeviceInfo::available`]),
+/// wherever the two stand in that order: a microphone picked once and then unplugged from the
+/// headset jack is still a node on a UCM card, and handing every application's recording to its
+/// empty jack is no way to give the user their default back. Only when nothing remembered can be
+/// heard does the order alone decide, as it did before there were routes to ask.
 #[must_use]
 pub fn restore_default_candidate(
     memory: &SelectionMemory,
     devices: &[DeviceInfo],
     direction: DeviceDirection,
 ) -> Option<String> {
-    [
+    let remembered = [
         &memory.user_selected,
         &memory.most_recent_playback,
         &memory.most_recent_default,
         &memory.prior_default,
         &memory.original_default,
-    ]
-    .into_iter()
-    .find(|name| {
+    ];
+    let present = |name: &String, heard: bool| {
         !name.is_empty()
             && devices
                 .iter()
-                .any(|d| d.direction == direction && &d.name == *name)
-    })
-    .cloned()
+                .any(|d| d.direction == direction && &d.name == name && (d.available || !heard))
+    };
+    remembered
+        .into_iter()
+        .find(|name| present(name, true))
+        .or_else(|| remembered.into_iter().find(|name| present(name, false)))
+        .cloned()
 }
 
 /// Pull the `name` out of a `Spa:String:JSON` default-metadata value.
@@ -855,10 +1471,95 @@ pub fn default_node_value(node_name: &str) -> String {
 mod tests {
     use super::*;
 
+    fn sides_of(text: &str) -> Vec<fxsound_dsp::ChannelSide> {
+        let map = ChannelMap::parse(text).expect("a layout");
+        let (sides, len) = map.sides();
+        sides[..len].to_vec()
+    }
+
+    #[test]
+    fn every_channel_is_placed_on_its_side_of_the_listener() {
+        // 0.4.0 audit #44: the balance turns down a whole side, and needs to know which channels
+        // are on it whatever order the device lists them in.
+        use fxsound_dsp::ChannelSide::{Centre as C, Left as L, Right as R};
+        assert_eq!(sides_of("FL,FR"), [L, R]);
+        assert_eq!(sides_of("MONO"), [C]);
+        assert_eq!(
+            sides_of("FL,FR,FC,LFE,RL,RR,SL,SR"),
+            [L, R, C, C, L, R, L, R]
+        );
+        // An order of its own: the rears first, the subwoofer last.
+        assert_eq!(sides_of("RL,RR,FL,FR,FC,LFE"), [L, R, L, R, C, C]);
+        // Four channels with no rear pair: the centre and the rear centre are no side's, where
+        // the engine's guess from the count alone took them for the rears.
+        assert_eq!(sides_of("FL,FR,FC,RC"), [L, R, C, C]);
+        assert_eq!(sides_of("FLC,FRC,TC,NA"), [L, R, C, C]);
+        // And PipeWire's own default for each count agrees with the engine's standard sides.
+        for channels in 1..=8_u32 {
+            let (sides, len) = ChannelMap::default_for(channels).sides();
+            let standard = fxsound_dsp::engine::standard_sides(channels as usize);
+            assert_eq!(&sides[..len], &standard[..len], "{channels} channels");
+        }
+    }
+
     /// A `pw-dump` taken on a live PipeWire 1.6.8 session, filtered to the Node and Metadata
     /// objects this module cares about. Captured rather than hand-written so the property spellings
     /// are the server's, not this author's memory of them.
     const PW_DUMP: &str = include_str!("../tests/fixtures/pw-dump-sinks.json");
+
+    /// A Bluetooth headset in its call profile, `headset-head-unit`, beside a laptop's own speakers
+    /// and microphone: the graph WirePlumber 0.5.17 builds while something records from the
+    /// headset's microphone.
+    ///
+    /// Composed rather than captured, because no headset was at hand and the session graph is not
+    /// ours to probe. Every property is one something in that stack sets: WirePlumber's
+    /// `monitors/bluez/name-node.lua` (the node names, description, priorities, `device.id`,
+    /// `factory.name`, `spa.object.id`, `node.pause-on-idle`), `create-node.lua`
+    /// (`api.bluez5.internal` and `bluez5.loopback` on the SCO source), `create-loopback-node.lua`
+    /// (the loopback microphone and its internal capture stream, as written there), and the
+    /// `api.bluez5.*` keys PipeWire's bluez5 plugin puts on the nodes it emits. The sink's one
+    /// channel is the SCO link's; the engine reads it from the node's info, not from the registry
+    /// global, and the fixture holds it where `pw-dump` would print it.
+    const BLUEZ_HEADSET_HEAD_UNIT_DUMP: &str =
+        include_str!("../tests/fixtures/pw-dump-bluez-headset-head-unit.json");
+
+    /// The headset's sink in that fixture. The same name it has on A2DP: WirePlumber names a
+    /// Bluetooth node by its address and its node id on the device, not by profile
+    /// (`name-node.lua:52-55`).
+    const HEADSET_SINK: &str = "bluez_output.00_11_22_33_44_55.1";
+
+    /// The laptop's speakers in that fixture.
+    const LAPTOP_SPEAKERS: &str = "alsa_output.pci-0000_00_1f.3.analog-stereo";
+
+    /// The laptop's microphone in the Bluetooth fixtures — on the same ALSA card as its speakers.
+    const LAPTOP_MICROPHONE: &str = "alsa_input.pci-0000_00_1f.3.analog-stereo";
+
+    /// The same headset under WirePlumber 0.5 in A2DP, the profile it idles in: the graph a user
+    /// has in front of them when they pick the headset's microphone for the input lane.
+    ///
+    /// Composed from [`BLUEZ_HEADSET_HEAD_UNIT_DUMP`], as that one was, with what changes between
+    /// the two profiles: the sink runs `a2dp-sink` with `sbc` over two channels
+    /// (`factory.name = api.bluez5.a2dp.sink`), and the SCO source is gone. The loopback microphone
+    /// and its internal capture stream stay: with `bluetooth.autoswitch-to-headset-profile` on —
+    /// WirePlumber's default — the loopback exists for as long as the device has a headset profile
+    /// at all, whichever one it runs (`create-loopback-node.lua:86-98`).
+    const BLUEZ_A2DP_WIREPLUMBER_05_DUMP: &str =
+        include_str!("../tests/fixtures/pw-dump-bluez-a2dp-wireplumber-0.5.json");
+
+    /// The same headset in its call profile under WirePlumber 0.4, which has no loopback: the SCO
+    /// source `bluez_input.<addr>.0` is the microphone itself, with neither `api.bluez5.internal`
+    /// nor `bluez5.loopback` (both are WirePlumber 0.5's, `create-node.lua:31-36`). Composed from
+    /// [`BLUEZ_HEADSET_HEAD_UNIT_DUMP`] with those two keys taken out, the loopback nodes left out,
+    /// and a headset that negotiated CVSD rather than mSBC — the narrow band some still do.
+    const BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP: &str =
+        include_str!("../tests/fixtures/pw-dump-bluez-headset-head-unit-wireplumber-0.4.json");
+
+    /// WirePlumber 0.5's microphone for the headset in these fixtures: the loopback, named by the
+    /// address with its colons (`create-loopback-node.lua:17`, `:45`).
+    const LOOPBACK_MICROPHONE: &str = "bluez_input.00:11:22:33:44:55";
+
+    /// The headset's SCO source: WirePlumber 0.5's internal node, and WirePlumber 0.4's microphone.
+    const SCO_SOURCE: &str = "bluez_input.00_11_22_33_44_55.0";
 
     // ---------------------------------------------------------------------------------------
     // A minimal JSON reader, test-only.
@@ -1050,9 +1751,14 @@ mod tests {
     /// dictionary — the same thing the registry hands a client.
     type FixtureObject = (u32, String, Vec<(String, String)>);
 
-    /// Every object in the fixture.
+    /// Every object in the captured desktop fixture.
     fn fixture_objects() -> Vec<FixtureObject> {
-        let Json::Arr(objects) = Parser::new(PW_DUMP).value() else {
+        objects_in(PW_DUMP)
+    }
+
+    /// Every object in a `pw-dump`.
+    fn objects_in(dump: &str) -> Vec<FixtureObject> {
+        let Json::Arr(objects) = Parser::new(dump).value() else {
             panic!("fixture is not a JSON array");
         };
         objects
@@ -1082,9 +1788,14 @@ mod tests {
             .collect()
     }
 
-    /// The `default` metadata object's entries, as `(key, value)`, the way `pw-dump` prints them.
+    /// The captured desktop fixture's `default` metadata entries.
     fn fixture_default_metadata() -> Vec<(String, String)> {
-        let Json::Arr(objects) = Parser::new(PW_DUMP).value() else {
+        default_metadata_in(PW_DUMP)
+    }
+
+    /// The `default` metadata object's entries, as `(key, value)`, the way `pw-dump` prints them.
+    fn default_metadata_in(dump: &str) -> Vec<(String, String)> {
+        let Json::Arr(objects) = Parser::new(dump).value() else {
             panic!("fixture is not a JSON array");
         };
         let object = objects
@@ -1122,8 +1833,14 @@ mod tests {
             .collect()
     }
 
+    /// Every device in the captured desktop fixture.
     fn fixture_devices() -> Vec<DeviceInfo> {
-        fixture_objects()
+        devices_in(PW_DUMP)
+    }
+
+    /// Every device in a `pw-dump`, parsed the way the engine parses a registry global.
+    fn devices_in(dump: &str) -> Vec<DeviceInfo> {
+        objects_in(dump)
             .into_iter()
             .filter(|(_, type_, _)| type_ == "PipeWire:Interface:Node")
             .filter_map(|(id, _, props)| {
@@ -1141,14 +1858,20 @@ mod tests {
         DeviceInfo {
             object_id: 0,
             object_serial: None,
+            card_id: None,
+            bluez_address: None,
             name: name.to_owned(),
             description: name.to_owned(),
             nick: name.to_owned(),
             channels,
             rate: None,
+            bluez_headset: false,
+            bluez: BluezFacts::default(),
             positions: ChannelMap::default_for(channels),
             form_factor: FormFactor::Unknown,
             direction,
+            profile_device: None,
+            available: true,
         }
     }
 
@@ -1175,6 +1898,7 @@ mod tests {
             current_default,
             previous_names,
             memory,
+            &Preference::default(),
         )
     }
 
@@ -1226,6 +1950,16 @@ mod tests {
             // belt and braces against a future property change.
             (crate::OUTPUT_NODE_NAME, "Audio/Sink"),
             (crate::CAPTURE_NODE_NAME, "Audio/Source"),
+            // The echo canceller's source is an `Audio/Source` like any microphone: only its name
+            // keeps the input lane from being offered its own canceller to record from.
+            (crate::AEC_SOURCE_NODE_NAME, "Audio/Source"),
+            // Its two capture streams, belt and braces as above.
+            (crate::AEC_CAPTURE_NODE_NAME, "Audio/Source"),
+            (crate::AEC_MONITOR_NODE_NAME, "Audio/Source"),
+            // A per-application route's sink and source are a sink and a source like any other:
+            // only their names keep a lane from playing into its own route, or recording from it.
+            ("fxsound_route_o1", "Audio/Sink"),
+            ("fxsound_route_i2", "Audio/Source"),
         ] {
             let props = [("media.class", class), ("node.name", name)];
             let parsed = DeviceInfo::from_props(1, &|key: &str| {
@@ -1257,15 +1991,15 @@ mod tests {
         assert_eq!(alc.form_factor, FormFactor::Speakers);
         assert!(!alc.is_mono());
 
-        // A sink whose channel count never reached us is not mono — it is unknown, and refusing it
-        // is what made the engine report "no usable output" on a perfectly ordinary desktop.
+        // A sink whose channel count never reached us is not mono — it is unknown, and runs as
+        // stereo until the node's info says what it is.
         let unknown = DeviceInfo {
             channels: 0,
             ..alc.clone()
         };
         assert!(
             !unknown.is_mono(),
-            "an unknown channel count must not be refused"
+            "an unknown channel count is not a known one"
         );
         assert!(unknown.channels_unknown());
         assert_eq!(
@@ -1278,11 +2012,12 @@ mod tests {
             channels: 1,
             ..alc.clone()
         };
-        assert!(
-            real_mono.is_mono(),
-            "a device that says it is mono is still refused"
+        assert!(real_mono.is_mono(), "a device that says it is mono is");
+        assert_eq!(
+            real_mono.clamped_channels(),
+            MIN_CHANNELS,
+            "and it runs a stereo pair that its adapter down-mixes"
         );
-        assert!(real_mono.is_refused_mono());
         assert_eq!(alc.clamped_channels(), 2);
     }
 
@@ -1316,10 +2051,6 @@ mod tests {
     fn a_mono_microphone_is_an_input_that_runs_as_stereo() {
         let mono = source("mono-mic", 1);
         assert!(mono.is_mono(), "it does say it is mono");
-        assert!(
-            !mono.is_refused_mono(),
-            "but the Windows mono bug was a playback bug; a capture device is not refused"
-        );
         assert_eq!(
             mono.clamped_channels(),
             MIN_CHANNELS,
@@ -1330,6 +2061,34 @@ mod tests {
                 .resized(mono.clamped_channels())
                 .to_property_value(),
             "FL,FR"
+        );
+    }
+
+    #[test]
+    fn a_mono_sink_is_an_output_that_runs_as_stereo_like_a_mono_microphone() {
+        let mono = sink("mono-headset", 1);
+        assert!(mono.is_mono());
+        assert_eq!(mono.positions.to_property_value(), "MONO");
+        assert_eq!(
+            mono.clamped_channels(),
+            MIN_CHANNELS,
+            "NODE 1 stays stereo; the playback stream's adapter down-mixes into the headset"
+        );
+        assert_eq!(
+            mono.positions
+                .resized(mono.clamped_channels())
+                .to_property_value(),
+            "FL,FR",
+            "the pair gets the stereo layout, not a two-slot MONO"
+        );
+
+        // Whether the headset's info has arrived yet or not, the pair it wants is the same one, so
+        // the info arriving is never a reason to rebuild a pair that is already playing.
+        let unknown = sink("mono-headset", 0);
+        assert_eq!(unknown.clamped_channels(), mono.clamped_channels());
+        assert_eq!(
+            unknown.positions.resized(unknown.clamped_channels()),
+            mono.positions.resized(mono.clamped_channels())
         );
     }
 
@@ -1538,6 +2297,460 @@ mod tests {
         assert_eq!(FormFactor::Unknown.key(), "unknown");
     }
 
+    /// The capture stream runs at 48 kHz whatever the microphone does, so the negotiated format
+    /// says nothing about the bandwidth in the signal; the properties are where the truth is.
+    #[test]
+    fn a_bluetooth_headset_profile_has_a_sixteen_kilohertz_native_rate() {
+        let parse = |pairs: &[(&str, &str)]| {
+            let owned: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            DeviceInfo::from_props(1, &|key: &str| {
+                owned
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str())
+            })
+            .expect("a named source or sink is a device")
+        };
+
+        let headset = parse(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", "bluez_input.00_11_22_33_44_55.0"),
+            ("device.bus", "bluetooth"),
+            ("api.bluez5.profile", "headset-head-unit"),
+        ]);
+        assert!(headset.bluez_headset);
+        assert_eq!(headset.form_factor, FormFactor::Headset);
+        assert_eq!(
+            headset.rate, None,
+            "nothing published, as on a real bluez5 node"
+        );
+        assert_eq!(headset.native_rate(), Some(16_000.0));
+
+        // The same device on its A2DP profile is a pair of headphones with no microphone, and
+        // nothing about its rate is known.
+        let a2dp = parse(&[
+            ("media.class", "Audio/Sink"),
+            ("node.name", "bluez_output.00_11_22_33_44_55.1"),
+            ("device.bus", "bluetooth"),
+            ("api.bluez5.profile", "a2dp-sink"),
+        ]);
+        assert!(!a2dp.bluez_headset);
+        assert_eq!(a2dp.form_factor, FormFactor::Headphones);
+        assert_eq!(a2dp.native_rate(), None);
+
+        // A published `audio.rate` is the device's own word and wins over the profile's figure.
+        let published = parse(&[
+            ("media.class", "Audio/Source"),
+            (
+                "node.name",
+                "alsa_input.usb-0d8c_USB_Audio-00.mono-fallback",
+            ),
+            ("audio.rate", "44100"),
+        ]);
+        assert_eq!(published.native_rate(), Some(44_100.0));
+        let spoken_for = parse(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", "bluez_input.00_11_22_33_44_55.0"),
+            ("api.bluez5.profile", "headset-audio-gateway"),
+            ("audio.rate", "8000"),
+        ]);
+        assert!(spoken_for.bluez_headset);
+        assert_eq!(spoken_for.native_rate(), Some(8_000.0));
+
+        // An ALSA microphone that says nothing leaves the stream rate as all there is to know.
+        let mic = parse(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", "alsa_input.pci-0000_05_00.6.analog-stereo"),
+            ("device.icon-name", "audio-card"),
+        ]);
+        assert!(!mic.bluez_headset);
+        assert_eq!(mic.native_rate(), None);
+    }
+
+    #[test]
+    fn a_bluetooth_headset_in_its_call_profile_parses_as_a_one_channel_output() {
+        let devices = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let outputs: Vec<&str> = devices
+            .iter()
+            .filter(|d| d.direction == DeviceDirection::Output)
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(
+            outputs,
+            [LAPTOP_SPEAKERS, HEADSET_SINK],
+            "the headset is listed as an output, not dropped for being mono"
+        );
+
+        let headset = devices
+            .iter()
+            .find(|d| d.name == HEADSET_SINK)
+            .expect("the headset's sink is in the fixture");
+        assert_eq!(headset.object_id, 70);
+        assert_eq!(headset.description, "Test Headset");
+        assert_eq!(headset.channels, 1);
+        assert!(headset.is_mono());
+        assert_eq!(headset.positions.to_property_value(), "MONO");
+        assert!(headset.bluez_headset);
+        assert_eq!(headset.form_factor, FormFactor::Headset);
+        assert_eq!(
+            headset.native_rate(),
+            Some(16_000.0),
+            "mSBC, the call profile's wide band"
+        );
+
+        // What the output lane builds for it: a stereo NODE 1, which the playback stream's adapter
+        // down-mixes into the one SCO channel.
+        assert_eq!(headset.clamped_channels(), 2);
+        assert_eq!(
+            headset
+                .positions
+                .resized(headset.clamped_channels())
+                .to_property_value(),
+            "FL,FR"
+        );
+
+        // And the GUI is told it is the default, which on this graph it is.
+        let entries = default_metadata_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let default_sink = entries
+            .iter()
+            .find(|(k, _)| k == default_key(DeviceDirection::Output))
+            .and_then(|(_, v)| parse_default_node_name(v));
+        assert_eq!(default_sink.as_deref(), Some(HEADSET_SINK));
+        let shown = headset.to_audio_device(default_sink.as_deref());
+        assert!(shown.is_default);
+        assert_eq!(shown.direction, DeviceDirection::Output);
+        assert_eq!(shown.form_factor, "headset");
+    }
+
+    #[test]
+    fn the_rules_take_a_headset_in_its_call_profile_as_they_would_a_stereo_output() {
+        let devices = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let output =
+            |current_default: Option<&str>, previous: &[String], memory: &SelectionMemory| {
+                choose_output(&devices, "fxsound_sink", current_default, previous, memory)
+                    .expect("an output target")
+            };
+
+        // 2 — the first run adopts the session default, which is the headset.
+        let first = output(Some(HEADSET_SINK), &[], &SelectionMemory::default());
+        assert_eq!(first.target, HEADSET_SINK);
+
+        // 4 — the user picked it while the speakers are the session default.
+        let picked = output(
+            Some(LAPTOP_SPEAKERS),
+            &[],
+            &SelectionMemory {
+                most_recent_default: LAPTOP_SPEAKERS.into(),
+                user_selected: HEADSET_SINK.into(),
+                ..SelectionMemory::default()
+            },
+        );
+        assert_eq!(picked.target, HEADSET_SINK);
+
+        // 5 — it connected, straight into its call profile, while FxSound was the default.
+        let speakers_only = [LAPTOP_SPEAKERS.to_owned()];
+        let at_our_default = SelectionMemory {
+            most_recent_default: LAPTOP_SPEAKERS.into(),
+            most_recent_playback: LAPTOP_SPEAKERS.into(),
+            ..SelectionMemory::default()
+        };
+        let connected = output(Some("fxsound_sink"), &speakers_only, &at_our_default);
+        assert_eq!(connected.target, HEADSET_SINK);
+        assert!(connected.write_previous_default);
+
+        // 6 — the session default moved to it.
+        let followed = output(Some(HEADSET_SINK), &[], &at_our_default);
+        assert_eq!(followed.target, HEADSET_SINK);
+    }
+
+    #[test]
+    fn a_headset_that_comes_back_mono_under_the_same_name_keeps_the_output_lane() {
+        // Something starts recording from the headset: WirePlumber switches it from A2DP to its
+        // call profile, which removes `bluez_output.….1` and adds it back under the same name with
+        // one channel. The previous enumeration is the A2DP graph — the same two names.
+        let devices = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let previous = vec![LAPTOP_SPEAKERS.to_owned(), HEADSET_SINK.to_owned()];
+        let memory = SelectionMemory {
+            original_default: LAPTOP_SPEAKERS.into(),
+            most_recent_default: HEADSET_SINK.into(),
+            prior_default: LAPTOP_SPEAKERS.into(),
+            most_recent_playback: HEADSET_SINK.into(),
+            user_selected: String::new(),
+        };
+        let selection = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &previous,
+            &memory,
+        )
+        .expect("the headset is still a target; Windows answered -58 here");
+        assert_eq!(
+            selection.target, HEADSET_SINK,
+            "the music stays in the headset for the call instead of moving to the speakers"
+        );
+        assert!(
+            !selection.write_previous_default,
+            "a device back under its own name within the same run of the rules is not a new one \
+             (rule 7, not rule 5)"
+        );
+
+        // Nor does its new shape ask for a different pair: the stereo pair built for A2DP is the
+        // pair the call profile wants, so the lane can keep the nodes it has.
+        let headset = devices
+            .iter()
+            .find(|d| d.name == HEADSET_SINK)
+            .expect("the headset's sink is in the fixture");
+        let on_a2dp = DeviceInfo {
+            channels: 2,
+            positions: ChannelMap::default_for(2),
+            bluez_headset: false,
+            ..headset.clone()
+        };
+        assert_eq!(on_a2dp.clamped_channels(), headset.clamped_channels());
+        assert_eq!(
+            on_a2dp.positions.resized(on_a2dp.clamped_channels()),
+            headset.positions.resized(headset.clamped_channels())
+        );
+    }
+
+    /// Every card in a `pw-dump`, parsed the way the engine parses a `Device` object.
+    fn cards_in(dump: &str) -> Vec<Card> {
+        objects_in(dump)
+            .into_iter()
+            .filter(|(_, type_, _)| type_ == "PipeWire:Interface:Device")
+            .map(|(id, _, props)| {
+                Card::from_props(id, &|key: &str| {
+                    props
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.as_str())
+                })
+            })
+            .collect()
+    }
+
+    /// The headset's sink in the Bluetooth fixture.
+    fn headset_sink() -> DeviceInfo {
+        devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP)
+            .into_iter()
+            .find(|d| d.name == HEADSET_SINK)
+            .expect("the headset's sink is in the fixture")
+    }
+
+    #[test]
+    fn a_node_says_which_card_it_belongs_to_and_a_bluetooth_node_its_address() {
+        let devices = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let headset = headset_sink();
+        assert_eq!(headset.card_id, Some(60));
+        assert_eq!(headset.bluez_address.as_deref(), Some("00:11:22:33:44:55"));
+        assert_eq!(headset.object_serial, Some(70));
+
+        let speakers = devices
+            .iter()
+            .find(|d| d.name == LAPTOP_SPEAKERS)
+            .expect("the laptop's speakers are in the fixture");
+        assert_eq!(speakers.card_id, Some(45));
+        assert_eq!(speakers.bluez_address, None, "an ALSA node has no address");
+
+        // A virtual sink belongs to no card.
+        let virtual_sink = DeviceInfo::from_props(90, &|key: &str| match key {
+            "media.class" => Some(SINK_MEDIA_CLASS),
+            "node.name" => Some("easyeffects_sink"),
+            "object.serial" => Some("900"),
+            _ => None,
+        })
+        .expect("a virtual sink is still a sink");
+        assert_eq!(virtual_sink.object_serial, Some(900));
+        assert_eq!(virtual_sink.card_id, None);
+        assert_eq!(virtual_sink.bluez_address, None);
+    }
+
+    #[test]
+    fn a_card_reads_its_bluetooth_address_and_an_empty_address_is_no_address() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        assert_eq!(
+            cards,
+            [Card {
+                object_id: 60,
+                bluez_address: Some("00:11:22:33:44:55".to_owned()),
+                bluetooth: true,
+            }],
+            "the fixture's one card is the headset's"
+        );
+        let blank = Card::from_props(7, &|key: &str| (key == "api.bluez5.address").then_some(""));
+        assert_eq!(blank.bluez_address, None);
+    }
+
+    #[test]
+    fn a_card_owns_a_node_by_its_id_or_its_address_and_never_by_two_unknowns() {
+        let headset = Card {
+            object_id: 60,
+            bluez_address: Some("00:11:22:33:44:55".to_owned()),
+            bluetooth: true,
+        };
+        assert!(headset.owns(Some(60), None), "by `device.id`");
+        assert!(
+            headset.owns(None, Some("00:11:22:33:44:55")),
+            "by `api.bluez5.address`"
+        );
+        assert!(
+            headset.owns(Some(60), Some("66:77:88:99:AA:BB")),
+            "either is enough"
+        );
+        assert!(!headset.owns(Some(61), Some("66:77:88:99:AA:BB")));
+        assert!(!headset.owns(None, None));
+
+        let alsa = Card {
+            object_id: 45,
+            bluez_address: None,
+            bluetooth: false,
+        };
+        assert!(alsa.owns(Some(45), None));
+        assert!(
+            !alsa.owns(None, None),
+            "a card with no address and a node with none are not the same card"
+        );
+    }
+
+    #[test]
+    fn a_headsets_sink_that_went_while_its_card_stayed_still_has_its_card() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        assert!(
+            headset_sink().card_present(&cards),
+            "the call profile's sink went; the headset did not"
+        );
+        assert!(
+            !headset_sink().card_present(&[]),
+            "with the headset's card gone too, the headset is gone"
+        );
+    }
+
+    #[test]
+    fn a_bluetooth_node_without_a_device_id_is_matched_to_its_card_by_address() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let unnumbered = DeviceInfo {
+            card_id: None,
+            ..headset_sink()
+        };
+        assert!(unnumbered.card_present(&cards));
+
+        let another_headset = DeviceInfo {
+            card_id: None,
+            bluez_address: Some("66:77:88:99:AA:BB".to_owned()),
+            ..headset_sink()
+        };
+        assert!(
+            !another_headset.card_present(&cards),
+            "another headset's card is not this one's"
+        );
+    }
+
+    #[test]
+    fn a_node_on_no_card_or_on_a_card_that_is_not_there_has_no_card_to_wait_for() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let speakers = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP)
+            .into_iter()
+            .find(|d| d.name == LAPTOP_SPEAKERS)
+            .expect("the laptop's speakers are in the fixture");
+        assert!(
+            !speakers.card_present(&cards),
+            "the fixture leaves the ALSA card out, so the speakers' card is not there"
+        );
+        // Neither an id nor an address: nothing matches, not even a card with no address of its
+        // own — two unknowns are not the same card.
+        let virtual_sink = sink("easyeffects_sink", 2);
+        let cards_without_addresses = [Card {
+            object_id: 0,
+            bluez_address: None,
+            bluetooth: false,
+        }];
+        assert!(!virtual_sink.card_present(&cards_without_addresses));
+        assert!(!virtual_sink.card_present(&cards));
+    }
+
+    #[test]
+    fn a_headset_whose_removal_had_a_run_of_its_own_comes_back_as_new_to_the_same_target() {
+        // The same profile switch, slow enough to straddle two supervisor ticks: one run of the
+        // rules sees the headset gone, the next sees it back, with `previous_names` as the first
+        // run left them without it. (The engine keeps a node that went while its card stayed in
+        // them for the length of its wait; this is the rules' answer when it is not there.)
+        let devices = devices_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let without_headset: Vec<DeviceInfo> = devices
+            .iter()
+            .filter(|d| d.name != HEADSET_SINK)
+            .cloned()
+            .collect();
+        let before = SelectionMemory {
+            original_default: LAPTOP_SPEAKERS.into(),
+            most_recent_default: HEADSET_SINK.into(),
+            prior_default: LAPTOP_SPEAKERS.into(),
+            most_recent_playback: HEADSET_SINK.into(),
+            user_selected: String::new(),
+        };
+        let on_a2dp = vec![LAPTOP_SPEAKERS.to_owned(), HEADSET_SINK.to_owned()];
+
+        // The removal's run: the speakers are all there is (rule 3), and nothing new was added.
+        let mut memory = before.clone();
+        let gone = choose_output(
+            &without_headset,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &on_a2dp,
+            &memory,
+        )
+        .expect("the speakers are still a target");
+        assert_eq!(gone.target, LAPTOP_SPEAKERS);
+        assert!(!gone.write_previous_default, "rule 3 writes no default");
+        commit(&mut memory, &gone);
+        assert_eq!(memory.most_recent_playback, LAPTOP_SPEAKERS);
+
+        // The re-add's run: the headset is missing from the names the last run saw, so rule 5
+        // takes it as new — and picks the device rule 7 would have picked in a single run.
+        let speakers_only = vec![LAPTOP_SPEAKERS.to_owned()];
+        let back = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &speakers_only,
+            &memory,
+        )
+        .expect("the headset is a target again");
+        assert_eq!(
+            back.target, HEADSET_SINK,
+            "the music goes back to the headset, the same device either way"
+        );
+        assert!(
+            back.write_previous_default,
+            "a name the last run did not see is a new device to rule 5"
+        );
+        commit(&mut memory, &back);
+
+        // The single-run path leaves the memory it had, the playback slot rewritten in place.
+        let mut in_one_run = before.clone();
+        let kept = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &on_a2dp,
+            &in_one_run,
+        )
+        .expect("the headset is still a target");
+        assert_eq!(kept.target, HEADSET_SINK);
+        commit(&mut in_one_run, &kept);
+
+        // Rule 5 wrote the default slots again, and here they already held what it wrote: the
+        // headset as the most recent default, the speakers played to in between as the prior one.
+        assert_eq!(
+            memory, in_one_run,
+            "two runs or one, the headset ends up remembered the same way"
+        );
+        assert_eq!(in_one_run, before);
+    }
+
     #[test]
     fn no_sinks_at_all_is_the_no_output_devices_state() {
         let memory = SelectionMemory::default();
@@ -1570,7 +2783,8 @@ mod tests {
                 "fxsound_source",
                 Some("fxsound_source"),
                 &[],
-                &memory
+                &memory,
+                &Preference::default()
             ),
             Err(AudioError::NoInputDevices),
             "a sink is never an input candidate, and neither is our own source"
@@ -1603,6 +2817,7 @@ mod tests {
             Some("internal-mic"),
             &[],
             &memory,
+            &Preference::default(),
         )
         .expect("an input target");
         assert_eq!(
@@ -1617,49 +2832,50 @@ mod tests {
     }
 
     #[test]
-    fn a_mono_microphone_is_accepted_where_a_mono_sink_would_be_refused() {
+    fn a_mono_device_is_accepted_in_either_direction() {
         let memory = SelectionMemory {
-            most_recent_default: "mono-mic".into(),
-            user_selected: "mono-mic".into(),
+            most_recent_default: "mono".into(),
+            user_selected: "mono".into(),
             ..SelectionMemory::default()
         };
-        let devices = [source("mono-mic", 1), source("stereo-mic", 2)];
-        let selection = choose_device(
-            &devices,
-            DeviceDirection::Input,
-            "fxsound_source",
-            Some("mono-mic"),
-            &[],
-            &memory,
-        )
-        .expect("a mono microphone is a perfectly good input");
-        assert_eq!(selection.target, "mono-mic");
+        let sources = [source("mono", 1), source("stereo", 2)];
+        let sinks = [sink("mono", 1), sink("stereo", 2)];
+        for (devices, direction, ours) in [
+            (&sources, DeviceDirection::Input, "fxsound_source"),
+            (&sinks, DeviceDirection::Output, "fxsound_sink"),
+        ] {
+            let selection = choose_device(
+                devices,
+                direction,
+                ours,
+                Some("mono"),
+                &[],
+                &memory,
+                &Preference::default(),
+            )
+            .expect("a mono device is a perfectly good target; on Windows the output side was -58");
+            assert_eq!(selection.target, "mono", "{direction:?}");
 
-        // The same shape on the output side is the -58 state.
-        let sinks = [sink("mono-mic", 1), sink("stereo-mic", 2)];
-        assert_eq!(
-            choose_output(&sinks, "fxsound_sink", Some("mono-mic"), &[], &memory),
-            Err(AudioError::AskUserSelectOutput)
-        );
-
-        // Rule 5, too: a newly plugged mono microphone is taken, a newly plugged mono sink is not.
-        let previous = vec!["stereo-mic".to_owned()];
-        let fresh = SelectionMemory {
-            most_recent_default: "stereo-mic".into(),
-            most_recent_playback: "stereo-mic".into(),
-            ..SelectionMemory::default()
-        };
-        let plugged = choose_device(
-            &devices,
-            DeviceDirection::Input,
-            "fxsound_source",
-            Some("fxsound_source"),
-            &previous,
-            &fresh,
-        )
-        .expect("a target");
-        assert_eq!(plugged.target, "mono-mic");
-        assert!(plugged.write_previous_default);
+            // Rule 5, too: a newly plugged mono device is taken, whichever way it faces.
+            let previous = vec!["stereo".to_owned()];
+            let fresh = SelectionMemory {
+                most_recent_default: "stereo".into(),
+                most_recent_playback: "stereo".into(),
+                ..SelectionMemory::default()
+            };
+            let plugged = choose_device(
+                devices,
+                direction,
+                ours,
+                Some(ours),
+                &previous,
+                &fresh,
+                &Preference::default(),
+            )
+            .expect("a target");
+            assert_eq!(plugged.target, "mono", "{direction:?}");
+            assert!(plugged.write_previous_default);
+        }
     }
 
     #[test]
@@ -1694,6 +2910,7 @@ mod tests {
             Some("fifine-mic"),
             &[],
             &memory,
+            &Preference::default(),
         )
         .expect("a target");
         assert_eq!(selection.target, "internal-mic");
@@ -1766,7 +2983,9 @@ mod tests {
     }
 
     #[test]
-    fn a_newly_appeared_mono_sink_is_skipped() {
+    fn a_newly_appeared_mono_sink_is_taken_like_any_other() {
+        // Windows skipped it here (`:202-210`); a Bluetooth headset that connects straight into
+        // its call profile is exactly the device the user just asked for.
         let sinks = [sink("speakers", 2), sink("mono-bt", 1)];
         let previous = vec!["speakers".to_owned()];
         let memory = SelectionMemory {
@@ -1782,7 +3001,161 @@ mod tests {
             &memory,
         )
         .expect("a target");
-        assert_eq!(selection.target, "speakers");
+        assert_eq!(selection.target, "mono-bt");
+        assert!(selection.write_previous_default);
+    }
+
+    #[test]
+    fn a_device_that_arrives_as_another_leaves_is_taken_though_the_count_did_not_grow() {
+        // One batch of registry events: the old DAC's node went, the new one came. Windows only
+        // looked for a new device when the count had grown, so it never saw this one.
+        let sinks = [sink("speakers", 2), sink("new-dac", 2)];
+        let previous = vec!["speakers".to_owned(), "old-dac".to_owned()];
+        let mut memory = SelectionMemory {
+            most_recent_default: "old-dac".into(),
+            most_recent_playback: "old-dac".into(),
+            prior_default: "speakers".into(),
+            ..SelectionMemory::default()
+        };
+        let selection = choose_output(
+            &sinks,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &previous,
+            &memory,
+        )
+        .expect("a target");
+        assert_eq!(
+            selection.target, "new-dac",
+            "rule 7 would have fallen back to the speakers"
+        );
+        assert!(
+            selection.write_previous_default,
+            "a device taken by rule 5 re-dates the remembered defaults, whatever the count did"
+        );
+
+        commit(&mut memory, &selection);
+        assert_eq!(memory.most_recent_playback, "new-dac");
+        assert_eq!(memory.most_recent_default, "new-dac");
+        assert_eq!(memory.prior_default, "old-dac");
+
+        // The same holds for microphones: the rules are the same rules.
+        let sources = [source("internal-mic", 2), source("new-headset", 1)];
+        let previous = vec!["internal-mic".to_owned(), "old-headset".to_owned()];
+        let memory = SelectionMemory {
+            most_recent_default: "old-headset".into(),
+            most_recent_playback: "old-headset".into(),
+            ..SelectionMemory::default()
+        };
+        let selection = choose_device(
+            &sources,
+            DeviceDirection::Input,
+            "fxsound_source",
+            Some("fxsound_source"),
+            &previous,
+            &memory,
+            &Preference::default(),
+        )
+        .expect("a target");
+        assert_eq!(selection.target, "new-headset");
+    }
+
+    #[test]
+    fn a_device_that_arrives_while_two_leave_is_taken_though_the_count_shrank() {
+        // A dock unplugged and a headset plugged in within the same batch.
+        let sinks = [sink("speakers", 2), sink("headset", 2)];
+        let previous = vec![
+            "speakers".to_owned(),
+            "dock-hdmi".to_owned(),
+            "dock-analog".to_owned(),
+        ];
+        let memory = SelectionMemory {
+            most_recent_default: "dock-analog".into(),
+            most_recent_playback: "dock-analog".into(),
+            ..SelectionMemory::default()
+        };
+        let selection = choose_output(
+            &sinks,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &previous,
+            &memory,
+        )
+        .expect("a target");
+        assert_eq!(selection.target, "headset");
+        assert!(selection.write_previous_default);
+    }
+
+    #[test]
+    fn when_several_devices_arrive_at_once_the_first_new_one_in_the_graph_is_taken() {
+        // `:196`: "if more than one device was added this will set playback to the first device
+        // found" — found in the graph's order, not the previous list's.
+        let sinks = [
+            sink("speakers", 2),
+            sink("second-new", 2),
+            sink("first-new", 2),
+        ];
+        let previous = vec!["speakers".to_owned(), "gone".to_owned()];
+        let selection = choose_output(
+            &sinks,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &previous,
+            &SelectionMemory {
+                most_recent_default: "speakers".into(),
+                most_recent_playback: "speakers".into(),
+                ..SelectionMemory::default()
+            },
+        )
+        .expect("a target");
+        assert_eq!(selection.target, "second-new");
+    }
+
+    #[test]
+    fn a_device_leaving_is_not_mistaken_for_one_arriving() {
+        let sinks = [sink("a", 2), sink("b", 2)];
+        let previous = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let selection = choose_output(
+            &sinks,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &previous,
+            &SelectionMemory {
+                most_recent_default: "b".into(),
+                most_recent_playback: "c".into(),
+                ..SelectionMemory::default()
+            },
+        )
+        .expect("a target");
+        assert_eq!(
+            selection.target, "b",
+            "nothing is new, so rule 7 walks on from the device that left"
+        );
+        assert!(
+            !selection.write_previous_default,
+            "and a device found by rule 7 re-dates nothing"
+        );
+    }
+
+    #[test]
+    fn nothing_counts_as_newly_arrived_without_a_previous_enumeration() {
+        // The first run of a lane, and the first after it is switched on again: every device is
+        // "not in the previous list", and none of them may be taken for being new.
+        let sinks = [sink("a", 2), sink("b", 2)];
+        let selection = choose_output(
+            &sinks,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &[],
+            &SelectionMemory {
+                most_recent_default: "b".into(),
+                most_recent_playback: "b".into(),
+                ..SelectionMemory::default()
+            },
+        )
+        .expect("a target");
+        assert_eq!(selection.target, "b");
+        assert!(!selection.write_previous_default);
     }
 
     #[test]
@@ -1854,22 +3227,24 @@ mod tests {
     }
 
     #[test]
-    fn a_mono_target_with_a_stereo_alternative_asks_the_user_to_choose() {
+    fn a_mono_output_the_user_picked_is_used_though_a_stereo_one_is_there() {
+        // Windows answered -58 here, SND_DEVICES_ASK_USER_SELECT_PLAYBACK_DEVICE: asked the user
+        // to pick an output when the user had just picked one.
         let sinks = [sink("mono-bt", 1), sink("speakers", 2)];
         let memory = SelectionMemory {
             most_recent_default: "mono-bt".into(),
             user_selected: "mono-bt".into(),
             ..SelectionMemory::default()
         };
-        assert_eq!(
-            choose_output(&sinks, "fxsound_sink", Some("mono-bt"), &[], &memory),
-            Err(AudioError::AskUserSelectOutput),
-            "this is the -58 SND_DEVICES_ASK_USER_SELECT_PLAYBACK_DEVICE state"
-        );
+        let selection =
+            choose_output(&sinks, "fxsound_sink", Some("mono-bt"), &[], &memory).expect("a target");
+        assert_eq!(selection.target, "mono-bt");
     }
 
     #[test]
-    fn a_mono_target_falls_back_to_the_last_stereo_device_we_used() {
+    fn a_mono_output_is_not_swapped_for_the_last_stereo_device_we_used() {
+        // Windows retried `most_recent_playback` for a mono target (`:300-302`), which moved the
+        // music out of a headset in its call profile and onto the speakers mid-call.
         let sinks = [sink("mono-bt", 1), sink("speakers", 2)];
         let memory = SelectionMemory {
             most_recent_default: "mono-bt".into(),
@@ -1879,23 +3254,33 @@ mod tests {
         };
         let selection =
             choose_output(&sinks, "fxsound_sink", Some("mono-bt"), &[], &memory).expect("a target");
-        assert_eq!(selection.target, "speakers");
+        assert_eq!(selection.target, "mono-bt");
     }
 
     #[test]
-    fn only_mono_sinks_present_is_the_no_valid_output_state() {
-        // Both sinks must *say* they are mono. A channel count of 0 means "the node never told
-        // us", which is the normal case for a registry global and is not a reason to refuse it.
+    fn a_graph_of_nothing_but_mono_sinks_still_has_an_output() {
+        // Windows answered -57 here, SND_DEVICES_NO_VALID_PLAYBACK_DEVICE, and played nothing.
         let sinks = [sink("mono-a", 1), sink("mono-b", 1)];
         let memory = SelectionMemory {
             most_recent_default: "mono-a".into(),
             ..SelectionMemory::default()
         };
-        assert_eq!(
-            choose_output(&sinks, "fxsound_sink", Some("mono-a"), &[], &memory),
-            Err(AudioError::NoValidOutput),
-            "this is the -57 SND_DEVICES_NO_VALID_PLAYBACK_DEVICE state"
-        );
+        let selection =
+            choose_output(&sinks, "fxsound_sink", Some("mono-a"), &[], &memory).expect("a target");
+        assert_eq!(selection.target, "mono-a");
+        assert!(selection.write_previous_default, "rule 6, as for any sink");
+
+        // Rule 3 as well: the only device there is, is the device, whatever its channel count.
+        let only = [sink("mono-only", 1)];
+        let selection = choose_output(
+            &only,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &[],
+            &SelectionMemory::default(),
+        )
+        .expect("a target");
+        assert_eq!(selection.target, "mono-only");
     }
 
     #[test]
@@ -1953,5 +3338,1245 @@ mod tests {
             restore_default_candidate(&memory, &unplugged, DeviceDirection::Input).as_deref(),
             Some("internal-mic")
         );
+    }
+
+    // ---- U9: WirePlumber 0.5's Bluetooth microphone, and one headset on both lanes -----------
+
+    /// A property dictionary out of `(key, value)` pairs, the way a test hands one to the parsers.
+    fn props_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<&'a str> + 'a {
+        move |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
+    }
+
+    /// One device out of a fixture, by name.
+    fn device_in(dump: &str, name: &str) -> DeviceInfo {
+        devices_in(dump)
+            .into_iter()
+            .find(|d| d.name == name)
+            .unwrap_or_else(|| panic!("{name} is not a device in the fixture"))
+    }
+
+    /// The devices of one direction in a fixture, by name.
+    fn names_in(dump: &str, direction: DeviceDirection) -> Vec<String> {
+        devices_in(dump)
+            .into_iter()
+            .filter(|d| d.direction == direction)
+            .map(|d| d.name)
+            .collect()
+    }
+
+    #[test]
+    fn each_hands_free_codec_carries_its_own_rate_and_a_music_codec_none() {
+        assert_eq!(bluez_codec_rate("cvsd"), Some(8_000));
+        assert_eq!(bluez_codec_rate("msbc"), Some(16_000));
+        assert_eq!(bluez_codec_rate("lc3_a127"), Some(24_000));
+        assert_eq!(bluez_codec_rate("lc3_swb"), Some(32_000));
+        for music in [
+            "sbc", "sbc_xq", "aac", "ldac", "aptx_hd", "opus_05", "lc3", "",
+        ] {
+            assert_eq!(
+                bluez_codec_rate(music),
+                None,
+                "{music:?} is not a call codec, and says nothing about a call's bandwidth"
+            );
+        }
+        assert_eq!(
+            BLUEZ_HEADSET_RATE,
+            bluez_codec_rate("msbc").expect("mSBC is a call codec"),
+            "a headset that names no codec is taken to run the wide band"
+        );
+    }
+
+    #[test]
+    fn wireplumbers_internal_sco_source_is_never_listed_as_a_microphone() {
+        let inputs = names_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP, DeviceDirection::Input);
+        assert_eq!(
+            inputs,
+            [LAPTOP_MICROPHONE, LOOPBACK_MICROPHONE],
+            "the loopback is the headset's microphone; the SCO source behind it is WirePlumber's"
+        );
+        assert!(
+            DeviceInfo::from_props(
+                71,
+                &props_of(&[
+                    ("media.class", "Audio/Source"),
+                    ("node.name", SCO_SOURCE),
+                    ("api.bluez5.profile", "headset-head-unit"),
+                    ("api.bluez5.internal", "true"),
+                ])
+            )
+            .is_none()
+        );
+        let facts = BluezFacts::from_props(&props_of(&[("api.bluez5.internal", "true")]));
+        assert!(facts.internal);
+        assert!(
+            !BluezFacts::from_props(&props_of(&[("api.bluez5.internal", "false")])).internal,
+            "only `true` hides a node"
+        );
+    }
+
+    #[test]
+    fn wireplumber_05s_loopback_microphone_is_a_bluetooth_headsets_at_the_wide_band() {
+        for dump in [BLUEZ_HEADSET_HEAD_UNIT_DUMP, BLUEZ_A2DP_WIREPLUMBER_05_DUMP] {
+            let microphone = device_in(dump, LOOPBACK_MICROPHONE);
+            assert_eq!(microphone.direction, DeviceDirection::Input);
+            assert!(microphone.bluez.loopback);
+            assert!(
+                !microphone.bluez.own,
+                "it carries no `api.bluez5.*` key at all"
+            );
+            assert_eq!(microphone.bluez.headset_profile, None);
+            assert_eq!(microphone.bluez_address, None);
+            assert_eq!(
+                microphone.card_id,
+                Some(60),
+                "`device.id` names the headset's card"
+            );
+            assert!(microphone.bluez_headset);
+            assert_eq!(microphone.form_factor, FormFactor::Headset);
+            assert_eq!(
+                microphone.native_rate(),
+                Some(16_000.0),
+                "it names no codec, so it runs the wide band nearly every headset negotiates"
+            );
+            assert_eq!(
+                microphone.to_audio_device(None).form_factor,
+                "headset",
+                "the GUI draws it as a headset"
+            );
+        }
+    }
+
+    #[test]
+    fn under_wireplumber_05_the_headset_idles_in_a2dp_as_headphones_beside_its_microphone() {
+        let outputs = names_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, DeviceDirection::Output);
+        assert_eq!(outputs, [LAPTOP_SPEAKERS, HEADSET_SINK]);
+        let inputs = names_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, DeviceDirection::Input);
+        assert_eq!(inputs, [LAPTOP_MICROPHONE, LOOPBACK_MICROPHONE]);
+
+        let sink = device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, HEADSET_SINK);
+        assert_eq!(sink.channels, 2);
+        assert!(!sink.bluez_headset, "A2DP carries no microphone");
+        assert_eq!(sink.bluez.headset_profile, Some(false));
+        assert_eq!(sink.bluez.codec_rate, None, "SBC is a music codec");
+        assert_eq!(sink.form_factor, FormFactor::Headphones);
+        assert_eq!(sink.native_rate(), None);
+    }
+
+    #[test]
+    fn wireplumber_04s_microphone_is_the_sco_source_itself_at_its_codecs_rate() {
+        let inputs = names_in(
+            BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP,
+            DeviceDirection::Input,
+        );
+        assert_eq!(
+            inputs,
+            [LAPTOP_MICROPHONE, SCO_SOURCE],
+            "without `api.bluez5.internal` the SCO source is the microphone"
+        );
+        let microphone = device_in(BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP, SCO_SOURCE);
+        assert!(microphone.bluez_headset);
+        assert!(!microphone.bluez.loopback);
+        assert_eq!(microphone.form_factor, FormFactor::Headset);
+        assert_eq!(
+            microphone.native_rate(),
+            Some(8_000.0),
+            "CVSD: the narrow band, which the de-esser should know to stand aside for"
+        );
+        let sink = device_in(BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP, HEADSET_SINK);
+        assert_eq!(sink.native_rate(), Some(8_000.0), "one SCO link, one codec");
+    }
+
+    #[test]
+    fn a_headsets_codec_sets_its_native_rate_and_a_published_rate_outranks_it() {
+        let parse = |pairs: &[(&str, &str)]| {
+            DeviceInfo::from_props(7, &props_of(pairs)).expect("a named source is a device")
+        };
+        let base = [
+            ("media.class", "Audio/Source"),
+            ("node.name", SCO_SOURCE),
+            ("api.bluez5.profile", "headset-head-unit"),
+        ];
+        for (codec, rate) in [
+            ("cvsd", 8_000.0),
+            ("msbc", 16_000.0),
+            ("lc3_a127", 24_000.0),
+            ("lc3_swb", 32_000.0),
+        ] {
+            let pairs: Vec<(&str, &str)> = base
+                .iter()
+                .copied()
+                .chain([("api.bluez5.codec", codec)])
+                .collect();
+            assert_eq!(parse(&pairs).native_rate(), Some(rate), "{codec}");
+        }
+        assert_eq!(
+            parse(&base).native_rate(),
+            Some(16_000.0),
+            "a headset profile that names no codec"
+        );
+        let published = parse(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", SCO_SOURCE),
+            ("api.bluez5.profile", "headset-head-unit"),
+            ("api.bluez5.codec", "lc3_swb"),
+            ("audio.rate", "16000"),
+        ]);
+        assert_eq!(
+            published.native_rate(),
+            Some(16_000.0),
+            "the node's own word about its rate wins"
+        );
+        // A music codec on an A2DP node is no reason to call it narrow.
+        let a2dp = parse(&[
+            ("media.class", "Audio/Sink"),
+            ("node.name", HEADSET_SINK),
+            ("api.bluez5.profile", "a2dp-sink"),
+            ("api.bluez5.codec", "sbc"),
+        ]);
+        assert_eq!(a2dp.native_rate(), None);
+    }
+
+    #[test]
+    fn a_bluetooth_microphone_that_names_no_profile_is_a_headsets_and_a_sink_is_not() {
+        let microphone = DeviceInfo::from_props(
+            9,
+            &props_of(&[
+                ("media.class", "Audio/Source"),
+                ("node.name", "bluez_input.66_77_88_99_AA_BB"),
+                ("device.api", "bluez5"),
+            ]),
+        )
+        .expect("a source");
+        assert!(microphone.bluez_headset);
+        assert_eq!(microphone.form_factor, FormFactor::Headset);
+        assert_eq!(microphone.native_rate(), Some(16_000.0));
+
+        let sink = DeviceInfo::from_props(
+            10,
+            &props_of(&[
+                ("media.class", "Audio/Sink"),
+                ("node.name", "bluez_output.66_77_88_99_AA_BB.1"),
+                ("device.api", "bluez5"),
+            ]),
+        )
+        .expect("a sink");
+        assert!(
+            !sink.bluez_headset,
+            "a Bluetooth sink that says nothing of its profile is not taken for a call"
+        );
+        assert_eq!(sink.form_factor, FormFactor::Headphones);
+
+        // The profile outranks everything: a phone streaming music into the computer is a
+        // Bluetooth source, and no headset.
+        let phone = DeviceInfo::from_props(
+            11,
+            &props_of(&[
+                ("media.class", "Audio/Source"),
+                ("node.name", "bluez_input.66_77_88_99_AA_BB.2"),
+                ("device.api", "bluez5"),
+                ("api.bluez5.profile", "a2dp-source"),
+            ]),
+        )
+        .expect("a source");
+        assert!(!phone.bluez_headset);
+        assert_eq!(phone.form_factor, FormFactor::Headphones);
+        assert_eq!(phone.native_rate(), None);
+    }
+
+    #[test]
+    fn the_form_factor_reads_the_loopback_microphone_as_a_headset_on_its_properties_alone() {
+        assert_eq!(
+            FormFactor::from_props(&props_of(&[("bluez5.loopback", "true")])),
+            FormFactor::Headset
+        );
+        assert_eq!(
+            FormFactor::from_props(&props_of(&[
+                ("bluez5.loopback", "false"),
+                ("api.bluez5.profile", "headset-head-unit"),
+            ])),
+            FormFactor::Headset,
+            "the SCO source WirePlumber marks `false` is a headset by its profile"
+        );
+        assert_eq!(
+            FormFactor::from_props(&props_of(&[("device.api", "bluez5")])),
+            FormFactor::Headphones,
+            "direction-agnostic, a Bluetooth node that says nothing is headphones"
+        );
+        assert_eq!(
+            FormFactor::from_props(&props_of(&[("bluez5.loopback", "false")])),
+            FormFactor::Unknown,
+            "`false` is not a loopback"
+        );
+    }
+
+    #[test]
+    fn a_microphone_known_only_by_its_registry_global_becomes_a_headset_by_its_card() {
+        // What the registry announces for WirePlumber 0.5's microphone: nothing Bluetooth about it
+        // but the card it names.
+        let mut microphone = DeviceInfo::from_props(
+            73,
+            &props_of(&[
+                ("media.class", "Audio/Source"),
+                ("node.name", LOOPBACK_MICROPHONE),
+                ("node.description", "Test Headset"),
+                ("device.id", "60"),
+                ("object.serial", "73"),
+            ]),
+        )
+        .expect("a source");
+        assert!(!microphone.bluez_headset);
+        assert_eq!(microphone.form_factor, FormFactor::Microphone);
+        assert_eq!(microphone.native_rate(), None);
+
+        assert!(microphone.on_bluetooth_card(), "news the first time");
+        assert!(microphone.bluez_headset);
+        assert_eq!(microphone.form_factor, FormFactor::Headset);
+        assert_eq!(microphone.native_rate(), Some(16_000.0));
+        assert!(!microphone.on_bluetooth_card(), "and no news after");
+
+        // A sink on the same card is Bluetooth, and headphones, until its info names a profile.
+        let mut sink = DeviceInfo::from_props(
+            70,
+            &props_of(&[
+                ("media.class", "Audio/Sink"),
+                ("node.name", HEADSET_SINK),
+                ("device.id", "60"),
+            ]),
+        )
+        .expect("a sink");
+        assert!(sink.on_bluetooth_card());
+        assert!(!sink.bluez_headset);
+        assert_eq!(sink.form_factor, FormFactor::Headphones);
+    }
+
+    #[test]
+    fn a_nodes_info_tells_what_its_registry_global_could_not_and_keeps_what_its_card_said() {
+        let registry_only = |name: &str| {
+            let pairs = [
+                ("media.class", "Audio/Source"),
+                ("node.name", name),
+                ("device.id", "60"),
+            ];
+            DeviceInfo::from_props(1, &props_of(&pairs)).expect("a source")
+        };
+        let info = |dump: &str, id: u32| {
+            let props = objects_in(dump)
+                .into_iter()
+                .find(|(object, _, _)| *object == id)
+                .map(|(_, _, props)| props)
+                .expect("the node is in the fixture");
+            let get = |key: &str| {
+                props
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str())
+            };
+            (BluezFacts::from_props(&get), FormFactor::from_props(&get))
+        };
+
+        // WirePlumber 0.5's microphone, learned from its info alone.
+        let mut loopback = registry_only(LOOPBACK_MICROPHONE);
+        let (facts, form_factor) = info(BLUEZ_HEADSET_HEAD_UNIT_DUMP, 73);
+        assert!(loopback.learn_bluetooth(facts, form_factor));
+        assert!(loopback.bluez_headset);
+        assert_eq!(loopback.form_factor, FormFactor::Headset);
+        assert_eq!(loopback.native_rate(), Some(16_000.0));
+        assert!(
+            !loopback.learn_bluetooth(facts, form_factor),
+            "the same info again is no news"
+        );
+
+        // WirePlumber 0.4's, whose codec is only in its info.
+        let mut sco = registry_only(SCO_SOURCE);
+        let (facts, form_factor) = info(BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP, 71);
+        assert!(sco.learn_bluetooth(facts, form_factor));
+        assert_eq!(sco.native_rate(), Some(8_000.0));
+
+        // What the card said survives an info that could not say it.
+        let mut on_card = registry_only(LOOPBACK_MICROPHONE);
+        assert!(on_card.on_bluetooth_card());
+        let (facts, form_factor) = info(BLUEZ_HEADSET_HEAD_UNIT_DUMP, 73);
+        on_card.learn_bluetooth(facts, form_factor);
+        assert!(on_card.bluez.card);
+        assert!(on_card.bluez.loopback);
+
+        // And an info that names a profile outranks what the card suggested.
+        let mut phone = registry_only("bluez_input.66_77_88_99_AA_BB.2");
+        assert!(phone.on_bluetooth_card());
+        assert!(
+            phone.bluez_headset,
+            "a Bluetooth microphone, as far as anyone knew"
+        );
+        let a2dp_source = [
+            ("device.api", "bluez5"),
+            ("api.bluez5.profile", "a2dp-source"),
+        ];
+        let get = props_of(&a2dp_source);
+        assert!(phone.learn_bluetooth(BluezFacts::from_props(&get), FormFactor::from_props(&get)));
+        assert!(!phone.bluez_headset);
+        assert_eq!(phone.form_factor, FormFactor::Headphones);
+
+        // An ALSA node's info leaves its icon to its registry global.
+        let mut mic = source("alsa_input.usb-fifine", 2);
+        mic.form_factor = FormFactor::Microphone;
+        let alsa = [("device.api", "alsa"), ("device.icon-name", "audio-card")];
+        let get = props_of(&alsa);
+        assert!(!mic.learn_bluetooth(BluezFacts::from_props(&get), FormFactor::from_props(&get)));
+        assert_eq!(mic.form_factor, FormFactor::Microphone);
+    }
+
+    #[test]
+    fn a_headsets_sink_and_its_microphone_are_one_bluetooth_device_under_either_wireplumber() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        for (dump, microphone) in [
+            (BLUEZ_HEADSET_HEAD_UNIT_DUMP, LOOPBACK_MICROPHONE),
+            (BLUEZ_A2DP_WIREPLUMBER_05_DUMP, LOOPBACK_MICROPHONE),
+            (BLUEZ_HEADSET_HEAD_UNIT_WIREPLUMBER_04_DUMP, SCO_SOURCE),
+        ] {
+            let sink = device_in(dump, HEADSET_SINK);
+            let microphone = device_in(dump, microphone);
+            assert!(sink.same_bluetooth_device(&microphone, &cards));
+            assert!(
+                microphone.same_bluetooth_device(&sink, &cards),
+                "either way round"
+            );
+        }
+
+        // By the card's address when the microphone names only its card and the sink only its
+        // address.
+        let sink = DeviceInfo {
+            card_id: None,
+            ..device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, HEADSET_SINK)
+        };
+        let loopback = device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, LOOPBACK_MICROPHONE);
+        assert!(sink.same_bluetooth_device(&loopback, &cards));
+        assert!(
+            !sink.same_bluetooth_device(&loopback, &[]),
+            "without the card, nothing ties an address to a card number"
+        );
+    }
+
+    #[test]
+    fn two_headsets_or_one_sound_card_are_not_one_bluetooth_device() {
+        let cards = cards_in(BLUEZ_HEADSET_HEAD_UNIT_DUMP);
+        let sink = device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, HEADSET_SINK);
+        let another = DeviceInfo {
+            card_id: Some(61),
+            ..device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, LOOPBACK_MICROPHONE)
+        };
+        assert!(!sink.same_bluetooth_device(&another, &cards));
+
+        // The laptop's speakers and microphone share a card, and nothing a lane could suffer from.
+        let speakers = device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, LAPTOP_SPEAKERS);
+        let microphone = device_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP, LAPTOP_MICROPHONE);
+        assert_eq!(speakers.card_id, microphone.card_id);
+        assert!(!speakers.same_bluetooth_device(&microphone, &cards));
+        // Nor is the headset one device with the laptop's microphone.
+        assert!(!sink.same_bluetooth_device(&microphone, &cards));
+    }
+
+    #[test]
+    fn a_card_says_it_is_bluetooth_in_its_registry_global() {
+        let cards = cards_in(BLUEZ_A2DP_WIREPLUMBER_05_DUMP);
+        assert_eq!(cards.len(), 1);
+        assert!(cards[0].bluetooth);
+        // What the registry announces of a card: its `device.api`, and no address.
+        let announced = Card::from_props(60, &props_of(&[("device.api", "bluez5")]));
+        assert!(announced.bluetooth);
+        assert_eq!(announced.bluez_address, None);
+        let alsa = Card::from_props(45, &props_of(&[("device.api", "alsa")]));
+        assert!(!alsa.bluetooth);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The priority list (U4): a ranking, a fresh pick, and devices nothing is plugged into.
+    // ---------------------------------------------------------------------------------------
+
+    fn ranked(names: &[&str]) -> Preference {
+        Preference {
+            ranking: names.iter().map(|&name| name.to_owned()).collect(),
+            ..Preference::default()
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|&name| name.to_owned()).collect()
+    }
+
+    /// A device whose card says nothing is plugged in behind it.
+    fn unheard(device: DeviceInfo) -> DeviceInfo {
+        DeviceInfo {
+            available: false,
+            ..device
+        }
+    }
+
+    /// The lane was last attached to `current`.
+    fn on(current: &str) -> SelectionMemory {
+        SelectionMemory {
+            original_default: current.into(),
+            most_recent_default: current.into(),
+            most_recent_playback: current.into(),
+            ..SelectionMemory::default()
+        }
+    }
+
+    /// What the rules pick for `direction`, with the session default elsewhere — on one of the
+    /// devices, so that rule 6 would have something to say — and `previous` the last run's names.
+    fn picked(
+        devices: &[DeviceInfo],
+        direction: DeviceDirection,
+        previous: &[&str],
+        memory: &SelectionMemory,
+        preference: &Preference,
+    ) -> Selection {
+        let ours = match direction {
+            DeviceDirection::Output => "fxsound_sink",
+            DeviceDirection::Input => "fxsound_source",
+        };
+        let default = devices
+            .iter()
+            .find(|device| device.direction == direction)
+            .map(|device| device.name.as_str());
+        choose_device(
+            devices,
+            direction,
+            ours,
+            default,
+            &names(previous),
+            memory,
+            preference,
+        )
+        .expect("a device to attach to")
+    }
+
+    fn output(
+        devices: &[DeviceInfo],
+        previous: &[&str],
+        memory: &SelectionMemory,
+        preference: &Preference,
+    ) -> String {
+        picked(
+            devices,
+            DeviceDirection::Output,
+            previous,
+            memory,
+            preference,
+        )
+        .target
+    }
+
+    #[test]
+    fn a_device_not_in_the_ranking_ranks_after_every_one_that_is() {
+        let preference = ranked(&["usb-dac", "speakers"]);
+        assert_eq!(preference.rank("usb-dac"), 0);
+        assert_eq!(preference.rank("speakers"), 1);
+        assert_eq!(preference.rank("hdmi"), 2);
+        assert_eq!(preference.rank("tv"), 2, "every unranked device ties");
+    }
+
+    #[test]
+    fn a_device_not_in_the_ranking_ranks_before_every_one_that_is_while_new_devices_go_first() {
+        let preference = Preference {
+            new_devices_first: true,
+            ..ranked(&["usb-dac", "speakers"])
+        };
+        assert_eq!(preference.rank("hdmi"), 0);
+        assert_eq!(preference.rank("tv"), 0, "every unranked device ties");
+        assert_eq!(preference.rank("usb-dac"), 1);
+        assert_eq!(preference.rank("speakers"), 2);
+    }
+
+    #[test]
+    fn a_device_plugged_in_before_the_app_ranked_it_takes_the_lane_while_new_devices_go_first() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        let first = Preference {
+            new_devices_first: true,
+            ..ranked(&["speakers"])
+        };
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["speakers"],
+            &on("speakers"),
+            &first,
+        );
+        assert_eq!(selection.target, "usb-dac");
+        assert!(selection.write_previous_default, "an arrival");
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &ranked(&["speakers"])
+            ),
+            "speakers",
+            "at the back of the list, it takes nothing"
+        );
+        assert_eq!(
+            output(&devices, &["speakers", "usb-dac"], &on("speakers"), &first),
+            "speakers",
+            "and once it has been seen it is no arrival, first in the list or not"
+        );
+    }
+
+    #[test]
+    fn a_ranking_coming_into_force_chooses_by_rank_past_the_device_the_rules_had() {
+        let devices = [sink("hdmi", 2), sink("usb-dac", 2)];
+        let fresh = Preference {
+            start_over: true,
+            ..ranked(&["usb-dac", "hdmi"])
+        };
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["hdmi", "usb-dac"],
+            &on("hdmi"),
+            &fresh,
+        );
+        assert_eq!(selection.target, "usb-dac");
+        assert!(!selection.write_previous_default, "no arrival");
+        assert_eq!(
+            output(
+                &devices,
+                &["hdmi", "usb-dac"],
+                &on("hdmi"),
+                &ranked(&["usb-dac", "hdmi"])
+            ),
+            "hdmi",
+            "a ranking in force keeps the current device"
+        );
+        let memory = SelectionMemory {
+            user_selected: "hdmi".into(),
+            ..on("usb-dac")
+        };
+        let picked_now = Preference {
+            fresh_pick: true,
+            ..fresh
+        };
+        assert_eq!(
+            output(&devices, &["hdmi", "usb-dac"], &memory, &picked_now),
+            "hdmi",
+            "a fresh pick still comes first"
+        );
+    }
+
+    #[test]
+    fn a_ranked_device_that_appears_above_the_current_one_takes_the_lane() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["speakers"],
+            &on("speakers"),
+            &ranked(&["usb-dac", "speakers"]),
+        );
+        assert_eq!(selection.target, "usb-dac");
+        assert!(
+            selection.write_previous_default,
+            "an arrival re-dates the remembered defaults, as rule 5 does"
+        );
+    }
+
+    #[test]
+    fn a_ranked_device_that_appears_below_the_current_one_does_not_take_it() {
+        let devices = [sink("usb-dac", 2), sink("speakers", 2)];
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["usb-dac"],
+            &on("usb-dac"),
+            &ranked(&["usb-dac", "speakers"]),
+        );
+        assert_eq!(selection.target, "usb-dac");
+        assert!(!selection.write_previous_default);
+    }
+
+    #[test]
+    fn with_no_ranking_the_same_arrival_takes_the_lane_as_rule_five_says() {
+        // The Windows rules, untouched when the list is empty: whatever arrives is taken.
+        let devices = [sink("usb-dac", 2), sink("speakers", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &["usb-dac"],
+                &on("usb-dac"),
+                &Preference::default()
+            ),
+            "speakers"
+        );
+    }
+
+    #[test]
+    fn an_unranked_device_that_appears_never_takes_the_lane_from_a_ranked_one() {
+        let devices = [sink("speakers", 2), sink("tv", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &ranked(&["usb-dac", "speakers"])
+            ),
+            "speakers"
+        );
+    }
+
+    #[test]
+    fn an_unranked_device_that_appears_does_not_take_the_lane_from_another_unranked_one() {
+        // Equal places: the device the lane is on keeps it.
+        let devices = [sink("tv", 2), sink("projector", 2)];
+        assert_eq!(
+            output(&devices, &["tv"], &on("tv"), &ranked(&["usb-dac"])),
+            "tv"
+        );
+    }
+
+    #[test]
+    fn of_several_arrivals_the_best_ranked_one_is_weighed_against_the_current_device() {
+        let devices = [
+            sink("speakers", 2),
+            sink("tv", 2),
+            sink("headphones", 2),
+            sink("usb-dac", 2),
+        ];
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &ranked(&["usb-dac", "speakers", "headphones"])
+            ),
+            "usb-dac",
+            "the first arrival in the graph is unranked, the best is ranked first"
+        );
+    }
+
+    #[test]
+    fn when_the_current_device_goes_the_first_present_by_rank_is_taken() {
+        let devices = [sink("speakers", 2), sink("headphones", 2), sink("tv", 2)];
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["speakers", "headphones", "tv", "usb-dac"],
+            &on("usb-dac"),
+            &ranked(&["usb-dac", "headphones", "speakers"]),
+        );
+        assert_eq!(selection.target, "headphones");
+        assert!(!selection.write_previous_default);
+    }
+
+    #[test]
+    fn unranked_devices_come_after_every_ranked_one_in_the_graphs_order() {
+        let devices = [sink("tv", 2), sink("projector", 2), sink("speakers", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &[],
+                &SelectionMemory::default(),
+                &ranked(&["usb-dac", "speakers"])
+            ),
+            "speakers",
+            "a ranked device outranks every unranked one, wherever it is in the graph"
+        );
+        let unranked_only = [sink("tv", 2), sink("projector", 2)];
+        assert_eq!(
+            output(
+                &unranked_only,
+                &[],
+                &SelectionMemory::default(),
+                &ranked(&["usb-dac"])
+            ),
+            "tv",
+            "with nothing ranked present, the graph's order"
+        );
+    }
+
+    #[test]
+    fn a_ranking_takes_the_best_device_on_a_first_run_rather_than_the_session_default() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        // `picked` puts the session default on the first sink, the speakers.
+        assert_eq!(
+            output(
+                &devices,
+                &[],
+                &SelectionMemory::default(),
+                &ranked(&["usb-dac", "speakers"])
+            ),
+            "usb-dac"
+        );
+        assert_eq!(
+            output(
+                &devices,
+                &[],
+                &SelectionMemory::default(),
+                &Preference::default()
+            ),
+            "speakers",
+            "following the system, the first run adopts the session default"
+        );
+    }
+
+    #[test]
+    fn with_a_ranking_the_session_default_does_not_move_the_lane() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        // The session default is the speakers; the lane is on the DAC, and nothing arrived.
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers", "usb-dac"],
+                &on("usb-dac"),
+                &ranked(&["speakers", "usb-dac"])
+            ),
+            "usb-dac"
+        );
+    }
+
+    #[test]
+    fn a_device_the_user_has_just_picked_wins_over_the_ranking() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        let memory = SelectionMemory {
+            user_selected: "speakers".into(),
+            ..on("usb-dac")
+        };
+        let preference = Preference {
+            fresh_pick: true,
+            ..ranked(&["usb-dac", "speakers"])
+        };
+        let selection = picked(
+            &devices,
+            DeviceDirection::Output,
+            &["speakers", "usb-dac"],
+            &memory,
+            &preference,
+        );
+        assert_eq!(selection.target, "speakers");
+        assert!(!selection.write_previous_default, "rule 4 never did");
+    }
+
+    #[test]
+    fn once_the_pick_is_the_current_device_a_better_ranked_arrival_takes_the_lane_from_it() {
+        // The user picked the speakers over the ranking; later the DAC is plugged in.
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        let memory = SelectionMemory {
+            user_selected: "speakers".into(),
+            ..on("speakers")
+        };
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &memory,
+                &ranked(&["usb-dac", "speakers"])
+            ),
+            "usb-dac"
+        );
+    }
+
+    #[test]
+    fn a_pick_that_went_and_came_back_is_an_arrival_like_any_other() {
+        // Following the system, rule 4 would take it back; with a ranking it has to outrank the
+        // device the lane went to meanwhile.
+        let devices = [sink("usb-dac", 2), sink("speakers", 2)];
+        let memory = SelectionMemory {
+            user_selected: "speakers".into(),
+            ..on("usb-dac")
+        };
+        assert_eq!(
+            output(
+                &devices,
+                &["usb-dac"],
+                &memory,
+                &ranked(&["usb-dac", "speakers"])
+            ),
+            "usb-dac"
+        );
+        assert_eq!(
+            output(&devices, &["usb-dac"], &memory, &Preference::default()),
+            "speakers"
+        );
+    }
+
+    #[test]
+    fn a_pick_that_is_not_there_leaves_the_choice_to_the_ranking() {
+        let devices = [sink("speakers", 2), sink("usb-dac", 2)];
+        let memory = SelectionMemory {
+            user_selected: "headphones".into(),
+            ..SelectionMemory::default()
+        };
+        let preference = Preference {
+            fresh_pick: true,
+            ..ranked(&["usb-dac", "speakers"])
+        };
+        assert_eq!(output(&devices, &[], &memory, &preference), "usb-dac");
+    }
+
+    #[test]
+    fn the_input_lane_is_ranked_the_same_way() {
+        let sources = [
+            source("internal-mic", 2),
+            source("usb-mic", 1),
+            sink("usb-dac", 2),
+        ];
+        let preference = ranked(&["headset-mic", "usb-mic", "internal-mic"]);
+        let input = |previous: &[&str], memory: &SelectionMemory| {
+            picked(
+                &sources,
+                DeviceDirection::Input,
+                previous,
+                memory,
+                &preference,
+            )
+            .target
+        };
+        assert_eq!(
+            input(&["internal-mic"], &on("internal-mic")),
+            "usb-mic",
+            "arrived, ranked above"
+        );
+        assert_eq!(
+            input(&["usb-mic"], &on("usb-mic")),
+            "usb-mic",
+            "the internal one arrived below it"
+        );
+        assert_eq!(
+            input(
+                &["internal-mic", "usb-mic", "headset-mic"],
+                &on("headset-mic")
+            ),
+            "usb-mic",
+            "the headset went: the next by rank"
+        );
+    }
+
+    #[test]
+    fn an_unheard_device_is_passed_over_even_when_ranked_first() {
+        let devices = [unheard(sink("hdmi", 2)), sink("speakers", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &[],
+                &SelectionMemory::default(),
+                &ranked(&["hdmi", "speakers"])
+            ),
+            "speakers"
+        );
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &ranked(&["hdmi", "speakers"])
+            ),
+            "speakers",
+            "nor does it count as an arrival"
+        );
+    }
+
+    #[test]
+    fn a_current_device_gone_silent_is_left_for_the_next_by_rank() {
+        let devices = [unheard(sink("hdmi", 2)), sink("speakers", 2), sink("tv", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &["hdmi", "speakers", "tv"],
+                &on("hdmi"),
+                &ranked(&["hdmi", "speakers"])
+            ),
+            "speakers"
+        );
+    }
+
+    #[test]
+    fn a_device_that_becomes_heard_arrives_as_a_new_one() {
+        // The monitor is plugged in: the HDMI sink was there all along, but not among what the
+        // rules chose from last time.
+        let devices = [sink("hdmi", 2), sink("speakers", 2)];
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &ranked(&["hdmi", "speakers"])
+            ),
+            "hdmi"
+        );
+        assert_eq!(
+            output(
+                &devices,
+                &["speakers"],
+                &on("speakers"),
+                &Preference::default()
+            ),
+            "hdmi",
+            "following the system too, as the HDMI endpoint appearing does on Windows"
+        );
+    }
+
+    #[test]
+    fn an_unheard_device_is_never_rule_sevens_first_device() {
+        // We are the default, nothing is remembered, nothing is new: rule 7 ends in the first
+        // device there is, which here is the silent one.
+        let devices = [unheard(sink("hdmi", 2)), sink("speakers", 2)];
+        let selection = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &[],
+            &SelectionMemory {
+                most_recent_default: "gone".into(),
+                ..SelectionMemory::default()
+            },
+        )
+        .expect("a device");
+        assert_eq!(selection.target, "speakers");
+    }
+
+    #[test]
+    fn an_unheard_device_wins_no_rule_while_anything_can_be_heard() {
+        let devices = [unheard(sink("hdmi", 2)), sink("speakers", 2)];
+        let everything_says_hdmi = SelectionMemory {
+            original_default: "hdmi".into(),
+            most_recent_default: "hdmi".into(),
+            prior_default: "hdmi".into(),
+            most_recent_playback: "hdmi".into(),
+            user_selected: "hdmi".into(),
+        };
+        let selection = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("hdmi"),
+            &names(&["speakers"]),
+            &everything_says_hdmi,
+        )
+        .expect("a device");
+        assert_eq!(selection.target, "speakers", "rules 2 to 7 all name it");
+        let fresh = Preference {
+            fresh_pick: true,
+            ..ranked(&["hdmi"])
+        };
+        assert_eq!(
+            output(&devices, &[], &everything_says_hdmi, &fresh),
+            "speakers",
+            "nor a pick of it, ranked or not"
+        );
+    }
+
+    #[test]
+    fn with_nothing_heard_at_all_the_rules_run_on_what_is_there() {
+        // A desktop whose only outputs are two sleeping monitors: tearing FxSound's node down for
+        // "no devices" would move every application off it until one wakes. The exception U4
+        // records in `docs/0.4.0-upstream.md`.
+        let devices = [unheard(sink("hdmi-1", 2)), unheard(sink("hdmi-2", 2))];
+        assert_eq!(
+            output(&devices, &[], &on("hdmi-2"), &ranked(&["hdmi-1", "hdmi-2"])),
+            "hdmi-2",
+            "the device the lane is on is kept"
+        );
+        assert_eq!(
+            output(&devices, &[], &on("hdmi-2"), &Preference::default()),
+            "hdmi-1",
+            "the session default, following the system"
+        );
+        assert_eq!(
+            candidates(&devices, DeviceDirection::Output, "fxsound_sink").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_lone_sleeping_monitor_keeps_the_output_lane_rather_than_ending_in_no_devices() {
+        let devices = [unheard(sink("hdmi", 2)), sink("fxsound_sink", 2)];
+        let selection = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &names(&["hdmi"]),
+            &on("hdmi"),
+        );
+        assert_eq!(
+            selection.map(|selection| selection.target),
+            Ok("hdmi".to_owned()),
+            "rule 3, not NoOutputDevices"
+        );
+        assert_eq!(
+            output(&devices, &["hdmi"], &on("hdmi"), &ranked(&["hdmi"])),
+            "hdmi",
+            "and ranked the same"
+        );
+    }
+
+    #[test]
+    fn an_empty_headset_jack_that_is_the_only_microphone_keeps_the_input_lane() {
+        let sources = [
+            unheard(source("headset-mic", 1)),
+            unheard(source("line-in", 2)),
+            source("fxsound_source", 2),
+        ];
+        let lone = [unheard(source("headset-mic", 1))];
+        assert_eq!(
+            choose_device(
+                &lone,
+                DeviceDirection::Input,
+                "fxsound_source",
+                None,
+                &[],
+                &SelectionMemory::default(),
+                &Preference::default(),
+            )
+            .map(|selection| selection.target),
+            Ok("headset-mic".to_owned()),
+            "rule 3, not NoInputDevices"
+        );
+        assert_eq!(
+            picked(
+                &sources,
+                DeviceDirection::Input,
+                &["headset-mic", "line-in"],
+                &on("line-in"),
+                &ranked(&["headset-mic", "line-in"]),
+            )
+            .target,
+            "line-in",
+            "the ranked rules keep the device the lane is on"
+        );
+        assert_eq!(
+            candidates(&sources, DeviceDirection::Input, "fxsound_source").len(),
+            2,
+            "every real microphone, and never ours"
+        );
+    }
+
+    #[test]
+    fn once_anything_can_be_heard_again_the_silent_devices_drop_out() {
+        let asleep = [unheard(sink("hdmi-1", 2)), unheard(sink("hdmi-2", 2))];
+        let one_awake = [unheard(sink("hdmi-1", 2)), sink("hdmi-2", 2)];
+        assert_eq!(
+            output(&asleep, &[], &on("hdmi-1"), &ranked(&["hdmi-1", "hdmi-2"])),
+            "hdmi-1"
+        );
+        assert_eq!(
+            output(
+                &one_awake,
+                &["hdmi-1", "hdmi-2"],
+                &on("hdmi-1"),
+                &ranked(&["hdmi-1", "hdmi-2"]),
+            ),
+            "hdmi-2",
+            "the lane leaves the silent device it was kept on"
+        );
+    }
+
+    #[test]
+    fn the_candidates_are_the_heard_devices_of_the_direction_and_never_ours() {
+        let devices = [
+            unheard(sink("hdmi", 2)),
+            sink("speakers", 2),
+            sink("fxsound_sink", 2),
+            source("mic", 1),
+            unheard(source("headset-mic", 1)),
+        ];
+        let named = |direction, ours| -> Vec<String> {
+            candidates(&devices, direction, ours)
+                .into_iter()
+                .map(|device| device.name.clone())
+                .collect()
+        };
+        assert_eq!(named(DeviceDirection::Output, "fxsound_sink"), ["speakers"]);
+        assert_eq!(named(DeviceDirection::Input, "fxsound_source"), ["mic"]);
+    }
+
+    #[test]
+    fn the_default_is_handed_back_to_a_remembered_device_that_can_be_heard_first() {
+        let sources = [unheard(source("headset-mic", 1)), source("dmic", 2)];
+        let memory = SelectionMemory {
+            user_selected: "headset-mic".into(),
+            most_recent_playback: "dmic".into(),
+            ..SelectionMemory::default()
+        };
+        assert_eq!(
+            restore_default_candidate(&memory, &sources, DeviceDirection::Input).as_deref(),
+            Some("dmic")
+        );
+        let silent = [unheard(source("headset-mic", 1))];
+        assert_eq!(
+            restore_default_candidate(&memory, &silent, DeviceDirection::Input).as_deref(),
+            Some("headset-mic"),
+            "with nothing remembered heard, the order alone decides"
+        );
+    }
+
+    #[test]
+    fn a_nodes_card_device_is_read_from_its_properties() {
+        let hdmi = DeviceInfo::from_props(
+            52,
+            &props_of(&[
+                ("media.class", "Audio/Sink"),
+                ("node.name", "hdmi"),
+                ("card.profile.device", "2"),
+            ]),
+        )
+        .expect("a sink");
+        assert_eq!(hdmi.profile_device, Some(2));
+        assert!(hdmi.available, "heard until its card says otherwise");
+        let virtual_sink = DeviceInfo::from_props(
+            80,
+            &props_of(&[("media.class", "Audio/Sink"), ("node.name", "virtual")]),
+        )
+        .expect("a sink");
+        assert_eq!(virtual_sink.profile_device, None);
+    }
+
+    // The UCM laptop (`crate::routes`' fixture): every HDMI port empty, nothing in the headset jack.
+
+    use crate::routes::tests::{
+        DMIC, HDMI1, HDMI2, HDMI3, HEADSET_MIC, SPEAKER, ucm_devices_as_heard,
+    };
+
+    #[test]
+    fn on_the_ucm_laptop_a_ranking_with_hdmi_first_still_plays_to_the_speakers() {
+        let devices = ucm_devices_as_heard();
+        let preference = ranked(&[HDMI1, HDMI2, HDMI3, SPEAKER]);
+        assert_eq!(
+            output(&devices, &[], &SelectionMemory::default(), &preference),
+            SPEAKER
+        );
+        assert_eq!(
+            output(&devices, &[SPEAKER], &on(SPEAKER), &preference),
+            SPEAKER
+        );
+    }
+
+    #[test]
+    fn on_the_ucm_laptop_rule_sevens_first_device_is_not_a_silent_hdmi_sink() {
+        // The speakers' node made last, as it is after the headphones come out and the card
+        // switches profile: the graph lists the HDMI sinks first.
+        let mut devices = ucm_devices_as_heard();
+        devices.sort_by_key(|device| device.name != HDMI1);
+        assert_eq!(devices[0].name, HDMI1);
+        let selection = choose_output(
+            &devices,
+            "fxsound_sink",
+            Some("fxsound_sink"),
+            &[],
+            &SelectionMemory {
+                most_recent_default: "gone".into(),
+                ..SelectionMemory::default()
+            },
+        )
+        .expect("a device");
+        assert_eq!(selection.target, SPEAKER);
+    }
+
+    #[test]
+    fn on_the_ucm_laptop_the_empty_headset_jacks_microphone_is_passed_over() {
+        let devices = ucm_devices_as_heard();
+        let selection = picked(
+            &devices,
+            DeviceDirection::Input,
+            &[],
+            &SelectionMemory::default(),
+            &ranked(&[HEADSET_MIC, DMIC]),
+        );
+        assert_eq!(selection.target, DMIC);
     }
 }

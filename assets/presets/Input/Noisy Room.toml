@@ -1,0 +1,47 @@
+# The case the decision record rejected as a preset, and why it is one now. The objection was
+# right: a gate does nothing about noise *during* speech, and a threshold high enough to hold a
+# -30 dB floor chatters on every word. What changed is that the denoiser has a level. Strong is
+# the network's whole opinion with nothing handed back, and Mono — one network on the downmix,
+# the same signal to every channel — because a room's noise is not an image worth keeping and a
+# second network is a second opinion about where the voice is. The gate is then a gate against a
+# *denoised* floor: -40 dB with the voice probability holding it open, a -20 dB range so that
+# what is left of the room comes and goes gently rather than switching. The 120 Hz corner takes
+# the fan's fundamental and traffic rumble the network is least sure about; the cut at 200 Hz is
+# the same idea one octave up.
+name = "Noisy Room"
+description = "An open room with a fan or traffic in it: the denoiser at full strength, then a gate that only hears the voice."
+rnnoise = true
+highpass_hz = 120.0
+highpass_order = 4
+makeup_db = 7.0
+ceiling_db = -3.0
+vad_gate = true
+
+[denoise]
+level = "strong"
+channels = "mono"
+
+[gate]
+threshold_db = -40.0
+ratio = 3.0
+range_db = -20.0
+attack_ms = 5.0
+release_ms = 150.0
+hold_ms = 200.0
+detection = "rms"
+
+[compressor]
+threshold_db = -18.0
+ratio = 4.0
+knee_db = 6.0
+attack_ms = 15.0
+release_ms = 150.0
+detection = "rms"
+
+[deesser]
+frequency_hz = 5500.0
+threshold_db = -24.0
+
+[eq]
+centers_hz = [62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0]
+gains_db = [0, 0, -1.5, 0, 0, 0, 2.0, 0, 0, 0]

@@ -22,6 +22,9 @@
 //! `FxView::modelChanged` builds the preset items as `preset.modified ? name + " *" : name`
 //! (`FxView.cpp:205-225`, `docs/spec/03-controls.md` §8.4), so the marker is part of the *label*,
 //! not of the widget. [`preset_label`] is that one line, kept here so the marker is written once.
+//! The original elides a label too long for its box from the end, so the marker went first and a
+//! long preset name lost the one sign of its unsaved changes (0.4.0 audit #26); the preset list
+//! passes [`FxComboBox::keep_suffix`], and a label is cut in its name instead.
 //! Item ids in the original are `index + 1` because JUCE reserves id 0 for "nothing selected";
 //! [`FxComboBox::new`] takes an `Option<usize>` index instead, which is the same information
 //! without the off-by-one.
@@ -48,10 +51,12 @@
 //!
 //! ## Deviations from the original
 //!
-//! * **The popup opens below the box**, using [`egui::Popup`]'s own flip-when-it-does-not-fit
-//!   logic. JUCE positions a `ComboBox` menu so that the *selected* row covers the box, which on a
-//!   120-entry preset list means the menu opens under the pointer with the list scrolled to the
-//!   selection. Reproducing that needs a scroll offset egui's `Popup` does not expose.
+//! * **The popup opens below the box**, over it when it fits there instead, and over the box
+//!   only when neither leaves room for three rows ([`place_list`]), always inside the bounds the
+//!   window sets ([`set_popup_bounds`]). JUCE positions a `ComboBox` menu so that the *selected*
+//!   row covers the box, which on a 120-entry preset list means the menu opens under the pointer
+//!   with the list scrolled to the selection. Reproducing that needs a scroll offset egui's
+//!   `Popup` does not expose.
 //! * **Long lists scroll with a scrollbar**, not with JUCE's top/bottom scroll arrows. The menu
 //!   therefore closes on a click *outside* it or on a picked item, not on any click at all: a
 //!   click on the scrollbar, a separator or a section header leaves it open, which is also what a
@@ -129,6 +134,9 @@ pub const HEADER_FONT_RATIO: f32 = 0.75;
 /// A section header's title is `MenuText` at this alpha **(port addition)**: legible, but clearly
 /// not one of the things that can be picked.
 pub const HEADER_TEXT_ALPHA: f32 = 0.6;
+/// The edit direction's device list is outlined in `HighlightedText` at this alpha **(port
+/// addition, 0.4.0 design §1.4)** — see [`FxComboBox::accent`].
+pub const ACCENT_ALPHA: f32 = 0.6;
 
 /// `cornerSize = (float) height / 5` (`FxTheme.cpp:138`).
 ///
@@ -235,6 +243,73 @@ pub fn popup_header_font_size(row_height: f32) -> f32 {
     popup_font_size(row_height) * HEADER_FONT_RATIO
 }
 
+/// How tall a drop-down's list is with every row showing: its items, its section titles and its
+/// separator, plus the one-point border above and below.
+#[must_use]
+pub fn popup_list_height(items: usize, headers: usize, separator: bool, row_height: f32) -> f32 {
+    items as f32 * row_height
+        + headers as f32 * popup_header_height(row_height)
+        + if separator {
+            popup_separator_height(row_height)
+        } else {
+            0.0
+        }
+        + 2.0
+}
+
+/// How far above the window's bottom edge an open list stops.
+pub const POPUP_WINDOW_MARGIN: f32 = 4.0;
+
+fn popup_bounds_id() -> Id {
+    Id::new("fx_combo_popup_bounds")
+}
+
+/// Where an open list may hang, in points: under the title bar and down to the window's bottom
+/// edge. The window sets it every frame before it draws; without it a list may use all of the
+/// window.
+///
+/// A drop-down cannot leave the window it is drawn in, where the original's `PopupMenu` is a
+/// window of its own, and the window does not grow for it: the Lite window's two lists scroll in
+/// the 128 points under its title bar ([`place_list`]).
+pub fn set_popup_bounds(ctx: &egui::Context, bounds: Rect) {
+    ctx.data_mut(|data| data.insert_temp(popup_bounds_id(), bounds));
+}
+
+fn popup_bounds(ctx: &egui::Context) -> Rect {
+    ctx.data(|data| data.get_temp::<Rect>(popup_bounds_id()))
+        .unwrap_or_else(|| {
+            let window = ctx.content_rect();
+            window.with_max_y(window.bottom() - POPUP_WINDOW_MARGIN)
+        })
+}
+
+/// How many rows a list shows at the least under its box before it goes over the box instead.
+const MIN_ROWS_BELOW: f32 = 3.0;
+
+/// Where a list `list` points tall hangs from the box at `anchor`, inside `bounds`: its top and
+/// its height.
+///
+/// Under the box when all of it fits there, and over the box when all of it fits there instead,
+/// as egui's own popup flips. A longer list scrolls: under the box while [`MIN_ROWS_BELOW`] rows
+/// fit there, and otherwise from as low as it goes in the bounds, over the box, the way a JUCE
+/// menu covers its box. That is the Lite window's two lists: 34 points under their boxes, and
+/// never over the title bar, where egui had pushed them (E6b).
+#[must_use]
+pub fn place_list(anchor: Rect, list: f32, bounds: Rect, row_height: f32) -> (f32, f32) {
+    let below = (bounds.bottom() - anchor.bottom()).max(0.0);
+    let above = (anchor.top() - bounds.top()).max(0.0);
+    if list <= below {
+        (anchor.bottom(), list)
+    } else if list <= above {
+        (anchor.top() - list, list)
+    } else if below >= MIN_ROWS_BELOW * row_height + 2.0 {
+        (anchor.bottom(), below)
+    } else {
+        let height = list.min(bounds.height().max(0.0));
+        ((bounds.bottom() - height).max(bounds.top()), height)
+    }
+}
+
 /// `(row height - 2) / 1.3`, the one quantity both the popup font and the icon column derive from.
 fn max_popup_font_height(row_height: f32) -> f32 {
     (row_height - 2.0).max(1.0) / POPUP_FONT_RATIO
@@ -270,6 +345,26 @@ pub fn outline_colour(palette: Palette, error: Option<bool>, focused: bool) -> C
         Some(false) => palette.color(FxColor::DefaultFill),
         None => palette.color(FxColor::ComboBoxBackground),
     }
+}
+
+/// The outline actually stroked: [`outline_colour`], with the accent **(port addition)** in
+/// between.
+///
+/// Keyboard focus still wins, and so does a real error — an unavailable device is the one thing
+/// the outline must never stop saying. Below those, an accented box gets a one-point hairline in
+/// `HighlightedText` at [`ACCENT_ALPHA`]: white on the dark palette, black on the light one, so
+/// it reads in both without a colour of its own.
+#[must_use]
+pub fn box_outline_colour(
+    palette: Palette,
+    error: Option<bool>,
+    focused: bool,
+    accent: bool,
+) -> Color32 {
+    if accent && !focused && error != Some(true) {
+        return palette.color_alpha(FxColor::HighlightedText, ACCENT_ALPHA);
+    }
+    outline_colour(palette, error, focused)
 }
 
 /// The closed box's text colour (`FxComboBox::highlightText`, `FxComboBox.cpp:36-54`).
@@ -308,10 +403,13 @@ pub struct FxComboBox<'a> {
     selected: Option<usize>,
     enabled: bool,
     placeholder: &'a str,
+    current: Option<&'a str>,
     error: Option<bool>,
     separator_before: Option<usize>,
     headers: &'a [SectionHeader<'a>],
     row_height: Option<f32>,
+    accent: bool,
+    keep: &'a str,
 }
 
 impl<'a> FxComboBox<'a> {
@@ -326,11 +424,34 @@ impl<'a> FxComboBox<'a> {
             selected,
             enabled: true,
             placeholder: "",
+            current: None,
             error: None,
             separator_before: None,
             headers: &[],
             row_height: None,
+            accent: false,
+            keep: "",
         }
+    }
+
+    /// A suffix that is never elided **(port addition)**: an item ending in it that does not fit is
+    /// cut before it, `Evening Headphones M… *`, not after. The preset list passes
+    /// [`MODIFIED_SUFFIX`] (0.4.0 audit #26).
+    #[must_use]
+    pub fn keep_suffix(mut self, suffix: &'a str) -> Self {
+        self.keep = suffix;
+        self
+    }
+
+    /// Outline the box as the one the window is editing **(port addition)**.
+    ///
+    /// The Pro view has a device list per lane, and the preset list and the equalizer address
+    /// whichever lane is being edited; this is how the window says which. See
+    /// [`box_outline_colour`] for what it gives way to.
+    #[must_use]
+    pub fn accent(mut self, accent: bool) -> Self {
+        self.accent = accent;
+        self
     }
 
     /// A disabled box shows the grey arrow and cannot be opened (`FxTheme.cpp:159-163`).
@@ -347,6 +468,15 @@ impl<'a> FxComboBox<'a> {
     #[must_use]
     pub fn placeholder(mut self, text: &'a str) -> Self {
         self.placeholder = text;
+        self
+    }
+
+    /// What the closed box shows when no item is selected and yet something is current: a device
+    /// a lane is on that the list does not carry right now **(port addition)**. Drawn as a
+    /// selected item is, not dimmed as the placeholder, which means nothing is chosen.
+    #[must_use]
+    pub fn current(mut self, text: Option<&'a str>) -> Self {
+        self.current = text;
         self
     }
 
@@ -406,10 +536,13 @@ impl<'a> FxComboBox<'a> {
             selected,
             enabled,
             placeholder,
+            current,
             error,
             separator_before,
             headers,
             row_height,
+            accent,
+            keep,
         } = self;
 
         let id = Id::new("fx_combo_box").with(id_salt);
@@ -428,11 +561,16 @@ impl<'a> FxComboBox<'a> {
             rect,
             palette,
             assets,
-            items,
-            selected,
+            BoxText {
+                items,
+                selected,
+                placeholder,
+                current,
+                keep,
+            },
             enabled,
-            placeholder,
             error,
+            accent,
             &response,
         );
 
@@ -449,11 +587,22 @@ impl<'a> FxComboBox<'a> {
             selected,
             separator_before,
             headers,
-            row_h,
+            (row_h, keep),
             &response,
         );
         (response, picked)
     }
+}
+
+/// What the closed box can show: the selected item, or what is current without being an item,
+/// or the placeholder.
+struct BoxText<'a> {
+    items: &'a [String],
+    selected: Option<usize>,
+    placeholder: &'a str,
+    current: Option<&'a str>,
+    /// [`FxComboBox::keep_suffix`].
+    keep: &'a str,
 }
 
 /// Everything `FxTheme::drawComboBox` puts on screen, in its order (`FxTheme.cpp:135-164`).
@@ -463,13 +612,19 @@ fn paint_box(
     rect: Rect,
     palette: Palette,
     assets: &mut AssetCache,
-    items: &[String],
-    selected: Option<usize>,
+    text: BoxText<'_>,
     enabled: bool,
-    placeholder: &str,
     error: Option<bool>,
+    accent: bool,
     response: &Response,
 ) {
+    let BoxText {
+        items,
+        selected,
+        placeholder,
+        current,
+        keep,
+    } = text;
     let painter = ui.painter().clone();
     let corner = CornerRadius::same(corner_radius(rect.height()) as u8);
 
@@ -479,15 +634,21 @@ fn paint_box(
     painter.rect_stroke(
         rect,
         corner,
-        Stroke::new(1.0, outline_colour(palette, error, response.has_focus())),
+        Stroke::new(
+            1.0,
+            box_outline_colour(palette, error, response.has_focus(), accent),
+        ),
         StrokeKind::Inside,
     );
 
     let font = theme::semibold(font_size(rect.height()));
-    let text = selected.and_then(|index| items.get(index));
+    let text = selected
+        .and_then(|index| items.get(index))
+        .map(String::as_str)
+        .or(current);
     let (label, colour, left) = match text {
         Some(label) => (
-            label.as_str(),
+            label,
             text_colour(palette, enabled, response.hovered()),
             rect.left() + TEXT_LEFT,
         ),
@@ -502,7 +663,7 @@ fn paint_box(
         let box_ = text_box(rect);
         draw_truncated(
             &painter,
-            label,
+            (label, keep),
             font,
             colour,
             left,
@@ -541,7 +702,7 @@ fn popup(
     selected: Option<usize>,
     separator_before: Option<usize>,
     headers: &[SectionHeader<'_>],
-    row_height: f32,
+    (row_height, keep): (f32, &str),
     response: &Response,
 ) -> Option<usize> {
     let popup_id = egui::Popup::default_response_id(response);
@@ -573,9 +734,18 @@ fn popup(
     } else {
         rect.width()
     };
+    let titles = headers
+        .iter()
+        .filter(|header| header.before < items.len())
+        .count();
+    let rule = separator_before.is_some_and(|index| index < items.len());
+    let list = popup_list_height(items.len(), titles, rule, row_height);
     // JUCE keeps the menu on screen by scrolling it; this keeps it on screen by scrolling it too,
-    // just with a scrollbar instead of arrows.
-    let max_height = (ui.ctx().content_rect().height() - rect.height()).max(row_height);
+    // just with a scrollbar instead of arrows. Placed by hand rather than by egui, which pushed a
+    // list that fitted neither under nor over its box up over the title bar ([`place_list`]).
+    let (top, height) = place_list(rect, list, popup_bounds(ui.ctx()), row_height);
+    // Inside the one-point border above and below.
+    let scroll = (height - 2.0).max(1.0);
 
     let frame = egui::Frame::NONE
         .fill(palette.color(FxColor::DefaultFill))
@@ -592,13 +762,17 @@ fn popup(
         // menu stays. `CloseOnClick` would close on every one of those, so the picked row closes
         // the menu itself (`Ui::close`) and only an outside click is left to egui.
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .anchor(egui::PopupAnchor::Position(egui::pos2(rect.left(), top)))
+        .align(egui::RectAlign::BOTTOM_START)
+        .align_alternatives(&[])
         .gap(0.0)
         .width(width)
         .frame(frame)
         .show(|ui| {
             ui.spacing_mut().item_spacing = Vec2::ZERO;
             egui::ScrollArea::vertical()
-                .max_height(max_height)
+                .max_height(scroll)
+                .min_scrolled_height(scroll)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     for (index, item) in items.iter().enumerate() {
@@ -609,7 +783,8 @@ fn popup(
                             header(ui, palette, section.label, &header_font, width, row_height);
                         }
                         let ticked = selected == Some(index);
-                        if row(ui, palette, item, &font, width, row_height, ticked) {
+                        let text = (item.as_str(), keep);
+                        if row(ui, palette, text, &font, width, row_height, ticked) {
                             picked = Some(index);
                             ui.close();
                         }
@@ -623,7 +798,7 @@ fn popup(
 fn row(
     ui: &mut Ui,
     palette: Palette,
-    text: &str,
+    text: (&str, &str),
     font: &FontId,
     width: f32,
     height: f32,
@@ -702,7 +877,7 @@ fn header(ui: &mut Ui, palette: Palette, text: &str, font: &FontId, width: f32, 
         ui.allocate_exact_size(vec2(width, popup_header_height(row_height)), Sense::hover());
     draw_truncated(
         ui.painter(),
-        text,
+        (text, ""),
         font.clone(),
         palette.color_alpha(FxColor::MenuText, HEADER_TEXT_ALPHA),
         rect.left() + popup_text_x(row_height),
@@ -711,26 +886,62 @@ fn header(ui: &mut Ui, palette: Palette, text: &str, font: &FontId, width: f32, 
     );
 }
 
-/// Draw one line of text, elided with `…` rather than condensed.
+/// Draw one line of text, elided with `…` rather than condensed, and never in `keep` when the
+/// text ends in it ([`FxComboBox::keep_suffix`]): the part before it is elided instead.
 ///
 /// `label.setMinimumHorizontalScale(1.0)` (`FxTheme.cpp:130`) is what rules out JUCE's default
 /// squeeze-to-fit; `drawFittedText` then drops the overflow. egui's `TextWrapping::truncate_at_width`
 /// is the same contract with a nicer ellipsis.
 fn draw_truncated(
     painter: &egui::Painter,
-    text: &str,
+    (text, keep): (&str, &str),
     font: FontId,
     colour: Color32,
     left: f32,
     right: f32,
     center_y: f32,
 ) {
-    let mut job =
-        LayoutJob::single_section(text.to_owned(), egui::TextFormat::simple(font, colour));
-    job.wrap = TextWrapping::truncate_at_width((right - left).max(0.0));
-    let galley = painter.layout_job(job);
+    let room = (right - left).max(0.0);
+    let line = |text: &str, room: f32| truncated_line(painter, text, font.clone(), colour, room);
+    let galley = line(text, room);
+    if galley.elided
+        && !keep.is_empty()
+        && let Some(head) = text.strip_suffix(keep)
+    {
+        let tail = painter.layout_no_wrap(keep.to_owned(), font.clone(), colour);
+        let head = line(head, (room - tail.size().x).max(0.0));
+        let x = left + head.size().x;
+        painter.galley(pos2(left, center_y - head.size().y / 2.0), head, colour);
+        painter.galley(pos2(x, center_y - tail.size().y / 2.0), tail, colour);
+        return;
+    }
     let y = center_y - galley.size().y / 2.0;
     painter.galley(pos2(left, y), galley, colour);
+}
+
+/// `text` on one line in `font`, cut with `…` where it passes `room`: the layout
+/// [`draw_truncated`] draws and [`shows_whole`] asks about.
+fn truncated_line(
+    painter: &egui::Painter,
+    text: &str,
+    font: FontId,
+    colour: Color32,
+    room: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job =
+        LayoutJob::single_section(text.to_owned(), egui::TextFormat::simple(font, colour));
+    job.wrap = TextWrapping::truncate_at_width(room);
+    painter.layout_job(job)
+}
+
+/// Whether a box drawing `text` in `font` across `room` points shows it whole, with no `…`.
+///
+/// Asked of the layout the box draws rather than of a measured width: egui lets a line run half a
+/// point past its room before cutting it, so a label measured a fraction wider than `room` is
+/// still drawn whole.
+#[must_use]
+pub fn shows_whole(painter: &egui::Painter, text: &str, font: FontId, room: f32) -> bool {
+    !truncated_line(painter, text, font, Color32::PLACEHOLDER, room).elided
 }
 
 #[cfg(test)]
@@ -748,6 +959,50 @@ mod tests {
     /// The EQ band-count combo (`FxAudioControls.cpp:436`).
     fn band_combo() -> Rect {
         Rect::from_min_size(pos2(8.0, 28.0), vec2(152.0, 20.0))
+    }
+
+    #[test]
+    fn a_list_hangs_under_its_box_when_it_fits_there_and_over_it_when_it_fits_there_instead() {
+        let bounds = Rect::from_min_max(pos2(0.0, 57.0), pos2(1040.0, 584.0));
+        let row = popup_row_height(40.0);
+        let high = Rect::from_min_size(pos2(40.0, 80.0), vec2(300.0, 40.0));
+        assert_eq!(place_list(high, 200.0, bounds, row), (120.0, 200.0));
+        let low = Rect::from_min_size(pos2(40.0, 500.0), vec2(300.0, 40.0));
+        assert_eq!(place_list(low, 200.0, bounds, row), (300.0, 200.0));
+    }
+
+    #[test]
+    fn a_long_list_scrolls_under_its_box_where_three_rows_fit_there() {
+        // The Pro preset list: egui pushed it up over the title bar.
+        let bounds = Rect::from_min_max(pos2(0.0, 57.0), pos2(1040.0, 584.0));
+        let combo = Rect::from_min_size(pos2(40.0, 80.0), vec2(470.0, 40.0));
+        let row = popup_row_height(combo.height());
+        let (top, height) = place_list(combo, 40.0 * row + 2.0, bounds, row);
+        assert_eq!(
+            (top, height),
+            (combo.bottom(), bounds.bottom() - combo.bottom())
+        );
+    }
+
+    #[test]
+    fn a_lite_list_in_a_window_that_does_not_grow_scrolls_over_its_box_and_never_over_the_title_bar()
+     {
+        // E6b, on Hyprland: 34 points under the box, and egui put the list over the title bar.
+        let bounds = Rect::from_min_max(pos2(0.0, 57.0), pos2(550.0, 185.0));
+        let combo = Rect::from_min_size(pos2(40.0, 99.0), vec2(225.0, 50.0));
+        let row = popup_row_height(combo.height());
+        let list = popup_list_height(5, 0, false, row);
+        let (top, height) = place_list(combo, list, bounds, row);
+        assert_eq!(top, bounds.top());
+        assert_eq!(height, bounds.height());
+        // A list short enough to fit is as short as its rows, still clear of the title bar.
+        let short = popup_list_height(2, 0, false, row);
+        let (top, height) = place_list(combo, short, bounds, row);
+        assert_eq!(height, short);
+        assert!(
+            top >= bounds.top() && top + height <= bounds.bottom(),
+            "{top} {height}"
+        );
     }
 
     #[test]
@@ -913,6 +1168,168 @@ mod tests {
     }
 
     #[test]
+    fn an_accented_box_is_outlined_in_the_highlight_colour_at_sixty_percent_in_both_palettes() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let palette = Palette::new(mode);
+            let accent = box_outline_colour(palette, None, false, true);
+            assert_eq!(
+                accent,
+                palette.color_alpha(FxColor::HighlightedText, ACCENT_ALPHA),
+                "{mode:?}"
+            );
+            assert_eq!(accent.a(), 153, "α 0.6 of 255");
+            // Visible against the box it outlines, which is the whole point.
+            assert_ne!(
+                Color32::from_rgb(accent.r(), accent.g(), accent.b()),
+                palette.color(FxColor::ComboBoxBackground),
+                "{mode:?}"
+            );
+            // And without the accent, nothing changes: the original's three-state outline.
+            for error in [None, Some(false), Some(true)] {
+                assert_eq!(
+                    box_outline_colour(palette, error, false, false),
+                    outline_colour(palette, error, false)
+                );
+            }
+        }
+        // The two palettes' accents differ: white on dark, black on light.
+        assert_ne!(
+            box_outline_colour(Palette::new(ThemeMode::Dark), None, false, true),
+            box_outline_colour(Palette::new(ThemeMode::Light), None, false, true)
+        );
+    }
+
+    #[test]
+    fn focus_and_a_real_error_both_outrank_the_accent() {
+        let palette = Palette::new(ThemeMode::Dark);
+        assert_eq!(
+            box_outline_colour(palette, None, true, true),
+            outline_colour(palette, None, true)
+        );
+        assert_eq!(
+            box_outline_colour(palette, Some(true), false, true),
+            palette.color(FxColor::SliderTrack)
+        );
+        // An error that has cleared is not an error, so the accent shows again.
+        assert_eq!(
+            box_outline_colour(palette, Some(false), false, true),
+            palette.color_alpha(FxColor::HighlightedText, ACCENT_ALPHA)
+        );
+    }
+
+    /// The colour of the one-point outline a frame stroked around `rect`.
+    fn stroked_outline(shapes: &[ClippedShape], rect: Rect) -> Option<Color32> {
+        shapes.iter().find_map(|clipped| match &clipped.shape {
+            Shape::Rect(shape)
+                if shape.stroke.width > 0.0 && (shape.rect.min - rect.min).length() < 1e-3 =>
+            {
+                Some(shape.stroke.color)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_accent_is_what_the_closed_box_actually_strokes() {
+        let items = [String::from("Speakers")];
+        let mut assets = AssetCache::new();
+        let ctx = test_context();
+        let palette = Palette::new(ThemeMode::Light);
+        for accent in [false, true] {
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                FxComboBox::new(&items, Some(0)).accent(accent).show(
+                    ui,
+                    pro_combo(),
+                    palette,
+                    &mut assets,
+                    "accented",
+                );
+            });
+            let shapes = std::mem::take(&mut output.shapes);
+            output.drop_without_applying_deltas();
+            let stroke = stroked_outline(&shapes, pro_combo()).expect("the box was outlined");
+            assert_eq!(
+                stroke,
+                box_outline_colour(palette, None, false, accent),
+                "accent = {accent}"
+            );
+        }
+    }
+
+    /// The texts the closed `combo` box paints for `item`, each with where its glyphs end.
+    fn closed_box_texts(item: &str, keep: &str, combo: Rect) -> Vec<(String, Rect, bool)> {
+        let items = [item.to_owned()];
+        let mut assets = AssetCache::new();
+        let ctx = test_context();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            FxComboBox::new(&items, Some(0)).keep_suffix(keep).show(
+                ui,
+                combo,
+                Palette::new(ThemeMode::Dark),
+                &mut assets,
+                "presets",
+            );
+        });
+        let shapes = std::mem::take(&mut output.shapes);
+        output.drop_without_applying_deltas();
+        shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                Shape::Text(text) => Some((
+                    text.galley.text().to_owned(),
+                    clipped.shape.visual_bounding_rect(),
+                    text.galley.elided,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_long_modified_name_is_cut_in_the_name_and_keeps_its_star() {
+        // 0.4.0 audit #26: "Evening Headphones Mix *" came out "Evening Headphones M…", and the
+        // one sign of unsaved changes went first.
+        let narrow = Rect::from_min_size(pos2(0.0, 0.0), vec2(225.0, 40.0));
+        let name = "Evening Headphones Mix for the Late Train Home";
+        let label = preset_label(name, true);
+        let painted = closed_box_texts(&label, MODIFIED_SUFFIX, narrow);
+        assert_eq!(painted.len(), 2, "{painted:?}");
+        let (head, head_rect, head_elided) = &painted[0];
+        let (star, star_rect, star_elided) = &painted[1];
+        assert_eq!(head, name);
+        assert!(*head_elided, "the name is cut");
+        assert_eq!(star, MODIFIED_SUFFIX);
+        assert!(!star_elided);
+        // The star follows the cut name and ends inside the text box.
+        assert!(
+            star_rect.left() >= head_rect.right() - 1.0,
+            "{head_rect:?} {star_rect:?}"
+        );
+        assert!(
+            star_rect.right() <= text_box(narrow).right() + 0.5,
+            "{star_rect:?}"
+        );
+    }
+
+    #[test]
+    fn a_label_that_fits_or_has_no_star_is_drawn_as_one_line() {
+        let wide = pro_combo();
+        let painted = closed_box_texts(&preset_label("Rock", true), MODIFIED_SUFFIX, wide);
+        assert_eq!(painted.len(), 1, "{painted:?}");
+        assert_eq!(painted[0].0, "Rock *");
+        assert!(!painted[0].2);
+        // A long name without unsaved changes is cut at its end, as ever.
+        let narrow = Rect::from_min_size(pos2(0.0, 0.0), vec2(225.0, 40.0));
+        let long = "Evening Headphones Mix for the Late Train Home";
+        let painted = closed_box_texts(long, MODIFIED_SUFFIX, narrow);
+        assert_eq!(painted.len(), 1, "{painted:?}");
+        assert!(painted[0].2);
+        // And a box that keeps nothing cuts a starred label at its end too.
+        let painted = closed_box_texts(&preset_label(long, true), "", narrow);
+        assert_eq!(painted.len(), 1, "{painted:?}");
+    }
+
+    #[test]
     fn keyboard_focus_outranks_the_error_outline() {
         let palette = Palette::new(ThemeMode::Dark);
         let focused = outline_colour(palette, Some(true), true);
@@ -1033,6 +1450,7 @@ mod tests {
         assert_eq!(combo.separator_before, None);
         assert!(combo.headers.is_empty());
         assert!(combo.row_height.is_none());
+        assert!(!combo.accent, "no box is accented unless it asks");
 
         let headers = [SectionHeader::new(0, "Output")];
         let combo = FxComboBox::new(&items, None)
@@ -1041,8 +1459,10 @@ mod tests {
             .error(true)
             .separator_before(Some(1))
             .headers(&headers)
-            .row_height(26.0);
+            .row_height(26.0)
+            .accent(true);
         assert!(!combo.enabled);
+        assert!(combo.accent);
         assert_eq!(combo.placeholder, "No device");
         assert_eq!(combo.error, Some(true));
         assert_eq!(combo.separator_before, Some(1));
@@ -1271,6 +1691,60 @@ mod tests {
             }
             picks
         }
+    }
+
+    #[test]
+    fn an_open_list_is_painted_under_its_box_as_tall_as_its_rows_where_they_fit() {
+        let mut menu = DeviceMenu::devices();
+        let shapes = menu.open();
+        let combo = pro_combo();
+        let row = popup_row_height(combo.height());
+        let rows = 3.0 * row + 2.0 * popup_header_height(row) + popup_separator_height(row) + 2.0;
+        assert!((popup_list_height(3, 2, true, row) - rows).abs() < 1e-3);
+        let painted = menu_frame(&shapes, combo, DeviceMenu::PALETTE);
+        assert!((painted.top() - combo.bottom()).abs() <= 1.0, "{painted:?}");
+        assert!((painted.height() - rows).abs() <= 1.0, "{painted:?}");
+    }
+
+    #[test]
+    fn a_label_is_shown_whole_in_its_own_width_and_cut_three_points_short_of_it() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(theme::font_definitions());
+        ctx.run_ui(Default::default(), |ui| {
+            let font = theme::semibold(FONT);
+            let text = "FxSound's preset";
+            let width = ui
+                .painter()
+                .layout_no_wrap(text.to_owned(), font.clone(), Color32::PLACEHOLDER)
+                .size()
+                .x;
+            assert!(shows_whole(ui.painter(), text, font.clone(), width));
+            assert!(!shows_whole(ui.painter(), text, font, width - 3.0));
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn an_open_list_stays_inside_the_bounds_the_window_sets_and_scrolls_there() {
+        let mut menu = DeviceMenu::devices();
+        let combo = pro_combo();
+        let row = popup_row_height(combo.height());
+        let bounds = Rect::from_min_max(
+            pos2(0.0, combo.top() - 20.0),
+            pos2(1000.0, combo.bottom() + 3.0 * row + 12.0),
+        );
+        set_popup_bounds(&menu.ctx, bounds);
+        let shapes = menu.open();
+        let painted = menu_frame(&shapes, combo, DeviceMenu::PALETTE);
+        assert!((painted.top() - combo.bottom()).abs() <= 1.0, "{painted:?}");
+        assert!(
+            painted.bottom() <= bounds.bottom() + 1.0,
+            "{painted:?} {bounds:?}"
+        );
+        assert!(
+            painted.height() < popup_list_height(3, 2, true, row),
+            "{painted:?}"
+        );
     }
 
     #[test]

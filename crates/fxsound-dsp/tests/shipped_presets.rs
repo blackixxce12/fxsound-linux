@@ -18,11 +18,15 @@ use fxsound_core::{Effect, Preset, scale};
 use fxsound_dsp::eq::GraphicEq;
 use std::path::{Path, PathBuf};
 
-/// Below this stored value the Ambience stage never turns on at all.
+/// Below this stored value the Ambience stage is all but silent.
 ///
-/// `(int)(midi * 0.34) > 12`, so the first value that reaches it is 39 — a slider position of 3.1
-/// out of 10. Anything from 1 to 38 is a preset claiming an effect it does not get.
-const AMBIENCE_MIN_AUDIBLE_MIDI: u8 = 39;
+/// The stage turns on above 12, as the original's does, but the MUSIC2 warp only gives it a real
+/// wet level from `(int)(midi * 0.34) > 12`, and the first value that reaches that is 39 — a
+/// slider position of 3.1 out of 10 on Windows, and position 1 here since the slider was spread
+/// over the audible values (audit report #39, `scale::AMBIENCE_FIRST_AUDIBLE_MIDI`). From 13 to
+/// 38 the wet level only ramps up to the one at 39, −40 dB below the dry signal, so a preset
+/// storing one of those is claiming an effect it barely gets.
+const AMBIENCE_MIN_AUDIBLE_MIDI: u8 = scale::AMBIENCE_FIRST_AUDIBLE_MIDI;
 
 /// Above this stored value Dynamic Boost stops changing.
 ///
@@ -114,7 +118,7 @@ fn no_preset_stores_an_effect_the_engine_ignores() {
         if (1..AMBIENCE_MIN_AUDIBLE_MIDI).contains(&ambience) {
             complaints.push(format!(
                 "{name}: Ambience is {ambience}, below the {AMBIENCE_MIN_AUDIBLE_MIDI} the stage \
-                 needs to turn on \u{2014} the file claims an effect it does not get"
+                 needs to be heard \u{2014} the file claims an effect it barely gets"
             ));
         }
     }
@@ -286,34 +290,53 @@ fn a_presets_curve_does_no_more_than_its_loudest_band_asks_for() {
 
 #[test]
 fn every_effect_amount_a_preset_stores_is_one_a_slider_can_reach() {
-    // The GUI slider has eleven positions. A stored value between them cannot be reproduced by a
-    // user, so saving the preset again would silently change it.
+    // Audit report #14. The GUI slider has eleven whole positions, and 49 of the shipped
+    // presets' 170 effect amounts sit between them: touching the slider used to snap such a value
+    // to a position and save that, silently. The slider now shows such a value where it is, with
+    // its decimal, and reaches every stored value with Shift, so a preset loaded and saved again
+    // is the preset it was. Checked through the mapping the window uses, both ways. The one
+    // exception is a Dynamic Boost past its saturation point, where every value is the same gain:
+    // it shows at the top of the slider and is saved as the top.
     let mut complaints = Vec::new();
+    let mut between = 0;
     for (name, preset) in shipped() {
         for effect in Effect::ALL {
             let midi = preset.main_midi[effect.vals_index()];
-            let round_tripped = scale::value_to_midi(scale::slider_to_value(
-                scale::value_to_slider(scale::midi_to_value(midi)).round(),
-            ));
-            if midi != round_tripped {
+            let shown = scale::midi_to_slider_for(effect, midi);
+            let saved = scale::slider_to_midi_for(effect, shown);
+            let expected = if effect == Effect::DynamicBoost && midi > DYNAMIC_BOOST_SATURATION_MIDI
+            {
+                DYNAMIC_BOOST_SATURATION_MIDI
+            } else {
+                midi
+            };
+            if saved != expected {
                 complaints.push(format!(
-                    "{name}: {:?} is {midi}, which is between slider positions (nearest is \
-                     {round_tripped})",
-                    effect
+                    "{name}: {effect:?} is {midi}, shown at {shown}, saved again as {saved}"
                 ));
+            }
+            if scale::whole_position_for(effect, shown).is_none() {
+                between += 1;
+                let label = scale::slider_label_for(effect, shown);
+                if !label.contains('.') {
+                    complaints.push(format!(
+                        "{name}: {effect:?} is {midi}, between positions, but reads {label:?}"
+                    ));
+                }
             }
         }
     }
-    // Reported rather than asserted: the shipped files were authored against the Windows build,
-    // whose slider had the same eleven positions but whose preset editor did not round. Turning
-    // this into a failure would mean rewriting files that must round-trip byte for byte.
-    if !complaints.is_empty() {
-        eprintln!(
-            "note: {} stored amount(s) sit between slider positions:\n  {}",
-            complaints.len(),
-            complaints.join("\n  ")
-        );
-    }
+    assert!(
+        complaints.is_empty(),
+        "{} stored amount(s) do not survive the slider:\n  {}",
+        complaints.len(),
+        complaints.join("\n  ")
+    );
+    // The fixture really does hold values between positions, or this checks nothing.
+    assert!(
+        between > 0,
+        "no shipped preset stores a value between positions"
+    );
 }
 
 #[test]
@@ -334,5 +357,62 @@ fn a_saturated_dynamic_boost_is_reported() {
             saturated.len(),
             saturated.join(", ")
         );
+    }
+}
+
+#[test]
+fn every_shipped_preset_keeps_its_own_bass_on_a_ladder_that_reaches_lower() {
+    // Audit report #13 (held ends). The shipped presets are ten-band curves from 62.5 Hz up; on
+    // fifteen, twenty or thirty-one bands, which reach down to 25 or 20 Hz, their lowest gain
+    // used to be copied onto every band below 62.5 Hz, and those sections added up to a sub-bass
+    // shelf none of them has. Measured against each preset's own ten-band response, 241 points
+    // from 20 Hz to 20 kHz: below 45 Hz the worst was 25.3 dB off on thirty-one bands ("Life
+    // (Quizal)", +10 dB at 62.5 Hz, played +28.6 dB at 31.5 Hz), 21.1 on twenty and 13.5 on
+    // fifteen, and the mean RMS departure on thirty-one bands was 2.6 dB. Tapered past the ends,
+    // the worst is 4.7, 4.4 and 4.4 dB and the mean 1.0 dB.
+    use fxsound_dsp::eq::{fit_preset_gains, standard_centres};
+    let points: Vec<f32> = (0..=240)
+        .map(|step| 20.0 * 1000.0_f32.powf(step as f32 / 240.0))
+        .collect();
+    let presets: Vec<(String, Preset)> = shipped()
+        .into_iter()
+        .filter(|(_, preset)| preset.eq_bands.iter().any(|band| band.boost_db != 0.0))
+        .collect();
+    for (count, worst_allowed, was) in [(31, 5.0, 25.3), (20, 5.0, 21.1), (15, 5.0, 13.5)] {
+        let live = standard_centres(count);
+        let mut worst = (0.0_f32, String::new());
+        let mut rms_total = 0.0_f32;
+        for (name, preset) in &presets {
+            let centres: Vec<f32> = preset.eq_bands.iter().map(|b| b.center_hz).collect();
+            let gains: Vec<f32> = preset.eq_bands.iter().map(|b| b.boost_db).collect();
+            let mut own = GraphicEq::new();
+            own.set_sample_rate(48_000.0);
+            own.set_bands(&centres, &gains);
+            let mut there = GraphicEq::new();
+            there.set_sample_rate(48_000.0);
+            there.set_bands(&live, &fit_preset_gains(&centres, &gains, &live));
+            let mut squares = 0.0;
+            for hz in &points {
+                let off = there.response_db(*hz) - own.response_db(*hz);
+                squares += off * off;
+                if *hz < 45.0 && off.abs() > worst.0 {
+                    worst = (off.abs(), name.clone());
+                }
+            }
+            rms_total += (squares / points.len() as f32).sqrt();
+        }
+        assert!(
+            worst.0 < worst_allowed,
+            "{count} bands: {} is {:.2} dB off its own response below 45 Hz, was {was} dB",
+            worst.1,
+            worst.0
+        );
+        let mean_rms = rms_total / presets.len() as f32;
+        if count == 31 {
+            assert!(
+                mean_rms < 1.1,
+                "{count} bands: mean RMS departure {mean_rms:.2} dB, was 2.6"
+            );
+        }
     }
 }

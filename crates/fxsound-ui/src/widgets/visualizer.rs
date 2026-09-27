@@ -31,7 +31,11 @@
 //!    between two frames. Here the level envelope releases with [`RELEASE_TAU_SECS`], so the bars
 //!    fall away over about a second and reach the same flat line. The end state is identical; only
 //!    the transition differs.
-//! 3. **A hold-and-release envelope in front of the history.** The original has no GUI-side
+//! 3. **No frames once it has settled.** The original drops to a 10 fps timer while idle
+//!    (`FxVisualizer.cpp:95`), redrawing a flat line ten times a second for as long as nothing
+//!    plays. Here a settled strip asks for nothing ([`VisualizerAnimation::repaint_interval`]):
+//!    the window's pump notices the sound coming back (0.4.0 design §12).
+//! 4. **A hold-and-release envelope in front of the history.** The original has no GUI-side
 //!    smoothing or peak hold whatsoever (`docs/spec/04-equalizer-visualizer.md` §B4); all temporal
 //!    shaping is the DSP's one-pole mean-square smoother. [`hold_release`] adds an envelope with an
 //!    *instant* attack and a release equal to that same smoother's own decay — τ = 0.2 s on the
@@ -42,7 +46,9 @@
 //!
 //! Everything else — the bar pitch, the 0 → 0.01 floor, the `GraphHigh` → `GraphLow` → `GraphHigh`
 //! gradient in component space, the 0.75 alpha while no audio flows, the desaturated palette when
-//! the power is off — is reproduced as the original draws it.
+//! the power is off — is reproduced as the original draws it, except that the light palette's
+//! grey is one that can be seen, where the original's is white on a light grey panel
+//! ([`crate::theme::Palette::greyed`], 0.4.0 audit #24).
 
 use std::time::Duration;
 
@@ -106,9 +112,6 @@ pub const ALPHA_IDLE: f32 = 0.75;
 
 /// How often the history ripples, in seconds (`FxVisualizer.cpp:58`: `1.0 / 30.0`).
 pub const FRAME_INTERVAL_SECS: f32 = 1.0 / 30.0;
-
-/// Repaint interval once the meter has settled (`FxVisualizer.cpp:95`: `setFramesPerSecond(10)`).
-pub const IDLE_INTERVAL_SECS: f32 = 0.1;
 
 /// Release time constant of the level envelope, in seconds.
 ///
@@ -186,6 +189,19 @@ impl VisualizerAnimation {
     #[must_use]
     pub fn is_settled(&self) -> bool {
         self.level.iter().all(|&l| l == 0.0) && self.bars().iter().all(|&b| b == 0.0)
+    }
+
+    /// When the strip wants its next frame: [`FRAME_INTERVAL_SECS`] while anything in it is still
+    /// moving — the original's 30 fps (`FxVisualizer.cpp:78`) — and never once it has settled.
+    ///
+    /// The original keeps a 10 fps timer running while idle (`:95`), which redraws a flat line
+    /// ten times a second for as long as nothing plays. Nothing here needs it: sound coming back
+    /// reaches the window through its pump, which wakes for the engine's news and looks at the
+    /// meters at least once a second (0.4.0 design §12), and the first frame with sound in it
+    /// unsettles the strip again.
+    #[must_use]
+    pub fn repaint_interval(&self) -> Option<Duration> {
+        (!self.is_settled()).then(|| Duration::from_secs_f32(FRAME_INTERVAL_SECS))
     }
 
     /// Fold one frame of elapsed time into the animation.
@@ -268,15 +284,11 @@ impl<'a> VisualizerWidget<'a> {
             self.animation.bars(),
         );
 
-        // 33.3 ms while anything is still moving, 100 ms once it has settled — the original's two
-        // frame rates (`FxVisualizer.cpp:78,95`), expressed as a deadline instead of a timer.
-        let interval = if audio_active || !self.animation.is_settled() {
-            FRAME_INTERVAL_SECS
-        } else {
-            IDLE_INTERVAL_SECS
-        };
-        ui.ctx()
-            .request_repaint_after(Duration::from_secs_f32(interval));
+        // 33.3 ms while anything is still moving, as a deadline instead of a timer; nothing once
+        // it has settled (see `repaint_interval`).
+        if let Some(interval) = self.animation.repaint_interval() {
+            ui.ctx().request_repaint_after(interval);
+        }
     }
 }
 
@@ -439,7 +451,9 @@ pub fn gradient_colour(high: Color32, low: Color32, y: f32) -> Color32 {
 /// The two gradient stop colours for the current state.
 ///
 /// `calcGradient` picks them from the palette when enabled and desaturates them when not, then
-/// applies the audio-activity alpha to both (`FxVisualizer.cpp:177-197`).
+/// applies the audio-activity alpha to both (`FxVisualizer.cpp:177-197`). The desaturation is
+/// [`Palette::greyed`]: the original's in the dark palette, and in the light one a grey that can
+/// still be seen, where the original's turns both colours white (0.4.0 audit #24).
 #[must_use]
 pub fn graph_colours(palette: Palette, enabled: bool, audio_active: bool) -> (Color32, Color32) {
     let alpha = if audio_active {
@@ -454,8 +468,8 @@ pub fn graph_colours(palette: Palette, enabled: bool, audio_active: bool) -> (Co
         )
     } else {
         (
-            with_alpha(desaturate(palette.color(FxColor::GraphHigh)), alpha),
-            with_alpha(desaturate(palette.color(FxColor::GraphLow)), alpha),
+            with_alpha(palette.greyed(palette.color(FxColor::GraphHigh)), alpha),
+            with_alpha(palette.greyed(palette.color(FxColor::GraphLow)), alpha),
         )
     }
 }
@@ -531,18 +545,6 @@ fn with_alpha(colour: Color32, alpha: f32) -> Color32 {
         colour.b(),
         (alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
     )
-}
-
-/// `juce::Colour::withSaturation(0.0f)`, which round-trips through HSB and so yields
-/// `max(r, g, b)` on all three channels.
-///
-/// `docs/spec/04-equalizer-visualizer.md` §A8 tabulates the results this must produce: dark
-/// `GraphHigh` `#d51535` → `#d5d5d5` and `GraphLow` `#fe566a` → `#fefefe`; both light-theme graph
-/// colours → `#ffffff`, which is the original's real legibility bug in light mode with the power
-/// off, faithfully reproduced.
-fn desaturate(colour: Color32) -> Color32 {
-    let brightness = colour.r().max(colour.g()).max(colour.b());
-    Color32::from_rgba_unmultiplied(brightness, brightness, brightness, colour.a())
 }
 
 /// The position of the spectrum strip's centre line, exposed for tests and callers that want to
@@ -828,6 +830,29 @@ mod tests {
     }
 
     #[test]
+    fn the_strip_asks_for_thirty_frames_a_second_while_it_moves_and_none_once_it_has_settled() {
+        let mut animation = VisualizerAnimation::new();
+        assert_eq!(
+            animation.repaint_interval(),
+            None,
+            "a flat line is not redrawn ten times a second, as the original's idle timer did"
+        );
+        animation.advance(&frame(0.6), true, FRAME_INTERVAL_SECS);
+        assert_eq!(
+            animation.repaint_interval(),
+            Some(Duration::from_secs_f32(FRAME_INTERVAL_SECS))
+        );
+        // The sound stops: the bars fall away at the same pace, and then nothing more is asked.
+        let mut frames = 0;
+        while animation.repaint_interval().is_some() {
+            animation.advance(&frame(0.0), false, FRAME_INTERVAL_SECS);
+            frames += 1;
+            assert!(frames < 90, "the strip never settled");
+        }
+        assert!(animation.is_settled());
+    }
+
+    #[test]
     fn an_inactive_frame_is_fed_zero_whatever_the_dsp_reports() {
         let mut animation = VisualizerAnimation::new();
         for _ in 0..20 {
@@ -922,19 +947,33 @@ mod tests {
     }
 
     #[test]
-    fn the_disabled_gradient_matches_the_precomputed_grey_table() {
+    fn the_disabled_dark_gradient_matches_the_precomputed_grey_table() {
         // docs/spec/04-equalizer-visualizer.md §A8/§B8.
         let (high, low) = graph_colours(Palette::new(ThemeMode::Dark), false, true);
         assert_eq!(high, Color32::from_rgb(0xd5, 0xd5, 0xd5));
         assert_eq!(low, Color32::from_rgb(0xfe, 0xfe, 0xfe));
+    }
 
+    #[test]
+    fn the_powered_off_strip_reads_at_three_to_one_on_its_panel_in_both_palettes() {
+        // 0.4.0 audit #24: the original's `withSaturation(0)` turned both light graph colours
+        // white on the #e0e0e0 panel, 1.3:1, and the strip vanished with the power off.
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let palette = Palette::new(mode);
+            let panel = palette.color(FxColor::ControlBackground);
+            let (high, low) = graph_colours(palette, false, true);
+            for grey in [high, low] {
+                assert!(
+                    grey.r() == grey.g() && grey.g() == grey.b(),
+                    "{mode:?}: {grey:?}"
+                );
+                let ratio = crate::theme::contrast_ratio(grey, panel);
+                assert!(ratio >= 3.0, "{mode:?}: {grey:?} is {ratio:.2}:1");
+            }
+        }
         let (high, low) = graph_colours(Palette::new(ThemeMode::Light), false, true);
-        assert_eq!(high, Color32::WHITE);
-        assert_eq!(
-            low,
-            Color32::WHITE,
-            "both light graph colours desaturate to white — the original's legibility bug"
-        );
+        assert_ne!(high, Color32::WHITE);
+        assert_ne!(low, Color32::WHITE);
     }
 
     #[test]
@@ -956,18 +995,11 @@ mod tests {
     }
 
     #[test]
-    fn desaturation_keeps_the_juce_hsb_brightness() {
-        assert_eq!(
-            desaturate(Color32::from_rgb(0xd5, 0x15, 0x35)),
-            Color32::from_rgb(0xd5, 0xd5, 0xd5)
-        );
-        assert_eq!(
-            desaturate(Color32::from_rgb(0x1a, 0xc1, 0xff)),
-            Color32::WHITE
-        );
-        // Alpha survives the round trip.
-        let faded = desaturate(Color32::from_rgba_unmultiplied(0xfe, 0x56, 0x6a, 191));
-        assert_eq!(faded.a(), 191);
+    fn the_dimmed_grey_keeps_the_three_quarter_alpha_in_both_palettes() {
+        for mode in [ThemeMode::Dark, ThemeMode::Light] {
+            let (high, low) = graph_colours(Palette::new(mode), false, false);
+            assert_eq!((high.a(), low.a()), (191, 191), "{mode:?}");
+        }
     }
 
     #[test]

@@ -192,6 +192,43 @@ so the dry track leads the other two by that much. Only one track plays at a tim
 so it is inaudible on a switch and the dry anchor is left bit-exact. Set
 `FXSV_ALIGN_DRY=1` to pad it into sample alignment if you would rather.
 
+## Two engines, one preset
+
+The same three-way test answers a different question when "old" and "new" are the
+same preset rendered by two builds of the engine — "did this engine change make
+the preset worse?" rather than "did this revoicing". Build `process_wav` from the
+older commit into a directory of its own, point `FXSV_OLD_PROCESS_WAV` at it, and
+give both sides the same `.fac`: a file already in `presets-old/` wins over git,
+so copying the current presets there makes "old" and "new" differ only in the
+engine. `FXSV_WORK` keeps the run apart from a revoicing session's votes.
+
+```sh
+# from the repository root
+git worktree add --detach /tmp/fxsound-before <commit>
+(cd /tmp/fxsound-before && cargo build --release -p fxsound-dsp --example process_wav \
+    --target-dir /tmp/fxsound-before-bin)
+git worktree remove /tmp/fxsound-before
+
+export FXSV_WORK="$PWD/target/voicing-engine"
+export FXSV_OLD_PROCESS_WAV=/tmp/fxsound-before-bin/release/examples/process_wav
+export FXSV_NEW_PRESETS="$FXSV_WORK/presets-new"
+mkdir -p "$FXSV_WORK/presets-old" "$FXSV_NEW_PRESETS" "$FXSV_WORK/material"
+cp assets/presets/BonusPresets/*.fac "$FXSV_NEW_PRESETS/"
+for f in assets/presets/Factsoft/*.fac; do   # the factory presets under their display names
+    cp "$f" "$FXSV_NEW_PRESETS/$(sed -n 3p "$f" | tr -d '\r').fac"
+done
+cp "$FXSV_NEW_PRESETS"/*.fac "$FXSV_WORK/presets-old/"
+cp ~/Music/some-track.flac "$FXSV_WORK/material/Movies.flac"   # one file per preset to judge
+
+scripts/voicing/render.sh --genre Movies
+scripts/voicing/match-and-mux.sh --genre Movies
+scripts/voicing/vote.sh --genre Movies
+```
+
+In the tally, `old` is the older engine and `new` the current one; `dry` still
+means the untouched excerpt beat both. `crates/fxsound-dsp/tests/preset_drift.rs`
+is the measuring half of the same question.
+
 ## Files
 
 | file | what it is |
@@ -221,4 +258,5 @@ Everything the harness assumes can be moved from the environment:
 | `FXSV_START` / `FXSV_DURATION` | `60` / `45` | default excerpt window, in seconds |
 | `FXSV_ALIGN_DRY` | `0` | pad the dry track by the engine's 0.75 ms latency |
 | `FXSV_PROCESS_WAV` | `target/release/examples/process_wav` | the renderer; setting it also skips the cargo rebuild |
+| `FXSV_OLD_PROCESS_WAV` | `$FXSV_PROCESS_WAV` | the renderer for the "old" variant only — see "Two engines" |
 | `FXSV_MPV_ARGS` | — | extra arguments for mpv during the session |

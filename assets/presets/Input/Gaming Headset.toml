@@ -1,0 +1,51 @@
+# Headset's near-field case with the room switched on: a boom capsule a few centimetres from the
+# mouth, and a mechanical keyboard, a fan and a game's speakers behind it. The denoiser is on
+# at Medium and *linked* — one network on the downmix, its mask applied to each channel through
+# that channel's own transform — because a headset that captures in stereo must not have its two
+# sides disagree about what is voice. The gate is opened by the network's voice probability as
+# well as by level (vad_gate), so a quiet consonant the network is sure about is not swallowed;
+# its range is deeper than Headset's because what it closes on is keys, not room tone. The
+# 100 Hz fourth-order corner sits between Headset's 120 and Laptop Mic's 85: proximity lift to
+# hold down, but with keyboard thumps under it rather than desk rumble.
+name = "Gaming Headset"
+description = "A boom microphone on a gaming headset, with a keyboard and fans behind it: denoised, gated on the voice, kept bright."
+rnnoise = true
+highpass_hz = 100.0
+highpass_order = 4
+makeup_db = 6.0
+ceiling_db = -3.0
+vad_gate = true
+
+[denoise]
+level = "medium"
+channels = "linked"
+
+[gate]
+threshold_db = -42.0
+ratio = 2.5
+range_db = -18.0
+attack_ms = 5.0
+release_ms = 150.0
+hold_ms = 150.0
+detection = "rms"
+
+[compressor]
+threshold_db = -20.0
+ratio = 3.0
+knee_db = 6.0
+attack_ms = 10.0
+release_ms = 120.0
+detection = "rms"
+
+# Adaptive: a headset over a Bluetooth profile captures at 16 kHz, where a 6 kHz corner has no
+# sibilance band above it, and the stage stands aside rather than running inert.
+[deesser]
+frequency_hz = 6000.0
+threshold_db = -22.0
+mode = "adaptive"
+
+# Presence at 2.5 kHz and a little at 5 kHz, kept apart from each other's summing by the
+# per-band test: two adjacent lifts at the derived Q realise more than either asks for.
+[eq]
+centers_hz = [62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0]
+gains_db = [0, 0, 0, 0, 0, 0, 2.0, 1.5, 0, 0]

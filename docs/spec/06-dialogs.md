@@ -294,6 +294,20 @@ Reset button auto-sizing (`GUI/FxSettingsDialog.cpp:289-315`):
 counts `\n` in the translated label, up to **3** lines; height = `24 × lineCount`;
 width = `min(bestWidthForHeight(24 × lines), 315)` clamped up to at least `220`.
 
+**Port addition (0.4.0, upstream review U4).** A second checkbox, "Follow the system's default
+device" (`follow_system_default`; upstream issue #629), sits at `(20, 384, 399, 30)`, ten points
+under the first. The group backdrop grows to `(10, 40, 419, 384)` and the reset button moves to
+`(20, 444, W, 24·lines)`; every translation's reset button still ends inside the pane. While the
+new checkbox is ticked the priority list stops choosing the device and "Prioritize new output
+devices" is greyed out. The port's Microphone pane carries the microphones' own list, "Input
+Device Preference", ten points under its last-calibration line (the pane's rows, checkbox, button
+and lines are all ten points apart): the Audio pane's rows — ▲ ▼, the name, the 150-point preset
+combo and ✕, laid out by the same functions — 32 points tall instead of 40, so that four fit before
+it scrolls. Each row's combo lists the voice presets, shows `"Select preset"` for a microphone that
+remembers none (or a deleted one), and sets that microphone's preset (`SetDevicePreset` for the
+input direction); set on the microphone the input lane is on, it applies at once, as on the Audio
+pane. Its 28-point box sets the text in the combo's small face. No row is selected.
+
 #### Settings exposed by the Audio pane
 
 | Control | String id | Type | Default | Range | Persistence key | Source |
@@ -895,6 +909,19 @@ All three buttons: `PointingHandCursor`; `yes_button_` also `setWantsKeyboardFoc
 (`GUI/FxMessage.h:141`). Any button click sets `yes_clicked_` only for Yes and then dismisses
 (`GUI/FxMessage.h:217-226`).
 
+The message is a plain JUCE `Label`, so `LookAndFeel_V2::drawLabel` draws it with
+`drawFittedText` over as many lines as its 52 px hold at 17 px — two — squeezing each line to as
+little as 0.7 of its width (`Font::getDefaultMinimumHorizontalScaleFactor`) before it elides.
+
+**The port departs (0.4.0 audit #49).** 0.3.0 drew the message on one elided line, so the overwrite
+question showed as `"Preset file Rock already exists in the export p…"` above Yes and No. The port
+wraps it at 410 px, centred line by line (`dialogs::message::message_galley`), in the normal font
+while two lines hold it; egui cannot squeeze a glyph sideways, so a longer message is set in the
+largest size down to 12 px (0.7 × 17) that fits the 52 px, and only one too long even for that is
+elided. A preset name in the question is cut in the middle — `Rock Ball…Night` — as far as it takes
+for the question after it to stay whole (`message_with_name`); every name of ordinary words fits
+whole in all 30 languages, and the tests measure every message below in each of them.
+
 **Call sites** (every user-visible use of this class):
 
 | Message string id | Style | Where |
@@ -902,6 +929,11 @@ All three buttons: `PointingHandCursor`; `yes_button_` also `setWantsKeyboardFoc
 | `"Preset file %s already exists in the export path, do you want to overwrite the preset file?"` | YesNo | `GUI/FxController.cpp:1403` |
 | `"Preset files not found in the selected folder."` | OK | `GUI/FxPresetImportDialog.cpp:264` |
 | `"Presets are exported successfully!"` | OK | `GUI/FxPresetExportDialog.cpp:195` |
+
+The port adds two, both Yes/No and both asked before something that cannot be taken back from
+inside FxSound: `"Move the preset %s to the trash?"` before Delete Preset (0.4.0 audit #16), and
+`"Discard the unsaved changes of every preset? Saved presets are kept."` before Settings ▸ Reset
+presets (#21).
 
 ---
 

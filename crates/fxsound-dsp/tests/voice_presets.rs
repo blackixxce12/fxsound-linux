@@ -20,12 +20,14 @@
 //! with the Windows build is untouched.
 
 use fxsound_core::messages::InputDspParams;
+use fxsound_dsp::ChainSpec;
 use fxsound_dsp::eq::GraphicEq;
 use fxsound_preset::input::InputPreset;
 use std::path::{Path, PathBuf};
 
-/// The rate the capture stream asks for, and therefore the rate every preset is voiced at.
-const CAPTURE_RATE: f32 = 48_000.0;
+mod voice_material;
+
+use voice_material::{CAPTURE_RATE, chain_for, room_floor, sibilance, speech_like};
 
 /// How far a band's realised gain may sit from the gain it stores.
 ///
@@ -193,44 +195,17 @@ fn fingerprint(preset: &InputPreset) -> Vec<f32> {
     out
 }
 
-/// The chain a preset describes, with every stage it asks for.
-fn chain_for(preset: &InputPreset) -> fxsound_dsp::InputChain {
-    let params = preset.to_params();
-    let mut chain = fxsound_dsp::InputChain::new(CAPTURE_RATE);
-    chain.set_highpass(params.highpass_hz, usize::from(params.highpass_order));
-    chain.set_denoise_enabled(params.rnnoise);
-
-    chain.set_gate_enabled(params.gate_on);
-    let gate = chain.gate_mut();
-    gate.set_threshold_db(params.gate_threshold_db);
-    gate.set_ratio(params.gate_ratio);
-    gate.set_range_db(params.gate_range_db);
-    gate.set_times(params.gate_attack_ms, params.gate_release_ms);
-    gate.set_hold_ms(params.gate_hold_ms);
-    gate.set_detection(params.gate_detection);
-
-    let eq = chain.eq_mut();
-    eq.set_enabled(params.eq_on);
-    eq.set_q_multiplier(params.filter_q);
-    let (centers, gains) = params.bands();
-    eq.set_bands(centers, gains);
-
-    chain.set_deesser_enabled(params.deesser_on);
-    let deesser = chain.deesser_mut();
-    deesser.set_frequency(params.deesser_hz);
-    deesser.set_threshold_db(params.deesser_threshold_db);
-
-    chain.set_compressor_enabled(params.compressor_on);
-    let compressor = chain.compressor_mut();
-    compressor.set_threshold_db(params.compressor_threshold_db);
-    compressor.set_ratio(params.compressor_ratio);
-    compressor.set_knee_db(params.compressor_knee_db);
-    compressor.set_times(params.compressor_attack_ms, params.compressor_release_ms);
-    compressor.set_detection(params.compressor_detection);
-
-    chain.set_makeup_db(params.makeup_db);
-    chain.set_ceiling_db(params.ceiling_db);
-    chain
+#[test]
+fn every_preset_names_a_chain_that_exists() {
+    for preset in shipped() {
+        assert!(
+            ChainSpec::by_name(&preset.chain).is_some(),
+            "{}: chain {:?} is not one of {:?}",
+            preset.name,
+            preset.chain,
+            ChainSpec::NAMES
+        );
+    }
 }
 
 /// Run a block through a chain and report the settled level, in dB against the input.
@@ -313,75 +288,6 @@ fn dynamics(preset: &InputPreset) -> Vec<f32> {
 fn probe_tone(hz: f32, amplitude: f32, frames: usize) -> Vec<f32> {
     (0..frames)
         .map(|n| (n as f32 * std::f32::consts::TAU * hz / CAPTURE_RATE).sin() * amplitude)
-        .collect()
-}
-
-/// Deterministic noise, so every run measures the same signal.
-fn noise(frames: usize, amplitude: f32) -> Vec<f32> {
-    let mut state = 0x2545_f491_4f6c_dd1d_u64;
-    (0..frames)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            ((state >> 40) as f32 / 8_388_608.0 - 1.0) * amplitude
-        })
-        .collect()
-}
-
-/// A stand-in for a voice: a fundamental with harmonics, under a syllabic envelope.
-///
-/// The envelope is not decoration. Without it the probe is a steady tone whose peak and RMS are a
-/// few decibels apart, and a compressor detecting peak looks exactly like one detecting RMS —
-/// which made this test refuse two presets that differ only in their detector, the one field the
-/// research insisted on because peak and RMS against the same threshold differ by three to seven
-/// decibels *on speech*. Speech has a crest factor near twelve decibels because it starts and
-/// stops; a probe for a voice chain has to as well.
-fn speech_like(amplitude: f32, frames: usize) -> Vec<f32> {
-    (0..frames)
-        .map(|n| {
-            let t = n as f32 / CAPTURE_RATE;
-            let f = 130.0;
-            let body = (t * std::f32::consts::TAU * f).sin() * 0.6
-                + (t * std::f32::consts::TAU * f * 2.0).sin() * 0.3
-                + (t * std::f32::consts::TAU * f * 5.0).sin() * 0.2
-                + (t * std::f32::consts::TAU * f * 11.0).sin() * 0.1;
-            // Four syllables a second, each with a quiet tail — roughly a talker's rhythm.
-            let syllable = (t * 4.0).fract();
-            let envelope = if syllable < 0.55 {
-                (syllable / 0.55 * std::f32::consts::PI).sin().powf(0.6)
-            } else {
-                0.02
-            };
-            body * envelope * amplitude / 1.2
-        })
-        .collect()
-}
-
-/// What a desk microphone in a room with a computer in it actually picks up: mains hum with
-/// broadband hiss over it.
-fn room_floor(amplitude: f32, frames: usize) -> Vec<f32> {
-    noise(frames, amplitude * 0.4)
-        .iter()
-        .enumerate()
-        .map(|(n, hiss)| {
-            let t = n as f32 / CAPTURE_RATE;
-            hiss + (t * std::f32::consts::TAU * 50.0).sin() * amplitude
-        })
-        .collect()
-}
-
-/// Energy where sibilance lives, so the de-esser has something to act on.
-fn sibilance(amplitude: f32, frames: usize) -> Vec<f32> {
-    (0..frames)
-        .map(|n| {
-            let t = n as f32 / CAPTURE_RATE;
-            ((t * std::f32::consts::TAU * 6_500.0).sin()
-                + (t * std::f32::consts::TAU * 7_900.0).sin()
-                + (t * std::f32::consts::TAU * 9_100.0).sin())
-                * amplitude
-                / 3.0
-        })
         .collect()
 }
 
@@ -478,7 +384,7 @@ fn what_each_preset_actually_does_is_printed() {
             .collect();
         println!(
             "{:<14} hpf {:>5.0} Hz/{}  gate {:<10} comp {:<10} de-ess {:<10} makeup {:+.1}  \
-             rnnoise {}",
+             denoise {}",
             preset.name,
             preset.highpass_hz,
             preset.highpass_order,
@@ -495,7 +401,7 @@ fn what_each_preset_actually_does_is_printed() {
                 |d| format!("{:.0}/{:.0}", d.frequency_hz, d.threshold_db)
             ),
             preset.makeup_db,
-            preset.rnnoise,
+            preset.denoise_level().key(),
         );
         println!("               realised curve: {}", curve.join(" "));
     }

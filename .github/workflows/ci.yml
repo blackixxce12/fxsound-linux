@@ -2,9 +2,22 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # release/** as well: the packages matrix has to have run on a release branch before the
+    # branch is tagged, because the tag is the wrong moment to learn that a leg is broken.
+    branches: [main, 'release/**']
   pull_request:
   workflow_dispatch:
+
+# Read-only by default; the one job that needs more says so itself.
+permissions:
+  contents: read
+
+# A push on top of a push cancels the older run: the older result would be stale before it
+# arrived. The group name is distinct from packages.yml's on purpose — a called workflow that
+# shares its caller's group waits on itself for ever.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,7 +28,10 @@ env:
 jobs:
   check:
     name: Format, lint and test
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: 24.04's PipeWire 1.0.5 is the oldest the tests run against,
+    # and it is where a real bug showed (a new pair took 1.0's startup volume for the user's).
+    # ubuntu-latest moves to a newer release, and with it to a newer PipeWire, in October 2026.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -28,11 +44,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libpipewire-0.3-dev libclang-dev pipewire
+            pkg-config libpipewire-0.3-dev libclang-dev \
+            pipewire pipewire-bin libspa-0.2-modules \
+            libspa-0.2-bluetooth dbus-daemon
           # `pipewire` itself is the daemon, and it is here for the graph-churn tests: each one
           # starts a private server with its own socket and synthetic devices. Without the binary
           # those tests print that they are skipping and pass, which is the right behaviour for a
-          # contributor's laptop and the wrong one for CI.
+          # contributor's laptop and the wrong one for CI — so the test steps below set
+          # FXSOUND_REQUIRE_PIPEWIRE_TOOLS, which turns every such skip into a failure.
+          # `pipewire-bin` is where Ubuntu ships pw-dump, pw-metadata, pw-cli and pw-link (and the
+          # daemon binary itself), which the same tests use to see our nodes and defaults from
+          # outside the engine and to wire a tone through both lanes; `libspa-0.2-modules` has the
+          # `audiotestsrc` plugin that tone comes from. Both already arrive as dependencies of
+          # `pipewire`; they are named because the tests now fail without them, and the list here
+          # is where to look first when one does. `dbus-daemon` is there for the same reason as
+          # `pipewire`: the D-Bus service's tests start a `dbus-daemon` of their own, never the
+          # session's. `libspa-0.2-bluetooth` and `dbus-daemon` are also for the tests of a headset
+          # between profiles: the only card — PipeWire `Device` — a private daemon can make without
+          # hardware is Bluetooth's enumerator, on a private system bus.
 
       # rust-toolchain.toml pins 1.98.1 and asks for rustfmt and clippy, so rustup installs
       # exactly what the developers use rather than whatever the runner image happens to ship.
@@ -51,21 +80,52 @@ jobs:
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      # The runner sets no XDG_RUNTIME_DIR, no session bus and no PipeWire daemon. Nothing in the
-      # suite needs any of them — every test is a unit test that stops at the crate boundary — and
-      # the one that used to depend on the session's runtime directory now takes it as an argument
-      # rather than reading it. If this step ever fails for want of a daemon, the fix is to make
-      # that test take its dependency as a parameter too, not to start a daemon here.
+      # The runner sets no XDG_RUNTIME_DIR, no session bus and no session PipeWire, and nothing in
+      # the suite may reach for any of them: a test that needs the user's session is a test that
+      # would take a developer's default device away mid-run. The graph-churn tests in
+      # fxsound-audio still talk to a real server — each starts its own private pipewire, with its
+      # own runtime directory and socket, from the packages installed above, and kills it when it
+      # is done. So never start a daemon in this step; if a test fails for want of one, it should
+      # start its own the way those do, through `fxsound_core::test_support`, whose children die
+      # with the test process even when a timeout kills it (util-linux's `setpriv --pdeathsig`, or
+      # a watchdog where there is none) and whose scratch directories go with the test.
+      #
+      # FXSOUND_REQUIRE_PIPEWIRE_TOOLS=1 makes every place those tests would print SKIPPED fail
+      # instead. The harness hides a passing test's output, so here a skip would be invisible, and
+      # with everything installed a skip means something that should work did not.
       - name: Tests
         run: cargo test --workspace
+        env:
+          FXSOUND_REQUIRE_PIPEWIRE_TOOLS: "1"
 
       # Release as well: the DSP is full of arithmetic whose rounding differs between opt-levels,
       # and `panic = "abort"` only applies to the release profile.
       - name: Tests, release profile
         run: cargo test --release --workspace
+        env:
+          FXSOUND_REQUIRE_PIPEWIRE_TOOLS: "1"
 
       - name: Build
         run: cargo build --release --bin fxsound
+
+  # Every package the tree can produce, built inside the distribution it targets, installed
+  # there and smoke-tested — see packages.yml. Independent of `check`: a packaging failure and a
+  # test failure are different news, and waiting for the tests would only delay the first.
+  packages:
+    name: Packages
+    uses: ./.github/workflows/packages.yml
+    permissions:
+      contents: read
+
+  # packaging/fxsound.1 is synced with cli.rs and dbus.rs by hand. This refuses the drift on
+  # the push that causes it rather than at the tag, where release.yml runs the same script. No
+  # toolchain: the script only reads the sources.
+  manpage:
+    name: Manual page agrees with the code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: packaging/check-manpage.sh
 
   audit:
     name: Dependency audit
@@ -73,6 +133,11 @@ jobs:
     # Advisories appear without anything in this repository changing, so a red run here means
     # "look at this", not "your commit is broken".
     continue-on-error: true
+    # audit-check reports through a check run, which the read-only default above cannot create.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2

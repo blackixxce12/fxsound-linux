@@ -15,6 +15,7 @@
 
 use super::Effect;
 use crate::biquad::{Real, SOS_FLOAT_BIAS};
+use crate::smooth::{Ramp, glide_frames};
 
 /// The high-pass corner, fixed by `DSP_PLAY_AURAL_TUNE_MIDI = 53` through an exponential
 /// quantiser spanning 500 Hz..10 kHz: `500 · 20^(53/127)` (`docs/spec/10-dsp-effects.md` §6.2).
@@ -54,7 +55,11 @@ pub struct Fidelity {
     state: [HighPassState; crate::biquad::MAX_CHANNELS],
     sample_rate: Real,
     amount: Real,
-    drive: Real,
+    /// The waveshaper's drive, gliding to a new amount over [`crate::smooth::GLIDE_SECONDS`]
+    /// (audit report #11) instead of stepping between two samples. The high-pass never changes
+    /// with the amount, so the drive is the one thing a slider move can step; at zero drive the
+    /// stage passes its input, so it fades in from, and out to, the bypass.
+    drive: Ramp,
     gain: Real,
     a1: Real,
     a0: Real,
@@ -74,7 +79,7 @@ impl Fidelity {
             state: [HighPassState::default(); crate::biquad::MAX_CHANNELS],
             sample_rate,
             amount: 0.0,
-            drive: 0.0,
+            drive: Ramp::new(0.0),
             gain: 0.0,
             a1: 0.0,
             a0: 0.0,
@@ -99,9 +104,9 @@ impl Fidelity {
         self.a0 = (2.0 * SQRT2 * w - 4.0 - w2) * t;
     }
 
-    /// One sample of high-pass plus waveshaping for one channel.
+    /// One sample of high-pass plus waveshaping for one channel, at this frame's `drive`.
     #[inline(always)]
-    fn tick(&mut self, channel: usize, x: Real) -> Real {
+    fn tick(&mut self, channel: usize, x: Real, drive: Real) -> Real {
         let state = &mut self.state[channel];
 
         let mut h = state.y1 * self.a1 + state.y2 * self.a0;
@@ -111,7 +116,7 @@ impl Fidelity {
         state.x2 = state.x1;
         state.x1 = x;
 
-        let driven = h * self.drive;
+        let driven = h * drive;
         let odd = driven.sin();
         // The even branch is a half-wave rectifier. It ships with a gain of zero, so it
         // contributes nothing; it is kept because the original's parameter slot still exists.
@@ -132,22 +137,39 @@ impl Effect for Fidelity {
         self.reset();
     }
 
+    /// Linear in MIDI, and `amount` is already `midi / 127`.
+    ///
+    /// Coming back from zero clears the high-pass. At zero the chain skips the stage and its
+    /// history stands still, as the original's does (`Play32.c:640-647`); resumed from it, the
+    /// waveshaper turns the old treble into a click — −6.5 dBFS into silence after a 3 kHz tone
+    /// at full Fidelity (audit report #9). Only a stage that really stopped is cleared: one taken
+    /// to zero and back while its drive was still fading out never stopped.
     fn set_amount(&mut self, amount: Real) {
+        let was_active = self.is_active();
         self.amount = amount.clamp(0.0, 1.0);
-        // Linear in MIDI, and `amount` is already `midi / 127`.
-        self.drive = DRIVE_MAX * self.amount;
+        self.drive
+            .glide_to(DRIVE_MAX * self.amount, glide_frames(self.sample_rate));
+        if !was_active && self.is_active() {
+            self.state = [HighPassState::default(); crate::biquad::MAX_CHANNELS];
+        }
     }
 
     fn amount(&self) -> Real {
         self.amount
     }
 
+    /// Switched on, or its drive still fading out after being switched off.
     fn is_active(&self) -> bool {
-        self.amount != 0.0
+        self.amount != 0.0 || self.drive.is_gliding()
+    }
+
+    fn settle(&mut self) {
+        self.drive.settle();
     }
 
     fn reset(&mut self) {
         self.state = [HighPassState::default(); crate::biquad::MAX_CHANNELS];
+        self.drive.settle();
     }
 
     fn process(&mut self, buffer: &mut [Real], channels: usize) {
@@ -155,6 +177,8 @@ impl Effect for Fidelity {
             return;
         }
         for frame in buffer.chunks_exact_mut(channels) {
+            // The glide's value for this frame; the drive it was set to, exactly, when none runs.
+            let drive = self.drive.advance();
             for (channel, sample) in frame.iter_mut().enumerate() {
                 // The subwoofer never gets this. `docs/spec/08-dsp-api.md:905-906`: the original
                 // sends the harmonic generator to the front, rear, side and centre instances and
@@ -164,7 +188,7 @@ impl Effect for Fidelity {
                 if Some(channel) == self.lfe_channel {
                     continue;
                 }
-                *sample = self.tick(channel, *sample);
+                *sample = self.tick(channel, *sample, drive);
             }
         }
     }
@@ -201,9 +225,9 @@ mod tests {
         ] {
             f.set_amount(fxsound_core::scale::midi_to_value(midi));
             assert!(
-                (f.drive - expected).abs() < 1e-3,
+                (f.drive.target() - expected).abs() < 1e-3,
                 "midi {midi}: got {}, expected {expected}",
-                f.drive
+                f.drive.target()
             );
         }
     }
@@ -308,6 +332,43 @@ mod tests {
         );
     }
 
+    /// Peak of the output when silence goes into a Fidelity that has shaped a loud 3 kHz tone at
+    /// full drive and then been set to `off_amount` for 100 ms of the tone and back to full.
+    ///
+    /// The 100 ms are there since audit report #11: the drive fades over 20 ms, so a Fidelity set
+    /// to zero and straight back never stopped — it is the stage that sat at zero while the music
+    /// played on that #9 is about.
+    fn ring_after_switching(off_amount: Real) -> Real {
+        let mut f = Fidelity::new(48_000.0);
+        f.set_amount(1.0);
+        let mut tone: Vec<Real> = (0..24_001)
+            .flat_map(|n| {
+                let s = (n as Real * 3_000.0 * TWO_PI / 48_000.0).sin() * 0.5;
+                [s, s]
+            })
+            .collect();
+        f.process(&mut tone, 2);
+        f.set_amount(off_amount);
+        f.process(&mut tone[..2 * 4_800], 2);
+        f.set_amount(1.0);
+        let mut silence = vec![0.0; 2 * 4_800];
+        f.process(&mut silence, 2);
+        silence.iter().fold(0.0, |m: Real, s| m.max(s.abs()))
+    }
+
+    #[test]
+    fn fidelity_brought_back_from_zero_starts_from_rest() {
+        // Audit report #9: the high-pass resumed from the treble it last heard, and the
+        // waveshaper turned it into a click at -6.5 dBFS in silence.
+        let peak = ring_after_switching(0.0);
+        assert!(peak < 1e-20, "the old state came out at {peak}");
+    }
+
+    #[test]
+    fn fidelity_that_stays_on_keeps_its_state_through_an_amount_change() {
+        assert!(ring_after_switching(0.5) > 1e-3);
+    }
+
     #[test]
     fn a_sample_rate_change_redesigns_the_filter() {
         let mut f = Fidelity::new(44_100.0);
@@ -315,5 +376,32 @@ mod tests {
         f.set_sample_rate(96_000.0);
         assert_ne!(before, f.gain);
         assert_eq!(f.sample_rate, 96_000.0);
+    }
+
+    #[test]
+    fn taken_to_zero_fidelity_fades_out_over_twenty_milliseconds_and_is_then_bypassed_exactly() {
+        // Audit report #11: the stage runs on through its fade to zero, then the chain skips it
+        // and it touches nothing, as it did the moment it reached zero before.
+        let mut stage = Fidelity::new(48_000.0);
+        stage.set_amount(1.0);
+        stage.settle();
+        let tone = |frames: usize| -> Vec<Real> {
+            (0..frames)
+                .flat_map(|n| {
+                    let s = (n as Real * 3_000.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.3;
+                    [s, -0.5 * s]
+                })
+                .collect()
+        };
+        let mut playing = tone(4_800);
+        stage.process(&mut playing, 2);
+        stage.set_amount(0.0);
+        assert!(stage.is_active(), "switched off, it went silent at once");
+        let mut fading = tone(959);
+        stage.process(&mut fading, 2);
+        assert!(stage.is_active(), "the fade ended early");
+        let mut last = tone(1);
+        stage.process(&mut last, 2);
+        assert!(!stage.is_active(), "the fade did not end after 20 ms");
     }
 }

@@ -141,6 +141,15 @@ const MAX_SAMPLE_RATE: Real = 768_000.0;
 /// Corner of the DC blocker, low enough to leave band 1 (from 42.17 Hz) untouched.
 const DC_BLOCK_HZ: Real = 5.0;
 
+/// A sample at or below this is silence for the purpose of skipping an analysis.
+///
+/// Once the whole ring is under it — [`FFT_SIZE`] such samples in a row — the transform of that
+/// window would be nothing but the DC blocker's own tail, and the bands would decay through the
+/// smoother exactly as they do when the analysis is skipped and the decay applied directly. So
+/// it is skipped: an idle sink with a silent client, which is most of a desktop's day, costs no
+/// FFT at all. The number sits two decades under the smallest band level the display can show.
+const SILENCE: Real = 1.0e-9;
+
 /// Below this the smoothed mean square is snapped to zero.
 ///
 /// The original never needs this: its `1.0e-5` bias inside the resonator
@@ -192,6 +201,11 @@ pub struct SpectrumAnalyser {
     since_hop: usize,
     /// Worst-case analyses per `push`, budgeted from `max_block` at construction.
     max_hops_per_push: usize,
+    /// How many consecutive input samples were at or under [`SILENCE`], saturating at
+    /// [`FFT_SIZE`]: at that count the whole ring is silence and the analysis is skipped.
+    quiet_run: usize,
+    /// How many analyses have actually run; what a test counts to see that silence ran none.
+    analyses: u64,
 
     bands: [Band; NUM_BANDS],
     sample_rate: Real,
@@ -260,6 +274,9 @@ impl SpectrumAnalyser {
             write: 0,
             since_hop: 0,
             max_hops_per_push: (max_block / HOP_SIZE).saturating_add(1),
+            // The ring starts silent, so the first analyses can be skipped too.
+            quiet_run: FFT_SIZE,
+            analyses: 0,
             bands,
             sample_rate: 0.0,
             alpha: 0.0,
@@ -315,6 +332,11 @@ impl SpectrumAnalyser {
             let sum = sum * inv_used;
             // A driver hiccup must not be able to poison the ring for the next FFT_SIZE samples.
             let x = if sum.is_finite() { sum } else { 0.0 };
+            self.quiet_run = if x.abs() <= SILENCE {
+                (self.quiet_run + 1).min(FFT_SIZE)
+            } else {
+                0
+            };
 
             // Stands in for the original's `1 - z^-2` zero at DC (`spectrumProcess.cpp:73-82`).
             // Without it a constant offset spreads into bin 1 through the window and pegs band 1.
@@ -334,10 +356,38 @@ impl SpectrumAnalyser {
                 self.since_hop = 0;
                 if hops_left > 0 {
                     hops_left -= 1;
-                    self.analyse();
+                    if self.quiet_run >= FFT_SIZE {
+                        self.decay();
+                    } else {
+                        self.analyse();
+                    }
                 }
             }
         }
+    }
+
+    /// What an analysis of a silent window does to the bands, without the transform: the
+    /// smoother's decay, with the same flush to zero.
+    fn decay(&mut self) {
+        let alpha = self.alpha;
+        for band in self.bands.iter_mut() {
+            let mut smoothed = alpha * band.smoothed_ms;
+            if !smoothed.is_finite() || smoothed < DENORMAL_FLOOR {
+                smoothed = 0.0;
+            }
+            band.smoothed_ms = smoothed;
+            band.level = if smoothed > MAX_OUTPUT_VALUE {
+                MAX_OUTPUT_VALUE
+            } else {
+                smoothed.sqrt()
+            };
+        }
+    }
+
+    /// How many transforms have run since construction.
+    #[cfg(test)]
+    pub(crate) const fn analyses(&self) -> u64 {
+        self.analyses
     }
 
     /// The ten smoothed band magnitudes, each `0.0..=1.0`, ready for the GUI.
@@ -361,6 +411,7 @@ impl SpectrumAnalyser {
         self.ring.fill(0.0);
         self.write = 0;
         self.since_hop = 0;
+        self.quiet_run = FFT_SIZE;
         self.dc_x1 = 0.0;
         self.dc_y1 = 0.0;
         for band in self.bands.iter_mut() {
@@ -405,6 +456,7 @@ impl SpectrumAnalyser {
 
     /// One analysis: window the ring, transform, fold the bins into ten levels.
     fn analyse(&mut self) {
+        self.analyses = self.analyses.saturating_add(1);
         {
             let Self {
                 ring,
@@ -513,6 +565,93 @@ mod tests {
     const FS: Real = 48_000.0;
 
     /// Feeds `frames` frames of stereo `source(n)` in `block` sized pushes.
+
+    #[test]
+    fn a_silent_stream_never_runs_the_transform() {
+        // An idle sink with a silent client is most of a desktop's day. The ring starts silent
+        // and stays silent, so not one analysis is worth running; the bands stay at zero.
+        let mut an = SpectrumAnalyser::new(FS, 1_024);
+        feed(&mut an, FFT_SIZE * 8, 1_024, |_| 0.0);
+        assert_eq!(an.analyses(), 0, "the FFT ran on silence");
+        assert!(an.bands().iter().all(|b| *b == 0.0));
+
+        // A sample one decade above the line is not silence.
+        feed(&mut an, HOP_SIZE, 1_024, |_| 1.0e-8);
+        assert!(
+            an.analyses() >= 1,
+            "a quiet signal was mistaken for silence"
+        );
+    }
+
+    #[test]
+    fn silence_after_signal_is_analysed_until_the_ring_is_empty_and_then_decayed() {
+        // The short-circuit must not freeze the display: while loud samples are still in the
+        // ring the transform runs and the bands fall through the smoother; once the whole ring
+        // is silence the decay continues without it, to the same zero.
+        let mut an = SpectrumAnalyser::new(FS, 1_024);
+        feed(&mut an, FFT_SIZE * 4, 1_024, |n| {
+            (n as Real * core::f32::consts::TAU * 1_000.0 / FS).sin() * 0.5
+        });
+        let loud = an.bands();
+        assert!(loud.iter().any(|b| *b > 0.1), "premise: the tone registers");
+        let before = an.analyses();
+
+        // One ring's worth of silence: for three of its four hops the ring still holds the
+        // tone and the transform runs; at the fourth the ring is all silence and it is skipped.
+        feed(&mut an, FFT_SIZE, 1_024, |_| 0.0);
+        let during = an.analyses();
+        assert_eq!(
+            during - before,
+            (FFT_SIZE / HOP_SIZE - 1) as u64,
+            "the tail was not analysed"
+        );
+
+        // From here on the ring is silence and the transform is skipped, but the bands keep
+        // decaying exactly as an analysis of zeros would decay them: the smoothed mean square
+        // times alpha per hop, flushed to zero under the floor, clamped and rooted for display.
+        let mut reference: Vec<Real> = an.bands.iter().map(|b| b.smoothed_ms).collect();
+        feed(&mut an, FFT_SIZE * 2, 1_024, |_| 0.0);
+        assert_eq!(an.analyses(), during, "the FFT ran on a silent ring");
+        for _ in 0..(FFT_SIZE * 2 / HOP_SIZE) {
+            for ms in reference.iter_mut() {
+                *ms *= an.alpha;
+                if *ms < DENORMAL_FLOOR {
+                    *ms = 0.0;
+                }
+            }
+        }
+        for (k, (got, ms)) in an.bands().iter().zip(&reference).enumerate() {
+            let want = if *ms > MAX_OUTPUT_VALUE {
+                MAX_OUTPUT_VALUE
+            } else {
+                ms.sqrt()
+            };
+            assert!(
+                (got - want).abs() <= want.abs() * 1.0e-3 + 1.0e-9,
+                "band {k}: {got} against {want}"
+            );
+        }
+        // And in the end, silence reaches a true zero — in the time the smoother's own arithmetic
+        // says it takes, and not before. The mean square falls by `alpha` per hop until it is
+        // under DENORMAL_FLOOR, so from its largest value that is `ln(ms / floor) / -ln(alpha)`
+        // hops. Forty rings looked like plenty and was not: with τ = 0.1 s on the mean square,
+        // from 0.1 to 1e-20 is forty-four time constants, four and a half seconds, fifty-two
+        // rings — the budget is derived rather than guessed so the test cannot drift from the
+        // constants it is checking.
+        let largest = an
+            .bands
+            .iter()
+            .map(|b| b.smoothed_ms)
+            .fold(DENORMAL_FLOOR, Real::max);
+        let hops = ((largest / DENORMAL_FLOOR).ln() / -an.alpha.ln()).ceil() as usize + 1;
+        let rings = hops.div_ceil(FFT_SIZE / HOP_SIZE);
+        feed(&mut an, FFT_SIZE * rings, 1_024, |_| 0.0);
+        assert!(
+            an.bands().iter().all(|b| *b == 0.0),
+            "after {rings} rings of silence: {:?}",
+            an.bands()
+        );
+    }
     fn feed(
         an: &mut SpectrumAnalyser,
         frames: usize,

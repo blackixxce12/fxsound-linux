@@ -12,12 +12,14 @@
 #      build host happens to have rustup installed: the proxy then tries to
 #      *download* 1.98.1, and on a network-isolated builder that fails with a
 #      message about a missing toolchain that looks nothing like the real
-#      problem. debian/rules exports RUSTUP_TOOLCHAIN=stable to defuse it,
-#      which is the same trick packaging/PKGBUILD uses.
+#      problem. debian/rules defaults RUSTUP_TOOLCHAIN to stable unless the
+#      caller set one (`?=`): that defuses it, and a CI container that
+#      installed exactly 1.98.1 can still name that toolchain instead.
+#      packaging/PKGBUILD does the same.
 #
 #   2. Cargo.toml says rust-version = "1.98.1". Cargo enforces that one itself,
 #      with any rustc, and refuses the build outright: "package `fxsound-app
-#      v0.3.0` cannot be built because it requires rustc 1.98.1 or newer".
+#      v0.4.0` cannot be built because it requires rustc 1.98.1 or newer".
 #      Exporting RUSTUP_TOOLCHAIN does nothing about it. Neither does removing
 #      rust-toolchain.toml.
 #
@@ -113,8 +115,16 @@ Recommends:
 # Switching the session's default sink is a session-manager operation; without
 # one, FxSound creates its sink and nothing moves onto it.
  wireplumber,
-# Native file dialogs for preset import and export, through the portal.
+# Native file dialogs for preset import and export, through the portal. The
+# portal itself only routes the request: a *backend* has to implement the file
+# chooser, and wlroots' own backend does not. Any of the three desktop ones
+# will do; the GTK one is the smallest and works under every compositor.
  xdg-desktop-portal,
+ xdg-desktop-portal-gtk | xdg-desktop-portal-kde | xdg-desktop-portal-gnome,
+# The D-Bus interface, the tray and notifications all need a session bus. Every
+# desktop session starts one, but a bare compositor started from a tty does
+# not — dbus-user-session gives it one through systemd --user.
+ dbus-user-session,
 # egui embeds its own base faces, so this is not required to start — it is what
 # lets the window fall back to a system face for a script the embedded fonts do
 # not cover.
@@ -136,8 +146,9 @@ Description: system-wide audio enhancement for PipeWire
  This is a native Linux port of the Windows application, written in Rust with
  egui. It is a fork rather than a wrapper: the GUI, the device layer and the
  persistence are new, but the DSP is ported line by line from the original C,
- so a preset voiced on Windows sounds the same here. The factory and bonus
- .fac presets are installed alongside it and are the upstream files unchanged.
+ with some of its defects fixed, so a preset voiced on Windows sounds slightly
+ different here. The factory and bonus .fac presets are installed alongside it
+ and are the upstream files unchanged.
  .
  A Wayland client cannot grab global shortcuts, so the keyboard bindings live
  in the compositor and call back into the running instance over a control

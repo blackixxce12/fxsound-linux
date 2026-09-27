@@ -64,6 +64,27 @@ pub const LIGHT: [u32; NUM_COLORS] = [
     0xc0_c0c0, 0x4e_4e4e, 0x23_b6eb,
 ];
 
+/// The lightest grey [`Palette::greyed`] gives in the light palette: `#767676`, 3.4:1 on the light
+/// `ControlBackground` (`#e0e0e0`) the visualizer and the equalizer are drawn on.
+pub const LIGHT_GREY_LIMIT: u8 = 0x76;
+
+/// WCAG 2's contrast ratio between two opaque colours, 1 to 21.
+#[must_use]
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    fn channel(value: u8) -> f32 {
+        let c = f32::from(value) / 255.0;
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    let luminance =
+        |c: Color32| 0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b());
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
 /// The active palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
@@ -126,6 +147,42 @@ impl Palette {
         self.color_alpha(FxColor::PanelBackground, 0.2)
     }
 
+    /// A rule between two areas and the edge of a menu: `Outline`, except in the light palette.
+    ///
+    /// The light `Outline` is `#fafafa`, 1.04:1 on the `#f5f5f5` window, so the Settings rule and
+    /// the hamburger menu's edge the original draws in it are not there at all (0.4.0 audit #25).
+    /// The light palette's own `#c0c0c0` — its `PanelBackground` — is used instead; the palette
+    /// tables are left as the original's.
+    #[must_use]
+    pub const fn divider(self) -> Color32 {
+        match self.mode {
+            ThemeMode::Dark => self.color(FxColor::Outline),
+            ThemeMode::Light => Color32::from_rgb(0xc0, 0xc0, 0xc0),
+        }
+    }
+
+    /// `colour` greyed out, as a graph shows it while what it draws is switched off: the
+    /// visualizer with the power off and the equalizer's curve while it is bypassed.
+    ///
+    /// The original's `Colour::withSaturation(0.0f)` round-trips through HSB and keeps the
+    /// brightness, `max(r, g, b)` (`FxVisualizer.cpp:177-199`), which the dark palette keeps. In
+    /// the light palette that turns the light blues white, `#1ac1ff` and `#72d8ff` into `#ffffff`
+    /// on a `#e0e0e0` panel, 1.3:1, and the graph is gone — "a real legibility bug", which 0.3.0
+    /// reproduced (0.4.0 audit #24). There the grey is the colour's luma instead, and no lighter
+    /// than [`LIGHT_GREY_LIMIT`], which still reads at 3:1 on the panel. Alpha is kept.
+    #[must_use]
+    pub fn greyed(self, colour: Color32) -> Color32 {
+        let [r, g, b, a] = colour.to_srgba_unmultiplied();
+        let grey = match self.mode {
+            ThemeMode::Dark => r.max(g).max(b),
+            ThemeMode::Light => {
+                let luma = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
+                (luma.round() as u8).min(LIGHT_GREY_LIMIT)
+            }
+        };
+        Color32::from_rgba_unmultiplied(grey, grey, grey, a)
+    }
+
     /// egui `Visuals` that make stock widgets look like the FxSound ones.
     ///
     /// Custom-painted widgets (sliders, the EQ, the visualizer, the title bar) do not read these;
@@ -154,7 +211,7 @@ impl Palette {
         v.warn_fg_color = self.color(FxColor::InvalidTextBorder);
         v.error_fg_color = self.color(FxColor::InvalidTextBorder);
 
-        v.window_stroke = Stroke::new(1.0, self.color(FxColor::Outline));
+        v.window_stroke = Stroke::new(1.0, self.divider());
         v.window_corner_radius = CornerRadius::same(crate::layout::WINDOW_CORNER_RADIUS as u8);
         v.menu_corner_radius = CornerRadius::same(8);
 
@@ -164,7 +221,7 @@ impl Palette {
         let widgets = &mut v.widgets;
         widgets.noninteractive.bg_fill = self.window_background();
         widgets.noninteractive.weak_bg_fill = self.window_background();
-        widgets.noninteractive.bg_stroke = Stroke::new(1.0, self.color(FxColor::Outline));
+        widgets.noninteractive.bg_stroke = Stroke::new(1.0, self.divider());
         widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
 
         widgets.inactive.bg_fill = self.color(FxColor::ComboBoxBackground);
@@ -353,6 +410,103 @@ mod tests {
                 p.color(FxColor::WidgetBackground)
             );
         }
+    }
+
+    #[test]
+    fn the_light_divider_can_be_seen_on_the_window_and_on_a_menu_and_the_dark_one_is_the_outline() {
+        // 0.4.0 audit #25: the light `Outline`, #fafafa, is 1.04:1 on the #f5f5f5 window.
+        let light = Palette::new(ThemeMode::Light);
+        let outline = light.color(FxColor::Outline);
+        assert!(contrast_ratio(outline, light.window_background()) < 1.1);
+        for behind in [light.window_background(), light.color(FxColor::DefaultFill)] {
+            let ratio = contrast_ratio(light.divider(), behind);
+            assert!(ratio > 1.5, "{ratio} on {behind:?}");
+        }
+        let dark = Palette::new(ThemeMode::Dark);
+        assert_eq!(dark.divider(), dark.color(FxColor::Outline));
+        // The palette table itself stays the original's.
+        assert_eq!(LIGHT[FxColor::Outline as usize], 0xfa_fafa);
+    }
+
+    /// `docs/spec/04-equalizer-visualizer.md` §A8's precomputed greys, dark column:
+    /// `Colour::withSaturation(0)` keeps HSB brightness, the channel maximum, not a mid grey.
+    #[test]
+    fn the_dark_palette_greys_as_the_original_does_keeping_the_brightest_channel() {
+        let dark = Palette::new(ThemeMode::Dark);
+        let spec_table = [
+            (FxColor::SliderTrack, 0xe3),
+            (FxColor::GraphHigh, 0xd5),
+            (FxColor::GraphLow, 0xfe),
+            (FxColor::EqStart, 0xef),
+            (FxColor::EqEnd, 0x74),
+            (FxColor::SliderHighlight, 0xf7),
+        ];
+        for (id, expected) in spec_table {
+            assert_eq!(
+                dark.greyed(dark.color(id)),
+                Color32::from_rgb(expected, expected, expected),
+                "{id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_dark_palette_keeps_the_alpha_of_what_it_greys() {
+        let dark = Palette::new(ThemeMode::Dark);
+        let translucent = dark.color_alpha(FxColor::EqEnd, 0x55 as f32 / 255.0);
+        let [r, g, b, a] = dark.greyed(translucent).to_srgba_unmultiplied();
+        assert_eq!(a, 0x55);
+        assert!(r == g && g == b, "{:?}", [r, g, b]);
+        // The grey is `EqEnd`'s own brightest channel, 0x74, and not the premultiplied one, 0x26;
+        // storing it premultiplied at a third alpha costs at most one step of rounding.
+        assert!(r.abs_diff(0x74) <= 1, "{r:#x}");
+    }
+
+    #[test]
+    fn the_light_palette_greys_to_luma_no_lighter_than_three_to_one_on_its_panels() {
+        // 0.4.0 audit #24: `withSaturation(0)` turned both light graph colours white.
+        let light = Palette::new(ThemeMode::Light);
+        let panel = light.color(FxColor::ControlBackground);
+        for id in [
+            FxColor::GraphHigh,
+            FxColor::GraphLow,
+            FxColor::EqStart,
+            FxColor::EqEnd,
+            FxColor::SliderTrack,
+            FxColor::VerticalSliderLow,
+        ] {
+            let grey = light.greyed(light.color(id));
+            assert!(
+                grey.r() == grey.g() && grey.g() == grey.b(),
+                "{id:?}: {grey:?}"
+            );
+            assert!(grey.r() <= LIGHT_GREY_LIMIT, "{id:?}: {grey:?}");
+            let ratio = contrast_ratio(grey, panel);
+            assert!(
+                ratio >= 3.0,
+                "{id:?}: {grey:?} is {ratio:.2}:1 on {panel:?}"
+            );
+        }
+        // A dark colour keeps its own luma rather than being lifted to the limit.
+        assert_eq!(
+            light.greyed(light.color(FxColor::SliderTrack)),
+            Color32::from_rgb(0x41, 0x41, 0x41)
+        );
+        assert_eq!(
+            light
+                .greyed(Color32::from_rgba_unmultiplied(0x1a, 0xc1, 0xff, 191))
+                .a(),
+            191
+        );
+    }
+
+    #[test]
+    fn the_contrast_ratio_is_wcags() {
+        assert!((contrast_ratio(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio(Color32::WHITE, Color32::WHITE) - 1.0).abs() < 1e-6);
+        // #767676 on white is the classic 4.54:1.
+        let grey = Color32::from_rgb(0x76, 0x76, 0x76);
+        assert!((contrast_ratio(grey, Color32::WHITE) - 4.54).abs() < 0.01);
     }
 
     #[test]

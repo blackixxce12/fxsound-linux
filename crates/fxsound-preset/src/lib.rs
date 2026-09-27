@@ -13,15 +13,23 @@
 //! * floats are written with C's `%g`, i.e. six significant digits with trailing zeros stripped;
 //! * the equalizer block exists only in files of version 9 or newer.
 //!
+//! One thing is deliberately **not** reproduced from the file it came from: its version. The
+//! writer always writes the current one, [`VALS_FILE_VERSION`], as the original's
+//! `createValsFromStateInfo` does (`dsp/DfxDspPreset.cpp:278`) — a preset read from an older file
+//! is saved as a current one (0.4.0 audit #46).
+//!
 //! Line endings are accepted as LF or CRLF, with or without a final terminator, because the files
 //! in the FxSound tree are a mix of all three.
 
 #![forbid(unsafe_code)]
 
 pub mod input;
+pub mod input_store;
 mod store;
+pub mod trash;
 
-pub use store::{PresetEntry, PresetSource, PresetStore};
+pub use input_store::InputPresetStore;
+pub use store::{PresetEntry, PresetFile, PresetSource, PresetStore, Store};
 
 use fxsound_core::{EqBand, Preset, eq};
 use std::fmt::Write as _;
@@ -47,6 +55,22 @@ pub enum PresetError {
     },
     #[error("preset has no name")]
     MissingName,
+    /// A name the store's list does not hold. Its own variant rather than a `Malformed` at line
+    /// zero, because the string reaches the command line and D-Bus, and "line 0: expected a known
+    /// preset name" describes a file that was never opened.
+    #[error("no preset named {0:?}")]
+    Unknown(String),
+    /// A name whose file is already another listed preset's. The two names differ only in
+    /// characters a filename cannot hold — `Mu:sic` and `Music` are both `Music.fac` — so writing
+    /// the second would replace the first's file, or share its autosave when the first is a
+    /// factory preset kept under a numbered name, and the list would show one name where two had
+    /// been saved. [`crate::Store::save_as`] refuses it instead.
+    #[error("{name:?} and {existing:?} would share the file {file}")]
+    SharedFile {
+        name: String,
+        existing: String,
+        file: String,
+    },
     #[error("{0} equalizer bands, the engine supports at most {max}", max = eq::MAX_BANDS)]
     TooManyBands(usize),
     #[error(transparent)]
@@ -63,8 +87,133 @@ const NUM_ELEMENT_PARAMS: usize = 7;
 const NUM_APP_INTS: usize = 7;
 /// The first version that carries an equalizer block.
 const EQ_MIN_VERSION: f32 = 9.0;
-/// `DFXG_MAX_PRESET_NAME_LENGTH`.
+/// The version every file is written as: `DFXG_VALS_FILE_VERSION` (`dsp/DfxDspPreset.cpp:53`).
+pub const VALS_FILE_VERSION: f32 = 9.0;
+/// The first version with a bass boost (`dsp/DfxDspPreset.cpp:206-210`).
+const BASS_MIN_VERSION: f32 = 3.0;
+/// The first version with a headphone flag (`dsp/DfxDspPreset.cpp:226-229`).
+const HEADPHONE_MIN_VERSION: f32 = 4.0;
+/// `DFXG_VALS_APP_DEPEND_HEADPHONE_INDEX`.
+const HEADPHONE_APP_INT: usize = 5;
+/// `DFXG_MAX_PRESET_NAME_LENGTH`: what the file format can hold.
 pub const MAX_NAME_LEN: usize = 128;
+
+/// Characters stripped from a preset name before it is used, from
+/// `FxController::sanitizePresetName` (`fxsound/Source/GUI/FxController.cpp:378`).
+///
+/// This is the Windows reserved-filename set and it stays reserved on Linux, because a preset name
+/// becomes a `.fac` filename (`FxController.cpp:805-808`) and preset files are meant to travel
+/// between the two platforms. NUL is stripped as well: no filesystem takes it, and the original
+/// never had to say so because a Windows text field cannot type it.
+pub const PRESET_NAME_RESERVED: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+
+/// Preset names are truncated to this many characters (`FxController.cpp:380-383`, and the
+/// interactive editor's `setInputRestrictions(64)` at `FxPresetNameEditor.cpp:52`). Shorter than
+/// [`MAX_NAME_LEN`], which is what the *file* can carry; this is what a person may type.
+pub const MAX_PRESET_NAME_LEN: usize = 64;
+
+/// Steps 1 and 2 of `FxController::sanitizePresetName` (`FxController.cpp:377-391`): strip the
+/// reserved characters, then truncate to [`MAX_PRESET_NAME_LEN`] characters. Surrounding
+/// whitespace goes too, because a name that is only spaces is not a name and a trailing space is
+/// a filename nobody can see.
+///
+/// Control characters — a line break, a tab, a carriage return — become a space, a run of them
+/// one space, the way the calibration wizard cleans the name it makes. A Windows text field
+/// cannot type them, so the original never had to; a pasted `--save_preset="$(xclip -o)"`, a
+/// D-Bus call or an imported file's name can. The `.fac` format keeps the name on a line of its
+/// own, so a line break in it wrote a file no reader could parse: the preset saved, vanished
+/// from the list and could be neither picked nor renamed nor deleted.
+///
+/// The one sanitiser for every route a name takes to disk. 0.3.0 had two — the command line
+/// stripped nine characters and the store replaced three with underscores — and a name typed
+/// with a `:` in the window became a file the Windows build could not open. Step 3, the
+/// case-insensitive collision check against the existing names (`FxModel.cpp:142-153`), needs the
+/// preset list and so belongs to the controller. The order matters and is why
+/// `--save_preset="Mu:sic"` is a no-op when a preset named `Music` exists: stripping the `:`
+/// produces the collision (`docs/COMMAND_LINE_OPTIONS.md:52`).
+#[must_use]
+pub fn sanitise_preset_name(name: &str) -> String {
+    let mut stripped = String::with_capacity(name.len());
+    let mut after_control = false;
+    for c in name.chars() {
+        if c == '\0' || PRESET_NAME_RESERVED.contains(&c) {
+            continue;
+        }
+        if c.is_control() {
+            if !after_control {
+                stripped.push(' ');
+            }
+            after_control = true;
+        } else {
+            stripped.push(c);
+            after_control = false;
+        }
+    }
+    let cut: String = stripped.trim().chars().take(MAX_PRESET_NAME_LEN).collect();
+    cut.trim_end().to_owned()
+}
+
+/// The most bytes a preset name may take in a `.fac` file: the Windows reader takes the name line
+/// with `fgets(…, LINE_LENGTH = 128, …)` (`dsp/ptutil/VALS/Valsfile.cpp:38`, `:320-331`), which
+/// keeps 127 bytes and the newline has to be one of them, and then drops the name's last byte as
+/// that newline. A name of 126 bytes comes back whole; one byte longer and Windows cuts it, reads
+/// the rest of the line as the next field, and every field after it lands one line late.
+pub const MAX_NAME_BYTES: usize = 126;
+
+/// A name for a preset about to be **created** — Save New Preset, Rename Preset, `--save_preset`,
+/// an import, the calibration wizard's — made safe for every FxSound to read (0.4.0 audit #15):
+/// [`sanitise_preset_name`], then cut to [`MAX_NAME_BYTES`] on a character boundary.
+///
+/// Sixty-four characters is what the original's editor allows, but its file reader counts bytes:
+/// sixty-four Cyrillic letters are 128 bytes, and the Windows build read a preset with such a
+/// name back shifted by a line. Only new names are cut. A preset already on disk keeps its name
+/// and its files — the autosave and export paths come from [`sanitise_preset_name`], which is
+/// unchanged — so nothing that exists is orphaned.
+#[must_use]
+pub fn new_preset_name(name: &str) -> String {
+    let mut name = sanitise_preset_name(name);
+    if name.len() > MAX_NAME_BYTES {
+        let mut end = MAX_NAME_BYTES;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+        name.truncate(name.trim_end().len());
+    }
+    name
+}
+
+/// The two prefixes an installed FxSound's presets are looked for under — only these, see the
+/// manual page's FILES — in their usual order.
+const INSTALL_PREFIXES: [&str; 2] = ["/usr", "/usr/local"];
+
+/// Where an installed FxSound keeps its shared presets, `<prefix>/share/fxsound`, in the order the
+/// stores search them: the prefix the running binary is installed under first, then the other.
+///
+/// The order decides which copy a binary gets when both prefixes hold presets — a distribution
+/// package under `/usr` and the tarball under `/usr/local`, say. A factory preset found in two
+/// directories is listed from the first ([`Store`]), and so is a voice preset, so with `/usr`
+/// always first a 0.4.0 binary under `/usr/local` ran with an older package's revoiced genre
+/// presets and voice presets instead of its own. A binary under neither prefix — the source tree,
+/// or a tarball unpacked elsewhere — keeps the usual order.
+#[must_use]
+pub fn install_data_dirs() -> Vec<std::path::PathBuf> {
+    install_data_dirs_for(std::env::current_exe().ok().as_deref())
+}
+
+/// [`install_data_dirs`] for a binary at `exe`.
+fn install_data_dirs_for(exe: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    use std::path::Path;
+    // `<prefix>/bin/fxsound`: the prefix is two above the executable.
+    let own = exe.and_then(Path::parent).and_then(Path::parent);
+    let mut prefixes = INSTALL_PREFIXES.map(Path::new);
+    // Stable, so the prefix that is not the binary's keeps its place behind it.
+    prefixes.sort_by_key(|prefix| Some(*prefix) != own);
+    prefixes
+        .into_iter()
+        .map(|prefix| prefix.join("share/fxsound"))
+        .collect()
+}
 
 /// Parse a `.fac` file.
 ///
@@ -153,7 +302,8 @@ pub fn parse(bytes: &[u8]) -> Result<Preset, PresetError> {
 
     // The equalizer block. The writer emits it whenever it holds an EQ handle; the reader only
     // looks for it from version 9 on, and that is the behaviour that matters for compatibility.
-    let (eq_bands, eq_on) = if version >= EQ_MIN_VERSION && !lines.is_exhausted() {
+    let eq_block = version >= EQ_MIN_VERSION && !lines.is_exhausted();
+    let (eq_bands, eq_on) = if eq_block {
         let num_bands = lines.next_i64("the band count")?.max(0) as usize;
         if num_bands > eq::MAX_BANDS {
             return Err(PresetError::TooManyBands(num_bands));
@@ -171,6 +321,17 @@ pub fn parse(bytes: &[u8]) -> Result<Preset, PresetError> {
         (eq::default_bands(), true)
     };
 
+    // What an older file does not carry, read the way the original reads it
+    // (`dsp/DfxDspPreset.cpp:206-229`), so that saving it again — always as the current version —
+    // writes what it meant rather than whatever its slots happened to hold.
+    if version < BASS_MIN_VERSION {
+        main_midi[fxsound_core::Effect::Bass.vals_index()] = 0;
+        app_ints[fxsound_core::Effect::Bass.app_depend_index()] = 0;
+    }
+    if version < HEADPHONE_MIN_VERSION {
+        app_ints[HEADPHONE_APP_INT] = 0;
+    }
+
     Ok(Preset {
         name,
         version,
@@ -187,13 +348,20 @@ pub fn parse(bytes: &[u8]) -> Result<Preset, PresetError> {
 /// Byte-identical to what the original writes for any preset it produced, apart from the line
 /// ending: the Windows build opens the file in text mode so it emits CRLF. Files in the FxSound
 /// tree use both, and the reader accepts either.
+///
+/// Always as the current version, [`VALS_FILE_VERSION`], whatever `preset.version` says, and so
+/// always with the double-params line and the equalizer block its reader expects (0.4.0 audit
+/// #46). Writing the version a preset was read with, as this did, made a re-saved version 7 file
+/// one whose equalizer block the reader skips — an imported preset lost its curve the moment it
+/// was saved — and a version 1 file one whose double-params line the reader takes for the element
+/// count, so every field after it shifted.
 #[must_use]
 pub fn write(preset: &Preset) -> String {
     let mut out = String::with_capacity(1024);
 
     let _ = writeln!(out, "CLASS1 : Effect Type");
-    let _ = writeln!(out, "{}: Version", format_g(preset.version));
-    let _ = writeln!(out, "{}", preset.name);
+    let _ = writeln!(out, "{}: Version", format_g(VALS_FILE_VERSION));
+    let _ = writeln!(out, "{}", one_line(&preset.name));
     let _ = writeln!(out, "0: Double Params Flag");
     let _ = writeln!(out, "1: Total number of elements");
 
@@ -225,6 +393,34 @@ pub fn write(preset: &Preset) -> String {
     }
 
     out
+}
+
+/// `name` as the one line the `.fac` format keeps it on: each run of line breaks a space, as
+/// [`sanitise_preset_name`] makes them.
+///
+/// A line break inside the name would end its line early — the rest of the name read as the
+/// double-params flag, and the file unreadable. Every route to a name cleans it first; this is
+/// the writer never producing a file it cannot read, whatever it is handed. Only line breaks: a
+/// tab a 0.3.0 name may hold reads back as it was written, and changing it would rename the
+/// preset under the settings that select it.
+fn one_line(name: &str) -> std::borrow::Cow<'_, str> {
+    if !name.contains(['\n', '\r']) {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut after_break = false;
+    for c in name.chars() {
+        if matches!(c, '\n' | '\r') {
+            if !after_break {
+                out.push(' ');
+            }
+            after_break = true;
+        } else {
+            out.push(c);
+            after_break = false;
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Read a preset from disk, taking the display name from the file stem when the file itself
@@ -646,5 +842,268 @@ Band 10
         for band in &again.eq_bands {
             assert!(band.boost_db.is_finite() && band.center_hz.is_finite());
         }
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_not_part_of_a_preset_name() {
+        // A trailing space is a filename nobody can see, and a name that is only spaces is not a
+        // name. Spaces inside stay: "Bass Boost" is a shipped preset.
+        assert_eq!(sanitise_preset_name("  Rock  "), "Rock");
+        assert_eq!(sanitise_preset_name("Bass  Boost"), "Bass  Boost");
+        assert_eq!(sanitise_preset_name("   "), "");
+    }
+
+    #[test]
+    fn nul_is_stripped_like_a_reserved_character() {
+        // Not in the original's list only because a Windows text field cannot type it; no
+        // filesystem takes it, and `--save_preset` can be handed one by a script.
+        assert_eq!(sanitise_preset_name("a\0b"), "ab");
+        assert_eq!(sanitise_preset_name("\0"), "");
+    }
+
+    #[test]
+    fn control_characters_become_a_space_and_a_run_of_them_one_space() {
+        // A multi-line string pasted into `--save_preset="$(xclip -o)"` used to come through
+        // whole, and the `.fac` it was saved to could not be read back.
+        assert_eq!(
+            sanitise_preset_name("Line one\nLine two"),
+            "Line one Line two"
+        );
+        assert_eq!(
+            sanitise_preset_name("Line one\r\nLine two\n"),
+            "Line one Line two"
+        );
+        assert_eq!(sanitise_preset_name("\tRock\x7f"), "Rock");
+        assert_eq!(sanitise_preset_name("a\u{85}b"), "a b", "C1 controls too");
+        assert_eq!(sanitise_preset_name("\n\r\t"), "");
+        assert_eq!(new_preset_name("Line one\nLine two"), "Line one Line two");
+        // NUL is still stripped, not spaced: it never separated two words.
+        assert_eq!(sanitise_preset_name("a\0b"), "ab");
+    }
+
+    #[test]
+    fn a_name_with_a_line_break_is_written_as_a_file_that_reads_back() {
+        // Every route cleans a name first; the writer still never produces a file it cannot
+        // parse, whatever it is handed.
+        let preset = Preset {
+            name: "Line one\r\nLine two\r".into(),
+            ..Preset::default()
+        };
+        let again = parse(write(&preset).as_bytes()).expect("reparse what we just wrote");
+        assert_eq!(again.name, "Line one Line two");
+        // A tab is left as it is: it reads back, and a 0.3.0 name may hold one.
+        let tabbed = Preset {
+            name: "a\tb".into(),
+            ..Preset::default()
+        };
+        assert_eq!(
+            parse(write(&tabbed).as_bytes()).expect("reparse").name,
+            "a\tb"
+        );
+        assert_eq!(again.main_midi, preset.main_midi);
+        assert_eq!(again.eq_bands, preset.eq_bands);
+    }
+
+    #[test]
+    fn every_reserved_character_is_stripped_wherever_it_sits() {
+        for c in PRESET_NAME_RESERVED {
+            assert_eq!(
+                sanitise_preset_name(&format!("{c}Ro{c}ck{c}")),
+                "Rock",
+                "{c:?}"
+            );
+        }
+        assert_eq!(sanitise_preset_name(r#"<>:"/\|?*"#), "");
+        // And nothing else is: the set is deliberately the Windows one, not the shell's, and a
+        // shipped preset is called R&B.
+        assert_eq!(sanitise_preset_name("R&B"), "R&B");
+        assert_eq!(
+            sanitise_preset_name("Naïve 'Jazz' (live) #2"),
+            "Naïve 'Jazz' (live) #2"
+        );
+    }
+
+    #[test]
+    fn a_long_name_is_cut_to_sixty_four_characters_and_does_not_end_in_a_space() {
+        // 63 letters, a space, 6 more letters: the cut lands on the space, and a stem with a
+        // trailing space is the filename problem the trim exists for.
+        let name = format!("{} {}", "a".repeat(63), "b".repeat(6));
+        assert_eq!(name.chars().count(), 70);
+        assert_eq!(sanitise_preset_name(&name), "a".repeat(63));
+        // The limit is characters, not bytes: a name of two-byte letters keeps 64 of them.
+        let wide = "é".repeat(70);
+        assert_eq!(
+            sanitise_preset_name(&wide).chars().count(),
+            MAX_PRESET_NAME_LEN
+        );
+        // Exactly 64 is not cut at all.
+        let exact = "a".repeat(MAX_PRESET_NAME_LEN);
+        assert_eq!(sanitise_preset_name(&exact), exact);
+    }
+
+    #[test]
+    fn reserved_characters_are_stripped_before_the_cut_is_measured() {
+        // The original's order (`FxController.cpp:378` before `:380`): the characters that go
+        // do not count towards the 64, so ten colons in front of 64 letters leave all 64.
+        let name = format!("{}{}", ":".repeat(10), "a".repeat(MAX_PRESET_NAME_LEN));
+        assert_eq!(sanitise_preset_name(&name), "a".repeat(MAX_PRESET_NAME_LEN));
+    }
+
+    /// The fixture as a file of another version: `version` on its second line and, for a version
+    /// 1 file, no double-params line, as `valsSave` writes one (`Valsfile.cpp:93-96`).
+    fn fixture_as_version(version: &str) -> String {
+        let mut text = FIXTURE.replacen("9: Version", &format!("{version}: Version"), 1);
+        if version.parse::<f32>().is_ok_and(|v| v <= 1.0) {
+            text = text.replacen("0: Double Params Flag\n", "", 1);
+        }
+        text
+    }
+
+    #[test]
+    fn a_preset_read_from_an_older_file_is_written_as_the_current_version() {
+        // 0.4.0 audit #46. Imported from a version 7 file, moved on the equalizer, saved: the
+        // writer kept "7: Version", the reader skips the equalizer block below version 9, and the
+        // curve came back flat after a restart.
+        let mut preset = parse(fixture_as_version("7").as_bytes()).expect("a version 7 file");
+        assert_eq!(preset.version, 7.0);
+        assert_eq!(
+            preset.eq_bands,
+            eq::default_bands(),
+            "version 7 carries no curve"
+        );
+        preset.eq_bands[3].boost_db = 5.0;
+
+        let text = write(&preset);
+        assert!(text.contains("\n9: Version\n"), "{text}");
+        let again = parse(text.as_bytes()).expect("reparse");
+        assert_eq!(again.eq_bands[3].boost_db, 5.0, "the edited curve survives");
+        assert_eq!(again.main_midi, preset.main_midi);
+    }
+
+    #[test]
+    fn a_version_one_file_reads_right_and_is_saved_as_one_that_reads_right() {
+        // A version 1 file has no double-params line. Written back as version 1 with one, as the
+        // writer used to, the reader took "0: Double Params Flag" for the element count and every
+        // field after it was read one line late.
+        let old = parse(fixture_as_version("1").as_bytes()).expect("a version 1 file");
+        assert_eq!(old.version, 1.0);
+        assert_eq!(old.name, "Fixture");
+        let again = parse(write(&old).as_bytes()).expect("reparse what was written");
+        assert_eq!(again.name, old.name);
+        assert_eq!(again.main_midi, old.main_midi);
+        assert_eq!(again.app_ints, old.app_ints);
+        assert_eq!(again.element_params, old.element_params);
+    }
+
+    #[test]
+    fn a_file_older_than_version_three_has_no_bass_and_one_older_than_four_no_headphones() {
+        // `DfxDspPreset.cpp:206-229`: before version 3 the file has no bass boost, before 4 no
+        // headphone flag. Whatever those slots hold is not a setting.
+        let two = parse(fixture_as_version("2").as_bytes()).expect("version 2");
+        assert_eq!(two.main_midi[fxsound_core::Effect::Bass.vals_index()], 0);
+        assert!(!two.is_effect_on(fxsound_core::Effect::Bass));
+        assert_eq!(
+            two.app_ints[fxsound_core::Effect::Bass.app_depend_index()],
+            0
+        );
+        let three = parse(
+            fixture_as_version("3")
+                .replacen("0: Integer[5]", "1: Integer[5]", 1)
+                .as_bytes(),
+        )
+        .expect("version 3");
+        assert_eq!(three.main_midi[fxsound_core::Effect::Bass.vals_index()], 60);
+        assert_eq!(
+            three.app_ints[HEADPHONE_APP_INT], 0,
+            "no headphone flag before 4"
+        );
+        let four = parse(
+            fixture_as_version("4")
+                .replacen("0: Integer[5]", "1: Integer[5]", 1)
+                .as_bytes(),
+        )
+        .expect("version 4");
+        assert_eq!(four.app_ints[HEADPHONE_APP_INT], 1);
+    }
+
+    #[test]
+    fn a_current_file_is_still_written_back_byte_for_byte() {
+        let preset = parse(FIXTURE.as_bytes()).expect("parse");
+        assert_eq!(write(&preset), FIXTURE);
+    }
+
+    #[test]
+    fn a_new_name_is_cut_to_what_the_windows_reader_takes_on_a_character_boundary() {
+        // 0.4.0 audit #15: 64 Cyrillic letters are 128 bytes, two more than the Windows reader
+        // keeps, and that preset read back shifted by a line.
+        let cyrillic = "я".repeat(MAX_PRESET_NAME_LEN);
+        assert_eq!(cyrillic.len(), 128);
+        let cut = new_preset_name(&cyrillic);
+        assert_eq!(cut, "я".repeat(63));
+        assert_eq!(cut.len(), MAX_NAME_BYTES);
+        // A three-byte letter never splits: 42 of them are 126 bytes, 43 cannot fit.
+        let cjk = "音".repeat(50);
+        assert_eq!(new_preset_name(&cjk), "音".repeat(42));
+        // A cut that lands after a space does not leave a trailing space.
+        let spaced = format!("{} {}", "я".repeat(62), "яя");
+        assert_eq!(new_preset_name(&spaced), "я".repeat(62));
+        // What fits is left alone, and the sanitiser still runs first.
+        assert_eq!(new_preset_name(" Rock:  "), "Rock");
+        assert_eq!(
+            new_preset_name(&"a".repeat(80)),
+            "a".repeat(MAX_PRESET_NAME_LEN)
+        );
+        // And a name cut this way is one the reader gives back whole.
+        let mut preset = parse(FIXTURE.as_bytes()).expect("parse");
+        preset.name = cut.clone();
+        let text = write(&preset);
+        let name_line = text.lines().nth(2).expect("the name line");
+        assert!(
+            name_line.len() < 128,
+            "fits fgets(…, 128, …) with its newline"
+        );
+        assert_eq!(parse(text.as_bytes()).expect("reparse").name, cut);
+    }
+
+    fn data_dirs_for(exe: &str) -> Vec<std::path::PathBuf> {
+        install_data_dirs_for(Some(std::path::Path::new(exe)))
+    }
+
+    #[test]
+    fn a_binary_under_usr_local_takes_its_own_presets_before_a_packages_under_usr() {
+        // The tarball's binary beside a distribution package: the package's presets may be an
+        // older release's, and the first directory's copy of a name is the one listed.
+        assert_eq!(
+            data_dirs_for("/usr/local/bin/fxsound"),
+            ["/usr/local/share/fxsound", "/usr/share/fxsound"].map(std::path::PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn a_binary_under_usr_takes_its_own_presets_before_those_under_usr_local() {
+        assert_eq!(
+            data_dirs_for("/usr/bin/fxsound"),
+            ["/usr/share/fxsound", "/usr/local/share/fxsound"].map(std::path::PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn a_binary_under_neither_prefix_searches_usr_then_usr_local() {
+        for exe in [
+            "/home/someone/fxsound-linux/target/release/fxsound",
+            "/opt/fxsound/bin/fxsound",
+            "fxsound",
+        ] {
+            assert_eq!(
+                data_dirs_for(exe),
+                ["/usr/share/fxsound", "/usr/local/share/fxsound"].map(std::path::PathBuf::from),
+                "{exe}"
+            );
+        }
+        assert_eq!(
+            install_data_dirs_for(None),
+            ["/usr/share/fxsound", "/usr/local/share/fxsound"].map(std::path::PathBuf::from),
+            "no executable path to go by"
+        );
     }
 }

@@ -12,3 +12,12 @@ toml = { workspace = true }
 dirs = { workspace = true }
 log = { workspace = true }
 arc-swap = { workspace = true }
+tempfile = { workspace = true, optional = true }
+
+[features]
+# `test_support`: the scratch directories and the guarded children the workspace's tests share.
+# Only the crates' dev-dependencies turn it on, so none of it is in FxSound itself.
+test-support = ["dep:tempfile"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

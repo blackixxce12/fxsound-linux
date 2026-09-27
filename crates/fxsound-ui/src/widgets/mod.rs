@@ -17,5 +17,5 @@ pub use combo::FxComboBox;
 pub use equalizer::{EqInteraction, EqLayout, EqualizerWidget};
 pub use icon_button::IconButton;
 pub use power_button::PowerButton;
-pub use slider::{Fidelity, FxSlider};
+pub use slider::{Fidelity, FxSlider, Track};
 pub use visualizer::{VisualizerAnimation, VisualizerWidget};

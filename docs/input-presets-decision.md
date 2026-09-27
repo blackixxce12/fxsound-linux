@@ -114,3 +114,70 @@ reason it fails is written down, and without that they get proposed again.
 
 - **Rename Laptop Mic -> Small Mic** — Half of the rename proposal, and the half that is wrong. The vendor argument is against DESTINATION names (Discord), not against source names — 'Speech' and 'Acoustic Instrument' are source names and they are exactly what vendors do ship. 'Laptop Mic' tells a user instantly whether it is for them; 'Small Mic' does not, and its stated coverage of headset booms is now served by a preset voiced for that distance rather than by a vaguer name. Keep Laptop Mic, and write its numbers down — it is currently the only one of the seven with no row in the draft table and no reviewed values at all.
 
+
+## Revisited for 0.4.0: the denoiser has a level, and three cases become presets
+
+Decided 2026-09-22 against `docs/0.4.0-design.md` §2–3 and §7. The set goes from ten to thirteen,
+and the reason is not that the rejections above were wrong. They were right about the chain as it
+was: a denoiser that is a switch, a gate that hears only level. Two things changed underneath them.
+
+**The `[denoise]` table.** RNNoise is no longer on or off; it is a control surface — a floor on
+the network's band gains, an attenuation of frames the network calls noise, a share of the gap to
+unity handed back in proportion to how sure it is of a voice — with three rows, `light`, `medium`
+and `strong`, and a channel mode, `mono`, `linked` or `independent`. A preset names the row and
+the mode in a `[denoise]` table and may override any of the four numbers beside them. Everything
+the format promised still holds: the table is optional, a stage that is off has no table, and
+`rnnoise` stays in every file as the master switch a 0.3.0 binary reads — written in step with
+the table, so both binaries hear the same stage. A 0.3.0 file with `rnnoise = true` and no table
+is the `medium` row with one network per channel, which is what that version did; the
+distinction is enforced by a test, because `Laptop Mic` must sound after the upgrade as it did
+before. `Laptop Mic` now says `medium` explicitly. `Streaming` and `Podcast` gain the `light` row
+— a 12 dB floor with most of the voice handed back, the row for a good microphone in an ordinary
+room where the full network's smearing of a quiet consonant would cost more than the hiss it
+removes. Their gate thresholds are unchanged: a floor lowered by twelve decibels is still under
+them.
+
+Three keys ride with it. `[deesser] mode = "adaptive"` lets the corner follow the source's
+bandwidth, which is the Nyquist guard above made a preset choice. `[dereverb] level` names the
+late-reverberation suppressor the design adds after the denoiser; no shipped preset turns it on,
+because a reverb is a room's property and not a microphone's, and it belongs to the setting. And
+`vad_gate = true` lets the network's voice probability hold the gate open, which is the field the
+two rejections below turned on.
+
+**Noisy Room** — *confidence: medium.* Rejected above because "a gate is a time-domain switch: it
+does nothing about noise during speech", and a threshold high enough to hold a −30 dB floor
+chatters on every word. Both objections stand, and neither is what the preset now does. The work
+is in the table: `strong` — the network's whole opinion, nothing handed back — and `mono`, one
+network on the downmix and the same signal to every channel, because a room's noise is not an
+image worth keeping. The gate then sits at −40 dB against a *denoised* floor with `vad_gate`
+holding it open while the network hears a voice, and a −20 dB range so what is left of the room
+comes and goes gently. The vendors that ship this case as a switch still ship it as a switch; here
+the switch has a row, and the row has a gate voiced for it, and that is a preset. HPF 120 Hz
+fourth order for the fan's fundamental; −1.5 dB at 200 Hz, +2 dB at 2.5 kHz; makeup +7; the rest
+as Clean Voice.
+
+**Mechanical Keyboard** — *confidence: medium.* The opposite problem from Noisy Room: transients,
+not a floor. A key click is a millisecond of energy an RMS detector barely sees and a 150 ms
+release lets ring, so this is the one preset in the set with a `peak` gate — 1 ms attack, 60 ms
+release, 40 ms hold, 4:1, −24 dB range, closed between words and closed fast, with the voice
+probability keeping it open through a sentence so the fast release does not chop the ends of
+words. `strong` and `independent`: the network knows keyboards, and a desk microphone's stereo
+image is worth keeping. HPF 100 Hz second order; +2 dB at 2.5 kHz; makeup +5.
+
+**Gaming Headset** — *confidence: medium-high.* Headset's near-field case with the room switched
+on, and the reason it is not Headset with `rnnoise = true`: it is `linked`. A headset that captures
+in stereo must not have its two sides disagree about what is voice, so one network analyses the
+downmix and its mask is applied to each channel through that channel's own transform. `medium`,
+`vad_gate`, a −18 dB range because what the gate closes on is keys rather than room tone, a
+100 Hz fourth-order corner between Headset's 120 and Laptop Mic's 85, and the de-esser at
+`adaptive` because a headset on a Bluetooth profile captures at 16 kHz, where a 6 kHz corner has
+no sibilance band above it and the stage should stand aside rather than run inert. Presence +2 at
+2.5 kHz and +1.5 at 5 kHz; makeup +6.
+
+All thirteen pass the same contract the first ten did (`crates/fxsound-dsp/tests/voice_presets.rs`):
+nothing the engine would clamp, every gate range in (−40, 0), every de-esser buildable at 48 kHz,
+every band within half a decibel of what it stores, and no two presets within a decibel of each
+other anywhere in the chain. The rule for the three additions was the rule for the first ten: a
+preset ships only where the named source's acoustics force it, and a denoise row is set only there.
+Room Echo and Game Voice Chat stay rejected — de-reverb and echo cancellation are session settings
+in 0.4.0, not voicings.

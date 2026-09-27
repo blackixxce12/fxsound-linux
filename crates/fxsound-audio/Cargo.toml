@@ -9,13 +9,31 @@ description = "PipeWire audio backend for the FxSound Linux port: the virtual si
 [dependencies]
 fxsound-core = { workspace = true }
 fxsound-dsp = { workspace = true }
-# `v0_3_65` is the feature level the verified cheatsheet prescribes
-# (`docs/api/pipewire-0.10-rust.md` §1.1): without it `keys::NODE_LINK_GROUP`,
-# `keys::TARGET_OBJECT`, `keys::NODE_WANT_DRIVER` and `Buffer::requested()` do not exist.
+# `v0_3_64` on `pipewire` is the level the code needs: without it `keys::NODE_LINK_GROUP`,
+# `keys::TARGET_OBJECT`, `keys::NODE_WANT_DRIVER` and `Buffer::requested()` do not exist
+# (`docs/api/pipewire-0.10-rust.md` §1.1). Not `v0_3_65`, although 0.3.65 is the floor: that level
+# turns on libspa's `v0_3_65`, whose `MediaSubtype::Opus` names `SPA_MEDIA_SUBTYPE_opus`, which
+# PipeWire only added in 0.3.68 — so against the 0.3.65 headers of Debian bookworm, where the
+# release tarball is built, libspa 0.10.1 does not compile. Nothing here uses what libspa gates
+# behind its own levels, so `libspa` takes none beyond what `pipewire` turns on.
 # Features are additive on top of the workspace pin, so the version stays workspace-owned.
-pipewire = { workspace = true, features = ["v0_3_65"] }
-libspa = { workspace = true, features = ["v0_3_65"] }
+pipewire = { workspace = true, features = ["v0_3_64"] }
+libspa = { workspace = true }
+# `pipewire` 0.10.1 wraps no `pw_context_load_module`, and the echo canceller is a module
+# (`src/aec.rs`, `docs/0.4.0-design.md` §7). The same version `pipewire` itself links, so the
+# pointers its safe types hand out are the pointers these bindings take.
+pipewire-sys = { workspace = true }
 crossbeam-channel = { workspace = true }
 triple_buffer = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
+# The level WirePlumber kept for FxSound's own nodes before 0.4.0 took its volume over is a JSON
+# object in WirePlumber's state file (`src/volume.rs`, `inherited`). The tests use it as well:
+# `graph_churn`'s, to read the format one of our nodes holds out of `pw-dump`'s JSON rather than
+# out of a status the engine is right not to send, and `routes`', to read the UCM laptop
+# fixture's card routes, whose nested structs the device tests' minimal reader does not cover.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+# The tests' scratch directories and guarded children (`fxsound_core::test_support`).
+fxsound-core = { workspace = true, features = ["test-support"] }

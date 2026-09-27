@@ -48,7 +48,7 @@ workspace with six members. Pinned versions, verbatim from the workspace manifes
 | `egui` | `=0.36.0` | fxsound-ui |
 | `eframe` | `=0.36.0`, `default-features = false`, `["default_fonts","glow","wayland","x11"]` | fxsound-app |
 | `egui_extras` | `=0.36.0`, `default-features = false` | **unused — delete** (see §2.3) |
-| `pipewire` / `libspa` | `0.10.1` | fxsound-audio (with `features = ["v0_3_65"]` set per-crate) |
+| `pipewire` / `libspa` | `0.10.1` | fxsound-audio (with `features = ["v0_3_64"]` on `pipewire`, set per-crate; not `v0_3_65`, see `docs/api/pipewire-0.10-rust.md` §1.1) |
 | `resvg` / `usvg` / `tiny-skia` | `0.48.1` / `0.48.1` / `0.12.0` | fxsound-ui |
 | `ksni` | `0.3.6` | fxsound-app |
 | `notify-rust` | `4.18.0` | fxsound-app |
@@ -76,14 +76,15 @@ fxsound-linux/
     ├── fxsound-dsp      core                                          [WRITTEN except leveling + ambience]
     ├── fxsound-preset   core                                          [WRITTEN]
     ├── fxsound-audio    core + dsp + pipewire                         [EMPTY]
-    ├── fxsound-ui       core + egui + resvg                           [theme/layout/assets/state/slider WRITTEN]
+    ├── fxsound-ui       core + dsp (EQ response, D-27) + egui + resvg [theme/layout/assets/state/slider WRITTEN]
     └── fxsound-app      all of the above + eframe/ksni/notify-rust/rfd/clap   [EMPTY]
 ```
 
 Dependency edges are acyclic and deliberately narrow: **`fxsound-ui` must never depend on
 `fxsound-audio`, `fxsound-preset` or `pipewire`.** It renders a `UiState` and returns a
-`UiResponse`; that is what makes it testable headless. **`fxsound-dsp` must never depend on
-`pipewire`.** It is a pure `&mut [f32]` transformer.
+`UiResponse`; that is what makes it testable headless. It does use `fxsound-dsp`, a pure library,
+for one thing: the equalizer curve is drawn from the audio thread's own filter designs (D-27).
+**`fxsound-dsp` must never depend on `pipewire`.** It is a pure `&mut [f32]` transformer.
 
 ### 2.2 What is already written and is a fixed contract
 
@@ -105,7 +106,7 @@ Dependency edges are acyclic and deliberately narrow: **`fxsound-ui` must never 
 ### 2.3 Cargo.toml deltas required before Phase 1
 
 ```toml
-# crates/fxsound-audio/Cargo.toml — the v0_3_65 features are already right; keep that comment.
+# crates/fxsound-audio/Cargo.toml — the pipewire feature level (now v0_3_64) is already right; keep that comment.
 # ADD exactly one dependency:
 rtrb = { workspace = true }
 # Do NOT add fxsound-preset here: the audio crate never touches files.
@@ -234,8 +235,7 @@ pub enum AudioError {
     #[error("no output devices present")]            NoOutputDevices,      // ≡ 209
     #[error("selected output is not present")]       DeviceNotPresent,     // ≡ -2
     #[error("output device is unavailable")]         DeviceUnavailable,    // ≡ -54
-    #[error("no usable (stereo or better) output")]  NoValidOutput,        // ≡ -57
-    #[error("please choose an output device")]       AskUserSelectOutput,  // ≡ -58
+    // -57 NoValidOutput / -58 AskUserSelectOutput: retired in 0.4.0, mono outputs are accepted
     #[error("PipeWire is not available: {0}")]       PipewireUnavailable(String),
     #[error("lost connection to PipeWire")]          PipewireDisconnected,
     #[error("format negotiation failed")]            FormatNegotiation,    // ≡ -35/-36
@@ -584,7 +584,7 @@ PipeWire's data-thread naming convention, run for 10 minutes under load (Phase 2
 | `GUI/FxAudioControls.{h,cpp}` | 168×257 two-faced card, 5 effect sliders, 4 level sliders, flip, restore | `fxsound-ui::view::controls`, `layout::audio_controls` | `layout` [W], view P3 |
 | `GUI/FxAudioSlider.{h,cpp}` | value-label slider | `fxsound-ui::widgets::slider::FxSlider` | [W] |
 | `GUI/FxBalanceSlider.{h,cpp}` | two-sided gradient track | `fxsound-ui::widgets::FxBalanceSlider` | P3 |
-| `GUI/FxEqualizer.{h,cpp}` | band layout, curve, alt-solo, tooltips | `fxsound-ui::view::equalizer` + `widgets::{FxVerticalSlider,FxRotary}` | P3 |
+| `GUI/FxEqualizer.{h,cpp}` | band layout, curve, solo (Ctrl+Alt here, D-19), tooltips | `fxsound-ui::view::equalizer` + `widgets::{FxVerticalSlider,FxRotary}` | P3 |
 | `GUI/FxVisualizer.{h,cpp}` | 960×120, 100 bars, mirrored history, gradient | `fxsound-ui::widgets::visualizer` | P3 |
 | `GUI/FxPowerButton.{h,cpp}` | 24×24 two-state | `fxsound-ui::widgets::FxPowerButton` | P3 |
 | `GUI/FxComboBox.{h,cpp}` | themed combo, error outline, lazy popup | `fxsound-ui::widgets::FxComboBox` | P3 |
@@ -606,8 +606,8 @@ PipeWire's data-thread naming convention, run for 10 minutes under load (Phase 2
 | `dsp/include/DfxDsp.h`, `DfxDsp.cpp`, `DfxDspPrivate.cpp` | public façade + pimpl | `fxsound-dsp::engine::Engine` | [W] |
 | `dsp/DfxDspEq.cpp`, `DspUtil/GraphicEq/*` | band tables, Q derivation, remap | `fxsound-dsp::eq::GraphicEq` | [W] |
 | `ptutil/Filt/FiltCalcBiqd.cpp`, `SOS/SosProcess.cpp` (sections) | parametric design + TDF-II runner | `fxsound-dsp::biquad::{calc_parametric,Section}` | [W] |
-| `SOS/SosProcess.cpp:139-472` | the 38-constant volume leveller | `fxsound-dsp::leveling::VolumeLeveling` | **P2 — missing** |
-| `SOS/SosProcess.cpp:677-723` | RMS normalisation | `fxsound-dsp::engine` (`normalization_db`; disabled at 0.0) | [W] |
+| `SOS/SosProcess.cpp:139-472` | the 38-constant volume leveller | `fxsound-dsp::leveller::VolumeLeveller` (10 ms steps, unfiltered peak safety, LFE levelled: 0.4.0 audit #1–#5) | [W] |
+| `SOS/SosProcess.cpp:677-723` | RMS normalisation | — **not ported**: `setNormalization` has no caller in the Windows app (0.4.0 audit #37) | — |
 | `ptechDsp/Aural/Aural032/Auralp32.c` | Fidelity exciter | `fxsound-dsp::effects::fidelity::Fidelity` | [W] |
 | `ptechDsp/Lex/Lex32/Lex32.c` | Ambience plate reverb | `fxsound-dsp::effects::ambience::Ambience` | **P2 — stub on disk** |
 | `ptechDsp/wide/Wide32/Wide32.c` | Surround widener | `fxsound-dsp::effects::surround::Surround` | [W] |
@@ -661,13 +661,15 @@ widget fills it.
 
 **Disabled state.** egui's built-in "greyed out" tint is a multiply toward the background; JUCE uses
 `Colour::withSaturation(0.0)`, which is **`grey = max(r,g,b)`**, not a luma grey
-(`docs/spec/02-theme.md:315-333`). `fxsound-ui::theme` must gain:
+(`docs/spec/02-theme.md:315-333`). `fxsound-ui::theme` has:
 
 ```rust
-#[must_use] pub fn desaturate(c: Color32) -> Color32;   // grey = max(r,g,b), alpha preserved
+#[must_use] pub fn greyed(self, c: Color32) -> Color32;   // on Palette; alpha preserved
 ```
 
-and every custom painter calls it instead of relying on `ui.add_enabled_ui`.
+`max(r,g,b)` in the dark palette; in the light one a luma grey no lighter than `#767676`, because
+`max(r,g,b)` turns its light blues white (D-21). Every custom painter calls it instead of relying on
+`ui.add_enabled_ui`.
 
 ---
 
@@ -835,7 +837,8 @@ clean; every constant in `layout.rs` and `theme.rs` has a `path:line` citation i
   verified spellings in `docs/api/pipewire-0.10-rust.md:2215-2266`. `node.link-group = "fxsound"`
   on **both** — without it, the moment our sink becomes default, our own output stream autoconnects
   to our own sink and feeds back.
-* `rules.rs` with unit tests covering all seven branches and the mono guard.
+* `rules.rs` with unit tests covering all seven branches and the mono guard (the guard itself was
+  retired in 0.4.0; its tests now pin that mono devices are accepted).
 * Default-sink takeover and the five-step restore, wired to `Drop`, `SIGINT`, `SIGTERM`.
 * Reconnect FSM with 200 / 400 / 800 / 1600 / 3200 / 5000 ms backoff.
 * `Engine` present but `power = false` → clean pass-through.
@@ -850,7 +853,9 @@ clean; every constant in `layout.rs` and `theme.rs` has a `path:line` citation i
 5. `systemctl --user restart pipewire wireplumber` mid-playback → reconnect < 2 s, one audible gap,
    backoff never tighter than 200 ms.
 6. USB DAC unplugged mid-playback → node 2 moves, node 1 untouched, clients never disconnected.
-7. A mono-only sink yields `NoValidOutput`; mono + stereo yields `AskUserSelectOutput`.
+7. A mono sink is rendered to like any other, through a stereo pair its adapter down-mixes
+   (0.4.0; this item originally asked for `NoValidOutput` / `AskUserSelectOutput`, see open
+   question 4).
 
 ### Phase 2 — DSP live
 
@@ -946,13 +951,24 @@ against upstream does not "restore" them.
 | D-16 | `user_selected_playback` read in four places, never written | `docs/spec/12-audio-io.md:1716-1721` | `set_output` writes it |
 | D-17 | `savePreset("")` can shadow a factory preset into the user dir | `docs/spec/05-controller-model.md:706-708` | Invariant asserted inside the function |
 | D-18 | N=31 EQ columns overlap by 8 px; "last child wins" | `docs/spec/04-equalizer-visualizer.md:1386-1390` | Interactive width clamped to `min(32, col_w)` |
-| D-19 | Alt+drag "solo" collides with the compositor's window-move gesture | `docs/spec/04-equalizer-visualizer.md:1437-1439` | Rebound to Ctrl+Alt+drag, and surfaced with a per-band affordance |
+| D-19 | Alt+drag "solo" (`FxEqualizer.cpp:123-210`) collides with the compositor's window-move gesture, and its walk goes through the controller, which marks the preset modified | `docs/spec/04-equalizer-visualizer.md` §A16, `:1437-1439` | Built on Ctrl+Alt+drag (0.4.0 audit R10): every other band walks to −10 dB a decibel per 1/30 s and the curve comes back on release, as upstream; the walk is only played (`UiAction::SoloBand`, laid over the snapshot by `App::played_params`), never written to the curve, the preset or its modified mark; the press itself does not move the band; the application holds the one solo, and whatever ends it there — a preset, a band count or a lane from outside the window with the button still down — ends it in the window too (`UiState::eq_solo_generation`); every band's tooltip names the gesture |
+| D-20 | Master Gain and Balance step by 2 dB while the controller and CLI round to 1 (audit #22) | `docs/spec/03-controls.md` §5.2 | Step 1 dB |
+| D-21 | Light theme: `withSaturation(0)` turns the power-off spectrum and a bypassed EQ white on `#e0e0e0` (audit #24) | `FxVisualizer.cpp:177-199` | `Palette::greyed`: luma, no lighter than `#767676`, in the light theme |
+| D-22 | Light `Outline` `#fafafa` is invisible as the Settings rule and the menu's edge (audit #25) | `FxTheme.cpp:26` | `Palette::divider`: `#c0c0c0` in the light theme |
+| D-23 | The lit slider thumb fitted by its 64×64 viewBox, a quarter of its size (audit #40) | `docs/spec/02-theme.md` §4.4 | Rasterised by its ink, 16×16 |
+| D-24 | Effect values and EQ band gains hidden with the power off (audit #42) | `FxAudioControls.cpp:208-211` | Shown at half alpha |
+| D-25 | Preset list, menu preset items and tray preset menu dead with the power off, while the CLI works (audit R7) | `FxProView.cpp:117-121`, `FxSystemTrayView.cpp:313-316` | Live with the power off |
+| D-26 | The first band of the five- and ten-band EQ sits at the bottom of its wheel's range and the last at the top, so each turns one way only (audit R6) | `GraphicEqGet.cpp:105-168`, `docs/spec/04-equalizer-visualizer.md` §A4 | The two end bands reach half a band past the ladder's edges, within 20 Hz–20 kHz (`fxsound_core::eq::band_frequency_range`; ten bands 46–85 Hz and 11768–20000 Hz, five 31–125 Hz and 8010–20000 Hz); an exported `.fac` has an end band past the edge put back on it (`fxsound_core::eq::move_end_bands_back_inside_the_ladder`), an imported one keeps what it carries |
+| D-27 | The EQ curve is a polyline through the band values, so the filter width and the bands' overlap never show (audit R8) | `FxEqualizer.cpp:350-393`, `docs/spec/04-equalizer-visualizer.md` §A9 | The magnitude response of the running designs (`fxsound_dsp::eq::GraphicEq::response_db`, at the device's rate and the filter width in force), about 200 points, in the original's colour, stroke and fill; worked out only when the bands, the width, the count or the rate change (`ResponseCache`) |
 
 Behaviours ported **verbatim** because they are the product's fingerprint: the 100 ms tick and the
-5-tick (500 ms) processing debounce; the 600-tick (60 s) autosave; autosave-shadow semantics
-(`modified` derived only from the shadow file's existence, `setPreset` prefers the shadow); the
-`" *"` suffix; the single separator between factory and user presets; the 64-char preset name cap
-with `<>:"/\|?*` stripped and case-insensitive uniqueness; the five quantisation rules
+5-tick (500 ms) processing debounce; the 60 s autosave (missing until 0.4.0, audit #47; now a
+deadline a minute after the first edit, `App::next_deadline`, rather than a tick counter);
+autosave-shadow semantics (`modified` derived only from the shadow file's existence, `setPreset`
+prefers the shadow); the `" *"` suffix; the single separator between factory and user presets; the
+64-char preset name cap (and, for a new name, the 126 bytes Windows reads a name line in, audit
+#15) with `<>:"/\|?*` stripped and case-insensitive uniqueness (a rename that changes only case is
+allowed, audit #19); the five quantisation rules
 (master gain → integer, balance → integer, volume levelling → 0.5, filter Q → 0.5); wrap-around
 preset/output cycling including the "skip < 2 channel devices" loop; device priority as array order
 with an unlisted device sorting last; 7 s / 8 s notification timeouts, 3 lines maximum.
@@ -973,7 +989,7 @@ with an unlisted device sorting last; 7 s / 8 s notification timeouts, 3 lines m
 | **R-08** | GNOME has no SNI host; with `--hide` the app is invisible and unkillable from the UI. | Medium | High | Detect "no watcher within 5 s"; post a notification; refuse to start hidden when there is neither a watcher nor a notification daemon. | P4 |
 | **R-09** | Alpha blending: JUCE composites in straight sRGB with no gamma correction; epaint blends in linear space. The many α 0.1 / 0.2 / 0.34 overlays will read lighter. | Medium | Medium | Compare the EQ fill and the panel backgrounds against a Windows screenshot early; adjust the alphas in one place (`Palette::color_alpha`) if needed, not at each call site. | P3 |
 | **R-10** | `ksni` defaults to tokio while `notify-rust` defaults to async-io; both pull zbus with different feature sets. | Low | Medium | Enable `ksni/blocking` and keep both on a plain `std::thread` (T4). Never call `notify-rust`'s `.show()` from inside a ksni callback. If a clash appears, move ksni to `default-features = false, features = ["async-io","blocking"]`. | P4 |
-| **R-11** | `pipewire`/`libspa` key constants are `#[cfg]`-gated; `NODE_LINK_GROUP`, `TARGET_OBJECT`, `NODE_WANT_DRIVER` do not exist without `v0_3_65`. | Low | Certain | Already handled in `crates/fxsound-audio/Cargo.toml`. Keep the comment. Literal strings are a valid fallback. | P1 |
+| **R-11** | `pipewire`/`libspa` key constants are `#[cfg]`-gated; `NODE_LINK_GROUP`, `TARGET_OBJECT`, `NODE_WANT_DRIVER` do not exist without `v0_3_44` (the crate sets `v0_3_64`; `v0_3_65` breaks libspa on 0.3.65 headers). | Low | Certain | Already handled in `crates/fxsound-audio/Cargo.toml`. Keep the comment. Literal strings are a valid fallback. | P1 |
 | **R-12** | Preset compatibility: a `.fac` written by the port must reload in the Windows build. | Medium | Low | Round-trip tests against all 32 shipped presets, byte-for-byte, including the `%g` float formatting, the `Main 2` hole, the seven app-dependent integers and the 1-based band numbering. `fxsound-preset` already implements this — keep the tests. | P0 (done), re-run each phase |
 | **R-13** | PipeWire version floor: `target.object` needs ≥ 0.3.64, `node.link-group` settled ~0.3.43. | Low | Low | Declare a hard minimum of PipeWire 0.3.65 / WirePlumber 0.4.14; detect via `pw_get_library_version()` at startup and refuse with a clear message rather than half-working. | P1 |
 | **R-14** | Translations are not in this checkout (`Resources/Strings/` is empty); only `BinaryData` symbol names survive. | Medium | Certain | Ship English only in Phases 1–5. Phase 5 builds the catalogue machinery with a validating format (named placeholders, not `%s`) so a bad translation can never be a format-string bug. Extraction from `BinaryData.cpp` is a separate work item. | P5 |
@@ -997,10 +1013,11 @@ with an unlisted device sorting last; 7 s / 8 s notification timeouts, 3 lines m
    time we run on a machine where the user never picked a default. This document specifies **500**
    (never wins implicitly) plus the explicit §7 takeover path — but that is a product decision, and
    it differs from the Windows behaviour.
-4. **Mono outputs are refused, not downmixed.** Ported faithfully from
-   `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES`. There is no driver bug on Linux forcing this, and a
-   mono BT headset is perfectly drivable. Fixing it would delete the `NoValidOutput` /
-   `AskUserSelectOutput` states entirely. Decision deferred to Phase 1 review.
+4. **Mono outputs — decided in 0.4.0: accepted and down-mixed.** 0.3.0 refused them, ported
+   faithfully from `SND_DEVICES_MONO_BUG_SKIP_MONO_DEVICES`, a Windows driver workaround. With two
+   lanes that moved the music out of a Bluetooth headset the moment it switched to its call
+   profile, so the refusal and the `NoValidOutput` / `AskUserSelectOutput` states are gone; the
+   decision and its details are in `12-audio-io.md`, open question 6.
 5. **Does the maximizer's 16-bit quantise/shaped-dither stage actually run?** `Play32.c:414-415`
    sets it but `MAXIMIZE_QUANTIZE_ON` is never written by `dfxpComm.cpp`. Adding a spurious 16-bit
    dither to a float pipeline would raise the noise floor by ~90 dB. Verify against a real build

@@ -237,6 +237,14 @@ defaults:
 | **Focus** | Every slider sets `setWantsKeyboardFocus(true)` (`FxAudioControls.cpp:193`, `FxAudioSlider.cpp:39`, `FxBalanceSlider.cpp:39`) and draws the α-0.1 halo when focused | as cited |
 | **Cursor** | `PointingHandCursor` while enabled; effect sliders switch back to `NormalCursor` when disabled (`FxAudioControls.cpp:213-223`) | as cited |
 
+**The port departs on the thumb (0.4.0 audit #14).** A left press that lands on the thumb (within
+its 8 px radius of the centre) moves nothing until the pointer has moved 2 px sideways; from then on
+it is the absolute drag above. This holds on every slider: the thumb's radius is more than half a
+step of the master gain, the leveller and the balance, so JUCE's jump on a touch off the thumb's
+centre moved them a whole step, and a value between two positions — an effect's stored 20, a
+`--master_gain=3` on the 2 dB interval — was snapped to one. A press on the track off the thumb still
+jumps.
+
 egui note: egui's `Response::double_clicked()` should be left unused here; implement
 right-click-reset with `response.secondary_clicked()`, wheel with
 `ui.input(|i| i.raw_scroll_delta.y)` gated on `response.hovered()`, and drag with
@@ -276,6 +284,15 @@ Tooltips: `FxAudioControls.cpp:157-161`. `\r\n` in the tooltip is a hard line br
 the value always comes from the currently loaded preset. `FxEffects::update()` reads
 `FxController::getEffectValue()` (a 0.0–1.0 float), rejects anything outside `[0, 1]`, and
 multiplies by 10 for the UI (`FxAudioControls.cpp:119-131`).
+
+**The port departs (0.4.0 audit #14, #39).** Eleven positions stand over 128 stored values, and 49 of
+the shipped presets' 170 effect amounts sit between two of them, so touching a slider silently
+saved a different value. Here a value between positions is shown with one decimal
+(`fxsound_core::scale::slider_label_for`), a press on the thumb moves nothing until the pointer
+does, and Shift with the arrow keys, the wheel or a drag steps one stored value
+(`scale::stored_step_for`); a plain drag still lands on whole positions. Dynamic Boost's positions
+run over the stored values below its dead top (70), and Ambience's positions 1–10 over the values it
+can be heard at (39–127), with 1–38 shown below position 1.
 
 Tooltips are suppressed entirely when the user has ticked *Hide help tips for audio controls*:
 `setTooltip("")` (`FxAudioControls.cpp:169-176`, driven by
@@ -452,7 +469,8 @@ to these controls.
 
 Quirk worth noting: the Master Gain slider's step is **2** while the controller rounds to the
 nearest integer, so only even dB values are ever reachable from the slider; the odd values exist
-only if a preset or the settings file supplies them.
+only if a preset or the settings file supplies them. **Port (0.4.0 audit #22):** the master gain and
+the balance step by 1 dB.
 
 Each slider's `onValueChange` writes through only when the value actually differs from the
 controller's current value (`FxAudioControls.cpp:315-321`, `:333-339`, `:351-357`). The balance
@@ -556,6 +574,8 @@ once and cache it.
   so their `onValueChange` handlers also fire (harmlessly, since the controller already holds those
   values).
 * It resets **only face B**. The five effect sliders are untouched.
+* **The port departs (0.4.0 audit R5, option A):** the band count is left alone, and with it the
+  curve; the original's reset to ten bands carried a thirty-one-band curve onto ten for good.
 
 ### 5.7 Flip button
 
@@ -600,7 +620,12 @@ Disabled rendering rules:
 
 egui equivalent: `ui.add_enabled_ui(power_on, |ui| ...)` plus explicit desaturated colour
 substitution — egui's default "greyed out" tint is a multiply toward the background, which is not
-the same as `withSaturation(0.0)`. Implement saturation removal in HSL space to match.
+the same as `withSaturation(0.0)`. `withSaturation` works in **HSB** and keeps the brightness, the
+brightest channel (`02-theme.md`); an earlier revision of this line said HSL, and the port's
+sliders took the channels' midpoint from it until 0.4.0. As built they grey through
+`Palette::greyed`, as the equalizer and the visualizer do (`crates/fxsound-ui/src/theme.rs`): the
+brightest channel in the dark palette, and in the light one a grey that still reads on the window
+(0.4.0 audit #24).
 
 ---
 
@@ -826,8 +851,23 @@ with their exact enable predicates (`model` = `FxModel`, `power_state` = `model.
 | — separator — | | |
 | `Donate` | always | opens a PayPal URL |
 
+**The port departs (0.4.0 audit #16, #17, #18, #20).** The table above is the original's. In the
+port:
+
+* `Save New Preset` needs only `userPresetCount < maxUserPresets && power_state`: a preset with no
+  unsaved changes is saved as a copy (#17), from the menu and from `--save_preset` alike.
+* `Export Presets` and `Import Presets` need only `power_state` (#18). The export writes the
+  presets as saved and the import skips a name already taken, the modified preset's included, so
+  unsaved changes stand in the way of neither.
+* `Delete Preset` asks first — `"Move the preset %s to the trash?"`, Yes/No — and moves the preset,
+  with its autosave, to the desktop's trash rather than deleting it for good (#16; see the Linux
+  note below).
+* The enable predicates are `App::preset_menu()`, the controller's one rule for the menu, the
+  command line and D-Bus.
+
 `maxUserPresets` is read from settings and clamped: anything below 10 or above 120 becomes **120**
-(`FxController.cpp:194-198`).
+(`FxController.cpp:194-198`). **The port clamps it to `10..=1000` instead** (#20): a
+`max_user_presets = 500` stays 500, and a 5 becomes 10.
 
 `undoPreset()` (`FxController.cpp:1317-1332`): no-op if not modified; otherwise clear the modified
 flag, delete the auto-saved copy, and re-run `setPreset(index)` so the original `.fac` is reloaded.
@@ -845,9 +885,16 @@ The menu button also shows a one-shot help bubble on first hover:
 **Linux/PipeWire note.** Nothing in the preset combo is Windows-specific except the storage paths
 and `SHFileOperation`-based deletes (`FxController.cpp:1252-1258`, `:1285-1291`). Map
 `userApplicationDataDirectory` → `$XDG_DATA_HOME/fxsound` (default `~/.local/share/fxsound`) and
-the factory `Factsoft/` directory → `/usr/share/fxsound/presets` with a per-user override;
-`SHFileOperation(FO_DELETE)` → `std::fs::remove_file` (or the trash via the
-`org.freedesktop.portal.Trash` portal if a recoverable delete is wanted).
+the factory `Factsoft/` directory → `/usr/share/fxsound/presets` with a per-user override.
+
+**The port departs on the delete (0.4.0 audit #16).** `SHFileOperation(FO_DELETE)` without
+`FOF_ALLOWUNDO` deletes for good; the port does not map it to `std::fs::remove_file`. The preset
+file and its autosave go to the home trash of the FreeDesktop.org Trash specification
+(`$XDG_DATA_HOME/Trash/files`, with a `.trashinfo` under `Trash/info`), where a file manager can
+restore them (`fxsound_preset::trash`). When the trash is on another filesystem, the file is set
+aside beside itself as `<name>.fac.1.bak` or the next free number, never over the overwrite's
+`<name>.fac.bak`. A rename moves the file and its autosave (#19) instead of saving a copy and
+deleting the old file.
 
 ---
 
@@ -1278,7 +1325,8 @@ write is cheap enough to do on every drag frame (the original writes on every `v
    label, which does (`FxAudioControls.cpp:190`). In the original, clicking directly on the
    `"0 dB"` text does not move the Master Gain slider. This is a bug; do not reproduce it.
 10. **The Master Gain step (2) versus the controller's integer rounding** means half the nominal
-    range is unreachable from the UI. Confirm whether the intent was `step = 1`.
+    range is unreachable from the UI. Confirm whether the intent was `step = 1`. *Resolved in
+    0.4.0 (audit #22): the port steps the master gain and the balance by 1.*
 11. **`showValues(false)` is dead** (§4.5) but the plumbing survives. Decide whether to keep a
     compact mode or delete the flag.
 12. **`FxPresetNameEditor` is dead code** duplicated inline in `FxMainWindow.cpp` (§11.1). Build one
@@ -1289,7 +1337,8 @@ write is cheap enough to do on every drag frame (the original writes on every `v
     Do not try to reverse-engineer meaning from them.
 14. **Right-click-to-reset is undiscoverable and undocumented in the UI** (no tooltip mentions it,
     §3.5). Consider adding a visible affordance (a small reset glyph on hover) in the Linux port,
-    or at least mention it in the tooltip text.
+    or at least mention it in the tooltip text. *Resolved in 0.4.0 (audit R9): every slider's
+    tooltip names the right-click reset, and the effect sliders now reset to 0.*
 15. **Theme switching re-creates every `Drawable` from SVG** (`FxPowerButton.cpp:62-67`,
     `FxTheme.cpp:99-102`) and `FxBalanceSlider` re-parses its thumb on *every value change*
     (`FxBalanceSlider.cpp:154-155`). Cache aggressively in Rust; a naive `resvg` call per frame

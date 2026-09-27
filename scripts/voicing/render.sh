@@ -117,6 +117,9 @@ if [ -z "${FXSV_PROCESS_WAV:-}" ] && command -v cargo >/dev/null 2>&1; then
 fi
 [ -x "$PROCESS_WAV" ] \
     || die "no renderer at $PROCESS_WAV. Install cargo and re-run, or point FXSV_PROCESS_WAV at a build of the process_wav example."
+[ -x "$OLD_PROCESS_WAV" ] \
+    || die "no renderer at $OLD_PROCESS_WAV. Point FXSV_OLD_PROCESS_WAV at a build of the process_wav example."
+[ "$OLD_PROCESS_WAV" = "$PROCESS_WAV" ] || note "old variant rendered by $OLD_PROCESS_WAV"
 
 # ------------------------------------------------------------------- the renders
 newer_than() { [ -e "$1" ] && [ ! "$2" -nt "$1" ]; }
@@ -144,7 +147,7 @@ for g in "${SELECTED[@]}"; do
     # kind of staleness nothing downstream can see.
     if [ "$FORCE" -eq 0 ] \
         && newer_than "$dry" "$src" \
-        && newer_than "$old" "$old_fac" && newer_than "$old" "$PROCESS_WAV" \
+        && newer_than "$old" "$old_fac" && newer_than "$old" "$OLD_PROCESS_WAV" \
         && newer_than "$new" "$new_fac" && newer_than "$new" "$PROCESS_WAV"; then
         skipped=$((skipped + 1))
         continue
@@ -176,7 +179,7 @@ for g in "${SELECTED[@]}"; do
     # before changing this line.
     cp -- "$excerpt" "$dry"
 
-    "$PROCESS_WAV" "$excerpt" "$old" --preset "$old_fac" > "$RENDER_DIR/$g.old.log" 2>&1 \
+    "$OLD_PROCESS_WAV" "$excerpt" "$old" --preset "$old_fac" > "$RENDER_DIR/$g.old.log" 2>&1 \
         || { cat "$RENDER_DIR/$g.old.log" >&2; die "render failed: $g / old"; }
     "$PROCESS_WAV" "$excerpt" "$new" --preset "$new_fac" > "$RENDER_DIR/$g.new.log" 2>&1 \
         || { cat "$RENDER_DIR/$g.new.log" >&2; die "render failed: $g / new"; }

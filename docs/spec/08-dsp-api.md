@@ -487,7 +487,14 @@ float buffer (interleaved, in place)
 * When the engine is bypassed, the EQ chain is replaced by a **master-gain-only** pass —
   so the master-gain slider still works with the power button off, but EQ, balance,
   normalization and volume leveling do not (`dfxpProcessReal.cpp:158-170`,
-  `dsp/ptutil/SOS/SosProcess.cpp:501-516`).
+  `dsp/ptutil/SOS/SosProcess.cpp:501-516`). That pass sits behind the same `i_eq_on` test as
+  the powered block, so with the equalizer off the master gain goes too.
+  **The port departs (0.4.0 audit, R3, the user's decision):** the master gain and the balance
+  play always — powered or bypassed, equalizer on or off — so neither the power button nor the
+  equalizer's switch moves the level or the balance. The engine runs them before the equalizer
+  (the two commute); the equalizer's switch takes the curve and the levelling with it, and power
+  off bypasses everything but the gain stage. `crates/fxsound-dsp/src/engine.rs` has the
+  reasoning and the numbers, and `docs/0.4.0-upstream.md` (U3) the decision.
 * The spectrum is computed from the **post-EQ, post-effects** front-channel signal
   (`rp_buf` after step 5) and is fed zero input while bypassed
   (`dsp/ptutil/DspUtil/spectrum/spectrumProcess.cpp:73-82`).
@@ -598,6 +605,13 @@ if (balance_db < 0) balance_right = powf(10,  balance_db/20);   // GraphicEqSet.
   `fxsound/Source/GUI/FxBalanceSlider.cpp:53`.
 * **Stereo only.** The mono branch of `sosProcessBuffer` ignores balance entirely
   (`SosProcess.cpp:583`). Surround (`sosProcessSurroundBuffer`) likewise.
+  **The port departs (0.4.0 audit, #44):** on surround it balances by side. Every left-hand
+  speaker takes the left attenuation, every right-hand one the right, and centre and LFE take
+  neither. The sides come from the device's channel positions (`Engine::set_channel_sides`), or
+  from PipeWire's default layout for the channel count. Mono is unchanged. Before this, the port
+  applied the balance to channels 0 and 1 of any layout. Until `fxsound-audio` passes the
+  device's positions, a device that orders its channels some other way has only its front pair
+  balanced (`engine::default_sides`).
 
 ### 8.3 `setNormalization(float gain_db)`
 
@@ -630,6 +644,9 @@ Constants at `SosProcess.cpp:688-694` and `:699-708`.
   480-frame buffers / 48 kHz that is ~20 s. The release is instantaneous (α = 1).
 * **No public GUI control exposes this** — `setNormalization` is never called from
   `fxsound/Source/GUI/`. It is dead in the shipping app but present in the API.
+* **Port: not ported** (0.4.0 audit #37). With nothing to set a target the stage never ran on
+  Windows, so `fxsound-dsp` carries no normaliser, and `DspParams` has no `normalization_db`
+  (removed in 0.4.0; no settings file, preset or socket message ever carried it).
 
 ### 8.4 `setVolumeLeveling(float gain_db)` — the parameter is **not** dB
 
@@ -719,6 +736,44 @@ Algorithm sketch (`SosProcess.cpp:139-472`):
 `sqrtf`, `log10`, `fabs`, `fmax`, `fmin` are called per buffer; the per-sample loops are
 multiply/add only. This is RT-safe (no allocation, no locks), but expensive.
 
+**Where the port departs from it** (0.4.0 audit of copied Windows defects; each changes the sound
+only while levelling is on; `crates/fxsound-dsp/src/leveller.rs` has the detail):
+
+* **#1** — the peak safety `ceiling / peak` reads the *unfiltered* peak of every channel the gain
+  reaches, not the 120 Hz side chain's, so bass is held under the ceiling instead of boosted past
+  it and hard-clipped. The side-chain peak still feeds the quiet statistics; the clip at step 8 is
+  kept as a last guard.
+* **#2** — the state machine steps every **10 ms of audio** (`round(fs · 0.010)` frames), not
+  once per buffer, carrying a step across calls when the PipeWire quantum is shorter or not a
+  multiple of it. Every "per buffer" constant in the table above is therefore per 10 ms, as it was
+  tuned on WASAPI's 10 ms period, and the 6-entry power ring spans 60 ms. At 480-frame buffers and
+  48 kHz the arithmetic is the original's, sample for sample, wherever #1 and #4 do not apply.
+* **#3** — the subwoofer is levelled with every other channel; it is left out of the statistics
+  only (see §16 item 4).
+* **#4** — the start of a step's ramp is no longer clamped to the peak-safe gain: where the peak
+  safety bites, the gain falls over at most 2 ms, arriving on the first sample that would otherwise
+  cross the ceiling, instead of on the step's first sample. The fade is searched for across the
+  whole call, so a transient just past a step boundary inside a call is faded into from the step
+  before; where the next step completes in the same call, the search assumes the lowest effective
+  ceiling that step's decision can set (the tonality moves at most `0.08` of the way to fully
+  clear in a step). The clamp of the start to `max_gain_cap` (`SosProcess.cpp:367`), a fraction of
+  a decibel as the cap drifts, is kept.
+  **Limit:** a transient in the first 2 ms of a *call* cannot be faded into without 2 ms of
+  look-ahead latency, which the port does not add. One `n` frames into a call is faded over those
+  `n` frames only, and one on a call's first frame still falls the whole way in one sample (12.2 dB
+  from a ×4.5 quiet passage into a ±0.9 burst). At 48 kHz that is the first 96 frames of every
+  call — about one hit in eleven at a 1024-frame quantum, one in five at 480 — and every hit at a
+  quantum of 96 frames or less (at 64 frames, 2.8 dB in one sample 8 frames into a call, 1.5 dB
+  16 frames in).
+* **#5** — the detector does no subnormal arithmetic in digital silence. Its filter state is
+  flushed to zero below `DENORMAL_FLUSH` (`1.1e-19`, just above `sqrt(f32::MIN_POSITIVE)`), and a
+  stretch whose every sample is below that — the bias residue, around 1e-30, that any live
+  equalizer band hands on in silence — is read as zeros by the detector and is not squared into
+  the post-gain statistics, in loops that have no such square in them. Behind a ten-band curve at
+  Volume Leveling 2 with everything else off, silence cost the engine on stereo 96.5 ns a frame
+  against 60.6 on music (53.4 with FTZ/DAZ); now 45.6 (48 kHz, 480-frame blocks, best of seven
+  release runs on a Ryzen 7 6800H).
+
 ### 8.5 `setFilterQ(float q_multiplier)`
 
 ```cpp
@@ -767,7 +822,7 @@ the five supported counts, and geometric spacing otherwise (`:495-509`):
 | 5 | 62.5 / 16000 | 62.5, 250, 1000, 4000, 16000 | `GraphicEqSet.cpp:430-434` |
 | 10 | 62.5 / 16000 | 62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000 — **legacy geometric grid, not ISO** | `GraphicEqSet.cpp:441-449` |
 | 15 | 25 / 16000 | 25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 16000 | `GraphicEqSet.cpp:456-461` |
-| 20 | 20 / 16000 | 20, 31.5, 40, 63, 80, 125, 160, 250, 315, 500, 630, 1000, 1250, 2000, 2500, 4000, 5000, 8000, 10000, 16000 | `GraphicEqSet.cpp:468-473` |
+| 20 | 20 / 16000 | 20, 31.5, 40, 63, 80, 125, 160, 250, 315, 500, 630, 1000, 1250, 2000, 2500, 4000, 5000, 8000, 10000, 16000 — **the port departs** (0.4.0 audit R4): geometric half-octave ladder between the same ends, see `09-dsp-eq.md` §3.1 | `GraphicEqSet.cpp:468-473` |
 | 31 | 20 / 20000 | 20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000 | `GraphicEqSet.cpp:480-486` |
 
 Band index in the *public* API is **0-based**; every private call adds 1
@@ -983,6 +1038,28 @@ quantisation: KERNOISE_QUANTIZE_16 + KERNOISE_DITHER_SHAPED       Play32.c:414-4
 **Note the dither/quantise-to-16-bit stage is initialised** even though the pipeline is
 32-bit float. Port only if you can confirm it is actually applied; for a float Linux
 pipeline it should be dropped.
+
+**Where the port departs from it** (0.4.0 audit of copied Windows defects; each changes the sound;
+`docs/spec/10-dsp-effects.md` §8.9 and `crates/fxsound-dsp/src/effects/dynamic_boost.rs` have the
+detail):
+
+* **#6** — the anti-pumping floor is `min(1.06, gain_boost)`, so slider 0 never lifts loud
+  material by +0.5 dB; at every boosted setting it is unchanged.
+* **#7** — the detector is `(L² + R²)/2` of the front pair (channels 0 and 1 unless the layout
+  names others through `Chain::set_front_pair`; `M²` for mono), not `in_L²`. Centred material
+  gives the identical estimate. A block whose front pair is all under `1.1e-19` (bias residue in
+  silence) is heard as silence without being squared: every square of it underflowed.
+* **#8** — the envelope is clamped to its ramp's peak after `env += delta`, so it no longer
+  overshoots (a 50 Hz sine at 2× the ceiling: 2.26 → 2.00).
+* **R1** — the envelope holds the loudest leaving sample of the last ~20 ms before
+  `release_time_beta` applies (a limited 40 Hz sine: 15.6 % → 0 % THD+N).
+* **R2** — one envelope, from the loudest of them, for both channels of a stereo pair, and on
+  surround for every speaker either side of the listener; the centre and the subwoofer each have
+  their own (`Chain::set_channel_sides`, which `Engine` feeds with the sides it balances by). The
+  microphone chain's limiter links every channel.
+
+The limiter is `crates/fxsound-dsp/src/input/limiter.rs`, shared with the microphone chain, whose
+limiter takes #8, the hold and the linking as well.
 
 ### 9.5 Ambience → Lex reverb
 
@@ -1407,7 +1484,7 @@ pub struct Params {
 
     pub master_gain_db:    f32,            // -20..=+20 step 2, default 0.0
     pub balance_db:        f32,            // -20..=+20 step 1, default 0.0
-    pub normalization_db:  f32,            // default 0.0 == disabled
+    // (no normalisation target: the stage was never reachable on Windows, 0.4.0 audit #37)
     pub volume_leveling:   f32,            // 0.0..=4.0 step 0.5, default 0.0 == disabled
 }
 
@@ -1516,6 +1593,33 @@ impl DspProcessor {
    Volume leveling is the only stage that ramps within a buffer
    (`SosProcess.cpp:376-379`); add a short ramp on `master_gain` and `balance` too,
    because the original steps them and the GUI slider will zipper.
+   **Done in 0.4.0** (audit #11), wider than this asks: every gain the user moves — master
+   gain, balance, the effects' gains, Dynamic Boost's target, and levelling switched off —
+   glides over 20 ms, and the equalizer bands and Bass crossfade between designs
+   (`crates/fxsound-dsp/src/smooth.rs`; `10-dsp-effects.md` open question 7 has the choice).
+   A 2 dB master-gain step under a 50 Hz tone at −6 dBFS moved the waveform 0.099 in one
+   sample; no step is now larger than the tone's own, 0.0032. Levelling switched off lets its
+   lift down under the peak safety of the running stage: a loud onset in those 20 ms is faded
+   under the ceiling over the 2 ms before it rather than hard-clipped (a ×4.7 lift let down into
+   a 440 Hz tone at 0.5 flattened 772 samples at the ceiling; none now). Until audio has passed,
+   a new snapshot lands at once, so a stream starts on its parameters. The equalizer's own switch
+   fades the whole GraphicEq block (filters, master gain, balance, levelling) in or out over the
+   same 20 ms, mixing its output with its input: with 62.5 Hz at +6 dB under a 50 Hz tone at 0.3,
+   switching the equalizer off moved the waveform 0.143 in one sample, and now no more than the
+   tone does on its own. A new band count crossfades the whole old curve into the new one
+   (`09-dsp-eq.md` §18, point 3). A stage that is left out — the equalizer and the leveller while
+   power is off, the GraphicEq block once it has faded out — lands every glide and takes the next
+   change at once (`GraphicEq::sit_out`, `VolumeLeveller::sit_out`), so switching back on never
+   plays 20 ms of what was set before the switch. The power switch cannot glide: it is the
+   listener's A/B against the dry sound, and a faded bypass would mix the processed signal, a
+   look-ahead behind, with the dry one. Acting between two samples was a click, though (under a
+   100 Hz tone at −12 dBFS through the release build on a private PipeWire it stepped by up to
+   −5 dBFS, high-passed at 2 kHz), so it dips (`smooth::Dip`): the sound fades out over 10 ms on
+   the old side, the switch is made in silence, and the other side fades back in over 10 ms once
+   the chain's look-ahead has passed. The two sides are never mixed, and the comparison is still
+   20 ms from the press. The voice chain's switches — its power, the denoiser and its level or
+   mode, the de-reverb, the high-pass, the gate, the equalizer, the de-esser and the compressor,
+   several at once on a preset change — dip the same way (`input::needs_dip`).
 
 Non-RT-safe surface, clearly separated: `DspEngine::new`, `DspEngine::prepare`,
 everything in `DspHandle`, preset load/save, and config persistence.
@@ -1573,6 +1677,11 @@ fxsound-dsp/
    `excluded_channel = 3`** (LFE) (`SosProcess.cpp:908` vs `:725`). Confirm the intended
    behaviour for 5.1/7.1 before porting, and decide what to do for PipeWire's arbitrary
    channel maps (which are *not* guaranteed to be Windows WAVE order).
+   *Decided (0.4.0 audit #3):* the original skipped the LFE in the gain as well as in the
+   detector, so a quiet scene lifted by 10–20 dB lost its subwoofer by as much. The port levels
+   every channel and keeps the LFE — found by its position in the PipeWire channel map, not by
+   index 3 — out of the RMS, tonality and post-gain statistics only. It does count towards the
+   peak safety, because the ceiling applies to it like any other channel.
 
 5. **Channel order is assumed to be Windows WAVE order** (FL FR FC LFE BL BR [SL SR],
    `dfxpProcessReal.cpp:218-221`). PipeWire delivers a `SPA_PARAM_EnumFormat` channel

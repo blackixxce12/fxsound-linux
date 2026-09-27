@@ -32,19 +32,23 @@
 //! the pointer (so a title-bar drag has to be handed to the compositor with
 //! [`egui::ViewportCommand::StartDrag`], which is what [`ChromeResponse::drag_started`] is for).
 
+pub mod calibration;
 pub mod changelog;
 pub mod message;
 pub mod presets;
 pub mod settings;
 
-pub use message::{ConfirmChoice, ConfirmStyle, MessageBox, Toast, ToastLayout, ToastResponse};
+pub use calibration::{
+    CalibrationAction, CalibrationDialog, CalibrationPhase, CalibrationResultView, CalibrationView,
+};
+pub use message::{ConfirmChoice, ConfirmStyle, MessageBox};
 pub use presets::{
     ExportDialog, ExportState, ImportDialog, ImportState, ImportSummary, OverwriteChoice,
     PresetsAction,
 };
 pub use settings::{
-    DevicePriority, HotkeyCommand, NavIcon, NavIcons, SettingsAction, SettingsDialog,
-    SettingsState, SettingsTab,
+    AppLane, AppRow, DevicePriority, HotkeyCommand, NavIcon, NavIcons, SettingsAction,
+    SettingsDialog, SettingsState, SettingsTab,
 };
 
 use crate::assets::{AssetCache, FxImage};
@@ -515,6 +519,74 @@ pub fn text_button_font(button_height: f32) -> FontId {
     theme::semibold(NORMAL_FONT.min(button_height))
 }
 
+/// Where a button's label is laid out: the button reduced by two points on each side and one at
+/// the top and bottom, as `drawButtonText` does **[JUCE semantics]**.
+#[must_use]
+pub fn text_button_inner(rect: Rect) -> Rect {
+    rect.shrink2(vec2(2.0, 1.0))
+}
+
+/// The smallest share of its own size a button's label is set in.
+///
+/// Lower than a label's [`MIN_FIT_SCALE`]: a label can lose its end and still be read, a button
+/// that loses its end no longer says what it does. Bulgarian "Експортиране" needs 11 of the
+/// Export button's 17 points.
+pub const MIN_BUTTON_FIT_SCALE: f32 = 0.6;
+
+/// The font a button's label is set in: [`text_button_font`] where the label fits the button, and
+/// otherwise the largest size down to [`MIN_BUTTON_FIT_SCALE`] of it at which no word is wider
+/// than the button and the lines the label wraps into fit its height.
+///
+/// Wrapping stays, because the reset-presets button is allowed up to three lines
+/// (`FxSettingsDialog.cpp:289-315`); what goes is a word broken across two lines and out of the
+/// button, which is what a translation one word long did to a fixed-size button — German
+/// "Exportier|en" and Russian "Сохрани|ть" under the Export dialog's 80 points (E6b). JUCE's
+/// `drawFittedText` squeezes such a line instead of breaking it.
+#[must_use]
+pub fn text_button_label_font(ctx: &egui::Context, label: &str, rect: Rect) -> FontId {
+    let inner = text_button_inner(rect);
+    let base = text_button_font(rect.height());
+    // As many lines as the button is tall for in its own font: one for every button but the
+    // reset-presets one, which is made a line taller per line its label needs.
+    let line = ctx.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap("Xg".to_owned(), base.clone(), Color32::PLACEHOLDER)
+            .size()
+            .y
+    });
+    let lines = ((inner.height() + 1.0) / line.max(1.0)).floor().max(1.0) as usize;
+    let fits = |size: f32| {
+        let font = FontId::new(size, base.family.clone());
+        ctx.fonts_mut(|fonts| {
+            let widest_word = label
+                .split_whitespace()
+                .map(|word| {
+                    fonts
+                        .layout_no_wrap(word.to_owned(), font.clone(), Color32::PLACEHOLDER)
+                        .size()
+                        .x
+                })
+                .fold(0.0_f32, f32::max);
+            let rows = fonts
+                .layout(
+                    label.to_owned(),
+                    font.clone(),
+                    Color32::PLACEHOLDER,
+                    inner.width(),
+                )
+                .rows
+                .len();
+            widest_word <= inner.width() && rows <= lines
+        })
+    };
+    let smallest = (base.size * MIN_BUTTON_FIT_SCALE * 2.0).ceil() / 2.0;
+    let mut size = base.size;
+    while size > smallest && !fits(size) {
+        size = (size - 0.5).max(smallest);
+    }
+    FontId::new(size, base.family)
+}
+
 /// A `juce::TextButton`: rounded fill in `TextButtonBackground`, label in `HighlightedText`
 /// (`FxTheme.cpp:83-86`).
 pub struct TextButton<'a> {
@@ -583,16 +655,11 @@ impl<'a> TextButton<'a> {
         if !enabled {
             colour = colour.gamma_multiply(BUTTON_DISABLED_ALPHA);
         }
-        // `drawButtonText` lays the label out in the button reduced by two points on each side and
-        // one at the top **[JUCE semantics]**; wrapping matters because the reset-presets button is
-        // allowed up to three lines (`FxSettingsDialog.cpp:289-315`).
-        let inner = rect.shrink2(vec2(2.0, 1.0));
-        let galley = ui.painter().layout(
-            label.to_owned(),
-            text_button_font(rect.height()),
-            colour,
-            inner.width(),
-        );
+        let inner = text_button_inner(rect);
+        let font = text_button_label_font(ui.ctx(), label, rect);
+        let galley = ui
+            .painter()
+            .layout(label.to_owned(), font, colour, inner.width());
         let placed = Align2::CENTER_CENTER.align_size_within_rect(galley.size(), inner);
         ui.painter().galley(placed.min, galley, colour);
 
@@ -661,6 +728,61 @@ pub(crate) fn draw_truncated(
     placed
 }
 
+/// The smallest share of its own size a label is set in before it is cut.
+///
+/// A JUCE `Label`, and `drawFittedText` with no scale of its own, squeeze a line that does not fit
+/// down to 70 % of its width before they elide it (`Font::getDefaultMinimumHorizontalScaleFactor`).
+/// egui cannot squeeze glyphs sideways, so the whole line is set smaller instead — what the
+/// Settings tabs do with their captions ([`settings::nav_caption_font`]). The original's labels
+/// that forbid the squeeze (`setMinimumHorizontalScale(1.0)`: a combo's text, a device's name, a
+/// notice) keep [`draw_truncated`].
+pub const MIN_FIT_SCALE: f32 = 0.7;
+
+/// `font`, or the largest size in half points down to [`MIN_FIT_SCALE`] of it at which `text`
+/// fits `room` on one line. A line too long even then gets the smallest size, and whoever draws
+/// it elides what is left over.
+#[must_use]
+pub fn fitted_font(ctx: &egui::Context, text: &str, font: FontId, room: f32) -> FontId {
+    let width = |size: f32| {
+        ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    text.to_owned(),
+                    FontId::new(size, font.family.clone()),
+                    Color32::PLACEHOLDER,
+                )
+                .size()
+                .x
+        })
+    };
+    let full = width(font.size);
+    if full <= room || full <= 0.0 || room <= 0.0 {
+        return font;
+    }
+    let smallest = (font.size * MIN_FIT_SCALE * 2.0).ceil() / 2.0;
+    // Width follows the size closely; start from the proportion and step down to be sure.
+    let mut size = ((font.size * room / full) * 2.0).floor() / 2.0;
+    size = size.clamp(smallest, font.size);
+    while size > smallest && width(size) > room {
+        size = (size - 0.5).max(smallest);
+    }
+    FontId::new(size, font.family)
+}
+
+/// [`draw_truncated`] in the [`fitted_font`]: a line too long for `rect` is set smaller before
+/// anything of it is cut.
+pub fn draw_fitted(
+    painter: &Painter,
+    text: &str,
+    font: FontId,
+    colour: Color32,
+    rect: Rect,
+    align: Align2,
+) -> Rect {
+    let font = fitted_font(painter.ctx(), text, font, rect.width());
+    draw_truncated(painter, text, font, colour, rect, align)
+}
+
 /// Draw wrapped text into `rect`, top-aligned and clipped to it, and report how tall it came out.
 ///
 /// The height is the text's own, clipped or not, so a caller can assert that its box is big
@@ -681,6 +803,41 @@ pub(crate) fn draw_wrapped(
     height
 }
 
+/// `−48 dB`: whole decibels, a real minus sign, and never `−0`.
+///
+/// The microphone pane and the calibration wizard both print levels this way; the readout strip
+/// has its own, which also does tenths.
+pub(crate) fn whole_db(db: f32) -> String {
+    if !db.is_finite() {
+        return "— dB".to_owned();
+    }
+    let rounded = db.round();
+    if rounded < 0.0 {
+        format!("−{:.0} dB", -rounded)
+    } else {
+        format!("{:.0} dB", rounded.abs())
+    }
+}
+
+/// A Unix time as an ISO date, `2026-09-23`, in UTC.
+///
+/// A date that reads the same in every language, without a time-zone database or a calendar
+/// crate for one line of text. Howard Hinnant's `civil_from_days`, which is exact over the whole
+/// proleptic Gregorian calendar.
+pub(crate) fn iso_date(unix_time: u64) -> String {
+    let days = (unix_time / 86_400) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,6 +853,18 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.set_fonts(theme::font_definitions());
         ctx
+    }
+
+    /// `key` in English and in every language's table, read without touching the global table
+    /// the other tests are drawing with.
+    pub(super) fn every_translation(key: &str) -> Vec<(&'static str, String)> {
+        use fxsound_core::i18n::{Catalogue, LANGUAGES};
+        let mut all = vec![("en", key.to_owned())];
+        for language in &LANGUAGES[1..] {
+            let table = Catalogue::for_language(language);
+            all.push((language.code, table.get(key).unwrap_or(key).to_owned()));
+        }
+        all
     }
 
     #[test]
@@ -849,5 +1018,155 @@ mod tests {
         assert!((normal_font().size - 17.0).abs() < 1e-6);
         assert!((small_font().size - 14.0).abs() < 1e-6);
         assert!((title_font().size - 17.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_level_prints_in_whole_decibels_with_a_real_minus_and_no_negative_zero() {
+        assert_eq!(whole_db(-48.2), "−48 dB");
+        assert_eq!(whole_db(-18.6), "−19 dB");
+        assert_eq!(whole_db(-0.3), "0 dB");
+        assert_eq!(whole_db(0.0), "0 dB");
+        assert_eq!(whole_db(3.4), "3 dB");
+        assert_eq!(whole_db(f32::NAN), "— dB");
+        assert_eq!(whole_db(f32::NEG_INFINITY), "— dB");
+    }
+
+    #[test]
+    fn a_unix_time_prints_as_the_iso_date_it_falls_on_in_utc() {
+        assert_eq!(iso_date(0), "1970-01-01");
+        assert_eq!(iso_date(86_399), "1970-01-01");
+        assert_eq!(iso_date(86_400), "1970-01-02");
+        // A leap day, the day after it, and the turn of a century that is a leap year.
+        assert_eq!(iso_date(951_782_400), "2000-02-29");
+        assert_eq!(iso_date(951_868_800), "2000-03-01");
+        assert_eq!(iso_date(1_709_164_800), "2024-02-29");
+        // The last second of a year and the first of the next.
+        assert_eq!(iso_date(1_798_761_599), "2026-12-31");
+        assert_eq!(iso_date(1_798_761_600), "2027-01-01");
+    }
+
+    #[test]
+    fn a_line_that_fits_keeps_its_font_and_a_long_one_is_set_smaller_but_not_under_seven_tenths() {
+        let ctx = test_context();
+        let text = "Select the presets to export...";
+        frame(&ctx, |ui| {
+            let width = |font: &FontId| {
+                ui.painter()
+                    .layout_no_wrap(text.to_owned(), font.clone(), Color32::PLACEHOLDER)
+                    .size()
+                    .x
+            };
+            let font = normal_font();
+            let full = width(&font);
+            assert_eq!(fitted_font(ui.ctx(), text, font.clone(), full + 1.0), font);
+
+            let room = full * 0.8;
+            let fitted = fitted_font(ui.ctx(), text, font.clone(), room);
+            assert!(fitted.size < font.size, "{fitted:?}");
+            assert!(fitted.size >= font.size * MIN_FIT_SCALE, "{fitted:?}");
+            assert!(width(&fitted) <= room, "{} in {room}", width(&fitted));
+            assert_eq!(fitted.family, font.family);
+
+            // No smaller than seven tenths, however little room there is: the rest is elided.
+            let floor = fitted_font(ui.ctx(), text, font.clone(), full * 0.3);
+            assert!((floor.size - 12.0).abs() < 1e-6, "{floor:?}");
+        });
+    }
+
+    /// A label's layout in its button as [`TextButton::show`] lays it out: the font it is set in,
+    /// how many lines it takes, the widest line and the widest single word.
+    fn button_layout(ui: &Ui, label: &str, rect: Rect) -> (FontId, usize, f32, f32) {
+        let font = text_button_label_font(ui.ctx(), label, rect);
+        let inner = text_button_inner(rect);
+        let galley = ui.painter().layout(
+            label.to_owned(),
+            font.clone(),
+            Color32::PLACEHOLDER,
+            inner.width(),
+        );
+        let widest_word = label
+            .split_whitespace()
+            .map(|word| {
+                ui.painter()
+                    .layout_no_wrap(word.to_owned(), font.clone(), Color32::PLACEHOLDER)
+                    .size()
+                    .x
+            })
+            .fold(0.0_f32, f32::max);
+        (font, galley.rows.len(), galley.size().x, widest_word)
+    }
+
+    #[test]
+    fn a_one_word_label_too_long_for_its_button_is_set_smaller_rather_than_broken_in_two() {
+        // E6b: German "Exportieren" under the Export dialog's 80-point button came out as
+        // "Exportier" over "en", and Russian "Сохранить" as "Сохрани" over "ть".
+        let ctx = test_context();
+        let button = Rect::from_min_size(pos2(0.0, 0.0), presets::export::BUTTON_SIZE);
+        let inner = text_button_inner(button);
+        frame(&ctx, |ui| {
+            for label in ["Exportieren", "Сохранить"] {
+                let (font, lines, width, _) = button_layout(ui, label, button);
+                assert!(font.size < NORMAL_FONT, "{label}: {font:?}");
+                assert_eq!(lines, 1, "{label} broke over {lines} lines");
+                assert!(
+                    width <= inner.width(),
+                    "{label}: {width} in {}",
+                    inner.width()
+                );
+            }
+            // The English label is left as it was.
+            let (font, lines, _, _) = button_layout(ui, "Export", button);
+            assert_eq!(font, text_button_font(button.height()));
+            assert_eq!(lines, 1);
+        });
+    }
+
+    #[test]
+    fn a_label_a_taller_button_wraps_on_its_words_keeps_the_buttons_font() {
+        // The reset-presets button is a line taller for every line its label needs.
+        let ctx = test_context();
+        let button = Rect::from_min_size(pos2(0.0, 0.0), vec2(220.0, 48.0));
+        frame(&ctx, |ui| {
+            let label = "Сброс шаблонов к значениям по умолчанию";
+            let (font, lines, width, _) = button_layout(ui, label, button);
+            assert_eq!(font, text_button_font(button.height()));
+            assert_eq!(lines, 2);
+            assert!(width <= text_button_inner(button).width());
+        });
+    }
+
+    #[test]
+    fn every_languages_dialog_buttons_hold_their_labels_whole_and_on_one_line() {
+        // The fixed-size buttons: they do not grow with their label, so a translation has to fit.
+        let import = Rect::from_min_size(pos2(5.0, 62.0), presets::import::CONTENT_SIZE);
+        let summary = Rect::from_min_size(pos2(5.0, 62.0), presets::summary::CONTENT_SIZE);
+        let export = Rect::from_min_size(pos2(5.0, 62.0), presets::export::CONTENT_SIZE);
+        let question = Rect::from_min_size(pos2(5.0, 62.0), message::CONTENT_SIZE);
+        let buttons = [
+            ("Choose folder…", presets::choose_rect(import)),
+            ("Import", presets::import_rect(import)),
+            ("OK", presets::summary_ok_rect(summary)),
+            ("Export", presets::export_button_rect(export)),
+            ("Yes", message::yes_rect(question)),
+            ("No", message::no_rect(question)),
+            ("OK", message::ok_rect(question)),
+        ];
+        let ctx = test_context();
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            for (key, button) in buttons {
+                let room = text_button_inner(button).width();
+                for (code, label) in every_translation(key) {
+                    let (font, lines, width, word) = button_layout(ui, &label, button);
+                    if lines != 1 || width > room || word > room {
+                        problems.push(format!(
+                            "{code}: {label:?} in {room:.0} at {:.1}: {lines} lines, {width:.0} wide",
+                            font.size
+                        ));
+                    }
+                }
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 }

@@ -595,7 +595,7 @@ read from `fxsound/Images/*.svg`.
 | `ArrowDown` | `arrow_down_white.svg` | 259 | `arrow_down_black.svg` | 259 | 6×5 | **`#B1B1B1`** | `#4E4E4E` |
 | `DropDownArrow` | `dropdown_arrow_bw.svg` | 750 | **`dropdown_arrow_bw.svg`** | 750 | 11×7 | stroke `#B0B0B0` | stroke `#B0B0B0` |
 | `DropDownArrowHover` | `dropdown_arrow_hover.svg` | 685 | `dropdown_arrow_hover_blue.svg` | 685 | 11×7 | `#E63462` | `#23B6EB` |
-| `SliderThumb` | `Slider_Thumb.svg` | 4894 | `Slider_Thumb_blue.svg` | 4894 | 64×64 (art at 16×16) | crimson gradient | teal gradient |
+| `SliderThumb` | `Slider_Thumb.svg` | 4894 | `Slider_Thumb_blue.svg` | 4894 | 64×64 (art at 16×16, drawn by the art) | crimson gradient | teal gradient |
 | `SliderThumbBW` | `Slider_Thumb_bw.svg` | 4109 | **`Slider_Thumb_bw.svg`** | 4109 | 16×16 | grey gradient | grey gradient |
 
 Four assets are **shared between themes**: `remove.svg`, `arrow_next_bw.svg`,
@@ -654,10 +654,14 @@ inner circle r=3 at (8,8)
 `Slider_Thumb_bw.svg`: outer gradient `#818181 → #9F9F9F`, stroke gradient
 `#9D9D9D → #7B7B7B`, inner circle `#0F0F0F`, inner-shadow colour
 `rgba(0.714825,0.714825,0.714825, 0.6)`; viewBox is `0 0 16 16` (the other two are
-`0 0 64 64` with a 16×16 art group — **the 64×64 canvas is 4× larger than the ink**,
-which matters because JUCE `drawWithin(..., RectanglePlacement::centred, ...)` scales
-the *whole viewBox*, not the ink. Reproduce by rasterising the full 64×64 box and
-letting the ink occupy the middle quarter, or the thumb will come out 4× too big).
+`0 0 64 64` with a 16×16 art group — **the 64×64 canvas is 4× larger than the ink**).
+*Corrected by the 0.4.0 audit (#40):* this section used to say that JUCE's
+`drawWithin(..., RectanglePlacement::centred, ...)` scales the whole viewBox, so the ink should
+fill the middle quarter. It fits `getDrawableBounds()`, the union of what the SVG draws, so the
+lit thumb is a 16×16 circle like the grey one; fitted by its viewBox it came out a 4-point dot
+that grew fourfold when the power went off. The port rasterises the lit thumb by its ink
+(`assets::fitted_by_ink`); every other image's ink spans most of its viewBox, and those are
+fitted by the viewBox as before.
 
 ### 4.5 SVG in the Rust port
 

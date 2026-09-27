@@ -148,6 +148,7 @@ write — so every stage must write exactly one output per input.
     │  bypass_all==1 && eq_on:  master_gain only                     │
     │        GraphicEqProcess_MasterGainOnly → SosProcess.cpp:501-517│
     │  eq_on==0: NOTHING (not even master gain)  ← see §12 traps     │
+    │  (port, audit R3: the bypass pass also carries the balance)    │
     └────────────────────────────────────────────────────────────────┘
     │
     ├─ BinauralSyn HRIR headphone virtualisation, only if
@@ -340,9 +341,13 @@ Applied at:
 
 **This is not cosmetic.** Under MUSIC2:
 
-* **Ambience is fully bypassed for UI ≤ 3.0** — `int(midi·0.34) ≤ 12` triggers
-  `DFXP_MIN_EFFECTIVE_MIDI_AMBIENCE` (`dfxpComm.cpp:50, 1688-1691`). The first
-  30 % of the Ambience slider does nothing at all.
+* **Ambience does nothing useful for UI ≤ 3.0.** The bypass test
+  (`DFXP_MIN_EFFECTIVE_MIDI_AMBIENCE`, `dfxpComm.cpp:50, 1688-1691`) reads the
+  *unscaled* MIDI value, so only UI 0 is bypassed (§6.6). But `int(midi·0.34) ≤ 12`
+  takes the wet gain to zero or below (§6.7). Positions 1 and 2 run a phase-inverted
+  tail, and position 3 runs none. An earlier version of this bullet said
+  "fully bypassed", which contradicted §6.6. The port copied that mistake until the
+  0.4.0 audit (#39, §6.7a).
 * **Dynamic Boost saturates at UI ≈ 5.59** (`midi ≥ 71` → `71·1.8 = 127.8` →
   clamped to 127). The top 44 % of the Dynamic Boost slider does nothing.
 
@@ -380,6 +385,15 @@ no atomicity — a torn parameter update is possible in principle. See
 > buffer or `ArcSwap<Params>`) plus per-buffer coefficient interpolation for the
 > gains that are audible when stepped (Aural drive, Lex wet/dry, Wide intensity,
 > Maxi gain_boost).
+>
+> **Done in 0.4.0** (audit #11), per sample rather than per buffer: every gain
+> the user moves glides to its new value in a straight line over 20 ms
+> (`crates/fxsound-dsp/src/smooth.rs`, `Ramp`) — Aural drive, Lex wet, dry,
+> decay and diffuser coefficient, Wide side and mid gains, Maxi `gain_boost`,
+> and the master gain, balance and levelling release in front of them — and the
+> Bass biquad crossfades from its old design to its new one over the same 20 ms
+> (`FadingSection`). Open question 7 has why a crossfade and not interpolated
+> coefficients.
 
 ### 3.6 Which parameters are *never* written from the host
 
@@ -997,6 +1011,26 @@ non-positive number. See §12.3.
 Because the 0.34 factor caps `eff` at 43, the shipped app never uses a decay
 above **0.206**; the reverb is a short, dense ambience, not a hall.
 
+### 6.7a Where the port departs from it (0.4.0 audit)
+
+* **#39 — the bypass reads the stored value, as the original's does.** Only a stored value of 12
+  or less, which is UI 0, is bypassed. The port used to test the warped value and so silenced
+  positions 1–3. For stored 13–38, where the warp gives wet ≤ 0 and dry ≥ 1, the port does not
+  copy the original. It runs a straight line from wet 0 / dry 1 at the threshold to the warp's
+  own pair at 39 (wet 0.00975, dry 0.99632). The tail never inverts, the dry signal is never
+  boosted, and the effect grows with the slider. Stored 39 and above, which covers every factory
+  preset, are bit-identical. This implements §14 items 3 and 4. Positions 1–3 are only *audible*
+  once the slider's positions are spread over stored 39–127 (§14 item 2), which is the
+  application's job. Until then they run but stay far below hearing: after a −6 dBFS 440 Hz tone
+  the tail reaches −73, −51 and −45 dBFS at positions 1–3, against −31 dBFS at position 4. The
+  original's position 1, a wet gain of −0.078, was about −22 dB, but phase-inverted.
+* **#9 — a switched-on reverb starts from an empty tank.** The original skips a bypassed tank
+  and resumes from what it held, up to 150 ms of old music. After a second of a tone at full
+  Ambience, that measured −15.3 dBFS in silence. The port empties the part of the ring the
+  current rate uses on the first block after the effect comes back on. That is 165 kB at 48 kHz,
+  once per switch-on. The same applies to Bass and Fidelity: their filters are cleared on the
+  off→on edge. Before, they rang at +4.9 dBFS and −6.5 dBFS respectively.
+
 ### 6.8 Memory and state
 
 ```c
@@ -1287,8 +1321,10 @@ if (result > s->target_level) {
 * The estimator is a mean-square, so `sqrt_level` is an **RMS**, not a peak.
 * Only the left channel feeds it (`Maxi32.c:258-259`). Hard-panned right-channel
   content is invisible to the auto-gain. Reproduce or fix deliberately.
+  **Port: fixed** (0.4.0 audit #7) — see §8.9.
 * The `1.06` floor (`Maxi32.c:287-289`, commented "11/4/04 Modifications to help
   fix volume pumping") means the auto-gain never backs off below +0.5 dB.
+  **Port: never above the static boost** (0.4.0 audit #6) — see §8.9.
 
 Level filter design (`Maxi32.c:119-137`), same `filtDesignSimple1rstLowPass`
 form as §4.5 with `MAXIMIZE_LEVEL_FILT_CUTOFF = 0.1` Hz (`c_max.h:57`):
@@ -1536,6 +1572,62 @@ impl Maximizer {
     }
 }
 ```
+
+### 8.9 Where the port departs from it (0.4.0 audit)
+
+The audit of Windows defects the port had copied found five here, and all five are fixed. Each
+makes FxSound for Linux sound different from Windows; the detail and the measurements are in
+`crates/fxsound-dsp/src/effects/dynamic_boost.rs` and `crates/fxsound-dsp/src/input/limiter.rs`.
+The limiter changes (#8, R1, R2) are in the one limiter the microphone chain shares, which takes
+all three (its hold and its linking were decided with tests of their own).
+
+* **#6 — the anti-pumping floor is `min(1.06, gain_boost)`.** At slider 0 (and stored values 1–4)
+  the flat `1.06` lifted material louder than −10 dBFS RMS by 0.5 dB — +0.2 dB against the input
+  where quiet material gets −0.3 dB — and stepped there as the level crossed the threshold. Now
+  loud material at slider 0 is −0.3 dB like everything else. At every boosted setting the floor
+  is unchanged.
+* **#7 — the level estimator hears `(L² + R²)/2` of the front pair** (channels 0 and 1 unless the
+  layout names another pair, `DynamicBoost::set_front_pair` through `Chain::set_front_pair`; `M²`
+  for mono). A mix quiet on the left and loud on the right used to get the full +11.6 dB at slider
+  10 with the right channel 5.5 dB into the limiter; it now backs off like any other. For centred
+  material the two estimates are bit-identical. On 5.1/7.1 the centre, LFE and surrounds still do
+  not steer the level, whatever order the device puts them in. A block whose front pair is all
+  under `1.1e-19` — the bias residue every stage with a biquad leaves in silence — is heard as
+  silence without being squared: each square underflowed, and silence cost more than music
+  (through the engine on stereo with Bass at 0.6 and everything else off, 40.7 against 30.6 ns a
+  frame; 21.9 now; 48 kHz, 480-frame blocks, best of seven release runs on a Ryzen 7 6800H).
+* **#8 — the attack ramp is clamped to its peak.** After `env += delta` the envelope is clamped to
+  `max(max_abs, held)` (`held` ≥ `|dly_out|`, below), so a slope kept steep from an earlier
+  retarget cannot carry it past the peak it aims at. A 50 Hz sine at twice the ceiling drove the
+  original's envelope to 2.26 (1.06 dB of needless reduction); now 2.00. What a kick saves
+  depends on the kick's shape, so no single figure is quoted for it.
+* **R1 — a 20 ms hold before the release.** In release mode the envelope is
+  `max(env·beta + bias, held)`, where `held` is the loudest `|dly_out|` of roughly the last 20 ms
+  (a running maximum kept in eight segments, so the window is 20–22.5 ms). The 10 ms release used
+  to let go between the crests of a limited bass note: 15.6 % THD+N at 40 Hz and 9.5 % at 80 Hz,
+  3 dB into the limiter. Held, a steady tone from 25 Hz up has none (20 Hz: 0.7 %). A lone
+  transient now keeps the level down for the hold, then releases at the original 10 ms rate (fully
+  off 33 ms after it has left, from 11.5), and a synthetic kick-and-hats mix at slider 10 comes
+  out 0.6 dB quieter (0.9 dB against #8 alone). A steady bass note driven into the limiter comes
+  out clean and at the same peak but 0.8–0.9 dB lower in RMS than the original's distorted one
+  (50 Hz at twice the ceiling: −2.47 → −3.31 dBFS; 40 Hz: −2.40 → −3.31): the gain that breathed
+  inside every cycle and raised the RMS was the distortion. A kick train at slider 10 came out
+  1.03 dB quieter in the audit's measurement.
+* **R2 — one envelope for both sides of the pair.** The envelope follows the louder channel of the
+  stereo pair and one gain goes to both, so a peak on one side (Surround 10, hard panning) no
+  longer shifts the image by up to 5.6 dB. On surround every speaker either side of the listener
+  (front, side, rear) shares the envelope and the centre and the subwoofer each keep their own
+  (`Chain::set_channel_sides`); with the sides unknown only the front pair is linked. The first
+  cut linked all channels, and since the auto-gain listens to the front pair alone, a quiet 5.1
+  bed at slider 10 took the full +11.6 dB and then swung 12 dB on every subwoofer boom (4 dB under
+  a shouting centre), where the original's per-channel envelopes had moved it not at all. Each
+  channel keeps its own delay line. The limiter runs each envelope over the whole block
+  (`LookaheadLimiter::process`), so the linking costs no more than the original's envelope per
+  channel did: Dynamic Boost alone at slider 10 costs 20.0 ns a frame on 5.1 and 22.4 on 7.1,
+  against the original's 20.8 and 30.3 (23.7 against 20.6 on 5.1 with only the front pair known;
+  white noise at ±0.3, measured as above). The whole engine on 5.1, every effect at 0.6, a
+  ten-band curve and Volume Leveling 2, costs 169.4 ns a frame on music, against 171.1 before
+  these fixes.
 
 ---
 
@@ -1873,17 +1965,22 @@ record it.
    but expose the true effective range in the UI, or remap the slider so its
    full travel is useful. Currently Ambience's bottom 30 % and Dynamic Boost's
    top 44 % do nothing.
+   **Dynamic Boost's slider is remapped in 0.4.0.** Ambience's slider remap (positions 1..10 →
+   stored 39..127, audit #39) belongs to the application. The DSP side is §6.7a.
 3. **Ambience `wet_gain` goes negative** for `12 > eff_midi ≥ 0` (§6.7,
    `dfxpComm.cpp:630`: `(pc_liveliness − 12) × …`). It is masked because the
    bypass flag uses the *unscaled* MIDI value, so the block is skipped
    below UI 0.95 — but between UI 0.95 and 3.07 the reverb runs with
    `wet_gain ≤ 0`, i.e. a phase-inverted (and at UI ≤ 0.94 also bypassed) tail.
    Recommend: clamp `wet_gain` to `≥ 0`.
+   **Done in 0.4.0** (audit #39): wet ramps from 0 there instead, §6.7a.
 4. **Ambience `dry_gain` exceeds 1.0** below eff_midi 12 (up to 1.044 at 0,
    `dfxpComm.cpp:631`). Same masking, same recommendation: clamp to `≤ 1.0`.
+   **Done in 0.4.0** (audit #39), §6.7a.
 5. **Maximizer level estimate uses the left channel only** (`Maxi32.c:258-259`).
    Recommend: use `max(|L|,|R|)²` or `(L²+R²)/2` and document the change; the
    current behaviour mis-tracks hard-panned material.
+   **Done in 0.4.0** (audit #7): `(L²+R²)/2` of the front pair, wherever the layout puts it, §8.9.
 6. **`s->level` must be `f64`.** (§8.2) Using `f32` with a pole of 0.99998575
    silently freezes the estimator.
 7. **The reverb has no modulation in this build.** (§1.2) If you re-enable it
@@ -2063,6 +2160,22 @@ bypassed it. The Maximizer is unconditional; "off" is expressed as
    is a genuine click source. **Recommend a 10–20 ms linear ramp on gains and a
    full-coefficient-set swap with a short crossfade for the biquad, and verify
    no one relies on instantaneous response.**
+
+   **Done in 0.4.0** (audit #11), as recommended, at 20 ms. Gains ramp linearly;
+   the Bass section and every equalizer band run the old and the new design side
+   by side and crossfade their outputs, a new design that arrives mid-fade
+   waiting for the fade to finish. Interpolated coefficients were measured and
+   refused: in the transposed direct form a pole pair near `z = 1` turns the
+   error a moving coefficient leaves in the state into a transient, so a 62.5 Hz
+   band (one section, prototyped) dragged 0 → +12 dB under a 25 Hz tone
+   overshot the tone by 2 dB and put more buzz above 80 Hz than no smoothing at
+   all (−51.7 against −55.4 dB RMS), where the crossfade took it to −67.2; in
+   the whole engine the same drag went from −57.3 to −66.9. Nothing relies on
+   the instantaneous response: a stage nobody has heard yet — a new stream, a
+   format change, a reset — lands its parameters at once, so every golden
+   vector, which builds its stage, applies and only then processes, is
+   unchanged. An effect set to 0 runs until its fade out ends and is then the
+   exact bypass it was.
 
 8. **Denormal handling on aarch64.** The `1.0e-30`/`1.0e-36` biases were tuned
    for x87/SSE. On ARM with FZ set they are harmless but also unnecessary; on

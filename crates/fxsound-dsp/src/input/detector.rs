@@ -42,6 +42,14 @@ const RMS_WINDOW_MS: Real = 10.0;
 /// Keeps the recursions out of denormals, the way the rest of the crate does.
 const BIAS: Real = 1.0e-24;
 
+/// A sample smaller than this is read as silence before it is squared: its square would be under
+/// the smallest normal `f32`. Every filter in front of a detector — the high-pass above all —
+/// hands on its bias residue in silence, around `1e-30` rather than zeros, and squaring that
+/// underflowed on every sample of a muted microphone in the gate, the de-esser and the
+/// compressor alike. 380 dB under full scale, so nothing a detector could measure is lost; the
+/// output side's leveller reads its input the same way (`leveller::DENORMAL_FLUSH`).
+const SQUARE_FLOOR: Real = 1.1e-19;
+
 /// How fast a dynamics stage's detector lets go, in milliseconds.
 ///
 /// Not a preset field, and fixed for the same reason the RMS window is: it is not the stage's
@@ -150,6 +158,7 @@ impl Follower {
                 let Some(mean_square) = self.mean_square.get_mut(channel) else {
                     return 0.0;
                 };
+                let x = if x.abs() < SQUARE_FLOOR { 0.0 } else { x };
                 *mean_square += self.mean_square_coeff * (x * x - *mean_square) + BIAS;
                 // The mean square is its own recursion and latches independently of the envelope
                 // below, so it needs its own escape: a single non-finite sample would otherwise

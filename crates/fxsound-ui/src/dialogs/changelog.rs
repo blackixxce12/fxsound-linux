@@ -105,6 +105,20 @@ pub fn plain(text: &str) -> String {
     out
 }
 
+/// The face a heading of `level` is set in.
+fn heading_font(level: u8) -> egui::FontId {
+    match level {
+        1 => theme::bold(20.0),
+        2 => theme::semibold(17.0),
+        _ => theme::semibold(15.0),
+    }
+}
+
+/// The face bullets and paragraphs are set in.
+fn body_font() -> egui::FontId {
+    theme::regular(14.0)
+}
+
 /// The changelog pane.
 pub struct ChangelogPane<'a> {
     text: &'a str,
@@ -157,22 +171,18 @@ impl<'a> ChangelogPane<'a> {
                 for block in blocks(self.text) {
                     match block {
                         Line::Heading(level, text) => {
-                            let font = match level {
-                                1 => theme::bold(20.0),
-                                2 => theme::semibold(17.0),
-                                _ => theme::semibold(15.0),
-                            };
+                            let font = heading_font(level);
                             ui.add_space(if level == 1 { 2.0 } else { 8.0 });
                             ui.label(RichText::new(text).font(font).color(heading));
                         }
                         Line::Bullet(text) => {
                             ui.horizontal_top(|ui| {
                                 ui.add_space(8.0);
-                                ui.label(RichText::new("•").font(theme::regular(14.0)).color(body));
+                                ui.label(RichText::new("•").font(body_font()).color(body));
                                 ui.add_space(4.0);
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(text).font(theme::regular(14.0)).color(body),
+                                        RichText::new(text).font(body_font()).color(body),
                                     )
                                     .wrap(),
                                 );
@@ -180,10 +190,8 @@ impl<'a> ChangelogPane<'a> {
                         }
                         Line::Text(text) => {
                             ui.add(
-                                egui::Label::new(
-                                    RichText::new(text).font(theme::regular(14.0)).color(body),
-                                )
-                                .wrap(),
+                                egui::Label::new(RichText::new(text).font(body_font()).color(body))
+                                    .wrap(),
                             );
                         }
                         Line::Blank => ui.add_space(6.0),
@@ -249,6 +257,65 @@ mod tests {
             plain("`code` and **bold** and *italic*"),
             "code and bold and italic"
         );
+    }
+
+    /// Every character of `text` the pane would draw as an empty box, each with its block.
+    fn missing_glyphs(text: &str) -> Vec<String> {
+        // egui's `has_glyph` asks whether a character resolves to a face other than the one its
+        // replacement box `◻` comes from, which is exact only where that face holds nothing else.
+        // The body's chain ends in egui's own faces, whose NotoEmoji holds the box; the headings'
+        // chains stop at the Noto fallbacks, where the box falls back to Gilroy's own `?` and
+        // every letter would read as missing. So a heading face is probed through a copy of its
+        // chain with NotoEmoji put after it, and the body through a plain copy of its own: either
+        // way a character is found only in a face the pane draws with.
+        let probe =
+            |family: &egui::FontFamily| egui::FontFamily::Name(format!("probe {family:?}").into());
+        let mut definitions = theme::font_definitions();
+        for level in 1..=3 {
+            let family = heading_font(level).family;
+            let mut chain = definitions.families[&family].clone();
+            chain.push("NotoEmoji-Regular".to_owned());
+            definitions.families.insert(probe(&family), chain);
+        }
+        let family = body_font().family;
+        let chain = definitions.families[&family].clone();
+        definitions.families.insert(probe(&family), chain);
+
+        let ctx = egui::Context::default();
+        ctx.set_fonts(definitions);
+        ctx.run_ui(egui::RawInput::default(), |_| {})
+            .drop_without_applying_deltas();
+        let mut missing = Vec::new();
+        for block in blocks(text) {
+            let (font, text) = match block {
+                Line::Heading(level, text) => (heading_font(level), text),
+                Line::Bullet(text) => (body_font(), format!("• {text}")),
+                Line::Text(text) => (body_font(), text),
+                Line::Blank => continue,
+            };
+            let font = egui::FontId::new(font.size, probe(&font.family));
+            ctx.fonts_mut(|fonts| {
+                for c in text.chars() {
+                    if !c.is_whitespace() && !fonts.has_glyph(&font, c) {
+                        missing.push(format!("{c:?} (U+{:04X}) in {text:?}", u32::from(c)));
+                    }
+                }
+            });
+        }
+        missing
+    }
+
+    #[test]
+    fn every_character_of_the_bundled_changelog_has_a_glyph_in_the_face_it_is_drawn_in() {
+        // The app bundles this very file (`fxsound-app`'s `CHANGELOG`), and a character none of
+        // the faces carries is drawn as an empty box — as `▸` and `✕` are.
+        assert_eq!(
+            missing_glyphs("## [0.4.0] — Added ▸\n- Settings ▸ Help, the ✕ beside it.\n").len(),
+            3,
+            "the check sees the missing glyphs, and only those, in a heading and in a bullet"
+        );
+        let missing = missing_glyphs(include_str!("../../../../CHANGELOG.md"));
+        assert!(missing.is_empty(), "no glyph for:\n{}", missing.join("\n"));
     }
 
     #[test]

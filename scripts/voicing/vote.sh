@@ -231,9 +231,10 @@ cat <<'INTRO'
 
   Blind listening — the revoiced genre presets
   --------------------------------------------
-  One file per genre. Three audio tracks: the untouched excerpt, the shipped
-  preset and the revoiced one, all at the same integrated loudness, in an order
-  you are not told. The same seconds loop until you decide.
+  One file per genre. Three audio tracks: the untouched excerpt and the two
+  renders being compared (old and new preset, or old and new engine), all at
+  the same integrated loudness, in an order you are not told. The same seconds
+  loop until you decide.
 
     a s d   switch tracks instantly
     1 2 3   keep this one, and move on

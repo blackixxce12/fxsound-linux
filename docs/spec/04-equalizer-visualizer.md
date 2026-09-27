@@ -311,6 +311,19 @@ Slider step is `(max - min) / 100` (`FxEqualizer.cpp:55` and `:105`).
 Writes are rejected outside the range — `FxController::setEqBandFrequency` returns early
 if `freq < min_freq || freq > max_freq` (`FxController.cpp:1853-1858`).
 
+**Port (0.4.0 audit R6, `docs/spec/00-architecture.md` D-26).** The tables above are the
+Windows ranges (`fxsound_core::eq::windows_band_range`). The port's wheels reach half a band
+further at the two ends of the ladder, `min_band_freq / h` and `max_band_freq · h` with
+`h = R^(1/D)` rounded to whole hertz and held within 20 Hz–20 kHz
+(`fxsound_core::eq::band_frequency_range`), so band 1 of five and ten bands and the last band
+turn both ways: N = 5 band 1 is 31..125 and band 5 8010..20000; N = 10 band 1 46..85 and band 10
+11768..20000; N = 15 20..31 and 12713..20000; N = 20's last band 13429..19077; N = 20 band 1
+and N = 31 keep 20 Hz and 20 kHz. Every other band keeps the table's range. A `.fac` exported for
+Windows has a first band below the ladder's bottom or a last band above its top put back on the
+edge (`move_end_bands_back_inside_the_ladder`); nothing else is clamped, since the Windows build
+plays any centre from 10 Hz to 21 kHz and its presets put inner bands outside their wheels'
+ranges. `--status` reports the port's ranges.
+
 ## A5. Q / filter-width control
 
 Two separate things share the name "Q".
@@ -585,6 +598,14 @@ loaded at `FxTheme.cpp:386-388`), re-heighted to 12 or 10 for EQ labels.
     g.setFillType(gradient); g.fillPath(path);                            (:392-393)
 ```
 
+**Port (0.4.0 audit R8, D-27).** Steps 6–7 draw the equalizer's real magnitude response rather
+than a polyline through the band values: the running designs (`GraphicEq::response_db` at the
+device's rate, with the filter width, the band-count Q and the design's own Q limits), sampled
+about 200 times from band 1's fader to the last one's, each fader at its band's centre and the
+frequency geometric between two faders, clamped to the panel above and to the −12 dB baseline
+below. Colours, the 1.5 px stroke, the fill's gradient and its anchor are as below. The points are
+worked out only when the bands, the width, the count or the rate change.
+
 ### Notes an implementer must not miss
 
 * **Line width is effectively ~2 px, not 1.** `Path::addLineSegment(line, 1.0)` builds
@@ -806,6 +827,24 @@ Side effect on painting: while `highlight_mode_` is true, `gradient_colour_2`
 (the EQ fill's bottom stop) is desaturated (`:345-348`), and each polyline segment is
 desaturated unless at least one of its two endpoints is enabled (`:360-367`) — so the
 soloed band's two segments stay coloured and everything else goes grey.
+
+**Port (0.4.0 audit R10, D-19).** Built on **Ctrl+Alt**+drag, since Alt+drag moves windows on
+several desktops; every band's tooltip ends with *Ctrl+Alt+drag to hear this band alone*. The walk,
+the timing and the painting are the above: the other faders greyed with no gain caption, the curve
+coloured from the soloed band's left neighbour to its right one, the fill's bottom stop greyed.
+Three differences: the walk is **played, never written** — the window sends `UiAction::SoloBand`
+and the application lays the walked gains over the snapshot on its way to the audio thread, so the
+curve, the preset, its modified mark, its autosave and `--status` never see it (upstream's
+`setEqBandBoostCut` marks the preset modified); a Ctrl+Alt **press does not move** the band, only
+the drag after it does, and moving it is an edit like any drag; and a band at a fractional gain
+settles on −10 dB, where upstream's whole-decibel steps swing it around −10 for ever. Release, the
+power going off, the band count changing under it, a preset load, a switch of the edit direction,
+the Lite view and the window closing all end the solo — also with the button still down, when the
+preset, the band count or the lane comes from the tray, the command line, D-Bus or a device's
+preset. The application holds the one solo there is: each time it ends one it moves
+`UiState::eq_solo_generation`, and the window lets go of a solo begun under an older number, so it
+never draws a solo the equalizer has stopped playing. The band held stays where the new curve puts
+it until the pointer moves.
 
 ## A17. Tooltips
 
@@ -1352,7 +1391,7 @@ accumulation drift is what the original does, and the two differ by ~1e-4 px by 
 | `MouseCursor::PointingHandCursor` | `FxEqualizer.cpp:400,432,500,550` | `ui.ctx().set_cursor_icon(CursorIcon::PointingHand)` inside the hover branch. |
 | `TooltipWindow` with custom bounds/padding | `FxTheme.cpp:515-546` | `Response::on_hover_text` / `show_tooltip_at_pointer`; restyle `Visuals::window_fill` to match `#0f0f0f`/`#e0e0e0` and the ±18/36 px offsets if you want pixel parity. |
 | Right-click as "reset control" | `FxEqualizer.cpp:484`, `:596` | `Response::secondary_clicked()` — works identically under Wayland. Consider also offering a modifier (some Wayland desktops steal right-click for gestures on touch). |
-| `ModifierKeys::getCurrentModifiersRealtime().isAltDown()` for solo mode | `FxEqualizer.cpp:130` | `ui.input(\|i\| i.modifiers.alt)`. **Caution:** Alt+drag is a window-move gesture in GNOME/KDE by default — offer a second binding (e.g. Ctrl+Alt or a long-press) and document it. |
+| `ModifierKeys::getCurrentModifiersRealtime().isAltDown()` for solo mode | `FxEqualizer.cpp:130` | `ui.input(\|i\| i.modifiers.alt)`. **Caution:** Alt+drag is a window-move gesture in GNOME/KDE by default — offer a second binding (e.g. Ctrl+Alt or a long-press) and document it. **Built on Ctrl+Alt (§A16, D-19).** |
 | Per-monitor DPI via JUCE desktop scaling | — | `egui`'s `pixels_per_point`; keep all the constants in this document as **points**, not pixels, and let egui scale. Wayland fractional scaling arrives via `wp_fractional_scale_v1` through `winit`. |
 | Audio tap for the spectrum (virtual soundcard passthrough) | `audiopassthru/` | A PipeWire filter node inserted on the sink, or a `pw-stream` capturing the sink's **monitor** port. Compute the 10 band levels in `on_process` (the filter chain is already RT-safe: 10 biquads × 2 channels is trivial), publish lock-free. Do not allocate or lock there. |
 
@@ -1403,6 +1442,8 @@ accumulation drift is what the original does, and the two differ by ~1e-4 px by 
    broken on the wheel). Preserving this is necessary for preset compatibility.
    Consider showing the wheel's value textually (already done) so the off-centre knob
    reads as intentional.
+   **Changed (0.4.0 audit R6):** the end bands' ranges reach half a band past the ladder, so
+   those two wheels start part-way round (§A4); the inner bands keep the table.
 
 7. **Light-mode disabled visualizer is invisible.** Both `GraphHigh` (`#1ac1ff`) and
    `GraphLow` (`#72d8ff`) desaturate to `#ffffff` (§A8), drawn on `ControlBackground`
@@ -1437,6 +1478,7 @@ accumulation drift is what the original does, and the two differ by ~1e-4 px by 
 13. **Alt+drag conflicts with the compositor** (§C). GNOME and KDE both bind Alt+drag to
     window move by default. The solo feature is undiscoverable as-is; either rebind or
     surface it in the UI (e.g. a small "solo" affordance per band).
+    **Resolved (0.4.0 audit R10):** Ctrl+Alt+drag, named in every band's tooltip (§A16).
 
 14. **`FxEqualizer::getInstance()` singleton vs the `FxProView` member** — the singleton
     at `FxEqualizer.h:32-36` is never used. If any future code path (CLI, tray menu) was

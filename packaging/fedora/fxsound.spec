@@ -11,8 +11,8 @@
 # WHY VENDORED DEPENDENCIES, AND WHY THE rust-packaging MACROS
 #
 # A Fedora reviewer will ask both questions, so: the dependency tree this application links is
-# not available as packaged crates. eframe/egui 0.36, pipewire 0.10, ksni, nnnoiseless, rfd and
-# resvg have no rust-*-devel packages in Fedora, so %%cargo_generate_buildrequires against
+# not available as packaged crates. eframe/egui 0.36, pipewire 0.10, ksni, rfd and resvg have
+# no rust-*-devel packages in Fedora, so %%cargo_generate_buildrequires against
 # %%{cargo_registry} cannot resolve and the package simply would not build. The guidelines
 # allow an *application* to bundle its Rust dependencies, so this spec does that: `cargo vendor`
 # output as Source1, %%cargo_prep -v vendor to point crates-io at it, and %%cargo_vendor_manifest
@@ -28,7 +28,7 @@
 # binary.
 #
 # The one macro deliberately NOT used is %%cargo_install. It runs `cargo install --path .`, and
-# the root of this repository is a *virtual* workspace manifest ([workspace] with six members
+# the root of this repository is a *virtual* workspace manifest ([workspace] with seven members
 # and no [package]), so that call fails with
 #
 #     error: found a virtual manifest at `.../Cargo.toml` instead of a package manifest
@@ -49,21 +49,24 @@
 # fxsound.spec: for a local rpmbuild, mock or COPR build the filename is irrelevant, but Fedora
 # dist-git wants <name>.spec, so a submission renames this to fxsound-linux.spec.
 Name:           fxsound-linux
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        System-wide audio enhancement: EQ, ambience, surround, bass and dynamic boost
 
 # The application itself is AGPL-3.0-or-later (see LICENSE). Its Rust dependencies are statically
 # linked into the executable, so the effective license of the binary package is the conjunction
-# of theirs with ours. The list below is the verbatim output of %%{cargo_license_summary} for the
-# 0.3.0 Cargo.lock, that is of
+# of theirs with ours. The list below is what %%{cargo_license_summary} prints for the 0.4.0
+# Cargo.lock: `cargo tree` over the workspace's normal (not build, dev or proc-macro) edges for
+# every target, one `# {l}` line per crate, the deprecated "MIT/Apache-2.0" slash form rewritten
+# to "MIT OR Apache-2.0", sorted and made unique. Neither rpm nor cargo2rpm was at hand when it was
+# taken, so that pipeline was run by hand; run the same way on the 0.3.0 tree it gives, line for
+# line, the list this spec carried for 0.3.0, which was cargo2rpm's own output, and
+# `cargo metadata`'s resolve, walked over the same edges, names the same 26 expressions for 0.4.0.
 #
-#   cargo2rpm --path Cargo.toml license-summary
-#
-# Running the `cargo tree` underneath it by hand gives three extra lines: cargo2rpm rewrites the
-# deprecated "MIT/Apache-2.0" slash form to "MIT OR Apache-2.0" before sorting, and the crates
-# that still use it (bitflags 1.x, pollster, signal-hook, siphasher and friends) then collapse
-# into entries already in the list. Compare against the macro, not against cargo tree.
+# One expression left since 0.3.0: "BlueOak-1.0.0 OR MIT OR Apache-2.0", held by anymap3 alone,
+# which came in through nnnoiseless -> easyfft -> generic_singleton. The RNNoise code is now
+# vendored as the workspace member fxsound-rnnoise (BSD-3-Clause, which cargo tree lists like any
+# other crate), which calls realfft directly and keeps easyfft for its tests only. None came in.
 #
 # # 0BSD OR MIT OR Apache-2.0
 # # AGPL-3.0-or-later
@@ -72,7 +75,6 @@ Summary:        System-wide audio enhancement: EQ, ambience, surround, bass and 
 # # Apache-2.0 OR GPL-2.0-only
 # # Apache-2.0 OR MIT
 # # Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
-# # BlueOak-1.0.0 OR MIT OR Apache-2.0
 # # BSD-2-Clause
 # # BSD-2-Clause OR Apache-2.0 OR MIT
 # # BSD-3-Clause
@@ -93,6 +95,12 @@ Summary:        System-wide audio enhancement: EQ, ambience, surround, bass and 
 # # Zlib
 # # Zlib OR Apache-2.0 OR MIT
 #
+# Two things the window embeds are not crates. The Noto fallback faces from assets/fonts are
+# OFL-1.1, which the tag names already for egui's own default fonts. The Gilroy interface faces
+# are Radomir Tinkov's commercial typeface, "All rights reserved" with no licence named, and no
+# SPDX expression can state that; README.md and debian/copyright say so, and a package for
+# Fedora proper would have to replace them with free faces (docs/spec/13-assets.md §7 names some).
+#
 # %%build re-runs %%{cargo_license_summary} on every build and prints it to the build log: if it
 # stops matching this comment, the dependency tree moved and this tag has to be updated.
 # LICENSE.dependencies, shipped in the package, carries the per-crate breakdown.
@@ -101,7 +109,6 @@ License:        %{shrink:
     (0BSD OR Apache-2.0 OR MIT) AND
     Apache-2.0 AND
     (Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT) AND
-    (Apache-2.0 OR BlueOak-1.0.0 OR MIT) AND
     (Apache-2.0 OR BSD-2-Clause OR MIT) AND
     (Apache-2.0 OR BSD-3-Clause) AND
     (Apache-2.0 OR BSD-3-Clause OR MIT) AND
@@ -145,6 +152,9 @@ BuildRequires:  clang-devel
 # %%{_userunitdir} and the %%systemd_user_* scriptlet macros.
 BuildRequires:  systemd-rpm-macros
 BuildRequires:  desktop-file-utils
+# For `appstreamcli validate` in %%check, which the guidelines ask of every package that ships
+# metainfo.
+BuildRequires:  appstream
 
 # No ExclusiveArch: rust_arches. rpm itself now depends on Rust (rpm-sequoia), so every Fedora
 # architecture is a Rust architecture and rust-srpm-macros documents the tag as no longer needed.
@@ -174,6 +184,8 @@ Requires:       libglvnd-egl
 # pure Rust and speaks to the bus socket directly, so they need no library here.) Without it rfd
 # falls back to shelling out to zenity, which Fedora does not install by default either.
 Requires:       dbus-libs
+# Owns /usr/share/dbus-1/services, where the D-Bus activation file goes.
+Requires:       dbus-common
 # Not libfontconfig.so — nothing links or dlopens it. This is for /etc/fonts, which the pure-Rust
 # fontconfig-parser under fontdb reads to find the faces the SVG icons and labels are drawn with.
 Requires:       fontconfig
@@ -191,8 +203,13 @@ Recommends:     libxkbcommon-x11
 Recommends:     libglvnd-glx
 # Claiming the default sink goes through the session manager rather than PipeWire itself.
 Recommends:     wireplumber
-# Preset import and export use native file dialogs, which are an XDG portal call.
+# Preset import and export use native file dialogs, which are an XDG portal call. The portal
+# itself only routes the request: a *backend* has to implement the file chooser, and wlroots' own
+# backend does not, so a bare compositor with only xdg-desktop-portal installed shows no dialog
+# at all. Any of the three desktop backends will do; the GTK one is the smallest and works under
+# every compositor. debian/control and the PKGBUILD name the same three.
 Recommends:     xdg-desktop-portal
+Recommends:     (xdg-desktop-portal-gtk or xdg-desktop-portal-kde or xdg-desktop-portal-gnome)
 
 Provides:       fxsound = %{version}-%{release}
 
@@ -236,8 +253,8 @@ install -Dpm0755 target/rpm/fxsound %{buildroot}%{_bindir}/fxsound
 # Factory and bonus presets. PresetStore::with_default_dirs
 # (crates/fxsound-preset/src/store.rs) looks under %%{_datadir}/fxsound/presets when the binary
 # is installed rather than run out of a build tree. Only the .fac files: the upstream
-# BonusPresets folder also carries a zip of the same presets and an empty MeaningfulPresets
-# directory, and neither belongs in a package.
+# BonusPresets folder also carries a zip of the same presets and a stray text file called
+# MeaningfulPresets, and neither belongs in a package.
 for dir in Factsoft BonusPresets; do
     install -Dpm0644 assets/presets/${dir}/*.fac \
         -t %{buildroot}%{_datadir}/fxsound/presets/${dir}
@@ -258,18 +275,43 @@ install -Dpm0644 packaging/fxsound.desktop \
 install -Dpm0644 packaging/fxsound.service \
     %{buildroot}%{_userunitdir}/fxsound.service
 
+# D-Bus activation: a call to org.fxsound.FxSound starts FxSound through that unit
+# (SystemdService=fxsound.service).
+install -Dpm0644 packaging/org.fxsound.FxSound.service \
+    %{buildroot}%{_datadir}/dbus-1/services/org.fxsound.FxSound.service
+
 # 256x256 and 32x32 respectively; both verified against the files, not assumed from the names.
 install -Dpm0644 assets/images/fxsound_large.png \
     %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/fxsound.png
 install -Dpm0644 assets/images/fxsound.png \
     %{buildroot}%{_datadir}/icons/hicolor/32x32/apps/fxsound.png
 
-# No AppStream metainfo: upstream does not ship one yet, so none is installed rather than one
-# being invented here.
+# The tray icon's three states. A StatusNotifier host resolves an icon *name* through the theme,
+# so without these under hicolor's status context the tray shows a blank where the icon should be.
+install -Dpm0644 assets/icons/status/com.fxsound.FxSound-*.svg \
+    -t %{buildroot}%{_datadir}/icons/hicolor/scalable/status
+
+# The unit says Documentation=man:fxsound(1); shipping the page is what makes that line true.
+# rpm compresses it, hence the glob in %%files.
+install -Dpm0644 packaging/fxsound.1 %{buildroot}%{_mandir}/man1/fxsound.1
+
+# AppStream metadata, validated in %%check.
+install -Dpm0644 packaging/com.fxsound.FxSound.metainfo.xml \
+    %{buildroot}%{_metainfodir}/com.fxsound.FxSound.metainfo.xml
+
+# Two parts of the binary are not AGPL, and each licence makes shipping its text a condition of
+# shipping the binary: the RNNoise code and model compiled in from crates/fxsound-rnnoise
+# (BSD-3-Clause), and the Noto fallback faces embedded in the window (SIL OFL 1.1).
+# LICENSE.dependencies only names licences, so both texts are shipped as %%license files, under
+# the names every other package gives them: %%license on the source paths would install them as
+# a bare COPYING and OFL.txt beside our own LICENSE.
+cp -p crates/fxsound-rnnoise/COPYING COPYING.rnnoise
+cp -p assets/fonts/OFL.txt OFL.noto
 
 
 %check
 desktop-file-validate %{buildroot}%{_datadir}/applications/com.fxsound.FxSound.desktop
+appstreamcli validate --no-net %{buildroot}%{_metainfodir}/com.fxsound.FxSound.metainfo.xml
 %if %{with check}
 %cargo_test
 %endif
@@ -292,6 +334,8 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/com.fxsound.FxSound.d
 
 %files
 %license LICENSE
+%license COPYING.rnnoise
+%license OFL.noto
 %license LICENSE.dependencies
 %license cargo-vendor.txt
 %doc README.md
@@ -310,9 +354,22 @@ desktop-file-validate %{buildroot}%{_datadir}/applications/com.fxsound.FxSound.d
 %{_datadir}/fxsound/presets/Input/
 %{_datadir}/icons/hicolor/256x256/apps/fxsound.png
 %{_datadir}/icons/hicolor/32x32/apps/fxsound.png
+%{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-off.svg
+%{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-on.svg
+%{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-processing.svg
+%{_mandir}/man1/fxsound.1*
+%{_metainfodir}/com.fxsound.FxSound.metainfo.xml
 %{_userunitdir}/fxsound.service
+%{_datadir}/dbus-1/services/org.fxsound.FxSound.service
 
 
 %changelog
+* Sun Sep 27 2026 FxSound Linux port contributors <blackixxce12@users.noreply.github.com> - 0.4.0-1
+- Update to 0.4.0
+- Install the manual page, the D-Bus activation file, the tray's status icons and the
+  AppStream metainfo
+- Ship the RNNoise and Noto licence texts as COPYING.rnnoise and OFL.noto
+- Re-derive the License tag from the 0.4.0 dependency tree
+
 * Mon Sep 21 2026 FxSound Linux port contributors <blackixxce12@users.noreply.github.com> - 0.3.0-1
 - Initial Fedora packaging, for the 0.3.0 release

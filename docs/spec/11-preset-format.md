@@ -182,7 +182,12 @@ must therefore accept LF, CRLF, and a missing final terminator.
 
 Every one of the 32 `.fac` files shipped in this tree is version `9`.
 `valsInit()` is always called with `DFXG_VALS_FILE_VERSION` (`dsp/DfxDspPreset.cpp:278`),
-so the Rust writer must emit exactly `9: Version`.
+so the Rust writer must emit exactly `9: Version` — whatever version the preset was read from
+(0.4.0 audit #46: the port's writer kept the file's version, so a version 7 file saved again lost
+its EQ block to its own reader, and a version 1 file gained a double-params line its reader takes
+for the element count). Reading an older file, the port fills in what it lacks as
+`getStateInfoFromVals` reads it: no bass before version 3, no headphone flag before 4, a flat EQ
+before 9.
 
 ### 3.2 `double_params`
 
@@ -369,7 +374,7 @@ frequency table and only remaps gain (`dsp/DfxDspEq.cpp:168-227`). Those tables,
 | 5 | 62.5 / 16000 | 62.5, 250, 1000, 4000, 16000 | `GraphicEqSet.cpp:430-440` |
 | **10** | **62.5 / 16000** | **62.5, 115.734, 214.311, 396.85, 734.867, 1360.79, 2519.84, 4666.12, 8640.48, 16000.0** | `GraphicEqSet.cpp:441-455` |
 | 15 | 25 / 16000 | 25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 16000 | `GraphicEqSet.cpp:456-467` |
-| 20 | 20 / 16000 | 20, 31.5, 40, 63, 80, 125, 160, 250, 315, 500, 630, 1000, 1250, 2000, 2500, 4000, 5000, 8000, 10000, 16000 | `GraphicEqSet.cpp:468-479` |
+| 20 | 20 / 16000 | 20, 31.5, 40, 63, 80, 125, 160, 250, 315, 500, 630, 1000, 1250, 2000, 2500, 4000, 5000, 8000, 10000, 16000 — **the port departs** (0.4.0 audit R4): geometric half-octave ladder between the same ends, see `09-dsp-eq.md` §3.1. A preset's own twenty centres are still installed as written | `GraphicEqSet.cpp:468-479` |
 | 31 | 20 / 20000 | 20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000 | `GraphicEqSet.cpp:480-492` |
 | other | as given | geometric: `f_i = f_min * (f_max/f_min)^(i/(n-1))` | `GraphicEqSet.cpp:493-509` |
 
@@ -414,6 +419,31 @@ volume levelling `0.5`, filter Q `0.5` (`FxAudioControls.cpp:312, 330, 348`).
 * preset bands `>` live bands -> **equidistant nearest pick**:
   `source = 1 + (int)((i-1)*(nB-1)/(live-1) + 0.5)` (`DfxDspEq.cpp:214-218`).
 * equal counts -> gains **and** frequencies copied verbatim (`DfxDspEq.cpp:230-241`).
+
+**The port departs (0.4.0 audit #13):** a preset of another band count is read *by frequency*,
+not by position — `fxsound_dsp::eq::fit_preset_gains(preset_centres, preset_gains,
+live_centres)`, with the rules in `09-dsp-eq.md` §14. By position, a ten-band +6 dB at 62.5 Hz
+landed on thirty-one bands at 20 Hz, where the engine installs the band list it is given; by
+frequency it lands at 63 Hz. In short:
+
+* the live ladder is kept and only the gains move, read from the preset's **own** centres, not
+  from the standard ladder of its count;
+* onto more bands, each live band reads the preset's curve at its centre, linear in
+  log-frequency between the preset bands either side; past the preset's first and last band the
+  end gain tapers to 0 dB over one of the preset's own band spacings (it is not held flat: held,
+  a ten-band bass boost on thirty-one bands piled up into a sub-bass shelf of +12.8 dB at 25 Hz);
+* onto fewer bands, a preset curve that is exactly a reading of some curve on the live ladder
+  comes back as that curve (least squares, only where it cannot extrapolate — every pair of the
+  window's counts 5/10/15/20/31 qualifies when the larger is at least as fine); any other is
+  read at the live centres the same way, and a live end band also takes a boost or cut that lies
+  past it, tapered over the live ladder's end spacing, when that goes further from 0 dB the same
+  way than its own reading;
+* equal counts copy the gains **and** the preset's centres, as on Windows; the centres half is
+  the caller's.
+
+A tool that must reproduce what FxSound for Linux installs should call `fit_preset_gains`
+rather than re-implement the positional formula above, which is kept here as the record of what
+Windows does.
 
 `float f_bass_boost_value;` at `dsp/DfxDspEq.cpp:134` is declared and never used - dead.
 
@@ -812,7 +842,8 @@ The GUI `Preset` record is `{ name: String, path: String, type: PresetType, modi
 * **Save as new** (`:1223-1241`): same write, then `initPresets()`, then `setPreset(name)`.
   Toast `"Reached the limit on new presets."` when `getUserPresetCount() == max_user_presets_`.
   `max_user_presets_` comes from settings, validated to `10..=120`, default **120**
-  (`FxController.cpp:194-198`).
+  (`FxController.cpp:194-198`) — anything outside is read as 120. **The port clamps to
+  `10..=1000` instead (0.4.0 audit #20).**
 * **Rename** (`:1244-1276`): user presets only. Writes a **new** file under the new name,
   then deletes the old path with `SHFileOperation(FO_DELETE)`. It is a copy-then-delete, not
   a rename - so a crash in between leaves both files.
@@ -1264,7 +1295,7 @@ same directory, `fsync`, then `rename()`.
 | `MAX_PATH` / `wcscpy_s` into `wchar_t[MAX_PATH]` (`FxController.cpp:1259-1264`) | 260-char path cap, and a latent truncation bug for longer paths | `PathBuf`, no cap. |
 | `swprintf(..., L"%s\\%s", dir, file)` (`Valsfile.cpp:69`, `Prelst.cpp:160-162`) | path join | `Path::join`. |
 | Registry `HKCU\...\LastUsed\EQ\EQOn` for the EQ on/off that gets *written into* the preset (`dsp/DfxDspEq.cpp:269-282`, read at `:306-313`; used by `createValsFromStateInfo` at `dsp/DfxDspPreset.cpp:290`) | persistent "is EQ enabled" outside the preset | a single TOML/JSON settings file at `$XDG_CONFIG_HOME/fxsound/settings.toml`. Do **not** invent a registry abstraction; the port needs exactly one key here. |
-| JUCE `settings_` (`preset`, `max_user_presets`, `power`, `theme_mode`, ...) (`FxController.cpp:194-198, 750, 1082`) | app preferences | same `settings.toml`. Keep `max_user_presets` with its `10..=120` clamp and `120` default for parity (`FxController.cpp:194-198`). |
+| JUCE `settings_` (`preset`, `max_user_presets`, `power`, `theme_mode`, ...) (`FxController.cpp:194-198, 750, 1082`) | app preferences | same `settings.toml`. Keep `max_user_presets` and its `120` default (`FxController.cpp:194-198`); since 0.4.0 it is clamped to `10..=1000` rather than reset to 120 when out of `10..=120` (audit #20). |
 | `MessageBox(NULL, L"TTEST", ...)` on DSP init failure (`dsp/DfxDspPrivate.cpp:77`) | debug leftover | drop it; log via `tracing`. |
 | Per-device preset memory (`DeviceConfig::getDeviceConfig(settings_, getOutputName())`, `FxController.cpp:1303-1310, 1371-1378`) | remember which preset was last used per output device | key the same map on the PipeWire **node name** (`node.name`) or the `device.id`/serial of the sink, not on a human-readable description, which is localised and unstable. |
 | `DFXP_GRAPHIC_EQ_NUM_BANDS` mutable global (`GraphicEqSet.cpp:154`) | live band count shared between GUI and DSP | an `AtomicUsize` or, better, a value owned by the DSP graph and mirrored into the UI via a channel - never a mutable global touched from the audio thread. |
@@ -1380,10 +1411,18 @@ GUI spec, but the *states* the preset subsystem must expose are:
    Two coincident peaking filters at the same frequency and gain are a legitimate
    (if odd) 12 dB shelf; the sound of those presets depends on it.
 
-10. **Band-count remapping is lossy and asymmetric** (linear interpolation upward,
+10. **Band-count remapping is lossy and asymmetric on Windows** (linear interpolation upward,
     nearest-pick downward, §3.7). A user who switches 10 -> 31 -> 10 bands does **not** get
     their original curve back. Consider keeping the preset's authored band table
     untouched in the model and only remapping at DSP-apply time.
+    **The port departs (0.4.0 audit #13):** remapping is by frequency (§3.7), and a round trip
+    between any two of the window's counts (5, 10, 15, 20, 31) comes back exactly, since each
+    larger ladder reaches as far at both ends and has a band on or between every two neighbours
+    of the smaller. A pair that is not like that is still lossy: 14 -> 15 -> 14 comes back as a
+    reading of the fifteen-band curve, because fifteen bands have only thirteen in the range
+    fourteen cover. A curve that sits on centres of its own (a Windows twenty-band preset, a
+    dragged band) must be remapped from those centres (`fxsound_dsp::eq::remap_curve`), not as
+    if it sat on the standard ladder.
 
 11. **`FxController::setPreset()` calls the band setters with 0-based indices**
     (`FxController.cpp:1092-1095`) while `GraphicEqSetBandFreq()` rejects `0`
