@@ -8,7 +8,7 @@ pkgname=fxsound-linux-git
 _pkgname=fxsound-linux
 # Recomputed by pkgver() below at build time; until then it is what the AUR page shows, so it
 # names the release main descends from. release.yml refuses a tag it disagrees with.
-pkgver=0.3.0.r0.g0000000
+pkgver=0.4.0.r0.g0000000
 pkgrel=1
 pkgdesc="System-wide audio enhancement for Linux: EQ, ambience, surround, bass and dynamic boost (Rust/egui port of FxSound) — development version"
 arch=('x86_64')

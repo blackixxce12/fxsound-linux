@@ -11,7 +11,7 @@
 
 pkgname=fxsound-linux-bin
 _pkgname=fxsound-linux
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="System-wide audio enhancement for Linux: EQ, ambience, surround, bass and dynamic boost (Rust/egui port of FxSound) — prebuilt binary"
 arch=('x86_64')

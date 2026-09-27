@@ -6,9 +6,10 @@ the TOML input presets, the desktop entry, both icon sizes, the tray's status ic
 page, the AppStream metainfo, the systemd **user** unit and the D-Bus activation file that
 starts it.
 
-The Rust dependencies are vendored — `eframe`/`egui` 0.36, `pipewire`, `ksni`, `nnnoiseless`,
-`rfd` and `resvg` are not packaged as crates in Fedora, so a system-registry build cannot
-resolve. The spec header explains the choice in full; a reviewer will ask.
+The Rust dependencies are vendored — `eframe`/`egui` 0.36, `pipewire`, `ksni`, `rfd` and
+`resvg` are not packaged as crates in Fedora, so a system-registry build cannot resolve. The
+spec header explains the choice in full; a reviewer will ask. (RNNoise is not among them: it is
+in the tree, as `crates/fxsound-rnnoise`.)
 
 ## Build
 
@@ -16,7 +17,7 @@ resolve. The spec header explains the choice in full; a reviewer will ask.
 produce it once per release, then build:
 
 ```bash
-VER=0.3.0
+VER=0.4.0
 mkdir -p ~/rpmbuild/SOURCES ~/rpmbuild/SPECS
 
 # Source0: the release tarball
@@ -109,14 +110,16 @@ still only exercised by hand). What was checked locally before that, by running 
 reading:
 
 - every path and glob `%install` touches (15 `Factsoft/*.fac`, 19 `BonusPresets/*.fac`,
-  10 `Input/*.toml`, both icons at the sizes the hicolor paths claim, the three status icons,
-  the manual page, the metainfo, all six doc files);
+  13 `Input/*.toml`, both icons at the sizes the hicolor paths claim, the three status icons,
+  the manual page, the metainfo, the D-Bus activation file, every doc and licence file);
 - the macro behaviour, against `cargo-rpm-macros` 28.5 itself: `%cargo_prep -v <dir>` keeps
   `Cargo.lock`, writes `[net] offline`, creates `target/rpm` and symlinks `target/release` to
   it, and `%cargo_build` builds `--profile rpm` — hence `target/rpm/fxsound` in `%install`;
 - `%cargo_license_summary`, `%cargo_license` and `%cargo_vendor_manifest`, by running
-  `cargo2rpm` 0.4.0 against this workspace. The `License:` tag's comment block is that tool's
-  output verbatim;
+  `cargo2rpm` 0.4.0 against the 0.3.0 workspace. For 0.4.0 the `License:` tag was re-derived
+  without it: the summary's own pipeline (`cargo tree` over normal edges for every target, the
+  slash form rewritten to `OR`, sorted unique), run by hand, gives the 0.3.0 block line for line
+  on the 0.3.0 tree, and on the 0.4.0 tree the block the spec now carries;
 - that `%cargo_install` cannot be used here: `cargo install --path .` on this tree fails with
   `found a virtual manifest ... instead of a package manifest`;
 - the dlopen dependency list, read out of the built binary's own soname strings.

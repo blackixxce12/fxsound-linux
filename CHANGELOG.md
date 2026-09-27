@@ -4,6 +4,15 @@ All notable changes to the FxSound Linux port. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-09-27
+
+### Changed
+- The package descriptions — the `.deb`'s, and the AppStream metainfo GNOME Software and Discover
+  show — no longer say a preset voiced on Windows sounds the same here, since this release fixes
+  defects of the original DSP, and the metainfo now describes the release itself.
+- The Fedora package's `License` tag is taken again from this release's dependency tree: it no
+  longer names BlueOak-1.0.0, which only a crate the vendored RNNoise has stopped linking carried.
+
 ## [0.3.0] — 2026-09-21
 
 ### Added

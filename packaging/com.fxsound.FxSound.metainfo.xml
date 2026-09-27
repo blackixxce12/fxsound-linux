@@ -35,9 +35,10 @@
     </p>
     <p>
       It is a native Linux port of the Windows application, written in Rust with egui. The DSP
-      is ported line by line from the original, so a preset voiced on Windows sounds the same
-      here, and the factory and bonus presets are the upstream files unchanged. A running
-      instance can be driven from the command line, over D-Bus and from compositor keybindings.
+      is ported line by line from the original with some of its defects fixed, so a preset
+      voiced on Windows sounds slightly different here; the factory and bonus presets are the
+      upstream files unchanged. A running instance can be driven from the command line, over
+      D-Bus and from compositor keybindings.
     </p>
   </description>
   <launchable type="desktop-id">com.fxsound.FxSound.desktop</launchable>
@@ -61,11 +62,19 @@
   </keywords>
   <content_rating type="oars-1.1"/>
   <!-- Newest first, as the specification wants. A release's date is its CHANGELOG heading's
-       date, and release.yml's verify job refuses a tag where the two differ — so the
-       version-bump phase must set 0.4.0's date here when it dates the CHANGELOG heading; the
-       0.4.0 date below is a placeholder until then. -->
+       date, and release.yml's verify job refuses a tag where the two differ, so a version bump
+       dates both together. -->
   <releases>
-    <release version="0.4.0" date="2026-09-21">
+    <release version="0.4.0" date="2026-09-27">
+      <description>
+        <p>
+          The microphone gets a lane of its own beside the speakers', with noise suppression at
+          three levels, an adaptive de-esser, de-reverb, echo cancellation and a calibration
+          wizard. Applications can keep a preset of their own, a running instance answers on
+          D-Bus and reports its changes as they happen, and defects of the original DSP are
+          fixed.
+        </p>
+      </description>
       <url>https://github.com/blackixxce12/fxsound-linux/blob/main/CHANGELOG.md</url>
     </release>
     <release version="0.3.0" date="2026-09-21">

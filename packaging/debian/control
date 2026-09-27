@@ -19,7 +19,7 @@
 #
 #   2. Cargo.toml says rust-version = "1.98.1". Cargo enforces that one itself,
 #      with any rustc, and refuses the build outright: "package `fxsound-app
-#      v0.3.0` cannot be built because it requires rustc 1.98.1 or newer".
+#      v0.4.0` cannot be built because it requires rustc 1.98.1 or newer".
 #      Exporting RUSTUP_TOOLCHAIN does nothing about it. Neither does removing
 #      rust-toolchain.toml.
 #
@@ -146,8 +146,9 @@ Description: system-wide audio enhancement for PipeWire
  This is a native Linux port of the Windows application, written in Rust with
  egui. It is a fork rather than a wrapper: the GUI, the device layer and the
  persistence are new, but the DSP is ported line by line from the original C,
- so a preset voiced on Windows sounds the same here. The factory and bonus
- .fac presets are installed alongside it and are the upstream files unchanged.
+ with some of its defects fixed, so a preset voiced on Windows sounds slightly
+ different here. The factory and bonus .fac presets are installed alongside it
+ and are the upstream files unchanged.
  .
  A Wayland client cannot grab global shortcuts, so the keyboard bindings live
  in the compositor and call back into the running instance over a control

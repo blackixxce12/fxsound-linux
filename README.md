@@ -61,7 +61,7 @@ From the working tree you already have:
 ```bash
 cd packaging
 makepkg -f
-sudo pacman -U fxsound-linux-0.3.0-1-x86_64.pkg.tar.zst
+sudo pacman -U fxsound-linux-0.4.0-1-x86_64.pkg.tar.zst
 ```
 
 `makepkg` runs the whole test suite as part of the build; pass `--nocheck` to skip it.
@@ -77,7 +77,7 @@ tree, so copy it there first:
 ```bash
 cp -a packaging/debian debian
 dpkg-buildpackage -us -uc -b
-sudo apt install ../fxsound-linux_0.3.0-1_amd64.deb
+sudo apt install ../fxsound-linux_0.4.0-1_amd64.deb
 ```
 
 The `.deb` lands beside the source tree, not inside it. Use `apt` rather than `dpkg -i` so the
@@ -94,7 +94,7 @@ and why lowering the floor is not the fix, is at the top of
 
 ```bash
 rpmbuild -ba packaging/fedora/fxsound.spec
-sudo dnf install ~/rpmbuild/RPMS/x86_64/fxsound-linux-0.3.0-1.*.x86_64.rpm
+sudo dnf install ~/rpmbuild/RPMS/x86_64/fxsound-linux-0.4.0-1.*.x86_64.rpm
 ```
 
 The spec needs a vendored-dependency tarball beside it;
@@ -107,8 +107,8 @@ For anything else, or for anyone who would rather no package manager were involv
 
 ```bash
 packaging/build-tarball.sh
-tar xf dist/fxsound-linux-0.3.0-x86_64.tar.gz
-sudo ./fxsound-linux-0.3.0-x86_64/install.sh        # /usr/local unless you name another prefix
+tar xf dist/fxsound-linux-0.4.0-x86_64.tar.gz
+sudo ./fxsound-linux-0.4.0-x86_64/install.sh        # /usr/local unless you name another prefix
 ```
 
 `/usr/local` is searched for presets alongside `/usr`, so nothing needs configuring afterwards.

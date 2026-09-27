@@ -1,3 +1,29 @@
+fxsound-linux (0.4.0-1) unstable; urgency=medium
+
+  * New upstream release. The microphone runs in a lane of its own beside
+    the speakers', with noise suppression at three levels and in three
+    channel modes, an adaptive de-esser, de-reverb, echo cancellation and a
+    calibration wizard; applications can keep a preset of their own; a
+    running instance answers on D-Bus as org.fxsound.FxSound, `--watch`
+    streams what changes and `--self-test` checks an installation. See the
+    upstream changelog in /usr/share/doc/fxsound-linux/changelog.gz.
+  * Installs the D-Bus activation file, so a call to org.fxsound.FxSound
+    starts FxSound through the systemd user unit; the tray's three status
+    icons under hicolor's scalable/status, without which the tray showed a
+    blank; and the AppStream metainfo, so software centres list it.
+  * The manual page is packaging/fxsound.1 now, the one every package ships.
+  * Recommends a file-chooser backend for the portal (xdg-desktop-portal-gtk,
+    -kde or -gnome), which xdg-desktop-portal alone does not provide, and
+    dbus-user-session, which gives a compositor started from a tty the
+    session bus the tray, the notifications and the D-Bus interface need.
+  * debian/copyright gives the RNNoise code and model under
+    crates/fxsound-rnnoise (BSD-3-Clause), the Noto fallback faces (OFL-1.1)
+    and the Gilroy faces a stanza each, with their notices and licences,
+    where it declared every file AGPL-3.0-or-later.
+  * debian/rules keeps a RUSTUP_TOOLCHAIN the caller has already set.
+
+ -- FxSound Linux port contributors <blackixxce12@users.noreply.github.com>  Sun, 27 Sep 2026 14:09:18 +0400
+
 fxsound-linux (0.3.0-1) unstable; urgency=medium
 
   * Initial Debian packaging, tracking upstream 0.3.0.
