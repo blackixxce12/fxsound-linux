@@ -315,6 +315,16 @@ never mixes them. Your choice is remembered **per direction**, so a preset picke
 does not follow you back to your speakers. The reasoning behind every number in these files is in
 `docs/input-presets-decision.md`.
 
+It is also remembered **per device**, in both directions: every output keeps the `.fac` preset and
+every microphone the voice preset it was last used with, and brings it back whenever FxSound moves
+to it again — picked in the window or the tray, with `--output`, `--input`, `--next-output` or
+`--next-input`, or chosen by the priority list when it is plugged in. A device used for the first
+time leaves the preset alone. The rows of Settings ▸ Audio's *Output Device Preference* and of
+Settings ▸ Microphone's *Input Device Preference* each have a combo that sets that device's preset
+ahead of time; set on the device in use, it takes over at once. A renamed preset takes its devices
+with it; a device whose preset was deleted shows *Select preset* and keeps whatever the lane is
+running when it comes back.
+
 While a microphone is selected the window says so rather than pretending: the five effect sliders are
 drawn disabled with the reason underneath, the chain's stages read out along the bottom of the panel,
 and an equalizer band the device's sample rate cannot carry is struck through instead of left looking

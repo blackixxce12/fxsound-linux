@@ -4542,11 +4542,12 @@ impl App {
         state
     }
 
-    /// The names the Output Device Preference rows' preset combos offer: the speakers' presets,
-    /// whichever lane the window edits, in the store's order — the order a row's preset index
-    /// ([`App::device_rows`]) counts in.
-    fn device_preset_names(&self) -> Vec<String> {
-        self.presets
+    /// The names `direction`'s priority list rows' preset combos offer: the speakers' presets on
+    /// Settings ▸ Audio, the voice presets on Settings ▸ Microphone, whichever lane the window
+    /// edits, in the store's order — the order a row's preset index ([`App::device_rows`])
+    /// counts in. The Applications pane's combos offer the same two lists.
+    fn device_preset_names(&self, direction: DeviceDirection) -> Vec<String> {
+        self.store(direction)
             .entries()
             .iter()
             .map(|p| p.name.clone())
@@ -4569,12 +4570,14 @@ impl App {
 
     /// One direction's priority list as the Settings pane draws it, most preferred first: the
     /// Audio pane's Output Device Preference (`FxOutputPreference.cpp:104-181`), each row with its
-    /// `.fac` preset, or the Microphone pane's Input Device Preference (U4).
+    /// `.fac` preset, or the Microphone pane's Input Device Preference (U4), each row with its
+    /// voice preset.
     ///
-    /// A microphone's row has no preset combo: the voice preset it remembers is not in the
-    /// speakers' list the combo offers — offered one, it would remember a `.fac` it can never
-    /// load. Rows count one direction's devices only; the actions that name a row find its entry
-    /// through [`App::config_index`].
+    /// Each row's preset is looked up in its own lane's store, the one its combo lists: a
+    /// microphone offered the speakers' list would remember a `.fac` it can never load. A name the
+    /// store no longer has — a preset deleted since — is no row's preset, and the combo shows its
+    /// placeholder. Rows count one direction's devices only; the actions that name a row find its
+    /// entry through [`App::config_index`].
     fn device_rows(&self, direction: DeviceDirection) -> Vec<DevicePriority> {
         let playing = self.state.device_for(direction).map(|d| d.name.as_str());
         priority::ranked(&self.settings, direction)
@@ -4583,7 +4586,7 @@ impl App {
                 name: config.device_name.clone(),
                 preset: match direction {
                     DeviceDirection::Output => self.presets.index_of(&config.preset),
-                    DeviceDirection::Input => None,
+                    DeviceDirection::Input => self.voice_presets.index_of(&config.preset),
                 },
                 connected: playing == Some(config.device_id.as_str()),
                 present: self
@@ -4855,29 +4858,36 @@ impl App {
                 self.forget_app(app);
                 state.apps = self.app_rows();
             }
-            A::SetDevicePreset { device, preset } => {
-                // By the name the row showed, and only one the speakers' store still has: an
-                // index would be counted in the list as it was drawn, not as it is now.
-                let name = self
-                    .presets
+            // A row of Settings ▸ Audio's list and a `.fac`, or of Settings ▸ Microphone's and a
+            // voice preset: the same steps on both lanes.
+            A::SetDevicePreset {
+                direction,
+                device,
+                preset,
+            } => {
+                // By the name the row showed, and only one the lane's own store still has: an
+                // index would be counted in the list as it was drawn, not as it is now, and a name
+                // from the other lane's store is one the device could never load.
+                let known = self
+                    .store(*direction)
                     .entries()
                     .iter()
-                    .find(|p| p.name == *preset)
-                    .map(|p| p.name.clone());
-                if let (Some(index), Some(name)) =
-                    (self.config_index(DeviceDirection::Output, *device), name)
-                {
-                    self.settings.device_configs[index].preset = name;
-                    // The row of the device playing now takes effect at once, rather than the
-                    // next time the device comes back (upstream 83ccf5e,
-                    // `FxOutputPreference.cpp:57-61`).
+                    .any(|p| p.name == *preset);
+                if known && let Some(index) = self.config_index(*direction, *device) {
+                    self.settings.device_configs[index]
+                        .preset
+                        .clone_from(preset);
+                    // The row of the device the lane is on now takes effect at once, rather than
+                    // the next time the device comes back (upstream 83ccf5e,
+                    // `FxOutputPreference.cpp:57-61`) — on the microphone lane as on the
+                    // speakers', whichever of the two the window edits.
                     let node_name = self.settings.device_configs[index].device_id.clone();
                     if self
                         .state
-                        .device_for(DeviceDirection::Output)
-                        .is_some_and(|playing| playing.name == node_name)
+                        .device_for(*direction)
+                        .is_some_and(|in_use| in_use.name == node_name)
                     {
-                        self.bring_back_device_preset(DeviceDirection::Output, &node_name);
+                        self.bring_back_device_preset(*direction, &node_name);
                     }
                     self.device_configs_changed(state);
                 }
@@ -5032,18 +5042,14 @@ impl App {
         // store's order, and a save, rename or delete from the command line or D-Bus while the
         // pane is open moves the names under it. A stale list would show a row one name and bind
         // another to it.
-        let names = self.device_preset_names();
+        let names = self.device_preset_names(DeviceDirection::Output);
         if state.presets != names {
             state.presets = names;
         }
-        // The same for the Applications pane's input combos, and its rows: a preset saved,
-        // renamed or deleted anywhere, an application starting or stopping, show while it is open.
-        let voices: Vec<String> = self
-            .voice_presets
-            .entries()
-            .iter()
-            .map(|p| p.name.clone())
-            .collect();
+        // The same for the microphones' rows and the Applications pane's input combos, and for
+        // its rows: a preset saved, renamed or deleted anywhere, an application starting or
+        // stopping, show while it is open.
+        let voices = self.device_preset_names(DeviceDirection::Input);
         if state.input_presets != voices {
             state.input_presets = voices;
         }
@@ -10553,6 +10559,7 @@ mod tests {
 
         app.handle_settings(
             &SettingsAction::SetDevicePreset {
+                direction: OUT,
                 device: 0,
                 preset: "Beta".to_owned(),
             },
@@ -11545,6 +11552,7 @@ mod tests {
         let headphones = row_of(&pane, "alsa_output.headphones");
         app.handle_settings(
             &SettingsAction::SetDevicePreset {
+                direction: OUT,
                 device: headphones,
                 preset: "Alpha".to_owned(),
             },
@@ -11560,6 +11568,7 @@ mod tests {
         let speakers = row_of(&pane, "alsa_output.speakers");
         app.handle_settings(
             &SettingsAction::SetDevicePreset {
+                direction: OUT,
                 device: speakers,
                 preset: "Beta".to_owned(),
             },
@@ -11582,6 +11591,7 @@ mod tests {
         let mut pane = app.settings_state();
         app.handle_settings(
             &SettingsAction::SetDevicePreset {
+                direction: OUT,
                 device: row_of(&pane, "alsa_output.speakers"),
                 preset: "Beta".to_owned(),
             },
@@ -12599,6 +12609,7 @@ mod tests {
             pane.microphones.iter().map(|row| row.id.clone()).collect()
         };
         assert_eq!(rows(&pane), [MIC, "alsa_input.webcam"]);
+        // Neither remembers a voice preset yet: both combos show the placeholder.
         assert!(pane.microphones.iter().all(|row| row.preset.is_none()));
         assert!(pane.microphones.iter().all(|row| row.present));
 
@@ -12636,6 +12647,284 @@ mod tests {
         app.handle_settings(&SettingsAction::RemoveMicrophone(1), &mut pane);
         assert_eq!(rows(&pane), [MIC]);
         assert_eq!(pane.devices.len(), 2);
+    }
+
+    // ---- a voice preset per microphone, from Settings ▸ Microphone ------------------------------
+
+    const HEADSET_MIC: &str = "alsa_input.headset";
+
+    /// [`two_lane_devices`] and a headset's microphone, which is not the default.
+    fn two_microphones() -> Vec<AudioDevice> {
+        let mut devices = two_lane_devices();
+        devices.push(device(HEADSET_MIC, IN, false));
+        devices
+    }
+
+    /// A start from [`saved_settings`] editing the speakers, with [`two_microphones`] listed: the
+    /// headphones on `Beta`, the microphone lane on [`MIC`] with `Loud`.
+    fn two_microphones_listed() -> (App, FakeEngine, tempfile::TempDir) {
+        let (mut app, engine, dir) = started_with(saved_settings(OUT));
+        engine.feed(AudioToUi::Devices(two_microphones()));
+        app.poll_audio();
+        assert_eq!(selected(&app, IN), Some(MIC));
+        assert_eq!(app.lane_preset(IN), Some(("Loud", false)));
+        assert_eq!(app.state.direction, OUT);
+        (app, engine, dir)
+    }
+
+    /// The row of `lane`'s priority list that shows `node_name`.
+    fn lane_row(pane: &SettingsState, lane: DeviceDirection, node_name: &str) -> usize {
+        let rows = match lane {
+            OUT => &pane.devices,
+            IN => &pane.microphones,
+        };
+        rows.iter()
+            .position(|row| row.id == node_name)
+            .unwrap_or_else(|| panic!("no row for {node_name}"))
+    }
+
+    /// What the combo of `node_name`'s row shows: its preset's name, or `None` for the
+    /// placeholder.
+    fn row_preset<'a>(
+        pane: &'a SettingsState,
+        lane: DeviceDirection,
+        node_name: &str,
+    ) -> Option<&'a str> {
+        let (rows, presets) = match lane {
+            OUT => (&pane.devices, &pane.presets),
+            IN => (&pane.microphones, &pane.input_presets),
+        };
+        rows[lane_row(pane, lane, node_name)]
+            .preset
+            .map(|at| presets[at].as_str())
+    }
+
+    /// Pick `preset` in the combo of `node_name`'s row of `lane`'s list.
+    fn set_row_preset(
+        app: &mut App,
+        pane: &mut SettingsState,
+        lane: DeviceDirection,
+        node_name: &str,
+        preset: &str,
+    ) {
+        let device = lane_row(pane, lane, node_name);
+        app.handle_settings(
+            &SettingsAction::SetDevicePreset {
+                direction: lane,
+                device,
+                preset: preset.to_owned(),
+            },
+            pane,
+        );
+    }
+
+    #[test]
+    fn a_microphones_row_offers_the_voice_presets_and_remembers_the_one_picked_for_it_alone() {
+        let (mut app, _engine, _dir) = two_microphones_listed();
+        let mut pane = app.settings_state();
+        assert_eq!(pane.input_presets, ["Loud", "Quiet"], "the voice set");
+        assert_eq!(
+            pane.presets,
+            ["Alpha", "Beta"],
+            "and the speakers' beside it"
+        );
+        assert_eq!(row_preset(&pane, IN, HEADSET_MIC), None, "nothing yet");
+        let speakers_rows = pane.devices.clone();
+
+        set_row_preset(&mut app, &mut pane, IN, HEADSET_MIC, "Quiet");
+        assert_eq!(
+            app.settings.preset_for_device(HEADSET_MIC, IN),
+            Some("Quiet")
+        );
+        assert_eq!(
+            row_preset(&pane, IN, HEADSET_MIC),
+            Some("Quiet"),
+            "the row follows"
+        );
+        assert_eq!(pane.settings.device_configs, app.settings.device_configs);
+        // The headset is not the microphone in use: its preset waits for it.
+        assert_eq!(app.lane_preset(IN), Some(("Loud", false)));
+        assert_eq!(row_preset(&pane, IN, MIC), None);
+        assert_eq!(
+            pane.devices, speakers_rows,
+            "the speakers' rows are not touched"
+        );
+        assert_eq!(app.settings.preset_for_device(HEADSET_MIC, OUT), None);
+        // A pane opened afresh shows it again.
+        assert_eq!(
+            row_preset(&app.settings_state(), IN, HEADSET_MIC),
+            Some("Quiet")
+        );
+
+        // A speakers' preset is no microphone's, and a name the store no longer has — deleted
+        // under the open pane — binds nothing.
+        for stranger in ["Beta", "Gone"] {
+            set_row_preset(&mut app, &mut pane, IN, HEADSET_MIC, stranger);
+            assert_eq!(
+                app.settings.preset_for_device(HEADSET_MIC, IN),
+                Some("Quiet"),
+                "{stranger}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_voice_preset_given_to_the_microphone_in_use_applies_at_once_whichever_lane_is_edited() {
+        // As on the speakers (upstream 83ccf5e): the row of the device a lane is on is the lane's
+        // preset from then on, not only the next time the device comes back.
+        let (mut app, engine, _dir) = two_microphones_listed();
+        let mut pane = app.settings_state();
+        set_row_preset(&mut app, &mut pane, IN, MIC, "Quiet");
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+        assert_eq!(app.settings.input_preset, "Quiet");
+        assert_eq!(
+            engine.input_params().expect("published").makeup_db,
+            0.0,
+            "Quiet's makeup, where Loud's is 9 dB"
+        );
+        assert_eq!(app.state.direction, OUT, "the window stays on the speakers");
+        assert_eq!(app.lane_preset(OUT), Some(("Beta", false)));
+        assert_eq!(row_preset(&pane, IN, MIC), Some("Quiet"));
+
+        let (mut app, _engine, _dir) = editing_the_microphone();
+        let mut pane = app.settings_state();
+        set_row_preset(&mut app, &mut pane, IN, MIC, "Quiet");
+        assert_eq!(
+            app.state.preset().map(|p| p.name.as_str()),
+            Some("Quiet"),
+            "the window shows it"
+        );
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+    }
+
+    #[test]
+    fn switching_microphones_brings_back_the_voice_preset_each_row_gave_it() {
+        let (mut app, _engine, _dir) = two_microphones_listed();
+        let mut pane = app.settings_state();
+        set_row_preset(&mut app, &mut pane, IN, MIC, "Quiet");
+        set_row_preset(&mut app, &mut pane, IN, HEADSET_MIC, "Loud");
+        for (microphone, preset) in [
+            (HEADSET_MIC, "Loud"),
+            (MIC, "Quiet"),
+            (HEADSET_MIC, "Loud"),
+            (MIC, "Quiet"),
+        ] {
+            app.handle(&[UiAction::SelectInput(device_at(&app, microphone))]);
+            assert_eq!(
+                app.lane_preset(IN),
+                Some((preset, false)),
+                "on {microphone}"
+            );
+        }
+        assert_eq!(
+            app.lane_preset(OUT),
+            Some(("Beta", false)),
+            "the speakers kept theirs"
+        );
+    }
+
+    #[test]
+    fn the_voice_presets_the_microphones_rows_gave_them_survive_a_restart() {
+        let (mut app, _engine, dir) = two_microphones_listed();
+        let mut pane = app.settings_state();
+        set_row_preset(&mut app, &mut pane, IN, MIC, "Quiet");
+        set_row_preset(&mut app, &mut pane, IN, HEADSET_MIC, "Loud");
+        let file = dir.path().join("settings.toml");
+        app.settings()
+            .save_to(&file)
+            .expect("the settings are written");
+
+        let engine = FakeEngine::new();
+        let mut store =
+            PresetStore::with_dirs(vec![dir.path().join("factory")], dir.path().join("user"));
+        store.rescan();
+        let mut app =
+            App::start_for_tests(Settings::load_from(&file), store, voices(&dir), &engine);
+        engine.feed(AudioToUi::Devices(two_microphones()));
+        app.poll_audio();
+
+        let pane = app.settings_state();
+        assert_eq!(row_preset(&pane, IN, MIC), Some("Quiet"));
+        assert_eq!(row_preset(&pane, IN, HEADSET_MIC), Some("Loud"));
+        assert_eq!(
+            app.lane_preset(IN),
+            Some(("Quiet", false)),
+            "the microphone in use came back with its own"
+        );
+        app.handle(&[UiAction::SelectInput(device_at(&app, HEADSET_MIC))]);
+        assert_eq!(app.lane_preset(IN), Some(("Loud", false)));
+        app.handle(&[UiAction::SelectInput(device_at(&app, MIC))]);
+        assert_eq!(app.lane_preset(IN), Some(("Quiet", false)));
+    }
+
+    /// What renaming and then deleting a device's preset does on `lane`: the user preset `Mine`
+    /// saved on the device the lane is on, `in_use`, and given to `other` in its row of the
+    /// lane's Settings list, is renamed `Yours` and then deleted, and the lane then moves to
+    /// `other`. Returns, after each step, what the two rows show and the lane's preset.
+    fn rename_then_delete_a_device_preset(
+        mut app: App,
+        lane: DeviceDirection,
+        in_use: &str,
+        other: &str,
+    ) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+        let select = |at| match lane {
+            OUT => UiAction::SelectOutput(at),
+            IN => UiAction::SelectInput(at),
+        };
+        app.handle(&[select(device_at(&app, in_use))]);
+        app.handle(&[UiAction::SetBandGain(0, 6.0)]);
+        app.handle(&[UiAction::SavePresetAs("Mine".into())]);
+        let mut pane = app.settings_state();
+        set_row_preset(&mut app, &mut pane, lane, other, "Mine");
+
+        let mut steps = Vec::new();
+        let mut note = |app: &App, pane: &mut SettingsState| {
+            app.refresh_settings_state(pane);
+            steps.push((
+                row_preset(pane, lane, in_use).map(ToOwned::to_owned),
+                row_preset(pane, lane, other).map(ToOwned::to_owned),
+                app.lane_preset(lane).map(|(name, _)| name.to_owned()),
+            ));
+        };
+        note(&app, &mut pane);
+        app.rename_preset("Yours");
+        note(&app, &mut pane);
+        app.handle(&[UiAction::DeletePreset]);
+        note(&app, &mut pane);
+        app.handle(&[select(device_at(&app, other))]);
+        note(&app, &mut pane);
+        steps
+    }
+
+    #[test]
+    fn a_renamed_or_deleted_voice_preset_leaves_the_microphones_rows_as_a_fac_leaves_the_speakers()
+    {
+        let some = |name: &str| Some(name.to_owned());
+        // The speakers' lane, on the headphones, with the speakers as the other device: the
+        // rename follows on both rows; the deletion moves the lane to the neighbour, which the
+        // headphones then remember, leaves the speakers' row on its placeholder, and moving to
+        // the speakers keeps the lane where it is rather than guessing.
+        let (app, _engine, _music) = listed_with(saved_settings(OUT), HEADPHONES);
+        assert_eq!(
+            rename_then_delete_a_device_preset(app, OUT, HEADPHONES, SPEAKERS),
+            [
+                (some("Mine"), some("Mine"), some("Mine")),
+                (some("Yours"), some("Yours"), some("Yours")),
+                (some("Beta"), None, some("Beta")),
+                (some("Beta"), None, some("Beta")),
+            ]
+        );
+        // The microphone lane does the same with its voice presets.
+        let (app, _engine, _voices) = two_microphones_listed();
+        assert_eq!(
+            rename_then_delete_a_device_preset(app, IN, MIC, HEADSET_MIC),
+            [
+                (some("Mine"), some("Mine"), some("Mine")),
+                (some("Yours"), some("Yours"), some("Yours")),
+                (some("Quiet"), None, some("Quiet")),
+                (some("Quiet"), None, some("Quiet")),
+            ]
+        );
     }
 
     #[test]
@@ -13377,6 +13666,7 @@ mod tests {
 
         app.handle_settings(
             &SettingsAction::SetDevicePreset {
+                direction: OUT,
                 device: headphones,
                 preset: "Rock".to_owned(),
             },
@@ -13390,6 +13680,7 @@ mod tests {
         // A name the store no longer has binds nothing.
         app.handle_settings(
             &SettingsAction::SetDevicePreset {
+                direction: OUT,
                 device: headphones,
                 preset: "Gone".to_owned(),
             },

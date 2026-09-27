@@ -47,6 +47,22 @@ own, either can be detached, and one power switch covers both. An application
 can have a preset of its own on either lane: FxSound runs that preset for it
 alone, beside the lane's, and remembers the choice.
 .PP
+Each device remembers the preset it was last used with, in both directions: a
+playback device its
+.I .fac
+preset, a microphone its voice preset. Whenever a lane moves to a device again
+\(en picked in the window or the tray, named by
+.BR \-\-output " or " \-\-input ,
+stepped to by
+.BR \-\-next\-output " or " \-\-next\-input ,
+or chosen by the priority list when it is plugged in \(en the device brings its
+preset back; a device used for the first time leaves the preset alone.
+Settings \(-> Audio sets the preset of each playback device, and Settings \(->
+Microphone the voice preset of each microphone, in the device's row of its
+priority list; set on the device a lane is on, it takes over at once. A renamed
+preset takes its devices with it; a device whose preset was deleted keeps the
+preset the lane is running when it comes back.
+.PP
 Run with no options,
 .B fxsound
 starts and shows its window, unless it was last quit with its window hidden to

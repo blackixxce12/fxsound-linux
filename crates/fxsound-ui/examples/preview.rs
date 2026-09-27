@@ -38,6 +38,7 @@
 
 use eframe::egui;
 use fxsound_core::{AppKey, AudioDevice, DeviceDirection, ThemeMode, ViewMode};
+use fxsound_ui::dialogs::settings::DevicePriority;
 use fxsound_ui::dialogs::{
     AppLane, AppRow, NavIcons, SettingsAction, SettingsDialog, SettingsState, SettingsTab, settings,
 };
@@ -258,8 +259,27 @@ fn app_row(
     }
 }
 
-/// Settings ▸ Applications as the app would fill it: three applications running, then four
-/// remembered — one of them with a name too long for its room, one whose preset is gone.
+/// One row of a device priority list, remembering the preset at `preset` in its lane's list.
+fn priority_row(
+    id: &str,
+    name: &str,
+    preset: Option<usize>,
+    connected: bool,
+    present: bool,
+) -> DevicePriority {
+    DevicePriority {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        preset,
+        connected,
+        present,
+    }
+}
+
+/// Settings as the app would fill it. Applications: three applications running, then four
+/// remembered — one of them with a name too long for its room, one whose preset is gone. The
+/// priority lists: three outputs and four microphones, each with the preset it remembers but one
+/// on each list, which remembers none, and one of each gone.
 fn demo_settings(empty: bool) -> SettingsState {
     use DeviceDirection::{Input, Output};
     let apps = if empty {
@@ -301,6 +321,48 @@ fn demo_settings(empty: bool) -> SettingsState {
         presets: output_presets().into_iter().map(|p| p.name).collect(),
         input_presets: input_presets().into_iter().map(|p| p.name).collect(),
         apps,
+        devices: vec![
+            priority_row(
+                "alsa_output.usb-hecate",
+                "HECATE G2000 Pro",
+                Some(3),
+                true,
+                true,
+            ),
+            priority_row(
+                "alsa_output.pci-speakers",
+                "Laptop Speakers",
+                Some(1),
+                false,
+                true,
+            ),
+            priority_row("alsa_output.usb-hp", "HP Speakers", None, false, false),
+        ],
+        microphones: vec![
+            priority_row(
+                "alsa_input.usb-fifine",
+                "fifine Microphone",
+                Some(3),
+                true,
+                true,
+            ),
+            priority_row(
+                "alsa_input.usb-hecate",
+                "HECATE G2000 Pro",
+                Some(1),
+                false,
+                true,
+            ),
+            priority_row(
+                "alsa_input.pci-mic",
+                "Built-in Audio Analogue Stereo",
+                Some(2),
+                false,
+                true,
+            ),
+            priority_row("bluez_input.AC_12", "Headset", None, false, false),
+        ],
+        has_microphone: true,
         ..SettingsState::default()
     }
 }
@@ -494,6 +556,30 @@ impl Preview {
                     }
                 }
             }
+            SettingsAction::SetDevicePreset {
+                direction,
+                device,
+                preset,
+            } => {
+                let (rows, presets) = match direction {
+                    DeviceDirection::Output => (&mut settings.devices, &settings.presets),
+                    DeviceDirection::Input => (&mut settings.microphones, &settings.input_presets),
+                };
+                if let Some(row) = rows.get_mut(*device) {
+                    row.preset = presets.iter().position(|name| name == preset);
+                }
+            }
+            SettingsAction::MoveDeviceUp(row) if *row > 0 => settings.devices.swap(*row, row - 1),
+            SettingsAction::MoveDeviceDown(row) if row + 1 < settings.devices.len() => {
+                settings.devices.swap(*row, row + 1);
+            }
+            SettingsAction::MoveMicrophoneUp(row) if *row > 0 => {
+                settings.microphones.swap(*row, row - 1);
+            }
+            SettingsAction::MoveMicrophoneDown(row) if row + 1 < settings.microphones.len() => {
+                settings.microphones.swap(*row, row + 1);
+            }
+            SettingsAction::SelectDeviceRow(row) => settings.selected_device = Some(*row),
             SettingsAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => {}
         }

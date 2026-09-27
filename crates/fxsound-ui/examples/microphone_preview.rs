@@ -13,12 +13,13 @@
 //! Flags: `--light`, `--language=CODE`, `--wizard[=intro|silence|speech|loud|analysing|result|
 //! failed]`, `--no-microphone`, `--cannot-measure` (the wizard as a host without an input lane
 //! shows it: Start and Retry disabled), `--audio` (open on the Audio pane, with its priority list
-//! and its two checkboxes), `--exit-after-paint`. Keys while it runs: `W` opens or closes the
-//! wizard, `P` steps it to its next phase, `T` flips the palette, `Esc` quits.
+//! and its two checkboxes), `--microphones=N` (the first N of the five microphones the list
+//! ranks, each with its voice preset or none), `--exit-after-paint`. Keys while it runs: `W` opens
+//! or closes the wizard, `P` steps it to its next phase, `T` flips the palette, `Esc` quits.
 
 use eframe::egui;
 use fxsound_core::settings::CalibrationRecord;
-use fxsound_core::{Settings, ThemeMode, i18n};
+use fxsound_core::{DeviceDirection, Settings, ThemeMode, i18n};
 use fxsound_ui::dialogs::settings::DevicePriority;
 use fxsound_ui::dialogs::{
     CalibrationAction, CalibrationDialog, CalibrationPhase, CalibrationResultView, CalibrationView,
@@ -55,6 +56,9 @@ fn main() -> eframe::Result<()> {
 
     let mut state = demo_state();
     state.has_microphone = !flag("--no-microphone");
+    if let Some(count) = value("--microphones").and_then(|n| n.parse().ok()) {
+        state.microphones.truncate(count);
+    }
     if flag("--audio") {
         state.tab = SettingsTab::Audio;
     }
@@ -103,34 +107,49 @@ fn demo_state() -> SettingsState {
         preset: format!("Calibrated — {DEVICE}"),
         device: "alsa_input.usb-fifine".to_owned(),
     });
-    let row = |id: &str, name: &str, connected, present| DevicePriority {
+    let row = |id: &str, name: &str, preset, connected, present| DevicePriority {
         id: id.to_owned(),
         name: name.to_owned(),
-        preset: None,
+        preset,
         connected,
         present,
     };
+    // The voice presets FxSound ships, in the store's order.
+    let voices = [
+        "Bright Voice",
+        "Broadcaster",
+        "Clean Voice",
+        "Flat",
+        "Headset",
+        "Laptop Mic",
+        "Podcast",
+        "Streaming",
+        "Studio",
+        "Warm Voice",
+    ];
     SettingsState {
         tab: SettingsTab::Microphone,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         echo_cancel_trouble: Some(fxsound_ui::state::EchoCancelTrouble::NotLoaded),
         presets: vec!["General".to_owned(), "Music".to_owned()],
+        input_presets: voices.map(str::to_owned).to_vec(),
         devices: vec![
-            row("alsa_output.headphones", "Headphones", true, true),
-            row("alsa_output.speakers", "Speakers", false, true),
-            row("alsa_output.hdmi", "LG TV", false, false),
+            row("alsa_output.headphones", "Headphones", Some(1), true, true),
+            row("alsa_output.speakers", "Speakers", Some(0), false, true),
+            row("alsa_output.hdmi", "LG TV", None, false, false),
         ],
         microphones: vec![
-            row("alsa_input.usb-fifine", DEVICE, true, true),
-            row("bluez_input.AC_12", "Headset", false, false),
+            row("alsa_input.usb-fifine", DEVICE, Some(7), true, true),
+            row("bluez_input.AC_12", "Headset", Some(4), false, false),
             row(
                 "alsa_input.pci",
                 "Built-in Audio Analogue Stereo",
+                Some(5),
                 false,
                 true,
             ),
-            row("alsa_input.webcam", "C920 Webcam", false, true),
-            row("alsa_input.dock", "Dock Microphone", false, true),
+            row("alsa_input.webcam", "C920 Webcam", None, false, true),
+            row("alsa_input.dock", "Dock Microphone", Some(2), false, true),
         ],
         ..SettingsState::new(settings)
     }
@@ -203,6 +222,21 @@ impl Preview {
             }
             SettingsAction::RemoveMicrophone(row) => {
                 self.state.microphones.remove(*row);
+            }
+            SettingsAction::SetDevicePreset {
+                direction,
+                device,
+                preset,
+            } => {
+                let (rows, presets) = match direction {
+                    DeviceDirection::Output => (&mut self.state.devices, &self.state.presets),
+                    DeviceDirection::Input => {
+                        (&mut self.state.microphones, &self.state.input_presets)
+                    }
+                };
+                if let Some(row) = rows.get_mut(*device) {
+                    row.preset = presets.iter().position(|name| name == preset);
+                }
             }
             SettingsAction::OpenCalibration => self.wizard = Some(self.intro()),
             SettingsAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),

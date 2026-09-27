@@ -300,8 +300,13 @@ under the first. The group backdrop grows to `(10, 40, 419, 384)` and the reset 
 `(20, 444, W, 24·lines)`; every translation's reset button still ends inside the pane. While the
 new checkbox is ticked the priority list stops choosing the device and "Prioritize new output
 devices" is greyed out. The port's Microphone pane carries the microphones' own list, "Input
-Device Preference", twenty points under its last-calibration line: the same ▲ ▼ ✕ rows in 24-point
-height, without preset combos, four rows before it scrolls.
+Device Preference", ten points under its last-calibration line (the pane's rows, checkbox, button
+and lines are all ten points apart): the Audio pane's rows — ▲ ▼, the name, the 150-point preset
+combo and ✕, laid out by the same functions — 32 points tall instead of 40, so that four fit before
+it scrolls. Each row's combo lists the voice presets, shows `"Select preset"` for a microphone that
+remembers none (or a deleted one), and sets that microphone's preset (`SetDevicePreset` for the
+input direction); set on the microphone the input lane is on, it applies at once, as on the Audio
+pane. Its 28-point box sets the text in the combo's small face. No row is selected.
 
 #### Settings exposed by the Audio pane
 
