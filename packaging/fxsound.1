@@ -1015,9 +1015,9 @@ as a command line past the control socket's limit is. With
 .RS 4
 .EX
 busctl \-\-user call org.fxsound.FxSound /org/fxsound/FxSound \e
-    org.fxsound.FxSound SetPreset s Rock
+    org.fxsound.FxSound SetPreset s Music
 busctl \-\-user call org.fxsound.FxSound /org/fxsound/FxSound \e
-    org.fxsound.FxSound Apply as 2 \-\- \-\-preset=Rock \-\-set_effect=bass:7.5
+    org.fxsound.FxSound Apply as 2 \-\- \-\-preset=Music \-\-set_effect=bass:7.5
 busctl \-\-user \-\-auto\-start=no get\-property org.fxsound.FxSound \e
     /org/fxsound/FxSound org.fxsound.FxSound Power
 busctl \-\-user monitor org.fxsound.FxSound
@@ -1215,7 +1215,7 @@ Select a preset and lift the bass on the speakers without opening the window:
 .PP
 .RS 4
 .EX
-fxsound \-\-edit=output \-\-preset=Rock \-\-set_effect=bass:7,ambience:3
+fxsound \-\-edit=output \-\-preset=Music \-\-set_effect=bass:7,ambience:3
 .EE
 .RE
 .PP

@@ -6,15 +6,26 @@ audio through PipeWire.
 
 This is a **fork**, not a wrapper: the Windows application is C++/JUCE talking to a proprietary
 virtual audio driver through WASAPI and COM, none of which exists here. Every layer has been
-re-implemented, but the DSP is ported from the original C rather than reinvented, so presets voiced
-on Windows sound the same here.
+re-implemented, but the DSP is ported from the original C rather than reinvented. Since 0.4.0 it
+also fixes defects that came across with it, so a preset voiced on Windows sounds close to, but not
+exactly, the same here; [the deliberate differences](#deliberate-differences-from-the-windows-build)
+say what changed, and a mode that restores the original behaviour is planned.
 
-> Status: it builds, runs and passes 767 tests, and the audio path has been verified end to end
+It processes what the machine plays and, at the same time, a microphone: each has a lane of its
+own, with its own device and preset, and an application can have a preset of its own on either.
+A running instance answers on the command line, over D-Bus and to compositor keybindings, and
+streams its changes to a status bar.
+
+FxSound for Linux is an independent community project. It is not affiliated with, endorsed by or
+supported by FxSound LLC; please report problems with this port here, not to them.
+
+> Status: it builds, runs and passes 2,930 tests. The audio path has been verified end to end
 > against a live PipeWire session — the virtual sink appears and becomes the session default,
-> applications play through it, processed audio reaches the chosen output device, and picking a
-> microphone instead turns FxSound into a virtual source running [a voice chain of its
-> own](#the-microphone-chain). The interface speaks the desktop's language, using the Windows
-> build's own translation tables. See [Implementation status](#implementation-status).
+> applications play through it, processed audio reaches the chosen output device, and a microphone
+> feeds a virtual source through [a voice chain of its own](#the-microphone-chain). Both lanes at
+> once, the per-application routes and echo cancellation are tested against a private PipeWire
+> daemon. The interface speaks the desktop's language, using the Windows build's own translation
+> tables. See [Implementation status](#implementation-status).
 
 ---
 
@@ -29,13 +40,16 @@ on Windows sound the same here.
 | Registry persistence | — | TOML under `$XDG_CONFIG_HOME`, with the original's key names kept |
 
 The DSP is the exception. `dsp/` in the upstream tree is real C source, and it is ported
-line-by-line: the filter designs, the effect algorithms and their coefficient mappings are
-reproduced exactly, including a handful of quirks that a "cleaner" implementation would break.
+line-by-line: the filter designs, the effect algorithms and their coefficient mappings come from
+the original, and where the original is defective 0.4.0 fixes it rather than copying it (see
+[the deliberate differences](#deliberate-differences-from-the-windows-build)).
 
 ## Requirements
 
 - Rust 1.98.1 (edition 2024)
-- PipeWire 1.0 or newer
+- PipeWire 1.0 or newer, and WirePlumber (or another session manager) to move the session default
+  and applications' streams. Echo cancellation needs PipeWire's WebRTC canceller,
+  `aec/libspa-aec-webrtc`; without it the microphone runs as before and says why.
 - A Wayland compositor. Verified on a 17-check acceptance run across **sway, labwc, river, wayfire,
   KWin, niri and cosmic-comp**, and developed against Hyprland 0.56. X11 works through XWayland but
   is not a target.
@@ -141,6 +155,9 @@ for presets. On an older distribution than Debian 12, build from source instead.
 | `/usr/lib/systemd/user/fxsound.service` | `systemctl --user enable --now fxsound` |
 | `/usr/share/dbus-1/services/org.fxsound.FxSound.service` | starts FxSound, through that unit, for a D-Bus call |
 | `/usr/share/icons/hicolor/*/apps/fxsound.png` | the icon |
+| `/usr/share/icons/hicolor/scalable/status/` | the tray's three status icons |
+| `/usr/share/man/man1/fxsound.1` | the manual page: every option, the status document and the D-Bus interface |
+| `/usr/share/metainfo/com.fxsound.FxSound.metainfo.xml` | what GNOME Software and Discover show |
 | `/usr/share/doc/fxsound-linux/` | the Hyprland rules and the autostart entry |
 | `/usr/share/licenses/fxsound-linux/` | the AGPL, and the licences of the RNNoise code and the Noto faces built into the binary (the `.deb` carries them in `/usr/share/doc/fxsound-linux/copyright`) |
 
@@ -213,6 +230,78 @@ what you are doing. That holds when the keybind is what starts FxSound, too: it 
 (with no tray icon after a few seconds, minimised), and `--view` at a start sets the layout without
 showing the window unless the tray state or `--show` says so.
 
+## Scripts, status bars and D-Bus
+
+A running FxSound can be driven and watched without its window. `man fxsound` has every option, the
+whole status document and the D-Bus interface; what follows is the short version.
+
+Ask a running instance what it is doing, as one JSON document — both lanes, their devices and
+presets, the microphone's readouts, every preset, every device, every band with its range, and the
+applications:
+
+```bash
+fxsound --status --json | jq '.output'
+```
+
+It carries every key the Windows build's `--status` writes, too, so a client written for either
+reads it. For a bar, `fxsound --watch --json` is better than polling that: it stays connected,
+opens with the whole status and prints one JSON object per line as things change — `power`,
+`preset_changed`, `device_changed`, `audio_state`, `notice`, `app_routed` and the rest — until
+FxSound quits. It never starts FxSound. A Waybar module that shows the speakers' preset, or *off*,
+is a few lines of `jq` over it, saved as `~/.config/waybar/fxsound.sh` and made executable:
+
+```sh
+#!/bin/sh
+fxsound --watch --json | jq --unbuffered -c -n '
+  foreach inputs as $e ({on: false, preset: ""};
+    if $e.event == "status" then {on: $e.status.power, preset: ($e.status.output.preset // "")}
+    elif $e.event == "power" then .on = $e.on
+    elif $e.event == "preset_changed" and $e.direction == "output" then .preset = $e.name
+    else . end;
+    if $e.event == "quit" then {text: ""}
+    else {text: (if .on then .preset else "off" end),
+          tooltip: "FxSound: \(.preset)",
+          class: (if .on then "on" else "off" end)} end)'
+```
+
+```jsonc
+"custom/fxsound": {
+    "exec": "~/.config/waybar/fxsound.sh",
+    "return-type": "json",
+    "restart-interval": 5,
+    "on-click": "fxsound --toggle-power",
+    "on-click-right": "fxsound --toggle-window"
+}
+```
+
+The module hides while FxSound is not running, and `restart-interval` picks the stream up again
+once it is. `--meters` adds the microphone's readouts, at most four times a second.
+
+The same commands are a D-Bus interface, `org.fxsound.FxSound` at `/org/fxsound/FxSound` on the
+session bus, for anything that would rather hold a connection than start a process:
+
+```bash
+busctl --user call org.fxsound.FxSound /org/fxsound/FxSound org.fxsound.FxSound SetPreset s Music
+busctl --user call org.fxsound.FxSound /org/fxsound/FxSound org.fxsound.FxSound \
+    Apply as 2 -- --preset=Music --set_effect=bass:7.5
+busctl --user --auto-start=no get-property org.fxsound.FxSound /org/fxsound/FxSound \
+    org.fxsound.FxSound Power
+busctl --user monitor org.fxsound.FxSound
+```
+
+Each method does what its option does — `TogglePower`, `SetPreset`, `SetOutput`, `SetInput`,
+`SetNoiseSuppression`, `SetAppPreset`, `GetStatus` and the rest — and `Apply` runs a whole command
+line and answers with what it printed. Properties carry the power, the edited lane's preset, both
+lanes' devices and the edit direction, and signals say when they change. A call with no FxSound
+running starts it in the tray, through the systemd user unit, so anything that only reads — a bar
+module above all — should ask the bus not to (`busctl --auto-start=no`, or the `NO_AUTO_START`
+flag), or it brings FxSound back seconds after you quit it. The command line keeps to its own socket
+and works without a session bus.
+
+`fxsound --self-test` checks an installation without a display, a session or a sound server —
+presets, settings, both chains run offline, the desktop entry, icons, unit, activation file, man
+page and metainfo — and never touches a running FxSound. Every package's CI job runs it.
+
 ## How the audio path works
 
 ```
@@ -220,9 +309,17 @@ showing the window unless the tray state or `--show` says so.
        │  play into
        ▼
 ┌──────────────────┐     ┌─────────────────────┐     ┌──────────────────┐
-│  FxSound sink    │────►│  DSP engine         │────►│  your real sink  │
+│  FxSound sink    │────►│  music chain        │────►│  your real sink  │
 │  (virtual, ours) │     │  EQ → effects → lim │     │  (you choose it) │
 └──────────────────┘     └─────────────────────┘     └──────────────────┘
+
+┌──────────────────┐     ┌─────────────────────┐     ┌──────────────────┐
+│  your real mic   │────►│  voice chain        │────►│  FxSound source  │
+│  (you choose it) │     │  denoise → … → lim  │     │  (virtual, ours) │
+└──────────────────┘     └─────────────────────┘     └──────────────────┘
+                                                            │  record from
+                                                            ▼
+                                                        your apps
 ```
 
 FxSound publishes its own sink. Everything written there is processed and rendered to whichever real
@@ -230,9 +327,18 @@ device you pick in the app. That is the same shape as the Windows virtual driver
 PipeWire nodes instead of a kernel driver — which also means uninstalling is `pkill fxsound` and
 your audio comes straight back.
 
-Pick a microphone instead and the whole thing reverses: the sink pair comes down and a capture
-stream feeds a virtual source, `FxSound (Input)`, that applications record from. One direction at a
-time, which is what keeps the routing unambiguous.
+A microphone is a second lane beside it, not a switch: a capture stream from the microphone you pick
+runs [the voice chain](#the-microphone-chain) and feeds a virtual source, `FxSound (Input)`, that
+applications record from. Each lane has its own device, preset, nodes and claim on the session
+default, and either can be set to *Off* while the other runs; the one power button covers both.
+
+Neither lane keeps anything awake for nothing. The stream to your speakers sleeps while no
+application plays into FxSound, and the microphone is opened only while something records from
+`FxSound (Input)`, the calibration runs or the Pro view shows the microphone's meters.
+
+The volume the desktop shows for `FxSound (Output)` is kept per output device, so a level set for
+quiet laptop speakers does not come back at full on headphones, and it is applied after the chain
+rather than in front of it, where the volume levelling would win part of a turn-down back.
 
 **It does not take over your default output on its own.** The sink is published with
 `priority.session = 500` so it never wins implicitly, and the default is only claimed when you ask
@@ -279,16 +385,17 @@ make music sound *bigger* — reverberation, a bass lift, a stereo widener — a
 the opposite of what a voice wants. So a microphone gets a chain of its own:
 
 ```
-mic ─► RNNoise ─► high-pass ─► gate ─► 10-band EQ ─► de-esser ─► compressor ─► makeup ─► limiter ─► out
+mic ─► RNNoise ─► de-reverb ─► high-pass ─► gate ─► 10-band EQ ─► de-esser ─► compressor ─► makeup ─► limiter ─► out
 ```
 
 | Stage | What it does |
 |---|---|
-| RNNoise | Recurrent-network denoiser. Off unless the preset asks. ~44 dB off a desk microphone's hum-under-hiss; on undifferentiated white noise, ~1 dB — it separates speech from noise, and white noise gives it nothing to separate |
+| RNNoise | Recurrent-network denoiser. Off unless the preset asks. ~44 dB off a desk microphone's hum-under-hiss; on undifferentiated white noise, ~1 dB — it separates speech from noise, and white noise gives it nothing to separate. Three levels, *Mild*, *Medium* and *Strong*, set how deep it may cut, how hard it holds down what is not a voice and how much of the voice it spares. A stereo microphone is denoised as *Mono*, *Linked stereo* (one analysis, the same mask on both sides, so the talker stays where they are) or *Independent* |
+| De-reverb | Suppresses a bare room's late reverberation, *Mild*, *Medium* or *Strong*. Off unless the preset or Settings asks |
 | High-pass | Butterworth, 2nd or 4th order. Desk rumble and plosives sit ten to twenty dB above the voice below 150 Hz; left in, they hold the gate open through every pause |
-| Gate | Downward expander with a threshold, a ratio, a floor, hold, and peak or RMS detection — it turns the room down rather than switching it off |
+| Gate | Downward expander with a threshold, a ratio, a floor, hold, and peak or RMS detection — it turns the room down rather than switching it off. A preset can also hold it open on RNNoise's voice probability, so a quiet consonant gets through and a keyboard does not |
 | Equalizer | The same graphic EQ the output chain uses, ten bands unless you pick five to 31 |
-| De-esser | Split-band, fourth-order Linkwitz–Riley crossover, acting only on the high band |
+| De-esser | Split-band, fourth-order Linkwitz–Riley crossover, acting only on the high band. *Adaptive* takes the band from what the microphone really carries — a 16 kHz Bluetooth headset has nothing above 8 kHz — and stands aside where there is no sibilance band at all |
 | Compressor | Threshold, ratio, soft knee, attack, release, peak or RMS detection |
 | Makeup | Applied after everything that measures, so a preset's thresholds mean what they say |
 | Limiter | 1 ms look-ahead, linked across the channels with a 20 ms hold, always running. It is the only stage that cannot be switched off: makeup gain is the one control here that can push a sample past full scale |
@@ -297,18 +404,39 @@ The order is not a preference — each position is argued, with its reason, at t
 [`crates/fxsound-dsp/src/input/chain.rs`](crates/fxsound-dsp/src/input/chain.rs). Denoising goes
 first because everything below it measures a level. The gate goes before the equalizer so that what
 it measures is the microphone and not the preset's own presence lift. The de-esser goes before the
-compressor, because a compressor in front would ride the sibilant and duck the word behind it.
+compressor, because a compressor in front would ride the sibilant and duck the word behind it. A
+voice preset may still name another order, `chain = "podcast"`, `"broadcast"` or `"streaming"`, each
+argued in [`crates/fxsound-dsp/src/input/processor.rs`](crates/fxsound-dsp/src/input/processor.rs).
 
-Added latency is the limiter's 1 ms, plus RNNoise's 10 ms when it is on. Both are published to
-PipeWire and kept current, so a recording application is never told a figure that has since changed.
-The capture stream asks for 48 kHz whatever the microphone runs at — RNNoise exists at 48 kHz and
-nowhere else — so a voice preset means one thing on every device.
+**Echo cancellation** is PipeWire's own WebRTC canceller, loaded into FxSound: the microphone and
+what the speakers actually play go in, and the voice chain records from the echo-cancelled result,
+so a call on speakers does not hear itself. It runs only while something records from
+`FxSound (Input)`, and if the WebRTC module is missing the microphone keeps working and the window
+says so.
+
+Added latency is the limiter's 1 ms, plus 20 ms for RNNoise and 10 ms for the de-reverb while they
+run. All of it is published to PipeWire and kept current, so a recording application is never told a
+figure that has since changed. The capture stream asks for 48 kHz whatever the microphone runs at —
+RNNoise exists at 48 kHz and nowhere else — so a voice preset means one thing on every device.
+
+**Settings ▸ Microphone** holds what is not a preset: the noise-suppression level and the
+denoiser's channels, each either *Preset* or one choice that every voice preset then runs at; the
+de-esser mode and de-reverb, which can ask for more than a preset does but never less; echo
+cancellation; the calibration; and the microphones' priority list, each with its own voice preset.
+`--noise-suppression` sets the level from a script.
+
+**Calibrate microphone…** on that page listens to the microphone before the chain touches it:
+three seconds of the room, five of normal speech and two of loud speech. From the floor, the level
+and the peaks it proposes a high-pass, a gate, a compressor, makeup, a ceiling and a
+noise-suppression level, and *Apply* saves them as a voice preset of the microphone's own, named
+after it. A Bluetooth headset is woken into its headset profile first, and the room is timed only
+once it sends sound.
 
 ### Voice presets
 
-Ten ship, in TOML rather than `.fac`: a `.fac` is a byte-for-byte contract with the Windows build
-and has nowhere to put a gate threshold. A stage that is switched off has no table in the file, so
-there is no way to ship a full set of numbers that nothing reads.
+Thirteen ship, in TOML rather than `.fac`: a `.fac` is a byte-for-byte contract with the Windows
+build and has nowhere to put a gate threshold. A stage that is switched off has no table in the
+file, so there is no way to ship a full set of numbers that nothing reads.
 
 | Preset | For |
 |---|---|
@@ -322,11 +450,16 @@ there is no way to ship a full set of numbers that nothing reads.
 | Studio | Recording into a DAW: one gentle compressor and nothing else |
 | Bright Voice | For a dull or chesty voice: presence and air lifted, the low end eased |
 | Warm Voice | For a thin or distant-sounding microphone: chest added, presence eased back |
+| Gaming Headset | A gaming headset's boom with a keyboard and fans behind it: denoised in linked stereo, gated on the voice, the adaptive de-esser, kept bright |
+| Noisy Room | An open room with a fan or traffic in it: the denoiser at full strength, then a gate that only hears the voice |
+| Mechanical Keyboard | A desk microphone beside a clicky keyboard: a fast peak gate between words, the denoiser at full strength |
 
-The picker shows the voice set in front of a microphone and the `.fac` set in front of a speaker, and
-never mixes them. Your choice is remembered **per direction**, so a preset picked for a microphone
-does not follow you back to your speakers. The reasoning behind every number in these files is in
-`docs/input-presets-decision.md`.
+The picker shows the voice set in front of a microphone and the `.fac` set in front of a speaker,
+and never mixes them. Your choice is remembered **per direction**, so a preset picked for a
+microphone does not follow you back to your speakers. Voice presets are edited, saved, renamed,
+deleted, imported and exported like the `.fac` ones, and yours live in
+`~/.local/share/fxsound/presets/Input/`. The reasoning behind every number in the shipped files is
+in `docs/input-presets-decision.md`.
 
 It is also remembered **per device**, in both directions: every output keeps the `.fac` preset and
 every microphone the voice preset it was last used with, and brings it back whenever FxSound moves
@@ -338,11 +471,14 @@ ahead of time; set on the device in use, it takes over at once. A renamed preset
 with it; a device whose preset was deleted shows *Select preset* and keeps whatever the lane is
 running when it comes back.
 
-While a microphone is selected the window says so rather than pretending: the five effect sliders are
-drawn disabled with the reason underneath, the chain's stages read out along the bottom of the panel,
-and an equalizer band the device's sample rate cannot carry is struck through instead of left looking
-live. Turned over, the effect column shows only what the voice chain has: the band count, the filter
-width, and the preset's makeup gain in the master gain's place.
+While a microphone is selected the window says so rather than pretending: the five effect sliders
+are drawn disabled with the reason underneath, and an equalizer band the device's sample rate cannot
+carry is struck through instead of left looking live. Along the bottom of the panel the chain reads
+out live — the denoiser's reduction, the noise floor, the voice probability, echo cancellation,
+de-reverb, the gate, the compressor and the de-esser — and a stage with nothing to report reads
+*off*, a dash, or *unavailable* with the reason, never a stale number. Turned over, the effect
+column shows only what the voice chain has: the band count, the filter width, and the preset's
+makeup gain in the master gain's place.
 
 ## Presets
 
@@ -354,9 +490,10 @@ directions between this port and the Windows build.
 |---|---|
 | Factory presets | `/usr/share/fxsound/presets/Factsoft/`, `BonusPresets/` |
 | Voice presets | `/usr/share/fxsound/presets/Input/` |
-| Your presets | `~/.local/share/fxsound/presets/` |
+| Your presets | `~/.local/share/fxsound/presets/`, voice presets under `Input/` |
 | Unsaved edits | `~/.local/share/fxsound/presets/AutoSave/` |
 | Settings | `~/.config/fxsound/settings.toml` |
+| Applications and their presets | `~/.config/fxsound/apps.toml` |
 
 The flip button at the top of the effect column turns it over to the equalizer's own controls, as in
 the original since 1.2.12: the band count, the master gain, the volume leveling, the filter width,
@@ -420,10 +557,58 @@ file it points to is the one replaced. A link to a read-only file, or to one in 
 not write, is never saved through, so every save of that file fails. home-manager's default links
 into the Nix store are such links; link the file with `mkOutOfStoreSymlink` to let FxSound save it.
 
+## A preset per application
+
+Every application that plays or records through FxSound is remembered, and each can have a preset of
+its own on either lane: a game on *Gaming*, a browser on *Volume Boost*, a voice chat's microphone
+on *Headset*, all at the same time. One chain cannot run two presets at once, so FxSound gives such
+an application a pair of nodes of its own on the same device, `FxSound (Output) · Gaming` for one,
+running its preset, and moves the application's stream onto it the way a volume mixer moves a stream
+— through the stream's target in PipeWire's `default` metadata, which WirePlumber honours. The rest
+of the session keeps the lane's preset. Up to four presets of one lane run this way at a time; an
+application past that stays on the lane's preset, and the window says so.
+
+**Settings ▸ Applications** lists every application FxSound has seen, the ones running now first,
+each with a preset combo for what it plays, what it records, or both; *FxSound's preset* has it
+follow the lane again, and the ✕ forgets it. The Pro view's preset combo says on hover which
+applications are running on presets of their own. From a script:
+
+```bash
+fxsound --app-preset='bf6.exe=Gaming' --app-preset='firefox=Volume Boost' \
+    --app-input-preset='com.discordapp.Discord=Headset'
+fxsound --app-preset='firefox=default'     # back to the lane's preset
+fxsound --list-apps
+```
+
+An application is named by its Flatpak id, its program or the name it gives itself, and one FxSound
+has never seen gets its preset the first time it plays. D-Bus has the same as `SetAppPreset` and
+`ListApps`, and `--watch` reports every move as `app_routed`. The choices live in
+`~/.config/fxsound/apps.toml`, which keeps the 500 applications heard most recently, forgetting
+those that only follow the lanes first.
+
+With the power off none of them is moved: every application plays and records through the system's
+default devices, and power on takes them back onto their presets. A stream you move by hand onto
+one of these nodes is moved back to where its application's preset puts it — give it a preset
+instead — while a stream moved anywhere else, or a recorder pointed at such a node's monitor, stays
+where you put it.
+
 ## Deliberate differences from the Windows build
 
 Each of these is a considered decision, not an oversight:
 
+- **The sound is not quite the Windows build's.** Since 0.4.0 defects of the original DSP are fixed
+  rather than reproduced, so a preset plays close to, not exactly, as it does on Windows. Bass
+  driven into the limiter comes out clean: the limiter holds its gain for 20 ms and moves the
+  channels together, where it breathed within each bass cycle — up to 18.6 % distortion on a limited
+  bass tone with the shipped presets, at most 0.016 % now — and dragged the stereo image towards the
+  other side. Loud, finished masters play 1.4 to 3.5 LU quieter for it, because the limiter no
+  longer squeezes the bass into loudness. Dynamic Boost at 0 lifts nothing and judges loudness from
+  both front channels; the volume levelling keeps deep bass clean, reacts at one speed whatever
+  buffer size PipeWire runs at and lifts the subwoofer too; the balance on 5.1 and 7.1 turns down a
+  whole side; an effect or band switched back on starts clean; the twenty-band equalizer's bands sit
+  every half octave; and a slider, a preset change or the EQ switch glides over about 20 ms instead
+  of clicking. No shipped preset was re-voiced, and each genre preset still ranks where it did for
+  its genre.
 - **No update check and no telemetry.** Nothing contacts the network; updates come from your package
   manager. The Windows keys for the update check, the hotkey chords, the window position and
   always-on-top are read from an older `settings.toml` without complaint and no longer written back.
@@ -523,11 +708,12 @@ Each of these is a considered decision, not an oversight:
   are cleared before they are unmuted, as the Windows build does from its suspend notification. It
   never holds a sleep inhibitor, as the Windows build decided too; without a system bus it simply
   does not listen.
-- **Input mode is a different processor, not the same one pointed elsewhere.** The device list is
-  split into *Output* and *Input* sections. Choosing a microphone tears the sink pair down, builds a
-  capture stream feeding a virtual source, `FxSound (Input)`, which becomes the default microphone,
-  and runs [the voice chain](#the-microphone-chain) rather than applying reverberation and a bass
-  lift to someone's speech. Choosing an output again reverses it.
+- **A microphone gets a processor of its own, beside the speakers'.** The Windows build has no input
+  processing at all. Here the device lists are split into *Output* and *Input*, and choosing a
+  microphone builds a second lane — a capture stream feeding a virtual source, `FxSound (Input)`,
+  which becomes the default microphone — running [the voice chain](#the-microphone-chain) rather
+  than applying reverberation and a bass lift to someone's speech. The speakers' lane keeps running;
+  either lane can be set to *Off* on its own.
 - **System-visible names follow the system locale.** The node descriptions shown by pavucontrol and
   desktop volume widgets are `FxSound (Вывод)` / `FxSound (Ввод)` on a Russian desktop,
   `FxSound (Ausgabe)` / `FxSound (Eingabe)` on a German one, and so on for the thirteen languages
@@ -546,12 +732,13 @@ past the rule.
 
 | Component | Tests | State |
 |---|---:|---|
-| `fxsound-core` — shared types, scales, settings, translations | 36 | complete |
-| `fxsound-preset` — `.fac` reader/writer, TOML voice presets, preset store | 22 | complete |
-| `fxsound-dsp` — biquads, graphic EQ, five effects, limiter, leveller, spectrum, engine, voice chain | 251 | complete |
-| `fxsound-ui` — palettes, geometry, assets, widgets, views, dialogs | 281 | complete |
-| `fxsound-audio` — PipeWire backend, output and input modes | 57 | complete, verified on a live PipeWire 1.6 session |
-| `fxsound-app` — controller, CLI, IPC, tray, notifications, window shell | 120 | complete |
+| `fxsound-core` — shared types, scales, settings, the application store, translations | 232 | complete |
+| `fxsound-preset` — `.fac` reader/writer, TOML voice presets, preset stores, the trash | 108 | complete |
+| `fxsound-dsp` — biquads, graphic EQ, five effects, limiter, leveller, spectrum, engine, voice chain | 505 | complete |
+| `fxsound-rnnoise` — RNNoise, vendored from `nnnoiseless`, with an in-place reset and its band gains exposed | 15 | complete |
+| `fxsound-ui` — palettes, geometry, assets, widgets, views, dialogs | 568 | complete |
+| `fxsound-audio` — PipeWire backend: two lanes, per-application routes, echo cancellation | 616 | complete, verified on a live PipeWire 1.6 session; its graph tests run a private daemon |
+| `fxsound-app` — controller, CLI, IPC, D-Bus, event stream, tray, notifications, window shell | 886 | complete |
 
 Verified end to end: the window opens on Wayland at the original's exact geometry, a preset loads
 from disk and drives both the sliders and the equalizer curve, the Settings pane opens, the CLI
@@ -563,8 +750,15 @@ the chosen output device. Verified on Hyprland 0.56 as well: the window survives
 workspace without tripping the compositor's "not responding" watchdog (the control socket keeps
 answering while the surface is unmapped), ✕ / minimise / `killactive` hide to the tray and
 `fxsound --show` brings a fresh, fully painted window back, the hamburger menu opens with the
-original's items, and switching to the microphone and back moves the session default source to
-**FxSound (Input)** and restores it afterwards.
+original's items, and picking a microphone moves the session default source to **FxSound (Input)**
+and hands it back afterwards.
+
+The audio crate's graph tests start a PipeWire daemon of their own, with synthetic speakers and a
+microphone, and watch it from outside with `pw-dump` and `pw-metadata`: both lanes' nodes at once
+and a tone through each reaching only its own, a lane detached on its own, both defaults taken and
+handed back, the speakers sleeping while nothing plays, the echo canceller put in front of the
+microphone and holding nothing awake while nothing records, a headset's sink vanishing through a
+profile switch and linked again, and the priority list choosing the device.
 
 Beyond Hyprland, a 17-check acceptance run — window, tray, control socket, node publication,
 default claim and hand-back — passes on **sway, labwc, river, wayfire, KWin, niri and cosmic-comp**,
@@ -585,6 +779,15 @@ dimmed backdrop, and the window grows to fit it. Worth re-testing against the wg
 against a Mesa driver before calling it an upstream bug.
 
 ## Documentation
+
+`man fxsound` ([`packaging/fxsound.1`](packaging/fxsound.1) in the tree, `man -l
+packaging/fxsound.1` to read it there) is the reference for using it: every option and its exit
+status, the `--status --json` document key by key, the `--watch` events, the D-Bus methods,
+properties and signals, and the files FxSound reads and writes.
+
+`docs/0.4.0-design.md`, `docs/0.4.0-upstream.md` and `docs/0.4.0-apps.md` record how 0.4.0 was
+built: the two lanes, the voice chain's new stages, D-Bus and the event stream; what was taken from
+the Windows build's own later releases; and the per-application presets.
 
 `docs/spec/` holds the reverse-engineering specification this port was written against — roughly
 20,000 lines covering every subsystem of the original, with citations down to the source line. It is
@@ -612,4 +815,5 @@ not itself a licence to redistribute.
 
 FxSound is by [FxSound LLC](https://www.fxsound.com), with major DSP contributions from
 [Theremino](https://www.theremino.com). This port would not be possible without their decision to
-open the source.
+open the source. It is an independent community project, not affiliated with, endorsed by or
+supported by FxSound LLC.
