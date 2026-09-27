@@ -484,6 +484,14 @@ pub(crate) struct PropsUpdate {
     /// that carries `params` names only the settings it changes, and one that changes some other
     /// setting reads here as `Some(false)`, an adapter that does not clamp.
     pub(crate) clamped: Option<bool>,
+    /// Whether the object carries `softVolumes`: the volumes the adapter derives and applies
+    /// itself, which only its own whole `Props` list. A desktop's write carries what it sets —
+    /// `channelVolumes`, `mute`, now and then a setting in `params` — and never them.
+    ///
+    /// PipeWire 1.0's adapter also hands its whole `Props` to the stream it wraps when it sets
+    /// itself up, as if they were written to it: at unity, before the engine has written the
+    /// volume the pair starts at (`take_props` in `crate::engine`, which leaves them alone).
+    pub(crate) whole: bool,
 }
 
 impl PropsUpdate {
@@ -503,6 +511,7 @@ impl PropsUpdate {
             channel_volumes: prop(libspa::sys::SPA_PROP_channelVolumes).and_then(float_array),
             mute: prop(libspa::sys::SPA_PROP_mute).and_then(|value| value.get_bool().ok()),
             clamped: prop(libspa::sys::SPA_PROP_params).and_then(clamped),
+            whole: prop(libspa::sys::SPA_PROP_softVolumes).is_some(),
         })
     }
 }
@@ -887,6 +896,50 @@ mod tests {
         assert_eq!(update.mute, Some(false));
         assert_eq!(update.channel_volumes, Some(vec![0.1; 6]));
         assert_eq!(update.clamped, None, "no params, no opinion on the clamp");
+    }
+
+    #[test]
+    fn only_an_object_that_lists_the_soft_volumes_is_the_adapters_whole_props() {
+        let slider = pod_of(vec![property(
+            libspa::sys::SPA_PROP_channelVolumes,
+            Value::ValueArray(ValueArray::Float(vec![0.25, 0.25])),
+        )]);
+        assert!(!parse(&slider).expect("a Props object").whole);
+        // A slider's write that sets one of the adapter's settings as well is still a write.
+        let with_params = pod_of(vec![
+            property(
+                libspa::sys::SPA_PROP_channelVolumes,
+                Value::ValueArray(ValueArray::Float(vec![0.25, 0.25])),
+            ),
+            params(vec![
+                Value::String("monitor.channel-volumes".to_owned()),
+                Value::Bool(false),
+            ]),
+        ]);
+        assert!(!parse(&with_params).expect("a Props object").whole);
+        // What PipeWire 1.0's adapter hands the stream as it sets itself up: everything, at unity.
+        let adapter = pod_of(vec![
+            property(libspa::sys::SPA_PROP_volume, Value::Float(1.0)),
+            property(libspa::sys::SPA_PROP_mute, Value::Bool(false)),
+            property(
+                libspa::sys::SPA_PROP_channelVolumes,
+                Value::ValueArray(ValueArray::Float(vec![1.0; 8])),
+            ),
+            property(libspa::sys::SPA_PROP_softMute, Value::Bool(false)),
+            property(
+                libspa::sys::SPA_PROP_softVolumes,
+                Value::ValueArray(ValueArray::Float(vec![1.0; 8])),
+            ),
+            params(vec![
+                Value::String(MIN_VOLUME_KEY.to_owned()),
+                Value::Float(1.0),
+                Value::String(MAX_VOLUME_KEY.to_owned()),
+                Value::Float(1.0),
+            ]),
+        ]);
+        let update = parse(&adapter).expect("a Props object");
+        assert!(update.whole);
+        assert_eq!(update.channel_volumes, Some(vec![1.0; 8]));
     }
 
     #[test]
@@ -1326,6 +1379,7 @@ Audio/Sink:application.id:com.fxsound.FxSound=\\s{\"channelVolumes\":[0.2,\\t0.2
             channel_volumes: Some(vec![0.5, 0.5]),
             mute: Some(false),
             clamped: None,
+            whole: false,
         };
         assert!(!lane.update(&echo), "the engine's own write coming back");
         assert_eq!(lane.changes(), built);

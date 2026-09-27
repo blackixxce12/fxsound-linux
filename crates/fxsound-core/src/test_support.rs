@@ -177,6 +177,12 @@ impl Guarded {
         self.child.stdin.as_mut()
     }
 
+    /// The child's standard input, when it was piped and has not been taken yet: for a thread of
+    /// its own to feed, which finds the pipe broken once the child has been killed.
+    pub fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
     /// The child's standard output, when it was piped and has not been taken yet.
     pub fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.stdout.take()
@@ -215,6 +221,47 @@ impl Guarded {
         Ok(status)
     }
 
+    /// What became of the child, for the message of a test that gave up on it: how it ended —
+    /// waiting a moment for that — or that it is still running, and then the end of what it wrote
+    /// to `stderr`, the file [`log_to`] sent its standard error to. A tool that "could not run"
+    /// says why here, where a message that it never appeared says nothing.
+    pub fn account(&mut self, stderr: Option<&Path>) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let ended = loop {
+            match self.try_wait() {
+                Ok(Some(status)) => break format!("it exited with {status}"),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(None) => break "it is still running".to_owned(),
+                Err(error) => break format!("its status could not be read: {error}"),
+            }
+        };
+        let Some(stderr) = stderr else {
+            return ended;
+        };
+        match std::fs::read(stderr) {
+            Ok(bytes) if bytes.iter().all(u8::is_ascii_whitespace) => {
+                format!("{ended}, and wrote nothing to its standard error")
+            }
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let lines: Vec<&str> = text.lines().collect();
+                let tail = &lines[lines.len().saturating_sub(STDERR_LINES)..];
+                format!(
+                    "{ended}; its standard error{}:\n    {}",
+                    if tail.len() < lines.len() {
+                        format!(", the last {STDERR_LINES} lines")
+                    } else {
+                        String::new()
+                    },
+                    tail.join("\n    ")
+                )
+            }
+            Err(error) => format!("{ended}; {} could not be read: {error}", stderr.display()),
+        }
+    }
+
     /// Kill the watchdog, once the child it watches has been waited for and its id is free.
     fn retire_watchdog(&mut self) {
         if let Some(mut watchdog) = self.watchdog.take() {
@@ -230,6 +277,16 @@ impl Drop for Guarded {
         let _ = self.child.wait();
         self.retire_watchdog();
     }
+}
+
+/// How much of a child's standard error [`Guarded::account`] quotes.
+const STDERR_LINES: usize = 40;
+
+/// A standard error for a child that goes to a new file at `path`, for [`Guarded::account`] to
+/// quote; nowhere, when the file cannot be made.
+#[must_use]
+pub fn log_to(path: &Path) -> Stdio {
+    std::fs::File::create(path).map_or_else(|_| Stdio::null(), Stdio::from)
 }
 
 /// `setpriv`, when it is installed and knows `--pdeathsig` (util-linux 2.33 and later). Asked once.
@@ -450,6 +507,30 @@ mod tests {
         assert!(unwound.is_err());
         let pids = receiver.recv().expect("the ids");
         assert_eq!(still_sleeping_after(&pids, Duration::ZERO), []);
+    }
+
+    #[test]
+    fn a_child_that_failed_is_accounted_for_with_its_status_and_its_standard_error() {
+        let dir = ScratchDir::new("account");
+        let log = dir.join("stderr");
+        let mut failing = command("sh");
+        failing
+            .args(["-c", "echo 'no such option: --raw' >&2; exit 3"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log_to(&log));
+        let mut failing = spawn(failing).expect("sh");
+        let account = failing.account(Some(&log));
+        assert!(account.contains("exit status: 3"), "{account}");
+        assert!(account.contains("no such option: --raw"), "{account}");
+
+        let mut quiet = command("sleep");
+        quiet.arg("600").stderr(log_to(&dir.join("quiet")));
+        let mut quiet = spawn(quiet).expect("sleep");
+        let account = quiet.account(Some(&dir.join("quiet")));
+        assert!(account.contains("still running"), "{account}");
+        assert!(account.contains("nothing"), "{account}");
+        assert!(quiet.account(None).contains("still running"));
     }
 
     #[test]

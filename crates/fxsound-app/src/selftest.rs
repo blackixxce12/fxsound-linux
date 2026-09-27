@@ -745,7 +745,13 @@ fn check_dbus_service(path: &Path, binary: &Path) -> Check {
     }
 }
 
-/// `fxsound.1`, compressed or not — every distribution but the tarball gzips it.
+/// `fxsound.1`, compressed or not — every distribution but the tarball compresses it (gzip for
+/// Debian, Ubuntu and Arch, others may use zstd, xz or bzip2), so any `fxsound.1.<suffix>` counts.
+///
+/// A page that is not there is a failure even where the system chose that: the minimal images of
+/// Ubuntu (dpkg `path-exclude`), Arch (pacman `NoExtract`) and Fedora (dnf `tsflags=nodocs`) drop
+/// every manual page a package ships. The detail says so, because from inside such an image a
+/// correct package and a package without its page look the same.
 fn check_man_page(dir: &Path) -> Check {
     const NAME: &str = "man_page";
     let found = std::fs::read_dir(dir).ok().and_then(|entries| {
@@ -760,7 +766,15 @@ fn check_man_page(dir: &Path) -> Check {
     });
     match found {
         Some(path) => Check::ok(NAME, path.display().to_string()),
-        None => Check::fail(NAME, format!("missing: {}/fxsound.1", dir.display())),
+        None => Check::fail(
+            NAME,
+            format!(
+                "missing: no fxsound.1 or fxsound.1.* in {} (a system set not to install manual \
+                 pages — dpkg path-exclude, pacman NoExtract, dnf tsflags=nodocs, as container \
+                 images are — has none)",
+                dir.display()
+            ),
+        ),
     }
 }
 
@@ -1098,6 +1112,44 @@ pub(crate) mod tests {
         assert_eq!(check_man_page(&dir).status, Status::Ok);
         // A page for something else is not ours.
         fs::rename(dir.join("fxsound.1"), dir.join("fxsoundx.1")).expect("rename");
+        assert_eq!(check_man_page(&dir).status, Status::Fail);
+    }
+
+    #[test]
+    fn every_compressed_man_page_counts() {
+        let (tmp, _env) = installed();
+        let dir = tmp.path().join(MAN_DIR);
+        let mut current = dir.join("fxsound.1.gz");
+        for name in [
+            "fxsound.1.zst",
+            "fxsound.1.xz",
+            "fxsound.1.bz2",
+            "fxsound.1.gz",
+        ] {
+            let next = dir.join(name);
+            fs::rename(&current, &next).expect("rename");
+            let check = check_man_page(&dir);
+            assert_eq!(check.status, Status::Ok, "{name}: {}", check.detail);
+            assert_eq!(check.detail, next.display().to_string());
+            current = next;
+        }
+    }
+
+    #[test]
+    fn a_missing_man_page_says_what_was_looked_for() {
+        let (tmp, _env) = installed();
+        let dir = tmp.path().join(MAN_DIR);
+        fs::remove_file(dir.join("fxsound.1.gz")).expect("remove");
+        let check = check_man_page(&dir);
+        assert_eq!(check.status, Status::Fail);
+        assert!(check.detail.starts_with("missing: "), "{}", check.detail);
+        assert!(
+            check.detail.contains("fxsound.1.*") && check.detail.contains(&*dir.to_string_lossy()),
+            "{}",
+            check.detail
+        );
+        // No man1 directory at all, as in an image that installs no manual pages: the same.
+        fs::remove_dir(&dir).expect("remove the directory");
         assert_eq!(check_man_page(&dir).status, Status::Fail);
     }
 
