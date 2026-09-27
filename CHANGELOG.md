@@ -328,6 +328,10 @@ All notable changes to the FxSound Linux port. The format follows
   FxSound" to "Preset von FxSo…"; it reads "Wie FxSound".
 - The Russian question before exporting over several existing preset files read "2 файлов
   шаблонов…", the number before a noun it does not agree with; it now gives the number at the end.
+- A binary installed under `/usr/local`, as the tarball installs it, took the factory and voice
+  presets a distribution package had left under `/usr` before its own, so beside an older package
+  it listed that release's copies, older genre voicings among them; each binary now looks under
+  its own prefix first.
 
 ### Removed
 - The tray's *Always On Top* item, which winit cannot honour on Wayland.

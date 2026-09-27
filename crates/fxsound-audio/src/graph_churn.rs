@@ -1173,6 +1173,11 @@ const CHILD_HALF: &str = "FXSOUND_GRAPH_CHILD_HALF";
 /// binary's. It starts a private PipeWire, a `pw-record` recording from it and a private
 /// `dbus-daemon`, says which processes they are and where their directory is, and then does what
 /// [`CHILD_HALF`] says — panics, or waits a minute to be killed. Without it, it passes at once.
+///
+/// Before it panics it waits for a line on its standard input, which [`graph_child_half`] writes
+/// once it has read the daemons' start times. Panicking straight away raced that reading: on a
+/// loaded machine the unwinding had already stopped the daemons, and the parent found nothing to
+/// take a start time from. A standard input that is not a pipe ends at once and does not hold it.
 #[test]
 fn the_child_half_starts_its_daemons_and_then_panics_or_waits() {
     let Some(then) = std::env::var_os(CHILD_HALF) else {
@@ -1189,6 +1194,9 @@ fn the_child_half_starts_its_daemons_and_then_panics_or_waits() {
         graph.dir.display()
     );
     std::io::stdout().flush().expect("the ids are out");
+    if then == "panic" {
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
     assert_ne!(then, "panic", "on purpose, with the daemons still running");
     std::thread::sleep(Duration::from_secs(60));
 }
@@ -1260,7 +1268,7 @@ fn graph_child_half(then: &str) -> Option<ChildHalf> {
     process
         .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
         .env(CHILD_HALF, then)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut process = support::spawn(process).expect("the child half");
@@ -1279,6 +1287,10 @@ fn graph_child_half(then: &str) -> Option<ChildHalf> {
         .into_iter()
         .map(|pid| (pid, started_at(pid).expect("a daemon the child half runs")))
         .collect();
+    // Noted: a child half that is to panic may now.
+    let stdin = process.stdin().expect("piped");
+    writeln!(stdin).expect("the child half reads its standard input");
+    stdin.flush().expect("the line is out");
     Some(ChildHalf {
         process,
         started,

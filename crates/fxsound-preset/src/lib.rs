@@ -183,6 +183,38 @@ pub fn new_preset_name(name: &str) -> String {
     name
 }
 
+/// The two prefixes an installed FxSound's presets are looked for under — only these, see the
+/// manual page's FILES — in their usual order.
+const INSTALL_PREFIXES: [&str; 2] = ["/usr", "/usr/local"];
+
+/// Where an installed FxSound keeps its shared presets, `<prefix>/share/fxsound`, in the order the
+/// stores search them: the prefix the running binary is installed under first, then the other.
+///
+/// The order decides which copy a binary gets when both prefixes hold presets — a distribution
+/// package under `/usr` and the tarball under `/usr/local`, say. A factory preset found in two
+/// directories is listed from the first ([`Store`]), and so is a voice preset, so with `/usr`
+/// always first a 0.4.0 binary under `/usr/local` ran with an older package's revoiced genre
+/// presets and voice presets instead of its own. A binary under neither prefix — the source tree,
+/// or a tarball unpacked elsewhere — keeps the usual order.
+#[must_use]
+pub fn install_data_dirs() -> Vec<std::path::PathBuf> {
+    install_data_dirs_for(std::env::current_exe().ok().as_deref())
+}
+
+/// [`install_data_dirs`] for a binary at `exe`.
+fn install_data_dirs_for(exe: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
+    use std::path::Path;
+    // `<prefix>/bin/fxsound`: the prefix is two above the executable.
+    let own = exe.and_then(Path::parent).and_then(Path::parent);
+    let mut prefixes = INSTALL_PREFIXES.map(Path::new);
+    // Stable, so the prefix that is not the binary's keeps its place behind it.
+    prefixes.sort_by_key(|prefix| Some(*prefix) != own);
+    prefixes
+        .into_iter()
+        .map(|prefix| prefix.join("share/fxsound"))
+        .collect()
+}
+
 /// Parse a `.fac` file.
 ///
 /// `bytes` rather than `&str` because the name line is raw UTF-8 written by a narrow `fprintf`
@@ -1031,5 +1063,47 @@ Band 10
             "fits fgets(…, 128, …) with its newline"
         );
         assert_eq!(parse(text.as_bytes()).expect("reparse").name, cut);
+    }
+
+    fn data_dirs_for(exe: &str) -> Vec<std::path::PathBuf> {
+        install_data_dirs_for(Some(std::path::Path::new(exe)))
+    }
+
+    #[test]
+    fn a_binary_under_usr_local_takes_its_own_presets_before_a_packages_under_usr() {
+        // The tarball's binary beside a distribution package: the package's presets may be an
+        // older release's, and the first directory's copy of a name is the one listed.
+        assert_eq!(
+            data_dirs_for("/usr/local/bin/fxsound"),
+            ["/usr/local/share/fxsound", "/usr/share/fxsound"].map(std::path::PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn a_binary_under_usr_takes_its_own_presets_before_those_under_usr_local() {
+        assert_eq!(
+            data_dirs_for("/usr/bin/fxsound"),
+            ["/usr/share/fxsound", "/usr/local/share/fxsound"].map(std::path::PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn a_binary_under_neither_prefix_searches_usr_then_usr_local() {
+        for exe in [
+            "/home/someone/fxsound-linux/target/release/fxsound",
+            "/opt/fxsound/bin/fxsound",
+            "fxsound",
+        ] {
+            assert_eq!(
+                data_dirs_for(exe),
+                ["/usr/share/fxsound", "/usr/local/share/fxsound"].map(std::path::PathBuf::from),
+                "{exe}"
+            );
+        }
+        assert_eq!(
+            install_data_dirs_for(None),
+            ["/usr/share/fxsound", "/usr/local/share/fxsound"].map(std::path::PathBuf::from),
+            "no executable path to go by"
+        );
     }
 }

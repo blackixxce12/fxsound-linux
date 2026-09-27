@@ -1086,8 +1086,13 @@ Only
 .I /usr
 and
 .I /usr/local
-are searched for these directories. An install under any other prefix starts
-with an empty preset list.
+are searched for these directories, the one the binary is installed under
+first: a binary under
+.I /usr/local
+uses the presets installed with it even where a distribution package has left
+others, perhaps an older release's, under
+.IR /usr .
+An install under any other prefix starts with an empty preset list.
 .TP
 .I ~/.local/share/fxsound/presets/
 Imported and user-saved presets; voice presets under

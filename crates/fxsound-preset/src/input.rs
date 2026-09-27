@@ -419,7 +419,8 @@ impl InputPreset {
         Ok(presets)
     }
 
-    /// Every directory a shipped voice preset could be in, source tree first.
+    /// Every directory a shipped voice preset could be in, source tree first, then the install
+    /// prefixes with the binary's own first ([`crate::install_data_dirs`]).
     ///
     /// The same search order `PresetStore::with_default_dirs` uses, and for the same reason: a
     /// developer running out of `target/release` must get the presets in the working tree, not the
@@ -435,8 +436,8 @@ impl InputPreset {
         {
             dirs.push(root.join("assets/presets/Input"));
         }
-        for prefix in ["/usr/share/fxsound", "/usr/local/share/fxsound"] {
-            dirs.push(Path::new(prefix).join("presets/Input"));
+        for data in crate::install_data_dirs() {
+            dirs.push(data.join("presets/Input"));
         }
         dirs
     }

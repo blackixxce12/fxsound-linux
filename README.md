@@ -125,7 +125,9 @@ tar xf dist/fxsound-linux-0.4.0-x86_64.tar.gz
 sudo ./fxsound-linux-0.4.0-x86_64/install.sh        # /usr/local unless you name another prefix
 ```
 
-`/usr/local` is searched for presets alongside `/usr`, so nothing needs configuring afterwards.
+`/usr/local` is searched for presets alongside `/usr`, and first by a binary installed there, so
+nothing needs configuring afterwards and a distribution package's presets under `/usr` never stand
+in for the tarball's own.
 The script always builds the binary from the tree it sits in first (with `--locked`; a no-op when
 the build is current), and refuses to pack one whose `--version` is not the version in
 `Cargo.toml`, so a binary left in `target/release` by an older checkout never ends up in a newer

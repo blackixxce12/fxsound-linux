@@ -155,7 +155,8 @@ impl Store<Preset> {
     /// Build a store from the standard locations.
     ///
     /// Factory presets are looked for next to the executable and in the usual install prefixes, so
-    /// the binary works both from `cargo run` and from a package.
+    /// the binary works both from `cargo run` and from a package; of the prefixes, the one the
+    /// binary is installed under comes first ([`crate::install_data_dirs`]).
     #[must_use]
     pub fn with_default_dirs() -> Self {
         let mut factory_dirs = Vec::new();
@@ -170,10 +171,10 @@ impl Store<Preset> {
             factory_dirs.push(target_dir.join("assets/presets/Factsoft"));
             factory_dirs.push(target_dir.join("assets/presets/BonusPresets"));
         }
-        // Installed.
-        for prefix in ["/usr/share/fxsound", "/usr/local/share/fxsound"] {
-            factory_dirs.push(Path::new(prefix).join("presets/Factsoft"));
-            factory_dirs.push(Path::new(prefix).join("presets/BonusPresets"));
+        // Installed, the binary's own prefix first.
+        for data in crate::install_data_dirs() {
+            factory_dirs.push(data.join("presets/Factsoft"));
+            factory_dirs.push(data.join("presets/BonusPresets"));
         }
 
         Self::with_dirs(factory_dirs, Settings::user_preset_dir()).with_home_trash()
