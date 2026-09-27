@@ -202,6 +202,32 @@ jobs:
           "$CARGO_HOME/bin/rustc" --version
           "$CARGO_HOME/bin/cargo" --version
 
+      # Container images drop every manual page a package ships: ubuntu:24.04 through a dpkg
+      # path-exclude, archlinux through pacman's NoExtract, fedora through dnf's tsflags=nodocs
+      # (debian:* keeps them). A desktop installation keeps them, and the smoke test below checks
+      # that the package installed its page — `fxsound --self-test` fails without one — so the
+      # image is told to keep them too. After the build dependencies, before the package.
+      - name: Let the image install manual pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ matrix.family }}' in
+            arch)
+              sed -i 's#usr/share/man/\*##g' /etc/pacman.conf
+              grep -n '^NoExtract' /etc/pacman.conf || true
+              ;;
+            deb|tarball)
+              for f in /etc/dpkg/dpkg.cfg.d/*; do
+                [ -f "$f" ] && sed -i '\#^path-exclude=/usr/share/man/#d' "$f"
+              done
+              grep -rn 'path-exclude' /etc/dpkg/dpkg.cfg.d/ || true
+              ;;
+            rpm)
+              sed -i '/^tsflags=.*nodocs/d' /etc/dnf/dnf.conf
+              grep -rn 'nodocs\|excludedocs' /etc/dnf /etc/rpm /usr/lib/rpm/macros.d 2>/dev/null || true
+              ;;
+          esac
+
       # ------------------------------------------------------------------ Arch
       - name: Build and install (Arch)
         if: matrix.family == 'arch'
