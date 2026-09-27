@@ -157,6 +157,15 @@ pub mod effects {
         )
     }
 
+    /// The room the microphone note under the five sliders has: from the captions' left edge to
+    /// as far inside the column's right edge as the sliders start inside its left one. The
+    /// captions' own 160 points run eight past the column, where the note's end came out over its
+    /// edge (Italian "Senza effetto su un microfono").
+    #[must_use]
+    pub fn note_room(column: Rect) -> f32 {
+        column.right() - X_MARGIN - caption_rect(column, 0).left()
+    }
+
     /// Row `index`'s slider.
     #[must_use]
     pub fn slider_rect(column: Rect, index: usize) -> Rect {
@@ -901,17 +910,30 @@ fn effect_column(
     // broken. The sixth row's worth of space below the five sliders is where the original leaves
     // padding, and it is drawn on only in the direction the original does not have.
     if !applies {
+        let note = tr(MICROPHONE_INERT_CAPTION);
+        let font = inert_note_font(ui.ctx(), &note, column);
         ui.painter().text(
             pos2(
                 column.left() + effects::X_MARGIN + crate::widgets::slider::THUMB_RADIUS,
                 effects::row_top(column, Effect::COUNT),
             ),
             Align2::LEFT_TOP,
-            tr(MICROPHONE_INERT_CAPTION),
-            caption_font(CAPTION_FONT_PX),
+            note,
+            font,
             palette.color(FxColor::DefaultText),
         );
     }
+}
+
+/// The microphone note's font: the captions', set smaller where the note would not fit inside the
+/// column otherwise ([`effects::note_room`]).
+fn inert_note_font(ctx: &egui::Context, note: &str, column: Rect) -> egui::FontId {
+    crate::dialogs::fitted_font(
+        ctx,
+        note,
+        caption_font(CAPTION_FONT_PX),
+        effects::note_room(column),
+    )
 }
 
 /// The values an effect's slider stands at between its whole positions: every value a preset can
@@ -2746,34 +2768,45 @@ mod tests {
     }
 
     #[test]
-    fn every_language_fits_the_microphone_note_in_the_room_the_captions_above_it_have() {
-        // The note is painted with no width of its own, so a translation longer than the five
-        // captions' 160 points runs into the equalizer panel and is cut there: German's
-        // "Bei einem Mikrofon ohne Wirkung" lost its last letters that way.
+    fn every_language_fits_the_microphone_note_inside_the_column_set_no_smaller_than_seven_tenths()
+    {
+        // The note is painted with no width of its own. German's "Bei einem Mikrofon ohne
+        // Wirkung" ran into the equalizer panel and lost its last letters there; Italian's "Senza
+        // effetto su un microfono" fitted the captions' 160 points but ended six past the
+        // column's rounded edge, which the captions overhang by eight.
         use fxsound_core::i18n::{Catalogue, LANGUAGES};
         let ctx = test_context();
         let column = layout::pro::audio_controls();
-        let room = effects::caption_rect(column, Effect::COUNT).width();
+        let room = effects::note_room(column);
+        let left = effects::caption_rect(column, Effect::COUNT).left();
+        assert!(left + room <= column.right() - effects::X_MARGIN + 1e-3);
+        let smallest = caption_font(CAPTION_FONT_PX).size * crate::dialogs::MIN_FIT_SCALE;
         let mut problems = Vec::new();
         ctx.run_ui(raw_input(Vec::new()), |ui| {
+            let english = inert_note_font(ui.ctx(), MICROPHONE_INERT_CAPTION, column);
+            assert_eq!(
+                english,
+                caption_font(CAPTION_FONT_PX),
+                "English keeps its size"
+            );
             for language in &LANGUAGES[1..] {
                 let table = Catalogue::for_language(language);
                 let text = table
                     .get(MICROPHONE_INERT_CAPTION)
                     .unwrap_or(MICROPHONE_INERT_CAPTION);
+                let font = inert_note_font(ui.ctx(), text, column);
+                if language.code == "it" {
+                    assert!(font.size < english.size, "Italian is set smaller: {font:?}");
+                }
                 let width = ui
                     .painter()
-                    .layout_no_wrap(
-                        text.to_owned(),
-                        caption_font(CAPTION_FONT_PX),
-                        egui::Color32::PLACEHOLDER,
-                    )
+                    .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
                     .size()
                     .x;
-                if width > room {
+                if width > room || font.size < smallest - 1e-3 {
                     problems.push(format!(
-                        "{}: {text:?} is {width:.0} points in {room:.0}",
-                        language.code
+                        "{}: {text:?} is {width:.0} points in {room:.0} at {}",
+                        language.code, font.size
                     ));
                 }
             }

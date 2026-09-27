@@ -3242,29 +3242,31 @@ mod tests {
     }
 
     #[test]
-    fn the_hotkey_note_fits_the_box_it_is_wrapped_into() {
+    fn every_languages_hotkey_note_fits_the_box_it_is_wrapped_into() {
         // Measured with the real faces, because a note that overflows would be painted straight
-        // over the first row of the table.
+        // over the first row of the table. Italian wraps to four lines, and Chinese lines are
+        // taller for the CJK face.
         let ctx = test_context();
         let pane = pane_rect(content());
         let box_ = hotkey_note_rect(pane);
+        let mut problems = Vec::new();
         frame(&ctx, |ui| {
-            let height = ui
-                .painter()
-                .layout(
-                    HOTKEY_NOTE.to_owned(),
-                    small_font(),
-                    Color32::PLACEHOLDER,
-                    box_.width(),
-                )
-                .size()
-                .y;
-            assert!(
-                height <= box_.height(),
-                "the note wrapped to {height} points in a {} point box",
-                box_.height()
-            );
+            for (code, text) in every_translation(HOTKEY_NOTE) {
+                let size = ui
+                    .painter()
+                    .layout(
+                        text.clone(),
+                        small_font(),
+                        Color32::PLACEHOLDER,
+                        box_.width(),
+                    )
+                    .size();
+                if size.y > box_.height() || size.x > box_.width() {
+                    problems.push(format!("{code}: {size:?} in {:?}", box_.size()));
+                }
+            }
         });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 
     #[test]
@@ -5283,13 +5285,14 @@ mod tests {
     /// the tables' order. Held exactly: a language that comes to fit leaves the list, and every
     /// other one must be shown whole.
     const FOLLOW_PRESET_ELIDED: &[&str] = &[
-        "es", "fr", "it", "nl", "no", "pt", "pt-br", "sl", "fi", "sv", "vi", "tr", "bg", "ar",
-        "fa", "th", "ja",
+        "es", "fr", "nl", "no", "pt", "pt-br", "sl", "fi", "sv", "vi", "tr", "bg", "fa", "th", "ja",
     ];
 
     #[test]
     fn every_languages_follow_entry_is_shown_whole_in_the_applications_combo_but_the_listed_ones() {
         // E6b: German "Preset von FxSound" was cut to "Preset von FxSo…"; it is "Wie FxSound" now.
+        // The pre-tag look: Italian "Preset di FxSou…" is "Come FxSound" and Arabic, cut before
+        // FxSound, "قالب FxSound", the word the Arabic table uses for a preset.
         // Russian "Шаблон FxSound" measures 113.3 in 113 points and is still drawn whole, egui
         // letting a line run half a point past its room — so this asks the combo's own layout.
         let ctx = test_context();
@@ -5304,7 +5307,7 @@ mod tests {
                 }
             }
         });
-        for code in ["en", "de", "ru"] {
+        for code in ["en", "de", "ru", "it", "ar", "zh-CN"] {
             let prefix = format!("{code}: ");
             assert!(
                 !elided.iter().any(|entry| entry.starts_with(&prefix)),

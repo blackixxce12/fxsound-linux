@@ -326,6 +326,14 @@ All notable changes to the FxSound Linux port. The format follows
 - The German and Russian texts FxSound added called a preset "Preset" or "пресет" where the rest
   of the window says "Voreinstellung" or "шаблон", and German Settings > Apps cut "Preset von
   FxSound" to "Preset von FxSo…"; it reads "Wie FxSound".
+- Italian and Arabic Settings > Apps cut "FxSound's preset" in the same way ("Preset di
+  FxSou…"); they read "Come FxSound" and "قالب FxSound".
+- With the name field of Save New Preset or Rename Preset open, the hamburger menu in the Pro
+  view kept the height it had without it, and Light was lost below Dark; it now grows to hold the
+  field.
+- The note under the effect sliders while a microphone is selected ran past the edge of their
+  panel in Italian ("Senza effetto su un microfono"); it is set a little smaller where a
+  translation would run past it.
 - The Russian question before exporting over several existing preset files read "2 файлов
   шаблонов…", the number before a noun it does not agree with; it now gives the number at the end.
 - A binary installed under `/usr/local`, as the tarball installs it, took the factory and voice

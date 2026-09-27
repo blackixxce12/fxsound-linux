@@ -103,7 +103,7 @@ countries: EG sa
 "waiting for the speakers" = "في انتظار مكبرات الصوت"
 "Applications that used %s now follow FxSound's preset" = "التطبيقات التي كانت تستخدم %s تتبع الآن الإعداد المسبق لـ FxSound"
 "Applications" = "التطبيقات"
-"FxSound's preset" = "الإعداد المسبق لـ FxSound"
+"FxSound's preset" = "قالب FxSound"
 "No application has played or recorded through FxSound yet" = "لم يشغّل أي تطبيق صوتًا أو يسجّله عبر FxSound بعد"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "لا يعمل ميكروفون البلوتوث إلا أثناء تسجيل تطبيق من FxSound (الإدخال)، وعندها يحوّل سماعة الرأس إلى جودة المكالمات."
 "Unsaved preset changes discarded" = "تم تجاهل التغييرات غير المحفوظة في القوالب"

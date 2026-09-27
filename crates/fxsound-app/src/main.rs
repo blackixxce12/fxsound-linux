@@ -1448,8 +1448,12 @@ impl<'a> Shell<'a> {
                     .corner_radius(egui::CornerRadius::same(8))
                     .inner_margin(egui::Margin::symmetric(8, 8))
                     .show(ui, |ui| {
+                        // `min_scrolled_height` too: without it the rows get no more than the
+                        // height the area had last frame, so an editor opened in the menu pushed
+                        // Light out of the Pro window's menu for good.
                         let mut rows = egui::ScrollArea::vertical()
                             .max_height(room)
+                            .min_scrolled_height(room)
                             .auto_shrink([true, true]);
                         // Opened at its top, wherever it was last scrolled to.
                         if just_opened {
@@ -3739,7 +3743,7 @@ mod confirmation_tests {
 
     /// A runtime over a controller whose speakers list the user presets `Mine` and `Other`, with
     /// `Mine` selected.
-    fn runtime(dir: &std::path::Path) -> Runtime {
+    pub(super) fn runtime(dir: &std::path::Path) -> Runtime {
         let Instance::Primary(listener) = Instance::acquire_in(dir).expect("acquire") else {
             panic!("expected to be primary");
         };
@@ -4320,6 +4324,49 @@ mod popup_tests {
             assert!(menu.height() > 3.0 * MENU_ROW_HEIGHT, "{menu:?}");
         }
         assert_eq!(shell.window_size(), lite);
+    }
+
+    #[test]
+    fn the_menu_in_the_pro_window_grows_to_hold_an_editor_opened_in_it_and_keeps_every_row() {
+        // The pre-tag look in Italian: with Save New Preset's editor open the menu kept the
+        // height it had without it, and Light was scrolled out of sight under Dark.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = confirmation_tests::runtime(dir.path());
+        rt.app.state.view = ViewMode::Pro;
+        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let pro = layout::pro::WINDOW_SIZE;
+        let ctx = context();
+        sized_frame(&mut shell, &ctx, pro);
+        settle(&mut shell);
+
+        shell.menu.toggle();
+        let mut shut = None;
+        for _ in 0..3 {
+            shut = sized_frame(&mut shell, &ctx, pro).0;
+        }
+        let shut = shut.expect("the menu is open");
+
+        let app = &shell.rt.app;
+        shell.menu.editor = Some(NameEditor::new(
+            EditorPurpose::SaveNew,
+            app.state.direction,
+            app.state.preset().map(|p| p.name.as_str()),
+        ));
+        for frame in 0..4 {
+            let open = sized_frame(&mut shell, &ctx, pro)
+                .0
+                .expect("the menu is open");
+            assert!(shell.menu.editor.is_some(), "frame {frame}");
+            assert_eq!(open.top(), shut.top(), "frame {frame}");
+            assert!(
+                (open.height() - (shut.height() + NAME_EDITOR_SIZE.y + 4.0)).abs() < 1e-3,
+                "frame {frame}: {open:?} with the editor, {shut:?} without it"
+            );
+            assert!(
+                open.bottom() <= pro.y - POPUP_MARGIN,
+                "frame {frame}: {open:?}"
+            );
+        }
     }
 
     #[test]

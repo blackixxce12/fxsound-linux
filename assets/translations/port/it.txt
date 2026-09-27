@@ -104,7 +104,7 @@ countries: it
 "waiting for the speakers" = "in attesa degli altoparlanti"
 "Applications that used %s now follow FxSound's preset" = "Le applicazioni che usavano %s ora seguono il preset di FxSound"
 "Applications" = "Applicazioni"
-"FxSound's preset" = "Preset di FxSound"
+"FxSound's preset" = "Come FxSound"
 "No application has played or recorded through FxSound yet" = "Nessuna applicazione ha ancora riprodotto o registrato tramite FxSound"
 "A Bluetooth microphone wakes only while an application records from FxSound (Input), and then switches its headset to call quality." = "Un microfono Bluetooth si attiva solo mentre un'applicazione registra da FxSound (Ingresso), e porta allora le cuffie alla qualità di chiamata."
 "Unsaved preset changes discarded" = "Modifiche non salvate alle preimpostazioni annullate"
