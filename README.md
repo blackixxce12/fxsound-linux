@@ -112,6 +112,10 @@ sudo ./fxsound-linux-0.3.0-x86_64/install.sh        # /usr/local unless you name
 ```
 
 `/usr/local` is searched for presets alongside `/usr`, so nothing needs configuring afterwards.
+The script always builds the binary from the tree it sits in first (with `--locked`; a no-op when
+the build is current), and refuses to pack one whose `--version` is not the version in
+`Cargo.toml`, so a binary left in `target/release` by an older checkout never ends up in a newer
+archive.
 
 A prebuilt tarball is attached to each [release](https://github.com/blackixxce12/fxsound-linux/releases);
 check it against the release's `SHA256SUMS` before unpacking. It is this same script's output, built
@@ -119,11 +123,12 @@ on Debian 12's glibc so the binary runs on anything newer, and it carries the sa
 archive is a prefix in miniature: `bin/fxsound`, `lib/systemd/user/fxsound.service`,
 `share/dbus-1/services/` (D-Bus activation), `share/applications/`, `share/icons/hicolor/` (the
 app icon and the tray's three status icons), `share/fxsound/presets/`, `share/man/man1/fxsound.1`,
-`share/metainfo/` and `share/doc/fxsound-linux/` (README, CHANGELOG, LICENSE, the Hyprland rules
-and the autostart entry). `install.sh` copies all of that into the prefix and rewrites the unit's
-`ExecStart` and `ExecStop`, and the activation file's `Exec`, to `<prefix>/bin/fxsound`; it warns
-if the prefix is anything other than `/usr` or `/usr/local`, because those are the only two the
-binary searches for presets. On an older distribution than Debian 12, build from source instead.
+`share/metainfo/` and `share/doc/fxsound-linux/` (README, CHANGELOG, LICENSE, the licences of
+the bundled RNNoise code and Noto faces, the Hyprland rules and the autostart entry).
+`install.sh` copies all of that into the prefix and rewrites the unit's `ExecStart` and
+`ExecStop`, and the activation file's `Exec`, to `<prefix>/bin/fxsound`; it warns if the prefix
+is anything other than `/usr` or `/usr/local`, because those are the only two the binary searches
+for presets. On an older distribution than Debian 12, build from source instead.
 
 ### What lands where
 
@@ -137,6 +142,7 @@ binary searches for presets. On an older distribution than Debian 12, build from
 | `/usr/share/dbus-1/services/org.fxsound.FxSound.service` | starts FxSound, through that unit, for a D-Bus call |
 | `/usr/share/icons/hicolor/*/apps/fxsound.png` | the icon |
 | `/usr/share/doc/fxsound-linux/` | the Hyprland rules and the autostart entry |
+| `/usr/share/licenses/fxsound-linux/` | the AGPL, and the licences of the RNNoise code and the Noto faces built into the binary (the `.deb` carries them in `/usr/share/doc/fxsound-linux/copyright`) |
 
 There is no AppImage or Flatpak. A Flatpak would be actively counterproductive here: the whole
 point of the app is to own a node in your PipeWire graph and drive your real output device, and the
@@ -580,10 +586,16 @@ its own reasoning in `docs/voice-presets-research.md`, `docs/input-presets-decis
 
 AGPL-3.0-or-later, inherited from upstream FxSound.
 
+Two parts of the binary are under other licences, and every package installs their text beside
+`LICENSE` (the `.deb` in its `copyright` file): the noise suppression in `crates/fxsound-rnnoise`,
+Joe Neeman's `nnnoiseless` port of Xiph's RNNoise with its model, is BSD-3-Clause
+(`COPYING.rnnoise`), and the Noto fallback faces are SIL OFL 1.1 (`OFL.noto`, from
+`assets/fonts/OFL.txt`).
+
 The bundled artwork and the Gilroy typeface come from the upstream repository and carry their own
-terms; the Noto fallback faces are SIL OFL. A redistributable package may need to replace Gilroy —
-it is a commercial font and its presence in the upstream tree is not itself a licence to
-redistribute.
+terms. Gilroy is Radomir Tinkov's commercial typeface: its files say "All rights reserved" and name
+no licence. A redistributable package may need to replace it — its presence in the upstream tree is
+not itself a licence to redistribute.
 
 ## Credits
 

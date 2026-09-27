@@ -106,6 +106,10 @@ Decisions you might otherwise have to rediscover
   because that is Arch's convention; Debian's is debian/copyright, which
   carries the full AGPL-3 text because base-files does not ship AGPL-3 in
   /usr/share/common-licenses (it has GPL-3 and LGPL-3, but not this one).
+  The same goes for the notices of the two parts of the binary that are not
+  AGPL, which the other packages install as COPYING.rnnoise and OFL.noto:
+  debian/copyright reproduces the RNNoise code's BSD-3-Clause notice and the
+  Noto faces' SIL OFL 1.1 in full, and states the Gilroy faces' terms.
 
 * There is no postinst. The icon cache and the desktop database are updated by
   dpkg triggers that hicolor-icon-theme and desktop-file-utils declare on

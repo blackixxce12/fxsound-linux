@@ -16,7 +16,7 @@ pkgrel=1
 pkgdesc="System-wide audio enhancement for Linux: EQ, ambience, surround, bass and dynamic boost (Rust/egui port of FxSound) — prebuilt binary"
 arch=('x86_64')
 url="https://github.com/blackixxce12/fxsound-linux"
-license=('AGPL-3.0-or-later')
+license=('AGPL-3.0-or-later' 'BSD-3-Clause' 'OFL-1.1')
 depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus'
          'glibc>=2.36' 'hicolor-icon-theme')
 optdepends=(
@@ -67,8 +67,11 @@ package() {
   install -Dm644 "share/metainfo/com.fxsound.FxSound.metainfo.xml" \
     "${pkgdir}/usr/share/metainfo/com.fxsound.FxSound.metainfo.xml"
 
-  # README, CHANGELOG, LICENSE, the Hyprland rules and the autostart entry.
+  # README, CHANGELOG, the licences, the Hyprland rules and the autostart entry.
   install -Dm644 share/doc/fxsound-linux/* -t "${pkgdir}/usr/share/doc/${_pkgname}/"
-  install -Dm644 "share/doc/fxsound-linux/LICENSE" \
-    "${pkgdir}/usr/share/licenses/${_pkgname}/LICENSE"
+  # The AGPL, and the notices of the two parts of the binary that are not AGPL and whose licences
+  # make shipping their text a condition of shipping the binary: the RNNoise code and model
+  # (BSD-3-Clause) and the embedded Noto fallback faces (SIL OFL 1.1).
+  install -Dm644 share/doc/fxsound-linux/{LICENSE,COPYING.rnnoise,OFL.noto} \
+    -t "${pkgdir}/usr/share/licenses/${_pkgname}/"
 }

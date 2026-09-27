@@ -12,7 +12,7 @@ pkgrel=1
 pkgdesc="System-wide audio enhancement for Linux: EQ, ambience, surround, bass and dynamic boost (Rust/egui port of FxSound)"
 arch=('x86_64')
 url="https://github.com/blackixxce12/fxsound-linux"
-license=('AGPL-3.0-or-later')
+license=('AGPL-3.0-or-later' 'BSD-3-Clause' 'OFL-1.1')
 # Runtime: PipeWire for audio, the Wayland/GL stack for the window, D-Bus for the tray and
 # notifications, fontconfig because egui asks it for fallback faces.
 depends=('pipewire' 'libpipewire' 'wayland' 'libxkbcommon' 'libglvnd' 'fontconfig' 'dbus'
@@ -125,4 +125,10 @@ package() {
   install -Dm644 "CHANGELOG.md" "${pkgdir}/usr/share/doc/${pkgname}/CHANGELOG.md"
 
   install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  # Two parts of the binary are not AGPL, and each licence makes shipping its text a condition of
+  # shipping the binary: the RNNoise code and model compiled in from crates/fxsound-rnnoise
+  # (BSD-3-Clause), and the Noto fallback faces embedded in the window (SIL OFL 1.1).
+  install -Dm644 "crates/fxsound-rnnoise/COPYING" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/COPYING.rnnoise"
+  install -Dm644 "assets/fonts/OFL.txt" "${pkgdir}/usr/share/licenses/${pkgname}/OFL.noto"
 }

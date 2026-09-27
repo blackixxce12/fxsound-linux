@@ -340,6 +340,54 @@ jobs:
           test -f "$prefix/share/icons/hicolor/32x32/apps/fxsound.png"
           echo "::endgroup::"
 
+          # Two parts of the binary are not AGPL, and each licence makes shipping its text a
+          # condition of shipping the binary: the RNNoise code (BSD-3-Clause) and the embedded Noto
+          # faces (SIL OFL 1.1). Read out of the package this leg built wherever a container image
+          # may leave docs uninstalled; %license files and the tarball's tree are always there.
+          echo "::group::licences"
+          same() {
+            if [ "$(sha256sum < "$1")" != "$(sha256sum < "$2")" ]; then
+              echo "::error::the package's $3 is not $2"
+              exit 1
+            fi
+          }
+          rnnoise="$GITHUB_WORKSPACE/crates/fxsound-rnnoise/COPYING"
+          ofl="$GITHUB_WORKSPACE/assets/fonts/OFL.txt"
+          unpacked=$(mktemp -d)
+          case '${{ matrix.family }}' in
+            arch)
+              bsdtar -xf "$(ls dist/fxsound-linux-[0-9]*.pkg.tar.zst)" -C "$unpacked" \
+                usr/share/licenses/fxsound-linux
+              same "$unpacked/usr/share/licenses/fxsound-linux/COPYING.rnnoise" "$rnnoise" COPYING.rnnoise
+              same "$unpacked/usr/share/licenses/fxsound-linux/OFL.noto" "$ofl" OFL.noto
+              ;;
+            deb)
+              deb=$(ls dist/fxsound-linux_*.deb)
+              dpkg-deb --fsys-tarfile "$deb" \
+                | tar -xf - -C "$unpacked" ./usr/share/doc/fxsound-linux/copyright
+              copyright="$unpacked/usr/share/doc/fxsound-linux/copyright"
+              for line in 'Files: crates/fxsound-rnnoise/*' 'License: BSD-3-Clause' \
+                'Files: assets/fonts/Noto* assets/fonts/OFL.txt' 'License: OFL-1.1' \
+                ' - Neither the name of the Xiph.Org Foundation nor the names of its' \
+                ' SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007'; do
+                if ! grep -qxF -- "$line" "$copyright"; then
+                  echo "::error::the package's copyright file has no line '$line'"
+                  exit 1
+                fi
+              done
+              ;;
+            rpm)
+              same /usr/share/licenses/fxsound-linux/COPYING.rnnoise "$rnnoise" COPYING.rnnoise
+              same /usr/share/licenses/fxsound-linux/OFL.noto "$ofl" OFL.noto
+              ;;
+            tarball)
+              same "$prefix/share/doc/fxsound-linux/COPYING.rnnoise" "$rnnoise" COPYING.rnnoise
+              same "$prefix/share/doc/fxsound-linux/OFL.noto" "$ofl" OFL.noto
+              ;;
+          esac
+          rm -rf "$unpacked"
+          echo "::endgroup::"
+
           # The expected counts come from the checkout, not from a number written here, so a new
           # preset in the tree is a new preset that has to be installed.
           echo "::group::presets"

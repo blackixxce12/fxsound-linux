@@ -22,8 +22,12 @@
 #   share/fxsound/presets/{Factsoft,BonusPresets}/*.fac  share/fxsound/presets/Input/*.toml
 #   share/man/man1/fxsound.1
 #   share/metainfo/com.fxsound.FxSound.metainfo.xml
-#   share/doc/fxsound-linux/{README.md,CHANGELOG.md,LICENSE,hyprland.conf.example,fxsound-autostart.desktop}
+#   share/doc/fxsound-linux/{README.md,CHANGELOG.md,LICENSE,COPYING.rnnoise,OFL.noto,
+#                            hyprland.conf.example,fxsound-autostart.desktop}
 #   install.sh
+#
+# The binary is always built from the tree the script sits in, and one whose `--version` is not
+# that tree's version is refused rather than packed.
 #
 # The binary is linked against the glibc of the machine that builds it and runs on that release
 # and newer. CI builds it on debian:bookworm for that reason; a local build is for local use.
@@ -32,17 +36,32 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The first `version =` line of Cargo.toml is [workspace.package]'s; no dependency line starts
 # with the word, which is what keeps this one-liner honest.
-version="${1:-$(sed -n 's/^version = "\(.*\)"/\1/p' "${root}/Cargo.toml" | head -1)}"
+crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "${root}/Cargo.toml" | head -1)"
+version="${1:-${crate_version}}"
 arch="$(uname -m)"
 stage="$(mktemp -d)"
 name="fxsound-linux-${version}-${arch}"
 trap 'rm -rf "${stage}"' EXIT
 
 cd "${root}"
-[ -x target/release/fxsound ] || cargo build --release --bin fxsound
+# Always build, even when target/release/fxsound is already there: a binary an earlier checkout
+# left behind — a 0.3.0 built before pulling 0.4.0 — would otherwise be packed under this tree's
+# version, beside presets, a unit and a D-Bus activation file it does not understand. When the
+# binary is current, cargo does nothing. The target directory is pinned for this one command, so
+# that a CARGO_TARGET_DIR or build.target-dir set elsewhere cannot send the build somewhere this
+# script does not look.
+CARGO_TARGET_DIR="${root}/target" cargo build --release --locked --bin fxsound
+bin="${root}/target/release/fxsound"
+# And the binary has to be this tree's: `fxsound --version` prints "fxsound <version>".
+built="$("${bin}" --version)"
+if [ "${built}" != "fxsound ${crate_version}" ]; then
+  echo "build-tarball.sh: ${bin} says '${built}', but Cargo.toml is at ${crate_version};" \
+    "refusing to pack it" >&2
+  exit 1
+fi
 
 pkg="${stage}/${name}"
-install -Dm755 target/release/fxsound "${pkg}/bin/fxsound"
+install -Dm755 "${bin}" "${pkg}/bin/fxsound"
 # Named after the window's app_id (StartupWMClass=com.fxsound.FxSound), so the compositor can
 # match the window to the entry — the same rename every package does.
 install -Dm644 packaging/fxsound.desktop "${pkg}/share/applications/com.fxsound.FxSound.desktop"
@@ -76,6 +95,12 @@ install -Dm644 packaging/com.fxsound.FxSound.metainfo.xml \
 install -Dm644 README.md CHANGELOG.md LICENSE \
   packaging/hyprland.conf.example packaging/fxsound-autostart.desktop \
   -t "${pkg}/share/doc/fxsound-linux/"
+# Beside the AGPL, the notices of the two parts of the binary that are not AGPL, whose licences
+# make shipping the text a condition of shipping the binary: the RNNoise code and model
+# (BSD-3-Clause) and the embedded Noto fallback faces (SIL OFL 1.1). fxsound-linux-bin installs
+# all three from here into /usr/share/licenses.
+install -Dm644 crates/fxsound-rnnoise/COPYING "${pkg}/share/doc/fxsound-linux/COPYING.rnnoise"
+install -Dm644 assets/fonts/OFL.txt "${pkg}/share/doc/fxsound-linux/OFL.noto"
 
 cat > "${pkg}/install.sh" <<'INNER'
 #!/usr/bin/env sh

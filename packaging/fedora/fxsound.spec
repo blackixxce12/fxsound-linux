@@ -11,8 +11,8 @@
 # WHY VENDORED DEPENDENCIES, AND WHY THE rust-packaging MACROS
 #
 # A Fedora reviewer will ask both questions, so: the dependency tree this application links is
-# not available as packaged crates. eframe/egui 0.36, pipewire 0.10, ksni, nnnoiseless, rfd and
-# resvg have no rust-*-devel packages in Fedora, so %%cargo_generate_buildrequires against
+# not available as packaged crates. eframe/egui 0.36, pipewire 0.10, ksni, rfd and resvg have
+# no rust-*-devel packages in Fedora, so %%cargo_generate_buildrequires against
 # %%{cargo_registry} cannot resolve and the package simply would not build. The guidelines
 # allow an *application* to bundle its Rust dependencies, so this spec does that: `cargo vendor`
 # output as Source1, %%cargo_prep -v vendor to point crates-io at it, and %%cargo_vendor_manifest
@@ -300,6 +300,15 @@ install -Dpm0644 packaging/fxsound.1 %{buildroot}%{_mandir}/man1/fxsound.1
 install -Dpm0644 packaging/com.fxsound.FxSound.metainfo.xml \
     %{buildroot}%{_metainfodir}/com.fxsound.FxSound.metainfo.xml
 
+# Two parts of the binary are not AGPL, and each licence makes shipping its text a condition of
+# shipping the binary: the RNNoise code and model compiled in from crates/fxsound-rnnoise
+# (BSD-3-Clause), and the Noto fallback faces embedded in the window (SIL OFL 1.1).
+# LICENSE.dependencies only names licences, so both texts are shipped as %%license files, under
+# the names every other package gives them: %%license on the source paths would install them as
+# a bare COPYING and OFL.txt beside our own LICENSE.
+cp -p crates/fxsound-rnnoise/COPYING COPYING.rnnoise
+cp -p assets/fonts/OFL.txt OFL.noto
+
 
 %check
 desktop-file-validate %{buildroot}%{_datadir}/applications/com.fxsound.FxSound.desktop
@@ -326,6 +335,8 @@ appstreamcli validate --no-net %{buildroot}%{_metainfodir}/com.fxsound.FxSound.m
 
 %files
 %license LICENSE
+%license COPYING.rnnoise
+%license OFL.noto
 %license LICENSE.dependencies
 %license cargo-vendor.txt
 %doc README.md
