@@ -76,7 +76,14 @@
 //! something plays into NODE 1 again: minutes later, perhaps, and another application. Played
 //! then, the cushion would put the tail of the last sound in front of the next one. So NODE 1's
 //! `Paused` marks the ring stale, and NODE 2's first `pop` after it skips what was left
-//! (`SampleRing::mark_stale`). What that costs is the same block and a half of a player that was
+//! (`SampleRing::mark_stale`). It also has the next sound fade in from silence, as a new pair's
+//! first sound does (`first_node_went_idle`): a stream moved onto FxSound in the middle of a sound
+//! — every stream that follows the default, when the power comes back on — would otherwise start
+//! at full level between two samples. The pair is not always told it stopped, and may wake on the
+//! silence the sink mixes before the stream arrives, so NODE 1 also treats the first block with
+//! sound in it after a quarter of a second without one as a new sound
+//! (`woke_after_standing_still`), and NODE 2 drops a cushion it wakes up to
+//! (`SampleRing::skip_all`). What the skip costs is the same block and a half of a player that was
 //! merely paused and resumed — 16 ms at the quantum FxSound asks for — which it resumes that much
 //! further on than it stopped.
 //!
@@ -204,6 +211,7 @@
 //! with the hand-back of the defaults, confirmed by the same `sync`, before any node goes.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -234,6 +242,7 @@ use crate::devices::{
 use crate::lane_dsp::{self, ChainHandover, LaneDsp};
 use crate::per_direction::PerDirection;
 use crate::routes::{self, CardRoutes, Route, RouteList};
+use crate::stranded::Stranded;
 use crate::volume::{self, Debounce, LaneVolume, NodeVolume, PropsUpdate};
 use crate::{
     AEC_SOURCE_NODE_NAME, AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION,
@@ -698,7 +707,9 @@ impl SampleRing {
 
     /// Have the consumer's next [`Self::pop`] skip everything pushed so far, and prime again
     /// before it plays anything. Main loop: NODE 1's `state_changed`, when a pair whose NODE 2 is
-    /// passive stops (module docs, "Idle").
+    /// passive stops (module docs, "Idle"); and the producer itself, NODE 1's `process()`, when it
+    /// finds it stood still without being told (`woke_after_standing_still`) — which touches only
+    /// the same two atomics, and before it pushes the new sound.
     ///
     /// Such a pair stops in one cycle, both nodes together, and leaves the ring's cushion behind:
     /// the last block and a half of a sound that has ended. The next thing to wake the pair may
@@ -718,8 +729,26 @@ impl SampleRing {
         self.stale.store(true, Ordering::Release);
     }
 
+    /// The consumer found it stood still ([`woke_after_standing_still`]): skip everything the ring
+    /// holds and prime again before it plays anything. **Consumer only**: it moves the read
+    /// cursor, which is the consumer's alone.
+    ///
+    /// What is there is the cushion of a sound from before the pair stopped, which
+    /// [`Self::mark_stale`] would have had it skip had the pair been told it stopped. It is not
+    /// always told (`woke_after_standing_still`), and when it is not, the first to run when the
+    /// pair wakes may be this node rather than NODE 1: nothing in the graph orders the two, the
+    /// ring joining them is FxSound's own. So the consumer drops the cushion itself, in the cycle
+    /// it wakes in, before it plays a sample of it.
+    pub(crate) fn skip_all(&self) {
+        let channels = self.channels.load(Ordering::Relaxed).max(1);
+        let read = self.read.load(Ordering::Relaxed);
+        let write = self.write.load(Ordering::Acquire);
+        let skip = write.wrapping_sub(read) / channels * channels;
+        self.read.store(read.wrapping_add(skip), Ordering::Release);
+        self.primed.store(false, Ordering::Relaxed);
+    }
+
     /// Whether a [`Self::mark_stale`] is still waiting for the consumer.
-    #[cfg(test)]
     pub(crate) fn stale_pending(&self) -> bool {
         self.stale.load(Ordering::Acquire)
     }
@@ -1084,6 +1113,13 @@ pub(crate) struct SinkData {
     /// How many fades in the lane's volume had asked for when this node last looked
     /// ([`LaneVolume::request_fade`]); one more is a fade to start on the next block.
     fades_seen: u64,
+    /// When `process()` last had sound in its block — anything but digital silence — to tell the
+    /// first sound after a stretch without any from one that goes on
+    /// ([`woke_after_standing_still`]).
+    last_sound: Option<Instant>,
+    /// This pair's next block fades in from silence ([`first_node_went_idle`]). This pair's own,
+    /// not the lane volume's fade count, which the lane's per-application routes share with it.
+    fade_next: AtomicBool,
 }
 
 impl SinkData {
@@ -1108,6 +1144,8 @@ impl SinkData {
             system_mute: Arc::clone(&lane.system_mute),
             // A new pair fades in by itself; a fade asked for before it is not its own.
             fades_seen: lane.volume.fades(),
+            last_sound: None,
+            fade_next: AtomicBool::new(false),
             dsp: Some(dsp),
         }
     }
@@ -1139,6 +1177,13 @@ pub(crate) struct OutData {
     /// The lane's volume, written from this node's `Props` when it is the virtual source; `None`
     /// on the output lane's playback stream, whose `Props` are nobody's slider.
     volume: Option<Arc<LaneVolume>>,
+    /// Whether this node stops with NODE 1, in the same cycle — a passive pair's does — so that a
+    /// stretch with no `process()` means the pair stood still ([`SampleRing::skip_all`]). A node
+    /// paced by hand stops a second after NODE 1 and wakes after it, with the new sound already in
+    /// the ring.
+    stops_with_the_pair: bool,
+    /// When `process()` last ran.
+    last_block: Option<Instant>,
 }
 
 /// What [`crate::AudioEngine::start`] hands the thread.
@@ -1563,6 +1608,11 @@ struct DefaultState {
     /// lane was detached or opted out. Handed back by [`hand_back_disowned_defaults`], once the
     /// GUI has had its chance to attach the lane after all ([`ListDelivery`]).
     disowned: bool,
+    /// What this engine has written to the configured key and not heard back yet, oldest first
+    /// ([`write_configured_default`]): what tells its own claims and hand-backs from a pick made
+    /// in the desktop's sound settings ([`desktop_pick`]). The server reports each change once, in
+    /// order, and nothing for a write of the value it holds, which is therefore never noted.
+    unconfirmed: VecDeque<String>,
 }
 
 /// How far the GUI has got with the device lists it is sent: whether it has had its chance to act
@@ -1851,6 +1901,10 @@ struct Shared {
     /// failed because the object had already gone. Dropped once the server has removed them, on the
     /// next supervisor tick ([`AppProbe`] says why not before), and with the session.
     retired_probes: Vec<AppProbe>,
+    /// Every link of the graph and FxSound's own sink and source, to find a stream that follows a
+    /// default FxSound holds and was linked to nothing ([`rescue_stranded_streams`]). Belongs to
+    /// the session, and is emptied with the application streams.
+    stranded: Stranded,
     /// The session defaults, one per direction.
     defaults: PerDirection<DefaultState>,
     /// Whether the GUI has had its chance to attach a lane from the device list, before a claim
@@ -1970,6 +2024,7 @@ impl Shared {
             apps: AppStreams::default(),
             app_probes: std::collections::HashMap::new(),
             retired_probes: Vec::new(),
+            stranded: Stranded::default(),
             defaults: PerDirection::default(),
             delivery: ListDelivery::default(),
             clock: GraphClock::default(),
@@ -3444,6 +3499,10 @@ fn supervise(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) {
         //     routes and back, the routes built, moved with their lane, and taken down.
         route_pairs::reconcile(&mut guard, now);
 
+        // 4c. A stream that follows a default FxSound holds and was moved onto nothing is moved
+        //     onto FxSound again.
+        rescue_stranded_streams(&mut guard, now);
+
         // 5. Tell the GUI what changed.
         publish(&mut guard);
 
@@ -3662,6 +3721,17 @@ fn on_global(
             if is_fxsound_node(name) {
                 let serial = props.get("object.serial").and_then(|s| s.parse().ok());
                 guard.apps.own_node_appeared(global.id, serial, name);
+                // The lanes' own sink and source: what a stream that follows the default is moved
+                // onto when it was linked to nothing ([`rescue_stranded_streams`]).
+                if let Some(serial) = serial
+                    && let Some(direction) = DeviceDirection::ALL
+                        .into_iter()
+                        .find(|&direction| our_node_name(direction) == name)
+                {
+                    guard
+                        .stranded
+                        .own_node_appeared(direction, global.id, serial);
+                }
                 // A route's virtual node: the serial its streams are moved onto.
                 route_pairs::node_appeared(&mut guard, global.id, serial, name);
             }
@@ -3800,6 +3870,15 @@ fn on_global(
                     );
                 }
                 Err(err) => log::debug!("could not bind card {id} to read its address: {err}"),
+            }
+        }
+        pw::types::ObjectType::Link => {
+            // Which node feeds which: how a stream that follows a default FxSound holds is found
+            // linked to nothing ([`rescue_stranded_streams`]). Both are in the global.
+            let node = |key: &str| props.get(key).and_then(|id| id.parse::<u32>().ok());
+            if let (Some(output), Some(input)) = (node("link.output.node"), node("link.input.node"))
+            {
+                guard.stranded.link_appeared(global.id, output, input);
             }
         }
         pw::types::ObjectType::Client => {
@@ -4072,12 +4151,15 @@ fn forget_app_streams(shared: &mut Shared) {
     shared.app_probes.clear();
     shared.retired_probes.clear();
     shared.apps.clear();
+    shared.stranded.forget_session();
 }
 
 fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
     let Ok(mut guard) = shared.try_borrow_mut() else {
         return;
     };
+    // A link, or anything a link can name.
+    guard.stranded.removed(id);
     // An application's stream or a client goes with its probe; a node of ours is forgotten here
     // and may still be something below — the echo canceller's source.
     match guard.apps.remove(id) {
@@ -4592,10 +4674,16 @@ fn on_metadata_property(shared: &Rc<RefCell<Shared>>, key: Option<&str>, value: 
             let lane = guard.lanes.get(direction);
             let stands_behind = lane.enabled && (lane.want_default || lane.kept_by_hand);
             let disowned = holding && lane.nodes.is_none() && !stands_behind;
+            let ready = guard.ready();
             let state = guard.defaults.get_mut(direction);
+            let own = heard_own_write(&mut state.unconfirmed, configured.as_deref());
+            let changed = state.configured != configured;
             state.holding = holding;
             state.disowned = disowned;
             state.configured = configured;
+            if ready && changed && !own {
+                desktop_pick(&mut guard, direction);
+            }
             return;
         }
     }
@@ -4670,7 +4758,130 @@ fn claim_default(shared: &mut Shared, direction: DeviceDirection) {
     }
     if write_configured_default(shared, direction, ours) {
         shared.defaults.get_mut(direction).holding = true;
+        // Every stream that follows this default is about to be moved onto FxSound, and may be
+        // moved onto it again should the move leave it linked to nothing.
+        shared.stranded.claimed();
         log::info!("FxSound is now the default {}", noun(direction));
+    }
+}
+
+/// Whether `value`, the configured key's new value, is the report of a write of this engine's
+/// still unreported ([`DefaultState::unconfirmed`]). When it is, that write and every one before it
+/// are settled: the server reports changes in the order it applies them, so an earlier write it
+/// has not reported by now changed nothing and never will be.
+fn heard_own_write(unconfirmed: &mut VecDeque<String>, value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let Some(at) = unconfirmed.iter().position(|sent| sent == value) else {
+        return false;
+    };
+    unconfirmed.drain(..=at);
+    true
+}
+
+/// Someone else — the desktop's sound settings, `wpctl set-default`, `pactl set-default-sink` —
+/// has just written the configured key of `direction` (already in [`DefaultState::configured`]):
+/// the user picked their system's default device.
+///
+/// A lane that follows the system's default device — no ranking, *Follow the system's default
+/// device* on (upstream issue #629) — takes a real device picked there as the user's own pick,
+/// as though it had been picked in FxSound: the latest word on where the lane plays. The Windows
+/// rules put an explicit choice above the session default (`devices::choose_device`, rule 4), and
+/// the device the app announces from its settings at every start is one: before this, once a
+/// device had been picked in FxSound, a desktop pick moved the lane nowhere, and left the default
+/// on the device, so every application played past FxSound — found by the 0.4.0 live check. So
+/// the lane moves to the picked device, rebuilds its pair there and takes the default back
+/// ([`apply_rules`]), or takes it back at once when it already plays there
+/// ([`reclaim_followed_default`]); the power off, it moves and leaves the default where the user
+/// put it. A lane with a ranking leaves both where they are, as the Windows rules do, and so does
+/// a lane that is off.
+///
+/// Only a change is a pick: not the value read as the connection comes up, before the rules run
+/// ([`Barrier`]); not a node of FxSound's; and not what this engine wrote itself — a claim, or a
+/// hand-back that may still be on its way when the power comes back on
+/// ([`heard_own_write`]).
+fn desktop_pick(shared: &mut Shared, direction: DeviceDirection) {
+    let Some(picked) = shared.defaults.get(direction).configured.clone() else {
+        return;
+    };
+    let lane = shared.lanes.get(direction);
+    if is_ours(&picked) || !lane.enabled || !shared.preference.get(direction).ranking.is_empty() {
+        return;
+    }
+    let memory = shared.memory.get_mut(direction);
+    if memory.user_selected != picked {
+        log::info!(
+            "{} lane: the system's default {} is now {picked}, which the lane follows",
+            direction.key(),
+            noun(direction)
+        );
+        memory.user_selected = picked;
+    }
+    shared.mark_lane_for_rules(direction);
+}
+
+/// Move onto FxSound's node, for WirePlumber to link it again, every application stream that
+/// follows a default FxSound holds and has been linked to nothing for a while (`crate::stranded`,
+/// which says why WirePlumber leaves such a stream so, and how often it is moved).
+///
+/// A direction counts while FxSound holds its default and its lane's pair is up with its node in
+/// the graph. A stream follows the default when its own properties say it does
+/// ([`AppStreams::followers`]) and the `default` metadata names no target for it: a stream on a
+/// per-application route, or one a mixer moved, is somebody's choice, and stays where it is.
+fn rescue_stranded_streams(shared: &mut Shared, now: Instant) {
+    let mut followers = Vec::new();
+    for direction in DeviceDirection::ALL {
+        if !shared.defaults.get(direction).holding
+            || shared.lanes.get(direction).nodes.is_none()
+            || shared.stranded.our_serial(direction).is_none()
+        {
+            continue;
+        }
+        followers.extend(
+            shared
+                .apps
+                .followers(direction)
+                .into_iter()
+                .filter(|&id| !route_pairs::has_target(shared, id))
+                .map(|id| (id, direction)),
+        );
+    }
+    for (id, direction) in shared.stranded.due(&followers, now) {
+        let Some(serial) = shared.stranded.our_serial(direction) else {
+            continue;
+        };
+        log::info!(
+            "{}: linked to nothing since FxSound became the default {}, so moved onto FxSound \
+             for the session manager to link it again",
+            shared
+                .apps
+                .describe(id)
+                .unwrap_or_else(|| format!("stream {id}")),
+            noun(direction)
+        );
+        route_pairs::nudge(shared, id, serial);
+    }
+}
+
+/// Take the default back when the desktop has picked, as the system's default, the very device a
+/// lane that follows the system's default already plays to.
+///
+/// With no ranking the lane follows the system's default device (upstream issue #629): picking
+/// another device in the desktop's sound settings moves the lane there, rebuilds its pair and
+/// takes the default again, so every application keeps playing through FxSound. Picking the device
+/// the lane is already on rebuilt nothing, so nothing took the default back either, and every
+/// application played straight to the device, past FxSound — found by the 0.4.0 live check, where
+/// one of three picks in a row left FxSound out of the sound. A lane with a ranking leaves the
+/// default where the user put it, as the Windows rules do, and so does one that does not want the
+/// default (the power off).
+fn reclaim_followed_default(shared: &mut Shared, direction: DeviceDirection, target: &str) {
+    let wants = shared.lanes.get(direction).want_default;
+    let follows = shared.preference.get(direction).ranking.is_empty();
+    let defaults = shared.defaults.get(direction);
+    let picked_here = !defaults.holding && defaults.current.as_deref() == Some(target);
+    if wants && follows && picked_here {
+        claim_default(shared, direction);
     }
 }
 
@@ -4769,7 +4980,11 @@ fn release_all_defaults(shared: &mut Shared) -> bool {
 
 /// Write `default.configured.audio.sink` / `.source` — never `default.audio.*`, which is
 /// WirePlumber's to own (`docs/spec/12-audio-io.md` §21.6).
-fn write_configured_default(shared: &Shared, direction: DeviceDirection, node_name: &str) -> bool {
+fn write_configured_default(
+    shared: &mut Shared,
+    direction: DeviceDirection,
+    node_name: &str,
+) -> bool {
     let Some(metadata) = shared.session.as_ref().and_then(|s| s.metadata.as_ref()) else {
         log::warn!(
             "no `default` metadata object (a bare pipewire with no session manager?); \
@@ -4783,8 +4998,21 @@ fn write_configured_default(shared: &Shared, direction: DeviceDirection, node_na
         Some("Spa:String:JSON"),
         Some(&devices::default_node_value(node_name)),
     );
+    let state = shared.defaults.get_mut(direction);
+    // A write of what the key holds changes nothing, and the server reports nothing for it.
+    if state.configured.as_deref() != Some(node_name) {
+        if state.unconfirmed.len() == UNCONFIRMED_DEFAULTS {
+            state.unconfirmed.pop_front();
+        }
+        state.unconfirmed.push_back(node_name.to_owned());
+    }
     true
 }
+
+/// How many writes of the configured key [`DefaultState::unconfirmed`] keeps: a claim and a
+/// hand-back each way with room to spare. The server reports every one in a moment; one that
+/// never comes back is dropped for the next rather than held against the user's picks for ever.
+const UNCONFIRMED_DEFAULTS: usize = 8;
 
 // ---------------------------------------------------------------------------------------------
 // Device selection and node creation, per lane
@@ -5055,6 +5283,7 @@ fn apply_rules(shared: &mut Shared, direction: DeviceDirection) {
     if already {
         // Nothing to do. An error this lane reported is forgotten once its pair has proved
         // itself (`Lane::forgive_if_stable`), not because the rules ran again in the meantime.
+        reclaim_followed_default(shared, direction, &target.name);
         return;
     }
 
@@ -5255,10 +5484,7 @@ fn build_nodes(
             log::debug!("{first_name}: {new:?}");
             data.status.first_node_moved(&new);
             if passive && matches!(new, StreamState::Paused) {
-                // The pair stopped as one — a passive device-facing stream stops in the same cycle
-                // as the rest of its group — and what NODE 2 had not taken from the ring yet is the
-                // tail of a sound, or of a recording, that has ended (module docs, "Idle").
-                data.ring.mark_stale();
+                first_node_went_idle(data);
             }
             if let Some(wake) = &wake {
                 // Only fails once the main loop is gone, and then there is nothing left to pace.
@@ -5341,6 +5567,8 @@ fn build_nodes(
         channels: 0,
         scratch: vec![0.0; MAX_QUANTUM_FRAMES * MAX_CHANNELS as usize],
         volume: (direction == DeviceDirection::Input).then(|| Arc::clone(&lane.volume)),
+        stops_with_the_pair: passive,
+        last_block: None,
     };
     let second_listener = second
         .add_local_listener_with_user_data(second_data)
@@ -6318,6 +6546,55 @@ fn parse_audio_format(
     Some((rate, channels))
 }
 
+/// NODE 1 of a pair whose NODE 2 is passive has paused: the pair stopped as one — a passive
+/// device-facing stream stops in the same cycle as the rest of its group — and what NODE 2 had not
+/// taken from the ring yet is the tail of a sound, or of a recording, that has ended (module docs,
+/// "Idle"). So the ring skips it, and the next sound fades in from silence over the first block
+/// NODE 1 processes, as a new pair's first sound does (`crate::lane_dsp`, "After the chain").
+///
+/// The next sound is not always one that starts from silence. An application whose stream is
+/// moved onto FxSound mid-sound — every stream that follows the default, when the power comes
+/// back on and FxSound takes the default again — used to arrive after the ring's priming at full
+/// level between two samples: measured through the release build on a private PipeWire, a 100 Hz
+/// tone at −12 dBFS popped at −5 dBFS (high-passed at 2 kHz) on the speakers.
+fn first_node_went_idle(data: &SinkData) {
+    data.ring.mark_stale();
+    data.fade_next.store(true, Ordering::Release);
+}
+
+/// How long NODE 1 may go without a sound before the next one counts as a new sound: well past
+/// the longest quantum a server runs at — 8192 frames, 171 ms at 48 kHz — and four blocks of the
+/// one it runs at now.
+const STOOD_STILL: Duration = Duration::from_millis(250);
+
+/// Whether NODE 1, about to process a block of `frames` at `rate` with sound in it after `gap`
+/// without one — no block at all, or only digital silence — is starting a new sound: then it is
+/// [`first_node_went_idle`] after all, done on the data thread, before the block is pushed.
+///
+/// A pair does not always hear that it stopped, and a stream does not always start from silence.
+/// When the power goes off, every stream that follows the default is moved off FxSound's sink;
+/// when it comes back on they are moved back, in the middle of whatever they play, and NODE 1
+/// first runs on the silence the sink mixes while nothing is linked to it, then on the stream. The
+/// first block with the stream in it was played at full level between two samples: measured in
+/// the 0.4.0 live check, a 100 Hz tone at −12 dBFS popped at −5 dBFS on the speakers, high-passed
+/// at 2 kHz, and the stream was never told `Paused` in between. So the first sound after a quarter
+/// of a second without one fades in, whatever woke the pair — at the cost of a 30 ms fade in on a
+/// track that starts hard after that much digital silence.
+fn woke_after_standing_still(gap: Duration, frames: usize, rate: u32) -> bool {
+    let block_nanos = (frames as u64).saturating_mul(1_000_000_000) / u64::from(rate.max(1));
+    gap > STOOD_STILL.max(Duration::from_nanos(block_nanos.saturating_mul(4)))
+}
+
+/// Whether a block of `f32` samples, as the stream hands them over, holds anything but digital
+/// silence: a sample other than `+0.0` or `-0.0`. A quantum's block is a few kilobytes to look at.
+fn holds_sound(bytes: &[u8]) -> bool {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|sample| u32::from_le_bytes(*sample) & 0x7fff_ffff != 0)
+}
+
 /// NODE 1's `process()`: everything an application rendered into FxSound — or everything the
 /// microphone produced — DSP'd in place and pushed to the ring.
 ///
@@ -6352,6 +6629,22 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
         // channels is no format yet, or one the ring was not built for ([`adopt_sink_format`]).
         return;
     }
+    let has_sound = chunk_data
+        .data()
+        .and_then(|bytes| bytes.get(offset..offset.saturating_add(size)))
+        .is_some_and(holds_sound);
+    if has_sound {
+        let now = Instant::now();
+        if let Some(last) = data.last_sound.replace(now)
+            && woke_after_standing_still(
+                now.saturating_duration_since(last),
+                size / (channels * size_of::<f32>()),
+                data.format.rate(),
+            )
+        {
+            first_node_went_idle(data);
+        }
+    }
     let Some(dsp) = data.dsp.as_mut() else {
         return;
     };
@@ -6369,6 +6662,10 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
     // level fades in from silence, as a new pair's does.
     if fades != data.fades_seen {
         data.fades_seen = fades;
+        dsp.fade_in();
+    }
+    // The pair stood still, and this is the first block of whatever woke it.
+    if data.fade_next.swap(false, Ordering::Acquire) {
         dsp.fade_in();
     }
 
@@ -6416,6 +6713,23 @@ fn on_output_process(stream: &pw::stream::Stream, data: &mut OutData) {
     let Some(chunk_data) = buffer.datas_mut().first_mut() else {
         return;
     };
+
+    // A pair that stood still wakes with the cushion of the sound before it in the ring. NODE 1
+    // marks it stale if it runs first in the cycle that wakes them, and then only what it marked
+    // is skipped, not the block of the new sound it pushed after it; if this node runs first, it
+    // drops the cushion itself.
+    let now = Instant::now();
+    if let Some(last) = data.last_block.replace(now)
+        && data.stops_with_the_pair
+        && !data.ring.stale_pending()
+        && woke_after_standing_still(
+            now.saturating_duration_since(last),
+            requested.max(1),
+            data.format.rate(),
+        )
+    {
+        data.ring.skip_all();
+    }
 
     let channels = data.channels;
     let stride = channels * std::mem::size_of::<f32>();
@@ -6698,6 +7012,73 @@ mod tests {
         )
     }
 
+    #[test]
+    fn the_report_of_a_write_of_ours_settles_it_and_every_one_before_it() {
+        let mut unconfirmed: VecDeque<String> = [
+            "alsa_output.speakers",
+            SINK_NODE_NAME,
+            "alsa_output.speakers",
+        ]
+        .map(str::to_owned)
+        .into();
+        // A hand-back and a claim on a quick power toggle, and another hand-back.
+        assert!(heard_own_write(
+            &mut unconfirmed,
+            Some("alsa_output.speakers")
+        ));
+        assert_eq!(unconfirmed.len(), 2);
+        // The claim's report never came (it changed nothing): the later hand-back's settles both.
+        assert!(heard_own_write(
+            &mut unconfirmed,
+            Some("alsa_output.speakers")
+        ));
+        assert!(unconfirmed.is_empty());
+        // Nothing of ours on its way: somebody else's.
+        assert!(!heard_own_write(
+            &mut unconfirmed,
+            Some("alsa_output.speakers")
+        ));
+        assert!(!heard_own_write(&mut unconfirmed, None));
+    }
+
+    #[test]
+    fn a_desktop_pick_is_the_lanes_pick_only_for_a_lane_that_follows_the_system_and_is_on() {
+        const PICKED: &str = "alsa_output.usb-headphones";
+        let picked = |ranked: bool, direction: DeviceDirection, name: &str| {
+            let mut shared = shared_for_tests();
+            shared.memory.get_mut(direction).user_selected = "alsa_saved".to_owned();
+            if ranked {
+                shared.preference.get_mut(direction).ranking = vec!["alsa_saved".to_owned()];
+            }
+            shared.defaults.get_mut(direction).configured = Some(name.to_owned());
+            desktop_pick(&mut shared, direction);
+            (
+                shared.memory.get(direction).user_selected.clone(),
+                shared.lanes.get(direction).needs_rules,
+            )
+        };
+        // Following, the output lane on: the pick is the lane's, and its rules run on it.
+        assert_eq!(
+            picked(false, DeviceDirection::Output, PICKED),
+            (PICKED.to_owned(), true)
+        );
+        // A ranking decides instead, as on Windows.
+        assert_eq!(
+            picked(true, DeviceDirection::Output, PICKED).0,
+            "alsa_saved"
+        );
+        // FxSound's own node is no pick of a device.
+        assert_eq!(
+            picked(false, DeviceDirection::Output, SINK_NODE_NAME).0,
+            "alsa_saved"
+        );
+        // The input lane starts off, and a lane that is off is moved by nothing.
+        assert_eq!(
+            picked(false, DeviceDirection::Input, "alsa_input.usb-mic"),
+            ("alsa_saved".to_owned(), false)
+        );
+    }
+
     /// A thread between pairs of nodes: both lanes' DSP state is on the main loop.
     fn shared_with_dsp_for_tests() -> Shared {
         let (notify, _) = crossbeam_channel::unbounded();
@@ -6935,6 +7316,25 @@ mod tests {
             out, [-0.25; 8],
             "the tail of the last sound was played to the next one"
         );
+    }
+
+    #[test]
+    fn a_consumer_that_stood_still_skips_the_cushion_and_primes_again() {
+        let ring = SampleRing::new();
+        ring.reconfigure(2, 4);
+        // Primed and playing: a cushion is left in it when the pair stops.
+        ring.push(&[0.5; 12]);
+        let mut out = [0.0; 4];
+        assert_eq!(ring.pop(&mut out), 4);
+        ring.skip_all();
+        assert_eq!(ring.pop(&mut out), 0, "the old cushion is not played");
+        assert_eq!(out, [0.0; 4]);
+        // The new sound primes again before it is heard, and is heard whole.
+        ring.push(&[0.25; 4]);
+        assert_eq!(ring.pop(&mut out), 0, "not primed yet");
+        ring.push(&[0.25; 8]);
+        assert_eq!(ring.pop(&mut out), 4);
+        assert_eq!(out, [0.25; 4]);
     }
 
     /// The mark records a position, not "whatever is in the ring": a pair that stopped with the
@@ -12982,6 +13382,64 @@ mod tests {
                 "{port}"
             );
         }
+    }
+
+    #[test]
+    fn digital_silence_of_either_sign_is_no_sound_and_the_quietest_sample_is() {
+        let bytes =
+            |samples: &[f32]| -> Vec<u8> { samples.iter().flat_map(|s| s.to_le_bytes()).collect() };
+        assert!(!holds_sound(&bytes(&[0.0; 64])));
+        assert!(!holds_sound(&bytes(&[0.0, -0.0, 0.0, -0.0])));
+        assert!(holds_sound(&bytes(&[0.0, 0.0, f32::MIN_POSITIVE, 0.0])));
+        assert!(holds_sound(&bytes(&[0.0, -1.0e-30])));
+        assert!(!holds_sound(&[]));
+    }
+
+    #[test]
+    fn a_sound_after_a_quarter_second_without_one_is_new_and_one_a_quantum_after_the_last_is_not() {
+        let at = |ms| Duration::from_millis(ms);
+        assert!(
+            !woke_after_standing_still(at(21), 1_024, 48_000),
+            "one quantum"
+        );
+        assert!(
+            !woke_after_standing_still(at(180), 8_192, 48_000),
+            "the longest quantum"
+        );
+        assert!(
+            !woke_after_standing_still(at(600), 8_192, 48_000),
+            "four of the longest quanta"
+        );
+        assert!(woke_after_standing_still(at(260), 1_024, 48_000));
+        assert!(
+            woke_after_standing_still(at(3_000), 1_024, 48_000),
+            "a power off"
+        );
+        assert!(
+            !woke_after_standing_still(at(3_000), 1_024, 0),
+            "no rate yet: never, and no panic"
+        );
+    }
+
+    #[test]
+    fn a_pair_that_went_idle_skips_the_last_sound_and_fades_the_next_one_in() {
+        let mut shared = shared_with_dsp_for_tests();
+        let dsp = shared.lanes.output.dsp.take().expect("on the main loop");
+        let data = SinkData::new(&shared, dsp);
+        let lane_fades = data.volume.fades();
+        first_node_went_idle(&data);
+        assert!(data.ring.stale_pending(), "the tail is skipped");
+        assert!(
+            data.fade_next.load(Ordering::Acquire),
+            "a fade in is due on NODE 1's next block"
+        );
+        assert_eq!(
+            data.volume.fades(),
+            lane_fades,
+            "and on this pair's alone: the lane's routes share its volume"
+        );
+        drop(data);
+        drain_recycled_dsp(&mut shared);
     }
 
     #[test]

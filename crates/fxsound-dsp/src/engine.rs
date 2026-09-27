@@ -48,9 +48,15 @@
 //! or out over the same 20 ms, mixing its output with the audio it was given, for the same reason: with 62.5 Hz at +6 dB under a
 //! 50 Hz tone at 0.3, switching the equalizer off moved the waveform by 0.143 between two samples,
 //! and now by no more than the tone moves on its own.
-//! The power switch is the one control that still acts between two samples: it is the listener's
-//! A/B against the unprocessed sound, and a bypass that faded would mix the processed signal, a
-//! look-ahead behind, with the dry one for 20 ms. Switched back on, the equalizer starts from
+//! The power switch cannot glide: it is the listener's A/B against the unprocessed sound, and a
+//! bypass that crossfaded would mix the processed signal, a look-ahead behind, with the dry one
+//! for 20 ms. It used to act between two samples instead, and that was a click: measured through
+//! the release build on a private PipeWire, a 100 Hz tone at −12 dBFS on a stream that stays on
+//! FxSound's sink stepped by up to −5 dBFS, high-passed at 2 kHz. So it dips
+//! ([`crate::smooth::Dip`]): the sound fades out over 10 ms on the old side of the switch, the
+//! switch is made in silence, and the other side fades in over 10 ms — after the look-ahead's
+//! worth of silence the effect chain holds when it starts again, going on. Nothing is mixed, and
+//! the comparison is still 20 ms from the press. Switched back on, the equalizer starts from
 //! rest, as it does when its own switch comes back on and as the effects do (audit report #10):
 //! its sections stood still while FxSound was off, and resuming them played what they held from
 //! before into whatever came next. The leveller resumes its gain, as the original's does.
@@ -63,7 +69,7 @@ use crate::biquad::Real;
 use crate::effects::{Chain, MAX_BLOCK_FRAMES};
 use crate::eq::GraphicEq;
 use crate::leveller::VolumeLeveller;
-use crate::smooth::{Ramp, glide_frames};
+use crate::smooth::{Dip, Ramp, dip_frames, glide_frames};
 use crate::spectrum::SpectrumAnalyser;
 use fxsound_core::messages::{DspEvent, DspParams, Meters};
 
@@ -166,6 +172,11 @@ pub struct Engine {
 
     /// Cached so a snapshot that did not change a value does not force a redesign.
     applied: DspParams,
+    /// A snapshot that moves the power switch, waiting for [`Self::dip`] to close before it lands
+    /// (see the module documentation).
+    pending: Option<DspParams>,
+    /// The fade out and back in around the power switch.
+    dip: Dip,
     /// Samples processed per channel since the last reset, for the "audio processed" counter.
     processed_samples: u64,
     peak_left: Real,
@@ -205,6 +216,8 @@ impl Engine {
             eq_block: Ramp::new(1.0),
             dry: DryCopy::new(),
             applied: DspParams::default(),
+            pending: None,
+            dip: Dip::new(dip_frames(sample_rate)),
             processed_samples: 0,
             peak_left: 0.0,
             peak_right: 0.0,
@@ -243,6 +256,7 @@ impl Engine {
         self.leveller.set_sample_rate(sample_rate);
         self.chain.set_sample_rate(sample_rate);
         self.spectrum.set_sample_rate(sample_rate);
+        self.dip.set_length(dip_frames(sample_rate));
         self.refresh_sides();
         self.reset();
     }
@@ -304,11 +318,49 @@ impl Engine {
     }
 
     /// Adopt a parameter snapshot, skipping anything that has not changed.
+    ///
+    /// A snapshot that moves the power switch waits for the dip to close once audio has gone
+    /// through (see the module documentation); a later snapshot takes its place, so only the
+    /// newest lands, and one that puts the switch back lands at once and fades the sound back in
+    /// from wherever the fade out had got to. Everything else lands at once and glides.
     pub fn apply(&mut self, params: &DspParams) {
-        if *params == self.applied {
+        let wanted = self.pending.as_ref().unwrap_or(&self.applied);
+        if params == wanted {
             return;
         }
+        if self.heard && params.power != self.applied.power {
+            self.pending = Some(*params);
+            self.dip.close();
+            return;
+        }
+        if self.pending.take().is_some() {
+            self.dip.open(0);
+        }
         self.apply_unconditionally(params);
+    }
+
+    /// The snapshot the engine runs on once a power switch waiting for its dip has landed.
+    #[must_use]
+    pub fn params(&self) -> &DspParams {
+        self.pending.as_ref().unwrap_or(&self.applied)
+    }
+
+    /// Make the power switch a closed dip was waiting for, and open it again: after the effect
+    /// chain's look-ahead when it comes back on, since the chain starts again from rest and holds
+    /// that much silence before the first sample it was given.
+    fn land_pending(&mut self) {
+        let Some(params) = self.pending.take() else {
+            self.dip.open(0);
+            return;
+        };
+        let powering_on = params.power && !self.applied.power;
+        self.apply_unconditionally(&params);
+        let hold = if powering_on {
+            u32::try_from(self.chain.latency_frames()).unwrap_or(u32::MAX)
+        } else {
+            0
+        };
+        self.dip.open(hold);
     }
 
     fn apply_unconditionally(&mut self, params: &DspParams) {
@@ -385,8 +437,13 @@ impl Engine {
     }
 
     /// Clear every filter's history. A glide under way lands, and until audio goes through again
-    /// a new value lands at once.
+    /// a new value lands at once. So does a power switch waiting for its dip: with the history
+    /// gone there is nothing to fade out of.
     pub fn reset(&mut self) {
+        if let Some(params) = self.pending.take() {
+            self.apply_unconditionally(&params);
+        }
+        self.dip.settle();
         self.eq.reset();
         self.leveller.reset();
         self.chain.reset();
@@ -428,6 +485,36 @@ impl Engine {
         }
         self.heard = true;
 
+        if self.dip.is_open() {
+            self.process_part(buffer, channels);
+        } else {
+            // Split where a closing dip reaches silence, so the power switch lands on exactly that
+            // frame, and dip each part.
+            let frames = buffer.len() / channels;
+            let mut done = 0;
+            while done < frames {
+                if self.dip.is_closed() {
+                    self.land_pending();
+                }
+                let end = match self.dip.frames_to_closed() {
+                    Some(left) if left > 0 => done.saturating_add(left).min(frames),
+                    _ => frames,
+                };
+                let Some(part) = buffer.get_mut(done * channels..end * channels) else {
+                    break;
+                };
+                self.process_part(part, channels);
+                self.dip.process(part, channels);
+                done = end;
+            }
+        }
+
+        self.spectrum.push(buffer, channels);
+        self.measure(buffer, channels);
+    }
+
+    /// The chain over one stretch of a block, on the settings that apply to all of it.
+    fn process_part(&mut self, buffer: &mut [f32], channels: usize) {
         let block_runs = self.eq_block_runs();
         // The master gain and the balance, on every path: powered or not, equalizer on or off
         // (audit report R3; the module documentation has the original's version and why it is
@@ -464,9 +551,6 @@ impl Engine {
             buffer.fill(0.0);
             self.reset();
         }
-
-        self.spectrum.push(buffer, channels);
-        self.measure(buffer, channels);
     }
 
     /// Whether the GraphicEq block plays: the equalizer is on, or its switch is still fading the
@@ -1262,6 +1346,95 @@ mod tests {
             .iter()
             .flat_map(|frame| [frame[0] * left, frame[1] * right])
             .collect()
+    }
+
+    /// A phase-continuous stereo tone at `hz` and `amplitude`, from frame `start`.
+    fn stereo_tone_at(hz: f64, start: usize, frames: usize, amplitude: f32) -> Vec<f32> {
+        (start..start + frames)
+            .flat_map(|n| {
+                let value = (f64::from(amplitude)
+                    * (std::f64::consts::TAU * hz * n as f64 / 48_000.0).sin())
+                    as f32;
+                [value, value]
+            })
+            .collect()
+    }
+
+    /// The largest second difference of the left channel: a step of `d` between two samples is a
+    /// second difference of about `d`.
+    fn worst_left_corner(buffer: &[f32]) -> f32 {
+        let left: Vec<f32> = buffer.iter().step_by(2).copied().collect();
+        left.windows(3)
+            .map(|w| (w[2] - 2.0 * w[1] + w[0]).abs())
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn the_power_switch_dips_under_a_bass_tone_rather_than_stepping() {
+        // The live check's defect: a 100 Hz tone at -12 dBFS on a stream that stays on FxSound's
+        // sink, under the E6 preset (Movies with the 116 Hz band at +9 dB), stepped the speakers
+        // by up to -5 dBFS high-passed at 2 kHz on every press of the power button. The processed
+        // and the bypassed sound are a look-ahead apart and several decibels, so the switch dips.
+        let mut on = DspParams::default();
+        on.set_effect(EffectId::Fidelity, 0.4);
+        on.set_effect(EffectId::Bass, 0.6);
+        on.band_boost_db[1] = 9.0;
+        let off = DspParams { power: false, ..on };
+        let mut engine = Engine::new(48_000.0, 1_024, 2);
+        engine.apply(&on);
+        let block = 1_024;
+        let mut frame = 0;
+        let mut run = |engine: &mut Engine, blocks: usize| {
+            let mut out = Vec::new();
+            for _ in 0..blocks {
+                let mut buffer = stereo_tone_at(100.0, frame, block, 0.25);
+                engine.process(&mut buffer, 2);
+                out.extend_from_slice(&buffer);
+                frame += block;
+            }
+            out
+        };
+        let powered = run(&mut engine, 48);
+        engine.apply(&off);
+        assert!(engine.params() == &off, "the switch is on its way");
+        let bypassed = run(&mut engine, 10);
+        engine.apply(&on);
+        let back = run(&mut engine, 10);
+
+        // A step between two samples is a corner the size of the step: the switch used to make
+        // one of 0.3 to 0.9 here. What is left is the tone's own curve, 0.00017 at the preset's
+        // level, and on the way back on Dynamic Boost's limiter catching the chain as it starts
+        // again from rest, a few thousandths: under a hundredth, -40 dBFS, the live check's limit.
+        let steady = worst_left_corner(&powered[powered.len() / 2..]);
+        assert!(steady < 0.001);
+        for (what, around) in [
+            (
+                "off",
+                [&powered[powered.len() - 4..], &bypassed[..]].concat(),
+            ),
+            ("on", [&bypassed[bypassed.len() - 4..], &back[..]].concat()),
+        ] {
+            let corner = worst_left_corner(&around);
+            assert!(corner < 0.01, "switching {what}: a corner of {corner}");
+        }
+        // Each side of the switch is heard in full once the dip is over.
+        let level = |buffer: &[f32]| buffer.iter().fold(0.0_f32, |a, s| a.max(s.abs()));
+        assert!((level(&bypassed[bypassed.len() / 2..]) - 0.25).abs() < 0.01);
+        assert!(level(&back[back.len() / 2..]) > 0.3, "the preset is back");
+    }
+
+    #[test]
+    fn a_power_switch_before_any_audio_lands_at_once() {
+        let mut engine = Engine::new(48_000.0, 1_024, 2);
+        let off = DspParams {
+            power: false,
+            ..DspParams::default()
+        };
+        engine.apply(&off);
+        let input = stereo_tone_at(100.0, 0, 256, 0.25);
+        let mut buffer = input.clone();
+        engine.process(&mut buffer, 2);
+        assert_same_bits(&buffer, &input, "bypassed from the first sample");
     }
 
     #[test]

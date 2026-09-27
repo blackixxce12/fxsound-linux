@@ -284,8 +284,8 @@ session bus, for anything that would rather hold a connection than start a proce
 busctl --user call org.fxsound.FxSound /org/fxsound/FxSound org.fxsound.FxSound SetPreset s Music
 busctl --user call org.fxsound.FxSound /org/fxsound/FxSound org.fxsound.FxSound \
     Apply as 2 -- --preset=Music --set_effect=bass:7.5
-busctl --user --auto-start=no get-property org.fxsound.FxSound /org/fxsound/FxSound \
-    org.fxsound.FxSound Power
+busctl --user --auto-start=no call org.fxsound.FxSound /org/fxsound/FxSound \
+    org.freedesktop.DBus.Properties Get ss org.fxsound.FxSound Power
 busctl --user monitor org.fxsound.FxSound
 ```
 
@@ -294,8 +294,10 @@ Each method does what its option does — `TogglePower`, `SetPreset`, `SetOutput
 line and answers with what it printed. Properties carry the power, the edited lane's preset, both
 lanes' devices and the edit direction, and signals say when they change. A call with no FxSound
 running starts it in the tray, through the systemd user unit, so anything that only reads — a bar
-module above all — should ask the bus not to (`busctl --auto-start=no`, or the `NO_AUTO_START`
-flag), or it brings FxSound back seconds after you quit it. The command line keeps to its own socket
+module above all — should ask the bus not to (`busctl --auto-start=no call`, or the `NO_AUTO_START`
+flag), or it brings FxSound back seconds after you quit it. Read a property with `call` and
+`org.freedesktop.DBus.Properties Get`, as above: `busctl get-property` and `busctl introspect`
+start FxSound whatever `--auto-start` says (systemd 262). The command line keeps to its own socket
 and works without a session bus.
 
 `fxsound --self-test` checks an installation without a display, a session or a sound server —
@@ -606,8 +608,11 @@ Each of these is a considered decision, not an oversight:
   both front channels; the volume levelling keeps deep bass clean, reacts at one speed whatever
   buffer size PipeWire runs at and lifts the subwoofer too; the balance on 5.1 and 7.1 turns down a
   whole side; an effect or band switched back on starts clean; the twenty-band equalizer's bands sit
-  every half octave; and a slider, a preset change or the EQ switch glides over about 20 ms instead
-  of clicking. No shipped preset was re-voiced, and each genre preset still ranks where it did for
+  every half octave; a slider, a preset change or the EQ switch glides over about 20 ms instead
+  of clicking; the power button, and on a microphone a preset change or a stage switched in or out,
+  dips out and back in over 20 ms instead of stepping; and a sound moved onto FxSound in the middle
+  of a note — every application, when the power comes back on — fades in instead of starting at
+  full level. No shipped preset was re-voiced, and each genre preset still ranks where it did for
   its genre.
 - **No update check and no telemetry.** Nothing contacts the network; updates come from your package
   manager. The Windows keys for the update check, the hotkey chords, the window position and
@@ -688,7 +693,9 @@ Each of these is a considered decision, not an oversight:
   Microphone's list of microphones, a port addition) picks the device as the Windows build's does:
   every device seen joins it, at the bottom or, with *Prioritize new output devices*, at the top.
   *Follow the system's default device*, which the Windows build does not have (its issue #629),
-  hands that choice back to the desktop's sound settings and keeps the list for later. A device that
+  hands that choice back to the desktop's sound settings and keeps the list for later: a device
+  picked there moves the lane and FxSound stays the default, even after a device was picked in
+  FxSound. A device that
   is not connected has a ✕ beside it that forgets it and the preset it remembers, and
   `fxsound --forget-device=NAME` (D-Bus `ForgetDevice`) does the same from a script. With no
   FxSound running it forgets the name from the settings file and exits, without starting FxSound.

@@ -128,9 +128,12 @@ All notable changes to the FxSound Linux port. The format follows
   the wake-up never be announced, the sound returns after a minute awake. No sleep inhibitor is
   ever held.
 - **Every change glides.** Master gain, balance, the effects, the equalizer's bands and filter
-  width, the band count, the EQ switch, a preset change and a lane's mute now move over about
-  20 ms instead of in one sample, so moving a slider no longer clicks or zips. The settled sound
-  is the same, and the power button still acts at once.
+  width, the band count, the EQ switch, a preset change, a lane's mute and the microphone's makeup
+  gain now move over about 20 ms instead of in one sample, so moving a slider no longer clicks or
+  zips. What cannot glide dips: the power button, and on a microphone a preset change or the
+  denoiser, the high-pass, the gate, the equalizer, the de-esser or the compressor switched in or
+  out, fade the sound out over 10 ms, switch in silence and fade back in over 10 ms. The settled
+  sound is the same.
 - **The equalizer's curve is the response that plays**, filter width and neighbouring bands adding
   up included, where the Windows build joins the band values with straight lines.
 - **The first and last bands turn both ways** on five and ten bands, reaching half a band past the
@@ -215,6 +218,32 @@ All notable changes to the FxSound Linux port. The format follows
 - **Effects and bands start clean.** Switching Ambience, Bass or Fidelity off and on no longer
   replays up to 150 ms of old music or clicks, and a band back from 0 dB, the EQ switch and the
   power button no longer thump with bass heard before they were switched off.
+- **The power button and the microphone's presets no longer click.** Under a steady tone, the power
+  button stepped the speakers by up to -5 dBFS (high-passed at 2 kHz) for an application that
+  stays on FxSound's sink, and a voice preset change or the voice equalizer's switch stepped the
+  recording by up to -21 dBFS; now the power button stays at or under -48 dBFS and the voice
+  presets under -70 dBFS. An application moved back onto FxSound when the power comes on, in the
+  middle of a note, fades in instead of starting at full level after the ring's priming (it
+  popped at -5 dBFS), as does any sound after a quarter of a second of digital silence. What is
+  left on a power toggle, about -19 to -26 dBFS, is WirePlumber moving the stream between FxSound
+  and the device, the same as moving it between two devices without FxSound.
+- **Following the system's default device no longer loses FxSound.** Once a device had been
+  picked in FxSound, a device picked in the desktop's sound settings moved nothing, and the
+  default stayed on it, so every application played past FxSound; now the lane follows the
+  desktop's pick and FxSound takes the default back, also when the desktop picks the very device
+  FxSound is playing to.
+- **An application recording from the default source records FxSound again after the power
+  button.** Now and then WirePlumber moved such a recorder from the microphone back onto FxSound
+  (Input) and linked it to nothing, and it recorded nothing until the default changed again (3 to
+  6 of 9 quick toggles in the live check); FxSound now finds a stream it took over that was left
+  unlinked and has WirePlumber link it again within about a second.
+- The README and the manual page told a status bar to read a property with `busctl --user
+  --auto-start=no get-property`, which starts FxSound anyway (systemd 262's `busctl` honours the
+  flag only for `call`); they now read it with `busctl --user --auto-start=no call …
+  org.freedesktop.DBus.Properties Get ss org.fxsound.FxSound Power`.
+- The terminal and the journal no longer get six lines of the D-Bus library's authentication
+  handshake, raw bytes and all, for every desktop notification and every bus connection:
+  FxSound logs the bus library's warnings and errors only, unless `RUST_LOG` says otherwise.
 - An equalizer band set below 20 Hz, which only a hand-made or imported preset can do, raised the
   whole spectrum by its gain; it now lifts only the deep bass around it.
 - The balance on 5.1 and 7.1 turned down only the front speaker of a side; it turns down the whole

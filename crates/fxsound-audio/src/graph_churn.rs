@@ -69,6 +69,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 mod apps;
+mod policy;
 mod routes;
 mod sleep;
 mod volume;
@@ -144,6 +145,16 @@ impl PrivateGraph {
     /// [`Self::start`] or [`Self::start_with_cards`], saying why when there is no daemon to be
     /// had.
     fn spawn(tag: &str, cards: bool) -> Result<Self, String> {
+        let config = if cards {
+            card_config()
+        } else {
+            CONFIG.to_owned()
+        };
+        Self::spawn_with(tag, &config, cards)
+    }
+
+    /// [`Self::spawn`] with `config` for the daemon's configuration file.
+    fn spawn_with(tag: &str, config: &str, cards: bool) -> Result<Self, String> {
         if !installed("pipewire") {
             return Err("pipewire is not installed".to_owned());
         }
@@ -163,11 +174,6 @@ impl PrivateGraph {
         let dir = ScratchDir::for_sockets(&format!("t-{tag}"));
         let run = dir.join("run");
         let conf = dir.join("pipewire.conf");
-        let config = if cards {
-            card_config()
-        } else {
-            CONFIG.to_owned()
-        };
         std::fs::create_dir_all(&run)
             .and_then(|()| std::fs::File::create(&conf))
             .and_then(|mut file| file.write_all(config.as_bytes()))
@@ -1897,6 +1903,257 @@ fn the_session_defaults_outrank_the_settings_file_and_are_remembered_per_lane() 
         Some("t_mic"),
         "the default source should go back to the microphone that was picked, not stay ours"
     );
+}
+
+/// Following the system's default (the engine's own start, with no ranking), the desktop picking
+/// as its default the very sink the output lane already plays to hands FxSound the default back, as
+/// picking any other sink does by moving the lane. The 0.4.0 live check found the default left on
+/// the real device in that one case, and every application playing past FxSound.
+#[test]
+fn a_desktop_that_picks_the_device_a_following_lane_is_on_leaves_fxsound_the_default() {
+    let Some(graph) = PrivateGraph::start("refollow") else {
+        return;
+    };
+    let Some(seeded) = unless_skipped(
+        graph.seed_default(DeviceDirection::Output, "t_stereo"),
+        "pw-metadata",
+        "whether a following lane takes the default back",
+    ) else {
+        return;
+    };
+    assert_eq!(seeded, Ok(()));
+    let handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+    assert_eq!(
+        graph.default_settles_on(DeviceDirection::Output, SINK_NODE_NAME),
+        Some(Ok(()))
+    );
+
+    // What WirePlumber derives from FxSound's claim, which nothing here does by itself; then what
+    // a desktop's sound settings write when the user picks the speakers FxSound plays to.
+    graph.write_default(
+        devices::default_key(DeviceDirection::Output),
+        SINK_NODE_NAME,
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    graph.seed_default(DeviceDirection::Output, "t_stereo");
+    assert_eq!(
+        graph.default_settles_on(DeviceDirection::Output, SINK_NODE_NAME),
+        Some(Ok(())),
+        "the default was left on the speakers, past FxSound"
+    );
+    said.settle(&handle);
+    assert_eq!(
+        said.attachments(DeviceDirection::Output).last(),
+        Some(&Some("t_stereo".to_owned())),
+        "the lane stays where it was"
+    );
+
+    // With a ranking the lane does not follow the desktop, and the default stays the user's.
+    handle.send(UiToAudio::SetDevicePriority {
+        direction: DeviceDirection::Output,
+        names: vec!["t_stereo".to_owned(), "t_71".to_owned()],
+        new_devices_first: false,
+    });
+    said.settle(&handle);
+    graph.write_default(
+        devices::default_key(DeviceDirection::Output),
+        SINK_NODE_NAME,
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    graph.seed_default(DeviceDirection::Output, "t_stereo");
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        graph.configured_default(DeviceDirection::Output).as_deref(),
+        Some("t_stereo"),
+        "a ranked lane took back a default the user had moved"
+    );
+    handle.shutdown();
+}
+
+/// Following the system's default, with a device once picked in FxSound — the saved device the
+/// app announces to the engine as the lane's pick at every start — the desktop picking another
+/// sink as the system's default moves the lane there and hands FxSound the default back, pick after
+/// pick. The 0.4.0 live check found the lane staying on the saved device, the Windows rules'
+/// explicit choice, and the default left on the device the desktop picked: every application
+/// played past FxSound.
+#[test]
+fn a_saved_pick_does_not_keep_a_following_lane_from_the_sinks_the_desktop_picks() {
+    let Some(graph) = PrivateGraph::start("pickfollow") else {
+        return;
+    };
+    let Some(()) = unless_skipped(
+        graph.add_device("t_third", DeviceDirection::Output),
+        "pw-cli",
+        "whether a following lane goes where the desktop picks",
+    ) else {
+        return;
+    };
+    let Some(seeded) = unless_skipped(
+        graph.seed_default(DeviceDirection::Output, "t_stereo"),
+        "pw-metadata",
+        "whether a following lane goes where the desktop picks",
+    ) else {
+        return;
+    };
+    assert_eq!(seeded, Ok(()));
+    let handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    // The saved device, announced as the app announces it at every start.
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_71".to_owned(),
+        direction: DeviceDirection::Output,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_71")));
+    assert_eq!(
+        graph.default_settles_on(DeviceDirection::Output, SINK_NODE_NAME),
+        Some(Ok(()))
+    );
+
+    for picked in ["t_stereo", "t_third"] {
+        // What WirePlumber derives from FxSound's claim; then what a desktop's sound settings
+        // write when the user picks a sink, and what WirePlumber derives from that.
+        graph.write_default(
+            devices::default_key(DeviceDirection::Output),
+            SINK_NODE_NAME,
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        graph.seed_default(DeviceDirection::Output, picked);
+        assert!(
+            said.attached(&handle, DeviceDirection::Output, Some(picked)),
+            "the lane stayed on {:?} when the desktop picked {picked}",
+            said.attachments(DeviceDirection::Output).last()
+        );
+        assert_eq!(
+            graph.default_settles_on(DeviceDirection::Output, SINK_NODE_NAME),
+            Some(Ok(())),
+            "the default was left on {picked}, past FxSound"
+        );
+    }
+    handle.shutdown();
+}
+
+/// How long after the power comes back on a recorder that follows the default source has to be
+/// recording FxSound again: time for WirePlumber's move, and for FxSound to find one that left the
+/// recorder linked to nothing and move it again (`crate::stranded`), with room for a slow runner.
+const RELINKED_WITHIN: Duration = Duration::from_secs(4);
+
+/// Whether the recorder `recorder` is linked from FxSound's source and its recording `file` grows,
+/// within [`RELINKED_WITHIN`].
+fn records_fxsound(graph: &policy::PolicyGraph, recorder: u64, file: &std::path::Path) -> bool {
+    let deadline = Instant::now() + RELINKED_WITHIN;
+    while Instant::now() < deadline {
+        let linked = graph
+            .node_id(SOURCE_NODE_NAME)
+            .and_then(|source| graph.linked(source, recorder))
+            .unwrap_or(false);
+        if linked {
+            let before = policy::size_of(file);
+            std::thread::sleep(Duration::from_millis(300));
+            if policy::size_of(file) > before {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// When the power comes back on, FxSound takes the default source again and WirePlumber moves every
+/// recorder that follows it from the microphone back onto FxSound (Input) — and now and then onto
+/// nothing: moving from a mono microphone to a stereo source, the recorder's ports are replaced
+/// while WirePlumber links them, the link names a port that goes, and WirePlumber gives up
+/// (`crate::stranded`). The 0.4.0 live check found such a recorder recording nothing until the
+/// default changed again, on 3 to 6 of 9 quick toggles with something playing to the default sink.
+/// Here with WirePlumber itself, in an environment of the graph's own ([`policy`]): after each of
+/// eight power toggles, every one of three such recorders is linked from FxSound's source and
+/// receiving. Without FxSound's rescue of stranded streams this failed on the first toggle in
+/// every run tried, with WirePlumber 0.5.17 and PipeWire 1.6.9.
+#[test]
+fn a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_toggle() {
+    let Some(mut graph) = policy::PolicyGraph::start("relink") else {
+        return;
+    };
+    if let Some(missing) = ["pw-dump", "pw-metadata", "pw-cat", "pw-record"]
+        .into_iter()
+        .find(|tool| !installed(tool))
+    {
+        skip(&format!(
+            "{missing} is not installed, so recorders after a power toggle were not checked"
+        ));
+        return;
+    }
+    // Something plays to the default sink meanwhile, and is moved at the same moment: the live
+    // check never stranded the recorder without it. And three recorders rather than one: each is
+    // moved on its own, and each move is another chance for WirePlumber to lose one.
+    let _player = graph
+        .pw_cat("--playback", "t_player", "application.name = t_player", &[])
+        .expect("pw-cat should play");
+    let recorders: Vec<(String, Guarded, PathBuf, u64)> = (1..=3)
+        .map(|n| {
+            let name = format!("t_recorder{n}");
+            let (child, file) = graph
+                .follow_default_recorder(&name)
+                .expect("pw-record should record");
+            let id = graph.node_id(&name).expect("the recorder is there");
+            (name, child, file, id)
+        })
+        .collect();
+    let stranded = |graph: &policy::PolicyGraph| -> Vec<&str> {
+        recorders
+            .iter()
+            .filter(|(_, _, file, id)| !records_fxsound(graph, *id, file))
+            .map(|(name, ..)| name.as_str())
+            .collect()
+    };
+
+    let handle =
+        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+    let mut said = Transcript::default();
+    handle.send(UiToAudio::SelectDevice {
+        node_name: "t_mic".to_owned(),
+        direction: DeviceDirection::Input,
+    });
+    assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
+    for direction in DeviceDirection::ALL {
+        assert_eq!(
+            graph.default_settles_on(direction, our_node_name(direction)),
+            Some(Ok(())),
+            "FxSound never became the default {}",
+            direction.key()
+        );
+    }
+    assert_eq!(
+        stranded(&graph),
+        Vec::<&str>::new(),
+        "these never recorded FxSound"
+    );
+
+    for toggle in 1..=8 {
+        for want in [false, true] {
+            for direction in DeviceDirection::ALL {
+                handle.send(UiToAudio::SetAsDefault { direction, want });
+            }
+            if !want {
+                // Long enough for WirePlumber to have moved everything onto the devices.
+                std::thread::sleep(Duration::from_millis(1_200));
+            }
+        }
+        let left = stranded(&graph);
+        assert!(
+            graph.session_manager_runs(),
+            "the private WirePlumber went away"
+        );
+        assert!(
+            left.is_empty(),
+            "power toggle {toggle}: {left:?} followed the default source and were left linked \
+             to nothing"
+        );
+    }
+    handle.shutdown();
 }
 
 /// A run that was killed rather than quit leaves both configured defaults naming nodes that died

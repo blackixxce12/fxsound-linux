@@ -315,6 +315,9 @@ pub(crate) struct StreamNode {
     pub(crate) monitor: bool,
     /// The target its own properties name, if they name one.
     pub(crate) target: Option<ExplicitTarget>,
+    /// `node.autoconnect = true`: the session manager is to link it. A stream without it links
+    /// itself, or waits for someone to, and is linked to nothing on purpose.
+    pub(crate) autoconnect: bool,
     /// Its info has been read — every property, not only the registry global's handful — or
     /// cannot be, and the global is all there will ever be.
     pub(crate) complete: bool,
@@ -341,6 +344,7 @@ impl StreamNode {
             dont_fallback: false,
             monitor: false,
             target: None,
+            autoconnect: false,
             complete: false,
         };
         stream.read(get);
@@ -366,6 +370,7 @@ impl StreamNode {
         self.monitor =
             self.direction == DeviceDirection::Input && parse_bool(get("stream.capture.sink"));
         self.target = ExplicitTarget::from_props(get);
+        self.autoconnect = parse_bool(get("node.autoconnect"));
     }
 }
 
@@ -637,6 +642,29 @@ impl AppStreams {
         } else {
             None
         }
+    }
+
+    /// Every application stream of `direction` that follows the session's default device of its
+    /// direction, as far as its own properties say: one the session manager links
+    /// (`node.autoconnect`) and may move, that names no target of its own, and that records no
+    /// sink's monitor. Whether the `default` metadata names a target for it is the caller's to
+    /// ask (`crate::app_routes::Moves::has_key`). Only streams whose info is in: before that,
+    /// what they say of themselves is not known.
+    #[must_use]
+    pub(crate) fn followers(&self, direction: DeviceDirection) -> Vec<u32> {
+        self.streams
+            .iter()
+            .filter(|stream| {
+                stream.direction == direction
+                    && stream.complete
+                    && stream.autoconnect
+                    && !stream.dont_move
+                    && !stream.dont_reconnect
+                    && !stream.monitor
+                    && stream.target.is_none()
+            })
+            .map(|stream| stream.id)
+            .collect()
     }
 
     /// The stream under `id`, if it is an application's.
@@ -2019,5 +2047,39 @@ mod tests {
                 .all(|stream| stream.route.is_none()),
             "a new session starts with no stream on a route"
         );
+    }
+
+    #[test]
+    fn only_a_stream_the_session_manager_links_and_may_move_follows_the_default() {
+        // The first of a key's pairs is the one read: what `extra` says goes first.
+        let recording = |id, extra: &[(&str, &str)]| {
+            let mut pairs = extra.to_vec();
+            pairs.extend_from_slice(&[
+                ("media.class", RECORDING_MEDIA_CLASS),
+                ("application.name", "Recorder"),
+                ("node.autoconnect", "true"),
+            ]);
+            stream(id, &pairs)
+        };
+        let mut streams = AppStreams::default();
+        streams.stream_appeared(recording(1, &[]));
+        streams.stream_appeared(recording(2, &[("node.autoconnect", "false")]));
+        streams.stream_appeared(recording(3, &[("node.dont-move", "true")]));
+        streams.stream_appeared(recording(4, &[("node.dont-reconnect", "true")]));
+        streams.stream_appeared(recording(5, &[("stream.capture.sink", "true")]));
+        streams.stream_appeared(recording(6, &[("target.object", "alsa_input.usb-mic")]));
+        // Its info not read yet: what it says of itself is not known.
+        let mut unread = recording(7, &[]);
+        unread.complete = false;
+        streams.stream_appeared(unread);
+        // A player follows the default sink, and is the output lane's.
+        let mut playing = player(8, "Player");
+        playing.autoconnect = true;
+        streams.stream_appeared(playing);
+        // No `node.autoconnect` at all is a stream nobody is to link.
+        streams.stream_appeared(recorder(9, "Bare"));
+
+        assert_eq!(streams.followers(DeviceDirection::Input), [1]);
+        assert_eq!(streams.followers(DeviceDirection::Output), [8]);
     }
 }

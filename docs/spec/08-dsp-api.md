@@ -1610,9 +1610,16 @@ impl DspProcessor {
    (`09-dsp-eq.md` §18, point 3). A stage that is left out — the equalizer and the leveller while
    power is off, the GraphicEq block once it has faded out — lands every glide and takes the next
    change at once (`GraphicEq::sit_out`, `VolumeLeveller::sit_out`), so switching back on never
-   plays 20 ms of what was set before the switch. The power switch is the one control that still
-   acts between two samples: it is the listener's A/B against the dry sound, and a faded bypass
-   would mix the processed signal, a look-ahead behind, with the dry one.
+   plays 20 ms of what was set before the switch. The power switch cannot glide: it is the
+   listener's A/B against the dry sound, and a faded bypass would mix the processed signal, a
+   look-ahead behind, with the dry one. Acting between two samples was a click, though (under a
+   100 Hz tone at −12 dBFS through the release build on a private PipeWire it stepped by up to
+   −5 dBFS, high-passed at 2 kHz), so it dips (`smooth::Dip`): the sound fades out over 10 ms on
+   the old side, the switch is made in silence, and the other side fades back in over 10 ms once
+   the chain's look-ahead has passed. The two sides are never mixed, and the comparison is still
+   20 ms from the press. The voice chain's switches — its power, the denoiser and its level or
+   mode, the de-reverb, the high-pass, the gate, the equalizer, the de-esser and the compressor,
+   several at once on a preset change — dip the same way (`input::needs_dip`).
 
 Non-RT-safe surface, clearly separated: `DspEngine::new`, `DspEngine::prepare`,
 everything in `DspHandle`, preset load/save, and config persistence.

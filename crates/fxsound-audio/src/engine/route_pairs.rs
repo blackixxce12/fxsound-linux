@@ -981,6 +981,8 @@ fn build_pair(
         virtual_node: false,
         system_mute: Arc::clone(&lane.system_mute),
         fades_seen: volume.fades(),
+        last_sound: None,
+        fade_next: AtomicBool::new(false),
         dsp: Some(dsp),
     };
     let first_label = first_name.clone();
@@ -990,7 +992,7 @@ fn build_pair(
             log::debug!("{first_label}: {new:?}");
             data.status.first_node_moved(&new);
             if passive && matches!(new, StreamState::Paused) {
-                data.ring.mark_stale();
+                super::first_node_went_idle(data);
             }
             if let StreamState::Error(message) = &new {
                 log::warn!("{first_label} error: {message}");
@@ -1044,6 +1046,8 @@ fn build_pair(
         scratch: vec![0.0; MAX_QUANTUM_FRAMES * MAX_CHANNELS as usize],
         // A route's source is nobody's volume either.
         volume: None,
+        stops_with_the_pair: passive,
+        last_block: None,
     };
     let second_label = second_name.clone();
     let second_listener = second
@@ -1166,6 +1170,26 @@ pub(super) fn node_removed(shared: &mut Shared, id: u32) {
             route.node = None;
         }
     }
+}
+
+/// Whether the `default` metadata names a target for the stream `id`, or is about to name one of
+/// FxSound's: then the stream does not follow its lane's default.
+pub(super) fn has_target(shared: &Shared, id: u32) -> bool {
+    shared.routes.moves.has_key(id)
+}
+
+/// Move the stream `subject`, which follows a default FxSound holds and was linked to nothing, onto
+/// FxSound's node with `serial` and back to following the default at once: a write and a delete of
+/// its key, each of which has WirePlumber rescan the graph and link it (`crate::stranded`). Sent
+/// and noted as this engine's own, like a route's moves, so neither report is taken for a mixer's.
+pub(super) fn nudge(shared: &mut Shared, subject: u32, serial: u64) {
+    send(
+        shared,
+        &[
+            MetadataOp::Write { subject, serial },
+            MetadataOp::Delete { subject },
+        ],
+    );
 }
 
 /// The `default` metadata says where a stream is to go ([`app_routes::TARGET_OBJECT_KEY`]), or

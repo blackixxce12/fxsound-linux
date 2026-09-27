@@ -139,7 +139,10 @@ const ZOOM_TOLERANCE: f32 = 0.01;
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 fn main() -> eframe::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(fxsound_app::DEFAULT_LOG_FILTER),
+    )
+    .init();
 
     let cli = Cli::parse();
 

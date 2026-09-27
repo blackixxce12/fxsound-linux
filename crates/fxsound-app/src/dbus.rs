@@ -45,7 +45,8 @@
 //! `--forget-device` (0.4.0 audit #34); an instance the call has just started holds it until
 //! PipeWire has listed the devices (`commands::waits_for_the_device_list`). The bus starts FxSound for
 //! a call when it is not running — any call, a property read included, unless the caller sets
-//! `NO_AUTO_START` (`busctl --auto-start=no`), which the manual tells pollers to:
+//! `NO_AUTO_START` (`busctl --auto-start=no call`; `get-property` ignores the flag), which the
+//! manual tells pollers to:
 //! `org.fxsound.FxSound.service` in `/usr/share/dbus-1/services/` hands the start to
 //! `fxsound.service`, whose `--activated` exits quietly when an instance still starting up turns
 //! out to hold the lock already.

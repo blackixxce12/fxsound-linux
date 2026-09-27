@@ -1560,6 +1560,26 @@ value:            {"name":"fxsound_sink"}
 4. **Existing streams.** WirePlumber's default policy moves already-running streams to the new
    default (`node.stream.default-playback` "follow"). Streams pinned with `node.dont-reconnect` or an
    explicit `target.object` stay put — that is correct and must not be overridden.
+   *0.4.0:* WirePlumber 0.5.17 now and then moves such a stream onto nothing. A stream takes its
+   target's channels, and a recorder moved from a mono microphone onto the stereo `fxsound_source`
+   has its ports replaced while WirePlumber links them; the link names the port that goes, fails
+   ("1 of 1 PipeWire links failed to activate"), and nothing tries again until the default moves.
+   So while FxSound holds a default, a stream that follows it (`node.autoconnect`, no target of its
+   own, none in the metadata, not `node.dont-move`/`node.dont-reconnect`, no monitor recorder)
+   and has no link for 500 ms has its `target.object` set to FxSound's node and deleted again at
+   once: each change makes WirePlumber rescan and link it, and the stream still follows the
+   default. Twice at most per stream each time FxSound takes the default (`crate::stranded`;
+   `graph_churn::a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_toggle`,
+   with WirePlumber itself on a private graph).
+4a. **A desktop pick, while following the system.** With no ranking (*Follow the system's default
+   device*), a real device written to `default.configured.audio.<sink|source>` by anyone but
+   FxSound — the desktop's sound settings, `wpctl set-default` — once the connection is up, is
+   taken as the lane's own pick (`user_selected`): the lane moves there and takes the default back,
+   or takes it back at once when it already plays there. FxSound's own writes are told apart by
+   their echoes, kept until the server reports them. Before 0.4.0's live check the saved device the
+   app announces at every start outranked the desktop (rule 4), and the default stayed on the
+   picked device, past FxSound. A start still begins on that saved device; the desktop's next pick
+   moves it.
 5. **Restore on exit**, in this order (this is the Linux `sndDevicesRestoreDefaultDevice`,
    `sndDevicesSetupDevices.cpp:545-644`):
    1. Pick the first *present* sink from `user_selected_playback` → `most_recent_playback` →

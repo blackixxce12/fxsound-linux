@@ -55,7 +55,11 @@ preset, a microphone its voice preset. Whenever a lane moves to a device again
 .BR \-\-output " or " \-\-input ,
 stepped to by
 .BR \-\-next\-output " or " \-\-next\-input ,
-or chosen by the priority list when it is plugged in \(en the device brings its
+or chosen by the priority list when it is plugged in, or, with Settings \(->
+Audio's
+.I Follow the system's default device
+on, picked in the desktop's sound settings, which FxSound then follows even
+after a device was picked in FxSound \(en the device brings its
 preset back; a device used for the first time leaves the preset alone.
 Settings \(-> Audio sets the preset of each playback device, and Settings \(->
 Microphone the voice preset of each microphone, in the device's row of its
@@ -1003,10 +1007,18 @@ are refused instead. A started FxSound takes over the
 session's default devices, so anything that only reads or polls \(en a status
 bar module above all \(en must ask the bus not to start it, or it will bring
 FxSound back seconds after the user quit it:
-.B busctl \-\-auto\-start=no
+.B busctl \-\-auto\-start=no call
 does, as does the message flag
 .B NO_AUTO_START
-in any other client. At most 32 calls are answered at once; past that a call
+in any other client. A property is read that way with
+.BR org.freedesktop.DBus.Properties " " Get ,
+as below:
+.B busctl get\-property
+and
+.B busctl introspect
+start FxSound whatever
+.B \-\-auto\-start
+says (systemd 262). At most 32 calls are answered at once; past that a call
 is refused with
 .BR org.fxsound.FxSound.Error.Refused ,
 as a command line past the control socket's limit is. With
@@ -1018,8 +1030,8 @@ busctl \-\-user call org.fxsound.FxSound /org/fxsound/FxSound \e
     org.fxsound.FxSound SetPreset s Music
 busctl \-\-user call org.fxsound.FxSound /org/fxsound/FxSound \e
     org.fxsound.FxSound Apply as 2 \-\- \-\-preset=Music \-\-set_effect=bass:7.5
-busctl \-\-user \-\-auto\-start=no get\-property org.fxsound.FxSound \e
-    /org/fxsound/FxSound org.fxsound.FxSound Power
+busctl \-\-user \-\-auto\-start=no call org.fxsound.FxSound /org/fxsound/FxSound \e
+    org.freedesktop.DBus.Properties Get ss org.fxsound.FxSound Power
 busctl \-\-user monitor org.fxsound.FxSound
 .EE
 .RE

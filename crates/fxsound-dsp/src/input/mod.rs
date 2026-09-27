@@ -84,7 +84,7 @@ pub use deesser::DeEsser;
 pub use denoise::Denoiser;
 pub use dereverb::Dereverb;
 pub use detector::{Detection, Follower};
-pub use engine::InputEngine;
+pub use engine::{InputEngine, needs_dip};
 pub use gate::Gate;
 pub use highpass::HighPass;
 pub use limiter::LookaheadLimiter;

@@ -64,9 +64,18 @@
 //! settles its own gain stage): every glide lands, and until the stage runs again a change lands
 //! at once. The effect chain needs no telling: FxSound off clears it, as the original does.
 //!
-//! The power switch itself is the one control that still acts between two samples: it is the
-//! listener's comparison against the unprocessed sound, and a bypass that faded would mix the
-//! processed signal, Dynamic Boost's look-ahead behind, with the dry one for 20 ms.
+//! # What cannot glide
+//!
+//! The power switch has nothing to glide between: it is the listener's comparison against the
+//! unprocessed sound, and a bypass that crossfaded would mix the processed signal, Dynamic Boost's
+//! look-ahead behind, with the dry one for 20 ms. The microphone chain has more such switches —
+//! its denoiser, its high-pass, its gate and its equalizer switched in or out — and a preset that
+//! moves them. Each of them used to act between two samples, a step in the waveform. So they go
+//! through a **[`Dip`]** instead: the old sound fades out over [`DIP_SECONDS`], the switch is
+//! made in silence, and once the chain's own delay has passed the new sound fades in over the
+//! same, the two never mixed. The owner
+//! decides which changes dip: [`crate::Engine`] the power switch, [`crate::InputEngine`] the
+//! switches of the voice chain ([`crate::input::needs_dip`]).
 
 use crate::biquad::{BiquadCoeffs, Real, Section};
 
@@ -372,6 +381,210 @@ impl Default for FadingSection {
     }
 }
 
+/// How long a [`Dip`] takes each way: 10 ms down and 10 ms up, so a switch that cannot glide
+/// is out of the sound for [`GLIDE_SECONDS`] in all, the time every other change glides over.
+pub const DIP_SECONDS: Real = GLIDE_SECONDS / 2.0;
+
+/// A dip's length each way in frames at `sample_rate`: 480 at 48 kHz. Never zero, whatever the
+/// rate.
+#[must_use]
+pub fn dip_frames(sample_rate: Real) -> u32 {
+    let frames = (sample_rate * DIP_SECONDS).round();
+    if frames.is_finite() && frames >= 1.0 {
+        frames as u32
+    } else {
+        1
+    }
+}
+
+/// Where a [`Dip`] stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DipState {
+    /// Out of the way: every frame passes at unity.
+    Open,
+    /// Fading out, `position` frames of the fade left to go.
+    Closing,
+    /// Faded out: silence until its owner makes the switch and opens it again.
+    Closed,
+    /// Switched, and holding silence for this many more frames before it fades back in.
+    Holding(u32),
+    /// Fading back in, `position` frames of the fade done.
+    Opening,
+}
+
+/// A dip to silence and back, for a switch that cannot glide.
+///
+/// Some switches have nothing to glide between. Switching FxSound off hands the listener the
+/// unprocessed sound a look-ahead earlier than the processed one was playing it, so the two do not
+/// line up; switching the microphone's denoiser on puts twenty milliseconds of delay into the
+/// chain; turning a voice preset's equalizer or high-pass off or on, or moving its gate, puts one
+/// filter's output in place of another's. Crossfading such a pair would mix two signals that are
+/// not the same sound a moment apart — a comb filter for as long as the fade lasts — and
+/// switching between two samples is a step in the waveform: measured through the release build on
+/// a private PipeWire, the power button stepped by up to −5 dBFS (high-passed at 2 kHz) under a
+/// 100 Hz tone, and the voice preset's equalizer switch by −21 dBFS under a 300 Hz one.
+///
+/// So the owner closes the dip, keeps its old settings until the dip is closed
+/// ([`Dip::frames_to_closed`] says where in a buffer that is), makes the switch there, in
+/// silence, and opens it again ([`Dip::open`]), after holding the silence for as long as its
+/// chain delays what goes in: until then the output is still the sound from before the switch, or
+/// the silence a stage that has just started holds for its own delay, and fading in over it would
+/// play the step after all.
+/// Neither side of the switch is ever mixed with the other. The fades are smoothstep curves
+/// ([`dip_gain`]), which start and end with no slope, so the dip has no corner to click at either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dip {
+    state: DipState,
+    /// Frames into the fade: `length` is open, 0 is closed.
+    position: u32,
+    length: u32,
+}
+
+impl Dip {
+    /// An open dip, fading over `length` frames each way ([`dip_frames`]).
+    #[must_use]
+    pub fn new(length: u32) -> Self {
+        let length = length.max(1);
+        Self {
+            state: DipState::Open,
+            position: length,
+            length,
+        }
+    }
+
+    /// Fade over `length` frames each way from now on. A dip that is moving lands where it was
+    /// going: open, or closed.
+    pub fn set_length(&mut self, length: u32) {
+        let length = length.max(1);
+        if length == self.length {
+            return;
+        }
+        self.length = length;
+        match self.state {
+            DipState::Open | DipState::Opening | DipState::Holding(_) => self.settle(),
+            DipState::Closing | DipState::Closed => {
+                self.state = DipState::Closed;
+                self.position = 0;
+            }
+        }
+    }
+
+    /// Start fading out, from wherever the dip is. Nothing if it is already on its way down, or
+    /// down.
+    pub fn close(&mut self) {
+        match self.state {
+            DipState::Open | DipState::Opening => self.state = DipState::Closing,
+            DipState::Holding(_) => {
+                self.state = DipState::Closed;
+                self.position = 0;
+            }
+            DipState::Closing | DipState::Closed => {}
+        }
+        if self.state == DipState::Closing && self.position == 0 {
+            self.state = DipState::Closed;
+        }
+    }
+
+    /// The switch is made: hold the silence for `hold` frames, then fade back in. Also what takes
+    /// back a dip whose switch was cancelled on its way down: it fades back in from wherever it
+    /// had got to.
+    pub fn open(&mut self, hold: u32) {
+        match self.state {
+            DipState::Closed | DipState::Holding(_) if hold > 0 => {
+                self.state = DipState::Holding(hold);
+                self.position = 0;
+            }
+            DipState::Open => {}
+            _ => self.state = DipState::Opening,
+        }
+        if self.state == DipState::Opening && self.position >= self.length {
+            self.settle();
+        }
+    }
+
+    /// Open at once, as if every fade had already run: for an owner that clears its history, after
+    /// which there is nothing left to fade out of.
+    pub const fn settle(&mut self) {
+        self.state = DipState::Open;
+        self.position = self.length;
+    }
+
+    /// Whether the dip is all the way down, waiting for its owner to make the switch.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.state == DipState::Closed
+    }
+
+    /// Whether every frame passes untouched.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.state == DipState::Open
+    }
+
+    /// How many frames from now the dip will be closed: `Some` while it is on its way down (the
+    /// owner processes that many frames with its old settings, and switches after them), `Some(0)`
+    /// once it is down, `None` while it is open, opening or holding.
+    #[must_use]
+    pub fn frames_to_closed(&self) -> Option<usize> {
+        match self.state {
+            DipState::Closing => Some(self.position as usize),
+            DipState::Closed => Some(0),
+            _ => None,
+        }
+    }
+
+    /// Apply the dip to an interleaved buffer, a frame at a time, and move along it. Nothing to do
+    /// while it is open. Real-time safe.
+    pub fn process(&mut self, buffer: &mut [Real], channels: usize) {
+        if self.state == DipState::Open || channels == 0 {
+            return;
+        }
+        for frame in buffer.chunks_exact_mut(channels) {
+            let gain = self.advance();
+            for sample in frame.iter_mut() {
+                *sample *= gain;
+            }
+        }
+    }
+
+    /// The gain for the next frame.
+    fn advance(&mut self) -> Real {
+        match self.state {
+            DipState::Open => 1.0,
+            DipState::Closing => {
+                self.position = self.position.saturating_sub(1);
+                if self.position == 0 {
+                    self.state = DipState::Closed;
+                }
+                dip_gain(self.position, self.length)
+            }
+            DipState::Closed => 0.0,
+            DipState::Holding(left) => {
+                self.state = if left <= 1 {
+                    DipState::Opening
+                } else {
+                    DipState::Holding(left - 1)
+                };
+                0.0
+            }
+            DipState::Opening => {
+                self.position = (self.position + 1).min(self.length);
+                if self.position == self.length {
+                    self.state = DipState::Open;
+                }
+                dip_gain(self.position, self.length)
+            }
+        }
+    }
+}
+
+/// A dip's gain `position` frames into a fade `length` long: the smoothstep `3t² − 2t³`, 0 at the
+/// bottom and 1 at the top with no slope at either end.
+fn dip_gain(position: u32, length: u32) -> Real {
+    let t = (position as Real / length.max(1) as Real).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn is_finite(design: &BiquadCoeffs) -> bool {
     [design.b0, design.b1, design.b2, design.a1, design.a2]
         .iter()
@@ -497,6 +710,112 @@ mod tests {
         }
         assert!(!section.is_fading());
         assert_eq!(section.steady().coeffs, c);
+    }
+
+    /// The gains a dip plays over `frames` frames of a mono buffer of ones.
+    fn dip_gains(dip: &mut Dip, frames: usize) -> Vec<Real> {
+        let mut buffer = vec![1.0; frames];
+        dip.process(&mut buffer, 1);
+        buffer
+    }
+
+    #[test]
+    fn dips_are_ten_milliseconds_each_way_at_every_rate() {
+        assert_eq!(dip_frames(48_000.0), 480);
+        assert_eq!(dip_frames(44_100.0), 441);
+        assert_eq!(dip_frames(192_000.0), 1_920);
+        assert_eq!(dip_frames(0.0), 1);
+        assert_eq!(dip_frames(Real::NAN), 1);
+    }
+
+    #[test]
+    fn a_dip_closes_over_its_length_holds_and_opens_over_its_length() {
+        let mut dip = Dip::new(480);
+        assert!(dip.is_open());
+        assert_eq!(dip.frames_to_closed(), None);
+        assert_eq!(dip_gains(&mut dip, 10), vec![1.0; 10], "open is unity");
+
+        dip.close();
+        assert_eq!(dip.frames_to_closed(), Some(480));
+        let down = dip_gains(&mut dip, 480);
+        assert!(
+            down.windows(2).all(|pair| pair[1] <= pair[0]),
+            "it only falls"
+        );
+        assert_eq!(down[479], 0.0, "the last frame of the fade is silence");
+        assert!(dip.is_closed());
+        assert_eq!(dip.frames_to_closed(), Some(0));
+        assert_eq!(
+            dip_gains(&mut dip, 100),
+            vec![0.0; 100],
+            "closed stays closed"
+        );
+
+        dip.open(96);
+        assert!(!dip.is_closed() && dip.frames_to_closed().is_none());
+        assert_eq!(
+            dip_gains(&mut dip, 96),
+            vec![0.0; 96],
+            "the hold is silence"
+        );
+        let up = dip_gains(&mut dip, 480);
+        assert!(
+            up.windows(2).all(|pair| pair[1] >= pair[0]),
+            "it only rises"
+        );
+        assert_eq!(up[479], 1.0);
+        assert!(dip.is_open());
+    }
+
+    #[test]
+    fn a_dip_has_no_step_and_no_corner_anywhere() {
+        let mut dip = Dip::new(480);
+        let mut gains = dip_gains(&mut dip, 20);
+        dip.close();
+        gains.extend(dip_gains(&mut dip, 500));
+        dip.open(0);
+        gains.extend(dip_gains(&mut dip, 500));
+        let step = gains
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0, Real::max);
+        assert!(step < 1.6 / 480.0, "a step of {step} between two frames");
+        // The smoothstep leaves and joins each level flat: the first and last steps of each fade
+        // are a hundredth of its steepest.
+        let corner = gains
+            .windows(3)
+            .map(|w| (w[2] - 2.0 * w[1] + w[0]).abs())
+            .fold(0.0, Real::max);
+        assert!(corner < 7.0 / (480.0 * 480.0), "a corner of {corner}");
+    }
+
+    #[test]
+    fn a_dip_taken_back_on_its_way_down_rises_from_where_it_had_got_to() {
+        let mut dip = Dip::new(480);
+        dip.close();
+        let down = dip_gains(&mut dip, 200);
+        let last = down[199];
+        assert!(last > 0.0 && last < 1.0);
+        dip.open(0);
+        assert_eq!(
+            dip.frames_to_closed(),
+            None,
+            "no longer waiting for a switch"
+        );
+        let up = dip_gains(&mut dip, 300);
+        assert!((up[0] - last).abs() < 0.01, "{last} jumped to {}", up[0]);
+        assert!(up.windows(2).all(|pair| pair[1] >= pair[0]));
+        assert!(dip.is_open() || up[299] > 0.99);
+    }
+
+    #[test]
+    fn a_settled_dip_is_open_at_once() {
+        let mut dip = Dip::new(480);
+        dip.close();
+        dip_gains(&mut dip, 100);
+        dip.settle();
+        assert!(dip.is_open());
+        assert_eq!(dip_gains(&mut dip, 4), vec![1.0; 4]);
     }
 
     #[test]

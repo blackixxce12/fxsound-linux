@@ -14,10 +14,23 @@
 //! arrives: a peak that holds and decays, a ten-millisecond RMS, a running noise floor, and four
 //! cumulative counters the calibration wizard differences between phases. The tap sits before
 //! the chain because the wizard wants the microphone, not the preset.
+//!
+//! **Switches dip.** A snapshot that switches a stage in or out — the power, the denoiser and its
+//! level or mode, the de-reverb, the high-pass, the gate, the equalizer, the de-esser, the
+//! compressor, which a preset change does to several at once ([`needs_dip`]) — does not land
+//! between two samples. The chain fades out over [`crate::smooth::DIP_SECONDS`] on its old
+//! settings, takes the new ones in silence, and fades back in ([`crate::smooth::Dip`]) once the
+//! chain's own delay — the limiter's look-ahead, and the denoiser's twenty milliseconds when it
+//! runs — has passed, since until then the output is still what came in before the switch. Measured
+//! through the release build on a private PipeWire under a 300 Hz tone at −18 dBFS, high-passed at
+//! 2 kHz, the equalizer's switch stepped the waveform by −21 dBFS and a preset change by up to −26
+//! dBFS before this. The controls that move by degrees — thresholds, band gains, the makeup gain —
+//! keep landing at once, each stage gliding or smoothing its own ([`crate::smooth`]).
 
 use crate::input::InputChain;
 use crate::input::detector::linear_to_db;
 use crate::input::processor::{ChainSpec, StageKind};
+use crate::smooth::{Dip, dip_frames};
 use crate::spectrum::SpectrumAnalyser;
 use fxsound_core::messages::{DspEvent, InputDspParams, Meters};
 
@@ -53,6 +66,13 @@ pub struct InputEngine {
     /// Cached so a snapshot that did not change a value does not force a redesign — and, more to
     /// the point, does not clear a filter's history and click.
     applied: InputDspParams,
+    /// A snapshot with a switch in it, waiting for [`Self::dip`] to close before it lands.
+    pending: Option<InputDspParams>,
+    /// The fade out and back in around a switch ([`needs_dip`]).
+    dip: Dip,
+    /// Audio has gone through since the engine was built or last cleared. Until it has, a switch
+    /// lands at once: nobody is listening to a step.
+    heard: bool,
     processed_samples: u64,
     peak_left: f32,
     peak_right: f32,
@@ -98,6 +118,9 @@ impl InputEngine {
             channels: channels.clamp(1, crate::biquad::MAX_CHANNELS),
             source_rate: None,
             applied: InputDspParams::default(),
+            pending: None,
+            dip: Dip::new(dip_frames(sample_rate)),
+            heard: false,
             processed_samples: 0,
             peak_left: 0.0,
             peak_right: 0.0,
@@ -131,7 +154,11 @@ impl InputEngine {
             return;
         }
         self.chain = InputChain::from_spec(spec, self.sample_rate);
-        let params = self.applied;
+        // A new chain starts from rest, so a switch waiting for its dip has nothing to fade out
+        // of any more.
+        let params = self.pending.take().unwrap_or(self.applied);
+        self.applied = params;
+        self.dip.settle();
         self.chain.apply(&params);
         if let Some(deesser) = self.chain.deesser_mut() {
             deesser.set_source_rate(self.source_rate);
@@ -156,6 +183,7 @@ impl InputEngine {
         self.channels = channels;
         self.chain.set_sample_rate(sample_rate);
         self.spectrum.set_sample_rate(sample_rate);
+        self.dip.set_length(dip_frames(sample_rate));
         self.floor_block_frames = floor_block_frames(sample_rate);
         self.floor_block_sum = 0.0;
         self.floor_block_count = 0;
@@ -193,12 +221,50 @@ impl InputEngine {
     }
 
     /// Adopt a parameter snapshot, skipping anything that has not changed.
+    ///
+    /// A snapshot with a switch in it ([`needs_dip`]) waits for the dip to close once audio has
+    /// gone through (see the module documentation); a later snapshot takes its place, so only the
+    /// newest lands, and one that takes the switch back lands at once and fades the chain back in
+    /// from wherever the fade out had got to. Everything else lands at once, as it always did.
     pub fn apply(&mut self, params: &InputDspParams) {
-        if *params == self.applied {
+        let wanted = self.pending.as_ref().unwrap_or(&self.applied);
+        if params == wanted {
             return;
+        }
+        if self.heard && needs_dip(&self.applied, params) {
+            self.pending = Some(*params);
+            self.dip.close();
+            return;
+        }
+        if self.pending.take().is_some() {
+            self.dip.open(0);
         }
         self.chain.apply(params);
         self.applied = *params;
+    }
+
+    /// The snapshot the chain runs on once any switch waiting for its dip has landed.
+    #[must_use]
+    pub fn params(&self) -> &InputDspParams {
+        self.pending.as_ref().unwrap_or(&self.applied)
+    }
+
+    /// Make the switch a closed dip was waiting for, and open it again after the chain's delay.
+    ///
+    /// For that long after the switch the chain still plays what it took in before it — the
+    /// limiter's look-ahead, and the denoiser's twenty milliseconds when it runs — or, for a stage
+    /// that has just started, the silence it holds for its own delay. The switch reaches the output
+    /// only after it, so the silence is held until then: faded in any sooner, the dip would play
+    /// the step it is there to hide.
+    fn land_pending(&mut self) {
+        let Some(params) = self.pending.take() else {
+            self.dip.open(0);
+            return;
+        };
+        self.chain.apply(&params);
+        self.applied = params;
+        let delay = self.chain.latency_frames();
+        self.dip.open(u32::try_from(delay).unwrap_or(u32::MAX));
     }
 
     /// Act on a one-shot event. The same events the output engine knows, so the control path
@@ -223,8 +289,15 @@ impl InputEngine {
         self.capture_floor_db = f32::INFINITY;
     }
 
-    /// Clear every filter's history.
+    /// Clear every filter's history. A switch waiting for its dip lands at once: with the history
+    /// gone there is nothing to fade out of.
     pub fn reset(&mut self) {
+        if let Some(params) = self.pending.take() {
+            self.chain.apply(&params);
+            self.applied = params;
+        }
+        self.dip.settle();
+        self.heard = false;
         self.chain.reset();
         self.spectrum.reset();
         self.peak_left = 0.0;
@@ -291,7 +364,8 @@ impl InputEngine {
         }
 
         self.tap(buffer, channels);
-        self.chain.process(buffer, channels);
+        self.run_chain(buffer, channels);
+        self.heard = true;
 
         // A block that went in finite can still come out non-finite if a stage's own state has
         // blown up. Hand silence to whoever is listening rather than a NaN, and clear the history
@@ -303,6 +377,32 @@ impl InputEngine {
 
         self.spectrum.push(buffer, channels);
         self.measure(buffer, channels);
+    }
+
+    /// The chain over one block, split where a closing dip reaches silence so that a waiting switch
+    /// lands on exactly that frame, and the dip over each part.
+    fn run_chain(&mut self, buffer: &mut [f32], channels: usize) {
+        if self.dip.is_open() {
+            self.chain.process(buffer, channels);
+            return;
+        }
+        let frames = buffer.len() / channels;
+        let mut done = 0;
+        while done < frames {
+            if self.dip.is_closed() {
+                self.land_pending();
+            }
+            let end = match self.dip.frames_to_closed() {
+                Some(left) if left > 0 => done.saturating_add(left).min(frames),
+                _ => frames,
+            };
+            let Some(part) = buffer.get_mut(done * channels..end * channels) else {
+                return;
+            };
+            self.chain.process(part, channels);
+            self.dip.process(part, channels);
+            done = end;
+        }
     }
 
     /// The pre-chain statistics: what the microphone is doing before the preset touches it.
@@ -447,6 +547,36 @@ impl InputEngine {
     }
 }
 
+/// Whether going from `old` to `new` switches something that cannot glide, and so has to go
+/// through the engine's dip (module documentation): the power; the denoiser, its level, its
+/// channel mode or its table row; the de-reverb; the high-pass's corner or order; the gate, the
+/// equalizer, the de-esser or the compressor switched in or out, the equalizer's band count, and
+/// the de-esser's corner or mode. A preset change moves several of them at once.
+///
+/// What is left moves by degrees and lands at once: the thresholds, ratios and times of the gate
+/// and the compressor, whose own envelopes carry the change; the equalizer's band gains and
+/// centres and its Q, which the equalizer crossfades ([`crate::GraphicEq`]); the de-esser's
+/// threshold; the makeup gain, which glides ([`crate::input::Makeup`]); the limiter's ceiling; and
+/// the mute, which the audio crate fades after the chain.
+#[must_use]
+pub fn needs_dip(old: &InputDspParams, new: &InputDspParams) -> bool {
+    old.power != new.power
+        || old.rnnoise != new.rnnoise
+        || old.denoise_level != new.denoise_level
+        || old.denoise_channels != new.denoise_channels
+        || old.denoise_control != new.denoise_control
+        || old.dereverb != new.dereverb
+        || old.highpass_hz.to_bits() != new.highpass_hz.to_bits()
+        || old.highpass_order != new.highpass_order
+        || old.gate_on != new.gate_on
+        || old.eq_on != new.eq_on
+        || old.num_bands != new.num_bands
+        || old.deesser_on != new.deesser_on
+        || old.deesser_hz.to_bits() != new.deesser_hz.to_bits()
+        || old.deesser_mode != new.deesser_mode
+        || old.compressor_on != new.compressor_on
+}
+
 /// A block's peak against the one held from before, decayed by a block: the larger of the two,
 /// and nothing once the held one has fallen under [`PEAK_FLOOR`].
 fn held_peak(peak: f32, held: f32) -> f32 {
@@ -499,6 +629,181 @@ mod tests {
         for block in signal.chunks_mut(1_024 * channels) {
             engine.process(block, channels);
         }
+    }
+
+    /// A continuous 300 Hz tone at −18 dBFS from frame `start`, what the live check fed the
+    /// microphone.
+    fn steady_tone(start: usize, frames: usize) -> Vec<f32> {
+        let amplitude = 10.0_f32.powf(-18.0 / 20.0);
+        (start..start + frames)
+            .map(|n| (n as f32 * std::f32::consts::TAU * 300.0 / FS).sin() * amplitude)
+            .collect()
+    }
+
+    /// The largest second difference in a mono buffer: a step of `d` between two samples is a
+    /// second difference of about `d`, and the tone itself curves by `A·(2π·300/48 000)²`, 0.0002
+    /// at −18 dBFS.
+    fn worst_corner(buffer: &[f32]) -> f32 {
+        buffer
+            .windows(3)
+            .map(|w| (w[2] - 2.0 * w[1] + w[0]).abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// A preset like the live check's "E6 Voice EQ On": Podcast without the denoiser, its
+    /// equalizer lifting 400 Hz by 8 dB so that the switch is heard on the tone.
+    fn eq_preset(eq_on: bool) -> InputDspParams {
+        let mut params = InputDspParams {
+            highpass_hz: 80.0,
+            highpass_order: 2,
+            gate_on: true,
+            gate_threshold_db: -48.0,
+            gate_ratio: 2.0,
+            gate_range_db: -14.0,
+            compressor_on: true,
+            compressor_threshold_db: -20.0,
+            compressor_ratio: 3.0,
+            deesser_on: true,
+            eq_on,
+            makeup_db: 5.0,
+            ..InputDspParams::default()
+        };
+        params.band_boost_db[3] = 8.0;
+        params.sanitise();
+        params
+    }
+
+    /// Run `engine` on the tone for a second, apply `next` and run on: the worst corner in the
+    /// 100 ms after the change, against the worst in the steady second before it.
+    fn corner_across(engine: &mut InputEngine, next: &InputDspParams) -> (f32, f32, Vec<f32>) {
+        let mut before = steady_tone(0, 48_000);
+        for block in before.chunks_mut(1_024) {
+            engine.process(block, 1);
+        }
+        engine.apply(next);
+        let mut after = steady_tone(48_000, 9_600);
+        for block in after.chunks_mut(1_024) {
+            engine.process(block, 1);
+        }
+        let mut joined = before[before.len() - 2..].to_vec();
+        joined.extend_from_slice(&after[..4_800]);
+        (
+            worst_corner(&before[24_000..]),
+            worst_corner(&joined),
+            after,
+        )
+    }
+
+    #[test]
+    fn switching_the_voice_equalizer_off_and_on_under_a_tone_does_not_click() {
+        // The live check's defect: "E6 Voice EQ Off" picked under a 300 Hz tone stepped the
+        // recording by -21 dBFS high-passed at 2 kHz, the switch landing between two samples.
+        for (from, to) in [(true, false), (false, true)] {
+            let mut engine = InputEngine::new(FS, 1_024, 1);
+            engine.apply(&eq_preset(from));
+            let (steady, across, after) = corner_across(&mut engine, &eq_preset(to));
+            assert!(
+                across < 4.0 * steady.max(1.0e-4),
+                "equalizer {from} -> {to}: a corner of {across} against {steady} steady"
+            );
+            assert_eq!(engine.params().eq_on, to, "the switch landed");
+            // And it is heard: the last 50 ms are at the new level, not in the dip.
+            let tail = &after[after.len() - 2_400..];
+            assert!(tail.iter().fold(0.0_f32, |a, s| a.max(s.abs())) > 0.05);
+        }
+    }
+
+    #[test]
+    fn a_preset_change_and_the_power_switch_dip_rather_than_step() {
+        let mut studio = eq_preset(true);
+        studio.makeup_db = -1.0;
+        studio.highpass_hz = 100.0;
+        studio.gate_on = false;
+        let mut off = eq_preset(true);
+        off.power = false;
+        for next in [studio, off] {
+            let mut engine = InputEngine::new(FS, 1_024, 1);
+            engine.apply(&eq_preset(true));
+            let (steady, across, _) = corner_across(&mut engine, &next);
+            assert!(
+                across < 4.0 * steady.max(1.0e-4),
+                "a corner of {across} against {steady} steady"
+            );
+            assert_eq!(*engine.params(), next);
+        }
+    }
+
+    #[test]
+    fn the_denoiser_switched_on_fades_in_after_its_delay_rather_than_in_the_middle_of_it() {
+        // Noisy Room picked under the tone: the denoiser's twenty milliseconds of delay start as
+        // silence, and the chain came back out of them in one step (-28 dBFS high-passed). The dip
+        // holds the silence for the delay the switch added, and fades in after it.
+        let mut denoised = eq_preset(true);
+        denoised.rnnoise = true;
+        denoised.denoise_level = fxsound_core::DenoiseLevel::Strong;
+        denoised.sanitise();
+        let mut engine = InputEngine::new(FS, 1_024, 1);
+        engine.apply(&eq_preset(true));
+        let latency_before = engine.latency_frames();
+        let (_, _, after) = corner_across(&mut engine, &denoised);
+        assert!(engine.latency_frames() > latency_before + 900);
+        // RNNoise shapes a steady tone however it likes; what must not happen is a jump from
+        // silence to it. The largest step between two samples of the first 100 ms is well under
+        // a step to the tone's own level.
+        let step = after[..4_800]
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0, f32::max);
+        assert!(step < 0.03, "a step of {step}");
+    }
+
+    #[test]
+    fn a_control_that_moves_by_degrees_lands_at_once_without_a_dip() {
+        let mut engine = InputEngine::new(FS, 1_024, 1);
+        engine.apply(&eq_preset(true));
+        run(&mut engine, &steady_tone(0, 4_800), 1);
+        let mut moved = eq_preset(true);
+        moved.gate_threshold_db = -40.0;
+        moved.band_boost_db[3] = 6.0;
+        moved.makeup_db = 4.0;
+        assert!(!needs_dip(&eq_preset(true), &moved));
+        engine.apply(&moved);
+        assert_eq!(*engine.params(), moved);
+        let mut next = steady_tone(4_800, 960);
+        engine.process(&mut next, 1);
+        let quietest = next[480..].iter().map(|s| s.abs()).fold(0.0_f32, f32::max);
+        assert!(quietest > 0.05, "the chain went quiet: {quietest}");
+    }
+
+    #[test]
+    fn a_switch_before_any_audio_and_one_taken_back_in_time_land_at_once() {
+        let mut engine = InputEngine::new(FS, 1_024, 1);
+        engine.apply(&eq_preset(true));
+        engine.apply(&eq_preset(false));
+        assert!(
+            !engine.chain.eq().expect("eq").is_enabled(),
+            "nobody was listening"
+        );
+
+        let mut engine = InputEngine::new(FS, 1_024, 1);
+        engine.apply(&eq_preset(true));
+        run(&mut engine, &steady_tone(0, 4_800), 1);
+        engine.apply(&eq_preset(false));
+        engine.apply(&eq_preset(true));
+        let mut next = steady_tone(4_800, 1_024);
+        let expected = {
+            let mut twin = InputEngine::new(FS, 1_024, 1);
+            twin.apply(&eq_preset(true));
+            run(&mut twin, &steady_tone(0, 4_800), 1);
+            let mut same = next.clone();
+            twin.process(&mut same, 1);
+            same
+        };
+        engine.process(&mut next, 1);
+        assert_eq!(
+            next, expected,
+            "a switch taken back before it landed changes nothing"
+        );
     }
 
     #[test]
