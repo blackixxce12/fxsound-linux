@@ -24,6 +24,14 @@
 //! it every client connects and then hangs forever, which looks exactly like a deadlock in the
 //! code under test.
 //!
+//! Nothing a test starts here may outlive it. Every daemon and tool is started through
+//! `fxsound_core::test_support`, which kills it when its handle is dropped — a panicking test
+//! drops it too — and has the kernel, or a watchdog where `setpriv` is missing, kill it when the
+//! test process dies, however it dies: an interrupted run once left daemons and `pw-record`s
+//! writing raw audio into `/tmp` for hours. Recorders are also capped at [`RECORDING_LIMIT`]. And
+//! each graph gets a directory made new for it, never one an earlier run left under the same name
+//! with an old daemon's socket still in it.
+//!
 //! What the engine says is only half of each test; the other half is read from the server by
 //! PipeWire's own tools, run as children with the private socket on their command line and in
 //! their own environment. The engine cannot be its own witness here: its device list leaves our
@@ -54,9 +62,10 @@
 
 use super::*;
 use fxsound_core::messages::AudioToUi;
+use fxsound_core::test_support::{self as support, Guarded, ScratchDir};
 use std::io::Write as _;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 mod apps;
@@ -69,6 +78,10 @@ pub(crate) const PATIENCE: Duration = Duration::from_secs(10);
 
 /// Our nodes as the server lists them: each name with its `object.serial`.
 type OurNodes = Vec<(&'static str, u64)>;
+
+/// The most a recorder of these tests may write: a `pw-record` that nobody stopped stops here,
+/// about eleven minutes of 48 kHz stereo `f32` in, rather than filling `/tmp`.
+pub(crate) const RECORDING_LIMIT: u64 = 256 << 20;
 
 /// The clock of [`PrivateGraph::clocked_recorder`]: a null sink the engine does not take for a
 /// device, with a real device's driver priority.
@@ -97,10 +110,12 @@ pub(crate) fn skip(reason: &str) {
 /// Crate-visible for `engine::live_session`, whose tests stand in for the engine's main loop
 /// rather than drive its handle.
 pub(crate) struct PrivateGraph {
-    dir: PathBuf,
-    child: Child,
+    /// The daemon's runtime directory, configuration and whatever the tests write beside them:
+    /// made for this graph, and removed after the daemons are gone.
+    dir: ScratchDir,
+    child: Guarded,
     /// The private system bus of a graph that can hold cards ([`Self::start_with_cards`]).
-    bus: Option<Child>,
+    bus: Option<Guarded>,
 }
 
 impl PrivateGraph {
@@ -141,9 +156,11 @@ impl PrivateGraph {
             }
         }
 
-        // Directly under /tmp: a Unix socket path may not exceed 108 bytes, and a path beside the
-        // source tree is already most of that before the socket name is added.
-        let dir = PathBuf::from(format!("/tmp/fxsound-t-{}-{tag}", std::process::id()));
+        // Short, which in practice means directly under /tmp: a Unix socket path may not exceed
+        // 108 bytes, and a path beside the source tree is already most of that before the socket
+        // name is added. And new: a directory an earlier run left, perhaps with its daemon's
+        // socket still in it, is never taken for this one.
+        let dir = ScratchDir::for_sockets(&format!("t-{tag}"));
         let run = dir.join("run");
         let conf = dir.join("pipewire.conf");
         let config = if cards {
@@ -157,18 +174,12 @@ impl PrivateGraph {
             .map_err(|error| format!("{} could not be prepared: {error}", dir.display()))?;
 
         let bus = if cards {
-            match Self::start_bus(&dir) {
-                Ok(bus) => Some(bus),
-                Err(why) => {
-                    let _ = std::fs::remove_dir_all(&dir);
-                    return Err(why);
-                }
-            }
+            Some(Self::start_bus(&dir)?)
         } else {
             None
         };
 
-        let mut daemon = Command::new("pipewire");
+        let mut daemon = support::command("pipewire");
         daemon
             .arg("-c")
             .arg(&conf)
@@ -187,16 +198,8 @@ impl PrivateGraph {
                     format!("unix:path={}", dir.join("no-session-bus").display()),
                 );
         }
-        let child = match daemon.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                if let Some(mut bus) = bus {
-                    let _ = bus.kill();
-                    let _ = bus.wait();
-                }
-                return Err(format!("pipewire could not be started: {error}"));
-            }
-        };
+        let child = support::spawn(daemon)
+            .map_err(|error| format!("pipewire could not be started: {error}"))?;
 
         let graph = Self { dir, child, bus };
         let deadline = Instant::now() + PATIENCE;
@@ -213,7 +216,7 @@ impl PrivateGraph {
 
     /// A `dbus-daemon` for [`Self::start_with_cards`], listening in `dir` and nowhere else, and
     /// waited for until its socket is there.
-    fn start_bus(dir: &std::path::Path) -> Result<Child, String> {
+    fn start_bus(dir: &std::path::Path) -> Result<Guarded, String> {
         let conf = dir.join("bus.conf");
         let socket = dir.join("bus");
         let config = format!(
@@ -234,14 +237,14 @@ impl PrivateGraph {
         );
         std::fs::write(&conf, config)
             .map_err(|error| format!("{} could not be written: {error}", conf.display()))?;
-        let mut bus = Command::new("dbus-daemon")
-            .arg(format!("--config-file={}", conf.display()))
+        let mut bus = support::command("dbus-daemon");
+        bus.arg(format!("--config-file={}", conf.display()))
             .arg("--nofork")
             .arg("--nopidfile")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        let bus = support::spawn(bus)
             .map_err(|error| format!("dbus-daemon could not be started: {error}"))?;
         let deadline = Instant::now() + PATIENCE;
         while Instant::now() < deadline {
@@ -250,8 +253,6 @@ impl PrivateGraph {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let _ = bus.kill();
-        let _ = bus.wait();
         Err("the private system bus never came up".to_owned())
     }
 
@@ -275,7 +276,7 @@ impl PrivateGraph {
     /// tool that ignored `-r` would find no session socket to fall back on either. `None` when the
     /// tool is not installed or failed, which the callers treat as "cannot tell", not as a pass.
     pub(crate) fn tool(&self, program: &str, args: &[&str]) -> Option<String> {
-        let output = Command::new(program)
+        let output = support::command(program)
             .arg("-r")
             .arg(self.socket())
             .args(args)
@@ -551,7 +552,8 @@ impl PrivateGraph {
     pub(crate) fn record_from(&self, from: &str, name: &str) -> Option<Recorder> {
         let file = self.dir.join(format!("{name}.raw"));
         let props = format!("{{ node.name = {name} }}");
-        let child = Command::new("pw-record")
+        let mut recorder = support::command_writing_at_most("pw-record", RECORDING_LIMIT);
+        recorder
             .arg("--remote")
             .arg(self.socket())
             .args(["--target", "0", "-P", &props, "--raw", "--format", "f32"])
@@ -561,9 +563,8 @@ impl PrivateGraph {
             .env("PIPEWIRE_REMOTE", self.socket())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+            .stderr(Stdio::null());
+        let child = support::spawn(recorder).ok()?;
         let recorder = Recorder {
             child,
             name: name.to_owned(),
@@ -662,16 +663,16 @@ impl PrivateGraph {
     /// connected, because a device belongs to the client that made it and goes when that client
     /// does — which is also how a test takes it away again.
     pub(crate) fn add_card(&self, name: &str, address: &str) -> Option<CardHolder> {
-        let mut child = Command::new("pw-cli")
+        let mut client = support::command("pw-cli");
+        client
             .arg("-r")
             .arg(self.socket())
             .env("XDG_RUNTIME_DIR", self.dir.join("run"))
             .env("PIPEWIRE_REMOTE", self.socket())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+            .stderr(Stdio::null());
+        let mut child = support::spawn(client).ok()?;
         let command = format!(
             "create-device spa-device-factory {{ factory.name = api.bluez5.enum.dbus \
              device.name = {name} device.api = bluez5 api.bluez5.address = \"{address}\" }}\n"
@@ -679,10 +680,12 @@ impl PrivateGraph {
         // Written and left open: `pw-cli` reads its commands from it, and stays for as long as
         // there may be more.
         let written = child
-            .stdin
-            .as_mut()
+            .stdin()
             .is_some_and(|stdin| stdin.write_all(command.as_bytes()).is_ok());
-        let mut holder = CardHolder { child, id: 0 };
+        let mut holder = CardHolder {
+            _child: child,
+            id: 0,
+        };
         if !written {
             return None;
         }
@@ -900,7 +903,7 @@ impl PrivateGraph {
 /// An application recording from the graph ([`PrivateGraph::record_from`]). Dropped, it stops, and
 /// its links go with it.
 pub(crate) struct Recorder {
-    child: Child,
+    child: Guarded,
     /// Its `node.name`, to link and unlink it by.
     pub(crate) name: String,
     file: std::path::PathBuf,
@@ -964,33 +967,20 @@ impl Recorder {
     }
 }
 
-impl Drop for Recorder {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 /// A card [`PrivateGraph::add_card`] made, and the `pw-cli` that holds it in the graph. Dropped,
 /// the client goes and its card with it.
 pub(crate) struct CardHolder {
-    child: Child,
+    /// Kept for its drop, which kills the client.
+    _child: Guarded,
     /// The card's registry id: what its nodes name in `device.id`.
     pub(crate) id: u64,
-}
-
-impl Drop for CardHolder {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 /// Whether a program can be started at all. Asked up front by a test that cannot do without a
 /// tool, because [`PrivateGraph::tool`]'s `None` also means "ran and refused", which for such a
 /// test is a failure and not a reason to skip.
 pub(crate) fn installed(program: &str) -> bool {
-    Command::new(program)
+    support::command(program)
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1039,6 +1029,7 @@ pub(crate) fn unless_skipped<T>(checked: Option<T>, tool: &str, what: &str) -> O
 }
 
 impl Drop for PrivateGraph {
+    /// The daemons go first, and their directory after them, with the fields.
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -1046,7 +1037,6 @@ impl Drop for PrivateGraph {
             let _ = bus.kill();
             let _ = bus.wait();
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -1166,6 +1156,214 @@ fn wait_for<T>(
     }
     println!("gave up waiting for {what}");
     None
+}
+
+/// Set, in a test process of this binary's that the tests below start, to what the child half
+/// ([`the_child_half_starts_its_daemons_and_then_panics_or_waits`]) does once its daemons run:
+/// `panic`, or wait to be killed.
+const CHILD_HALF: &str = "FXSOUND_GRAPH_CHILD_HALF";
+
+/// Not a test of its own: the half of the two tests below that runs in a test process of this
+/// binary's. It starts a private PipeWire, a `pw-record` recording from it and a private
+/// `dbus-daemon`, says which processes they are and where their directory is, and then does what
+/// [`CHILD_HALF`] says — panics, or waits a minute to be killed. Without it, it passes at once.
+#[test]
+fn the_child_half_starts_its_daemons_and_then_panics_or_waits() {
+    let Some(then) = std::env::var_os(CHILD_HALF) else {
+        return;
+    };
+    let graph = PrivateGraph::start("child-half").expect("a private pipewire");
+    let recorder = graph.clocked_recorder("t_rec").expect("a recorder");
+    let bus = PrivateGraph::start_bus(&graph.dir).expect("a private dbus-daemon");
+    println!(
+        "daemons {} {} {} in {}",
+        graph.child.id(),
+        recorder.child.id(),
+        bus.id(),
+        graph.dir.display()
+    );
+    std::io::stdout().flush().expect("the ids are out");
+    assert_ne!(then, "panic", "on purpose, with the daemons still running");
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+/// When the process `pid` started, in clock ticks since boot (`/proc/<pid>/stat`, field 22): with
+/// the id, what tells a process from a later one that was given the same id. `None` once it has
+/// gone, or is a zombie waiting to be reaped.
+fn started_at(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The fields after the command name, which is in parentheses; the state comes first.
+    let fields: Vec<&str> = stat.rsplit_once(") ")?.1.split(' ').collect();
+    if matches!(fields.first(), Some(&("Z" | "X"))) {
+        return None;
+    }
+    fields.get(19)?.parse().ok()
+}
+
+/// Which of the processes `started` — each an id and a start time — still run once `patience`
+/// has passed; none as soon as none does.
+fn still_running_after(started: &[(u32, u64)], patience: Duration) -> Vec<u32> {
+    let deadline = Instant::now() + patience;
+    loop {
+        let running: Vec<u32> = started
+            .iter()
+            .filter(|&&(pid, start)| started_at(pid) == Some(start))
+            .map(|&(pid, _)| pid)
+            .collect();
+        if running.is_empty() || Instant::now() >= deadline {
+            return running;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The child half as the tests below see it.
+struct ChildHalf {
+    /// The test process — guarded itself, so a test here that fails cannot leave it waiting.
+    process: Guarded,
+    /// Its daemons, each with its start time.
+    started: Vec<(u32, u64)>,
+    /// Their directory.
+    dir: PathBuf,
+}
+
+/// Start the child half with [`CHILD_HALF`] set to `then`, and read what it says. `None`, after
+/// saying so, when a tool it needs is not installed.
+fn graph_child_half(then: &str) -> Option<ChildHalf> {
+    use std::io::{BufRead as _, BufReader};
+
+    let tools = [
+        "pipewire",
+        "pw-record",
+        "pw-cli",
+        "pw-link",
+        "pw-dump",
+        "dbus-daemon",
+    ];
+    if let Some(missing) = tools.into_iter().find(|tool| !installed(tool)) {
+        skip(&format!(
+            "{missing} is not installed, so no daemon could be left behind"
+        ));
+        return None;
+    }
+    let (_, module) = module_path!()
+        .split_once("::")
+        .expect("a module of the crate");
+    let name = format!("{module}::the_child_half_starts_its_daemons_and_then_panics_or_waits");
+    let mut process = support::command(std::env::current_exe().expect("this test binary"));
+    process
+        .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+        .env(CHILD_HALF, then)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut process = support::spawn(process).expect("the child half");
+    let lines = BufReader::new(process.take_stdout().expect("piped")).lines();
+    // The harness puts the test's name in front of what it prints, on the same line.
+    let (pids, dir) = lines
+        .map_while(Result::ok)
+        .find_map(|line| {
+            let (_, said) = line.rsplit_once("daemons ")?;
+            let (ids, dir) = said.split_once(" in ")?;
+            let ids: Option<Vec<u32>> = ids.split(' ').map(|id| id.parse().ok()).collect();
+            Some((ids?, PathBuf::from(dir)))
+        })
+        .expect("the child half said which its daemons are");
+    let started = pids
+        .into_iter()
+        .map(|pid| (pid, started_at(pid).expect("a daemon the child half runs")))
+        .collect();
+    Some(ChildHalf {
+        process,
+        started,
+        dir,
+    })
+}
+
+#[test]
+fn a_test_that_panics_leaves_no_private_daemon_behind() {
+    let Some(ChildHalf {
+        mut process,
+        started,
+        dir,
+    }) = graph_child_half("panic")
+    else {
+        return;
+    };
+    let status = process.wait().expect("the child half ended");
+    assert!(!status.success(), "its test panicked, so it failed");
+    assert_eq!(
+        still_running_after(&started, Duration::ZERO),
+        Vec::<u32>::new()
+    );
+    assert!(!dir.exists(), "{} is still there", dir.display());
+}
+
+#[test]
+fn a_test_killed_outright_leaves_no_private_daemon_behind() {
+    let Some(ChildHalf {
+        mut process,
+        started,
+        dir,
+    }) = graph_child_half("wait")
+    else {
+        return;
+    };
+    process.kill().expect("SIGKILL");
+    process.wait().expect("the child half ended");
+    let left = still_running_after(&started, PATIENCE);
+
+    // No destructor ran in the killed process, so its directory is still there — which no later
+    // graph takes for its own — and the recording in it has stopped growing.
+    let recording = dir.join("t_rec.raw");
+    let size = || std::fs::metadata(&recording).map_or(0, |meta| meta.len());
+    let before = size();
+    std::thread::sleep(Duration::from_millis(300));
+    let after = size();
+    if dir
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("fxsound-t-child-half-"))
+    {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert_eq!(
+        left,
+        Vec::<u32>::new(),
+        "still running after the test process was killed"
+    );
+    assert_eq!(after, before, "the recorder is still writing");
+}
+
+/// A run killed outright leaves its graph's directory behind, with the socket in it — and for a
+/// moment perhaps a daemon still behind the socket. A graph with the same tag never takes that
+/// directory for its own. When the name was the tag and the process id, a run that happened to
+/// get an earlier run's process id did: it found the old socket already there, took it for its
+/// own daemon's, and its test talked to whatever answered on it. Here the earlier graph is still
+/// running, which is the worst case, and the later one still gets a directory and a daemon of its
+/// own.
+#[test]
+fn a_private_graph_never_starts_in_the_directory_of_one_before_it() {
+    let Some(earlier) = PrivateGraph::start("reuse") else {
+        return;
+    };
+    let Some(mut later) = PrivateGraph::start("reuse") else {
+        return;
+    };
+    assert_ne!(earlier.dir.path(), later.dir.path());
+    assert!(
+        earlier.socket().exists(),
+        "the earlier graph's socket stays"
+    );
+    assert!(later.socket().exists());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        later.child.try_wait().expect("the later daemon's status"),
+        None,
+        "the later daemon should be running, on a socket of its own"
+    );
+    if let Some(dump) = unless_skipped(later.dump(), "pw-dump", "the later graph's own daemon") {
+        assert!(!dump.is_empty());
+    }
 }
 
 #[test]

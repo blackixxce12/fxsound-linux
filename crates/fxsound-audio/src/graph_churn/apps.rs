@@ -13,14 +13,8 @@ use fxsound_core::{AppKey, AppStream};
 /// An application `pw-cat` runs on a private graph ([`PrivateGraph::pw_cat`]). Dropped, its
 /// process is killed, and its stream goes with its connection.
 pub(crate) struct App {
-    child: Child,
-}
-
-impl Drop for App {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+    /// Kept for its drop, which kills the process.
+    _child: Guarded,
 }
 
 impl PrivateGraph {
@@ -41,7 +35,8 @@ impl PrivateGraph {
         } else {
             "/dev/null"
         };
-        let child = Command::new("pw-cat")
+        let mut player = support::command("pw-cat");
+        player
             .arg("--remote")
             .arg(self.socket())
             .arg(mode)
@@ -54,10 +49,10 @@ impl PrivateGraph {
             .env("PIPEWIRE_REMOTE", self.socket())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let app = App { child };
+            .stderr(Stdio::null());
+        let app = App {
+            _child: support::spawn(player).ok()?,
+        };
         let deadline = Instant::now() + PATIENCE;
         while self.node_id(node_name).is_none() {
             if Instant::now() >= deadline {

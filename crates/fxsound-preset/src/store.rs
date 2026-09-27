@@ -714,6 +714,7 @@ fn collect<F: PresetFile>(dir: &Path, source: PresetSource, out: &mut Vec<Preset
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fxsound_core::test_support::ScratchDir;
 
     fn assets() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -732,11 +733,9 @@ mod tests {
         store
     }
 
-    fn tempdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("fxsound-preset-test-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// A new directory of the test's own, removed when the test ends — also when it panics.
+    fn tempdir(tag: &str) -> ScratchDir {
+        ScratchDir::new(&format!("preset-test-{tag}"))
     }
 
     /// The twelve factory presets, in the order their filenames number them.
@@ -1297,7 +1296,6 @@ mod tests {
         assert!(from_autosave);
         assert_eq!(loaded.main_midi[0], 43, "the edits are back");
         assert_eq!(store.load_saved("Mine").expect("saved").main_midi[0], 42);
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1364,7 +1362,6 @@ mod tests {
                 .main_midi[0],
             99
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1396,7 +1393,6 @@ mod tests {
             std::fs::read(user.join("New.fac.1.bak")).unwrap(),
             b"not a preset"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

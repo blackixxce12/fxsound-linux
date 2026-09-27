@@ -86,79 +86,74 @@ fn write_and_sync(temp: &Path, contents: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("fxsound-atomic-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create the test directory");
-        dir
+    /// A new directory of the test's own, removed with the handle — also when the test panics.
+    fn temp_dir(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("fxsound-atomic-{name}-"))
+            .tempdir()
+            .expect("create the test directory")
     }
 
     #[test]
     fn a_write_creates_the_file_and_its_parent() {
         let dir = temp_dir("create");
-        let path = dir.join("nested").join("settings.toml");
+        let path = dir.path().join("nested").join("settings.toml");
         write(&path, b"hello").expect("write");
         assert_eq!(std::fs::read(&path).expect("read"), b"hello");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_write_leaves_no_temporary_file_behind() {
         let dir = temp_dir("clean");
-        let path = dir.join("preset.fac");
+        let path = dir.path().join("preset.fac");
         write(&path, b"one").expect("write");
         write(&path, b"two").expect("overwrite");
-        let left: Vec<_> = std::fs::read_dir(&dir)
+        let left: Vec<_> = std::fs::read_dir(dir.path())
             .expect("list")
             .filter_map(Result::ok)
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(left, vec!["preset.fac".to_owned()], "stray files: {left:?}");
         assert_eq!(std::fs::read(&path).expect("read"), b"two");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_failed_write_leaves_the_previous_contents_intact() {
         let dir = temp_dir("failure");
-        let path = dir.join("preset.fac");
+        let path = dir.path().join("preset.fac");
         write(&path, b"original").expect("write");
 
         // A directory cannot be replaced by a file, so the rename fails while the temporary file
         // has already been written — the one ordering where a naive implementation would have
         // truncated the target first.
-        let blocked = dir.join("blocked");
+        let blocked = dir.path().join("blocked");
         std::fs::create_dir_all(&blocked).expect("create");
         assert!(write(&blocked, b"nope").is_err());
 
         assert_eq!(std::fs::read(&path).expect("read"), b"original");
         assert!(blocked.is_dir(), "the directory should be untouched");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_backup_keeps_what_was_overwritten() {
         let dir = temp_dir("backup");
-        let path = dir.join("My Preset.fac");
+        let path = dir.path().join("My Preset.fac");
         write(&path, b"first").expect("write");
         write_with_backup(&path, b"second").expect("overwrite");
 
         assert_eq!(std::fs::read(&path).expect("read"), b"second");
         assert_eq!(
-            std::fs::read(dir.join("My Preset.fac.bak")).expect("read the backup"),
+            std::fs::read(dir.path().join("My Preset.fac.bak")).expect("read the backup"),
             b"first"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_backup_of_a_file_that_does_not_exist_yet_is_not_an_error() {
         let dir = temp_dir("backup-missing");
-        let path = dir.join("new.fac");
+        let path = dir.path().join("new.fac");
         write_with_backup(&path, b"only").expect("write");
         assert_eq!(std::fs::read(&path).expect("read"), b"only");
-        assert!(!dir.join("new.fac.bak").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.path().join("new.fac.bak").exists());
     }
 }

@@ -84,6 +84,7 @@ mod tests {
     use crate::input::{Denoise, Gate};
     use crate::{PresetSource, sanitise_preset_name};
     use fxsound_core::DenoiseLevel;
+    use fxsound_core::test_support::ScratchDir;
     use std::path::PathBuf;
 
     fn assets() -> PathBuf {
@@ -99,11 +100,9 @@ mod tests {
         store
     }
 
-    fn tempdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("fxsound-input-store-test-{tag}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// A new directory of the test's own, removed when the test ends — also when it panics.
+    fn tempdir(tag: &str) -> ScratchDir {
+        ScratchDir::new(&format!("input-store-test-{tag}"))
     }
 
     fn named(name: &str) -> InputPreset {

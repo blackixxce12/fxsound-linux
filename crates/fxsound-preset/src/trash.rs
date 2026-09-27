@@ -238,13 +238,11 @@ fn deletion_date() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fxsound_core::test_support::ScratchDir;
 
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("fxsound-trash-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch");
-        dir
+    /// A new directory of the test's own, removed when the test ends — also when it panics.
+    fn scratch(tag: &str) -> ScratchDir {
+        ScratchDir::new(&format!("trash-test-{tag}"))
     }
 
     #[test]
@@ -277,7 +275,6 @@ mod tests {
         assert_eq!(date.len(), "2026-09-24T10:00:00".len(), "{date}");
         assert_eq!(&date[4..5], "-");
         assert_eq!(&date[10..11], "T");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -293,7 +290,6 @@ mod tests {
         assert_eq!(std::fs::read(trash.join("files/Rock.fac")).unwrap(), b"one");
         assert_eq!(std::fs::read(&second).unwrap(), b"two");
         assert!(trash.join("info/Rock.2.fac.trashinfo").is_file());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -317,7 +313,6 @@ mod tests {
             std::fs::read(dir.join("Rock.fac.1.bak")).unwrap(),
             b"CLASS1"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -341,7 +336,6 @@ mod tests {
             std::fs::read(dir.join("Rock.fac.1.bak")).unwrap(),
             b"deleted before"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -354,7 +348,6 @@ mod tests {
             0,
             "nothing made on the way"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

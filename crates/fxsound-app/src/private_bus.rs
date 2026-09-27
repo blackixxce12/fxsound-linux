@@ -1,20 +1,25 @@
 //! A `dbus-daemon` of the tests' own, for the D-Bus service ([`crate::dbus`]) and the suspend
 //! watcher ([`crate::sleep`]). Never the session's bus, never the system's: a test that reached
 //! either would be driving — or muting — the FxSound the user is listening to.
+//!
+//! Started through `fxsound_core::test_support`, so it cannot outlive the test: it is killed
+//! when dropped, which a panicking test does too, and when the test process dies, however it
+//! dies.
 
+use fxsound_core::test_support::{self as support, Guarded, ScratchDir};
 use std::io::{BufRead as _, BufReader};
-use std::process::{Child, ChildStdout, Stdio};
+use std::process::{ChildStdout, Stdio};
 use std::time::Duration;
 
 /// A private bus, killed when dropped.
 pub(crate) struct PrivateBus {
-    daemon: Child,
+    daemon: Guarded,
     /// What a client connects to.
     pub(crate) address: String,
     /// Kept open: the daemon has nowhere to write otherwise.
     _stdout: BufReader<ChildStdout>,
-    /// The bus's configuration and socket, removed with it.
-    _dir: tempfile::TempDir,
+    /// The bus's configuration and socket, made new for it and removed with it.
+    _dir: ScratchDir,
 }
 
 impl PrivateBus {
@@ -40,8 +45,8 @@ impl PrivateBus {
     /// A bus of type `kind` in a scratch directory, anyone allowed to own any name, and no
     /// service directory: nothing is ever activated.
     fn typed(kind: &str) -> Option<Self> {
-        let dir = scratch_dir();
-        let config = dir.path().join(format!("{kind}-like.conf"));
+        let dir = ScratchDir::for_sockets("bus");
+        let config = dir.join(format!("{kind}-like.conf"));
         std::fs::write(
             &config,
             format!(
@@ -58,7 +63,7 @@ impl PrivateBus {
   </policy>
 </busconfig>
 "#,
-                dir.path().display()
+                dir.display()
             ),
         )
         .expect("write the bus configuration");
@@ -66,14 +71,15 @@ impl PrivateBus {
         Self::spawn(&[flag.as_str()], dir)
     }
 
-    fn spawn(config: &[&str], dir: tempfile::TempDir) -> Option<Self> {
-        let spawned = std::process::Command::new("dbus-daemon")
+    fn spawn(config: &[&str], dir: ScratchDir) -> Option<Self> {
+        let mut daemon = support::command("dbus-daemon");
+        daemon
             .args(config)
             .args(["--print-address=1", "--nofork"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        let spawned = support::spawn(daemon);
         let mut daemon = match spawned {
             Ok(daemon) => daemon,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -82,7 +88,7 @@ impl PrivateBus {
             }
             Err(err) => panic!("dbus-daemon did not start: {err}"),
         };
-        let mut stdout = BufReader::new(daemon.stdout.take().expect("piped"));
+        let mut stdout = BufReader::new(daemon.take_stdout().expect("piped"));
         let mut address = String::new();
         stdout.read_line(&mut address).expect("the bus address");
         let address = address.trim().to_owned();
@@ -115,22 +121,9 @@ impl PrivateBus {
 }
 
 impl Drop for PrivateBus {
+    /// The daemon goes first, and its directory after it, with the fields.
     fn drop(&mut self) {
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
-    }
-}
-
-/// A scratch directory short enough to hold a socket: a Unix socket's path has room for about
-/// a hundred bytes, which a deep `TMPDIR` can use up on its own.
-fn scratch_dir() -> tempfile::TempDir {
-    let make = |parent: &std::path::Path| {
-        tempfile::Builder::new()
-            .prefix("fxs-bus-")
-            .tempdir_in(parent)
-    };
-    match make(&std::env::temp_dir()) {
-        Ok(dir) if dir.path().as_os_str().len() <= 64 => dir,
-        _ => make(std::path::Path::new("/tmp")).expect("a scratch directory for the bus"),
     }
 }

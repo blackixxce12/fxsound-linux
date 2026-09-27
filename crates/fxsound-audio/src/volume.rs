@@ -1275,12 +1275,10 @@ Audio/Sink:application.id:com.fxsound.FxSound=\\s{\"channelVolumes\":[0.2,\\t0.2
         assert_eq!(missing.output, None);
         assert_eq!(missing.input, None);
 
-        let dir = std::env::temp_dir().join(format!("fxsound-volume-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let dir = fxsound_core::test_support::ScratchDir::new("volume");
         let path = dir.join(WIREPLUMBER_STATE);
         std::fs::write(&path, STREAM_PROPERTIES).expect("the state file");
         let read = inherited_from(&path);
-        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             read.output.map(|volume| volume.effective(2)),
             Some(vec![0.064, 0.064])

@@ -29,3 +29,7 @@ thiserror = { workspace = true }
 # out of a status the engine is right not to send, and `routes`', to read the UCM laptop
 # fixture's card routes, whose nested structs the device tests' minimal reader does not cover.
 serde_json = { workspace = true }
+
+[dev-dependencies]
+# The tests' scratch directories and guarded children (`fxsound_core::test_support`).
+fxsound-core = { workspace = true, features = ["test-support"] }

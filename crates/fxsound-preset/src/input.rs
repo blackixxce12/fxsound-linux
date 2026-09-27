@@ -554,6 +554,7 @@ impl InputPreset {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fxsound_core::test_support::ScratchDir;
     use std::path::PathBuf;
 
     /// A preset using every table and key the format has.
@@ -596,12 +597,9 @@ mod tests {
         )
     }
 
-    fn tempdir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("fxsound-input-preset-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// A new directory of the test's own, removed when the test ends — also when it panics.
+    fn tempdir(tag: &str) -> ScratchDir {
+        ScratchDir::new(&format!("input-preset-{tag}"))
     }
 
     fn shipped_dir() -> PathBuf {
@@ -847,7 +845,6 @@ mod tests {
             text.contains("rnnoise = true") && !text.contains("[denoise]"),
             "a preset with no table is written with no table:\n{text}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -927,7 +924,6 @@ mod tests {
         let back = InputPreset::load(&path).expect("load");
         assert_eq!(back, off);
         assert!(!back.to_params().eq_on);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -954,7 +950,6 @@ mod tests {
         let back = InputPreset::load(&path).expect("load");
         assert_eq!(back, wide);
         assert_eq!(back.to_params().filter_q, 2.5);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1002,7 +997,6 @@ mod tests {
         let error = InputPreset::load(&path).expect_err("nine gains for ten centres");
         assert!(matches!(error, Error::Mismatched { .. }), "{error}");
         assert!(error.to_string().contains("broken.toml"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1013,7 +1007,6 @@ mod tests {
         let error = InputPreset::load(&path).expect_err("a string for a float");
         assert!(matches!(error, Error::Toml { .. }), "{error}");
         assert!(error.to_string().contains("typo.toml"), "{error}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1043,7 +1036,6 @@ mod tests {
             matches!(&missing, Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound),
             "{missing:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1063,7 +1055,6 @@ mod tests {
             .map(|p| p.name)
             .collect();
         assert_eq!(names, ["Alpha", "Mike", "Zulu"]);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

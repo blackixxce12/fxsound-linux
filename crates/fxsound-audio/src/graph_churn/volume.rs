@@ -85,10 +85,11 @@ fn rms_db(samples: &[f32]) -> f32 {
 }
 
 impl PrivateGraph {
-    /// Start one of `pw-cat`'s faces against this daemon and nothing else: the socket on its
-    /// command line and in its own environment, as [`Self::tool`] does, but left running.
-    fn client(&self, program: &str, args: &[&str]) -> Option<Child> {
-        Command::new(program)
+    /// Start one of `pw-cat`'s faces, made by `support::command` or its recording kind, against
+    /// this daemon and nothing else: the socket on its command line and in its own environment,
+    /// as [`Self::tool`] does, but left running.
+    fn client(&self, mut client: std::process::Command, args: &[&str]) -> Option<Guarded> {
+        client
             .arg("--remote")
             .arg(self.socket())
             .args(args)
@@ -96,17 +97,19 @@ impl PrivateGraph {
             .env("PIPEWIRE_REMOTE", self.socket())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()
+            .stderr(Stdio::null());
+        support::spawn(client).ok()
     }
 
     /// Play a file into nothing yet, as a stream called `name`: linked by the caller, like
     /// everything on this graph.
-    fn play(&self, name: &str, file: &std::path::Path) -> Option<Child> {
+    fn play(&self, name: &str, file: &std::path::Path) -> Option<Guarded> {
         let props = format!("{{ node.name = {name} }}");
         let file = file.to_str()?;
-        let child = self.client("pw-play", &["--target", "0", "-P", &props, file])?;
+        let child = self.client(
+            support::command("pw-play"),
+            &["--target", "0", "-P", &props, file],
+        )?;
         let deadline = Instant::now() + PATIENCE;
         while Instant::now() < deadline {
             if self.node_id(name).is_some() {
@@ -127,7 +130,7 @@ impl PrivateGraph {
         let frames = ((RATE as f32) * seconds) as u32;
         let props = format!("{{ node.name = {name} }}");
         let mut child = self.client(
-            "pw-record",
+            support::command_writing_at_most("pw-record", RECORDING_LIMIT),
             &[
                 "--target",
                 "0",
@@ -186,7 +189,8 @@ impl PrivateGraph {
     /// cannot answer, and a test hung with it rather than failed.
     fn set_props(&self, node: &str, props: &str) -> Option<()> {
         let id = self.node_id(node)?.to_string();
-        let mut child = Command::new("pw-cli")
+        let mut client = support::command("pw-cli");
+        client
             .arg("-r")
             .arg(self.socket())
             .args(["set-param", &id, "Props", props])
@@ -194,9 +198,8 @@ impl PrivateGraph {
             .env("PIPEWIRE_REMOTE", self.socket())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+            .stderr(Stdio::null());
+        let mut child = support::spawn(client).ok()?;
         let deadline = Instant::now() + PATIENCE;
         loop {
             if let Ok(Some(status)) = child.try_wait() {
@@ -286,7 +289,7 @@ fn play_through_the_output_lane(
     handle: &EngineHandle,
     said: &mut Transcript,
     file: &std::path::Path,
-) -> Child {
+) -> Guarded {
     said.until(
         handle,
         "a device list",

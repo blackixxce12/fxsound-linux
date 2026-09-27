@@ -83,7 +83,9 @@ jobs:
       # fxsound-audio still talk to a real server — each starts its own private pipewire, with its
       # own runtime directory and socket, from the packages installed above, and kills it when it
       # is done. So never start a daemon in this step; if a test fails for want of one, it should
-      # start its own the way those do.
+      # start its own the way those do, through `fxsound_core::test_support`, whose children die
+      # with the test process even when a timeout kills it (util-linux's `setpriv --pdeathsig`, or
+      # a watchdog where there is none) and whose scratch directories go with the test.
       #
       # FXSOUND_REQUIRE_PIPEWIRE_TOOLS=1 makes every place those tests would print SKIPPED fail
       # instead. The harness hides a passing test's output, so here a skip would be invisible, and

@@ -1503,6 +1503,7 @@ mod tests {
     use super::*;
     use crate::cli::{InputCommand, OutputCommand};
     use clap::Parser as _;
+    use fxsound_core::test_support::ScratchDir;
     use fxsound_core::{AudioDevice, DenoiseLevel, NoiseSuppressionOverride};
     use serde_json::Value;
 
@@ -1510,13 +1511,39 @@ mod tests {
         App::headless_for_tests()
     }
 
+    /// A headless app from [`app_with_presets`], and the scratch directory its presets are in,
+    /// which goes with it — also when the test panics. It stands in for the app everywhere.
+    struct WithPresets {
+        app: App,
+        root: ScratchDir,
+    }
+
+    impl WithPresets {
+        /// The directory the app keeps its user presets in: the speakers' `.fac` files directly,
+        /// the microphone's voice presets under `Input/`.
+        fn user_dir(&self) -> std::path::PathBuf {
+            self.root.join("user")
+        }
+    }
+
+    impl std::ops::Deref for WithPresets {
+        type Target = App;
+
+        fn deref(&self) -> &App {
+            &self.app
+        }
+    }
+
+    impl std::ops::DerefMut for WithPresets {
+        fn deref_mut(&mut self) -> &mut App {
+            &mut self.app
+        }
+    }
+
     /// A headless app with two `.fac` presets for the speakers and two voice presets for the
-    /// microphone. `tag` keeps each test's scratch directory its own: the tests run on threads of
-    /// one process.
-    fn app_with_presets(tag: &str) -> App {
-        let root =
-            std::env::temp_dir().join(format!("fxsound-commands-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+    /// microphone, in a scratch directory of the test's own — `tag` names it — that goes with it.
+    fn app_with_presets(tag: &str) -> WithPresets {
+        let root = ScratchDir::new(&format!("commands-{tag}"));
         let factory = root.join("factory");
         std::fs::create_dir_all(&factory).expect("create the preset directory");
         for name in ["Alpha", "Beta"] {
@@ -1536,7 +1563,7 @@ mod tests {
             root.join("user"),
             vec![voice("Clean Voice"), voice("Flat Voice")],
         );
-        a
+        WithPresets { app: a, root }
     }
 
     #[test]
@@ -2007,7 +2034,6 @@ mod tests {
         let text = run(&mut bare, &[Command::Status { json: true }]).stdout;
         let decoded: UpstreamStatus = serde_json::from_str(&text).expect("status.go's Status");
         assert!(decoded.output_devices.is_empty());
-        let _ = std::fs::remove_dir_all(user_dir("upstream-decode").parent().expect("the root"));
     }
 
     #[test]
@@ -2105,7 +2131,6 @@ mod tests {
             [("Mine".to_owned(), true)]
         );
         assert_eq!(json["selected_preset"], json["input"]["preset"]);
-        let _ = std::fs::remove_dir_all(user_dir(tag).parent().expect("the root"));
     }
 
     #[test]
@@ -3411,14 +3436,6 @@ mod tests {
         assert!(outcome.stdout.contains("master_gain: -6 dB"));
     }
 
-    /// The directory `app_with_presets(tag)` keeps its user presets in: the speakers' `.fac`
-    /// files directly, the microphone's voice presets under `Input/`.
-    fn user_dir(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir()
-            .join(format!("fxsound-commands-{}-{tag}", std::process::id()))
-            .join("user")
-    }
-
     /// Where `lane` files a user preset called `name` under `user`, and where the other lane
     /// would have, had its kind of file been written for it.
     fn files(user: &std::path::Path, lane: DeviceDirection, name: &str) -> [std::path::PathBuf; 2] {
@@ -3441,7 +3458,7 @@ mod tests {
         for lane in DeviceDirection::ALL {
             let tag = format!("preset-commands-{}", lane.key());
             let mut a = app_with_presets(&tag);
-            let user = user_dir(&tag);
+            let user = a.user_dir();
             run(&mut a, &[Command::EditDirection(lane)]);
             let first = a.state.presets[0].name.clone();
             run(&mut a, &[preset(PresetCommand::Select(first))]);
@@ -3476,7 +3493,6 @@ mod tests {
             run(&mut a, &[preset(PresetCommand::Delete)]);
             assert!(!renamed.exists(), "{lane:?}");
             assert!(!a.lane_has_preset(lane, "Yours"), "{lane:?}");
-            let _ = std::fs::remove_dir_all(user.parent().expect("the root"));
         }
     }
 
@@ -3513,7 +3529,6 @@ mod tests {
             "{}",
             outcome.stderr
         );
-        let _ = std::fs::remove_dir_all(user_dir(tag).parent().expect("the root"));
     }
 
     #[test]
@@ -3540,7 +3555,7 @@ mod tests {
         // instead of a user copy shadowing a factory preset or a save nobody asked for.
         let tag = "refusals";
         let mut a = app_with_presets(tag);
-        let user = user_dir(tag);
+        let user = a.user_dir();
         run(&mut a, &[preset(PresetCommand::Select("Alpha".into()))]);
         for (command, words) in [
             (PresetCommand::Overwrite, "factory"),
@@ -3593,7 +3608,6 @@ mod tests {
         );
         let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("Mine".into()))]);
         assert!(!outcome.failed, "{}", outcome.stderr);
-        let _ = std::fs::remove_dir_all(user.parent().expect("the root"));
     }
 
     #[test]
@@ -3602,7 +3616,7 @@ mod tests {
         // factory preset meant moving a slider and moving it back first.
         let tag = "save-a-copy";
         let mut a = app_with_presets(tag);
-        let user = user_dir(tag);
+        let user = a.user_dir();
         run(&mut a, &[preset(PresetCommand::Select("Alpha".into()))]);
         let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("Copy".into()))]);
         assert!(!outcome.failed, "{}", outcome.stderr);
@@ -3618,7 +3632,6 @@ mod tests {
                 .any(|p| p.name == "Alpha" && p.factory),
             "the preset it copies is still there"
         );
-        let _ = std::fs::remove_dir_all(user.parent().expect("the root"));
     }
 
     #[test]
@@ -3641,7 +3654,6 @@ mod tests {
             a.lane_preset(DeviceDirection::Output),
             Some(("Beta", false))
         );
-        let _ = std::fs::remove_dir_all(user_dir(tag).parent().expect("the root"));
     }
 
     #[test]
@@ -3667,7 +3679,6 @@ mod tests {
             Some(("Mine", false))
         );
         assert!(a.preset_menu().delete, "and the menu offers the same");
-        let _ = std::fs::remove_dir_all(user_dir(tag).parent().expect("the root"));
     }
 
     // ---- per-application presets --------------------------------------------------------------

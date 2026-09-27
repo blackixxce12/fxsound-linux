@@ -5399,6 +5399,7 @@ fn set_autostart(enabled: bool) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fxsound_core::test_support::ScratchDir;
 
     fn headless() -> App {
         App::headless_for_tests()
@@ -6726,17 +6727,16 @@ mod tests {
 
     /// A restart: a music store holding a flat `Alpha` and a bass-heavy `Beta`, the two voice
     /// presets, `Beta` and `Flat` saved as the two lanes' presets, and the window last on `edit`.
-    fn restarted(tag: &str, edit: DeviceDirection) -> App {
+    fn restarted(tag: &str, edit: DeviceDirection) -> OnDisk {
         restarted_with(tag, edit, ("Beta", "Flat"))
     }
 
     /// [`restarted`] with the two saved names, music first.
-    fn restarted_with(tag: &str, edit: DeviceDirection, saved: (&str, &str)) -> App {
+    fn restarted_with(tag: &str, edit: DeviceDirection, saved: (&str, &str)) -> OnDisk {
         use fxsound_core::Preset;
 
-        let dir =
-            std::env::temp_dir().join(format!("fxsound-restart-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = ScratchDir::new(&format!("restart-{tag}"));
+        let dir = root.join("factory");
         std::fs::create_dir_all(&dir).expect("create the preset directory");
         for (name, bass) in [("Alpha", 0.0), ("Beta", 0.6)] {
             let mut preset = Preset {
@@ -6748,17 +6748,14 @@ mod tests {
         }
 
         let mut app = App::headless_for_tests();
-        app.presets = fxsound_preset::PresetStore::with_dirs(
-            vec![dir],
-            std::env::temp_dir().join(format!("fxsound-restart-user-{}-{tag}", std::process::id())),
-        );
+        app.presets = fxsound_preset::PresetStore::with_dirs(vec![dir], root.join("user"));
         app.presets.rescan();
         let _voices = with_voice_presets(&mut app);
         app.settings.device_direction = edit;
         saved.0.clone_into(&mut app.settings.output_preset);
         saved.1.clone_into(&mut app.settings.input_preset);
         app.adopt_saved_presets();
-        app
+        OnDisk { app, _root: root }
     }
 
     fn bass_of(app: &App) -> f32 {
@@ -6907,19 +6904,37 @@ mod tests {
         }
     }
 
+    /// An app whose presets are in a scratch directory of the test's own, which goes with it —
+    /// also when the test panics. It stands in for the app everywhere.
+    struct OnDisk {
+        app: App,
+        _root: ScratchDir,
+    }
+
+    impl std::ops::Deref for OnDisk {
+        type Target = App;
+
+        fn deref(&self) -> &App {
+            &self.app
+        }
+    }
+
+    impl std::ops::DerefMut for OnDisk {
+        fn deref_mut(&mut self) -> &mut App {
+            &mut self.app
+        }
+    }
+
     /// Builds a store with two real presets on disk, so `select_preset` has something to load.
     ///
-    /// `tag` names the caller, because the directory has to be the caller's alone: these tests run
-    /// on threads of one process, and a path shared between them meant each one wiped the presets
-    /// another was in the middle of listing — a failure that only showed up under load.
-    fn app_with_two_presets(tag: &str) -> App {
+    /// The directory is the caller's alone, and new — `tag` names it: these tests run on threads
+    /// of one process, and a path shared between them meant each one wiped the presets another
+    /// was in the middle of listing — a failure that only showed up under load.
+    fn app_with_two_presets(tag: &str) -> OnDisk {
         use fxsound_core::Preset;
 
-        let dir = std::env::temp_dir().join(format!(
-            "fxsound-device-memory-{}-{tag}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = ScratchDir::new(&format!("device-memory-{tag}"));
+        let dir = root.join("factory");
         std::fs::create_dir_all(&dir).expect("create the preset directory");
         for name in ["Alpha", "Beta"] {
             let preset = Preset {
@@ -6930,13 +6945,7 @@ mod tests {
         }
 
         let mut app = App::headless_for_tests();
-        app.presets = fxsound_preset::PresetStore::with_dirs(
-            vec![dir],
-            std::env::temp_dir().join(format!(
-                "fxsound-device-memory-user-{}-{tag}",
-                std::process::id()
-            )),
-        );
+        app.presets = fxsound_preset::PresetStore::with_dirs(vec![dir], root.join("user"));
         app.presets.rescan();
         app.state.presets = app
             .presets
@@ -6952,7 +6961,7 @@ mod tests {
             device("alsa_output.headphones", DeviceDirection::Output, false),
             device("alsa_output.speakers", DeviceDirection::Output, true),
         ];
-        app
+        OnDisk { app, _root: root }
     }
 
     #[test]
@@ -8291,14 +8300,12 @@ mod tests {
     fn a_saved_echo_cancellation_is_asked_of_the_engine_as_soon_as_it_exists() {
         // The restart the verifier described: `echo_cancel = true` in settings.toml, and an engine
         // that starts knowing nothing of it.
-        let dir = std::env::temp_dir().join(format!("fxsound-startup-echo-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = ScratchDir::new("startup-echo");
         let path = dir.join("settings.toml");
         let mut saved = Settings::default();
         saved.echo_cancel = true;
         saved.save_to(&path).expect("save");
         let loaded = Settings::load_from(&path);
-        let _ = std::fs::remove_dir_all(&dir);
 
         let messages = startup_messages(&loaded);
         let asked = messages
@@ -11506,7 +11513,7 @@ mod tests {
 
     /// The speakers playing `Alpha` and the headphones last used with `Beta`, both remembered in
     /// `device_configs` the way a pick remembers them.
-    fn speakers_on_alpha(tag: &str) -> App {
+    fn speakers_on_alpha(tag: &str) -> OnDisk {
         let mut app = app_with_two_presets(tag);
         app.handle(&[UiAction::SelectOutput(0), UiAction::SelectPreset(1)]);
         app.handle(&[UiAction::SelectOutput(1), UiAction::SelectPreset(0)]);
