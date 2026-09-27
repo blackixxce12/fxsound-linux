@@ -48,7 +48,7 @@ workspace with six members. Pinned versions, verbatim from the workspace manifes
 | `egui` | `=0.36.0` | fxsound-ui |
 | `eframe` | `=0.36.0`, `default-features = false`, `["default_fonts","glow","wayland","x11"]` | fxsound-app |
 | `egui_extras` | `=0.36.0`, `default-features = false` | **unused — delete** (see §2.3) |
-| `pipewire` / `libspa` | `0.10.1` | fxsound-audio (with `features = ["v0_3_65"]` set per-crate) |
+| `pipewire` / `libspa` | `0.10.1` | fxsound-audio (with `features = ["v0_3_64"]` on `pipewire`, set per-crate; not `v0_3_65`, see `docs/api/pipewire-0.10-rust.md` §1.1) |
 | `resvg` / `usvg` / `tiny-skia` | `0.48.1` / `0.48.1` / `0.12.0` | fxsound-ui |
 | `ksni` | `0.3.6` | fxsound-app |
 | `notify-rust` | `4.18.0` | fxsound-app |
@@ -106,7 +106,7 @@ for one thing: the equalizer curve is drawn from the audio thread's own filter d
 ### 2.3 Cargo.toml deltas required before Phase 1
 
 ```toml
-# crates/fxsound-audio/Cargo.toml — the v0_3_65 features are already right; keep that comment.
+# crates/fxsound-audio/Cargo.toml — the pipewire feature level (now v0_3_64) is already right; keep that comment.
 # ADD exactly one dependency:
 rtrb = { workspace = true }
 # Do NOT add fxsound-preset here: the audio crate never touches files.
@@ -989,7 +989,7 @@ with an unlisted device sorting last; 7 s / 8 s notification timeouts, 3 lines m
 | **R-08** | GNOME has no SNI host; with `--hide` the app is invisible and unkillable from the UI. | Medium | High | Detect "no watcher within 5 s"; post a notification; refuse to start hidden when there is neither a watcher nor a notification daemon. | P4 |
 | **R-09** | Alpha blending: JUCE composites in straight sRGB with no gamma correction; epaint blends in linear space. The many α 0.1 / 0.2 / 0.34 overlays will read lighter. | Medium | Medium | Compare the EQ fill and the panel backgrounds against a Windows screenshot early; adjust the alphas in one place (`Palette::color_alpha`) if needed, not at each call site. | P3 |
 | **R-10** | `ksni` defaults to tokio while `notify-rust` defaults to async-io; both pull zbus with different feature sets. | Low | Medium | Enable `ksni/blocking` and keep both on a plain `std::thread` (T4). Never call `notify-rust`'s `.show()` from inside a ksni callback. If a clash appears, move ksni to `default-features = false, features = ["async-io","blocking"]`. | P4 |
-| **R-11** | `pipewire`/`libspa` key constants are `#[cfg]`-gated; `NODE_LINK_GROUP`, `TARGET_OBJECT`, `NODE_WANT_DRIVER` do not exist without `v0_3_65`. | Low | Certain | Already handled in `crates/fxsound-audio/Cargo.toml`. Keep the comment. Literal strings are a valid fallback. | P1 |
+| **R-11** | `pipewire`/`libspa` key constants are `#[cfg]`-gated; `NODE_LINK_GROUP`, `TARGET_OBJECT`, `NODE_WANT_DRIVER` do not exist without `v0_3_44` (the crate sets `v0_3_64`; `v0_3_65` breaks libspa on 0.3.65 headers). | Low | Certain | Already handled in `crates/fxsound-audio/Cargo.toml`. Keep the comment. Literal strings are a valid fallback. | P1 |
 | **R-12** | Preset compatibility: a `.fac` written by the port must reload in the Windows build. | Medium | Low | Round-trip tests against all 32 shipped presets, byte-for-byte, including the `%g` float formatting, the `Main 2` hole, the seven app-dependent integers and the 1-based band numbering. `fxsound-preset` already implements this — keep the tests. | P0 (done), re-run each phase |
 | **R-13** | PipeWire version floor: `target.object` needs ≥ 0.3.64, `node.link-group` settled ~0.3.43. | Low | Low | Declare a hard minimum of PipeWire 0.3.65 / WirePlumber 0.4.14; detect via `pw_get_library_version()` at startup and refuse with a clear message rather than half-working. | P1 |
 | **R-14** | Translations are not in this checkout (`Resources/Strings/` is empty); only `BinaryData` symbol names survive. | Medium | Certain | Ship English only in Phases 1–5. Phase 5 builds the catalogue machinery with a validating format (named placeholders, not `%s`) so a bad translation can never be a format-string bug. Extraction from `BinaryData.cpp` is a separate work item. | P5 |

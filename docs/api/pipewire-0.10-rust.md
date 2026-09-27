@@ -121,14 +121,18 @@ That is not enough to compile the code in §13/§16. Change it to:
 
 ```toml
 # fxsound-linux/Cargo.toml — [workspace.dependencies]
-pipewire = { version = "0.10.1", features = ["v0_3_65"] }
-libspa   = { version = "0.10.1", features = ["v0_3_65"] }
+pipewire = { version = "0.10.1", features = ["v0_3_64"] }
+libspa   = { version = "0.10.1" }
 ```
 
-`v0_3_65` is the sweet spot: it subsumes every gate below and matches libspa's own `v0_3_65`
-(which is the last one that also flips `spa_sys/v0_3_65`). Higher levels (`v1_0_0`, `v1_2_0`,
-libspa `v1_6_0`) also build here — the installed daemon is **1.6.8** — but buy nothing this project
-uses. `v0_3_44` is the hard floor, because `TARGET_OBJECT` is behind it.
+`v0_3_64` subsumes every `pipewire` gate below. Not `v0_3_65`, although PipeWire 0.3.65 is the
+project's floor: `pipewire`'s `v0_3_65` turns on libspa's `v0_3_65`, and libspa 0.10.1 puts
+`MediaSubtype::Opus` behind that level while `SPA_MEDIA_SUBTYPE_opus` only appeared in PipeWire
+0.3.68 — so with the 0.3.65 headers of Debian bookworm (where the release tarball is built) libspa
+fails with `cannot find value 'SPA_MEDIA_SUBTYPE_opus' in crate 'spa_sys'`. libspa's own levels
+gate nothing this project uses, so it takes none beyond the `v0_3_33` that `pipewire` turns on.
+Higher levels (`v1_0_0`, `v1_2_0`, libspa `v1_6_0`) build against a newer daemon's headers but buy
+nothing this project uses. `v0_3_44` is the hard floor, because `TARGET_OBJECT` is behind it.
 
 > `crates/fxsound-audio/Cargo.toml` currently lists only `fxsound-core`. Add
 > `pipewire = { workspace = true }` and `libspa = { workspace = true }` there too.
@@ -2006,8 +2010,9 @@ The **only** thing you give up is `spa_io_position` in `process()`. Recover it v
 ## 13. Concretely: virtual sink + capture + render, in one process
 
 > **Both property sets in this section were compiled and run** against `pipewire`/`libspa` 0.10.1
-> with `features = ["v0_3_65"]` (§1.1). At the workspace's current feature level they do **not**
-> compile: `NODE_LINK_GROUP`, `NODE_WANT_DRIVER` and `TARGET_OBJECT` are all gated off.
+> with `features = ["v0_3_65"]`; `pipewire`'s `v0_3_64`, which the workspace uses (§1.1), gates
+> them identically. With default features they do **not** compile: `NODE_LINK_GROUP`,
+> `NODE_WANT_DRIVER` and `TARGET_OBJECT` are all gated off.
 
 ### (a) Create a virtual sink other apps can play into
 
@@ -2415,8 +2420,8 @@ What this means for FxSound:
 **Prerequisite** (§1.1) — without this, `*pw::keys::NODE_LINK_GROUP` below does not compile:
 
 ```toml
-pipewire = { version = "0.10.1", features = ["v0_3_65"] }
-libspa   = { version = "0.10.1", features = ["v0_3_65"] }
+pipewire = { version = "0.10.1", features = ["v0_3_64"] }
+libspa   = { version = "0.10.1" }
 ```
 
 ```rust
