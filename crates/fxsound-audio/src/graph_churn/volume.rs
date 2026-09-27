@@ -88,7 +88,15 @@ impl PrivateGraph {
     /// Start one of `pw-cat`'s faces, made by `support::command` or its recording kind, against
     /// this daemon and nothing else: the socket on its command line and in its own environment,
     /// as [`Self::tool`] does, but left running.
-    fn client(&self, mut client: std::process::Command, args: &[&str]) -> Option<Guarded> {
+    ///
+    /// Its standard error goes to a file named after `name`, whose path comes back with it, for
+    /// [`Guarded::account`] to quote when it does not do what it was started for.
+    fn client(
+        &self,
+        mut client: std::process::Command,
+        name: &str,
+        args: &[&str],
+    ) -> Option<(Guarded, PathBuf)> {
         client
             .arg("--remote")
             .arg(self.socket())
@@ -96,9 +104,15 @@ impl PrivateGraph {
             .env("XDG_RUNTIME_DIR", self.dir.join("run"))
             .env("PIPEWIRE_REMOTE", self.socket())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        support::spawn(client).ok()
+            .stdout(Stdio::null());
+        let log = self.stderr_log(&mut client, name);
+        match support::spawn(client) {
+            Ok(child) => Some((child, log)),
+            Err(error) => {
+                println!("{name} could not be started: {error}");
+                None
+            }
+        }
     }
 
     /// Play a file into nothing yet, as a stream called `name`: linked by the caller, like
@@ -106,8 +120,9 @@ impl PrivateGraph {
     fn play(&self, name: &str, file: &std::path::Path) -> Option<Guarded> {
         let props = format!("{{ node.name = {name} }}");
         let file = file.to_str()?;
-        let child = self.client(
+        let (mut child, log) = self.client(
             support::command("pw-play"),
+            name,
             &["--target", "0", "-P", &props, file],
         )?;
         let deadline = Instant::now() + PATIENCE;
@@ -117,6 +132,10 @@ impl PrivateGraph {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        println!(
+            "{name} never appeared in the graph: pw-play; {}",
+            child.account(Some(&log))
+        );
         None
     }
 
@@ -129,8 +148,9 @@ impl PrivateGraph {
         let _ = std::fs::remove_file(&file);
         let frames = ((RATE as f32) * seconds) as u32;
         let props = format!("{{ node.name = {name} }}");
-        let mut child = self.client(
+        let (mut child, log) = self.client(
             support::command_writing_at_most("pw-record", RECORDING_LIMIT),
+            name,
             &[
                 "--target",
                 "0",
@@ -160,6 +180,11 @@ impl PrivateGraph {
             self.link_nodes(from, name).then_some(())
         })();
         if linked.is_none() {
+            println!(
+                "{name} never appeared in the graph or could not be linked from {from}: \
+                 pw-record; {}",
+                child.account(Some(&log))
+            );
             let _ = child.kill();
             let _ = child.wait();
             return None;
@@ -176,9 +201,15 @@ impl PrivateGraph {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let bytes = std::fs::read(&file).ok()?;
+        let bytes = std::fs::read(&file).unwrap_or_default();
         let (words, _) = bytes.as_chunks::<4>();
         let samples: Vec<f32> = words.iter().map(|w| f32::from_le_bytes(*w)).collect();
+        if samples.is_empty() {
+            println!(
+                "{name} recorded nothing from {from}: pw-record; {}",
+                child.account(Some(&log))
+            );
+        }
         (!samples.is_empty()).then_some(samples)
     }
 

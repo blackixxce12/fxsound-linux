@@ -48,20 +48,27 @@ impl PrivateGraph {
             .env("XDG_RUNTIME_DIR", self.dir.join("run"))
             .env("PIPEWIRE_REMOTE", self.socket())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let app = App {
-            _child: support::spawn(player).ok()?,
+            .stdout(Stdio::null());
+        let log = self.stderr_log(&mut player, node_name);
+        let mut child = match support::spawn(player) {
+            Ok(child) => child,
+            Err(error) => {
+                println!("pw-cat could not be started for {node_name}: {error}");
+                return None;
+            }
         };
         let deadline = Instant::now() + PATIENCE;
         while self.node_id(node_name).is_none() {
             if Instant::now() >= deadline {
-                println!("{node_name} never appeared in the graph");
+                println!(
+                    "{node_name} never appeared in the graph: pw-cat {mode}; {}",
+                    child.account(Some(&log))
+                );
                 return None;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        Some(app)
+        Some(App { _child: child })
     }
 }
 

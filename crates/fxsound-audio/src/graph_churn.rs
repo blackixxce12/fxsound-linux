@@ -281,6 +281,9 @@ impl PrivateGraph {
     /// is named on the command line, and the child's runtime directory is the private one, so a
     /// tool that ignored `-r` would find no session socket to fall back on either. `None` when the
     /// tool is not installed or failed, which the callers treat as "cannot tell", not as a pass.
+    ///
+    /// A tool that ran and failed says how, and what it wrote to its standard error, in the
+    /// test's output — which the harness shows only for a test that fails.
     pub(crate) fn tool(&self, program: &str, args: &[&str]) -> Option<String> {
         let output = support::command(program)
             .arg("-r")
@@ -289,9 +292,16 @@ impl PrivateGraph {
             .env("XDG_RUNTIME_DIR", self.dir.join("run"))
             .env("PIPEWIRE_REMOTE", self.socket())
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
             .output()
             .ok()?;
+        if !output.status.success() {
+            println!(
+                "{program} {} failed with {}: {}",
+                args.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         output
             .status
             .success()
@@ -301,7 +311,7 @@ impl PrivateGraph {
     /// Everything in the graph, as `pw-dump` prints it. `None` when `pw-dump` is not there to ask.
     fn dump(&self) -> Option<Vec<serde_json::Value>> {
         let dump = self.tool("pw-dump", &[])?;
-        Some(serde_json::from_str(&dump).expect("pw-dump should print a JSON array"))
+        Some(merged_dump(&dump))
     }
 
     /// The node called `name` in a dump, if it is there.
@@ -568,10 +578,16 @@ impl PrivateGraph {
             .env("XDG_RUNTIME_DIR", self.dir.join("run"))
             .env("PIPEWIRE_REMOTE", self.socket())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = support::spawn(recorder).ok()?;
-        let recorder = Recorder {
+            .stdout(Stdio::null());
+        let log = self.stderr_log(&mut recorder, name);
+        let child = match support::spawn(recorder) {
+            Ok(child) => child,
+            Err(error) => {
+                println!("pw-record could not be started for {name}: {error}");
+                return None;
+            }
+        };
+        let mut recorder = Recorder {
             child,
             name: name.to_owned(),
             file,
@@ -579,12 +595,38 @@ impl PrivateGraph {
         let deadline = Instant::now() + PATIENCE;
         while self.node_id(name).is_none() {
             if Instant::now() >= deadline {
+                println!(
+                    "{name} never appeared in the graph: pw-record; {}",
+                    recorder.child.account(Some(&log))
+                );
                 return None;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        self.configure_ports(name, "Input", &["FL", "FR"])?;
-        self.link_nodes(from, name).then_some(recorder)
+        let linked = self.configure_ports(name, "Input", &["FL", "FR"]).is_some()
+            && self.link_nodes(from, name);
+        if !linked {
+            println!(
+                "{name} could not be given ports or linked from {from}: pw-record; {}",
+                recorder.child.account(Some(&log))
+            );
+            return None;
+        }
+        Some(recorder)
+    }
+
+    /// Send the standard error of `command`, a tool run against this graph, to a file of its own
+    /// in the graph's directory, named after `name`, and say where: for
+    /// [`Guarded::account`] to quote when the tool does not do what it was started for.
+    pub(crate) fn stderr_log(&self, command: &mut std::process::Command, name: &str) -> PathBuf {
+        let mut log = self.dir.join(format!("{name}.stderr"));
+        let mut n = 1;
+        while log.exists() {
+            n += 1;
+            log = self.dir.join(format!("{name}-{n}.stderr"));
+        }
+        command.stderr(support::log_to(&log));
+        log
     }
 
     /// [`Self::record_from`], for a recorder that runs on a clock of its own before it records
@@ -1162,6 +1204,60 @@ fn wait_for<T>(
     }
     println!("gave up waiting for {what}");
     None
+}
+
+/// What `pw-dump` printed, as one list of objects. Usually that is one JSON array; but a
+/// `pw-dump` of PipeWire 1.0 that sees the graph change while it gathers it prints a second array
+/// after the first, with the objects that changed since — each whole, or, for one that has gone,
+/// its id with `"info": null` — so each array after the first is applied to the list by id.
+fn merged_dump(dump: &str) -> Vec<serde_json::Value> {
+    let mut arrays = serde_json::Deserializer::from_str(dump).into_iter::<Vec<serde_json::Value>>();
+    let mut objects = match arrays.next() {
+        Some(Ok(objects)) => objects,
+        other => panic!("pw-dump should print a JSON array ({other:?}):\n{dump}"),
+    };
+    for update in arrays {
+        let update = update.unwrap_or_else(|error| {
+            panic!("pw-dump printed something after its array that is not one ({error}):\n{dump}")
+        });
+        for object in update {
+            let id = object["id"].as_u64();
+            let at = objects.iter().position(|old| old["id"].as_u64() == id);
+            match (
+                at,
+                object.get("info").is_some_and(serde_json::Value::is_null),
+            ) {
+                (Some(at), true) => {
+                    objects.remove(at);
+                }
+                (Some(at), false) => objects[at] = object,
+                (None, true) => {}
+                (None, false) => objects.push(object),
+            }
+        }
+    }
+    objects
+}
+
+#[test]
+fn a_dump_printed_in_two_arrays_is_read_as_the_graph_after_both() {
+    let dump = r#"[
+  { "id": 0, "type": "PipeWire:Interface:Core", "info": { "name": "core" } },
+  { "id": 31, "type": "PipeWire:Interface:Node", "info": { "props": { "node.name": "old" } } },
+  { "id": 32, "type": "PipeWire:Interface:Node", "info": { "props": { "node.name": "gone" } } }
+]
+[
+  { "id": 31, "type": "PipeWire:Interface:Node", "info": { "props": { "node.name": "new" } } },
+  { "id": 32, "info": null },
+  { "id": 40, "type": "PipeWire:Interface:Link", "info": {} }
+]
+"#;
+    let objects = merged_dump(dump);
+    let ids: Vec<u64> = objects.iter().filter_map(|o| o["id"].as_u64()).collect();
+    assert_eq!(ids, [0, 31, 40]);
+    assert_eq!(objects[1]["info"]["props"]["node.name"], "new");
+    // The usual case: one array, read as it is.
+    assert_eq!(merged_dump("[]\n"), Vec::<serde_json::Value>::new());
 }
 
 /// Set, in a test process of this binary's that the tests below start, to what the child half
