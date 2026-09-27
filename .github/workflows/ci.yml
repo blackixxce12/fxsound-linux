@@ -28,7 +28,10 @@ env:
 jobs:
   check:
     name: Format, lint and test
-    runs-on: ubuntu-latest
+    # Pinned rather than ubuntu-latest: 24.04's PipeWire 1.0.5 is the oldest the tests run against,
+    # and it is where a real bug showed (a new pair took 1.0's startup volume for the user's).
+    # ubuntu-latest moves to a newer release, and with it to a newer PipeWire, in October 2026.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
