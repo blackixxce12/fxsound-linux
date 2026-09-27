@@ -36,6 +36,7 @@ countries: ua
 "Not used on a microphone" = "Не діє на мікрофон"
 "These five belong to the playback chain. A microphone runs the voice chain instead: high-pass, gate, equalizer, de-esser, compressor and limiter." = "Ці п'ять належать до ланцюга відтворення. Мікрофон натомість проходить через голосовий ланцюг: фільтр високих частот, гейт, еквалайзер, деесер, компресор і лімітер."
 "FxSound is still running, but this session has no tray icon.\nRun 'fxsound --show' to bring the window back." = "FxSound досі працює, але в цьому сеансі немає значка в системному лотку.\nВиконайте 'fxsound --show', щоб повернути вікно."
+"FxSound could not open its window and keeps running in the system tray.\nQuit it from the tray and start FxSound again to open the window." = "FxSound не зміг відкрити своє вікно і далі працює в системному лотку.\nЗакрийте його з лотка й знову запустіть FxSound, щоб відкрити вікно."
 "Off" = "Вимк"
 "Mild" = "Слабке"
 "Medium" = "Середнє"

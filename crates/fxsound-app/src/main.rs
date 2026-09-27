@@ -333,8 +333,8 @@ fn main() -> eframe::Result<()> {
     let dbus = DbusHandle::start(server.control(), dbus::Properties::of(&app));
 
     // Step 6: suspend and resume (U13). logind's `PrepareForSleep` reaches the pump over a
-    // channel, and the controller mutes both lanes on the way down and starts them clean on the
-    // way up. Nothing holds the suspend up (upstream PR #533).
+    // channel, and the controller tells the engine, which silences both lanes on the way down and
+    // starts them clean on the way up. Nothing holds the suspend up (upstream PR #533).
     let (sleep_tx, sleep_rx) = crossbeam_channel::unbounded();
     let sleep = SleepWatch::start(WakingSender::new(sleep_tx, waker.clone()));
 
@@ -370,11 +370,15 @@ fn main() -> eframe::Result<()> {
                 Ok(WindowExit::Reopen) => {}
                 Ok(WindowExit::Quit) => break,
                 Err(err) => {
-                    // Better to leave than to loop on a window that cannot be created; the
-                    // shutdown below still restores the system default device.
-                    log::error!("the window could not be run: {err}");
-                    runtime.shutdown();
-                    return Err(err);
+                    let tray_visible = runtime.tray_visible();
+                    if runtime.window_failed(&err, tray_visible) {
+                        visibility = WindowVisibility::Hidden;
+                    } else {
+                        // With no tray to fall back to, better to leave than to run with nothing
+                        // on screen; the shutdown still restores the system default device.
+                        runtime.shutdown();
+                        return Err(err);
+                    }
                 }
             },
             WindowVisibility::Hidden => match runtime.run_headless() {
@@ -674,6 +678,42 @@ impl Runtime {
         }
         self.reopening = self.exit == WindowExit::Reopen;
         self.exit
+    }
+
+    /// What happens when a window could not be created or run. Returns whether FxSound stays in
+    /// the tray; `false` leaves it to the caller to quit.
+    ///
+    /// With a tray icon on screen, it stays: the audio, the tray, the control socket and the bus
+    /// all work without a window, and quitting would hand the defaults back, drop the sound, and —
+    /// under the systemd user unit's `Restart=on-failure` — start it all again hidden a few seconds
+    /// later, the same way every time the window is asked for. That is an instance the session bus
+    /// started for a status bar's call, where the systemd user manager never had the compositor's
+    /// `WAYLAND_DISPLAY` or `DISPLAY` to hand it (sway, or Hyprland without uwsm). So the reason is
+    /// logged, a notification says the window could not be opened, and the window's coming is
+    /// announced undone: `window visible=false`. `run_minimized` stays the `false`
+    /// [`Runtime::run_window`] wrote, since the window was asked for: the notification tells the
+    /// user to quit from the tray and start FxSound again, and that start, a bare `fxsound` from a
+    /// launcher, opens the window. The bus's `--activated` start stays in the tray whatever the
+    /// setting says (`Cli::window_command`), so this brings back no failing start. With no tray
+    /// icon there is nothing to fall back to, and it quits as before.
+    fn window_failed(&mut self, err: &dyn std::fmt::Display, tray_visible: bool) -> bool {
+        if !tray_visible {
+            log::error!("the window could not be run: {err}");
+            return false;
+        }
+        log::error!(
+            "the window could not be run: {err}; FxSound keeps running in the system tray (is \
+             WAYLAND_DISPLAY or DISPLAY set in its environment?)"
+        );
+        self.app.cancel_calibration();
+        self.announce(&AppEvent::Window { visible: false });
+        self.app.window_unavailable();
+        // Nothing asks for the window again on its own: a Settings item chosen in the tray would
+        // otherwise have the tray-only state ask for it at once, and fail, for ever.
+        self.settings_requested = false;
+        self.start_minimised = false;
+        self.reopening = false;
+        true
     }
 
     /// Whether a tray icon is on screen to bring the window back from ([`TrayHandle::is_visible`]).
@@ -2588,6 +2628,58 @@ mod runtime_tests {
     }
 
     #[test]
+    fn a_window_that_cannot_be_opened_leaves_fxsound_in_the_tray_rather_than_quitting() {
+        // An instance the session bus started through the systemd user unit, with no
+        // WAYLAND_DISPLAY in its environment: quitting would drop the sound, and the unit's
+        // `Restart=on-failure` would start it hidden again, the same way every time the window
+        // is asked for.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        let (lines, _watcher) = watch(runtime.server.path(), &["--watch"]);
+        next_line(&mut runtime, &lines);
+        with_a_window_up(&mut runtime);
+        runtime.settings_requested = true;
+        runtime.start_minimised = true;
+
+        let why = "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET nor DISPLAY is set.";
+        assert!(runtime.window_failed(&why, true), "it stays in the tray");
+        assert!(
+            !runtime.app.settings_run_minimized(),
+            "the fresh start the notification asks for opens the window"
+        );
+        assert!(
+            !runtime.settings_requested,
+            "nothing asks for the window again on its own"
+        );
+        assert!(!runtime.start_minimised);
+        assert_eq!(next_line(&mut runtime, &lines), "window visible=false");
+        let notice = next_line(&mut runtime, &lines);
+        assert!(
+            notice.starts_with("notice message="),
+            "and a status bar hears why: {notice}"
+        );
+
+        // The tray-only state it goes back to waits for someone to ask, rather than asking
+        // for the window again at once.
+        runtime.terminate.store(true, Ordering::Relaxed);
+        assert_eq!(runtime.run_headless(), HeadlessExit::Quit);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn a_window_that_cannot_be_opened_with_no_tray_icon_ends_fxsound_as_before() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        with_a_window_up(&mut runtime);
+        assert!(!runtime.window_failed(&"no display", false));
+        assert!(
+            !runtime.app.settings_run_minimized(),
+            "nothing to start in next time"
+        );
+        runtime.shutdown();
+    }
+
+    #[test]
     fn a_window_closed_for_a_quit_leaves_the_start_up_preference_as_the_window_found_it() {
         // The window was showing when FxSound was told to quit, so the next start shows it; and a
         // quit is no hide, so no tray tip and no `window visible=false` either.
@@ -2834,14 +2926,12 @@ mod runtime_tests {
         assert!(!runtime.app.is_system_sleeping(), "not before the tick");
         runtime.tick();
         assert!(runtime.app.is_system_sleeping());
-        assert!(runtime.app.params().mute);
         // Down and up again within one tick: the resume is the last word.
         tx.send(false).expect("the pump is listening");
         tx.send(true).expect("the pump is listening");
         tx.send(false).expect("the pump is listening");
         runtime.tick();
         assert!(!runtime.app.is_system_sleeping());
-        assert!(!runtime.app.params().mute);
         runtime.shutdown();
     }
 }

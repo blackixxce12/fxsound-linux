@@ -144,6 +144,13 @@ for presets. On an older distribution than Debian 12, build from source instead.
 | `/usr/share/doc/fxsound-linux/` | the Hyprland rules and the autostart entry |
 | `/usr/share/licenses/fxsound-linux/` | the AGPL, and the licences of the RNNoise code and the Noto faces built into the binary (the `.deb` carries them in `/usr/share/doc/fxsound-linux/copyright`) |
 
+FxSound started by the user unit — enabled, or by a D-Bus call such as a status bar's — runs in the
+systemd user manager's environment, not the compositor's. Where the compositor does not import
+`WAYLAND_DISPLAY` into it (sway, and Hyprland without uwsm), that FxSound has no display: it runs in
+the tray, and asking for its window brings a notification that it could not be opened instead. Import
+it when the compositor starts, with `exec dbus-update-activation-environment --systemd
+WAYLAND_DISPLAY DISPLAY` in sway (`exec-once = ...` in Hyprland).
+
 There is no AppImage or Flatpak. A Flatpak would be actively counterproductive here: the whole
 point of the app is to own a node in your PipeWire graph and drive your real output device, and the
 sandbox exists to prevent exactly that.
@@ -485,7 +492,11 @@ Each of these is a considered decision, not an oversight:
   application playing through FxSound's nodes with the effects switched off. Now, as in the Windows
   build since 1.2.6, power off also hands both session defaults back to the real devices, so sound
   no longer passes through FxSound at all (no added latency, and the desktop's own device switcher
-  works), and power on takes them again. While it is off, the device lists show the system's
+  works), and power on takes them again. That goes for applications with a preset of their own
+  too: while the power is off none of them is kept on its route, and each plays and records
+  through the system's default devices like everything else, until the power comes back on and
+  takes them onto their presets again (a stream that holds on to its preset's node by itself stays
+  there, unprocessed). While it is off, the device lists show the system's
   default device, which is where the sound goes; a device picked then is the one FxSound takes
   over when the power comes back on.
 - **The device priority list can be told to step aside.** Settings ▸ Audio's list (and Settings ▸

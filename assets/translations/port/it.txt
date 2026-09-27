@@ -35,6 +35,7 @@ countries: it
 "Not used on a microphone" = "Senza effetto su un microfono"
 "These five belong to the playback chain. A microphone runs the voice chain instead: high-pass, gate, equalizer, de-esser, compressor and limiter." = "Questi cinque appartengono alla catena di riproduzione. Un microfono passa invece per la catena voce: passa-alto, gate, equalizzatore, de-esser, compressore e limiter."
 "FxSound is still running, but this session has no tray icon.\nRun 'fxsound --show' to bring the window back." = "FxSound è ancora in esecuzione, ma questa sessione non ha un'icona nell'area di notifica.\nEsegui 'fxsound --show' per richiamare la finestra."
+"FxSound could not open its window and keeps running in the system tray.\nQuit it from the tray and start FxSound again to open the window." = "FxSound non è riuscito ad aprire la sua finestra e continua a funzionare nell'area di notifica.\nChiudilo dall'area di notifica e avvia di nuovo FxSound per aprire la finestra."
 "Off" = "Spento"
 "Mild" = "Leggera"
 "Medium" = "Media"

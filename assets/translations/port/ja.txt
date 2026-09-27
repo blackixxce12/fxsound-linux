@@ -35,6 +35,7 @@ countries: ja
 "Not used on a microphone" = "マイクでは使用されません"
 "These five belong to the playback chain. A microphone runs the voice chain instead: high-pass, gate, equalizer, de-esser, compressor and limiter." = "この5つは再生チェーンのものです。マイクは代わりに音声チェーンを通ります：ハイパス、ゲート、イコライザー、歯擦音除去、コンプレッサー、リミッター。"
 "FxSound is still running, but this session has no tray icon.\nRun 'fxsound --show' to bring the window back." = "FxSound は実行中ですが、このセッションにはトレイアイコンがありません。\n'fxsound --show' を実行するとウィンドウが戻ります。"
+"FxSound could not open its window and keeps running in the system tray.\nQuit it from the tray and start FxSound again to open the window." = "FxSound はウィンドウを開けなかったため、システムトレイで実行を続けています。\nトレイから終了し、FxSound をもう一度起動するとウィンドウが開きます。"
 "Off" = "オフ"
 "Mild" = "弱"
 "Medium" = "中"

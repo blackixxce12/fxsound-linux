@@ -3858,6 +3858,82 @@ fn a_ranking_handed_over_at_start_makes_the_first_choice_of_output() {
 }
 
 #[test]
+fn a_power_left_off_at_start_builds_the_speakers_pair_without_claiming_the_default() {
+    let Some(graph) = PrivateGraph::start("poweroff") else {
+        return;
+    };
+    let handle = AudioEngine::start_for_tests(
+        Some(&graph.remote()),
+        StartOptions {
+            want_default: false,
+            ..StartOptions::default()
+        },
+        None,
+    )
+    .expect("the engine should start");
+    let mut said = Transcript::default();
+    assert!(
+        said.until(&handle, "the output lane attached", |m| matches!(
+            m,
+            AudioToUi::Attached {
+                direction: DeviceDirection::Output,
+                node_name: Some(_)
+            }
+        ))
+    );
+    said.settle(&handle);
+    if graph.tool("pw-metadata", &["-n", "default"]).is_none() {
+        skip("pw-metadata is not available, so poweroff cannot read the default");
+        handle.shutdown();
+        return;
+    }
+    assert_ne!(
+        graph.configured_default(DeviceDirection::Output).as_deref(),
+        Some(SINK_NODE_NAME),
+        "the first pair took the default sink the app was about to hand back"
+    );
+    handle.shutdown();
+}
+
+#[test]
+fn a_speakers_lane_left_off_at_start_builds_no_pair_before_the_app_says_so() {
+    let Some(graph) = PrivateGraph::start("outputoff") else {
+        return;
+    };
+    let handle = AudioEngine::start_for_tests(
+        Some(&graph.remote()),
+        StartOptions {
+            output_enabled: false,
+            ..StartOptions::default()
+        },
+        None,
+    )
+    .expect("the engine should start");
+    let mut said = Transcript::default();
+    assert!(said.until(
+        &handle,
+        "a device list",
+        |m| matches!(m, AudioToUi::Devices(d) if !d.is_empty())
+    ));
+    said.settle(&handle);
+    assert_eq!(
+        said.attachments(DeviceDirection::Output),
+        Vec::<Option<String>>::new(),
+        "the speakers' lane was attached before the app could switch it off"
+    );
+    if let Some(settled) = unless_skipped(graph.settles_on(&[]), "pw-dump", "that no pair is up") {
+        assert_eq!(settled.map(drop), Ok(()));
+    }
+    if graph.tool("pw-metadata", &["-n", "default"]).is_some() {
+        assert_ne!(
+            graph.configured_default(DeviceDirection::Output).as_deref(),
+            Some(SINK_NODE_NAME)
+        );
+    }
+    handle.shutdown();
+}
+
+#[test]
 fn a_device_plugged_in_takes_the_lane_while_the_app_puts_new_devices_first() {
     let Some(graph) = PrivateGraph::start("newfirst") else {
         return;

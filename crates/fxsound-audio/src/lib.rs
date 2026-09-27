@@ -468,8 +468,12 @@ pub fn quantum_for_ms(ms: u32, rate: u32) -> u32 {
 /// The output lane is enabled from the start and builds its pair as soon as the registry has been
 /// read — a round trip after the connection, well before a message sent once
 /// [`AudioEngine::start`] has returned is sure to have been taken in. Anything the first pair
-/// depends on travels here.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// depends on travels here: whether it is built at all, and whether it takes the session default,
+/// included.
+///
+/// [`StartOptions::default`] is the engine as [`AudioEngine::start`] starts it: the output lane
+/// on, both lanes wanting the default, nothing ranked or remembered.
+#[derive(Debug, Clone, PartialEq)]
 pub struct StartOptions {
     /// The UI's language for the virtual nodes' descriptions ([`AudioEngine::start_with_language`]);
     /// `None` reads the desktop locale.
@@ -488,6 +492,34 @@ pub struct StartOptions {
     pub output_priority: DevicePriority,
     /// The input lane's device ranking, as [`Self::output_priority`] is the output lane's.
     pub input_priority: DevicePriority,
+    /// Whether both lanes take the session default once their nodes are up, as
+    /// [`UiToAudio::SetAsDefault`] would say for each: `false` for an app whose power was left
+    /// off, which keeps FxSound out of the path (U12). Here so that the first pair does not claim
+    /// the default, move every playing stream onto FxSound and have them moved back a moment
+    /// later, when a `SetAsDefault` with `want: false` arrives after it.
+    ///
+    /// [`UiToAudio::SetAsDefault`]: fxsound_core::messages::UiToAudio::SetAsDefault
+    pub want_default: bool,
+    /// Whether the output lane starts enabled: `false` for an app whose speakers' lane was left
+    /// `Off`, as [`UiToAudio::DetachLane`] would say. Here so that no first pair is built on the
+    /// speakers — the default claimed and the streams moved — before that message arrives. The
+    /// input lane always starts detached, until a microphone is picked.
+    ///
+    /// [`UiToAudio::DetachLane`]: fxsound_core::messages::UiToAudio::DetachLane
+    pub output_enabled: bool,
+}
+
+impl Default for StartOptions {
+    fn default() -> Self {
+        Self {
+            language: None,
+            target_volumes: Vec::new(),
+            output_priority: DevicePriority::default(),
+            input_priority: DevicePriority::default(),
+            want_default: true,
+            output_enabled: true,
+        }
+    }
 }
 
 /// One lane's ranking of its devices, as [`UiToAudio::SetDevicePriority`] carries it after start:
@@ -663,6 +695,8 @@ impl AudioEngine {
             target_volumes,
             output_priority,
             input_priority,
+            want_default,
+            output_enabled,
         } = options;
         let (mut handle, mut config, ready) = EngineHandle::wire(remote, language.as_deref());
         config.aec_library = aec_library;
@@ -671,6 +705,8 @@ impl AudioEngine {
             output: output_priority,
             input: input_priority,
         };
+        config.want_default = want_default;
+        config.output_enabled = output_enabled;
         config.wireplumber_state = wireplumber_state;
         config.route_idle = route_idle;
         let join = std::thread::Builder::new()
@@ -789,6 +825,8 @@ impl EngineHandle {
             aec_library: aec::WEBRTC_LIBRARY,
             target_volumes: Vec::new(),
             device_priority: PerDirection::default(),
+            want_default: true,
+            output_enabled: true,
             wireplumber_state: None,
             route_idle: app_routes::ROUTE_IDLE,
         };

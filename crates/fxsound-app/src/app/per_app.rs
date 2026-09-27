@@ -31,7 +31,11 @@
 //!   the speakers' filter width, master gain, balance and volume leveller;
 //! - a recording route runs the voice preset with the Settings pane's microphone settings written
 //!   over it, and the voice chain it names;
-//! - both carry the power switch and the mute of a system going to sleep.
+//! - there are none while the power is off: power off takes FxSound out of the path (U12), and
+//!   the engine moves every routed stream back when it is given no routes. They are switched off
+//!   first, for the one it keeps under a stream it cannot move ([`App::refresh_app_routes`]);
+//! - a system going to sleep silences them with their lane, which is the engine's to do
+//!   (`fxsound_audio`'s "Sleep"): a route reads its lane's own mute.
 //!
 //! A route runs its preset as last **saved** ([`fxsound_preset::Store::load_saved`]): unsaved
 //! edits in the window are the lane's, not what the name another application asked for says.
@@ -404,6 +408,16 @@ fn same_ignoring_case(a: &str, b: &str) -> bool {
     a.chars()
         .flat_map(char::to_lowercase)
         .eq(b.chars().flat_map(char::to_lowercase))
+}
+
+/// `route` as it was, with the power off in its parameters: what a route the engine keeps once no
+/// rule names it goes on running ([`App::refresh_app_routes`]).
+fn switched_off(mut route: AppRoute) -> AppRoute {
+    match &mut route.params {
+        RouteParams::Output(params) => params.power = false,
+        RouteParams::Input(params) => params.power = false,
+    }
+    route
 }
 
 // =============================================================================================
@@ -809,27 +823,44 @@ impl App {
     /// since that order breaks a tie between two rules that match a stream as strongly, for the
     /// engine as for the store. A rule that follows the lane carries an empty preset and a snapshot
     /// of its lane's kind that nothing runs.
+    ///
+    /// While the power is off the engine is given no routes at all, whatever is resolved: power
+    /// off takes FxSound out of the path (U12), and a route is a path through FxSound too. The
+    /// engine moves every routed stream back — it deletes the `target.object` keys it wrote — so
+    /// a game with a preset of its own follows the system's default device like everything else,
+    /// and a stream that starts meanwhile is moved nowhere. The rules and what they resolve to
+    /// are kept, and the power coming back on sends them again.
+    ///
+    /// Not every route goes with its rules: the engine keeps one that a stream it cannot move
+    /// still plays or records through — pinned to the route's node, or anchored there by
+    /// WirePlumber — until that stream has left, running the parameters it was last sent. So the
+    /// routes as they were go first with the power off in them, and only then none: what stays
+    /// runs the way the lane does, not the preset's effects under a switch that says `Off`. The
+    /// power coming back on names the preset again, which gives such a route the preset as it is
+    /// then.
     pub(super) fn refresh_app_routes(&mut self) {
-        let unchanged = self.apps.resolved.len() == self.apps.sent.len()
-            && self
-                .apps
-                .resolved
-                .iter()
-                .zip(&self.apps.sent)
-                .all(|(resolved, sent)| {
-                    let (params, chain) = self.route_payload(resolved);
-                    sent.direction == resolved.direction
-                        && sent.app == resolved.app
-                        && sent.preset == resolved.preset
-                        && sent.params == params
-                        && sent.chain == chain
-                });
+        let wanted: &[Resolved] = if self.state.power {
+            &self.apps.resolved
+        } else {
+            &[]
+        };
+        let unchanged = wanted.len() == self.apps.sent.len()
+            && wanted.iter().zip(&self.apps.sent).all(|(resolved, sent)| {
+                let (params, chain) = self.route_payload(resolved);
+                sent.direction == resolved.direction
+                    && sent.app == resolved.app
+                    && sent.preset == resolved.preset
+                    && sent.params == params
+                    && sent.chain == chain
+            });
         if unchanged {
             return;
         }
-        let routes: Vec<AppRoute> = self
-            .apps
-            .resolved
+        if !self.state.power && !self.apps.sent.is_empty() {
+            let bypassed = self.apps.sent.iter().cloned().map(switched_off).collect();
+            self.send(UiToAudio::SetAppRoutes(bypassed));
+        }
+        let routes: Vec<AppRoute> = wanted
             .iter()
             .map(|resolved| {
                 let (params, chain) = self.route_payload(resolved);
@@ -1066,8 +1097,9 @@ impl App {
             &eq_bands,
             MusicLevels::of(&self.settings),
         );
+        // On, since routes are sent only while it is ([`App::refresh_app_routes`]); said all the
+        // same, so a route never runs a power the lane does not.
         params.power = self.state.power;
-        params.mute = self.sleeping;
         params
     }
 
@@ -1078,7 +1110,6 @@ impl App {
         let voicing = PresetVoicing::of(&params);
         apply_microphone_settings(&mut params, &voicing, &self.settings);
         params.power = self.state.power;
-        params.mute = self.sleeping;
         params
     }
 

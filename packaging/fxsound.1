@@ -122,7 +122,8 @@ process per query can use the D-Bus interface instead; see
 .BI \-\-power= 0|1|toggle
 Turn audio processing on or off, for both lanes. Off also hands the session's
 default output and input back to the real devices, so applications play and
-record past FxSound until it is turned on again, which takes them back.
+record past FxSound until it is turned on again, which takes them back; an
+application with a preset of its own is moved back onto it then.
 Any non-zero integer means on;
 .B toggle
 inverts the current state.
@@ -413,8 +414,11 @@ all at once. FxSound moves the application's streams onto nodes of their own
 on the lane's device that run that preset, as
 .BR pavucontrol (1)
 moves a stream, and moves them back when the preset is taken away; the rest
-of the session keeps the lane's preset. At most four presets of one lane run
-this way at a time. Settings \(-> Applications offers the same choices. None
+of the session keeps the lane's preset. With the power off none of them is
+moved: they play and record through the system's default devices like every
+other application until the power is turned on again, and one that holds on to
+its preset's node by itself stays there unprocessed. At most four presets of
+one lane run this way at a time. Settings \(-> Applications offers the same choices. None
 of these options raises the window.
 .TP
 .BI \-\-app\-preset= APP=PRESET
@@ -1253,6 +1257,24 @@ FxSound come up with the session instead of on demand:
 systemctl \-\-user enable \-\-now fxsound
 .EE
 .RE
+.PP
+FxSound started by the user unit \(en enabled, or by a D-Bus call \(en runs in
+the systemd user manager's environment, not the compositor's. Where the
+compositor does not import
+.B WAYLAND_DISPLAY
+into it (sway, and Hyprland without uwsm), that FxSound has no display: it runs
+in the tray, and asking for its window brings a notification that it could not
+be opened instead; quit it and start it again once the variable is imported.
+Import it when the compositor starts, in sway with:
+.PP
+.RS 4
+.EX
+exec dbus\-update\-activation\-environment \-\-systemd WAYLAND_DISPLAY DISPLAY
+.EE
+.RE
+.PP
+and in Hyprland with the same command after
+.BR exec\-once\ = .
 .PP
 Switching the session's default sink onto the FxSound sink is a session-manager
 operation. Without

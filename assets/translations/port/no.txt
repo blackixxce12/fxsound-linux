@@ -35,6 +35,7 @@ countries: no
 "Not used on a microphone" = "Brukes ikke på en mikrofon"
 "These five belong to the playback chain. A microphone runs the voice chain instead: high-pass, gate, equalizer, de-esser, compressor and limiter." = "Disse fem tilhører avspillingskjeden. En mikrofon går i stedet gjennom talekjeden: høypassfilter, gate, equalizer, de-esser, kompressor og limiter."
 "FxSound is still running, but this session has no tray icon.\nRun 'fxsound --show' to bring the window back." = "FxSound kjører fortsatt, men denne økten har ikke noe ikon i systemstatusfeltet.\nKjør 'fxsound --show' for å hente vinduet tilbake."
+"FxSound could not open its window and keeps running in the system tray.\nQuit it from the tray and start FxSound again to open the window." = "FxSound kunne ikke åpne vinduet sitt og kjører videre i systemstatusfeltet.\nAvslutt det derfra og start FxSound på nytt for å åpne vinduet."
 "Off" = "Av"
 "Mild" = "Lett"
 "Medium" = "Middels"

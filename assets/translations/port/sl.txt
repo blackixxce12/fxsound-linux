@@ -35,6 +35,7 @@ countries: sl
 "Not used on a microphone" = "Se ne uporablja pri mikrofonu"
 "These five belong to the playback chain. A microphone runs the voice chain instead: high-pass, gate, equalizer, de-esser, compressor and limiter." = "Teh pet spada v verigo predvajanja. Mikrofon gre namesto tega skozi glasovno verigo: visokoprepustni filter, gate, izenačevalnik, de-esser, kompresor in limiter."
 "FxSound is still running, but this session has no tray icon.\nRun 'fxsound --show' to bring the window back." = "FxSound še vedno teče, a ta seja nima ikone v sistemski vrstici.\nZaženite 'fxsound --show', da vrnete okno."
+"FxSound could not open its window and keeps running in the system tray.\nQuit it from the tray and start FxSound again to open the window." = "FxSound ni mogel odpreti svojega okna in še naprej teče v sistemski vrstici.\nZaprite ga iz sistemske vrstice in znova zaženite FxSound, da odprete okno."
 "Off" = "Izklopljeno"
 "Mild" = "Blago"
 "Medium" = "Srednje"

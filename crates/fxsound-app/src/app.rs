@@ -627,7 +627,8 @@ pub struct App {
     /// list (see [`crate::priority`]).
     priority_sent: [Option<UiToAudio>; 2],
     /// The system is asleep, or about to be: logind said `PrepareForSleep(true)` and has not said
-    /// `false` since (U13, [`App::system_sleeping`]). Both lanes' snapshots carry it as `mute`.
+    /// `false` since (U13, [`App::system_sleeping`]). Only so that the same word is said to the
+    /// engine once: the silence while the system sleeps is the engine's, not the snapshots'.
     sleeping: bool,
     /// The shown lane's meters as the last poll read them, and whether they differed from the
     /// poll's before: the window paints at sixty a second only while they move (0.4.0 design
@@ -2266,10 +2267,8 @@ impl App {
     fn sync_params_from_state(&mut self) {
         self.params.power = self.state.power;
         self.input_params.power = self.state.power;
-        // Silence after both chains while the system sleeps (U13, [`App::system_sleeping`]):
-        // whatever else a snapshot changes, it cannot unmute a system on its way to sleep.
-        self.params.mute = self.sleeping;
-        self.input_params.mute = self.sleeping;
+        // No `mute` for a system asleep: the engine silences both lanes and every route itself
+        // (U13, [`App::system_sleeping`]), and gives up on a sleep whose end never came.
         match self.state.direction {
             DeviceDirection::Output => self.sync_output_params_from_state(),
             DeviceDirection::Input => self.sync_input_params_from_state(),
@@ -2285,8 +2284,9 @@ impl App {
             engine.set_input_params(input_params);
         }
         // An application's route shares what every chain of its lane shares — the power, the
-        // speakers' levels and band count, the microphone settings, the sleep — so it follows
-        // the lane's snapshot wherever that goes. Sent only when a route's parameters changed.
+        // speakers' levels and band count, the microphone settings — so it follows the lane's
+        // snapshot wherever that goes. Sent only when a route's parameters changed; the power
+        // going off switches the routes off and then takes them all away, and none is sent after.
         self.refresh_app_routes();
     }
 
@@ -2977,15 +2977,20 @@ impl App {
     /// logind's `PrepareForSleep` (U13, [`crate::sleep`]): `true` as the system goes to sleep,
     /// `false` once it has resumed.
     ///
-    /// Going to sleep, both lanes are muted — silence after each chain, carried in the snapshots —
-    /// so that the last buffers before the suspend never reach the speakers as a burst, and the
-    /// engine is told, to wait out the devices coming back rather than choose among them as they
-    /// do. Resumed, the engine is told first, then each lane's filters are cleared of what they
-    /// held when the machine stopped, and only then are the lanes unmuted: the events reach the
-    /// audio thread no later than the snapshot, so the first sound after the resume is the chain
-    /// starting clean, not the tail of what was playing before. Upstream mutes and unmutes the
-    /// same way (`FxController.cpp:2145-2159`) and, as here, never holds the suspend up with an
-    /// inhibitor (its PR #533).
+    /// The engine is told ([`UiToAudio::SystemSleeping`]), and does the rest: going to sleep it
+    /// silences both lanes and every application's route after their chains, so that the last
+    /// buffers before the suspend never reach the speakers as a burst, and waits out the devices
+    /// coming back rather than choose among them as they do; resumed, it clears every chain's
+    /// filters and hears each lane again once its device is back, so the first sound after the
+    /// resume is the chain starting clean, not the tail of what was playing before. The app clears
+    /// both lanes' filters on the resume as well, which changes nothing that the engine's own
+    /// clearing does not. Upstream mutes and unmutes the same way (`FxController.cpp:2145-2159`)
+    /// and, as here, never holds the suspend up with an inhibitor (its PR #533).
+    ///
+    /// The silence is the engine's alone, never the snapshots' `mute`: the engine gives up on a
+    /// sleep that no `false` follows once the system has been awake for a minute, and a mute of
+    /// the app's own would outlast that and keep FxSound silent for the rest of the session — a
+    /// logind restarted between its two signals, with the watcher's connection still up.
     ///
     /// The same word twice is said once: logind repeats nothing, but a watcher whose connection
     /// drops while the system sleeps says `false` for it ([`crate::sleep::SleepWatch`]).
@@ -2997,9 +3002,9 @@ impl App {
         log::info!(
             "{}",
             if sleeping {
-                "the system is going to sleep: muting both lanes"
+                "the system is going to sleep: the engine silences both lanes"
             } else {
-                "the system has resumed: clearing both lanes' filters and unmuting"
+                "the system has resumed: clearing both lanes' filters"
             }
         );
         self.send(UiToAudio::SystemSleeping(sleeping));
@@ -3008,7 +3013,6 @@ impl App {
                 engine.send_event(direction, DspEvent::ResetFilterState);
             }
         }
-        self.sync_params_from_state();
     }
 
     /// Whether the system is asleep as far as the controller knows ([`App::system_sleeping`]).
@@ -4041,12 +4045,13 @@ fn unvoiced_input_params() -> InputDspParams {
 ///
 /// - What a previous run displaced, first: if that run was killed while holding the default, the
 ///   metadata still names a node that is gone and only this can point it back at a real device.
-/// - The speakers' lane, when it was left off. The engine starts with the output lane enabled —
-///   FxSound in front of the speakers is the Windows behaviour — so `output_enabled = false` has
-///   to be said before the device rules attach it, or the speakers would be processed after
-///   every restart while the combo said `Off`. The input lane starts detached and needs no word:
-///   an enabled one is attached by its saved device the first time the list names it
-///   ([`saved_device_to_announce`]).
+/// - The speakers' lane, when it was left off. The engine's own start is enabled — FxSound in
+///   front of the speakers is the Windows behaviour — so `output_enabled = false` has to be said,
+///   or the speakers would be processed after every restart while the combo said `Off`. It is
+///   said first with the engine ([`engine_start_options`]), before the device rules can attach
+///   the lane; the message repeats it and changes nothing. The input lane starts detached and
+///   needs no word: an enabled one is attached by its saved device the first time the list names
+///   it ([`saved_device_to_announce`]).
 /// - The per-device volumes of FxSound's own nodes (U10), so the first pair the engine builds
 ///   for a device starts at the level the user left it at rather than at whatever WirePlumber
 ///   restores. Sent even when there are none: it is the engine's whole memory of them, and "none"
@@ -4056,7 +4061,8 @@ fn unvoiced_input_params() -> InputDspParams {
 ///   user has FxSound follow the system's default device.
 /// - With the power left off, both lanes' hand-back of the session default (U12): FxSound off is
 ///   FxSound out of the path, and the engine, which starts wanting the default, would otherwise
-///   take it with the first pair it builds.
+///   take it with the first pair it builds. Said first with the engine as well
+///   ([`engine_start_options`]); the messages repeat it.
 /// - Echo cancellation, when it was left on. It is otherwise sent only when the checkbox is
 ///   toggled, so a saved `echo_cancel = true` came back as a pane and a strip saying it had been
 ///   asked for, while the engine was never told and `module-echo-cancel` never loaded. Off is the
@@ -4094,15 +4100,19 @@ fn device_priority(settings: &Settings, direction: DeviceDirection) -> UiToAudio
 }
 
 /// What the engine is started with from the settings file ([`fxsound_audio::StartOptions`]): the
-/// language of its nodes' descriptions, the per-device volumes of FxSound's own nodes (U10), and
-/// each lane's device ranking (U4), with where a device the ranking does not name yet goes.
+/// language of its nodes' descriptions, the per-device volumes of FxSound's own nodes (U10), each
+/// lane's device ranking (U4), with where a device the ranking does not name yet goes, whether the
+/// speakers' lane is on, and whether the lanes take the session defaults — not with the power
+/// left off (U12).
 ///
 /// The engine builds the output lane's first pair a round trip after it connects, before a message
 /// sent once it has started is sure to have been read: a ranking sent only as
 /// [`UiToAudio::SetDevicePriority`] could arrive after the Windows rules had put the lane on the
 /// session default, which the ranking then had to take it away from, and the first pair on a
-/// remembered device would start at a level chosen without its volume. [`startup_messages`] still
-/// says both, with the same values.
+/// remembered device would start at a level chosen without its volume. A power left off or a
+/// speakers' lane left `Off` said only as messages could arrive after that pair had claimed the
+/// default sink and moved every playing stream onto FxSound, to move them all back a moment later.
+/// [`startup_messages`] still says all of it, with the same values.
 #[must_use]
 pub fn engine_start_options(settings: &Settings, language: &str) -> fxsound_audio::StartOptions {
     let ranking = |direction| fxsound_audio::DevicePriority {
@@ -4114,6 +4124,8 @@ pub fn engine_start_options(settings: &Settings, language: &str) -> fxsound_audi
         target_volumes: settings.device_volumes.clone(),
         output_priority: ranking(DeviceDirection::Output),
         input_priority: ranking(DeviceDirection::Input),
+        want_default: settings.power,
+        output_enabled: settings.lane_enabled(DeviceDirection::Output),
     }
 }
 
@@ -4740,6 +4752,17 @@ impl App {
             );
             self.notify(Message::hidden_with_no_tray());
         }
+    }
+
+    /// The window was asked for and could not be opened, and FxSound stays in the tray: say so, as
+    /// a desktop notification — there is no window to put a notice up in — and on the event
+    /// stream, where a status bar hears it.
+    pub fn window_unavailable(&mut self) {
+        let message = Message::window_unavailable();
+        self.events.push(AppEvent::Notice {
+            message: message.body.clone(),
+        });
+        self.notify(message);
     }
 
     /// Act on one Settings-window action.
@@ -12355,6 +12378,37 @@ mod tests {
     }
 
     #[test]
+    fn the_engine_is_started_with_the_power_and_the_speakers_lane_as_they_were_left() {
+        // A power left off or a speakers' lane left `Off`, said only as messages after the start,
+        // could reach the engine after its first pair had claimed the default sink and moved every
+        // playing stream onto FxSound, to be moved back a moment later.
+        let settings = saved_settings(OUT);
+        let options = engine_start_options(&settings, "en");
+        assert!(options.want_default && options.output_enabled);
+
+        let mut settings = saved_settings(OUT);
+        settings.power = false;
+        let options = engine_start_options(&settings, "en");
+        assert!(!options.want_default);
+        assert!(options.output_enabled);
+        assert_eq!(
+            default_wishes(&startup_messages(&settings)),
+            [(OUT, false), (IN, false)],
+            "the messages that follow say the same"
+        );
+
+        let mut settings = saved_settings(OUT);
+        settings.set_lane_enabled(OUT, false);
+        let options = engine_start_options(&settings, "en");
+        assert!(options.want_default);
+        assert!(!options.output_enabled);
+        assert!(
+            startup_messages(&settings).contains(&UiToAudio::DetachLane(OUT)),
+            "and the message that follows says the same"
+        );
+    }
+
+    #[test]
     fn a_device_list_puts_every_device_on_the_priority_list_and_the_engine_is_told_first() {
         let (mut app, engine, _dir) = started_with(saved_settings(OUT));
         engine.feed(AudioToUi::Devices(two_lane_devices()));
@@ -13101,14 +13155,12 @@ mod tests {
     // ---- sleep (U13) ------------------------------------------------------------------------------
 
     #[test]
-    fn going_to_sleep_mutes_both_lanes_and_tells_the_engine() {
+    fn going_to_sleep_tells_the_engine_which_silences_both_lanes_itself() {
         let (mut app, engine, _dir) = listed_with(saved_settings(OUT), HEADPHONES);
         let _ = engine.take_sent();
         app.system_sleeping(true);
         assert!(app.is_system_sleeping());
         assert_eq!(engine.take_sent(), [UiToAudio::SystemSleeping(true)]);
-        assert!(engine.params().expect("published").mute);
-        assert!(engine.input_params().expect("published").mute);
         assert!(
             engine.take_events().is_empty(),
             "nothing is reset on the way down"
@@ -13116,7 +13168,28 @@ mod tests {
     }
 
     #[test]
-    fn resuming_clears_both_lanes_filters_and_unmutes_them() {
+    fn a_sleep_whose_end_is_never_heard_leaves_no_mute_of_the_app_s_own_behind() {
+        // logind restarted between `PrepareForSleep(true)` and `(false)`: the engine gives the
+        // sleep up after a minute awake and hears both lanes again. A mute in the snapshots, which
+        // only logind's `false` would lift, kept them silent for the rest of the session.
+        let (mut app, engine, _dir) = listed_with(saved_settings(OUT), HEADPHONES);
+        app.system_sleeping(true);
+        app.handle(&[UiAction::SetEffect(Effect::Bass, 7.0)]);
+        app.handle(&[UiAction::SetEditDirection(IN)]);
+        app.handle(&[UiAction::SetMasterGain(3.0)]);
+        app.poll_audio_at(Instant::now() + std::time::Duration::from_secs(120));
+        assert!(!engine.params().expect("published").mute);
+        assert!(!engine.input_params().expect("published").mute);
+        assert!(
+            !engine
+                .take_sent()
+                .contains(&UiToAudio::SystemSleeping(false)),
+            "and the engine is not told the system woke: it gives up on its own"
+        );
+    }
+
+    #[test]
+    fn resuming_tells_the_engine_and_clears_both_lanes_filters() {
         let (mut app, engine, _dir) = listed_with(saved_settings(OUT), HEADPHONES);
         app.system_sleeping(true);
         let _ = engine.take_sent();
@@ -13131,21 +13204,25 @@ mod tests {
                 (IN, DspEvent::ResetFilterState)
             ]
         );
-        assert!(!engine.params().expect("published").mute);
-        assert!(!engine.input_params().expect("published").mute);
     }
 
     #[test]
-    fn nothing_the_user_moves_while_the_system_sleeps_unmutes_it() {
+    fn nothing_the_user_moves_while_the_system_sleeps_tells_the_engine_it_woke() {
         let (mut app, engine, _dir) = listed_with(saved_settings(OUT), HEADPHONES);
         app.system_sleeping(true);
+        let _ = engine.take_sent();
         app.handle(&[UiAction::SetEffect(Effect::Bass, 7.0)]);
         app.handle(&[UiAction::TogglePower]);
         app.handle(&[UiAction::TogglePower]);
         app.handle(&[UiAction::SetEditDirection(IN)]);
         app.handle(&[UiAction::SetMasterGain(3.0)]);
-        assert!(engine.params().expect("published").mute);
-        assert!(engine.input_params().expect("published").mute);
+        assert!(app.is_system_sleeping());
+        assert!(
+            !engine
+                .take_sent()
+                .iter()
+                .any(|message| matches!(message, UiToAudio::SystemSleeping(_)))
+        );
     }
 
     #[test]
@@ -13177,7 +13254,7 @@ mod tests {
             let word = crate::sleep::prepare_for_sleep(&signal).expect("logind's signal");
             app.system_sleeping(word);
             assert_eq!(engine.take_sent(), [UiToAudio::SystemSleeping(sleeping)]);
-            assert_eq!(engine.params().expect("published").mute, sleeping);
+            assert_eq!(app.is_system_sleeping(), sleeping);
         }
     }
 

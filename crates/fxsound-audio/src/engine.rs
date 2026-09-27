@@ -1167,6 +1167,12 @@ pub(crate) struct Config {
     /// Each lane's device ranking ([`crate::StartOptions::output_priority`]), in place before the
     /// thread connects, so each lane's first choice of device is already made by rank.
     pub(crate) device_priority: PerDirection<crate::DevicePriority>,
+    /// Whether both lanes want the session default ([`crate::StartOptions::want_default`]), in
+    /// place before the thread connects, so the first pair does not claim what the app hands back.
+    pub(crate) want_default: bool,
+    /// Whether the output lane starts enabled ([`crate::StartOptions::output_enabled`]), in place
+    /// before the thread connects, so a lane the user left off builds no first pair.
+    pub(crate) output_enabled: bool,
     /// WirePlumber's `stream-properties` file, to read the level it kept for our nodes before
     /// 0.4.0 from ([`volume::inherited`]); `None` to read nothing, which is what the tests do.
     pub(crate) wireplumber_state: Option<std::path::PathBuf>,
@@ -2212,6 +2218,8 @@ pub(crate) fn run(config: Config) {
         aec_library,
         target_volumes,
         device_priority,
+        want_default,
+        output_enabled,
         wireplumber_state,
         route_idle,
     } = config;
@@ -2259,9 +2267,11 @@ pub(crate) fn run(config: Config) {
         };
         // Before the first connection, and so before any pair: neither lane can build on a volume
         // chosen without what the app remembers, or without what WirePlumber kept — nor choose
-        // its first device without the user's ranking.
+        // its first device without the user's ranking, nor be built, or take the default, when
+        // the app is about to say it must not.
         state.target_volumes = remembered_volumes(target_volumes);
         start_ranked(&mut state, device_priority);
+        start_lanes(&mut state, output_enabled, want_default);
         state.routes.set_idle(route_idle);
         if let Some(path) = wireplumber_state {
             state.inherited_volumes = volume::inherited_from(&path);
@@ -2796,6 +2806,25 @@ fn start_ranked(shared: &mut Shared, priority: PerDirection<crate::DevicePriorit
                 preference.ranking[0]
             );
         }
+    }
+}
+
+/// Each lane as the app left it when it last quit ([`crate::StartOptions::output_enabled`],
+/// [`crate::StartOptions::want_default`]): the output lane off when the user left it off, and
+/// neither lane wanting the default when the power was left off. In force before the first pair,
+/// which is then never built on the speakers, or never claims the default, only to be torn down
+/// or handed back by the [`UiToAudio::DetachLane`] or [`UiToAudio::SetAsDefault`] that follows —
+/// the app still sends both, and they change nothing then.
+fn start_lanes(shared: &mut Shared, output_enabled: bool, want_default: bool) {
+    if !output_enabled {
+        log::info!("output lane: starts off");
+    }
+    if !want_default {
+        log::info!("both lanes start leaving the session defaults where they are");
+    }
+    shared.lanes.output.enabled = output_enabled;
+    for (_, lane) in shared.lanes.iter_mut() {
+        lane.want_default = want_default;
     }
 }
 
@@ -9479,6 +9508,91 @@ mod tests {
         assert_eq!(plan.assigned, vec![(40, slot)]);
     }
 
+    /// The app's power off (`fxsound-app`'s `refresh_app_routes`): the rules as they were with the
+    /// power off in them, then none. A route kept for a stream FxSound does not move runs switched
+    /// off, as its lane does, until that stream leaves — never the preset's effects under a switch
+    /// that says `Off` — and the power coming back on runs the preset on it again.
+    #[test]
+    fn a_route_kept_through_the_power_going_off_runs_switched_off() {
+        use crate::app_routes::{Candidate, RouteSlot, Rules};
+        use fxsound_core::AppKey;
+        use fxsound_core::messages::{AppRoute, DspParams, RouteParams};
+
+        let rule = |power: bool| AppRoute {
+            direction: DeviceDirection::Output,
+            app: AppKey {
+                name: "Game".to_owned(),
+                ..AppKey::default()
+            },
+            preset: "Gaming".to_owned(),
+            params: RouteParams::Output(DspParams {
+                power,
+                master_gain_db: 3.0,
+                ..DspParams::default()
+            }),
+            chain: String::new(),
+        };
+        let preset = |power: bool| {
+            Rules::new(vec![rule(power)])
+                .0
+                .preset(DeviceDirection::Output, "Gaming")
+                .expect("named")
+        };
+        let powered = |params: Option<RouteParams>| match params.expect("a route in the slot") {
+            RouteParams::Output(params) => params.power,
+            RouteParams::Input(params) => params.power,
+        };
+        let slot = RouteSlot::new(DeviceDirection::Output, 1);
+        let now = Instant::now();
+        let mut shared = shared_for_tests();
+
+        control(&mut shared, UiToAudio::SetAppRoutes(vec![rule(true)]));
+        let game = Candidate {
+            id: 40,
+            direction: DeviceDirection::Output,
+            app: AppKey {
+                name: "Game".to_owned(),
+                ..AppKey::default()
+            },
+            movable: true,
+            on_route: None,
+        };
+        let plan = shared.routes.plan_for_tests(&[game], now);
+        assert_eq!(plan.build, vec![(slot, "Gaming".to_owned())]);
+        shared.routes.add_for_tests(slot, preset(true));
+        assert!(powered(shared.routes.params_for_tests(slot)));
+
+        // The power goes off while a player that names the route's node itself plays through it.
+        control(&mut shared, UiToAudio::SetAppRoutes(vec![rule(false)]));
+        control(&mut shared, UiToAudio::SetAppRoutes(Vec::new()));
+        let pinned = Candidate {
+            id: 44,
+            direction: DeviceDirection::Output,
+            app: AppKey {
+                name: "Player".to_owned(),
+                ..AppKey::default()
+            },
+            movable: false,
+            on_route: Some(slot),
+        };
+        let plan = shared
+            .routes
+            .plan_for_tests(std::slice::from_ref(&pinned), now);
+        assert_eq!(plan.kept, vec![(slot, "Gaming".to_owned())]);
+        assert!(plan.teardown.is_empty());
+        assert!(
+            !powered(shared.routes.params_for_tests(slot)),
+            "the kept route runs switched off"
+        );
+
+        control(&mut shared, UiToAudio::SetAppRoutes(vec![rule(true)]));
+        assert_eq!(
+            shared.routes.params_for_tests(slot),
+            Some(preset(true).params),
+            "and the preset again once the power is back on"
+        );
+    }
+
     /// A route's preset: the music chain's busy parameters, or the voice chain's defaults.
     fn route_preset(direction: DeviceDirection, name: &str) -> crate::app_routes::RoutePreset {
         use fxsound_core::messages::RouteParams;
@@ -12512,6 +12626,61 @@ mod tests {
             run_and_commit(&mut shared, DeviceDirection::Output),
             USB_DAC,
             "the ranking's first device, not the session default rule 2 would adopt"
+        );
+    }
+
+    #[test]
+    fn a_speakers_lane_and_a_power_left_off_are_in_force_before_the_first_pair() {
+        let (mut shared, messages) = shared_with_messages();
+        start_lanes(&mut shared, false, false);
+        add_device(
+            &mut shared,
+            device(52, HDMI_MONITOR, DeviceDirection::Output),
+        );
+        shared.mark_enabled_lanes_for_rules();
+        assert!(!shared.lanes.output.enabled);
+        assert!(
+            !shared.lanes.output.needs_rules,
+            "no rules run for the speakers, so no pair is built on them"
+        );
+        for (direction, lane) in shared.lanes.iter() {
+            assert!(!lane.want_default, "{} lane", direction.key());
+        }
+
+        // The messages the app sends after the start say the same, and change nothing more.
+        let before = DeviceDirection::ALL.map(|direction| lane_state(&shared, direction));
+        control(&mut shared, UiToAudio::DetachLane(DeviceDirection::Output));
+        for direction in DeviceDirection::ALL {
+            control(
+                &mut shared,
+                UiToAudio::SetAsDefault {
+                    direction,
+                    want: false,
+                },
+            );
+        }
+        assert_eq!(
+            DeviceDirection::ALL.map(|direction| lane_state(&shared, direction)),
+            before
+        );
+        assert!(
+            !drained(&messages).iter().any(|message| matches!(
+                message,
+                AudioToUi::Attached {
+                    node_name: Some(_),
+                    ..
+                }
+            )),
+            "nothing was ever attached"
+        );
+
+        // The engine's own start: the speakers on, both lanes wanting the default.
+        let (mut shared, _messages) = shared_with_messages();
+        let before = DeviceDirection::ALL.map(|direction| lane_state(&shared, direction));
+        start_lanes(&mut shared, true, true);
+        assert_eq!(
+            DeviceDirection::ALL.map(|direction| lane_state(&shared, direction)),
+            before
         );
     }
 

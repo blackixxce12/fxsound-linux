@@ -148,6 +148,21 @@ impl Message {
         ))
     }
 
+    /// The window was asked for and could not be opened, and FxSound stays in the tray instead of
+    /// quitting: an instance the session bus started through the systemd user unit, on a desktop
+    /// that never gave the systemd user manager its `WAYLAND_DISPLAY` or `DISPLAY`. The audio keeps
+    /// being processed; only the window is out of reach, and a notification is the one way left to
+    /// say so. It stays out of reach for as long as this instance runs — a process gets one try at
+    /// its display connection (winit's event loop) — so the way back is a fresh start from the
+    /// desktop. A port addition.
+    #[must_use]
+    pub fn window_unavailable() -> Self {
+        Self::new(tr(
+            "FxSound could not open its window and keeps running in the system tray.\nQuit it \
+             from the tray and start FxSound again to open the window.",
+        ))
+    }
+
     /// Preset changed with `notify == true` and power on (`FxController.cpp:1099-1102`).
     #[must_use]
     pub fn preset_selected(name: &str) -> Self {

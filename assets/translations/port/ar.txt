@@ -35,6 +35,7 @@ countries: EG sa
 "Not used on a microphone" = "لا يُستخدم مع الميكروفون"
 "These five belong to the playback chain. A microphone runs the voice chain instead: high-pass, gate, equalizer, de-esser, compressor and limiter." = "هذه الخمسة تخص سلسلة التشغيل. أما الميكروفون فيمر عبر سلسلة الصوت البشري: مرشح تمرير عالٍ، بوابة ضوضاء، معادل، مزيل صفير، ضاغط ومحدد."
 "FxSound is still running, but this session has no tray icon.\nRun 'fxsound --show' to bring the window back." = "لا يزال FxSound يعمل، لكن هذه الجلسة لا تحتوي على أيقونة في شريط النظام.\nشغّل 'fxsound --show' لإعادة النافذة."
+"FxSound could not open its window and keeps running in the system tray.\nQuit it from the tray and start FxSound again to open the window." = "تعذّر على FxSound فتح نافذته، وهو مستمر في العمل في شريط النظام.\nأغلقه من شريط النظام وشغّل FxSound مجددًا لفتح النافذة."
 "Off" = "إيقاف"
 "Mild" = "خفيف"
 "Medium" = "متوسط"

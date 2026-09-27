@@ -219,6 +219,23 @@ fn input(route: &AppRoute) -> InputDspParams {
     }
 }
 
+/// Whether `route`'s snapshot has the power on: the effects run.
+fn powered(route: &AppRoute) -> bool {
+    match route.params {
+        RouteParams::Output(params) => params.power,
+        RouteParams::Input(params) => params.power,
+    }
+}
+
+/// `route` with the power switched `power` in its snapshot.
+fn with_power(mut route: AppRoute, power: bool) -> AppRoute {
+    match &mut route.params {
+        RouteParams::Output(params) => params.power = power,
+        RouteParams::Input(params) => params.power = power,
+    }
+    route
+}
+
 /// How many times `text` was raised as a notice among `events`.
 fn notices(events: &[AppEvent], text: &str) -> usize {
     events
@@ -1037,19 +1054,149 @@ fn a_microphone_setting_reaches_the_recording_routes() {
 }
 
 #[test]
-fn the_power_switch_and_the_sleep_reach_every_route() {
+fn turning_the_power_off_takes_every_route_away_and_turning_it_on_brings_them_back() {
+    // Power off hands both defaults back so that nothing passes through FxSound (U12): a game
+    // left on `FxSound (Output) · Gaming` would stay on the lane's device, at FxSound's volume,
+    // when the user moves the system's default somewhere else.
     let (mut app, engine, _dir) = routed();
-    app.handle(&[UiAction::TogglePower]);
-    let routes = the_routes_sent(&engine);
-    assert!(!output(route_of(&routes, &battlefield(), OUT)).power);
-    assert!(!input(route_of(&routes, &discord(), IN)).power);
-    app.handle(&[UiAction::TogglePower]);
-    let _ = routes_sent(&engine);
+    let before = app.app_routes().to_vec();
+    assert!(!before.is_empty());
 
-    app.system_sleeping(true);
+    app.handle(&[UiAction::TogglePower]);
+    assert_eq!(
+        the_last_routes_sent(&engine),
+        [],
+        "no route while the power is off"
+    );
+    assert!(app.app_routes().is_empty());
+    assert_eq!(
+        store_choice(&app, OUT, &battlefield()).as_deref(),
+        Some("Gaming"),
+        "the choice itself is kept"
+    );
+
+    // Nothing that changes meanwhile puts a route back: a level, a preset saved, a new rule.
+    app.handle(&[UiAction::SetMasterGain(6.0)]);
+    app.set_app_preset(&brave(), OUT, Some("Volume Boost"))
+        .expect("set");
+    play(
+        &mut app,
+        &engine,
+        vec![stream(1, OUT, &battlefield()), stream(3, OUT, &brave())],
+    );
+    assert!(routes_sent(&engine).iter().all(Vec::is_empty));
+    assert!(app.app_routes().is_empty());
+
+    app.handle(&[UiAction::TogglePower]);
     let routes = the_routes_sent(&engine);
-    assert!(output(route_of(&routes, &battlefield(), OUT)).mute);
-    assert!(input(route_of(&routes, &discord(), IN)).mute);
+    assert_eq!(
+        presets_of(&routes),
+        [
+            (OUT, battlefield(), "Gaming"),
+            (OUT, brave(), "Volume Boost"),
+            (IN, discord(), "Headset")
+        ],
+        "every rule resolved meanwhile, back at once"
+    );
+    let game = output(route_of(&routes, &battlefield(), OUT));
+    assert!(game.power);
+    assert_eq!(game.master_gain_db, 6.0, "with the levels of the moment");
+    assert!(input(route_of(&routes, &discord(), IN)).power);
+}
+
+#[test]
+fn turning_the_power_off_switches_every_route_off_before_it_takes_them_away() {
+    // The engine keeps a route no rule names any more for as long as a stream it cannot move is
+    // on it — one pinned to the route's node, or anchored there by WirePlumber — running what it
+    // was last sent. Taken away at once, such a route went on with the preset's effects while the
+    // switch said `Off`.
+    let (mut app, engine, _dir) = routed();
+    let before = app.app_routes().to_vec();
+    assert!(
+        before
+            .iter()
+            .filter(|route| !route.preset.is_empty())
+            .all(powered),
+        "{before:?}"
+    );
+
+    app.handle(&[UiAction::TogglePower]);
+    let sent = routes_sent(&engine);
+    let [bypassed, none] = sent.as_slice() else {
+        panic!("the routes switched off, then none: {sent:?}");
+    };
+    assert!(
+        !bypassed.iter().any(powered),
+        "no route is left running its effects: {bypassed:?}"
+    );
+    assert_eq!(
+        bypassed
+            .iter()
+            .cloned()
+            .map(|route| with_power(route, true))
+            .collect::<Vec<_>>(),
+        before,
+        "the routes as they were, with nothing but the power changed"
+    );
+    assert!(none.is_empty());
+
+    // Off stays off: nothing more is sent, and nothing that is sent runs.
+    app.handle(&[UiAction::SetMasterGain(6.0)]);
+    assert!(routes_sent(&engine).is_empty());
+}
+
+#[test]
+fn a_start_with_the_power_off_sends_no_route_until_it_is_turned_on() {
+    let dir = tempfile::tempdir().expect("scratch directory");
+    let file = dir.path().join("apps.toml");
+    std::fs::write(
+        &file,
+        "[[app]]\nbinary = \"bf6.exe\"\nname = \"Battlefield 6\"\noutput_preset = \"Gaming\"\n\
+         last_seen = 1\n",
+    )
+    .expect("write the store");
+    let mut settings = Settings::default();
+    settings.output_preset = "Music".to_owned();
+    settings.power = false;
+    let engine = FakeEngine::new();
+    let mut app = App::start_for_tests(
+        settings,
+        music_presets(dir.path()),
+        voice_presets(dir.path()),
+        &engine,
+    );
+    app.use_app_rules_file_for_tests(file);
+    assert_eq!(
+        store_choice(&app, OUT, &battlefield()).as_deref(),
+        Some("Gaming")
+    );
+    assert!(
+        routes_sent(&engine).iter().all(Vec::is_empty),
+        "a game started while FxSound is off is moved nowhere"
+    );
+
+    app.handle(&[UiAction::TogglePower]);
+    assert_eq!(
+        presets_of(&the_last_routes_sent(&engine)),
+        [(OUT, battlefield(), "Gaming")]
+    );
+}
+
+#[test]
+fn a_system_going_to_sleep_leaves_every_route_to_the_engine_s_own_mute() {
+    // The engine silences each route with its lane while the system sleeps, and gives a sleep
+    // that never ends up after a minute awake. A route that carried the app's own mute would stay
+    // silent for as long as logind's `false` stayed lost.
+    let (mut app, engine, _dir) = routed();
+    app.system_sleeping(true);
+    assert!(
+        routes_sent(&engine).is_empty(),
+        "nothing to change on a route"
+    );
+    assert!(app.app_routes().iter().all(|route| match route.params {
+        RouteParams::Output(params) => !params.mute,
+        RouteParams::Input(params) => !params.mute,
+    }));
 }
 
 // ---- the store ----------------------------------------------------------------------------------
