@@ -164,8 +164,6 @@ impl PrivateGraph {
                 "48000",
                 "--channels",
                 "2",
-                "-n",
-                &frames.to_string(),
                 file.to_str()?,
             ],
         )?;
@@ -190,21 +188,26 @@ impl PrivateGraph {
             let _ = child.wait();
             return None;
         }
+        // Stopped by hand once it has written `frames`, rather than by `-n`, which the
+        // `pw-record` of PipeWire 1.0 — Ubuntu 24.04's, where CI runs — does not have.
+        let wanted = frames as u64 * 2 * 4;
+        let written = || std::fs::metadata(&file).map_or(0, |meta| meta.len());
         let deadline = Instant::now() + Duration::from_secs_f32(seconds) + PATIENCE;
-        loop {
-            if child.try_wait().ok().flatten().is_some() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
+        while written() < wanted
+            && Instant::now() < deadline
+            && child.try_wait().ok().flatten().is_none()
+        {
             std::thread::sleep(Duration::from_millis(20));
         }
+        let _ = child.kill();
+        let _ = child.wait();
         let bytes = std::fs::read(&file).unwrap_or_default();
         let (words, _) = bytes.as_chunks::<4>();
-        let samples: Vec<f32> = words.iter().map(|w| f32::from_le_bytes(*w)).collect();
+        let samples: Vec<f32> = words
+            .iter()
+            .take(frames as usize * 2)
+            .map(|w| f32::from_le_bytes(*w))
+            .collect();
         if samples.is_empty() {
             println!(
                 "{name} recorded nothing from {from}: pw-record; {}",
