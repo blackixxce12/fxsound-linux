@@ -43,6 +43,8 @@
 //!    "… Digital Stereo" both read "Family 17h/19h/1ah HD Audio...". Here a name keeps up to
 //!    [`MENU_LABEL_MAX`] characters and loses its middle beyond that, where the card's name ends
 //!    and before the profile or the port that tells two of its devices apart (0.4.0 audit #31).
+//!    At «Как в Windows» = Interface and above the playback devices are cut after 30 again, as
+//!    there ([`WINDOWS_LABEL_MAX`]).
 //! 4. **Two preset submenus.** One per lane, each listing that lane's presets — the music presets
 //!    and the voice presets — so the microphone's can be changed from the tray without the
 //!    window, and without making the microphone the lane the window edits.
@@ -68,7 +70,7 @@
 
 use crate::wake::WakingSender;
 use fxsound_core::i18n::{tr, tr_args};
-use fxsound_core::{DeviceDirection, ThemeMode};
+use fxsound_core::{DeviceDirection, ThemeMode, WindowsParity};
 use ksni::blocking::{Handle, TrayMethods as _};
 use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Category, Icon, MenuItem, Status, ToolTip, Tray};
@@ -102,6 +104,12 @@ pub const PIXMAP_SIZES: [u32; 6] = [16, 22, 24, 32, 48, 64];
 /// (`FxSystemTrayView.cpp:353`, `:422-432`) cut the end off at 30, which is where PipeWire's
 /// descriptions start to differ.
 pub const MENU_LABEL_MAX: usize = 60;
+
+/// What the Windows build cuts a playback device's name to: its first 27 characters and `...`
+/// (`getTruncatedText(name, 30)`, `FxSystemTrayView.cpp:353`, `:422-432`). The tray does so again
+/// at «Как в Windows» = Interface and above ([`TrayState::windows_parity`]); the recording
+/// submenu, which only this port has, keeps [`MENU_LABEL_MAX`].
+pub const WINDOWS_LABEL_MAX: usize = 30;
 
 /// Which of the three icons the item is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -278,6 +286,9 @@ pub struct TrayState {
     pub devices: Vec<TrayDevice>,
     /// The UI language the labels were built in, so a switch re-sends the menu.
     pub language: String,
+    /// The level of «Как в Windows» in force: from Interface on, the playback devices' rows are
+    /// cut as the Windows build cuts them ([`WINDOWS_LABEL_MAX`], 0.4.0 audit #31).
+    pub windows_parity: WindowsParity,
 }
 
 impl Default for TrayState {
@@ -291,6 +302,7 @@ impl Default for TrayState {
             input: TrayLane::default(),
             devices: Vec::new(),
             language: String::new(),
+            windows_parity: WindowsParity::Off,
         }
     }
 }
@@ -590,6 +602,17 @@ impl FxTray {
             .collect()
     }
 
+    /// A device's row: cut after [`WINDOWS_LABEL_MAX`] characters as on Windows for a playback
+    /// device at «Как в Windows» = Interface and above, in its middle past [`MENU_LABEL_MAX`]
+    /// otherwise (0.4.0 audit #31).
+    fn device_label(&self, direction: DeviceDirection, name: &str) -> String {
+        if direction == DeviceDirection::Output && self.state.windows_parity.interface() {
+            truncate_label_as_windows(name)
+        } else {
+            truncate_label(name)
+        }
+    }
+
     /// One lane's radio group — `Off`, then its direction's devices — or `None` when the direction
     /// has no devices.
     fn device_group(&self, direction: DeviceDirection) -> Option<MenuItem<Self>> {
@@ -609,7 +632,7 @@ impl FxTray {
             ..Default::default()
         })
         .chain(indices.iter().map(|&i| RadioItem {
-            label: truncate_label(&self.state.devices[i].name),
+            label: self.device_label(direction, &self.state.devices[i].name),
             ..Default::default()
         }))
         .collect();
@@ -946,6 +969,21 @@ fn truncate_label(text: &str) -> String {
     let head: String = chars[..kept / 2].iter().collect();
     let tail: String = chars[chars.len() - (kept - kept / 2)..].iter().collect();
     format!("{}…{}", head.trim_end(), tail.trim_start())
+}
+
+/// A playback device's name as the Windows build's tray shows it: whole up to
+/// [`WINDOWS_LABEL_MAX`] characters, and beyond that its first `WINDOWS_LABEL_MAX - 3` and `...`
+/// (`FxSystemTrayView::getTruncatedText`, `FxSystemTrayView.cpp:422-432`).
+fn truncate_label_as_windows(text: &str) -> String {
+    const ELLIPSIS: &str = "...";
+    if text.chars().count() <= WINDOWS_LABEL_MAX {
+        return text.to_owned();
+    }
+    let head: String = text
+        .chars()
+        .take(WINDOWS_LABEL_MAX - ELLIPSIS.len())
+        .collect();
+    format!("{head}{ELLIPSIS}")
 }
 
 #[cfg(test)]
@@ -1716,6 +1754,58 @@ mod tests {
             truncate_label("Navi 31 HDMI/DP Audio Controller Digital Stereo (HDMI 3) Output"),
             "Navi 31 HDMI/DP Audio Control…Digital Stereo (HDMI 3) Output"
         );
+    }
+
+    #[test]
+    fn at_interface_a_playback_device_is_cut_after_thirty_characters_as_on_windows() {
+        // 0.4.0 audit #31 at «Как в Windows» = Interface: `getTruncatedText(name, 30)`
+        // (`FxSystemTrayView.cpp:422-432`) keeps the first 27 characters and "...". At Off the
+        // same name loses its middle past 60 (above).
+        assert_eq!(truncate_label_as_windows("Speakers"), "Speakers");
+        let at_the_limit = "a".repeat(WINDOWS_LABEL_MAX);
+        assert_eq!(truncate_label_as_windows(&at_the_limit), at_the_limit);
+        assert_eq!(
+            truncate_label_as_windows("Family 17h/19h/1ah HD Audio Controller Analog Stereo"),
+            "Family 17h/19h/1ah HD Audio..."
+        );
+        assert_eq!(
+            truncate_label_as_windows("Встроенное аудио Аналоговый стерео"),
+            "Встроенное аудио Аналоговый...",
+            "characters, not bytes"
+        );
+
+        let long_mic = "Family 17h/19h/1ah HD Audio Controller Analog Stereo Microphone";
+        let mut state = both_lanes();
+        state.devices[4].name = long_mic.to_owned();
+        for level in WindowsParity::ALL {
+            let (tray, _rx) = with_state(TrayState {
+                windows_parity: level,
+                ..state.clone()
+            });
+            let menu = tray.menu();
+            let outputs = options(devices_of(&menu, OUT));
+            let inputs = options(devices_of(&menu, IN));
+            let hdmi = if level.interface() {
+                "HDMI / DisplayPort 3 Output..."
+            } else {
+                "HDMI / DisplayPort 3 Output That Goes On Forever"
+            };
+            assert_eq!(
+                outputs,
+                vec![
+                    "Off",
+                    "Built-in Audio Analogue Stereo",
+                    hdmi,
+                    "Mono Headset"
+                ],
+                "{level:?}"
+            );
+            assert_eq!(
+                inputs[2],
+                truncate_label(long_mic),
+                "{level:?}: the recording submenu is the port's own and keeps its cut"
+            );
+        }
     }
 
     // ---- whether the icon is shown ----------------------------------------------------------

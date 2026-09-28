@@ -281,8 +281,10 @@ fn main() -> eframe::Result<()> {
     // no such thing as a hidden window here (see the module docs). An explicit `--show` overrides
     // the preference, as `--hide` overrides it the other way (`Cli::cold_start_commands`), and so
     // does `--toggle-window`, since the window it toggles is not up yet. A line that only sets
-    // something starts in the tray too (`cold_start_visibility`).
-    let quiet = cli.only_sets_things();
+    // something starts in the tray too (`cold_start_visibility`), except at «Как в Windows» =
+    // Interface and above one with an option the Windows build has, whose start shows its window
+    // (0.4.0 audit R11, `Cli::only_sets_things_at`) — at the level the line itself may have set.
+    let quiet = cli.only_sets_things_at(app.windows_parity());
     let mut visibility = cold_start_visibility(
         cold.window.hide,
         cold.window.show || cold.window.toggle,
@@ -564,7 +566,11 @@ impl Runtime {
                 self.waiting_for_devices.push((forwarded, until));
                 continue;
             }
-            let outcome = commands::run(&mut self.app, forwarded.commands());
+            let outcome = commands::run_forwarded(
+                &mut self.app,
+                forwarded.commands(),
+                forwarded.raises_like_windows(),
+            );
             merge(&mut request, outcome.window);
             forwarded.respond_with(outcome.stdout, outcome.stderr, outcome.failed);
         }
@@ -1378,8 +1384,9 @@ impl<'a> Shell<'a> {
 
         // The enablement predicates of `FxMainWindow.cpp:536-543`: the preset items are the
         // controller's one rule, which the command line and D-Bus are refused by too, with the
-        // power on or off (0.4.0 audit R7); Export and Import are always offered (audit #18,
-        // [`App::preset_menu`]).
+        // power on or off (0.4.0 audit R7); Export and Import are offered whether or not the
+        // preset has unsaved changes (audit #18), except at «Как в Windows» = Interface and
+        // above, where changes grey them out as on Windows ([`App::preset_menu`]).
         let preset = app.state.preset();
         let PresetMenu {
             save_new: can_save_new,
@@ -3571,6 +3578,42 @@ mod minimise_tests {
             cold_start_visibility(false, false, false, line(&["--view=2"])),
             Shown,
             "--view asks for the window"
+        );
+    }
+
+    #[test]
+    fn at_interface_a_cold_start_from_an_option_windows_has_shows_the_window_as_there() {
+        // 0.4.0 audit R11 at «Как в Windows» = Interface: the Windows build's start shows its
+        // window whatever its line set, unless it was last quit hidden; a keybind's option, which
+        // stands in for a Windows hotkey, still starts in the tray.
+        use WindowVisibility::{Hidden, Shown};
+        use fxsound_core::WindowsParity;
+        let quiet = |args: &[&str], level: WindowsParity| {
+            Cli::try_parse_from(std::iter::once("fxsound").chain(args.iter().copied()))
+                .expect("parses")
+                .only_sets_things_at(level)
+        };
+        for level in [WindowsParity::Interface, WindowsParity::Sound] {
+            let gaming = quiet(&["--preset=Gaming"], level);
+            assert_eq!(cold_start_visibility(false, false, false, gaming), Shown);
+            assert_eq!(
+                cold_start_visibility(false, false, true, gaming),
+                Hidden,
+                "the remembered tray state still counts"
+            );
+            assert_eq!(
+                cold_start_visibility(false, false, false, quiet(&["--toggle-power"], level)),
+                Hidden
+            );
+        }
+        assert_eq!(
+            cold_start_visibility(
+                false,
+                false,
+                false,
+                quiet(&["--preset=Gaming"], WindowsParity::Off)
+            ),
+            Hidden
         );
     }
 }

@@ -105,7 +105,14 @@ is not left running with nothing on screen. At a start,
 sets the layout and the window follows the remembered tray state, unless
 .B \-\-show
 is given too. The Windows build raises its window for every option but
-.BR \-\-status .
+.BR \-\-status ,
+and so does this one at \(lqLike FxSound for Windows\(rq = interface and
+above
+.RB ( \-\-windows\-parity )
+for the options the Windows build has, and a start from one of them shows the
+window unless FxSound was last quit hidden. The keybinding options
+.RB ( \-\-toggle\-power ", " \-\-next\-preset ", " \-\-prev\-preset ", " \-\-next\-output ),
+the options only this port has and D-Bus never raise it.
 .BR \-\-status ", " \-\-watch " and " \-\-list\-apps
 print and exit without touching the window, and
 .B \-\-self\-test
@@ -179,7 +186,9 @@ on standard error, as
 does on ten bands. A
 .B \-\-num_bands
 on the same command line sets the count first. The Windows build drops such a
-list, or sets what it can of it, without a word.
+list, or sets what it can of it, without a word. At \(lqLike FxSound for
+Windows\(rq = interface and above, either list sets the pairs that fit and
+skips the others, naming them in a note on standard error, and succeeds.
 .TP
 .BI \-\-filter_q= Q
 Equalizer filter Q,
@@ -246,7 +255,10 @@ Save the current settings as a new user preset: its unsaved changes, or a copy
 of it when it has none. Refused with a name a preset already has (in any
 case), and at the user-preset limit
 .RB ( max_user_presets
-in the settings file, 10 to 1000).
+in the settings file, 10 to 1000). At \(lqLike FxSound for Windows\(rq =
+interface and above a preset with no unsaved changes is refused, as on
+Windows, and the menu's Save New Preset waits for changes too, while Export
+Presets and Import Presets wait for none.
 .TP
 .B \-\-overwrite_preset
 Overwrite the selected user preset with its unsaved changes. A factory preset
@@ -1350,7 +1362,9 @@ devices under
 and the microphones under
 .BR "Recording Device Select" ,
 a long name shortened in its middle so that the part that tells two devices of
-one card apart stays.
+one card apart stays; at \(lqLike FxSound for Windows\(rq = interface and
+above a playback device's name is cut after 30 characters, as the Windows build
+cuts it.
 .PP
 The systemd user unit is installed but deliberately not enabled. The desktop
 entry already starts FxSound when you launch it, and an enabled user unit on

@@ -129,6 +129,11 @@ pub enum Refusal {
     NothingToSave {
         preset: String,
     },
+    /// Save New Preset of a preset with no unsaved changes at «Как в Windows» = Interface and
+    /// above, where it is offered only with changes, as on Windows (0.4.0 audit #17).
+    NothingToSaveAsNew {
+        preset: String,
+    },
     /// Undo with no unsaved changes.
     NothingToUndo {
         preset: String,
@@ -194,6 +199,12 @@ impl std::fmt::Display for Refusal {
             Self::NothingToSave { preset } => {
                 write!(f, "{preset:?} has no unsaved changes to save")
             }
+            Self::NothingToSaveAsNew { preset } => write!(
+                f,
+                "{preset:?} has no unsaved changes: with \"Like FxSound for Windows\" on, a new \
+                 preset is saved from unsaved changes only, as on Windows; --windows-parity=off \
+                 saves a copy"
+            ),
             Self::NothingToUndo { preset } => {
                 write!(f, "{preset:?} has no unsaved changes to undo")
             }
@@ -233,8 +244,9 @@ const fn lane_noun(lane: DeviceDirection) -> &'static str {
 
 /// Which of the hamburger menu's preset items are offered: each is
 /// [`App::preset_command_allowed`] for its command (`FxMainWindow.cpp:536-543`), with the power on
-/// or off (0.4.0 audit R7). Export and Import are not preset commands; they are always offered,
-/// whether or not the preset has unsaved changes (0.4.0 audit #18).
+/// or off (0.4.0 audit R7). Export and Import are not preset commands; they are offered whether or
+/// not the preset has unsaved changes (0.4.0 audit #18), except at «Как в Windows» = Interface and
+/// above, where unsaved changes grey them out as on Windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PresetMenu {
     pub save_new: bool,
@@ -3362,6 +3374,7 @@ impl App {
                 })
                 .collect(),
             language: i18n::current(),
+            windows_parity: self.windows_parity(),
         }
     }
 
@@ -3498,10 +3511,17 @@ impl App {
                 })
             }
             // A clean preset is saved as a copy (0.4.0 audit #17): the original offers Save New
-            // Preset only with unsaved changes (`FxMainWindow.cpp:535`), so copying a factory
-            // preset meant moving a slider and moving it back first.
+            // Preset only with unsaved changes (`FxMainWindow.cpp:535`,
+            // `FxController.cpp:405-411`), so copying a factory preset meant moving a slider and
+            // moving it back first. At «Как в Windows» = Interface and above it is the original's
+            // again.
             PresetCommand::SaveAs(name) => {
-                selected()?;
+                let preset = selected()?;
+                if !preset.modified && self.windows_parity().interface() {
+                    return Err(Refusal::NothingToSaveAsNew {
+                        preset: preset.name.clone(),
+                    });
+                }
                 let max = self.max_user_presets();
                 if self.user_preset_count() >= max {
                     return Err(Refusal::LimitReached { max });
@@ -3594,10 +3614,11 @@ impl App {
     /// though its command line and this one's D-Bus run them; the port offers them either way, so
     /// a preset can be picked, saved or tidied before switching on (0.4.0 audit R7).
     ///
-    /// Export Presets and Import Presets are always offered. The original greys both out while
+    /// Export Presets and Import Presets are offered either way. The original greys both out while
     /// the preset has unsaved changes (`FxMainWindow.cpp:540-541`), which protects nothing here:
     /// the export writes the presets as saved, and the import skips a name already taken, the
-    /// modified preset's included (0.4.0 audit #18).
+    /// modified preset's included (0.4.0 audit #18). At «Как в Windows» = Interface and above
+    /// they are greyed out as there.
     #[must_use]
     pub fn preset_menu(&self) -> PresetMenu {
         let offered = |command: PresetCommand| {
@@ -3611,14 +3632,16 @@ impl App {
                 })
                 .is_ok()
         };
+        let transfer =
+            !(self.windows_parity().interface() && self.state.preset().is_some_and(|p| p.modified));
         PresetMenu {
             save_new: offered(PresetCommand::SaveAs(String::new())),
             overwrite: offered(PresetCommand::Overwrite),
             undo: offered(PresetCommand::Undo),
             rename: offered(PresetCommand::Rename(String::new())),
             delete: offered(PresetCommand::Delete),
-            export: true,
-            import: true,
+            export: transfer,
+            import: transfer,
         }
     }
 
@@ -4758,6 +4781,8 @@ impl App {
         self.settings.windows_parity = level;
         self.persist_settings();
         self.note_windows_parity();
+        // The tray's device rows are cut as Windows cuts them from Interface on (0.4.0 audit #31).
+        self.tray_stale = true;
         Ok(())
     }
 
@@ -12209,6 +12234,60 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn at_interface_save_new_export_and_import_are_offered_as_on_windows() {
+        // 0.4.0 audit #17 and #18 at «Как в Windows» = Interface: Save New Preset only with
+        // unsaved changes (`FxMainWindow.cpp:535`, `FxController.cpp:405-411`), Export Presets
+        // and Import Presets only without (`FxMainWindow.cpp:540-541`). At Off (above) a clean
+        // preset is copied and both are always offered; the other items are the same at both.
+        for level in [WindowsParity::Interface, WindowsParity::Sound] {
+            for factory in [true, false] {
+                for modified in [false, true] {
+                    let mut app = choosing(factory, modified);
+                    app.settings.windows_parity = level;
+                    let menu = app.preset_menu();
+                    let case = format!("{level:?}, factory {factory}, modified {modified}");
+                    assert_eq!(menu.save_new, modified, "{case}");
+                    assert_eq!(menu.export, !modified, "{case}");
+                    assert_eq!(menu.import, !modified, "{case}");
+                    assert_eq!(menu.overwrite, modified && !factory, "{case}");
+                    assert_eq!(menu.undo, modified, "{case}");
+                    assert_eq!(menu.rename, !modified && !factory, "{case}");
+                    assert_eq!(menu.delete, !factory, "{case}");
+
+                    let copy = app.preset_command_allowed(&P::SaveAs("Copy".into()));
+                    if modified {
+                        assert_eq!(copy, Ok(()), "{case}");
+                    } else {
+                        let preset = if factory { "Jazz" } else { "Mine" }.to_owned();
+                        let refusal = copy.unwrap_err();
+                        assert_eq!(refusal, Refusal::NothingToSaveAsNew { preset }, "{case}");
+                        assert!(
+                            refusal.to_string().contains("--windows-parity=off"),
+                            "the refusal says how to copy: {refusal}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_level_redraws_the_tray_with_it() {
+        // The tray cuts its playback devices as Windows does from Interface on (0.4.0 audit #31),
+        // so a level set from the command line, D-Bus or the slider reaches it at once.
+        let mut app = headless();
+        let _ = app.take_tray_refresh();
+        assert_eq!(app.tray_state().windows_parity, WindowsParity::Off);
+        app.set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        assert!(app.take_tray_refresh());
+        assert_eq!(app.tray_state().windows_parity, WindowsParity::Interface);
+        app.set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        assert!(!app.take_tray_refresh(), "the same level again is no news");
     }
 
     #[test]

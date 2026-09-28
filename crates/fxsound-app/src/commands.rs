@@ -104,6 +104,22 @@ pub fn run(app: &mut App, commands: &[Command]) -> Outcome {
     outcome
 }
 
+/// Execute a command line a second `fxsound` forwarded over the control socket, or D-Bus handed
+/// over: [`run`], and then the window the Windows build raises for it.
+///
+/// `raises_like_windows` is [`crate::cli::Cli::raises_like_windows`] for a line from the socket
+/// and `false` for D-Bus, whose calls come from keybinds and status bars. At «Как в Windows» =
+/// Interface and above such a line raises the window, as step 11 of `applyConfig` does for every
+/// forwarded line (`FxController.cpp:523-531`, 0.4.0 audit R11) — at the level the line leaves
+/// in force, since `--windows-parity` runs first on its line. `--quit` on the same line wins.
+pub fn run_forwarded(app: &mut App, commands: &[Command], raises_like_windows: bool) -> Outcome {
+    let mut outcome = run(app, commands);
+    if raises_like_windows && app.windows_parity().interface() && !outcome.window.quit {
+        outcome.window.show = true;
+    }
+    outcome
+}
+
 /// The self-test's report as a command's answer: on stdout, and failed when a check failed. The
 /// environment is a parameter so a test can point the checks at a scratch prefix instead of this
 /// host's installation, PipeWire socket and session bus.
@@ -228,6 +244,16 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
         // (`FxController.cpp:536-572`): a list with more pairs than bands was dropped without a
         // word, and one with fewer set what it could and passed the rest to a setter that ignores
         // them, also without a word.
+        //
+        // At «Как в Windows» = Interface and above the pairs that fit are set and the rest skipped
+        // (the approved contract, `docs/0.5.0-windows-parity.md` §2), with a note rather than a
+        // failure ([`set_the_pairs_that_fit`]).
+        Command::BandFrequencies(pairs) if app.windows_parity().interface() => {
+            return set_the_pairs_that_fit(app, "--set_band_freq", pairs);
+        }
+        Command::BandGains(pairs) if app.windows_parity().interface() => {
+            return set_the_pairs_that_fit(app, "--set_band_gain", pairs);
+        }
         Command::BandFrequencies(pairs) => {
             if let Err(refusal) = bands_exist(app, "--set_band_freq", pairs)
                 .and_then(|()| frequencies_in_range(app, pairs))
@@ -264,6 +290,44 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
     }
 
     outcome
+}
+
+/// `--set_band_freq` or `--set_band_gain` (`option`) at «Как в Windows» = Interface and above:
+/// every pair whose band the edit direction's equalizer has — and, for a frequency, whose centre
+/// lies in that band's tuning range — is set, and the others are skipped (0.4.0 audit #51, the
+/// Windows side of it). The Windows build says nothing about a pair it drops; the skipped pairs
+/// are named on stderr here, and the command still succeeds.
+fn set_the_pairs_that_fit(app: &mut App, option: &str, pairs: &[(usize, f32)]) -> Outcome {
+    let frequencies = option == "--set_band_freq";
+    let count = app.state.eq_bands.len();
+    let mut skipped = Vec::new();
+    let mut actions = Vec::new();
+    for &(band, value) in pairs {
+        if band >= count {
+            skipped.push(format!("band {band}"));
+        } else if frequencies {
+            let (low, high) = fxsound_core::eq::band_frequency_range(band, count);
+            if (low..=high).contains(&value) {
+                actions.push(UiAction::SetBandFrequency(band, value));
+            } else {
+                skipped.push(format!("band {band} at {} Hz", exact(value)));
+            }
+        } else {
+            actions.push(UiAction::SetBandGain(band, value));
+        }
+    }
+    app.handle(&actions);
+    Outcome {
+        stderr: if skipped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "note: {option}: on {count} bands, {} skipped and the rest set",
+                skipped.join(", ")
+            )
+        },
+        ..Outcome::default()
+    }
 }
 
 /// `Ok` when every band `pairs` names is one the edit direction's equalizer has now; otherwise the
@@ -4898,5 +4962,127 @@ mod tests {
         let outcome = run_line(&mut a, &["--windows-parity=full", "--force"]);
         assert!(!outcome.failed, "{}", outcome.stderr);
         assert_eq!(a.windows_parity(), WindowsParity::Full);
+    }
+    // ---- «Как в Windows» = Interface: the command line (W3) ------------------------------------
+
+    /// [`run_forwarded`] for `args` as the control socket hands them over from a second `fxsound`.
+    fn forward_line(a: &mut App, args: &[&str]) -> Outcome {
+        let cli =
+            crate::cli::Cli::try_parse_from(std::iter::once("fxsound").chain(args.iter().copied()))
+                .expect("parses");
+        run_forwarded(a, &cli.commands(), cli.raises_like_windows())
+    }
+
+    #[test]
+    fn at_interface_a_forwarded_line_with_an_option_windows_has_raises_the_window() {
+        // 0.4.0 audit R11 at «Как в Windows» = Interface: step 11 of applyConfig raises the
+        // window for every forwarded line (`FxController.cpp:523-531`). At Off it stays down.
+        let mut a = app();
+        assert!(
+            forward_line(&mut a, &["--balance=3"]).window.is_empty(),
+            "Off"
+        );
+        let outcome = forward_line(&mut a, &["--windows-parity=interface", "--balance=3"]);
+        assert!(outcome.window.show, "at the level the line itself sets");
+        for (line, raises) in [
+            (&["--balance=2"][..], true),
+            (&["--set_effect=bass:7"][..], true),
+            (&["--master_gain=-3", "--toggle-power"][..], true),
+            // The keybind options stand in for hotkeys, which raise nothing on Windows either.
+            (&["--toggle-power"][..], false),
+            (&["--next-output"][..], false),
+            (&["--output=off"][..], false),
+            (&["--status"][..], false),
+            (&["--balance=2", "--quit"][..], false),
+        ] {
+            let outcome = forward_line(&mut a, line);
+            assert_eq!(
+                outcome.window.show, raises,
+                "{line:?}: {:?}",
+                outcome.window
+            );
+        }
+        assert!(
+            forward_line(&mut a, &["--hide", "--balance=2"]).window.hide
+                && !forward_line(&mut a, &["--hide", "--balance=2"]).window.show,
+            "a line that says what the window does is taken at its word"
+        );
+        // D-Bus never raises it: its calls come from keybinds and status bars.
+        let commands = crate::dbus::apply_commands(&["--balance=2".to_owned()]).expect("parses");
+        assert!(run_forwarded(&mut a, &commands, false).window.is_empty());
+        let outcome = forward_line(&mut a, &["--windows-parity=off", "--balance=2"]);
+        assert!(outcome.window.is_empty(), "back at Off, quiet again");
+    }
+
+    #[test]
+    fn at_interface_a_band_list_sets_the_pairs_that_fit_and_skips_the_rest() {
+        // 0.4.0 audit #51 at «Как в Windows» = Interface, as the approved contract words it:
+        // apply the valid pairs, skip the rest. At Off the whole list is refused (above).
+        let mut a = app();
+        a.set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        assert_eq!(a.state.eq_bands.len(), 10);
+        let outcome = run(
+            &mut a,
+            &[Command::BandGains(vec![(3, 4.0), (12, 2.0), (30, 6.0)])],
+        );
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(a.state.eq_bands[3].boost_db, 4.0);
+        assert_eq!(
+            outcome.stderr,
+            "note: --set_band_gain: on 10 bands, band 12, band 30 skipped and the rest set"
+        );
+
+        let centre = a.state.eq_bands[0].center_hz;
+        let outcome = run(
+            &mut a,
+            &[Command::BandFrequencies(vec![
+                (9, 20_000.0),
+                (0, 10_000.0),
+                (10, 900.0),
+            ])],
+        );
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(a.state.eq_bands[9].center_hz, 20_000.0);
+        assert_eq!(a.state.eq_bands[0].center_hz, centre, "out of its range");
+        assert_eq!(
+            outcome.stderr,
+            "note: --set_band_freq: on 10 bands, band 0 at 10000 Hz, band 10 skipped and the rest \
+             set"
+        );
+
+        let outcome = run(&mut a, &[Command::BandGains(vec![(9, -2.0)])]);
+        assert!(
+            !outcome.failed && outcome.stderr.is_empty(),
+            "a list that fits says nothing: {}",
+            outcome.stderr
+        );
+        assert_eq!(a.state.eq_bands[9].boost_db, -2.0);
+    }
+
+    #[test]
+    fn at_interface_save_preset_on_a_preset_with_no_unsaved_changes_is_refused_as_on_windows() {
+        // 0.4.0 audit #17 at «Как в Windows» = Interface: `--save_preset` saves only unsaved
+        // changes (`FxController.cpp:405-411`). At Off it saves a copy (above).
+        let tag = "save-no-copy-at-interface";
+        let mut a = app_with_presets(tag);
+        let user = a.user_dir();
+        run(&mut a, &[preset(PresetCommand::Select("Alpha".into()))]);
+        a.set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("Copy".into()))]);
+        assert!(outcome.failed, "a script has to be able to tell");
+        assert!(
+            outcome.stderr.contains("no unsaved changes")
+                && outcome.stderr.contains("--windows-parity=off"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(!user.join("Copy.fac").exists(), "nothing was written");
+
+        run(&mut a, &[Command::BandGains(vec![(0, 3.0)])]);
+        let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("Copy".into()))]);
+        assert!(!outcome.failed, "with changes it saves: {}", outcome.stderr);
+        assert!(user.join("Copy.fac").is_file());
     }
 }

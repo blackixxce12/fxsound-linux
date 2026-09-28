@@ -558,7 +558,9 @@ Unsaved edits are kept in `AutoSave/` a minute after the first one and whenever 
 or quit, so a crash loses at most a minute. **Delete Preset** asks first and moves the file to the
 desktop's trash, where a file manager can restore it, and its unsaved edits with it: restore both
 and the preset is back with its `*`. **Save New Preset** also copies a preset with
-no unsaved changes. A new preset's name is cut to the 126 bytes a Windows FxSound reads a name in
+no unsaved changes, and **Export Presets** and **Import Presets** work with unsaved changes; at
+«Like FxSound for Windows» = Interface, as on Windows, the first waits for changes and the other two
+for none. A new preset's name is cut to the 126 bytes a Windows FxSound reads a name in
 (63 Cyrillic letters), and a line break or a tab in it becomes a space. Saving over one of your
 presets writes the file it was listed from, whatever that file is called, so a preset 0.3.0 saved
 as `Rock:Live.fac` keeps its file, and the unsaved edits 0.3.0 left in `AutoSave/` come back with
@@ -656,14 +658,16 @@ Each of these is a considered decision, not an oversight:
 - **The command line raises the window only when asked to.** On Windows every option but `--status`
   shows and raises the window; here only `--show`, `--view` and `fxsound` with no options do, so a
   keybind or a script sets a preset, the power or an effect without the window jumping in front —
-  and a line of such options that starts FxSound starts it in the tray.
+  and a line of such options that starts FxSound starts it in the tray. «Like FxSound for Windows»
+  = Interface raises it again for the options Windows has; the keybind options and D-Bus never do.
 - **The command line says what it will not do.** Two preset options on one line (`--save_preset=A
   --preset=B`, which Windows reads as `--preset=B` alone), a new preset name that is nothing once the
   characters a `.fac` name cannot hold are gone, and a `--language` FxSound has no translation for
   are parse errors; a band list naming a band the equalizer does not have (`--set_band_gain=12:2` on
-  ten bands), or a `--set_band_freq` outside the band's range, is refused whole with the band named.
-  Windows ignores all of them without a word. `--language` also takes the ISO codes Windows spells
-  its own way (`uk`, `bs`, `nb`) and locales.
+  ten bands), or a `--set_band_freq` outside the band's range, is refused whole with the band named
+  (at «Like FxSound for Windows» = Interface the pairs that fit are set and the rest skipped, with a
+  note). Windows ignores all of them without a word. `--language` also takes the ISO codes Windows
+  spells its own way (`uk`, `bs`, `nb`) and locales.
 - **Every option works when it starts FxSound.** Windows drops the band lists, `--set_effect` and
   the preset commands (`--next-preset` from a keybind included) when there is no FxSound running
   for them; here the start carries them out on the preset it selects. `--next-output` and
@@ -672,7 +676,7 @@ Each of these is a considered decision, not an oversight:
 - **Two device menus in the tray.** The playback devices are under *Playback Device Select* and the
   microphones under *Recording Device Select*, and a long device name is shortened in its middle,
   where Windows cut every name after 30 characters and PipeWire's names of one card's outputs all
-  looked alike.
+  looked alike. «Like FxSound for Windows» = Interface cuts the playback devices after 30 again.
 - **No Donate button, no update check, no bonus-preset download, no Help center.** The heart in
   the title bar and the Donate items in the menu and the tray are gone: this fork is not the
   upstream developers' product and must not solicit money for them. "Check for updates" and the

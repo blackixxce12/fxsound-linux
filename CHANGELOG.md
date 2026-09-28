@@ -17,6 +17,14 @@ All notable changes to the FxSound Linux port. The format follows
   `settings.toml` that says `full` runs as `sound` and keeps saying `full`, so the later version
   finds Everything again. A tab caption too long for one line, as
   «Экспериментальное» is, takes two, broken where its translation marks the word.
+- **«Like FxSound for Windows» = Interface brings back the Windows command line and tray.** A
+  command line with an option the Windows build has raises the window again, and a start from one
+  shows it unless FxSound was last quit hidden; the keybind options (`--toggle-power`,
+  `--next-preset`, `--prev-preset`, `--next-output`) and D-Bus still never raise it. Save New
+  Preset and `--save_preset` want unsaved changes, and Export Presets and Import Presets want none.
+  A `--set_band_gain` or `--set_band_freq` list sets the pairs that fit and skips the others, with
+  a note, where Off refuses the whole list. The tray cuts a playback device's name after 30
+  characters.
 - **Settings keep what a later version wrote.** A key of `settings.toml` this version does not
   know is written back as it was, so going back a version and up again keeps the newer version's
   settings. 0.4.0 does not keep them: after a downgrade to 0.4.0 its next save drops the keys 0.5.0

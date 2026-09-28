@@ -35,7 +35,10 @@
 //!    the tray ([`Cli::only_sets_things`]); `--show`, `--view` and a line with no options at all
 //!    raise the window, `--toggle-window` toggles it and `--hide` hides it
 //!    ([`Cli::window_command`]). At a start `--view` sets the layout and the window follows the
-//!    remembered tray state, unless `--show` is given too ([`Cli::cold_start_commands`]).
+//!    remembered tray state, unless `--show` is given too ([`Cli::cold_start_commands`]). At «Как
+//!    в Windows» = Interface and above a line with an option the Windows build has raises the
+//!    window again, as there ([`Cli::raises_like_windows`]); the keybind options and D-Bus never
+//!    do.
 //! 5. **One preset option per line** (audit #30). Windows takes the first of `--preset`,
 //!    `--save_preset`, `--overwrite_preset`, `--undo_preset`, `--rename_preset` and
 //!    `--delete_preset` and silently drops the rest (`FxController.cpp:393-448`); here a second one
@@ -46,7 +49,8 @@
 //!    #51): Windows drops such a list without a word when it has more pairs than bands, and sets
 //!    whatever it can otherwise; here nothing of it is set, and the command fails naming the bands
 //!    that are not there (`crate::commands`). So is a `--set_band_freq` list with a frequency
-//!    outside its band's range, a pair Windows drops alone and without a word.
+//!    outside its band's range, a pair Windows drops alone and without a word. At «Как в Windows»
+//!    = Interface and above the pairs that fit are set and the others skipped, with a note.
 //! 7. **An unknown `--language` is an error** (audit #28): Windows saves any code and shows the
 //!    language whose name it starts with, or English. The table's own codes are taken in any case,
 //!    and so are the ISO codes it spells otherwise (`uk`, `bs`, `nb`, `nn`) and locales
@@ -907,6 +911,34 @@ impl Cli {
     #[must_use]
     pub fn only_sets_things(&self) -> bool {
         !self.is_query() && self.window_command().is_none()
+    }
+
+    /// `true` for a line the Windows build would raise its window for and this one does not: one
+    /// that says nothing about the window, is no question, and carries an option the Windows
+    /// build has ([`Command::parity_class`] is [`ParityClass::Interface`]). At «Как в Windows» =
+    /// Interface and above a running instance raises its window for such a line, as step 11 of
+    /// `applyConfig` does (`FxController.cpp:523-531`, 0.4.0 audit R11), and a cold start from one
+    /// starts as a bare `fxsound` does ([`Cli::only_sets_things_at`]).
+    ///
+    /// The options only this port has — the keybind options that stand in for the Windows
+    /// hotkeys, which never raised anything there, `--output=off`, the microphone's and the
+    /// applications' — raise nothing at any level, and a line of them alone stays quiet.
+    #[must_use]
+    pub fn raises_like_windows(&self) -> bool {
+        self.only_sets_things()
+            && self
+                .commands()
+                .iter()
+                .any(|command| command.parity_class() == ParityClass::Interface)
+    }
+
+    /// [`Cli::only_sets_things`] at `level` of «Как в Windows»: from Interface on, a line the
+    /// Windows build raises its window for ([`Cli::raises_like_windows`]) is not one, so a cold
+    /// start from `fxsound --preset=Gaming` shows the window unless FxSound was last quit hidden,
+    /// as the Windows build's start does.
+    #[must_use]
+    pub fn only_sets_things_at(&self, level: WindowsParity) -> bool {
+        self.only_sets_things() && !(level.interface() && self.raises_like_windows())
     }
 
     /// `true` when this invocation only asks for state and must not disturb the window.
@@ -1958,6 +1990,77 @@ mod tests {
                 !parse(about_the_window).only_sets_things(),
                 "{about_the_window:?}"
             );
+        }
+    }
+
+    #[test]
+    fn at_interface_a_line_with_an_option_windows_has_raises_the_window_as_there() {
+        // 0.4.0 audit R11 at «Как в Windows» = Interface: step 11 of applyConfig raises the
+        // window for every forwarded line (`FxController.cpp:523-531`), and a start from one
+        // shows it unless FxSound was last quit hidden. At Off the same lines stay quiet (above).
+        for windows in [
+            &["--preset=Gaming"][..],
+            &["--power=1"][..],
+            &["--save_preset=Mine"][..],
+            &["--overwrite_preset"][..],
+            &["--undo_preset"][..],
+            &["--rename_preset=Other"][..],
+            &["--delete_preset"][..],
+            &["--output=Speakers"][..],
+            &["--num_bands=31"][..],
+            &["--volume_leveling=2"][..],
+            &["--balance=3"][..],
+            &["--filter_q=2"][..],
+            &["--master_gain=-6"][..],
+            &["--language=fr"][..],
+            &["--set_band_freq=0:60"][..],
+            &["--set_band_gain=0:3"][..],
+            &["--set_effect=bass:7"][..],
+            // An option Windows has beside the port's own still raises it, as there.
+            &["--toggle-power", "--preset=Rock"][..],
+            &["--edit=output", "--set_effect=bass:7"][..],
+            &["--windows-parity=interface", "--preset=Rock"][..],
+        ] {
+            let cli = parse(windows);
+            assert!(cli.raises_like_windows(), "{windows:?}");
+            assert!(cli.only_sets_things_at(WindowsParity::Off), "{windows:?}");
+            for level in [WindowsParity::Interface, WindowsParity::Sound] {
+                assert!(!cli.only_sets_things_at(level), "{windows:?} at {level:?}");
+            }
+        }
+        for linux in [
+            // The keybind options stand in for the Windows hotkeys, which raise nothing there.
+            &["--toggle-power"][..],
+            &["--power=toggle"][..],
+            &["--next-preset"][..],
+            &["--prev-preset"][..],
+            &["--next-output"][..],
+            // The port's own options, and the way back.
+            &["--output=off"][..],
+            &["--input=Mic"][..],
+            &["--edit=input"][..],
+            &["--noise-suppression=strong"][..],
+            &["--app-preset=bf6.exe=Gaming"][..],
+            &["--forget-device=Old Dock"][..],
+            &["--windows-parity=interface"][..],
+            // Questions, and lines that say what the window does already.
+            &["--status"][..],
+            &["--list-apps"][..],
+            &["--show", "--preset=Rock"][..],
+            &["--hide", "--preset=Rock"][..],
+            &["--run_minimized", "--preset=Rock"][..],
+            &["--toggle-window", "--preset=Rock"][..],
+            &["--view=1", "--preset=Rock"][..],
+        ] {
+            let cli = parse(linux);
+            assert!(!cli.raises_like_windows(), "{linux:?}");
+            for level in WindowsParity::ALL {
+                assert_eq!(
+                    cli.only_sets_things_at(level),
+                    cli.only_sets_things(),
+                    "{linux:?} at {level:?}"
+                );
+            }
         }
     }
 
