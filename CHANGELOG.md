@@ -4,6 +4,15 @@ All notable changes to the FxSound Linux port. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **Tested on the newest PipeWire as well as the oldest.** Besides Ubuntu 24.04 and its
+  PipeWire 1.0, CI runs the tests in an Arch Linux container with the newest PipeWire and
+  WirePlumber 0.5, where the tests of WirePlumber's own policy, which Ubuntu's 0.4 has to skip,
+  must run. The workflows moved to the Node 24 releases of their actions, run on Ubuntu 24.04
+  everywhere rather than on whatever `ubuntu-latest` becomes, and are checked by actionlint.
+
 ## [0.4.0] — 2026-09-27
 
 ### Added

@@ -28,12 +28,12 @@ concurrency:
 jobs:
   verify:
     name: Tag matches every version stamp
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.check.outputs.tag }}
       version: ${{ steps.check.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -142,18 +142,20 @@ jobs:
   publish:
     name: Publish the release
     needs: [verify, packages]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.verify.outputs.tag }}
 
       # Every leg of packages.yml uploads "package-<leg>"; merged into one directory they are the
       # release: the Arch package, the two .debs (codename-suffixed), the .rpm with its .src.rpm
-      # and vendor tarball, and the binary tarball.
-      - uses: actions/download-artifact@v4
+      # and vendor tarball, and the binary tarball. Since v8 a download whose digest differs from
+      # the one recorded at upload fails the job rather than warning, which is what a release
+      # wants; the legs upload zips (upload-artifact's default), which v8 still unpacks.
+      - uses: actions/download-artifact@v8.0.1
         with:
           pattern: package-*
           path: dist
@@ -161,6 +163,7 @@ jobs:
 
       - name: One SHA256SUMS for everything
         run: |
+          set -euo pipefail
           cd dist
           rm -f SHA256SUMS
           sha256sum -- * > SHA256SUMS
@@ -199,7 +202,7 @@ jobs:
           cat release-notes.md
 
       - name: Publish
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           tag_name: ${{ needs.verify.outputs.tag }}
           body_path: release-notes.md

@@ -33,7 +33,7 @@ jobs:
     # ubuntu-latest moves to a newer release, and with it to a newer PipeWire, in October 2026.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       # The build needs far less than the runtime does. `libpipewire-0.3-dev` is for the headers
       # pipewire-sys binds, and `libclang-dev` because it runs bindgen to do it — without it the
@@ -80,9 +80,9 @@ jobs:
       - name: Lints
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      # The runner sets no XDG_RUNTIME_DIR, no session bus and no session PipeWire, and nothing in
-      # the suite may reach for any of them: a test that needs the user's session is a test that
-      # would take a developer's default device away mid-run. The graph-churn tests in
+      # The runner has an XDG_RUNTIME_DIR but no session bus and no session PipeWire in it, and
+      # nothing in the suite may reach for any of them: a test that needs the user's session is a
+      # test that would take a developer's default device away mid-run. The graph-churn tests in
       # fxsound-audio still talk to a real server — each starts its own private pipewire, with its
       # own runtime directory and socket, from the packages installed above, and kills it when it
       # is done. So never start a daemon in this step; if a test fails for want of one, it should
@@ -108,6 +108,103 @@ jobs:
       - name: Build
         run: cargo build --release --bin fxsound
 
+  # The same tests on the newest PipeWire and on WirePlumber 0.5, which the job above cannot have:
+  # Ubuntu 24.04 ships WirePlumber 0.4.17, and the tests of what only WirePlumber's own policy shows
+  # (crates/fxsound-audio/src/graph_churn/policy.rs) need 0.5's profiles, so there they say SKIPPED
+  # and pass. Here they have to run: FXSOUND_REQUIRE_WIREPLUMBER=1 turns that skip into a failure,
+  # as FXSOUND_REQUIRE_PIPEWIRE_TOOLS=1 does every other. Formatting and lints stay with the job
+  # above; this one is about the runtime the tests talk to, so it only tests.
+  test-arch:
+    name: Test on Arch Linux (newest PipeWire, WirePlumber 0.5)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: archlinux:latest
+    env:
+      # What the Ubuntu runner has; the image sets no locale at all.
+      LANG: C.UTF-8
+    steps:
+      # Before the checkout, which needs git in the container to make a .git directory. `pipewire`
+      # is the daemon and pw-dump, pw-metadata, pw-cli and pw-link; `libpipewire` the headers and
+      # the SPA plugins (audiotestsrc, the null AEC); `pipewire-audio` pw-cat, pw-record and the
+      # Bluetooth plugin the tests of a headset between profiles use; `dbus` the dbus-daemon of the
+      # private buses; `util-linux` the `setpriv --pdeathsig` that the tests' children die by.
+      # rustup rather than Arch's rust, so that the compiler is rust-toolchain.toml's and
+      # RUSTFLAGS=-D warnings means what it means in the job above. The image keeps no manual
+      # pages or docs, which nothing here reads.
+      - name: Install build and test dependencies
+        run: |
+          set -euo pipefail
+          pacman -Syu --noconfirm --needed \
+            base-devel clang pkgconf rustup git \
+            pipewire libpipewire pipewire-audio wireplumber dbus util-linux
+          pipewire --version
+          wireplumber --version
+          setpriv --version
+
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # The tests run as a user of their own, as they do on the Ubuntu runner: as root, a file
+      # made read-only or unreadable to test a refusal is written and read all the same. The user
+      # gets an empty runtime directory, as a login on the runner does: the engine refuses to start
+      # without one even when it is given a private daemon's socket, and nothing in this container
+      # listens in it. No cache: this job is shorter than the one above, so not what a push waits
+      # for, and a compiled tree of its own would crowd the others out of the repository's cache.
+      - name: A user to run the tests as, and the toolchain
+        run: |
+          set -euo pipefail
+          useradd -m tester
+          install -d -m 0700 -o tester -g tester /run/tester
+          chown -R tester "$GITHUB_WORKSPACE"
+          runuser -u tester -- rustup toolchain install
+          runuser -u tester -- rustc --version
+          runuser -u tester -- cargo --version
+
+      # As in the job above: no session bus, no session PipeWire; every test that needs a daemon
+      # starts a private one and takes it down with it.
+      - name: Tests
+        run: runuser -u tester -- cargo test --workspace
+        env:
+          XDG_RUNTIME_DIR: /run/tester
+          FXSOUND_REQUIRE_PIPEWIRE_TOOLS: "1"
+          FXSOUND_REQUIRE_WIREPLUMBER: "1"
+
+  # The workflows themselves: actionlint checks their syntax, expressions, runner labels and job
+  # dependencies, and hands every `run:` script to shellcheck. Shellcheck's warnings and errors
+  # fail the job; its style and info notes (quoting advice, backticks in the Markdown the release
+  # notes echo) do not. actionlint is the released binary, checked against the SHA-256 GitHub
+  # records for the asset, rather than an action or a download script: nothing runs here that
+  # this file does not pin.
+  workflows:
+    name: Workflows lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          SHELLCHECK_OPTS: --severity=warning
+        run: |
+          set -euo pipefail
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL --retry 3 -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$tarball"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$tarball" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" actionlint
+          # Without shellcheck actionlint skips the scripts without a word.
+          if ! command -v shellcheck > /dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends shellcheck
+          fi
+          shellcheck --version
+          "$RUNNER_TEMP/actionlint" -version
+          "$RUNNER_TEMP/actionlint" -color
+
   # Every package the tree can produce, built inside the distribution it targets, installed
   # there and smoke-tested — see packages.yml. Independent of `check`: a packaging failure and a
   # test failure are different news, and waiting for the tests would only delay the first.
@@ -122,14 +219,14 @@ jobs:
   # toolchain: the script only reads the sources.
   manpage:
     name: Manual page agrees with the code
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
       - run: packaging/check-manpage.sh
 
   audit:
     name: Dependency audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Advisories appear without anything in this repository changing, so a red run here means
     # "look at this", not "your commit is broken".
     continue-on-error: true
@@ -139,7 +236,11 @@ jobs:
       checks: write
       issues: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@v7.0.1
+      # A commit rather than a tag: v2 and v2.0.0 still declare Node 20, and the move to Node 24
+      # (#48) is not in a release yet. Against v2.0.0 that commit changes action.yml's runtime
+      # line, package.json's engine and the docs, and not dist/index.js — the same audit, run by
+      # the runtime GitHub keeps. Back to a tag once one carries it.
+      - uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # v2.0.0 + Node 24
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

@@ -1385,7 +1385,14 @@ fn still_running_after(started: &[(u32, u64)], patience: Duration) -> Vec<u32> {
     }
 }
 
-/// The child half as the tests below see it.
+/// What every child half's directory is called: [`ChildHalf`] removes nothing else.
+const CHILD_HALF_DIR: &str = "fxsound-t-child-half-";
+
+/// The child half as the tests below see it. Dropped, it kills the test process if it still runs,
+/// waits for its daemons to go and removes their directory: a child half that was killed outright
+/// never removes it itself, and neither does one that waited on its standard input for a line
+/// that never came, because the test that started it failed first — which is how a
+/// `fxsound-t-child-half-*` directory was left in `/tmp`.
 struct ChildHalf {
     /// The test process — guarded itself, so a test here that fails cannot leave it waiting.
     process: Guarded,
@@ -1393,6 +1400,22 @@ struct ChildHalf {
     started: Vec<(u32, u64)>,
     /// Their directory.
     dir: PathBuf,
+}
+
+impl Drop for ChildHalf {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        // Their parent is gone, and the kernel's signal is on its way to them.
+        still_running_after(&self.started, PATIENCE);
+        if self
+            .dir
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(CHILD_HALF_DIR))
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 }
 
 /// Start the child half with [`CHILD_HALF`] set to `then`, and read what it says. `None`, after
@@ -1437,67 +1460,58 @@ fn graph_child_half(then: &str) -> Option<ChildHalf> {
             Some((ids?, PathBuf::from(dir)))
         })
         .expect("the child half said which its daemons are");
-    let started = pids
-        .into_iter()
-        .map(|pid| (pid, started_at(pid).expect("a daemon the child half runs")))
-        .collect();
+    // From here on, whatever fails, the directory goes with the child half.
+    let mut half = ChildHalf {
+        process,
+        started: Vec::new(),
+        dir,
+    };
+    for pid in pids {
+        let started = started_at(pid).expect("a daemon the child half runs");
+        half.started.push((pid, started));
+    }
     // Noted: a child half that is to panic may now.
-    let stdin = process.stdin().expect("piped");
+    let stdin = half.process.stdin().expect("piped");
     writeln!(stdin).expect("the child half reads its standard input");
     stdin.flush().expect("the line is out");
-    Some(ChildHalf {
-        process,
-        started,
-        dir,
-    })
+    Some(half)
 }
 
 #[test]
 fn a_test_that_panics_leaves_no_private_daemon_behind() {
-    let Some(ChildHalf {
-        mut process,
-        started,
-        dir,
-    }) = graph_child_half("panic")
-    else {
+    let Some(mut half) = graph_child_half("panic") else {
         return;
     };
-    let status = process.wait().expect("the child half ended");
+    let status = half.process.wait().expect("the child half ended");
     assert!(!status.success(), "its test panicked, so it failed");
     assert_eq!(
-        still_running_after(&started, Duration::ZERO),
+        still_running_after(&half.started, Duration::ZERO),
         Vec::<u32>::new()
     );
-    assert!(!dir.exists(), "{} is still there", dir.display());
+    // Asked before `half` is dropped, which would remove the directory whatever the child did.
+    assert!(!half.dir.exists(), "{} is still there", half.dir.display());
 }
 
 #[test]
 fn a_test_killed_outright_leaves_no_private_daemon_behind() {
-    let Some(ChildHalf {
-        mut process,
-        started,
-        dir,
-    }) = graph_child_half("wait")
-    else {
+    let Some(mut half) = graph_child_half("wait") else {
         return;
     };
-    process.kill().expect("SIGKILL");
-    process.wait().expect("the child half ended");
-    let left = still_running_after(&started, PATIENCE);
+    half.process.kill().expect("SIGKILL");
+    half.process.wait().expect("the child half ended");
+    let left = still_running_after(&half.started, PATIENCE);
 
     // No destructor ran in the killed process, so its directory is still there — which no later
-    // graph takes for its own — and the recording in it has stopped growing.
-    let recording = dir.join("t_rec.raw");
+    // graph takes for its own, and which `half` removes when it is dropped — and the recording in
+    // it has stopped growing.
+    let recording = half.dir.join("t_rec.raw");
     let size = || std::fs::metadata(&recording).map_or(0, |meta| meta.len());
     let before = size();
     std::thread::sleep(Duration::from_millis(300));
     let after = size();
-    if dir
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().starts_with("fxsound-t-child-half-"))
-    {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    let dir = half.dir.clone();
+    drop(half);
+    assert!(!dir.exists(), "{} is still there", dir.display());
     assert_eq!(
         left,
         Vec::<u32>::new(),

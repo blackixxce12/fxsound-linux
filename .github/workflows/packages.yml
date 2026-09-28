@@ -58,7 +58,9 @@ env:
 jobs:
   package:
     name: ${{ matrix.leg }}
-    runs-on: ubuntu-latest
+    # The host only: every leg builds and tests inside its own image. Pinned all the same, so that
+    # the runner a release is built on changes when this line does and not in the background.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     container:
       image: ${{ matrix.image }}
@@ -164,13 +166,13 @@ jobs:
           rustc --version
           cargo --version
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.ref }}
 
       # After the dependencies (the cache needs zstd and tar in the container) and before the
       # Arch chown (the restore creates root-owned files).
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6.1.0
         with:
           path: ${{ matrix.cache }}
           key: packages-${{ matrix.leg }}-${{ hashFiles('Cargo.lock') }}-1.98.1
@@ -232,6 +234,7 @@ jobs:
       - name: Build and install (Arch)
         if: matrix.family == 'arch'
         run: |
+          set -euo pipefail
           # makepkg refuses to run as root; the workspace (including the restored cache) goes to
           # the build user. The PKGBUILD's prepare() does the `cargo fetch --locked`, so the
           # --frozen build that follows has everything it needs.
@@ -429,7 +432,7 @@ jobs:
           done
           echo "::endgroup::"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7.0.1
         with:
           name: package-${{ matrix.leg }}
           path: dist/*

@@ -11,9 +11,11 @@
 //! below loads nothing that would want a bus, and the bus addresses name sockets that do not
 //! exist. It manages nothing but this graph's null devices: no ALSA, no Bluetooth, no cameras.
 //!
-//! WirePlumber 0.5 is needed, for its profiles. Ubuntu 24.04, which CI runs on, ships 0.4, which is
-//! configured in Lua instead; where there is no 0.5 the tests that need it say so and pass, even
-//! under [`REQUIRE_TOOLS`], which is for the tools CI installs.
+//! WirePlumber 0.5 is needed, for its profiles. Ubuntu 24.04, where CI's first test leg runs, ships
+//! 0.4, which is configured in Lua instead; where there is no 0.5 the tests that need it say so and
+//! pass, even under [`REQUIRE_TOOLS`], which is for the tools every leg installs. CI's second leg,
+//! an Arch Linux container, has 0.5 and sets [`REQUIRE_WIREPLUMBER`], under which such a skip fails
+//! instead: there the tests here have to run.
 
 use super::*;
 
@@ -107,9 +109,18 @@ impl std::ops::Deref for PolicyGraph {
     }
 }
 
+/// Set to `1` where WirePlumber 0.5 is installed for these tests: `.github/workflows/ci.yml` sets it
+/// on its Arch Linux leg, where a skip here can only mean that something which should work did not.
+const REQUIRE_WIREPLUMBER: &str = "FXSOUND_REQUIRE_WIREPLUMBER";
+
 /// Report that a check needing WirePlumber 0.5 could not run: a `SKIPPED` line and a pass, under
-/// [`REQUIRE_TOOLS`] as well — CI's Ubuntu ships 0.4 (module docs).
+/// [`REQUIRE_TOOLS`] as well — CI's Ubuntu ships 0.4 (module docs) — and a failure under
+/// [`REQUIRE_WIREPLUMBER`].
 fn skip_without_session_manager(reason: &str) {
+    assert!(
+        std::env::var_os(REQUIRE_WIREPLUMBER).is_none_or(|value| value != "1"),
+        "{reason}, and {REQUIRE_WIREPLUMBER}=1 says WirePlumber 0.5 is here"
+    );
     println!("SKIPPED: {reason}");
 }
 
