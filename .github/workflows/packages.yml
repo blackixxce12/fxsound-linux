@@ -321,7 +321,11 @@ jobs:
           packaging/build-tarball.sh
           ls -la dist/
           tar xf dist/fxsound-linux-*.tar.gz
-          ./fxsound-linux-*/install.sh /usr/local
+          # The glob is expanded into a variable first: as a command name it would be run as
+          # whatever it matched first, and shellcheck (SC2211) rightly refuses that.
+          set -- fxsound-linux-*/install.sh
+          test "$#" -eq 1
+          "./$1" /usr/local
           test -x /usr/local/bin/fxsound
 
       # ------------------------------------------------------------------ Smoke test, every leg
