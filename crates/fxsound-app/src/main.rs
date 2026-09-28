@@ -1344,11 +1344,8 @@ impl<'a> Shell<'a> {
                 .collect();
             // The names are this lane's, so the files written are too, whatever happens to the
             // edit direction before Export is pressed.
-            self.export = Some(ExportState {
-                lane: self.rt.app.state.direction,
-                presets,
-                ..ExportState::default()
-            });
+            let lane = self.rt.app.state.direction;
+            self.export = Some(self.rt.app.export_window(lane, presets));
         }
     }
 

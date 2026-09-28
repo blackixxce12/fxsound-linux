@@ -71,9 +71,13 @@
 //!
 //! A case passes when the two renders are identical, or differ nowhere by more than
 //! [`DEFAULT_LIMIT_DB`] (−120 dBFS) — in the switching pass, nowhere outside the settling time
-//! after each switch. Both builds must be made by the same toolchain on the same
-//! machine: nothing here is stored, and nothing promises that two versions of rustc or two
-//! machines' maths libraries round alike.
+//! after each switch. The listed exceptions of A1 are named by preset in `FXSOUND_BITEXACT_EXCEPT`:
+//! their differences are counted and reported apart and fail nothing. At Interface and sound
+//! against `3596e99` they are the two shipped presets whose Ambience is stored at 51, where the
+//! Windows C code, A1's reference for Ambience (audit #39, A2), and `3596e99` are a unit in the
+//! last place of the wet/dry pair apart (`docs/0.5.0-dsp-inventory.md`, W1c). Both builds must be
+//! made by the same toolchain on the same machine: nothing here is stored, and nothing promises
+//! that two versions of rustc or two machines' maths libraries round alike.
 //!
 //! The environment:
 //!
@@ -90,6 +94,7 @@
 //! | `FXSOUND_BITEXACT_LEVELS` | `settings,gain` | the sets of levels, by name |
 //! | `FXSOUND_BITEXACT_SETTLE_MS` | `20` ([`GLIDE_SECONDS`]) | how long after a switch goes uncompared |
 //! | `FXSOUND_BITEXACT_OUT` | `target/windows-parity-bitexact.tsv` | every case's result |
+//! | `FXSOUND_BITEXACT_EXCEPT` | none | presets (`dir/stem`, comma-separated) whose differences are reported and do not fail |
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -100,10 +105,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use fxsound_core::Effect;
 use fxsound_core::messages::{DspEvent, DspParams};
-use fxsound_core::{Effect, scale};
 use fxsound_dsp::Engine;
-use fxsound_dsp::preset::{MusicLevels, ladder, preset_params};
+use fxsound_dsp::preset::{MusicLevels, preset_params};
 
 #[allow(dead_code)]
 mod genre_material;
@@ -128,6 +133,7 @@ const PASSES_VAR: &str = "FXSOUND_BITEXACT_PASSES";
 const SETTLE_VAR: &str = "FXSOUND_BITEXACT_SETTLE_MS";
 const COMPAT_VAR: &str = "FXSOUND_BITEXACT_COMPAT";
 const LEVELS_VAR: &str = "FXSOUND_BITEXACT_LEVELS";
+const EXCEPT_VAR: &str = "FXSOUND_BITEXACT_EXCEPT";
 
 /// This test's own name, which the working tree runs the reference build's copy of by.
 const TEST_NAME: &str = "every_shipped_preset_renders_as_the_reference_build_renders_it";
@@ -290,7 +296,7 @@ struct Render {
 fn read_preset(path: &Path, bands: u32, levels: MusicLevels) -> DspParams {
     let preset =
         fxsound_preset::load(path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
-    let mut params = preset_params(&preset, &ladder(bands as usize), levels);
+    let mut params = preset_params(&preset, &levels.ladder(bands as usize), levels);
     params.sanitise();
     params
 }
@@ -320,11 +326,8 @@ fn render(request: &Request, material: &[f32]) -> Render {
                 }
                 _ => {
                     let effect = Effect::ALL[switches.effect as usize % Effect::COUNT];
-                    let slider = scale::value_to_slider_for(effect, params.effect(effect));
-                    params.set_effect(
-                        effect,
-                        scale::slider_to_value_for(effect, moved_slider(slider)),
-                    );
+                    let slider = levels.value_to_slider(effect, params.effect(effect));
+                    params.set_effect(effect, levels.slider_to_value(effect, moved_slider(slider)));
                     params.sanitise();
                 }
             }
@@ -900,6 +903,9 @@ fn report(
     );
     // Per pass: identical, within the limit, past it.
     let mut totals: BTreeMap<&str, (usize, usize, usize)> = BTreeMap::new();
+    // Per pass: of those past it, the ones in `FXSOUND_BITEXACT_EXCEPT`'s presets.
+    let excepted_presets = excepted();
+    let mut excepted_past: BTreeMap<&str, usize> = BTreeMap::new();
     // Per pass and preset, and per pass and material: how many cases differ past the limit, and
     // the worst of them.
     let mut by_preset: BTreeMap<(&str, &str), (usize, f64, bool)> = BTreeMap::new();
@@ -935,6 +941,9 @@ fn report(
             Some(db) if db < limit_db => total.1 += 1,
             Some(db) => {
                 total.2 += 1;
+                if excepted_presets.contains(&case.preset) {
+                    *excepted_past.entry(pass).or_default() += 1;
+                }
                 let entry = by_preset
                     .entry((pass, &case.preset))
                     .or_insert((0, f64::MIN, true));
@@ -953,9 +962,10 @@ fn report(
     std::fs::write(&out, tsv).unwrap_or_else(|err| panic!("{}: {err}", out.display()));
 
     for (pass, (identical, below, above)) in &totals {
+        let excepted = excepted_past.get(pass).copied().unwrap_or(0);
         eprintln!(
             "windows_parity_bitexact: {pass}: {identical} identical, {below} within {limit_db} \
-             dBFS, {above} past it"
+             dBFS, {above} past it ({excepted} of them in {EXCEPT_VAR}'s presets)"
         );
     }
     if let Some(frames) = longest_after_switch {
@@ -980,11 +990,31 @@ fn report(
         }
     }
     if expect_match {
+        let failing = above - excepted_past.values().sum::<usize>();
         assert_eq!(
-            above, 0,
-            "{above} cases differ from the reference build by more than {limit_db} dBFS"
+            failing, 0,
+            "{failing} cases differ from the reference build by more than {limit_db} dBFS"
         );
     }
+}
+
+/// The presets `FXSOUND_BITEXACT_EXCEPT` names, each as `dir/stem`; none unless it is set.
+fn excepted() -> Vec<String> {
+    let list = std::env::var(EXCEPT_VAR).unwrap_or_default();
+    let names: Vec<String> = list
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let shipped = shipped_presets();
+    for name in &names {
+        assert!(
+            shipped.iter().any(|(key, _)| key == name),
+            "{EXCEPT_VAR}: no shipped preset {name}"
+        );
+    }
+    names
 }
 
 #[test]
@@ -1122,10 +1152,14 @@ fn a_preset_renders_the_same_twice_in_one_build() {
 
 #[test]
 fn a_windows_case_is_played_by_the_windows_dsp() {
-    // `FXSOUND_BITEXACT_COMPAT=windows` reaches the engine: the same case renders otherwise,
-    // from the same snapshot but for whose DSP plays it.
+    // `FXSOUND_BITEXACT_COMPAT=windows` reaches the engine: on ten bands the same case renders
+    // otherwise, from the same snapshot but for whose DSP plays it.
     let material = a_second_of_tone();
-    let (key, linux) = jazz(None);
+    let (key, jazz_on_twenty) = jazz(None);
+    let linux = Request {
+        bands: 10,
+        ..jazz_on_twenty.clone()
+    };
     let windows = Request {
         windows: true,
         ..linux.clone()
@@ -1133,6 +1167,22 @@ fn a_windows_case_is_played_by_the_windows_dsp() {
     let (linux, windows) = (render(&linux, &material), render(&windows, &material));
     assert_eq!(linux.numbers, windows.numbers, "{key}");
     assert_ne!(linux.samples, windows.samples, "{key}");
+
+    // And it reaches the application's reading: on twenty bands the Windows DSP's snapshot is on
+    // the Windows ladder (audit report R4).
+    let windows = Request {
+        windows: true,
+        ..jazz_on_twenty
+    };
+    // `fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ`, written out: this file is built by
+    // the reference builds too, and `3596e99` has no such constant.
+    let windows_ladder = [
+        20.0, 31.5, 40.0, 63.0, 80.0, 125.0, 160.0, 250.0, 315.0, 500.0, 630.0, 1000.0, 1250.0,
+        2000.0, 2500.0, 4000.0, 5000.0, 8000.0, 10000.0, 16000.0,
+    ];
+    let snapshot = read_preset(&windows.preset, windows.bands, windows.levels());
+    assert_eq!(snapshot.bands().0, windows_ladder, "{key}");
+    assert_eq!(render(&windows, &material).numbers[..3], [1.0, 0.0, 1.0]);
 }
 
 #[test]
@@ -1161,10 +1211,11 @@ fn the_switching_pass_switches_three_times_at_block_starts_past_its_quarters() {
     let on_twenty = read_preset(metal, 20, switching.levels());
     let on_thirty_one = read_preset(metal, 31, switching.levels());
     let mut moved = on_thirty_one;
-    let bass = scale::value_to_slider_for(Effect::Bass, moved.effect(Effect::Bass));
+    let levels = switching.levels();
+    let bass = levels.value_to_slider(Effect::Bass, moved.effect(Effect::Bass));
     moved.set_effect(
         Effect::Bass,
-        scale::slider_to_value_for(Effect::Bass, moved_slider(bass)),
+        levels.slider_to_value(Effect::Bass, moved_slider(bass)),
     );
     moved.sanitise();
     assert_ne!(moved, on_thirty_one, "the slider moves");

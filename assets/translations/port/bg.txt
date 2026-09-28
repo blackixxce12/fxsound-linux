@@ -128,3 +128,4 @@ countries: bg
 "Plus the Windows sound: presets sound the same." = "Плюс звукът на Windows: пресетите звучат както там."
 "Only what Windows has; the rest is hidden." = "Само каквото има Windows; другото е скрито."
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "Винаги остават: кошчето и автоматичното запазване на пресетите, поправените грешки на порта, превключването без щракания, командният ред и D-Bus. Нито една настройка не се изтрива."
+"Keep the end bands where they are" = "Крайните ленти да останат на място"

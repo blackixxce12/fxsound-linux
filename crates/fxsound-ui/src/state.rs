@@ -8,7 +8,8 @@
 
 use fxsound_core::i18n::tr;
 use fxsound_core::{
-    AudioDevice, DenoiseLevel, DeviceDirection, Effect, EqBand, SpectrumFrame, ThemeMode, ViewMode,
+    AudioDevice, DenoiseLevel, DeviceDirection, DspCompat, Effect, EqBand, SpectrumFrame,
+    ThemeMode, ViewMode, WindowsParity,
 };
 use std::time::{Duration, Instant};
 
@@ -212,6 +213,11 @@ pub struct UiState {
     pub notice_clock: Option<(String, Instant)>,
     /// Suppresses every tooltip, matching the `hide_help_tooltips` setting.
     pub hide_tooltips: bool,
+    /// The level of «Как в Windows» / "Like FxSound for Windows" in force — the one the
+    /// application runs, Everything read from a later version's file already taken as Interface
+    /// and sound. From Interface and sound on the effect sliders show and step through the stored
+    /// values as the Windows build maps them ([`UiState::dsp_compat`]).
+    pub windows_parity: WindowsParity,
 
     // ---- per-application presets -------------------------------------------------------------
     /// Every application the engine has moved onto a route of its own, both lanes, in the order
@@ -269,12 +275,22 @@ impl Default for UiState {
             notification: None,
             notice_clock: None,
             hide_tooltips: false,
+            windows_parity: WindowsParity::Off,
             routed_apps: Vec::new(),
         }
     }
 }
 
 impl UiState {
+    /// Whose mapping of an effect slider to a stored value the window shows: the Windows build's
+    /// from «Like FxSound for Windows» = Interface and sound on (Ambience's straight line, audit
+    /// report #39), as the application reads and writes the values
+    /// ([`fxsound_core::scale::slider_to_value_in`]).
+    #[must_use]
+    pub const fn dsp_compat(&self) -> DspCompat {
+        DspCompat::for_level(self.windows_parity)
+    }
+
     /// The selected preset, if any.
     #[must_use]
     pub fn preset(&self) -> Option<&PresetEntry> {

@@ -23,13 +23,15 @@
 //! `scripts/voicing/` hear what the application plays, not the raw values of the file. The
 //! effect flags and `--no-eq` are set over the preset, whatever order they come in.
 //! `--windows-dsp` plays it as «Like FxSound for Windows» = Interface and sound does, through the
-//! Windows build's DSP ([`fxsound_core::DspCompat`]); a build that has one DSP only plays that.
+//! Windows build's DSP ([`fxsound_core::DspCompat`]) and the Windows build's reading of it — a
+//! curve of another count by position, twenty bands on the Windows ladder, Ambience's slider on
+//! its straight line; a build that has one DSP only plays that.
 //!
 //! Only 16-bit PCM WAV is handled, which is what `.wav` almost always means and what the original
 //! engine's `processAudio` took.
 
 use fxsound_core::{Effect, Preset, messages::DspParams};
-use fxsound_dsp::preset::{MusicLevels, bands_of, ladder, preset_params, write_music_params};
+use fxsound_dsp::preset::{MusicLevels, bands_of, preset_params, write_music_params};
 use fxsound_dsp::{ChainSpec, Engine, InputEngine};
 use std::path::Path;
 
@@ -106,14 +108,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         i += 1;
     }
     let mut params = match &preset {
-        Some(preset) => preset_params(preset, &ladder(bands), levels),
+        Some(preset) => preset_params(preset, &levels.ladder(bands), levels),
         None => {
             let mut params = DspParams::default();
             write_music_params(
                 &mut params,
                 &[0.0; Effect::COUNT],
                 true,
-                &bands_of(&ladder(bands), &vec![0.0; bands]),
+                &bands_of(&levels.ladder(bands), &vec![0.0; bands]),
                 levels,
             );
             params

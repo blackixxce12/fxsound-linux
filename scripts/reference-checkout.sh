@@ -16,7 +16,9 @@
 #
 # A commit older than the Windows DSP of «Like FxSound for Windows» (0.5.0's W1b) has one DSP only,
 # and no MusicLevels::with_windows_dsp to choose it with; the comparisons call it on both sides, so
-# such a commit gets one that changes nothing.
+# such a commit gets one that changes nothing. A commit older than the Windows reading of a preset
+# (W1c) reads one way whichever DSP plays: it gets MusicLevels::ladder, slider_to_value and
+# value_to_slider that are its own ladder and slider mappings.
 #
 # The measuring files are this checkout's, copied over: the harness, preset_drift.rs, their
 # material modules and, with --with-process-wav, the process_wav example.
@@ -39,7 +41,7 @@ for arg in "$@"; do
     case "$arg" in
         --with-process-wav) with_process_wav=1 ;;
         -h | --help)
-            sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         -*) die "unknown option $arg" ;;
@@ -88,12 +90,38 @@ impl MusicLevels {
     }
 }
 '
+one_reading='
+/// Written by scripts/reference-checkout.sh: this commit reads a preset one way, whichever DSP
+/// plays it.
+impl MusicLevels {
+    #[must_use]
+    pub fn ladder(self, count: usize) -> Vec<f32> {
+        ladder(count)
+    }
+
+    #[must_use]
+    pub fn slider_to_value(self, effect: Effect, slider: f32) -> f32 {
+        scale::slider_to_value_for(effect, slider)
+    }
+
+    #[must_use]
+    pub fn value_to_slider(self, effect: Effect, value: f32) -> f32 {
+        scale::value_to_slider_for(effect, value)
+    }
+}
+'
 if [ -f "$preset_rs" ]; then
     if grep -q 'fn with_windows_dsp' "$preset_rs"; then
-        echo "reference-checkout: $ref has fxsound_dsp::preset; nothing to add"
+        echo "reference-checkout: $ref has fxsound_dsp::preset and the Windows DSP"
     else
         printf '%s' "$one_dsp" >> "$preset_rs"
         echo "reference-checkout: $ref has fxsound_dsp::preset and one DSP; added with_windows_dsp"
+    fi
+    if grep -q 'pub fn ladder(self' "$preset_rs"; then
+        echo "reference-checkout: $ref reads a preset as its DSP does; nothing to add"
+    else
+        printf '%s' "$one_reading" >> "$preset_rs"
+        echo "reference-checkout: $ref reads a preset one way; added the levels' reading"
     fi
 else
     python3 - "$dir/crates/fxsound-app/src/app.rs" "$preset_rs" "$ref" <<'PYTHON'
@@ -240,6 +268,7 @@ open(preset_rs, "w", encoding="utf-8").write(header + "\n" + body.lstrip("\n"))
 print(f"reference-checkout: wrote fxsound_dsp::preset for {ref}, {note}")
 PYTHON
     printf '%s' "$one_dsp" >> "$preset_rs"
+    printf '%s' "$one_reading" >> "$preset_rs"
     lib_rs="$dir/crates/fxsound-dsp/src/lib.rs"
     printf '\n/// Written by scripts/reference-checkout.sh; not part of this commit.\npub mod preset;\n' >> "$lib_rs"
 fi

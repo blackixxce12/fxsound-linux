@@ -129,3 +129,4 @@ countries: id
 "Plus the Windows sound: presets sound the same." = "Plus suara Windows: preset terdengar sama."
 "Only what Windows has; the rest is hidden." = "Hanya yang ada di Windows; sisanya disembunyikan."
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "Selalu tetap ada: tempat sampah dan simpan otomatis preset, galat port yang sudah diperbaiki, peralihan tanpa bunyi klik, baris perintah, dan D-Bus. Tidak ada pengaturan yang dihapus."
+"Keep the end bands where they are" = "Biarkan pita ujung di tempatnya"

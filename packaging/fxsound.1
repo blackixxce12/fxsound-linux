@@ -401,7 +401,11 @@ another setting, and
 brings everything back as it was. Some parts of the levels are still being
 built
 .RB ( sound
-plays Volume Leveling and Dynamic Boost as the Windows build does so far);
+plays Volume Leveling, Dynamic Boost, Ambience, the equalizer, the master gain
+and the balance as the Windows build does, and reads a preset as it does \(en a
+curve of another band count by position, twenty bands on the Windows build's
+ladder; switching to it and back with a master gain or a balance set is not
+yet free of clicks);
 the level is saved and reported
 .RB ( windows_parity
 in
@@ -422,6 +426,19 @@ as
 keeping
 .B full
 in the file for the version that offers it.
+.TP
+.BR \-\-export\-unshifted [ =0|1 ]
+Where an exported preset puts its first and last equalizer band, as the tick box
+\(lqKeep the end bands where they are\(rq of the Export Presets window says;
+saved.
+.B 1
+(or no value) keeps them where they are, limited only to 10\ Hz\(en21\ kHz;
+.BR 0 ,
+the default, moves them back into the range FxSound for Windows tunes them in,
+as 0.4.0 does. Followed from
+.B \-\-windows\-parity=sound
+on, where the window offers the tick box; below it every export moves them and
+the choice waits.
 .TP
 .B \-\-force
 With
@@ -1194,6 +1211,10 @@ and so on, never over an earlier one. The Windows keys FxSound does not use
 check \(en are read from an older file without complaint and not written back.
 Keys this version does not know, such as those a later version wrote, are kept
 and written back as they were; 0.4.0 drops them on its next save.
+.B windows_parity
+and
+.B export_unshifted
+are written only when they are not the default.
 This file,
 .I apps.toml
 and a preset may be symbolic links, as a dotfile manager leaves them: a save

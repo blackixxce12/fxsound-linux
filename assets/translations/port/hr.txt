@@ -131,3 +131,4 @@ countries: HR
 "Plus the Windows sound: presets sound the same." = "Plus zvuk Windowsa: preseti zvuče isto."
 "Only what Windows has; the rest is hidden." = "Samo ono što imaju Windowsi; ostalo je skriveno."
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "Uvijek ostaje: smeće i automatsko spremanje preseta, ispravljene pogreške porta, prebacivanje bez klikova, naredbeni redak i D-Bus. Nijedna postavka se ne briše."
+"Keep the end bands where they are" = "Zadrži krajnje pojaseve gdje jesu"

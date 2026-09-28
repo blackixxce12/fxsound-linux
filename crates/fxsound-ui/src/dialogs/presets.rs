@@ -77,6 +77,8 @@ pub enum PresetsAction {
     /// `OpenURI.OpenDirectory`, never a hardcoded file manager (§9.3). This is
     /// `File::revealToUser()` (`FxPresetExportDialog.cpp:196`).
     RevealExportFolder,
+    /// Tick or untick "Keep the end bands where they are" ([`ExportState::end_bands_offered`]).
+    ToggleEndBands,
     /// Close the export window.
     CloseExport,
 }
@@ -531,6 +533,10 @@ pub mod export {
 
 /// `"Select the presets to export..."` (`FxPresetExportDialog.cpp:78`).
 pub const SELECT_PRESETS_LABEL: &str = "Select the presets to export...";
+/// The export window's choice from «Like FxSound for Windows» = Interface and sound on (roadmap
+/// 0.5.0 §14 #56): ticked, a `.fac` keeps its first and last band where they are; unticked, as
+/// in 0.4.0, they go back into the range the Windows build tunes them in (0.4.0 audit R6).
+pub const END_BANDS_AS_THEY_ARE: &str = "Keep the end bands where they are";
 /// `"Presets are exported successfully!"` (`FxPresetExportDialog.cpp:195`).
 pub const EXPORT_SUCCEEDED: &str = "Presets are exported successfully!";
 /// The original's per-file prompt (`FxController.cpp:1403`). `%s` is the preset name.
@@ -582,6 +588,12 @@ pub struct ExportState {
     /// box and the reveal in the original (`FxPresetExportDialog.cpp:190-197`). The window then
     /// closes either way (`:199-200`).
     pub finished: Option<bool>,
+    /// Whether the window offers [`END_BANDS_AS_THEY_ARE`]: for the speakers' presets from «Like
+    /// FxSound for Windows» = Interface and sound on. Below it, and for a voice preset, which has
+    /// no Windows reader, the window is the original's.
+    pub end_bands_offered: bool,
+    /// Whether it is ticked: the `export_unshifted` setting.
+    pub end_bands_as_they_are: bool,
 }
 
 impl ExportState {
@@ -644,14 +656,26 @@ impl<'a> ExportDialog<'a> {
             Align2::LEFT_CENTER,
         );
 
-        if let Some(index) = preset_list(
-            ui,
-            export_list_rect(content),
-            self.state,
-            palette,
-            id.with("list"),
-        ) {
+        let list = if self.state.end_bands_offered {
+            export_list_rect_with_end_bands(content)
+        } else {
+            export_list_rect(content)
+        };
+        if let Some(index) = preset_list(ui, list, self.state, palette, id.with("list")) {
             response.push(PresetsAction::ToggleExport(index));
+        }
+        if self.state.end_bands_offered
+            && tick_box(
+                ui,
+                end_bands_rect(content),
+                &tr(END_BANDS_AS_THEY_ARE),
+                self.state.end_bands_as_they_are,
+                !self.state.exporting,
+                palette,
+                id.with("end_bands"),
+            )
+        {
+            response.push(PresetsAction::ToggleEndBands);
         }
 
         if self.state.exporting {
@@ -736,6 +760,98 @@ pub fn export_list_rect(content: Rect) -> Rect {
     Rect::from_min_size(
         pos2(label.left(), label.bottom() + 10.0),
         vec2(label.width(), export::LIST_HEIGHT),
+    )
+}
+
+/// The list when the window offers [`END_BANDS_AS_THEY_ARE`]: [`export_list_rect`] a row
+/// shorter, so the choice sits between the list and the progress bar, and everything below keeps
+/// the original's place.
+#[must_use]
+pub fn export_list_rect_with_end_bands(content: Rect) -> Rect {
+    let list = export_list_rect(content);
+    Rect::from_min_size(
+        list.min,
+        vec2(list.width(), list.height() - export::ROW_HEIGHT - 4.0),
+    )
+}
+
+/// The row of [`END_BANDS_AS_THEY_ARE`]: the list's width, [`export::ROW_HEIGHT`] tall, under
+/// the shortened list.
+#[must_use]
+pub fn end_bands_rect(content: Rect) -> Rect {
+    let list = export_list_rect_with_end_bands(content);
+    Rect::from_min_size(
+        pos2(list.left(), list.bottom() + 4.0),
+        vec2(list.width(), export::ROW_HEIGHT),
+    )
+}
+
+/// A tick box and its label in `rect`, drawn as the Settings pane's (`settings::TICK_BOX_SIDE`
+/// and its neighbours), with the label set smaller before it is cut ([`draw_fitted`]). Returns
+/// whether it was clicked.
+fn tick_box(
+    ui: &mut Ui,
+    rect: Rect,
+    label: &str,
+    checked: bool,
+    enabled: bool,
+    palette: Palette,
+    id: Id,
+) -> bool {
+    use super::settings::{TICK_BOX_CORNER, TICK_BOX_SIDE};
+    let response = ui.interact(
+        rect,
+        id,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let colour = palette.color(if enabled {
+        FxColor::HighlightedText
+    } else {
+        FxColor::HintText
+    });
+    let tick = Align2::LEFT_CENTER.align_size_within_rect(Vec2::splat(TICK_BOX_SIDE), rect);
+    ui.painter().rect_stroke(
+        tick,
+        CornerRadius::same(TICK_BOX_CORNER as u8),
+        Stroke::new(1.5, colour),
+        StrokeKind::Inside,
+    );
+    if checked {
+        let mark = tick.shrink(4.0);
+        let stroke = Stroke::new(2.0, colour);
+        let elbow = pos2(
+            mark.left() + mark.width() * 0.36,
+            mark.top() + mark.height() * 0.82,
+        );
+        ui.painter()
+            .line_segment([pos2(mark.left(), mark.center().y), elbow], stroke);
+        ui.painter()
+            .line_segment([elbow, pos2(mark.right(), mark.top())], stroke);
+    }
+    draw_fitted(
+        ui.painter(),
+        label,
+        normal_font(),
+        colour,
+        end_bands_label_rect(rect),
+        Align2::LEFT_CENTER,
+    );
+    if enabled && response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clicked()
+}
+
+/// Where a tick box's label goes in its row: past the box and its gap.
+fn end_bands_label_rect(row: Rect) -> Rect {
+    use super::settings::{TICK_BOX_GAP, TICK_BOX_SIDE};
+    Rect::from_min_max(
+        pos2(row.left() + TICK_BOX_SIDE + TICK_BOX_GAP, row.top()),
+        row.max,
     )
 }
 
@@ -896,6 +1012,10 @@ mod tests {
                 (SELECT_FOLDER_LABEL, label_rect(import_content())),
                 (IMPORTED_LABEL, summary_label_rect(summary_content(), 0)),
                 (SKIPPED_LABEL, summary_label_rect(summary_content(), 1)),
+                (
+                    END_BANDS_AS_THEY_ARE,
+                    end_bands_label_rect(end_bands_rect(export_content())),
+                ),
             ] {
                 for (code, text) in every_translation(key) {
                     // The one the original's own table makes too long even for JUCE's squeeze
@@ -920,6 +1040,92 @@ mod tests {
             }
         });
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn the_end_bands_choice_sits_between_the_shortened_list_and_the_progress_bar() {
+        // «Like FxSound for Windows» = Interface and sound (roadmap 0.5.0 §14 #56): the list
+        // gives up a row, and the progress bar and the Export button keep the original's places.
+        let content = export_content();
+        let (list, row) = (
+            export_list_rect_with_end_bands(content),
+            end_bands_rect(content),
+        );
+        assert_eq!(list.min, export_list_rect(content).min);
+        assert!(list.bottom() < row.top(), "{list:?} {row:?}");
+        assert!(row.bottom() <= progress_rect(content).top(), "{row:?}");
+        assert_eq!(row.width(), list.width());
+        assert!(row.height() >= super::super::settings::TICK_BOX_SIDE);
+        // Rows of the list still fit whole.
+        assert!(list.height() >= export::ROW_HEIGHT * 10.0);
+    }
+
+    /// Move to `at`, press and release over the export window, and collect what it emitted.
+    fn click_export(state: &ExportState, at: egui::Pos2) -> Vec<PresetsAction> {
+        use egui::{Event, PointerButton, RawInput};
+        let ctx = test_context();
+        let mut assets = AssetCache::new();
+        let outer = Rect::from_min_size(pos2(0.0, 0.0), export::WINDOW_SIZE);
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let mut actions = Vec::new();
+        for events in [
+            vec![Event::PointerMoved(at)],
+            vec![Event::PointerMoved(at), button(true)],
+            vec![button(false)],
+        ] {
+            let input = RawInput {
+                screen_rect: Some(outer),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                actions.extend(
+                    ExportDialog::new(state)
+                        .show(ui, outer, Palette::new(ThemeMode::Dark), &mut assets, "t")
+                        .actions,
+                );
+            })
+            .drop_without_applying_deltas();
+        }
+        actions
+    }
+
+    #[test]
+    fn the_export_window_offers_the_end_bands_only_when_told_to() {
+        let outer = Rect::from_min_size(pos2(0.0, 0.0), export::WINDOW_SIZE);
+        let content = super::super::content_rect(outer);
+        let row = end_bands_rect(content);
+        let presets: Vec<String> = (0..12).map(|i| format!("Preset {i}")).collect();
+        let offered = ExportState {
+            presets: presets.clone(),
+            end_bands_offered: true,
+            ..ExportState::default()
+        };
+        assert_eq!(
+            click_export(&offered, row.left_center() + vec2(9.0, 0.0)),
+            [PresetsAction::ToggleEndBands]
+        );
+        // Below Interface and sound the place is the list's, as in the original.
+        let plain = ExportState {
+            presets,
+            ..ExportState::default()
+        };
+        let actions = click_export(&plain, row.left_center() + vec2(9.0, 0.0));
+        assert!(
+            !actions.contains(&PresetsAction::ToggleEndBands),
+            "{actions:?}"
+        );
+        // While the files are written the choice stands still.
+        let busy = ExportState {
+            exporting: true,
+            ..offered
+        };
+        assert!(click_export(&busy, row.left_center() + vec2(9.0, 0.0)).is_empty());
     }
 
     #[test]
@@ -1259,6 +1465,8 @@ mod tests {
             exporting: true,
             collisions: vec!["Preset 1".into()],
             finished: None,
+            end_bands_offered: true,
+            end_bands_as_they_are: true,
         };
         let outer = Rect::from_min_size(pos2(0.0, 0.0), export::WINDOW_SIZE);
         frame(&ctx, |ui| {

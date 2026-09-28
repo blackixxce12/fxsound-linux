@@ -857,7 +857,7 @@ fn effect_column(
         // A right-click switches the effect off, as it puts a level back to its neutral value on
         // the other face: the original gives only `FxAudioSlider` and `FxBalanceSlider` the reset
         // (`docs/spec/03-controls.md` §3.5), and the port gives it these five too (0.4.0 audit R9).
-        let steps = StoredSteps(effect);
+        let steps = StoredSteps(effect, state.dsp_compat());
         let slider = FxSlider::new(&mut value, 0.0, scale::SLIDER_MAX, 1.0)
             .fine_steps(&steps)
             .default_value(0.0)
@@ -899,7 +899,7 @@ fn effect_column(
             ui.painter().text(
                 pos2(label.left() + effects::LABEL_BORDER_LEFT, label.center().y),
                 Align2::LEFT_CENTER,
-                scale::slider_label_for(effect, value),
+                scale::slider_label_in(state.dsp_compat(), effect, value),
                 caption_font(VALUE_FONT_PX),
                 value_colour,
             );
@@ -937,16 +937,17 @@ fn inert_note_font(ctx: &egui::Context, note: &str, column: Rect) -> egui::FontI
 }
 
 /// The values an effect's slider stands at between its whole positions: every value a preset can
-/// store, one Shift-step apart ([`scale::stored_step_for`]).
-struct StoredSteps(Effect);
+/// store, one Shift-step apart ([`scale::stored_step_in`]), as the level's DSP maps them
+/// ([`UiState::dsp_compat`]).
+struct StoredSteps(Effect, fxsound_core::DspCompat);
 
 impl crate::widgets::slider::FineSteps for StoredSteps {
     fn step(&self, value: f32, up: bool) -> f32 {
-        scale::stored_step_for(self.0, value, up)
+        scale::stored_step_in(self.1, self.0, value, up)
     }
 
     fn nearest(&self, value: f32) -> f32 {
-        scale::nearest_stored_position_for(self.0, value)
+        scale::nearest_stored_position_in(self.1, self.0, value)
     }
 }
 
@@ -1296,6 +1297,33 @@ mod tests {
         for whole in ["3", "5", "4", "8"] {
             assert!(shown.iter().any(|t| t == whole), "{whole} in {shown:?}");
         }
+    }
+
+    #[test]
+    fn at_interface_and_sound_ambiences_readout_follows_the_windows_builds_positions() {
+        // Audit report #39 at «Like FxSound for Windows» = Interface and sound: stored 13 is
+        // Ambience's position 1 on Windows, where FxSound for Linux shows it as 0.3.
+        let compat = fxsound_core::DspCompat::Windows;
+        let mut state = UiState {
+            windows_parity: fxsound_core::WindowsParity::Sound,
+            ..state()
+        };
+        state.effects = [0.0; Effect::COUNT];
+        state.effects[Effect::Ambience as usize] =
+            scale::midi_to_slider_in(compat, Effect::Ambience, 13);
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let shapes = harness.settle(&state);
+        let shown: Vec<String> = texts(&shapes).into_iter().map(|(text, ..)| text).collect();
+        assert_eq!(shown.iter().filter(|t| *t == "1").count(), 1, "{shown:?}");
+        assert!(!shown.iter().any(|t| t == "1.0"), "{shown:?}");
+        // And a fine step goes to the next value a Windows preset stores, 14.
+        let steps = StoredSteps(Effect::Ambience, compat);
+        let next = crate::widgets::slider::FineSteps::step(
+            &steps,
+            state.effects[Effect::Ambience as usize],
+            true,
+        );
+        assert_eq!(scale::slider_to_midi_in(compat, Effect::Ambience, next), 14);
     }
 
     #[test]

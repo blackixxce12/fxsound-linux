@@ -130,3 +130,4 @@ countries: ro
 "Plus the Windows sound: presets sound the same." = "Plus sunetul Windows: presetările sună la fel."
 "Only what Windows has; the rest is hidden." = "Doar ce are Windows; restul e ascuns."
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "Rămân mereu: coșul și salvarea automată a presetărilor, erorile portului corectate, comutarea fără clicuri, linia de comandă și D-Bus. Nicio setare nu se șterge."
+"Keep the end bands where they are" = "Păstrează benzile extreme unde sunt"

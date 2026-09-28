@@ -11,8 +11,9 @@ also fixes defects that came across with it, so a preset voiced on Windows sound
 exactly, the same here; [the deliberate differences](#deliberate-differences-from-the-windows-build)
 say what changed. A mode that restores the original behaviour, «Like FxSound for Windows» in
 Settings ▸ Experimental (`--windows-parity=off|interface|sound`), is being built for 0.5.0: the
-setting is there, `sound` already plays Volume Leveling and Dynamic Boost as the Windows build
-does, and the rest of what each level changes arrives over the release
+setting is there, `sound` already plays Volume Leveling, Dynamic Boost, Ambience, the equalizer,
+the master gain and the balance as the Windows build does and reads a preset as it does, and the
+rest of what each level changes arrives over the release
 ([`docs/0.5.0-windows-parity.md`](docs/0.5.0-windows-parity.md)). Its fourth level, Everything,
 comes in a later version; 0.5.0 refuses `full`, and runs a `settings.toml` that says `full` as
 `sound` while keeping `full` in the file for that version.
@@ -539,13 +540,14 @@ The equalizer's curve is the response the equalizer really has, filter width and
 Windows build joins the band values with straight lines: bands boosted side by side add up, and a
 narrower filter width draws a narrower peak. The first and last band's wheels on five and ten bands
 turn both ways, reaching half a band past the ladder (on ten bands 46 Hz and 20 kHz); a preset
-exported for Windows has such a band put back at 62.5 Hz or 16 kHz, where its wheels stop.
-**Ctrl+Alt**+drag on a band solos it, as Alt+drag does on Windows: every other band sinks to
-−10 dB while you listen and comes back when you let go, or when a preset, the band count or the
-lane changes under it, and the preset is not marked as changed. The solo is offered while the
-equalizer plays, not while it is switched off. A press on a band's knob moves nothing until the
-pointer does, as on the sliders, and a band held when a preset, the band count or the lane arrives
-from elsewhere stays where the new curve puts it until you let go.
+exported for Windows has such a band put back at 62.5 Hz or 16 kHz, where its wheels stop, unless,
+at «Like FxSound for Windows» = Interface and sound, "Keep the end bands where they are" is ticked
+in the Export window (`--export-unshifted`). **Ctrl+Alt**+drag on a band solos it, as Alt+drag does
+on Windows: every other band sinks to −10 dB while you listen and comes back when you let go, or
+when a preset, the band count or the lane changes under it, and the preset is not marked as changed.
+The solo is offered while the equalizer plays, not while it is switched off. A press on a band's
+knob moves nothing until the pointer does, as on the sliders, and a band held when a preset, the
+band count or the lane arrives from elsewhere stays where the new curve puts it until you let go.
 
 A preset lands on your band count, as in the original since 1.2.11: pick a ten-band preset while on
 31 bands and its curve is fitted onto the 31, and changing the band count carries the curve over
@@ -826,7 +828,9 @@ lane's sound since the engine before the 0.4.0 audit, with the level each one be
 `scripts/windows-parity-bitexact.sh <commit>` holds the output lane to another build of itself bit
 for bit — every shipped preset as the application plays it, on 10, 20 and 31 bands; CI holds it to
 `v0.4.0`, and with `--compat=windows` holds Interface and sound to the engine before the 0.4.0
-audit as far as it is built.
+audit from a cold start. Where the Windows C code is the reference instead (Ambience, the balance
+on surround), `scripts/windows-vectors/build.sh` compiles it into the golden vectors the unit
+tests hold.
 
 `docs/0.4.0-design.md`, `docs/0.4.0-upstream.md` and `docs/0.4.0-apps.md` record how 0.4.0 was
 built: the two lanes, the voice chain's new stages, D-Bus and the event stream; what was taken from

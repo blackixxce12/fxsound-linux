@@ -236,8 +236,10 @@ is the measuring half of the same question.
 
 The same set-up compares «Like FxSound for Windows» = Interface and sound with Off
 in one build: `process_wav --windows-dsp` plays a preset through the Windows
-build's DSP, as that level does. Point `FXSV_OLD_PROCESS_WAV` at a wrapper that
-adds it, and `old` is the Windows sound:
+build's DSP and reads it as the Windows build does (a curve of another band
+count by position, twenty bands on the Windows ladder), as that level does.
+Point `FXSV_OLD_PROCESS_WAV` at a wrapper that adds it, and `old` is the Windows
+sound:
 
 ```sh
 cat > "$FXSV_WORK/windows-dsp" <<SH

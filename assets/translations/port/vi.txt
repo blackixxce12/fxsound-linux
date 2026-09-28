@@ -129,3 +129,4 @@ countries: vn
 "Plus the Windows sound: presets sound the same." = "Thêm âm thanh Windows: preset nghe giống hệt."
 "Only what Windows has; the rest is hidden." = "Chỉ những gì Windows có; phần còn lại bị ẩn."
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "Luôn được giữ: thùng rác và tự động lưu preset, các lỗi bản port đã sửa, chuyển đổi không tiếng click, dòng lệnh và D-Bus. Không thiết lập nào bị xóa."
+"Keep the end bands where they are" = "Giữ nguyên hai dải ở hai đầu"

@@ -288,15 +288,14 @@ jobs:
       - name: Off plays as v0.4.0 (A3)
         run: scripts/windows-parity-bitexact.sh --dir "$RUNNER_TEMP/reference-v0.4.0" v0.4.0
       # «Like FxSound for Windows» = Interface and sound against 3596e99, the engine before the
-      # 0.4.0 audit (A1), as far as 0.5.0 has built it: Volume Leveling, Dynamic Boost and its
-      # limiter (W1b), which ten bands and the settings' levels reach alone. The band counts'
-      # readings of a curve, the gain stage and the switching pass follow in W1c and W1d
-      # (docs/0.5.0-dsp-inventory.md).
-      - name: Interface and sound plays as the engine before the audit (A1, so far)
+      # 0.4.0 audit (A1), from a cold start: every shipped preset on 10, 20 and 31 bands with
+      # both sets of levels (W1b, W1c). The two presets whose Ambience is stored at 51 are A1's
+      # listed exception, held to the Windows C code instead (#39, A2, the unit tests); the
+      # switching pass follows in W1d (docs/0.5.0-dsp-inventory.md).
+      - name: Interface and sound plays as the engine before the audit (A1, cold)
         env:
           FXSOUND_BITEXACT_PASSES: cold
-          FXSOUND_BITEXACT_BANDS: "10"
-          FXSOUND_BITEXACT_LEVELS: settings
+          FXSOUND_BITEXACT_EXCEPT: BonusPresets/Classic Rock,BonusPresets/R&B
           FXSOUND_BITEXACT_OUT: target/windows-parity-bitexact-a1.tsv
         run: >-
           scripts/windows-parity-bitexact.sh --compat=windows

@@ -128,3 +128,4 @@ countries: cz
 "Plus the Windows sound: presets sound the same." = "Navíc zvuk Windows: předvolby zní stejně."
 "Only what Windows has; the rest is hidden." = "Jen to, co mají Windows; zbytek je skrytý."
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "Vždy zůstává: koš a automatické ukládání předvoleb, opravené chyby portu, přepínání bez cvaknutí, příkazová řádka a D-Bus. Žádné nastavení se nemaže."
+"Keep the end bands where they are" = "Ponechat krajní pásma, kde jsou"

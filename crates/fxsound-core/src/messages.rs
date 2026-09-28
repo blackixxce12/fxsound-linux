@@ -35,7 +35,9 @@ pub struct DspParams {
     /// kept the master gain alone on this path, and only while the equalizer was on
     /// (`dfxpProcessReal.cpp:158-169`, `SosProcess.cpp:500-516`). On 5.1 and 7.1 the balance turns
     /// down a whole side — front, side and rear — and leaves the centre and the subwoofer alone
-    /// (audit #44).
+    /// (audit #44). With [`DspCompat::Windows`] both come back as the original has them: the
+    /// bypass plays the master gain alone while the equalizer is on, and the balance plays on
+    /// stereo only.
     pub power: bool,
     /// Hand the device silence, whatever `power` says: the snapshot's mute, the app's to set.
     ///
@@ -54,7 +56,8 @@ pub struct DspParams {
     /// original switches the master gain and the balance with them as one block
     /// (`dfxpProcessReal.cpp:143-157`, upstream aad64c1); this engine applies those two whatever
     /// this says, powered or not (0.4.0 audit R3), so neither this switch nor the power button
-    /// moves the level by the master gain. The effects do not depend on it.
+    /// moves the level by the master gain — except with [`DspCompat::Windows`], where the switch
+    /// takes them with the block again, as the original's does. The effects do not depend on it.
     pub eq_on: bool,
     /// How many entries of the band arrays are live.
     pub num_bands: u8,
@@ -80,9 +83,11 @@ pub struct DspParams {
 /// The 0.4.0 audit fixed stages the port had copied from FxSound for Windows, and a preset has
 /// sounded different since. At «Like FxSound for Windows» = Interface and sound
 /// ([`crate::WindowsParity::sound`]) the output lane and the applications' output routes play the
-/// Windows arithmetic again, stage by stage, inside the port's click-free transitions
-/// (`docs/0.5.0-windows-parity.md`, `docs/0.5.0-dsp-inventory.md`). The voice chain has no Windows
-/// original, and [`InputDspParams`] has no such field.
+/// Windows arithmetic again, stage by stage — Volume Leveling, Dynamic Boost and its limiter,
+/// Ambience, the equalizer's design below 20 Hz, the gain stage — inside the port's click-free
+/// transitions (`docs/0.5.0-windows-parity.md`, `docs/0.5.0-dsp-inventory.md`); the application
+/// reads a preset for it as the Windows build does (`fxsound_dsp::preset::music_controls`). The
+/// voice chain has no Windows original, and [`InputDspParams`] has no such field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum DspCompat {
     /// FxSound for Linux: the audit's fixes in. The default, and what Off and Interface play.

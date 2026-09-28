@@ -21,9 +21,11 @@ use fxsound_core::{
     scale,
 };
 use fxsound_dsp::preset::{
-    MusicControls, MusicLevels, bands_of, ladder, music_controls, write_music_params,
+    MusicControls, MusicLevels, bands_of, ladder_in, music_controls, write_music_params,
 };
-use fxsound_preset::{InputPresetStore, PresetFile, PresetStore, Store, input::InputPreset};
+use fxsound_preset::{
+    EndBands, InputPresetStore, PresetFile, PresetStore, Store, input::InputPreset,
+};
 use fxsound_ui::{
     AssetCache, Palette, UiAction, UiState,
     dialogs::{
@@ -439,7 +441,7 @@ trait LaneStore {
     /// copying and deleting them ([`Store::rename`], 0.4.0 audit #19).
     fn rename(&mut self, old: &str, new: &str) -> Result<(), String>;
     fn import(&mut self, source: &Path) -> Result<String, String>;
-    fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, String>;
+    fn export(&self, name: &str, dir: &Path, end_bands: EndBands) -> Result<PathBuf, String>;
 }
 
 impl<F: PresetFile> LaneStore for Store<F> {
@@ -484,8 +486,8 @@ impl<F: PresetFile> LaneStore for Store<F> {
         Store::import(self, source).map_err(|err| err.to_string())
     }
 
-    fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, String> {
-        Store::export(self, name, dir).map_err(|err| err.to_string())
+    fn export(&self, name: &str, dir: &Path, end_bands: EndBands) -> Result<PathBuf, String> {
+        Store::export_with(self, name, dir, end_bands).map_err(|err| err.to_string())
     }
 }
 
@@ -703,6 +705,7 @@ impl App {
                 balance_db: settings.balance,
                 volume_leveling: settings.volume_leveling,
                 hide_tooltips: settings.hide_help_tooltips,
+                windows_parity: settings.windows_parity.offered_or_below(),
                 ..UiState::default()
             },
             params: DspParams::default(),
@@ -1772,7 +1775,7 @@ impl App {
             effects,
             eq_on,
             eq_bands,
-        } = music_controls(preset, &self.music_ladder());
+        } = music_controls(preset, &self.music_ladder(), self.music_compat());
         self.state.effects = effects;
         self.state.eq_on = eq_on;
         self.state.eq_bands = eq_bands;
@@ -1781,14 +1784,21 @@ impl App {
 
     /// The music lane's live band ladder: the user's band count (`settings.num_bands`), at the
     /// centres the window holds when it holds that many bands, else at the engine's own ladder
-    /// for the count. Asked while the window shows the music lane.
+    /// for the count in the DSP the level plays ([`ladder_in`]). Asked while the window shows the
+    /// music lane.
     fn music_ladder(&self) -> Vec<f32> {
         let count = (self.settings.num_bands as usize).clamp(1, fxsound_core::eq::MAX_BANDS);
         if self.state.eq_bands.len() == count {
             self.state.eq_bands.iter().map(|b| b.center_hz).collect()
         } else {
-            ladder(count)
+            ladder_in(count, self.music_compat())
         }
+    }
+
+    /// Whose DSP the music chains play and whose reading of a preset the window takes: the Windows
+    /// build's from «Like FxSound for Windows» = Interface and sound on ([`DspCompat::for_level`]).
+    fn music_compat(&self) -> DspCompat {
+        DspCompat::for_level(self.windows_parity())
     }
 
     /// The edit direction's controls as that lane's kind of preset, under the selected preset's
@@ -1854,10 +1864,11 @@ impl App {
     ) -> Preset {
         let mut preset = self.loaded_preset.clone().unwrap_or_default();
         preset.name = name;
+        let compat = self.music_compat();
         for effect in Effect::ALL {
             preset.set_effect(
                 effect,
-                scale::slider_to_value_for(effect, effects[effect as usize]),
+                scale::slider_to_value_in(compat, effect, effects[effect as usize]),
             );
         }
         preset.eq_bands = eq_bands.to_vec();
@@ -2095,8 +2106,14 @@ impl App {
             return;
         }
         self.drop_solo_on(self.state.direction);
-        let new_ladder = ladder(count);
         let lane = self.state.direction;
+        // The music lane reads a curve as the level's DSP does (at Interface and sound by
+        // position, onto the Windows twenty-band ladder); the voice chain has one reading.
+        let compat = match lane {
+            DeviceDirection::Output => self.music_compat(),
+            DeviceDirection::Input => DspCompat::Linux,
+        };
+        let new_ladder = ladder_in(count, compat);
         // Only the preset the list shows, unedited, and the one last read are the same curve: with
         // nothing selected — the last preset deleted from a list with no factory presets — the
         // last one read may be gone, and the curve on screen is the user's alone.
@@ -2108,13 +2125,15 @@ impl App {
             .filter(|(shown, read)| shown.name == read.name)
             .map(|(_, read)| read);
         self.state.eq_bands = match (unedited, lane) {
-            (Some(preset), DeviceDirection::Output) => music_controls(preset, &new_ladder).eq_bands,
+            (Some(preset), DeviceDirection::Output) => {
+                music_controls(preset, &new_ladder, compat).eq_bands
+            }
             _ => {
                 let centres: Vec<f32> = self.state.eq_bands.iter().map(|b| b.center_hz).collect();
                 let gains: Vec<f32> = self.state.eq_bands.iter().map(|b| b.boost_db).collect();
                 bands_of(
                     &new_ladder,
-                    &fxsound_dsp::eq::fit_preset_gains(&centres, &gains, &new_ladder),
+                    &fxsound_dsp::eq::fit_preset_gains_in(&centres, &gains, &new_ladder, compat),
                 )
             }
         };
@@ -2587,13 +2606,14 @@ impl App {
         // shows its own numbers rather than the other lane's.
         match direction {
             DeviceDirection::Output => {
+                let compat = self.music_compat();
                 self.state.filter_q = self.settings.filter_q;
                 self.state.master_gain_db = self.settings.master_gain;
                 self.state.balance_db = self.settings.balance;
                 self.state.volume_leveling = self.settings.volume_leveling;
                 for effect in Effect::ALL {
                     self.state.effects[effect as usize] =
-                        scale::value_to_slider_for(effect, self.params.effect(effect));
+                        scale::value_to_slider_in(compat, effect, self.params.effect(effect));
                 }
                 self.state.eq_on = self.params.eq_on;
                 let (centres, boosts) = self.params.bands();
@@ -2602,8 +2622,10 @@ impl App {
                 // on ten bands whatever the settings file says.
                 let ladder = self.music_ladder();
                 if ladder.len() != self.state.eq_bands.len() {
-                    // By frequency, from the centres the snapshot holds (audit #13).
-                    let gains = fxsound_dsp::eq::fit_preset_gains(centres, boosts, &ladder);
+                    // By frequency, from the centres the snapshot holds (audit #13); by position
+                    // at Interface and sound, as the Windows build reads it.
+                    let gains =
+                        fxsound_dsp::eq::fit_preset_gains_in(centres, boosts, &ladder, compat);
                     self.state.eq_bands = bands_of(&ladder, &gains);
                 }
             }
@@ -3869,6 +3891,7 @@ impl App {
             | PresetsAction::Export
             | PresetsAction::Overwrite(_)
             | PresetsAction::RevealExportFolder
+            | PresetsAction::ToggleEndBands
             | PresetsAction::CloseExport => false,
         }
     }
@@ -3943,12 +3966,62 @@ impl App {
                 }
                 false
             }
+            PresetsAction::ToggleEndBands => {
+                if state.end_bands_offered && !state.exporting {
+                    self.set_export_unshifted(!state.end_bands_as_they_are);
+                    state.end_bands_as_they_are = self.settings.export_unshifted;
+                }
+                false
+            }
             PresetsAction::CloseExport => true,
             PresetsAction::ChooseImportFolder
             | PresetsAction::Import
             | PresetsAction::DismissNotice
             | PresetsAction::CloseImport => false,
         }
+    }
+
+    /// The Export window for `lane`'s presets, `presets` listed: with the choice of where the end
+    /// bands go on the speakers' presets from «Like FxSound for Windows» = Interface and sound on
+    /// ([`App::export_end_bands`]), ticked as the setting says.
+    #[must_use]
+    pub fn export_window(&self, lane: DeviceDirection, presets: Vec<String>) -> ExportState {
+        ExportState {
+            lane,
+            presets,
+            end_bands_offered: self.end_bands_offered(lane),
+            end_bands_as_they_are: self.settings.export_unshifted,
+            ..ExportState::default()
+        }
+    }
+
+    /// Whether `lane`'s export offers to keep the end bands where they are: the speakers' `.fac`,
+    /// from «Like FxSound for Windows» = Interface and sound on (roadmap 0.5.0 §14 #56). A voice
+    /// preset has no Windows reader to shift them for.
+    fn end_bands_offered(&self, lane: DeviceDirection) -> bool {
+        lane == DeviceDirection::Output && self.windows_parity().sound()
+    }
+
+    /// Where an export of `lane`'s presets puts the end bands: where they are when that is offered
+    /// and chosen (`export_unshifted`, the Export window's tick box, `--export-unshifted`), back
+    /// inside the Windows build's range otherwise, as 0.4.0 does (0.4.0 audit R6).
+    fn export_end_bands(&self, lane: DeviceDirection) -> EndBands {
+        if self.end_bands_offered(lane) && self.settings.export_unshifted {
+            EndBands::AsTheyAre
+        } else {
+            EndBands::Shifted
+        }
+    }
+
+    /// Choose whether an export keeps the end bands where they are (the Export window's tick box,
+    /// `--export-unshifted`), and save it. It is followed from «Like FxSound for Windows» =
+    /// Interface and sound on; below it the choice is kept for then.
+    pub fn set_export_unshifted(&mut self, as_they_are: bool) {
+        if self.settings.export_unshifted == as_they_are {
+            return;
+        }
+        self.settings.export_unshifted = as_they_are;
+        self.persist_settings();
     }
 
     /// The presets among `names` whose file already exists in the export directory — the file
@@ -3978,8 +4051,9 @@ impl App {
             return 0;
         }
         let mut written = 0;
+        let end_bands = self.export_end_bands(lane);
         for name in names {
-            match self.store(lane).export(name, &self.export_dir) {
+            match self.store(lane).export(name, &self.export_dir, end_bands) {
                 Ok(_) => written += 1,
                 Err(err) => {
                     log::warn!("could not export {name}: {err}");
@@ -4650,14 +4724,117 @@ impl App {
             return Err(fxsound_core::parity::FULL_REFUSAL.to_owned());
         }
         self.settings.windows_parity = level;
+        // What the window draws at the level follows at the next frame.
+        self.state.windows_parity = self.windows_parity();
         self.persist_settings();
         // Interface and sound brings the Windows build's DSP to the output lane and the
-        // applications' output routes; the other levels play FxSound for Linux's.
-        if DspCompat::for_level(level) != DspCompat::for_level(current) {
+        // applications' output routes, and its reading of a preset to the window; the other
+        // levels play FxSound for Linux's.
+        let (from, to) = (DspCompat::for_level(current), DspCompat::for_level(level));
+        if to != from {
+            self.read_music_controls_in(from, to);
             self.sync_params_from_state();
         }
         self.note_windows_parity();
         Ok(())
+    }
+
+    /// Read the music lane's controls again in the other DSP's reading of a preset, when the level
+    /// of «Like FxSound for Windows» moves across Interface and sound: nothing is edited, marked or
+    /// saved.
+    ///
+    /// A preset with no unsaved changes is read again from its own file, as picking it would read
+    /// it at the new level ([`music_controls`]), as a band count change reads it (audit #45): a
+    /// curve of another band count by position at Interface and sound and by frequency below it,
+    /// Ambience's slider on the level's line. Controls with unsaved changes, or with no preset
+    /// read, are carried over instead: every effect keeps the value it plays and moves to the
+    /// position that value shows at in the new reading (audit #39), and a twenty-band curve on
+    /// one DSP's ladder moves to the other's band for band, its gains where they were (R4). Either
+    /// way a twenty-band preset taken to Interface and sound and back is the preset it was, bit
+    /// for bit (A12), and what is saved at either level reads back at the other as it was saved.
+    ///
+    /// The window's controls when it edits the speakers; otherwise the speakers' controls it keeps
+    /// aside ([`App::lane_controls`]), and the music chain's snapshot, which only the window's
+    /// controls rebuild, is written from them.
+    fn read_music_controls_in(&mut self, from: DspCompat, to: DspCompat) {
+        fn carry(
+            controls: (&mut [f32; Effect::COUNT], &mut bool, &mut Vec<EqBand>),
+            fresh: Option<&MusicControls>,
+            from: DspCompat,
+            to: DspCompat,
+        ) {
+            let (effects, eq_on, bands) = controls;
+            if let Some(fresh) = fresh {
+                effects.clone_from(&fresh.effects);
+                *eq_on = fresh.eq_on;
+                bands.clone_from(&fresh.eq_bands);
+                return;
+            }
+            for effect in Effect::ALL {
+                let slider = &mut effects[effect as usize];
+                *slider = scale::value_to_slider_in(
+                    to,
+                    effect,
+                    scale::slider_to_value_in(from, effect, *slider),
+                );
+            }
+            fxsound_core::eq::move_to_the_twenty_band_ladder_of(bands, to);
+        }
+        let count = (self.settings.num_bands as usize).clamp(1, fxsound_core::eq::MAX_BANDS);
+        let fresh = self
+            .unedited_music_preset()
+            .map(|preset| music_controls(preset, &ladder_in(count, to), to));
+        match self.state.direction {
+            DeviceDirection::Output => {
+                let state = &mut self.state;
+                carry(
+                    (&mut state.effects, &mut state.eq_on, &mut state.eq_bands),
+                    fresh.as_ref(),
+                    from,
+                    to,
+                );
+            }
+            DeviceDirection::Input => {
+                if let Some(music) = &mut self.lane_controls[lane_index(DeviceDirection::Output)] {
+                    carry(
+                        (&mut music.effects, &mut music.eq_on, &mut music.eq_bands),
+                        fresh.as_ref(),
+                        from,
+                        to,
+                    );
+                    write_music_params(
+                        &mut self.params,
+                        &music.effects,
+                        music.eq_on,
+                        &music.eq_bands,
+                        MusicLevels {
+                            filter_q: music.filter_q,
+                            master_gain_db: music.master_gain_db,
+                            balance_db: music.balance_db,
+                            volume_leveling: music.volume_leveling,
+                            compat: to,
+                        },
+                    );
+                }
+                self.mirror_music_controls();
+            }
+        }
+    }
+
+    /// The speakers' preset as it was read, while the speakers' controls are still that preset
+    /// unedited: the one their list shows, with no unsaved changes, and the one last read. The
+    /// same test a band count change makes ([`App::set_band_count`]).
+    fn unedited_music_preset(&self) -> Option<&Preset> {
+        let shown = match self.state.direction {
+            DeviceDirection::Output => self.state.preset(),
+            DeviceDirection::Input => {
+                let music = self.lane_controls[lane_index(DeviceDirection::Output)].as_ref()?;
+                music.selected_preset.and_then(|i| music.presets.get(i))
+            }
+        }?;
+        self.loaded_preset
+            .as_ref()
+            .filter(|read| !shown.modified && shown.name == read.name)
     }
 
     /// Whether a move to Everything would switch off something in use now: the microphone lane
@@ -5426,6 +5603,7 @@ fn set_autostart(enabled: bool) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use fxsound_core::test_support::ScratchDir;
+    use fxsound_dsp::preset::ladder;
 
     fn headless() -> App {
         App::headless_for_tests()
@@ -7742,6 +7920,81 @@ mod tests {
 
     fn names(app: &App) -> Vec<&str> {
         app.state.presets.iter().map(|p| p.name.as_str()).collect()
+    }
+
+    /// Export `name` through the Export window as `app` opens it for the speakers, and read the
+    /// file back.
+    fn export_through_the_window(app: &mut App, dir: &tempfile::TempDir, name: &str) -> Preset {
+        let names: Vec<String> = app.state.presets.iter().map(|p| p.name.clone()).collect();
+        let at = names.iter().position(|n| n == name).expect("listed");
+        let mut state = app.export_window(DeviceDirection::Output, names);
+        app.handle_export(&PresetsAction::ToggleExport(at), &mut state);
+        app.handle_export(&PresetsAction::Export, &mut state);
+        if !state.collisions.is_empty() {
+            app.handle_export(
+                &PresetsAction::Overwrite(OverwriteChoice::OverwriteAll),
+                &mut state,
+            );
+        }
+        fxsound_preset::load(&dir.path().join("export").join(format!("{name}.fac")))
+            .expect("the export")
+    }
+
+    #[test]
+    fn at_interface_and_sound_the_export_window_keeps_the_end_bands_where_they_are_when_asked() {
+        // Roadmap 0.5.0 §14 #56: from Interface and sound on, the Export window offers to leave
+        // the end bands where they are; unticked it shifts them as 0.4.0 does, and below that
+        // level it never offers and always shifts, whatever the setting says.
+        let (mut app, dir) = with_store();
+        let mut wide = Preset {
+            name: "Wide".into(),
+            ..Preset::default()
+        };
+        wide.eq_bands[0].center_hz = 46.0;
+        wide.eq_bands[9].center_hz = 20_000.0;
+        app.presets.save_as(&wide, "Wide").expect("saved");
+        app.refresh_preset_list();
+
+        let state = app.export_window(DeviceDirection::Output, vec!["Wide".into()]);
+        assert!(!state.end_bands_offered, "not offered at Off");
+        assert_eq!(
+            export_through_the_window(&mut app, &dir, "Wide").eq_bands[0].center_hz,
+            62.5
+        );
+
+        app.set_windows_parity(WindowsParity::Sound, false)
+            .expect("offered");
+        let mut state = app.export_window(DeviceDirection::Output, vec!["Wide".into()]);
+        assert!(state.end_bands_offered && !state.end_bands_as_they_are);
+        assert!(
+            !app.export_window(DeviceDirection::Input, Vec::new())
+                .end_bands_offered,
+            "a voice preset has no Windows reader"
+        );
+        assert_eq!(
+            export_through_the_window(&mut app, &dir, "Wide").eq_bands[0].center_hz,
+            62.5
+        );
+
+        app.handle_export(&PresetsAction::ToggleEndBands, &mut state);
+        assert!(state.end_bands_as_they_are);
+        assert!(app.settings.export_unshifted, "the choice is kept");
+        let exported = export_through_the_window(&mut app, &dir, "Wide");
+        assert_eq!(
+            exported.eq_bands, wide.eq_bands,
+            "the end bands where they were tuned"
+        );
+
+        // Back at Off the choice waits, and 0.4.0's export comes back.
+        app.set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        assert!(app.settings.export_unshifted);
+        assert_eq!(
+            export_through_the_window(&mut app, &dir, "Wide").eq_bands[0].center_hz,
+            62.5
+        );
+        let state = app.export_window(DeviceDirection::Output, vec!["Wide".into()]);
+        assert!(!state.end_bands_offered);
     }
 
     #[test]
@@ -11631,6 +11884,248 @@ mod tests {
         assert_eq!(app.played_params().compat, DspCompat::Windows);
     }
 
+    /// A twenty-band curve on the half-octave ladder, every band a different gain.
+    fn half_octave_twenty() -> Vec<(f32, f32)> {
+        fxsound_core::eq::TWENTY_BAND_CENTRES_HZ
+            .iter()
+            .enumerate()
+            .map(|(i, &hz)| (hz, (i as f32 * 0.6).sin() * 8.0))
+            .collect()
+    }
+
+    #[test]
+    fn a_twenty_band_preset_taken_to_interface_and_sound_and_back_is_the_preset_it_was() {
+        // A12 of «Like FxSound for Windows»: at Interface and sound twenty bands are the Windows
+        // ladder, and the curve moves there band for band (audit report R4 taken back); back at
+        // Off it is the curve it was, bit for bit, and nothing was edited on the way.
+        use WindowsParity::{Off, Sound};
+        let (mut app, engine, dir) =
+            started_on(20, &[preset_with("Twenty", &half_octave_twenty())]);
+        let twenty = fxsound_preset::load(&dir.path().join("factory").join("Twenty.fac"))
+            .expect("the preset as written");
+        let (at_off, gains_at_off) = (centres(&app), gains(&app));
+        assert_eq!(at_off, fxsound_core::eq::TWENTY_BAND_CENTRES_HZ);
+        let played_at_off = app.played_params();
+
+        app.set_windows_parity(Sound, false).expect("offered");
+        assert_eq!(
+            centres(&app),
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(gains(&app), gains_at_off, "every gain on its band");
+        let sent = engine.params().expect("published");
+        assert_eq!(
+            sent.bands().0,
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(
+            app.lane_preset(DeviceDirection::Output),
+            Some(("Twenty", false))
+        );
+        // As a fresh read of the preset at that level would have it.
+        assert_eq!(
+            app.played_params(),
+            fxsound_dsp::preset::preset_params(
+                &twenty,
+                &MusicLevels::of(&app.settings).ladder(20),
+                MusicLevels::of(&app.settings),
+            )
+        );
+
+        app.set_windows_parity(Off, false).expect("offered");
+        assert_eq!(centres(&app), at_off);
+        assert_eq!(gains(&app), gains_at_off);
+        assert_eq!(app.played_params(), played_at_off, "bit for bit");
+        assert_eq!(
+            app.lane_preset(DeviceDirection::Output),
+            Some(("Twenty", false))
+        );
+    }
+
+    #[test]
+    fn a_level_change_reads_an_unedited_preset_again_as_a_pick_at_that_level_would() {
+        // A ten-band preset on twenty bands: fitted by frequency at Off, by position onto the
+        // Windows ladder at Interface and sound, and back — each time what a pick would play.
+        use WindowsParity::{Off, Sound};
+        let ten: Vec<(f32, f32)> = fxsound_core::eq::DEFAULT_CENTERS_HZ
+            .iter()
+            .enumerate()
+            .map(|(i, &hz)| (hz, i as f32 - 4.5))
+            .collect();
+        let (mut app, _engine, dir) = started_on(20, &[preset_with("Ten", &ten)]);
+        let file = fxsound_preset::load(&dir.path().join("factory").join("Ten.fac"))
+            .expect("the preset as written");
+        let at_off = app.played_params();
+        for (level, then) in [(Sound, None), (Off, Some(at_off))] {
+            app.set_windows_parity(level, false).expect("offered");
+            let levels = MusicLevels::of(&app.settings);
+            let picked = fxsound_dsp::preset::preset_params(&file, &levels.ladder(20), levels);
+            assert_eq!(app.played_params(), picked, "{level:?}");
+            if let Some(then) = then {
+                assert_eq!(app.played_params(), then, "back at {level:?}");
+            }
+            assert_eq!(
+                app.lane_preset(DeviceDirection::Output),
+                Some(("Ten", false))
+            );
+        }
+    }
+
+    #[test]
+    fn a_level_change_reaches_the_speakers_while_the_window_edits_the_microphone() {
+        // The speakers' controls are kept aside while the microphone is edited; the music chain
+        // plays the new reading all the same, and the window finds it on coming back.
+        use WindowsParity::{Off, Sound};
+        let (mut app, engine, _dir) =
+            started_on(20, &[preset_with("Twenty", &half_octave_twenty())]);
+        let at_off = app.played_params();
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
+        app.set_windows_parity(Sound, false).expect("offered");
+        let sent = engine.params().expect("published");
+        assert_eq!(sent.compat, DspCompat::Windows);
+        assert_eq!(
+            sent.bands().0,
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Output)]);
+        assert_eq!(
+            centres(&app),
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
+        app.set_windows_parity(Off, false).expect("offered");
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Output)]);
+        assert_eq!(app.played_params(), at_off);
+    }
+
+    #[test]
+    fn a_level_change_carries_unsaved_changes_over_band_for_band() {
+        // An edited curve is the user's, not the file's: it moves between the twenty-band ladders
+        // band for band and stays edited.
+        use WindowsParity::{Off, Sound};
+        let (mut app, _engine, _dir) =
+            started_on(20, &[preset_with("Twenty", &half_octave_twenty())]);
+        app.handle(&[UiAction::SetBandGain(3, 7.5)]);
+        let edited = gains(&app);
+        app.set_windows_parity(Sound, false).expect("offered");
+        assert_eq!(
+            centres(&app),
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(gains(&app), edited);
+        assert_eq!(
+            app.lane_preset(DeviceDirection::Output),
+            Some(("Twenty", true))
+        );
+        app.set_windows_parity(Off, false).expect("offered");
+        assert_eq!(centres(&app), fxsound_core::eq::TWENTY_BAND_CENTRES_HZ);
+        assert_eq!(gains(&app), edited);
+    }
+
+    #[test]
+    fn a_twenty_band_preset_saved_at_interface_and_sound_reads_back_at_off_as_it_was_saved() {
+        // A12, the other half: saved at Interface and sound the file is on the Windows ladder, as
+        // the Windows build writes twenty bands, and read at Off it is on the half-octave ladder
+        // with every gain where it was saved.
+        use WindowsParity::{Off, Sound};
+        let (mut app, _engine, dir) =
+            started_on(20, &[preset_with("Twenty", &half_octave_twenty())]);
+        app.set_windows_parity(Sound, false).expect("offered");
+        app.handle(&[
+            UiAction::SetBandGain(4, 5.5),
+            UiAction::SavePresetAs("Mine".into()),
+        ]);
+        let saved_gains = gains(&app);
+        let file = fxsound_preset::load(&dir.path().join("user").join("Mine.fac"))
+            .expect("the saved preset");
+        let file_centres: Vec<f32> = file.eq_bands.iter().map(|b| b.center_hz).collect();
+        assert_eq!(
+            file_centres,
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+
+        app.set_windows_parity(Off, false).expect("offered");
+        pick(&mut app, "Twenty");
+        pick(&mut app, "Mine");
+        assert_eq!(centres(&app), fxsound_core::eq::TWENTY_BAND_CENTRES_HZ);
+        assert_eq!(gains(&app), saved_gains);
+        app.set_windows_parity(Sound, false).expect("offered");
+        assert_eq!(
+            centres(&app),
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(gains(&app), saved_gains);
+    }
+
+    #[test]
+    fn at_interface_and_sound_the_band_count_changes_and_a_preset_of_another_count_go_by_position()
+    {
+        // Audit report #13 taken back: the Windows build reads a curve onto another band count by
+        // position, on the window's band count change and on a pick alike.
+        let ten: Vec<(f32, f32)> = fxsound_core::eq::DEFAULT_CENTERS_HZ
+            .iter()
+            .enumerate()
+            .map(|(i, &hz)| (hz, if i == 0 { 6.0 } else { 0.0 }))
+            .collect();
+        let (mut app, _engine, _dir) = started_on(10, &[preset_with("Bass", &ten)]);
+        app.set_windows_parity(WindowsParity::Sound, false)
+            .expect("offered");
+        app.handle(&[UiAction::SetBandCount(31)]);
+        let ten_gains: Vec<f32> = ten.iter().map(|&(_, gain)| gain).collect();
+        assert_eq!(
+            gains(&app),
+            fxsound_dsp::eq::remap_band_gains_by_position(&ten_gains, 31)
+        );
+        assert_eq!(
+            gains(&app)[0],
+            6.0,
+            "the 20 Hz band takes the 62.5 Hz boost"
+        );
+        app.handle(&[UiAction::SetBandCount(20)]);
+        assert_eq!(
+            centres(&app),
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(
+            gains(&app),
+            fxsound_dsp::eq::remap_band_gains_by_position(&ten_gains, 20)
+        );
+    }
+
+    #[test]
+    fn at_interface_and_sound_ambiences_slider_stores_the_windows_builds_values() {
+        // Audit report #39 taken back with the stage: position 1 saves 13, as the Windows build's
+        // slider does; a value the preset stores keeps playing across the level change.
+        let mut stored = preset_with("Room", &[]);
+        stored.set_effect(Effect::Ambience, scale::midi_to_value(64));
+        let (mut app, _engine, _dir) = started_on(10, &[stored]);
+        let played = app.played_params().effect(Effect::Ambience);
+        app.set_windows_parity(WindowsParity::Sound, false)
+            .expect("offered");
+        assert_eq!(
+            scale::value_to_midi(app.played_params().effect(Effect::Ambience)),
+            scale::value_to_midi(played),
+            "the stored value plays on"
+        );
+        let shown = app.state.effects[Effect::Ambience as usize];
+        assert!(
+            (shown - 5.039).abs() < 0.001,
+            "64 shows at {shown} on Windows"
+        );
+        app.handle(&[UiAction::SetEffect(Effect::Ambience, 1.0)]);
+        assert_eq!(
+            scale::value_to_midi(app.played_params().effect(Effect::Ambience)),
+            13
+        );
+        app.set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        assert_eq!(
+            scale::value_to_midi(app.played_params().effect(Effect::Ambience)),
+            13,
+            "the value set at Interface and sound plays at Off too"
+        );
+    }
+
     #[test]
     fn a_preset_with_no_equalizer_turns_it_on_and_flat_on_the_users_ladder() {
         // The original's "old preset" (`DfxDspEq.cpp:144-158`).
@@ -11661,33 +12156,42 @@ mod tests {
             .collect();
         files.sort();
         assert!(files.len() >= 30, "only {} shipped presets", files.len());
-        let levels = MusicLevels {
-            filter_q: 1.5,
-            master_gain_db: -3.0,
-            balance_db: 2.0,
-            volume_leveling: 1.0,
-            compat: DspCompat::Linux,
-        };
-        for count in [10, 20, 31] {
-            for file in &files {
-                let preset = fxsound_preset::load(file).expect("a shipped preset loads");
-                let (mut app, _engine, _dir) = started_on(count, &[preset_with("Alpha", &[])]);
-                app.handle(&[
-                    UiAction::SetFilterQ(levels.filter_q),
-                    UiAction::SetMasterGain(levels.master_gain_db),
-                    UiAction::SetBalance(levels.balance_db),
-                    UiAction::SetVolumeLeveling(levels.volume_leveling),
-                ]);
-                assert_eq!(MusicLevels::of(&app.settings), levels);
-                app.apply_preset(&preset);
-                let expected =
-                    fxsound_dsp::preset::preset_params(&preset, &ladder(count as usize), levels);
-                assert_eq!(
-                    app.played_params(),
-                    expected,
-                    "{} on {count} bands",
-                    file.display()
-                );
+        for (level, compat) in [
+            (WindowsParity::Off, DspCompat::Linux),
+            (WindowsParity::Sound, DspCompat::Windows),
+        ] {
+            let levels = MusicLevels {
+                filter_q: 1.5,
+                master_gain_db: -3.0,
+                balance_db: 2.0,
+                volume_leveling: 1.0,
+                compat,
+            };
+            for count in [10, 20, 31] {
+                for file in &files {
+                    let preset = fxsound_preset::load(file).expect("a shipped preset loads");
+                    let (mut app, _engine, _dir) = started_on(count, &[preset_with("Alpha", &[])]);
+                    app.set_windows_parity(level, false).expect("offered");
+                    app.handle(&[
+                        UiAction::SetFilterQ(levels.filter_q),
+                        UiAction::SetMasterGain(levels.master_gain_db),
+                        UiAction::SetBalance(levels.balance_db),
+                        UiAction::SetVolumeLeveling(levels.volume_leveling),
+                    ]);
+                    assert_eq!(MusicLevels::of(&app.settings), levels);
+                    app.apply_preset(&preset);
+                    let expected = fxsound_dsp::preset::preset_params(
+                        &preset,
+                        &levels.ladder(count as usize),
+                        levels,
+                    );
+                    assert_eq!(
+                        app.played_params(),
+                        expected,
+                        "{} on {count} bands at {level:?}",
+                        file.display()
+                    );
+                }
             }
         }
     }

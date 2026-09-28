@@ -40,6 +40,24 @@
 //! The sides come from [`Engine::set_channel_sides`] when the layout is known and are inferred
 //! from the channel count, the front pair and the subwoofer otherwise ([`default_sides`]).
 //!
+//! **At «Like FxSound for Windows» = Interface and sound the gain stage is the Windows build's**
+//! (`DspParams::compat`; audit reports R3 and #44 taken back, #44 as the Windows C code has it):
+//!
+//! ```text
+//! in ─► graphic EQ ─► master gain · balance ─► volume levelling ─► effect chain ─► spectrum tap ─► out
+//!       └──────────── skipped while the EQ is off ────────────┘
+//!
+//! power off:
+//! in ─► master gain, while the EQ is on (no balance) ─► spectrum tap ─► out
+//! ```
+//!
+//! between the equalizer and the leveller, where `0f05ba5` had it and bit for bit as it did it
+//! (the two orders commute only in exact arithmetic); the balance on channels 0 and 1 of a
+//! stereo stream and on nothing else — the original's surround path multiplies every channel by
+//! the master gain alone (`SosProcess.cpp:846-908`), where the port's first cut balanced channels
+//! 0 and 1 of any layout. The transitions stay the port's: the equalizer's switch fades the block
+//! with the stage in it, a new gain glides, the power switch dips.
+//!
 //! A new master gain or balance glides there over [`crate::smooth::GLIDE_SECONDS`] instead of
 //! stepping between two samples, as every other gain and filter the user can move does (audit
 //! report #11, [`crate::smooth`]): the original writes the gain straight into the float the audio
@@ -190,6 +208,10 @@ pub struct Engine {
     named_sides: Option<([ChannelSide; crate::biquad::MAX_CHANNELS], usize)>,
     /// The sides the balance uses for `channels`: the named ones when they fit, else the default.
     sides: [ChannelSide; crate::biquad::MAX_CHANNELS],
+    /// The gain stage is the Windows build's («Like FxSound for Windows» = Interface and sound,
+    /// audit reports R3 and #44): inside the GraphicEq block, and with the power off the master
+    /// gain alone, while the equalizer is on; the balance on stereo only.
+    windows_gain_stage: bool,
 }
 
 impl Engine {
@@ -226,6 +248,7 @@ impl Engine {
             front_pair: None,
             named_sides: None,
             sides: [ChannelSide::Centre; crate::biquad::MAX_CHANNELS],
+            windows_gain_stage: false,
         };
         engine.refresh_sides();
         let params = DspParams::default();
@@ -394,6 +417,8 @@ impl Engine {
             // messages: the engine now starts clean without relying on every caller to send it.
             self.eq.reset();
         }
+        // Below 20 Hz the Windows design lets a band's Q go negative (audit report #12).
+        self.eq.set_compat(params.compat);
         self.eq.set_q_multiplier(params.filter_q);
         let (centers, boosts) = params.bands();
         if centers != self.eq.center_frequencies() || boosts != self.eq.boosts_db() {
@@ -407,15 +432,20 @@ impl Engine {
         self.leveller.set_amount(params.volume_leveling_db);
 
         // `10^(dB/20)`, applied per sample (`GraphicEqSet.cpp:101`); the balance attenuates one
-        // side and never boosts the other (`GraphicEqSet.cpp:38-59`).
+        // side and never boosts the other (`GraphicEqSet.cpp:38-59`). The Windows DSP's bypass
+        // is the master gain alone, and only while the equalizer is on (see the module
+        // documentation); powered, the stage is the same either way, only where it runs and
+        // which channels the balance reaches differ ([`Engine::windows_gain_stage`]).
         let master = db_to_linear(params.master_gain_db);
         let (left, right) = balance_gains(params.balance);
-        self.gains.glide_to(
-            master * left,
-            master * right,
-            master,
-            glide_frames(self.sample_rate),
-        );
+        let (left, right, centre) = match (params.compat.windows(), params.power) {
+            (false, _) | (true, true) => (master * left, master * right, master),
+            (true, false) if params.eq_on => (master, master, master),
+            (true, false) => (1.0, 1.0, 1.0),
+        };
+        self.windows_gain_stage = params.compat.windows();
+        self.gains
+            .glide_to(left, right, centre, glide_frames(self.sample_rate));
         if !self.heard {
             self.gains.settle();
         }
@@ -521,8 +551,11 @@ impl Engine {
         // The master gain and the balance, on every path: powered or not, equalizer on or off
         // (audit report R3; the module documentation has the original's version and why it is
         // not this). Before the equalizer, so its switch fades the rest of the block against a
-        // signal that already carries them.
-        self.apply_gain_stage(buffer, channels);
+        // signal that already carries them. The Windows DSP runs it inside the block instead,
+        // and here only with the power off, where it is the master gain alone.
+        if !self.windows_gain_stage || !self.applied.power {
+            self.apply_gain_stage(buffer, channels);
+        }
         if self.applied.power {
             // The rest of the GraphicEq block, whole or not at all (`dfxpProcessReal.cpp:143-157`),
             // faded in or out when the equalizer's switch moves. While it is skipped the
@@ -571,6 +604,11 @@ impl Engine {
     fn sit_out_eq_block(&mut self) {
         self.eq.sit_out();
         self.leveller.sit_out();
+        // The Windows DSP's gain stage is one of the block's stages while the power is on, so it
+        // settles with them; with the power off it is the bypass's and plays.
+        if self.windows_gain_stage && self.applied.power {
+            self.gains.settle();
+        }
     }
 
     /// The GraphicEq block over one buffer — the equalizer and the leveller, the gain stage having
@@ -606,9 +644,14 @@ impl Engine {
         }
     }
 
-    /// The GraphicEq block's stages after the gain stage, in order, at full strength.
+    /// The GraphicEq block's stages after the gain stage, in order, at full strength — and the
+    /// Windows DSP's gain stage between the equalizer and the leveller, where the original's
+    /// `sosProcessBuffer` has it (`SosProcess.cpp:583`, `:630-631`, `:904`).
     fn eq_block_pass(&mut self, buffer: &mut [f32], channels: usize) {
         self.eq.process(buffer, channels);
+        if self.windows_gain_stage {
+            self.apply_gain_stage(buffer, channels);
+        }
         // The subwoofer is levelled with every other channel but kept out of the level analysis:
         // it carries a deliberately enormous share of the programme's energy, so letting it into
         // the statistics would pull the gain down on bass-heavy material for reasons that have
@@ -632,11 +675,7 @@ impl Engine {
             self.apply_steady_gain_stage(buffer, channels);
             return;
         }
-        let sides = if channels == self.channels {
-            self.sides
-        } else {
-            standard_sides(channels)
-        };
+        let sides = self.gain_stage_sides(channels);
         for frame in buffer.chunks_exact_mut(channels) {
             let [left, right, centre] = self.gains.advance();
             if channels < 2 {
@@ -655,6 +694,30 @@ impl Engine {
         }
     }
 
+    /// The side each channel of a `channels`-channel block takes the balance for.
+    ///
+    /// FxSound for Linux: the layout's sides; a block in a format the engine was not told about
+    /// (`process` clamps rather than refuses) is balanced by the count's default layout. The
+    /// Windows DSP (audit report #44 as Windows has it): channels 0 and 1 of a stereo block, and
+    /// nothing on any other count — its surround path multiplies every channel by the master
+    /// gain alone (`SosProcess.cpp:846-908`), and it has no path for 3, 4, 5 or 7 channels, which
+    /// take the master gain alone here too. The power-off bypass is the master gain alone on every
+    /// channel at any count, which the stage's factors already say.
+    fn gain_stage_sides(&self, channels: usize) -> [ChannelSide; crate::biquad::MAX_CHANNELS] {
+        if self.windows_gain_stage {
+            let mut sides = [ChannelSide::Centre; crate::biquad::MAX_CHANNELS];
+            if channels == 2 {
+                sides[0] = ChannelSide::Left;
+                sides[1] = ChannelSide::Right;
+            }
+            sides
+        } else if channels == self.channels {
+            self.sides
+        } else {
+            standard_sides(channels)
+        }
+    }
+
     /// [`Engine::apply_gain_stage`] with nothing moving.
     fn apply_steady_gain_stage(&self, buffer: &mut [f32], channels: usize) {
         let [left, right, master] = self.gains.values();
@@ -668,13 +731,7 @@ impl Engine {
             return;
         }
 
-        // A block in a format the engine was not told about (`process` clamps rather than
-        // refuses) is balanced by the count's default layout.
-        let sides = if channels == self.channels {
-            self.sides
-        } else {
-            standard_sides(channels)
-        };
+        let sides = self.gain_stage_sides(channels);
         let mut gains = [master; crate::biquad::MAX_CHANNELS];
         for (gain, side) in gains.iter_mut().zip(sides).take(channels) {
             *gain = match side {
@@ -862,6 +919,7 @@ pub fn balance_gains(balance_db: Real) -> (Real, Real) {
 mod tests {
     use super::*;
     use crate::leveller::CEILING;
+    use fxsound_core::DspCompat;
     use fxsound_core::Effect as EffectId;
 
     fn tone(frames: usize, channels: usize, amplitude: f32) -> Vec<f32> {
@@ -1654,11 +1712,22 @@ mod tests {
     /// Each channel's level in dB against the same engine with the balance centred, so the
     /// effects Dynamic Boost always applies cancel out.
     fn balance_levels(channels: usize, setup: impl Fn(&mut Engine), balance: f32) -> Vec<f32> {
+        balance_levels_in(DspCompat::Linux, channels, setup, balance)
+    }
+
+    /// [`balance_levels`] in the DSP `compat` plays.
+    fn balance_levels_in(
+        compat: DspCompat,
+        channels: usize,
+        setup: impl Fn(&mut Engine),
+        balance: f32,
+    ) -> Vec<f32> {
         let render = |balance| {
             let mut engine = Engine::new(48_000.0, 4096, channels);
             setup(&mut engine);
             engine.apply(&DspParams {
                 balance,
+                compat,
                 ..DspParams::default()
             });
             let mut buffer = tone(4096, channels, 0.25);
@@ -2979,5 +3048,220 @@ mod tests {
             steepest < own_slope(0.5, 50.0),
             "the floor stepped the tone by {steepest}"
         );
+    }
+
+    // --- «Like FxSound for Windows» = Interface and sound: the Windows gain stage (W1c) --------
+    //
+    // Audit reports R3 and #44 taken back, the reference for #44 the Windows C code: the master
+    // gain and the balance between the equalizer and the leveller, inside the GraphicEq block; with
+    // the power off the master gain alone on every channel while the equalizer is on
+    // (`sosProcessBuffer_MasterGainOnly`, `SosProcess.cpp:497-516`); the balance on stereo only
+    // (`sosProcessBuffer`, `:630-631`), and on 5.1 and 7.1 the master gain alone on every channel
+    // (`sosProcessSurroundBuffer`, `:904`). The transitions stay the port's.
+
+    fn windows(params: DspParams) -> DspParams {
+        DspParams {
+            compat: DspCompat::Windows,
+            ..params
+        }
+    }
+
+    #[test]
+    fn at_interface_and_sound_the_gain_stage_sits_between_the_equalizer_and_the_leveller() {
+        // 0f05ba5's order, bit for bit: the equalizer, then the master gain with the balance
+        // folded in, then the leveller, then the effects.
+        let mut params = windows(DspParams {
+            master_gain_db: -6.0,
+            balance: 3.0,
+            volume_leveling_db: 2.0,
+            ..DspParams::default()
+        });
+        params.band_boost_db[2] = 6.0;
+        params.band_boost_db[7] = -4.0;
+        params.set_effect(EffectId::Fidelity, 0.3);
+
+        let input = tone(4096, 2, 0.2);
+        let mut through_engine = input.clone();
+        let mut engine = Engine::new(48_000.0, 4096, 2);
+        engine.apply(&params);
+        engine.process(&mut through_engine, 2);
+
+        let mut eq = GraphicEq::new();
+        eq.set_sample_rate(48_000.0);
+        eq.set_compat(DspCompat::Windows);
+        let mut leveller = VolumeLeveller::new(48_000.0);
+        leveller.set_compat(DspCompat::Windows);
+        leveller.set_amount(params.volume_leveling_db);
+        let mut chain = Chain::new(48_000.0);
+        chain.apply(&DspParams::default());
+        chain.apply(&params);
+        let (centres, boosts) = params.bands();
+        eq.set_bands(centres, boosts);
+        let mut reference = input;
+        eq.process(&mut reference, 2);
+        let (left, right) = balance_gains(params.balance);
+        let master = db_to_linear(params.master_gain_db);
+        let (left, right) = (master * left, master * right);
+        for frame in reference.as_chunks_mut::<2>().0 {
+            frame[0] *= left;
+            frame[1] *= right;
+        }
+        leveller.process_with_lfe(&mut reference, 2, None);
+        chain.process(&mut reference, 2);
+        assert_same_bits(&through_engine, &reference, "the Windows order");
+    }
+
+    #[test]
+    fn at_interface_and_sound_the_equalizer_switch_takes_the_master_gain_and_the_balance_with_it() {
+        // Upstream aad64c1 as the Windows build has it: with the equalizer off, powered, nothing
+        // of the block plays, the gain stage included.
+        let busy = render_blocks(&windows(busy_graphic_eq_block(false)), 60, 0.05);
+        let plain = render_blocks(
+            &windows(DspParams {
+                eq_on: false,
+                ..DspParams::default()
+            }),
+            60,
+            0.05,
+        );
+        assert_same_bits(&busy, &plain, "the equalizer off at Interface and sound");
+    }
+
+    #[test]
+    fn at_interface_and_sound_the_bypass_is_the_master_gain_alone_while_the_equalizer_is_on() {
+        // `sosProcessBuffer_MasterGainOnly`: `in * master_gain` on every sample of every channel,
+        // the subwoofer and the rears included, no balance; and nothing while the equalizer is off.
+        for channels in [1, 2, 6, 8] {
+            for eq_on in [true, false] {
+                let params = windows(DspParams {
+                    power: false,
+                    eq_on,
+                    master_gain_db: -6.0,
+                    balance: 10.0,
+                    ..DspParams::default()
+                });
+                let mut engine = Engine::new(48_000.0, 4096, channels);
+                engine.set_lfe_channel((channels >= 6).then_some(LFE));
+                engine.apply(&params);
+                let input = tone(1024, channels, 0.25);
+                let mut buffer = input.clone();
+                engine.process(&mut buffer, channels);
+                let master = if eq_on { 10_f32.powf(-6.0 / 20.0) } else { 1.0 };
+                let want: Vec<f32> = input.iter().map(|x| x * master).collect();
+                assert_same_bits(&buffer, &want, &format!("{channels} channels, eq {eq_on}"));
+            }
+        }
+    }
+
+    /// A frame of each channel count's golden vector for the Windows gain stage, as the bits of
+    /// `(input, output)` per channel: what `sosProcessBuffer`'s and `sosProcessSurroundBuffer`'s
+    /// gain stage hands back at −6 dB of master gain and +10 dB of balance, `powf` as
+    /// `GraphicEqSetMasterGain` and `GraphicEqSetBalance` take it (`SosProcess.cpp:583`,
+    /// `:630-631`, `:904`), transcribed with `realtype = float` and compiled as C with glibc's libm
+    /// on x86-64 (`scripts/windows-vectors/gain_stage.c`, printed by
+    /// `scripts/windows-vectors/build.sh`). A2 of «Like FxSound for Windows».
+    #[allow(clippy::unreadable_literal)]
+    const WINDOWS_GAIN_STAGE: [(usize, &[(u32, u32)]); 3] = [
+        (2, &[(0x3dcccccd, 0x3c81d59e), (0x3e2e147b, 0x3dae7e4b)]),
+        (
+            6,
+            &[
+                (0x3dcccccd, 0x3d4d494a),
+                (0x3e2e147b, 0x3dae7e4b),
+                (0x3e75c290, 0x3df657f3),
+                (0x3e9eb852, 0x3e1f18cc),
+                (0x3ec28f5c, 0x3e43059f),
+                (0x3ee66666, 0x3e66f272),
+            ],
+        ),
+        (
+            8,
+            &[
+                (0x3dcccccd, 0x3d4d494a),
+                (0x3e2e147b, 0x3dae7e4b),
+                (0x3e75c290, 0x3df657f3),
+                (0x3e9eb852, 0x3e1f18cc),
+                (0x3ec28f5c, 0x3e43059f),
+                (0x3ee66666, 0x3e66f272),
+                (0x3f051eb9, 0x3e856fa4),
+                (0x3f170a3e, 0x3e97660d),
+            ],
+        ),
+    ];
+
+    #[test]
+    fn at_interface_and_sound_the_balance_plays_on_stereo_only_as_the_windows_c_code_has_it() {
+        // Audit report #44 as Windows: on 6 and 8 channels every speaker takes the master gain and
+        // none the balance; on stereo the left takes the balance too.
+        for (channels, vector) in WINDOWS_GAIN_STAGE {
+            let mut engine = Engine::new(48_000.0, 64, channels);
+            engine.set_lfe_channel((channels >= 6).then_some(LFE));
+            engine.apply(&windows(DspParams {
+                master_gain_db: -6.0,
+                balance: 10.0,
+                ..DspParams::default()
+            }));
+            let input: Vec<f32> = vector.iter().map(|&(x, _)| f32::from_bits(x)).collect();
+            let want: Vec<f32> = vector.iter().map(|&(_, y)| f32::from_bits(y)).collect();
+            let mut frame = input.clone();
+            engine.apply_gain_stage(&mut frame, channels);
+            // On stereo's left the C multiplies left to right, `out1 * master_gain *
+            // balance_left`, where `0f05ba5` folds the two factors first: within a unit in the
+            // last place there, bit for bit on every surround speaker.
+            for (channel, (got, want)) in frame.iter().zip(&want).enumerate() {
+                assert!(
+                    (got - want).abs() <= want.abs() * f32::EPSILON,
+                    "{channels} channels, channel {channel}: {got} against the C's {want}"
+                );
+            }
+            if channels > 2 {
+                assert_same_bits(&frame, &want, &format!("{channels} channels"));
+            }
+        }
+        // By the levels, through the whole engine: no speaker of a surround layout moves.
+        for channels in [6, 8] {
+            let levels = balance_levels_in(
+                DspCompat::Windows,
+                channels,
+                |engine| engine.set_lfe_channel(Some(LFE)),
+                10.0,
+            );
+            assert_levels(
+                &levels,
+                &vec![0.0; channels],
+                "surround at Interface and sound",
+            );
+        }
+        let stereo = balance_levels_in(DspCompat::Windows, 2, |_| {}, 10.0);
+        assert_levels(&stereo, &[-10.0, 0.0], "stereo at Interface and sound");
+    }
+
+    #[test]
+    fn switching_the_power_at_interface_and_sound_dips_rather_than_stepping() {
+        // The dip stays at every level (E6a): the bypass's master gain lands in the silence.
+        let mut engine = Engine::new(48_000.0, 480, 2);
+        let mut params = windows(DspParams {
+            master_gain_db: -6.0,
+            balance: 6.0,
+            ..DspParams::default()
+        });
+        engine.apply(&params);
+        let mut last = 0.0_f32;
+        let mut steepest = 0.0_f32;
+        for block in 0..40 {
+            if block == 20 {
+                params.power = false;
+                engine.apply(&params);
+            }
+            let mut buffer = continuous_tone(block * 480, 480, 0.2);
+            engine.process(&mut buffer, 2);
+            for frame in buffer.as_chunks::<2>().0 {
+                if block > 0 {
+                    steepest = steepest.max((frame[0] - last).abs());
+                }
+                last = frame[0];
+            }
+        }
+        assert!(steepest < 0.02, "the tone stepped by {steepest}");
     }
 }

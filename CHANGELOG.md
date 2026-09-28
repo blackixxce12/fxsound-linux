@@ -22,8 +22,22 @@ All notable changes to the FxSound Linux port. The format follows
   chain, leaves the subwoofer alone and pulls the gain down at the top of a buffer, and Dynamic
   Boost lifts loud material by half a decibel at 0, hears the left channel alone and limits each
   channel on its own, with no hold: the Windows build's arithmetic, sample for sample, on the
-  output and on the applications' output routes. The transitions stay FxSound for Linux's. The
-  rest of the Windows sound follows during 0.5.0.
+  output and on the applications' output routes. The transitions stay FxSound for Linux's.
+- **At «Like FxSound for Windows» = Interface and sound, Ambience, the equalizer, the master gain
+  and the balance play as on Windows, and a preset is read as there.** Ambience's slider stores
+  13, 25 and 38 at its first three positions again, and the reverb plays them as the Windows build
+  does; a band below 20 Hz is the flat gain it is there; the master gain and the balance sit
+  between the equalizer and the levelling, go off with the equalizer's switch, and with FxSound
+  off the master gain alone plays, while the equalizer is on; the balance plays on stereo only. A
+  preset of another band count is read onto yours by position, and twenty bands are the Windows
+  build's ladder: a twenty-band preset moves to it and back band for band, and nothing is saved
+  on the way. Switching the level with a master gain or a balance set can still click; that goes
+  during 0.5.0.
+- **The Export window can keep the end bands where they are.** From «Like FxSound for Windows» =
+  Interface and sound on it has a tick box, "Keep the end bands where they are", and
+  `fxsound --export-unshifted[=0|1]` sets the same: a `.fac` then keeps its first and last band
+  where you tuned them, instead of moving them into the range FxSound for Windows tunes them in,
+  which stays the default.
 - **Settings keep what a later version wrote.** A key of `settings.toml` this version does not
   know is written back as it was, so going back a version and up again keeps the newer version's
   settings. 0.4.0 does not keep them: after a downgrade to 0.4.0 its next save drops the keys 0.5.0

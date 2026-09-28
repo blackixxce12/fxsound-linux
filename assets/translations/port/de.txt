@@ -130,3 +130,4 @@ countries: de at ch
 "Plus the Windows sound: presets sound the same." = "Plus Windows-Klang: Voreinstellungen klingen gleich."
 "Only what Windows has; the rest is hidden." = "Nur was Windows hat; der Rest ist ausgeblendet."
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "Bleibt immer: Papierkorb und automatisches Speichern der Voreinstellungen, behobene Fehler der Portierung, Umschalten ohne Klicken, Befehlszeile und D-Bus. Keine Einstellung wird gelöscht."
+"Keep the end bands where they are" = "Randbänder lassen, wo sie sind"

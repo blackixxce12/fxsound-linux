@@ -130,3 +130,4 @@ countries: it
 "Plus the Windows sound: presets sound the same." = "Più il suono di Windows: preimpostazioni uguali."
 "Only what Windows has; the rest is hidden." = "Solo ciò che ha Windows; il resto è nascosto."
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "Resta sempre: cestino e salvataggio automatico delle preimpostazioni, errori del port corretti, passaggi senza clic, riga di comando e D-Bus. Nessuna impostazione viene eliminata."
+"Keep the end bands where they are" = "Lascia le bande estreme dove sono"

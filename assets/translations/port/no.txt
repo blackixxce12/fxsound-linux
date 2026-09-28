@@ -133,3 +133,4 @@ countries: no
 "Plus the Windows sound: presets sound the same." = "Pluss Windows-lyden: forhåndsinnstillinger låter likt."
 "Only what Windows has; the rest is hidden." = "Bare det Windows har; resten er skjult."
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "Beholdes alltid: papirkurven og automatisk lagring av forhåndsinnstillinger, rettede feil i porteringen, bytte uten klikk, kommandolinjen og D-Bus. Ingen innstilling slettes."
+"Keep the end bands where they are" = "La ytterbåndene stå der de er"

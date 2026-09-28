@@ -63,7 +63,7 @@ use fxsound_preset::input::InputPreset;
 use fxsound_ui::dialogs::settings::{AppLane, AppRow};
 use fxsound_ui::state::RoutedApp;
 
-use fxsound_dsp::preset::{MusicLevels, ladder, preset_params};
+use fxsound_dsp::preset::{MusicLevels, preset_params};
 
 use super::{App, PresetVoicing, apply_microphone_settings, lane_index, voice_params};
 use crate::events::AppEvent;
@@ -1078,13 +1078,15 @@ impl App {
     /// band count, with the speakers' levels, as the output lane's own snapshot is built — the
     /// shared [`preset_params`], which the bit-exactness harness and the offline renderers use too.
     ///
-    /// The ladder is the engine's own for the band count. The lane fits a preset of another count
+    /// The ladder is the engine's own for the band count, in the DSP the level of «Like FxSound for
+    /// Windows» plays ([`MusicLevels::ladder`]). The lane fits a preset of another count
     /// onto the centres its window holds at that moment, which are the same ones unless the
     /// preset showing moved a band's frequency; a route does not hang on what the window happens
     /// to show.
     fn music_route_params(&self, preset: &Preset) -> DspParams {
         let count = (self.settings.num_bands as usize).clamp(1, fxsound_core::eq::MAX_BANDS);
-        let mut params = preset_params(preset, &ladder(count), MusicLevels::of(&self.settings));
+        let levels = MusicLevels::of(&self.settings);
+        let mut params = preset_params(preset, &levels.ladder(count), levels);
         // On, since routes are sent only while it is ([`App::refresh_app_routes`]); said all the
         // same, so a route never runs a power the lane does not.
         params.power = self.state.power;

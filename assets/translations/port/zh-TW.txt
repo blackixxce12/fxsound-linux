@@ -128,3 +128,4 @@ countries: Taiwan
 "Plus the Windows sound: presets sound the same." = "再加上 Windows 的聲音：預設聽起來一樣。"
 "Only what Windows has; the rest is hidden." = "只保留 Windows 版有的功能，其餘隱藏。"
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "一律保留：預設的資源回收筒和自動儲存、已修正的移植錯誤、無喀噠聲的切換、命令列和 D-Bus。不會刪除任何設定。"
+"Keep the end bands where they are" = "保持首尾頻段不動"

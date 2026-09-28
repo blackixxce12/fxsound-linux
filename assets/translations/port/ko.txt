@@ -128,3 +128,4 @@ countries: kr
 "Plus the Windows sound: presets sound the same." = "Windows의 소리까지: 프리셋이 똑같이 들립니다."
 "Only what Windows has; the rest is hidden." = "Windows에 있는 것만. 나머지는 숨김."
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "항상 유지: 프리셋 휴지통과 자동 저장, 수정된 포트 오류, 클릭 없는 전환, 명령줄과 D-Bus. 어떤 설정도 삭제되지 않습니다."
+"Keep the end bands where they are" = "양 끝 대역을 그대로 두기"

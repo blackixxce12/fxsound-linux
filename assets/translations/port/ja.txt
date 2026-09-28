@@ -128,3 +128,4 @@ countries: ja
 "Plus the Windows sound: presets sound the same." = "さらにWindows版の音：プリセットが同じ音に。"
 "Only what Windows has; the rest is hidden." = "Windows版にある機能だけ。ほかは非表示。"
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "常に残るもの：プリセットのごみ箱と自動保存、修正済みの移植上の不具合、クリック音のない切り替え、コマンドラインとD-Bus。設定は削除されません。"
+"Keep the end bands where they are" = "両端の帯域をそのままにする"
