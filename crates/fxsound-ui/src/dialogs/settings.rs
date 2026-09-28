@@ -72,7 +72,7 @@ use egui::{
 };
 use fxsound_core::{
     AppKey, DeEsserMode, DenoiseChannelsOverride, DereverbLevel, DeviceDirection,
-    NoiseSuppressionOverride, ParityClass, Settings, WindowsParity,
+    NoiseSuppressionOverride, ParityClass, Settings, WindowsLook, WindowsParity,
 };
 use std::collections::HashMap;
 
@@ -175,6 +175,22 @@ pub fn nav_label_rect(button: Rect) -> Rect {
     Rect::from_min_max(
         pos2(left, button.top()),
         pos2(rule - NAV_LABEL_CLEARANCE, button.bottom()),
+    )
+}
+
+/// Where the Windows build sets a tab's caption: `height + 5` points in and `width - height + 5`
+/// wide, 115 points, past the rule (`FxSettingsDialog.cpp:73-75`). The button, 150 points wide,
+/// clips what runs further. What «Как в Windows» = Interface and above caption the original's three
+/// tabs in ([`WindowsLook::NavCaptions`], 0.4.0 audit #29 set back).
+#[must_use]
+pub fn windows_nav_label_rect(button: Rect) -> Rect {
+    let left = button.left() + button.height() + NAV_LABEL_GAP;
+    Rect::from_min_size(
+        pos2(left, button.top()),
+        vec2(
+            button.width() - button.height() + NAV_LABEL_GAP,
+            button.height(),
+        ),
     )
 }
 
@@ -425,6 +441,12 @@ impl SettingsTab {
         }
     }
 
+    /// Whether the Windows build has this tab: Audio, General and Help.
+    #[must_use]
+    pub const fn windows_has(self) -> bool {
+        matches!(self, Self::Audio | Self::General | Self::Help)
+    }
+
     /// The level of «Как в Windows» at which this tab stops being what it is in FxSound for
     /// Linux (`docs/0.5.0-windows-parity.md`, "Classification"). Exhaustive on purpose: a new tab
     /// does not compile until its level is decided.
@@ -635,12 +657,24 @@ impl LanguageChoice {
     /// Every position, in order.
     #[must_use]
     pub fn all() -> Vec<Self> {
+        Self::all_at(WindowsParity::Off)
+    }
+
+    /// Every position at a level of «Как в Windows»: [`LanguageChoice::all`], or from Interface on
+    /// the system entry and then the Windows build's order ([`i18n::WINDOWS_ORDER`],
+    /// [`WindowsLook::LanguageOrder`]) — the order only; every language keeps its own name.
+    #[must_use]
+    pub fn all_at(level: WindowsParity) -> Vec<Self> {
+        let codes: Vec<&'static str> = if level.windows_look(WindowsLook::LanguageOrder) {
+            i18n::WINDOWS_ORDER.to_vec()
+        } else {
+            i18n::LANGUAGES
+                .iter()
+                .map(|language| language.code)
+                .collect()
+        };
         std::iter::once(Self::System)
-            .chain(
-                i18n::LANGUAGES
-                    .iter()
-                    .map(|language| Self::Code(language.code)),
-            )
+            .chain(codes.into_iter().map(Self::Code))
             .collect()
     }
 
@@ -672,7 +706,13 @@ impl LanguageChoice {
     /// The position `steps` away, wrapping in both directions (`FxLanguage.cpp:80-111`).
     #[must_use]
     pub fn step(self, steps: isize) -> Self {
-        let all = Self::all();
+        self.step_at(steps, WindowsParity::Off)
+    }
+
+    /// [`LanguageChoice::step`] through the order of [`LanguageChoice::all_at`] `level`.
+    #[must_use]
+    pub fn step_at(self, steps: isize, level: WindowsParity) -> Self {
+        let all = Self::all_at(level);
         let count = all.len() as isize;
         let current = all.iter().position(|choice| *choice == self).unwrap_or(0) as isize;
         all[(current + steps).rem_euclid(count) as usize]
@@ -1054,9 +1094,24 @@ impl<'a> SettingsDialog<'a> {
             Stroke::new(1.0, palette.divider()),
         );
 
+        let windows_captions = self
+            .state
+            .settings
+            .windows_parity
+            .offered_or_below()
+            .windows_look(WindowsLook::NavCaptions);
         for tab in SettingsTab::ALL {
             let rect = nav_button_rect(content, tab.index());
-            if nav_button(ui, rect, tab, self.state.tab == tab, palette, icons) {
+            let windows_caption = windows_captions && tab.windows_has();
+            if nav_button(
+                ui,
+                rect,
+                tab,
+                self.state.tab == tab,
+                windows_caption,
+                palette,
+                icons,
+            ) {
                 response.push(SettingsAction::SelectTab(tab));
             }
         }
@@ -1094,11 +1149,16 @@ impl<'a> SettingsDialog<'a> {
 }
 
 /// One tab button (`FxSettingsDialog.cpp:46-76`). Returns whether it was clicked.
+///
+/// `windows_caption` sets the caption as the Windows build does: the normal font on one line in
+/// [`windows_nav_label_rect`], cut with an ellipsis there and clipped by the button, so a long
+/// translation runs into the rule as it does on Windows ([`WindowsLook::NavCaptions`]).
 fn nav_button(
     ui: &mut Ui,
     rect: Rect,
     tab: SettingsTab,
     selected: bool,
+    windows_caption: bool,
     palette: Palette,
     icons: &mut NavIcons,
 ) -> bool {
@@ -1132,6 +1192,20 @@ fn nav_button(
     } else {
         palette.color(FxColor::DefaultText)
     };
+    if windows_caption {
+        draw_truncated(
+            &ui.painter().with_clip_rect(rect),
+            &tr(tab.nav_label()),
+            normal_font(),
+            colour,
+            windows_nav_label_rect(rect),
+            Align2::LEFT_CENTER,
+        );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        return response.clicked();
+    }
     let label = nav_label_rect(rect);
     let caption = nav_caption(
         ui.ctx(),
@@ -1903,6 +1977,7 @@ fn general_pane(
         ui,
         language_rect(pane),
         choice,
+        state.settings.windows_parity.offered_or_below(),
         palette,
         assets,
         id.with("language"),
@@ -2042,12 +2117,14 @@ fn language_switch(
     ui: &mut Ui,
     rect: Rect,
     choice: LanguageChoice,
+    level: WindowsParity,
     palette: Palette,
     assets: &mut AssetCache,
     id: Id,
 ) -> Option<LanguageChoice> {
     // Both directions wrap, so neither arrow is ever disabled (`FxLanguage.cpp:80-111`).
-    stepper(ui, rect, &choice.label(), palette, assets, id).map(|steps| choice.step(steps))
+    stepper(ui, rect, &choice.label(), palette, assets, id)
+        .map(|steps| choice.step_at(steps, level))
 }
 
 /// The language switch's box, for any short list: ‹ and › either side of the current value.
@@ -3747,6 +3824,46 @@ mod tests {
     }
 
     #[test]
+    fn at_interface_the_language_switch_runs_in_the_windows_order_with_the_same_names() {
+        // 0.4.0 audit #28 set back at «Как в Windows» = Interface (`FxLanguage.cpp:25`): the order
+        // only; Türkçe, ไทย and Čeština keep their real names.
+        let level = WindowsParity::Interface;
+        let all = LanguageChoice::all_at(level);
+        assert_eq!(all.len(), LanguageChoice::all().len());
+        assert_eq!(
+            all[..6],
+            [
+                LanguageChoice::System,
+                LanguageChoice::Code("en"),
+                LanguageChoice::Code("ar"),
+                LanguageChoice::Code("ba"),
+                LanguageChoice::Code("bg"),
+                LanguageChoice::Code("hr"),
+            ]
+        );
+        assert_eq!(all[all.len() - 1], LanguageChoice::Code("zh-TW"));
+        // Russian is twenty-one presses on from English again, as on Windows.
+        assert_eq!(
+            LanguageChoice::Code("en").step_at(21, level),
+            LanguageChoice::Code("ru")
+        );
+        assert_eq!(
+            LanguageChoice::System.step_at(-1, level),
+            LanguageChoice::Code("zh-TW")
+        );
+        assert_eq!(LanguageChoice::Code("tr").label(), "Türkçe");
+        // Off keeps the order of the names.
+        assert_eq!(
+            LanguageChoice::all_at(WindowsParity::Off),
+            LanguageChoice::all()
+        );
+        assert_eq!(
+            LanguageChoice::Code("en").step_at(1, WindowsParity::Off),
+            LanguageChoice::Code("id")
+        );
+    }
+
+    #[test]
     fn the_current_choice_follows_the_settings_and_falls_back_to_the_system() {
         let mut settings = Settings::default();
         assert_eq!(LanguageChoice::current(&settings), LanguageChoice::System);
@@ -4643,8 +4760,13 @@ mod tests {
 
     /// The pane as `SettingsDialog::show` lays it out in a window at the origin.
     fn shown_pane() -> Rect {
+        pane_rect(shown_content())
+    }
+
+    /// The content rectangle of the window [`Window`] draws.
+    fn shown_content() -> Rect {
         let outer = Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE);
-        pane_rect(super::super::content_rect(outer))
+        super::super::content_rect(outer)
     }
 
     #[test]
@@ -4859,6 +4981,65 @@ mod tests {
             }
             assert!(problems.is_empty(), "{}", problems.join("\n"));
         });
+    }
+
+    #[test]
+    fn the_windows_caption_box_is_the_originals_and_runs_past_the_rule() {
+        // `FxSettingsDialog.cpp:73-75`: from `height + 5` in, `width - height + 5` wide.
+        let content = content();
+        for tab in SettingsTab::ALL {
+            let button = nav_button_rect(content, tab.index());
+            let label = windows_nav_label_rect(button);
+            assert!((label.left() - (button.left() + 45.0)).abs() < 1e-4);
+            assert!((label.width() - 115.0).abs() < 1e-4, "{label:?}");
+            assert!(label.right() > divider_x(content));
+            assert_eq!(label.y_range(), button.y_range());
+        }
+        assert!(SettingsTab::Audio.windows_has() && SettingsTab::Help.windows_has());
+        assert!(!SettingsTab::Microphone.windows_has());
+        assert!(!SettingsTab::Experimental.windows_has());
+    }
+
+    #[test]
+    fn at_interface_the_three_windows_tabs_caption_in_the_normal_font_clipped_by_their_button() {
+        // 0.4.0 audit #29 set back at «Как в Windows» = Interface; the port's own tabs keep the
+        // fitted caption.
+        let caption = |level: WindowsParity, wanted: &str| {
+            let mut window = Window::new(ThemeMode::Dark);
+            let mut state = experimental_state(level);
+            state.tab = SettingsTab::Audio;
+            window.frame(&state, Vec::new());
+            let (_, shapes) = window.frame(&state, Vec::new());
+            shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.text() == wanted => Some((
+                        clipped.clip_rect,
+                        text.galley.job.sections[0].format.font_id.size,
+                        clipped.shape.visual_bounding_rect(),
+                    )),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no {wanted:?} at {level:?}"))
+        };
+        for level in [WindowsParity::Interface, WindowsParity::Sound] {
+            for tab in [SettingsTab::Audio, SettingsTab::General, SettingsTab::Help] {
+                let (clip, size, _) = caption(level, tab.nav_label());
+                let button = nav_button_rect(shown_content(), tab.index());
+                assert_eq!(clip, button, "{tab:?}");
+                assert_eq!(size, super::super::NORMAL_FONT, "{tab:?}");
+            }
+            let (clip, size, bounds) = caption(level, "Microphone");
+            assert!(size < super::super::NORMAL_FONT, "fitted: {size}");
+            assert!(
+                bounds.right() <= divider_x(shown_content()),
+                "{bounds:?} {clip:?}"
+            );
+        }
+        // Off: every caption stops short of the rule.
+        let (clip, _, bounds) = caption(WindowsParity::Off, "Audio");
+        assert_ne!(clip, nav_button_rect(shown_content(), 0));
+        assert!(bounds.right() <= divider_x(shown_content()));
     }
 
     #[test]

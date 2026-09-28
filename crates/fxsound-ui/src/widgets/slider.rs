@@ -61,7 +61,8 @@ pub enum Fidelity {
     /// the minimum and runs 8 px past the track at the maximum (`FxTheme.cpp:230-237`), and ends
     /// the balance gradient eight points short of the track (`FxBalanceSlider.cpp:89`).
     ///
-    /// Kept to compare against the Windows build; nothing in the window asks for it.
+    /// What «Как в Windows» = Interface and above paint (`fxsound_core::WindowsLook::SliderFill`),
+    /// and a reference to compare against the Windows build.
     Faithful,
     /// Fill the track from its start to the thumb and run the balance gradient to the track's
     /// end, which is what the original clearly meant (D-2 and D-3,

@@ -128,6 +128,7 @@ fn main() -> eframe::Result<()> {
     if let Some(level) = args.iter().find_map(|a| a.strip_prefix("--parity=")) {
         match WindowsParity::parse(level) {
             Some(level) => {
+                preview.state.windows_parity = level.offered_or_below();
                 if let Some(settings) = &mut preview.settings {
                     settings.settings.windows_parity = level.offered_or_below();
                 }
@@ -162,7 +163,7 @@ fn main() -> eframe::Result<()> {
         "FxSound preview",
         options,
         Box::new(move |cc| {
-            theme::apply(&cc.egui_ctx, Palette::new(preview.state.theme));
+            theme::apply(&cc.egui_ctx, preview.palette());
             Ok(Box::new(preview))
         }),
     )
@@ -418,6 +419,12 @@ struct Preview {
 }
 
 impl Preview {
+    /// The palette the application would hand the views: the Windows theme from Interface on.
+    fn palette(&self) -> Palette {
+        Palette::new(self.state.theme)
+            .windows(self.state.windows_look(fxsound_core::WindowsLook::Palette))
+    }
+
     fn new(state: UiState, exit_after_paint: bool) -> Self {
         Self {
             state,
@@ -596,7 +603,12 @@ impl Preview {
                 settings.microphones.swap(*row, row + 1);
             }
             SettingsAction::SelectDeviceRow(row) => settings.selected_device = Some(*row),
-            SettingsAction::SetWindowsParity(level) => settings.settings.windows_parity = *level,
+            SettingsAction::SetWindowsParity(level) => {
+                settings.settings.windows_parity = *level;
+                self.state.windows_parity = *level;
+                // The level decides the popups' and tooltips' edges too (`Palette::windows`).
+                theme::apply(ctx, self.palette());
+            }
             SettingsAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => {}
         }
@@ -607,7 +619,7 @@ impl Preview {
             ThemeMode::Dark => ThemeMode::Light,
             ThemeMode::Light => ThemeMode::Dark,
         };
-        theme::apply(ctx, Palette::new(self.state.theme));
+        theme::apply(ctx, self.palette());
         self.assets.clear();
     }
 }
@@ -661,13 +673,7 @@ impl eframe::App for Preview {
         if let Some(settings) = &self.settings {
             let outer = egui::Rect::from_min_size(ui.max_rect().min, settings::WINDOW_SIZE);
             let actions = SettingsDialog::new(settings)
-                .show(
-                    ui,
-                    outer,
-                    Palette::new(self.state.theme),
-                    &mut self.assets,
-                    &mut self.icons,
-                )
+                .show(ui, outer, self.palette(), &mut self.assets, &mut self.icons)
                 .actions;
             for action in &actions {
                 self.handle_settings(&ctx, action);
@@ -680,11 +686,12 @@ impl eframe::App for Preview {
             return;
         }
 
+        let palette = self.palette();
         let response = views::show(
             ui,
             &self.state,
             &mut self.scratch,
-            Palette::new(self.state.theme),
+            palette,
             &mut self.assets,
         );
         for action in &response.actions {
@@ -697,12 +704,7 @@ impl eframe::App for Preview {
                 "Rock Ballad Extended Night",
             );
             if fxsound_ui::dialogs::MessageBox::new(&text)
-                .show_modal(
-                    &ctx,
-                    Palette::new(self.state.theme),
-                    &mut self.assets,
-                    "preview.message",
-                )
+                .show_modal(&ctx, self.palette(), &mut self.assets, "preview.message")
                 .is_some()
             {
                 self.message = None;

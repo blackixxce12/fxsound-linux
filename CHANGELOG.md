@@ -25,6 +25,17 @@ All notable changes to the FxSound Linux port. The format follows
   A `--set_band_gain` or `--set_band_freq` list sets the pairs that fit and skips the others, with
   a note, where Off refuses the whole list. The tray cuts a playback device's name after 30
   characters.
+- **«Like FxSound for Windows» = Interface brings back the Windows window.** Master Gain and
+  Balance step by 2 dB, Volume Leveling reads "dB", the light theme's power-off graphs and rules
+  are the original's again, the slider fill is painted as the original paints it, a long preset
+  name is cut together with its ` *`, the equalizer's curve is the straight line through the
+  bands, the end bands' wheels on five and ten bands turn one way from 62.5 Hz and 16 kHz, a
+  right-click on an effect slider no longer switches the effect off, only the Windows build's
+  tooltips are shown, Audio, General and Help are captioned in the normal font, the language
+  switch runs in the Windows order, and with the power off the preset list, the menu's preset
+  items and the tray's preset menu are not offered. Nothing you hear or have saved changes, the
+  command line and D-Bus still pick presets with the power off, and the microphone lane, which
+  Windows does not have, keeps its tooltips.
 - **Settings keep what a later version wrote.** A key of `settings.toml` this version does not
   know is written back as it was, so going back a version and up again keeps the newer version's
   settings. 0.4.0 does not keep them: after a downgrade to 0.4.0 its next save drops the keys 0.5.0

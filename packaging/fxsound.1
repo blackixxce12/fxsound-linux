@@ -409,7 +409,11 @@ saved like it:
 .B off
 (the default) is FxSound for Linux as it is;
 .B interface
-brings the window and its controls back to the Windows build's;
+brings the window and its controls back to the Windows build's \(em the 2 dB
+steps of Master Gain and Balance, its readouts, tooltips and light theme, the
+equalizer's straight-line curve and one-way end wheels, the language order,
+and with the power off no preset picked from the window, its menu or the tray
+(the command line and D-Bus still pick them) \(em without changing the sound;
 .B sound
 adds the Windows build's sound, so that a preset sounds as it does there.
 Each level includes the ones before it, none of them changes or deletes
@@ -1418,7 +1422,7 @@ and the microphones under
 a long name shortened in its middle so that the part that tells two devices of
 one card apart stays; at \(lqLike FxSound for Windows\(rq = interface and
 above a playback device's name is cut after 30 characters, as the Windows build
-cuts it.
+cuts it, and with the power off the preset submenus are left out, as there.
 .PP
 The systemd user unit is installed but deliberately not enabled. The desktop
 entry already starts FxSound when you launch it, and an enabled user unit on

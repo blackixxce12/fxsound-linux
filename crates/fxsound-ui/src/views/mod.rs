@@ -34,7 +34,7 @@ use crate::widgets::combo::SectionHeader;
 use crate::widgets::{EqInteraction, FxComboBox, VisualizerAnimation, combo};
 use egui::{Pos2, Rect, Ui, Vec2};
 use fxsound_core::i18n::tr;
-use fxsound_core::{AudioDevice, DeviceDirection, ViewMode};
+use fxsound_core::{AudioDevice, DeviceDirection, ViewMode, WindowsLook};
 
 /// Which face of the Pro window's effect column is showing.
 ///
@@ -212,6 +212,10 @@ pub fn device_sections(devices: &[AudioDevice]) -> DeviceSections {
 /// and a preset can now be chosen before switching on. What the preset sets stays grey until
 /// then. It lists the edit direction's presets, and a long name is cut before its `*`, never
 /// the `*` itself (audit #26). The box's response is handed back for a tooltip.
+///
+/// At «Как в Windows» = Interface and above both are the original's again: the list goes grey
+/// with the power ([`WindowsLook::PresetsNeedPower`]) and a long name is cut with its `*`
+/// ([`WindowsLook::ModifiedMarkCut`]).
 pub(crate) fn preset_combo(
     ui: &mut Ui,
     state: &UiState,
@@ -225,8 +229,14 @@ pub(crate) fn preset_combo(
         .iter()
         .map(|preset| combo::preset_label(&preset.name, preset.modified))
         .collect();
+    let keep = if state.windows_look(WindowsLook::ModifiedMarkCut) {
+        ""
+    } else {
+        combo::MODIFIED_SUFFIX
+    };
     let (combo, picked) = FxComboBox::new(&presets, state.selected_preset)
-        .keep_suffix(combo::MODIFIED_SUFFIX)
+        .enabled(state.presets_offered())
+        .keep_suffix(keep)
         .separator_before(first_user_preset(&state.presets))
         .show(ui, rect, palette, assets, "preset_list");
     if let Some(index) = picked {
@@ -1122,6 +1132,55 @@ mod tests {
         ));
         let usb = device("USB microphone", DeviceDirection::Input);
         assert!(!shown(&mut harness, &on_the_microphone(usb)));
+    }
+
+    #[test]
+    fn a_long_modified_preset_keeps_its_mark_at_off_and_loses_it_with_the_name_at_interface() {
+        // 0.4.0 audit #26, and set back at «Как в Windows» = Interface (`FxTheme.cpp:128-133`
+        // cuts the whole label).
+        use crate::layout;
+        use crate::widgets::combo;
+        use fxsound_core::{ThemeMode, WindowsParity};
+
+        let long = "Evening Headphones Mix For The Late Train Home And Back Again";
+        let state = |level: WindowsParity| UiState {
+            presets: vec![PresetEntry {
+                name: long.to_owned(),
+                factory: false,
+                modified: true,
+            }],
+            selected_preset: Some(0),
+            windows_parity: level,
+            ..UiState::default()
+        };
+        let closed = layout::pro::preset_combo();
+        // Each text painted in the closed box, and whether it was cut.
+        let painted = |level: WindowsParity| {
+            let mut harness = testing::Harness::new(ThemeMode::Dark);
+            let shapes = harness.settle(&state(level));
+            shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text)
+                        if closed.contains(clipped.shape.visual_bounding_rect().center()) =>
+                    {
+                        Some((text.galley.text().to_owned(), text.galley.elided))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let off = painted(WindowsParity::Off);
+        assert!(
+            off.contains(&(combo::MODIFIED_SUFFIX.to_owned(), false)),
+            "the mark is drawn whole: {off:?}"
+        );
+        let windows = painted(WindowsParity::Interface);
+        assert_eq!(
+            windows,
+            [(combo::preset_label(long, true), true)],
+            "one label, cut with its mark"
+        );
     }
 
     #[test]

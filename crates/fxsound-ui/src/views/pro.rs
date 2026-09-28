@@ -47,13 +47,14 @@ use crate::views::{
     self, ColumnFace, ViewScratch, at, equalizer_controls, titlebar, window_origin, window_rect,
 };
 use crate::widgets::icon_button;
+use crate::widgets::slider::Fidelity;
 use crate::widgets::{EqualizerWidget, FxSlider, IconButton, VisualizerWidget};
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
     Align, Align2, Color32, CornerRadius, CursorIcon, Id, Rect, Sense, Ui, Vec2, pos2, vec2,
 };
 use fxsound_core::i18n::tr;
-use fxsound_core::{Effect, ViewMode, scale};
+use fxsound_core::{Effect, ViewMode, WindowsLook, scale};
 
 /// The effect captions' JUCE height: `getNormalFont().withHeight(14.0f)`
 /// (`FxAudioControls.cpp:104`).
@@ -752,6 +753,18 @@ fn input_meters(ui: &Ui, state: &UiState, palette: Palette, strip: Rect) {
     }
 }
 
+/// How the window's sliders paint their fill: as the original's `drawLinearSlider` does at «Как в
+/// Windows» = Interface and above ([`WindowsLook::SliderFill`], 0.4.0 audit #41), corrected
+/// otherwise.
+#[must_use]
+pub fn slider_fidelity(state: &UiState) -> Fidelity {
+    if state.windows_look(WindowsLook::SliderFill) {
+        Fidelity::Faithful
+    } else {
+        Fidelity::Corrected
+    }
+}
+
 /// The effect column: the card, whichever face is up, and the flip button over both
 /// (`FxAudioControls`, `FxAudioControls.cpp:26-90`).
 fn audio_controls(
@@ -796,7 +809,7 @@ fn audio_controls(
             equalizer_controls::DISABLED_BUTTON_OPACITY
         })
         .tooltip(&tip)
-        .hide_tooltips(state.hide_tooltips)
+        .hide_tooltips(!state.port_tips_shown())
         .show(
             ui,
             equalizer_controls::flip_button(column),
@@ -857,11 +870,18 @@ fn effect_column(
         // A right-click switches the effect off, as it puts a level back to its neutral value on
         // the other face: the original gives only `FxAudioSlider` and `FxBalanceSlider` the reset
         // (`docs/spec/03-controls.md` §3.5), and the port gives it these five too (0.4.0 audit R9).
+        //
+        // At «Как в Windows» = Interface and above the original's again: no right-click reset
+        // ([`WindowsLook::EffectReset`]), no word of one in the tip, and the fill painted as
+        // `drawLinearSlider` paints it ([`WindowsLook::SliderFill`]). On a microphone the five
+        // are inert at every level — no reset, and the tip says why — so there is nothing of the
+        // port's own for Interface to keep on that lane.
         let steps = StoredSteps(effect);
         let slider = FxSlider::new(&mut value, 0.0, scale::SLIDER_MAX, 1.0)
             .fine_steps(&steps)
             .default_value(0.0)
-            .reset_on_secondary_click(true)
+            .reset_on_secondary_click(!state.windows_look(WindowsLook::EffectReset))
+            .fidelity(slider_fidelity(state))
             .enabled(enabled)
             .show(ui, rect, palette, assets, effect.key());
         let changed = slider.changed();
@@ -871,9 +891,12 @@ fn effect_column(
         // is "why", and the answer has to be somewhere the user is already looking.
         if !state.hide_tooltips {
             let _ = if applies {
-                slider.on_hover_text(crate::widgets::slider::with_reset_tip(Some(&tr(
-                    effect.tooltip()
-                ))))
+                let tip = tr(effect.tooltip());
+                slider.on_hover_text(if state.port_tips_shown() {
+                    crate::widgets::slider::with_reset_tip(Some(&tip))
+                } else {
+                    tip
+                })
             } else {
                 slider.on_hover_text(tr(MICROPHONE_INERT_TIP))
             };
@@ -1521,6 +1544,128 @@ mod tests {
         assert!(press(&mut harness, &off, track.center(), PointerButton::Secondary).is_empty());
     }
 
+    /// [`state`] at «Как в Windows» = Interface.
+    fn windows_state() -> UiState {
+        UiState {
+            windows_parity: fxsound_core::WindowsParity::Interface,
+            ..state()
+        }
+    }
+
+    #[test]
+    fn at_interface_a_right_click_on_an_effect_is_a_press_like_any_other_as_on_windows() {
+        // 0.4.0 audit R9 set back: the original gives the reset to the level sliders only, and a
+        // JUCE slider with no popup menu takes the right button as it takes the left — the thumb
+        // goes to the pointer — where the port's right-click switches the effect off.
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let state = windows_state();
+        harness.settle(&state);
+        for effect in Effect::ALL {
+            let track = slider::track_rect(effects::slider_rect(column(), effect as usize));
+            let at = pos2(track.right() - 2.0, track.center().y);
+            let actions = press(&mut harness, &state, at, PointerButton::Secondary);
+            assert_eq!(
+                actions,
+                vec![UiAction::SetEffect(effect, 10.0)],
+                "{effect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn at_interface_an_effects_tip_is_the_originals_alone() {
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let rect = effects::slider_rect(column(), Effect::Bass as usize);
+        let shown = harness.rest(&windows_state(), rect.center());
+        let tip = shown
+            .iter()
+            .find(|text| text.starts_with("Boosts low end"))
+            .unwrap_or_else(|| panic!("no tip in {shown:?}"));
+        let effect = Effect::Bass;
+        assert_eq!(*tip, tr(effect.tooltip()));
+        assert!(!tip.contains(slider::RESET_TIP), "{tip:?}");
+    }
+
+    #[test]
+    fn the_sliders_fill_is_the_originals_at_interface_and_corrected_at_off() {
+        // 0.4.0 audit #41: `Fidelity::Faithful` is how `drawLinearSlider` paints.
+        assert_eq!(slider_fidelity(&state()), Fidelity::Corrected);
+        assert_eq!(slider_fidelity(&windows_state()), Fidelity::Faithful);
+        assert_eq!(
+            slider_fidelity(&UiState {
+                windows_parity: fxsound_core::WindowsParity::Sound,
+                ..state()
+            }),
+            Fidelity::Faithful
+        );
+    }
+
+    #[test]
+    fn at_interface_an_effect_sliders_fill_takes_the_thumbs_x_as_its_width_as_on_windows() {
+        // 0.4.0 audit #41 set back: `drawLinearSlider` passes the thumb's absolute x as the fill's
+        // width (`FxTheme.cpp:230-237`); Off fills from the track's start to the thumb.
+        let effect = Effect::ALL[0];
+        let rect = effects::slider_rect(column(), effect as usize);
+        let track = slider::track_rect(rect);
+        let t = state().effect(effect) / scale::SLIDER_MAX;
+        let thumb_x = track.left() + track.width() * t;
+        let fill_right = |state: &UiState| {
+            let mut harness = Harness::new(ThemeMode::Dark);
+            let shapes = harness.settle(state);
+            shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(shape)
+                        if (shape.rect.min - track.min).length() < 1e-3
+                            && (shape.rect.height() - track.height()).abs() < 1e-3
+                            && (shape.rect.width() - track.width()).abs() > 1e-3 =>
+                    {
+                        Some(shape.rect.right())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no fill for {effect:?}"))
+        };
+        let off = fill_right(&state());
+        assert!((off - thumb_x).abs() < 1e-3, "Off: {off} against {thumb_x}");
+        let faithful = fill_right(&windows_state());
+        let want = track.left() + (thumb_x - rect.left());
+        assert!(
+            (faithful - want).abs() < 1e-3,
+            "Interface: {faithful} against {want}"
+        );
+    }
+
+    #[test]
+    fn at_interface_the_microphones_effects_are_as_inert_as_off() {
+        // They are the music chain's and do nothing on a voice (see
+        // `UiState::music_effects_apply`): no reset to set back and a tip that says why, at every
+        // level.
+        for parity in [
+            fxsound_core::WindowsParity::Off,
+            fxsound_core::WindowsParity::Interface,
+        ] {
+            let state = UiState {
+                windows_parity: parity,
+                ..microphone_state()
+            };
+            let rect = effects::slider_rect(column(), Effect::Bass as usize);
+            let mut harness = Harness::new(ThemeMode::Dark);
+            let shown = harness.rest(&state, rect.center());
+            assert!(
+                shown.iter().any(|t| t == MICROPHONE_INERT_TIP),
+                "{parity:?}: {shown:?}"
+            );
+            let mut harness = Harness::new(ThemeMode::Dark);
+            harness.settle(&state);
+            let track = slider::track_rect(rect);
+            for button in [PointerButton::Primary, PointerButton::Secondary] {
+                let actions = press(&mut harness, &state, track.center(), button);
+                assert!(actions.is_empty(), "{parity:?} {button:?}: {actions:?}");
+            }
+        }
+    }
+
     #[test]
     fn an_effects_tip_names_the_right_click_under_its_own() {
         let mut harness = Harness::new(ThemeMode::Dark);
@@ -1605,6 +1750,18 @@ mod tests {
     }
 
     #[test]
+    fn at_interface_the_card_flip_has_no_tip_as_on_windows() {
+        // 0.4.0 audit #27 set back: `FxAudioControls.cpp:78-85` gives it none.
+        let flip = equalizer_controls::flip_button(column()).center();
+        let mut harness = Harness::new(ThemeMode::Dark);
+        let shown = harness.rest(&windows_state(), flip);
+        assert!(
+            !shown.contains(&"Equalizer settings".to_owned()),
+            "{shown:?}"
+        );
+    }
+
+    #[test]
     fn with_the_power_off_the_band_gains_stay_on_screen_greyed_and_readable() {
         // 0.4.0 audit #42, the equalizer's half; greyed to 3:1 on the panel (review FA).
         use crate::widgets::equalizer::{EqLayout, gain_label, gain_label_colour};
@@ -1679,6 +1836,36 @@ mod tests {
             } else {
                 assert_eq!(*tip, gestures);
             }
+        }
+    }
+
+    #[test]
+    fn at_interface_a_band_tip_is_the_originals_alone_and_only_at_ten_bands() {
+        // `FxEqualizer.cpp:326-343`: the description at ten bands, nothing at the others, and no
+        // word of the right-click or the solo (0.4.0 audit R9 and the port's tips set back).
+        use crate::widgets::equalizer::{BAND_TOOLTIPS, EqLayout, SOLO_TIP};
+        let panel = layout::pro::equalizer();
+        for count in [10, 31] {
+            let mut state = windows_state();
+            state.eq_bands = (0..count)
+                .map(|band| fxsound_core::EqBand::new(30.0 + 500.0 * band as f32, 0.0))
+                .collect();
+            let hit = EqLayout::new(count)
+                .gain_hit_rect(2)
+                .translate(panel.min.to_vec2());
+            let mut harness = Harness::new(ThemeMode::Dark);
+            let shown = harness.rest(&state, hit.center());
+            assert!(
+                !shown
+                    .iter()
+                    .any(|text| text.contains(slider::RESET_TIP) || text.contains(SOLO_TIP)),
+                "{count} bands: {shown:?}"
+            );
+            assert_eq!(
+                shown.iter().any(|text| text == BAND_TOOLTIPS[2]),
+                count == 10,
+                "{count} bands: {shown:?}"
+            );
         }
     }
 

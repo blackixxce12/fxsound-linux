@@ -86,15 +86,41 @@ pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
 }
 
 /// The active palette.
+///
+/// The theme the window is drawn in: FxSound's dark or light table, and whether it is the Windows
+/// build's theme exactly as it is ([`Palette::windows`]), which «Как в Windows» = Interface and
+/// above ask for. Every colour the window paints comes through here, so this is also where a
+/// theme of a later version gives way to the Windows one at those levels
+/// ([`fxsound_core::LaterFeature::Themes`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     mode: ThemeMode,
+    windows: bool,
 }
 
 impl Palette {
     #[must_use]
     pub const fn new(mode: ThemeMode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            windows: false,
+        }
+    }
+
+    /// The palette of FxSound for Windows exactly as it is, the two legibility repairs of 0.4.0
+    /// undone ([`fxsound_core::WindowsLook::Palette`], 0.4.0 audit #24 and #25): a graph that is
+    /// switched off greys by the original's `withSaturation(0)`, which turns the light theme's
+    /// blues white, and a rule or a menu's edge is `Outline`, `#fafafa` on the light window. The
+    /// dark palette is the same either way.
+    #[must_use]
+    pub const fn windows(self, windows: bool) -> Self {
+        Self { windows, ..self }
+    }
+
+    /// Whether this is the Windows build's theme as it is ([`Palette::windows`]).
+    #[must_use]
+    pub const fn is_windows(self) -> bool {
+        self.windows
     }
 
     #[must_use]
@@ -152,12 +178,13 @@ impl Palette {
     /// The light `Outline` is `#fafafa`, 1.04:1 on the `#f5f5f5` window, so the Settings rule and
     /// the hamburger menu's edge the original draws in it are not there at all (0.4.0 audit #25).
     /// The light palette's own `#c0c0c0` — its `PanelBackground` — is used instead; the palette
-    /// tables are left as the original's.
+    /// tables are left as the original's. The Windows theme ([`Palette::windows`]) keeps
+    /// `Outline`.
     #[must_use]
     pub const fn divider(self) -> Color32 {
         match self.mode {
-            ThemeMode::Dark => self.color(FxColor::Outline),
-            ThemeMode::Light => Color32::from_rgb(0xc0, 0xc0, 0xc0),
+            ThemeMode::Light if !self.windows => Color32::from_rgb(0xc0, 0xc0, 0xc0),
+            ThemeMode::Dark | ThemeMode::Light => self.color(FxColor::Outline),
         }
     }
 
@@ -169,12 +196,14 @@ impl Palette {
     /// the light palette that turns the light blues white, `#1ac1ff` and `#72d8ff` into `#ffffff`
     /// on a `#e0e0e0` panel, 1.3:1, and the graph is gone — "a real legibility bug", which 0.3.0
     /// reproduced (0.4.0 audit #24). There the grey is the colour's luma instead, and no lighter
-    /// than [`LIGHT_GREY_LIMIT`], which still reads at 3:1 on the panel. Alpha is kept.
+    /// than [`LIGHT_GREY_LIMIT`], which still reads at 3:1 on the panel. Alpha is kept. The
+    /// Windows theme ([`Palette::windows`]) keeps the original's brightness in both palettes.
     #[must_use]
     pub fn greyed(self, colour: Color32) -> Color32 {
         let [r, g, b, a] = colour.to_srgba_unmultiplied();
         let grey = match self.mode {
             ThemeMode::Dark => r.max(g).max(b),
+            ThemeMode::Light if self.windows => r.max(g).max(b),
             ThemeMode::Light => {
                 let luma = 0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b);
                 (luma.round() as u8).min(LIGHT_GREY_LIMIT)
@@ -442,6 +471,34 @@ mod tests {
         assert_eq!(dark.divider(), dark.color(FxColor::Outline));
         // The palette table itself stays the original's.
         assert_eq!(LIGHT[FxColor::Outline as usize], 0xfa_fafa);
+    }
+
+    #[test]
+    fn the_windows_theme_keeps_the_originals_outline_and_greys_white_in_the_light_palette() {
+        // «Как в Windows» = Interface: 0.4.0 audit #24 and #25 set back.
+        let light = Palette::new(ThemeMode::Light).windows(true);
+        assert!(light.is_windows() && !Palette::new(ThemeMode::Light).is_windows());
+        assert_eq!(light.divider(), light.color(FxColor::Outline));
+        assert_eq!(
+            light.greyed(light.color(FxColor::GraphHigh)),
+            Color32::WHITE,
+            "#1ac1ff by withSaturation(0) is white"
+        );
+        assert_eq!(
+            light.greyed(Color32::from_rgba_unmultiplied(0x1a, 0xc1, 0xff, 191)),
+            Color32::from_rgba_unmultiplied(0xff, 0xff, 0xff, 191)
+        );
+        // The dark palette is the original's either way.
+        let dark = Palette::new(ThemeMode::Dark);
+        for id in [FxColor::GraphHigh, FxColor::EqStart, FxColor::SliderTrack] {
+            let colour = dark.color(id);
+            assert_eq!(dark.windows(true).greyed(colour), dark.greyed(colour));
+        }
+        assert_eq!(dark.windows(true).divider(), dark.divider());
+        // And the light palette off the mode keeps 0.4.0's repairs.
+        let fixed = Palette::new(ThemeMode::Light);
+        assert_ne!(fixed.divider(), light.divider());
+        assert!(fixed.greyed(fixed.color(FxColor::GraphHigh)).r() <= LIGHT_GREY_LIMIT);
     }
 
     /// `docs/spec/04-equalizer-visualizer.md` §A8's precomputed greys, dark column:

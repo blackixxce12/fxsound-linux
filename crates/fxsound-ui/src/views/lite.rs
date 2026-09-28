@@ -432,6 +432,62 @@ mod tests {
         }
     }
 
+    /// Whether a click on the Lite window's `combo`, its menu hung off `salt`, opens the menu.
+    fn click_opens(state: &UiState, combo: egui::Rect, salt: &str) -> bool {
+        let ctx = test_context();
+        let mut scratch = ViewScratch::new();
+        let mut assets = AssetCache::new();
+        let at = combo.center();
+        let button = |pressed| Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        frame(
+            &ctx,
+            state,
+            &mut scratch,
+            &mut assets,
+            vec![Event::PointerMoved(at)],
+        );
+        frame(
+            &ctx,
+            state,
+            &mut scratch,
+            &mut assets,
+            vec![Event::PointerMoved(at), button(true), button(false)],
+        );
+        egui::Popup::is_id_open(&ctx, egui::Id::new("fx_combo_box").with(salt).with("popup"))
+    }
+
+    #[test]
+    fn at_interface_with_the_power_off_the_preset_list_stays_shut_as_on_windows() {
+        // FxLiteView.cpp:57 at «Как в Windows» = Interface (0.4.0 audit R7 set back): the preset
+        // list goes with the power, the output list does not.
+        let off = UiState {
+            power: false,
+            windows_parity: fxsound_core::WindowsParity::Interface,
+            ..state()
+        };
+        assert!(!click_opens(
+            &off,
+            layout::lite::preset_combo(),
+            "preset_list"
+        ));
+        assert!(click_opens(
+            &off,
+            layout::lite::output_combo(),
+            "output_list"
+        ));
+        let on = UiState { power: true, ..off };
+        assert!(click_opens(
+            &on,
+            layout::lite::preset_combo(),
+            "preset_list"
+        ));
+    }
+
     // ---- two lanes in one list ---------------------------------------------------------------
 
     fn device(name: &str, direction: DeviceDirection) -> AudioDevice {

@@ -270,6 +270,192 @@ impl ParityClass {
     }
 }
 
+/// A way the window looks or works in the Windows build that the port changed, and that
+/// Interface sets back (`docs/0.5.0-windows-parity.md` §2, "Window look", and §2.1): one variant
+/// per approved row, named at the place in the interface that follows it, so that a search for
+/// the variant finds everything the row changes.
+///
+/// Not listed, because the approved table keeps them at every level: the values shown with the
+/// power off (#42, a port error), Restore Defaults keeping the band count (R5, data loss) and an
+/// effect slider showing a stored value between its positions (#14, which only keeps a touch from
+/// changing a preset silently).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WindowsLook {
+    /// Master Gain and Balance move by two decibels, as the Windows sliders do (0.4.0 audit #22).
+    /// The microphone's Makeup Gain, which Windows does not have, keeps its one.
+    LevelSteps,
+    /// Volume Leveling's readout says `dB` after its 0 to 4 amount (#23).
+    LevelingUnit,
+    /// The Windows palette as it is (#24, #25): in the light theme a graph that is switched off
+    /// turns its colours white, and the rules and a menu's edge are `Outline`.
+    Palette,
+    /// A long preset name is cut with its unsaved-changes mark, not before it (#26).
+    ModifiedMarkCut,
+    /// Only the tooltips the Windows build has (#27 and the tips the port added to Windows
+    /// controls): none on the title bar's buttons, the card's flip button or the level sliders,
+    /// and no line about a right-click reset or the solo. The port's own features, the microphone
+    /// lane among them, keep theirs.
+    WindowsTooltips,
+    /// The three Windows tabs of Settings caption themselves in the normal font on one line, cut
+    /// where the button ends, as on Windows (#29). The port's own tabs keep the fitted caption.
+    NavCaptions,
+    /// A slider's fill painted as `drawLinearSlider` paints it, from the thumb's x as a width
+    /// (#41, `Fidelity::Faithful`).
+    SliderFill,
+    /// The five- and ten-band equalizer's end bands tune one way only, from the ladder's edge
+    /// inwards (R6). A band a preset already puts past the edge stays there and can only move in.
+    EndBandWheels,
+    /// With the power off the preset list, the menu's preset items and the tray's preset
+    /// submenus are not offered (R7). The command line and D-Bus still pick presets.
+    PresetsNeedPower,
+    /// The equalizer's curve is the straight line through the bands' gains, not the response
+    /// that plays (R8).
+    CurveThroughBands,
+    /// A right-click does not reset an effect slider (R9): it presses it as the left button does,
+    /// as a JUCE slider takes it. The level sliders and the bands keep their reset, which Windows
+    /// has.
+    EffectReset,
+    /// The language switch runs in the Windows build's order (#28): the order only, never its
+    /// wrong names.
+    LanguageOrder,
+    /// The tray cuts a playback device's name after 30 characters (#31; W3).
+    TrayNames,
+}
+
+impl WindowsLook {
+    /// Every row, in the audit's order.
+    pub const ALL: [Self; 13] = [
+        Self::LevelSteps,
+        Self::LevelingUnit,
+        Self::Palette,
+        Self::ModifiedMarkCut,
+        Self::WindowsTooltips,
+        Self::NavCaptions,
+        Self::SliderFill,
+        Self::EndBandWheels,
+        Self::PresetsNeedPower,
+        Self::CurveThroughBands,
+        Self::EffectReset,
+        Self::LanguageOrder,
+        Self::TrayNames,
+    ];
+
+    /// The level that sets the row back to Windows. Exhaustive, so a new row cannot be added
+    /// without deciding it.
+    #[must_use]
+    pub const fn parity_class(self) -> ParityClass {
+        match self {
+            Self::LevelSteps
+            | Self::LevelingUnit
+            | Self::Palette
+            | Self::ModifiedMarkCut
+            | Self::WindowsTooltips
+            | Self::NavCaptions
+            | Self::SliderFill
+            | Self::EndBandWheels
+            | Self::PresetsNeedPower
+            | Self::CurveThroughBands
+            | Self::EffectReset
+            | Self::LanguageOrder
+            | Self::TrayNames => ParityClass::Interface,
+        }
+    }
+
+    /// The 0.4.0 audit item the row reverts, as the contract document names it.
+    #[must_use]
+    pub const fn audit_item(self) -> &'static str {
+        match self {
+            Self::LevelSteps => "#22",
+            Self::LevelingUnit => "#23",
+            Self::Palette => "#24, #25",
+            Self::ModifiedMarkCut => "#26",
+            Self::WindowsTooltips => "#27",
+            Self::NavCaptions => "#29",
+            Self::SliderFill => "#41",
+            Self::EndBandWheels => "R6",
+            Self::PresetsNeedPower => "R7",
+            Self::CurveThroughBands => "R8",
+            Self::EffectReset => "R9",
+            Self::LanguageOrder => "#28",
+            Self::TrayNames => "#31",
+        }
+    }
+}
+
+/// A feature a later version of FxSound adds, and the level at which it gives way to the Windows
+/// build (`docs/0.5.0-windows-parity.md` §2.2). None of them is in 0.5.0: this is the hook each
+/// one asks when it arrives, through [`WindowsParity::keeps`], so that the level is decided here,
+/// once, in an exhaustive `match`, and not by each feature on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LaterFeature {
+    /// The Customization tab and the themes beyond FxSound's two (0.7.0): the Windows palette
+    /// from Interface on; the tab is one line there, and hidden at Everything.
+    Themes,
+    /// Following the system's or the shell's palette (0.7.0): its watchers stop from Interface
+    /// on.
+    SystemPalette,
+    /// The visualizer's new modes (0.7.0): Spectrum only from Interface on.
+    VisualizerModes,
+    /// The rainbow wordmark (0.7.0): the original wordmark, with its fade, from Interface on.
+    RainbowWordmark,
+    /// Frosted glass (0.7.0): opaque from Interface on.
+    Glass,
+    /// Importing foreign preset formats (0.7.0): up to Interface and sound, hidden at
+    /// Everything.
+    ForeignFormats,
+    /// Global shortcuts through the portal (0.7.0): every level, since they bring back the
+    /// Windows hotkeys.
+    GlobalShortcuts,
+    /// The MCP server and `--diag` (0.6.0): every level.
+    Mcp,
+    /// `fxsound cava` / `fxcava` (0.7.0): independent of the level.
+    Cava,
+}
+
+impl LaterFeature {
+    /// Every feature, in the order of the contract document.
+    pub const ALL: [Self; 9] = [
+        Self::Themes,
+        Self::SystemPalette,
+        Self::VisualizerModes,
+        Self::RainbowWordmark,
+        Self::Glass,
+        Self::ForeignFormats,
+        Self::GlobalShortcuts,
+        Self::Mcp,
+        Self::Cava,
+    ];
+
+    /// The level from which the feature gives way to the Windows build.
+    #[must_use]
+    pub const fn parity_class(self) -> ParityClass {
+        match self {
+            Self::Themes
+            | Self::SystemPalette
+            | Self::VisualizerModes
+            | Self::RainbowWordmark
+            | Self::Glass => ParityClass::Interface,
+            Self::ForeignFormats => ParityClass::Full,
+            Self::GlobalShortcuts | Self::Mcp | Self::Cava => ParityClass::Never,
+        }
+    }
+}
+
+impl WindowsParity {
+    /// Whether the window follows the Windows build in `look` at this level.
+    #[must_use]
+    pub const fn windows_look(self, look: WindowsLook) -> bool {
+        self.changes(look.parity_class())
+    }
+
+    /// Whether a feature of a later version runs as it would with the mode off: `false` from the
+    /// level at which it gives way to the Windows build ([`LaterFeature::parity_class`]).
+    #[must_use]
+    pub const fn keeps(self, feature: LaterFeature) -> bool {
+        !self.changes(feature.parity_class())
+    }
+}
+
 /// What the command line and D-Bus answer to Everything in 0.5.0, which does not offer it
 /// ([`WindowsParity::offered`]). Plain English, as every refusal of theirs.
 pub const FULL_NOT_YET: &str = "\"Like FxSound for Windows\" = Everything arrives in a later \
@@ -378,6 +564,48 @@ mod tests {
             WindowsParity::Off
         );
         assert_eq!(read("windows_parity = 1979-05-27"), WindowsParity::Off);
+    }
+
+    #[test]
+    fn every_row_of_the_window_look_follows_windows_from_interface_up_and_not_at_off() {
+        for look in WindowsLook::ALL {
+            assert_eq!(look.parity_class(), ParityClass::Interface, "{look:?}");
+            assert!(!WindowsParity::Off.windows_look(look), "{look:?}");
+            for level in [
+                WindowsParity::Interface,
+                WindowsParity::Sound,
+                WindowsParity::Full,
+            ] {
+                assert!(level.windows_look(look), "{level:?} {look:?}");
+            }
+            assert!(look.audit_item().starts_with(['#', 'R']), "{look:?}");
+        }
+    }
+
+    #[test]
+    fn a_later_feature_gives_way_at_the_level_the_contract_names() {
+        use LaterFeature::{
+            Cava, ForeignFormats, Glass, GlobalShortcuts, Mcp, RainbowWordmark, SystemPalette,
+            Themes, VisualizerModes,
+        };
+        for feature in LaterFeature::ALL {
+            assert!(WindowsParity::Off.keeps(feature), "{feature:?}");
+        }
+        for feature in [
+            Themes,
+            SystemPalette,
+            VisualizerModes,
+            RainbowWordmark,
+            Glass,
+        ] {
+            assert!(!WindowsParity::Interface.keeps(feature), "{feature:?}");
+            assert!(!WindowsParity::Sound.keeps(feature), "{feature:?}");
+        }
+        assert!(WindowsParity::Sound.keeps(ForeignFormats));
+        assert!(!WindowsParity::Full.keeps(ForeignFormats));
+        for feature in [GlobalShortcuts, Mcp, Cava] {
+            assert!(WindowsParity::Full.keeps(feature), "{feature:?}");
+        }
     }
 
     #[test]

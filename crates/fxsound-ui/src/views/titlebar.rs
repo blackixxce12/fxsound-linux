@@ -232,7 +232,7 @@ pub fn show(
     let power_tip = TitleButton::Power.tip(state);
     if PowerButton::new(state.power)
         .tooltip(&power_tip)
-        .hide_tooltips(state.hide_tooltips)
+        .hide_tooltips(!state.port_tips_shown())
         .show(
             ui,
             at(origin, chrome.power.rect()),
@@ -323,6 +323,10 @@ fn drag_region(
 /// alphas in opposite directions (`FxWindow.cpp:181`, `:193-208`); painting both at complementary
 /// opacities is the same picture. While the fade is running the context is asked to repaint, so a
 /// window with no other animation still finishes the transition.
+///
+/// This is the original's wordmark at every level of «Как в Windows»; a wordmark animation of a
+/// later version gives way to it from Interface on
+/// ([`fxsound_core::LaterFeature::RainbowWordmark`]).
 fn paint_logo(
     ui: &Ui,
     state: &UiState,
@@ -393,7 +397,9 @@ impl TitleButton {
     /// Button", "Minimize Button" — which is accessibility text and never a hover bubble
     /// (`FxMainWindow.cpp:193-221`), so five small glyphs, two of which change what they mean
     /// with the state, went unexplained (0.4.0 audit #27). The power button's two are the tray
-    /// menu's own, translated in every table. "Hide help tips" hides these as it hides the rest.
+    /// menu's own, translated in every table. "Hide help tips" hides these as it hides the rest,
+    /// and «Как в Windows» = Interface and above leave them out, as the original does
+    /// ([`fxsound_core::WindowsLook::WindowsTooltips`]).
     #[must_use]
     pub fn tip(self, state: &UiState) -> String {
         tr(match self {
@@ -430,7 +436,7 @@ fn icon(
     IconButton::new(normal)
         .hover(hover)
         .tooltip(tip)
-        .hide_tooltips(state.hide_tooltips)
+        .hide_tooltips(!state.port_tips_shown())
         .show(ui, rect, palette, assets, id_salt)
 }
 
@@ -444,7 +450,7 @@ fn close(ui: &mut Ui, state: &UiState, palette: Palette, rect: Rect, tip: &str) 
             Sense::click(),
         )
         .on_hover_cursor(CursorIcon::PointingHand);
-    if !state.hide_tooltips {
+    if state.port_tips_shown() {
         response = response.on_hover_text(icon_button::tooltip_text(tip, palette));
     }
     paint_close_glyph(ui.painter(), rect, palette);
@@ -820,6 +826,25 @@ mod tests {
         };
         assert_eq!(TitleButton::Power.tip(&off), "Turn On");
         assert!(resting_on(&off, TitleButton::Power).contains(&"Turn On".to_owned()));
+    }
+
+    #[test]
+    fn at_interface_the_title_bars_buttons_have_no_tips_as_on_windows() {
+        // 0.4.0 audit #27 set back at «Как в Windows» = Interface: the original's `setHelpText`
+        // never shows as a bubble.
+        for view in [ViewMode::Pro, ViewMode::Lite] {
+            let state = UiState {
+                windows_parity: fxsound_core::WindowsParity::Interface,
+                ..state(view)
+            };
+            for button in TitleButton::ALL {
+                let tip = button.tip(&state);
+                assert!(
+                    !resting_on(&state, button).contains(&tip),
+                    "{view:?} {button:?} still says {tip:?}"
+                );
+            }
+        }
     }
 
     #[test]

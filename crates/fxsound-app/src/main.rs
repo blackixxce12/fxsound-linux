@@ -654,7 +654,7 @@ impl Runtime {
                     .options_mut(|options| options.zoom_with_keyboard = false);
                 // From here on a producer's wake-up is a frame of this window.
                 runtime.waker.attach(&cc.egui_ctx);
-                Ok(Box::new(Shell::new(runtime, palette.mode())))
+                Ok(Box::new(Shell::new(runtime, palette)))
             }),
         );
         // Whatever arrives now is the headless pump's to wait for.
@@ -983,8 +983,9 @@ struct Shell<'a> {
     scratch: ViewScratch,
     /// The size the viewport was last told to be, so a resize is sent only on a real change.
     applied_size: Option<egui::Vec2>,
-    /// The theme the fonts and visuals were installed for.
-    applied_theme: ThemeMode,
+    /// The palette the fonts and visuals were installed for: its theme and whether it is the
+    /// Windows build's ([`Palette::windows`]), whose edges the visuals' strokes carry too.
+    applied_palette: Palette,
     /// The hamburger menu.
     menu: Menu,
     /// `Some` while the Settings pane is open.
@@ -1106,7 +1107,7 @@ const DELETE_QUESTION: &str = "Move the preset %s to the trash?";
 const RESET_QUESTION: &str = "Discard the unsaved changes of every preset? Saved presets are kept.";
 
 impl<'a> Shell<'a> {
-    fn new(rt: &'a mut Runtime, applied_theme: ThemeMode) -> Self {
+    fn new(rt: &'a mut Runtime, applied_palette: Palette) -> Self {
         let Panes {
             scratch,
             mut settings,
@@ -1132,7 +1133,7 @@ impl<'a> Shell<'a> {
             rt,
             scratch,
             applied_size: None,
-            applied_theme,
+            applied_palette,
             menu: Menu::default(),
             settings,
             settings_icons: NavIcons::new(),
@@ -1242,14 +1243,15 @@ impl<'a> Shell<'a> {
             .is_some_and(|asked| asked.elapsed() < RESIZE_SETTLE)
     }
 
-    /// Re-install fonts and visuals after a theme change.
+    /// Re-install fonts and visuals after a change of theme or of «Like FxSound for Windows»:
+    /// the level decides the edges of every popup and tooltip too ([`Palette::windows`]).
     fn sync_theme(&mut self, ctx: &egui::Context) {
         let palette = self.rt.app.palette();
-        if palette.mode() == self.applied_theme {
+        if palette == self.applied_palette {
             return;
         }
         theme::apply(ctx, palette);
-        self.applied_theme = palette.mode();
+        self.applied_palette = palette;
     }
 
     /// Where an open menu or drop-down may hang this frame, in `screen`'s points: under the title
@@ -2985,7 +2987,7 @@ mod runtime_tests {
         let mut runtime = runtime(dir.path());
         with_a_window_up(&mut runtime);
         {
-            let mut shell = Shell::new(&mut runtime, ThemeMode::Dark);
+            let mut shell = Shell::new(&mut runtime, Palette::new(ThemeMode::Dark));
             let ctx = egui::Context::default();
             shell.apply_window_request(
                 &ctx,
@@ -3169,7 +3171,7 @@ mod runtime_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut runtime = runtime(dir.path());
         {
-            let mut shell = Shell::new(&mut runtime, ThemeMode::Dark);
+            let mut shell = Shell::new(&mut runtime, Palette::new(ThemeMode::Dark));
             shell.open_settings();
             shell.open_import();
             shell.scratch.column_face = shell.scratch.column_face.flipped();
@@ -3177,7 +3179,7 @@ mod runtime_tests {
             shell.menu.toggle();
         }
         let flipped = fxsound_ui::views::ColumnFace::default().flipped();
-        let shell = Shell::new(&mut runtime, ThemeMode::Dark);
+        let shell = Shell::new(&mut runtime, Palette::new(ThemeMode::Dark));
         assert!(shell.settings.is_some(), "Settings is still open");
         assert!(shell.import.is_some(), "and so is Import Presets");
         assert_eq!(shell.scratch.column_face, flipped);
@@ -3190,7 +3192,7 @@ mod runtime_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut runtime = runtime(dir.path());
         runtime.settings_requested = true;
-        let shell = Shell::new(&mut runtime, ThemeMode::Dark);
+        let shell = Shell::new(&mut runtime, Palette::new(ThemeMode::Dark));
         assert!(shell.settings.is_some());
         drop(shell);
         assert!(!runtime.settings_requested);
@@ -3338,7 +3340,7 @@ mod calibration_tests {
     fn calibrate_microphone_opens_the_controllers_wizard_over_the_pane_and_grows_the_window() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path(), true);
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         shell.open_settings();
         shell.open_calibration();
 
@@ -3359,7 +3361,7 @@ mod calibration_tests {
     fn without_a_microphone_on_the_input_lane_the_wizard_does_not_open() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path(), false);
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         shell.open_settings();
         shell.open_calibration();
         assert!(shell.calibration.is_none());
@@ -3370,7 +3372,7 @@ mod calibration_tests {
     fn cancel_in_the_wizard_closes_it_in_the_controller_too() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path(), true);
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         shell.open_calibration();
         shell.rt.app.handle_calibration(CalibrationAction::Start);
         assert!(shell.rt.app.calibration_is_live(), "Start began a run");
@@ -3849,7 +3851,7 @@ mod confirmation_tests {
         // 0.4.0 audit #16: one click on the menu used to delete the preset for good.
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path());
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         assert_eq!(listed(&shell), ["Mine", "Other"]);
 
         shell.act_on_menu(MenuChoice::Delete);
@@ -3886,7 +3888,7 @@ mod confirmation_tests {
     fn a_yes_to_a_preset_that_is_no_longer_selected_deletes_nothing() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path());
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         shell.act_on_menu(MenuChoice::Delete);
         // A keybind moves the selection while the question is up.
         shell.rt.app.cycle_preset(true);
@@ -3903,7 +3905,7 @@ mod confirmation_tests {
         // 0.4.0 audit #21: the settings pane's button reset at once.
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path());
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         shell
             .rt
             .app
@@ -4342,7 +4344,7 @@ mod popup_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = calibration_tests::runtime(dir.path(), false);
         rt.app.state.view = ViewMode::Lite;
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         let lite = layout::lite::WINDOW_SIZE;
         let ctx = context();
 
@@ -4384,7 +4386,7 @@ mod popup_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = confirmation_tests::runtime(dir.path());
         rt.app.state.view = ViewMode::Pro;
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         let pro = layout::pro::WINDOW_SIZE;
         let ctx = context();
         sized_frame(&mut shell, &ctx, pro);
@@ -4427,7 +4429,7 @@ mod popup_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = calibration_tests::runtime(dir.path(), false);
         rt.app.state.view = ViewMode::Lite;
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         let ctx = context();
         let lite = layout::lite::WINDOW_SIZE;
         let (_, commands) = sized_frame(&mut shell, &ctx, lite);
@@ -4458,7 +4460,7 @@ mod popup_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = calibration_tests::runtime(dir.path(), false);
         rt.app.state.view = ViewMode::Lite;
-        let shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         let lite = layout::lite::WINDOW_SIZE;
         let bounds = shell.popup_bounds(Rect::from_min_size(Pos2::ZERO, lite));
         assert_eq!(
@@ -4635,5 +4637,78 @@ mod popup_tests {
         })
         .drop_without_applying_deltas();
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+    use fxsound_core::WindowsParity;
+
+    /// The edge the context draws every popup and tooltip with after one frame of `shell`'s.
+    fn frame_edge(shell: &mut Shell<'_>, ctx: &egui::Context) -> egui::Stroke {
+        ctx.run_ui(egui::RawInput::default(), |ui| shell.sync_theme(ui.ctx()))
+            .drop_without_applying_deltas();
+        ctx.global_style().visuals.window_stroke
+    }
+
+    #[test]
+    fn a_level_change_in_the_light_theme_redraws_the_popups_edges_on_the_next_frame() {
+        // W2: the level decides the palette's edges as well as the theme does, and a frame that
+        // re-applied the visuals only on a new theme kept the last level's edge on every popup.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = calibration_tests::runtime(dir.path(), false);
+        rt.app.state.theme = ThemeMode::Light;
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
+        let ctx = egui::Context::default();
+        let light = Palette::new(ThemeMode::Light);
+
+        let ours = frame_edge(&mut shell, &ctx);
+        assert_eq!(ours.color, light.divider());
+
+        shell
+            .rt
+            .app
+            .set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        let windows = frame_edge(&mut shell, &ctx);
+        assert_eq!(windows.color, light.windows(true).divider());
+        assert_ne!(
+            windows.color, ours.color,
+            "the Windows edge is another colour"
+        );
+
+        shell
+            .rt
+            .app
+            .set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        assert_eq!(frame_edge(&mut shell, &ctx), ours, "and back again at Off");
+    }
+
+    #[test]
+    fn a_window_opened_at_interface_keeps_the_windows_edge_until_the_level_goes_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = calibration_tests::runtime(dir.path(), false);
+        rt.app.state.theme = ThemeMode::Light;
+        rt.app
+            .set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        let palette = rt.app.palette();
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, palette);
+        let mut shell = Shell::new(&mut rt, palette);
+        let light = Palette::new(ThemeMode::Light);
+
+        assert_eq!(
+            frame_edge(&mut shell, &ctx).color,
+            light.windows(true).divider()
+        );
+        shell
+            .rt
+            .app
+            .set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        assert_eq!(frame_edge(&mut shell, &ctx).color, light.divider());
     }
 }

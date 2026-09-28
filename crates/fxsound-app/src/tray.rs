@@ -70,7 +70,7 @@
 
 use crate::wake::WakingSender;
 use fxsound_core::i18n::{tr, tr_args};
-use fxsound_core::{DeviceDirection, ThemeMode, WindowsParity};
+use fxsound_core::{DeviceDirection, ThemeMode, WindowsLook, WindowsParity};
 use ksni::blocking::{Handle, TrayMethods as _};
 use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Category, Icon, MenuItem, Status, ToolTip, Tray};
@@ -498,9 +498,18 @@ impl FxTray {
     /// The two lanes' preset submenus, `Output Presets ▸` and `Input Presets ▸` — the original's
     /// `Preset Select ▸`, once per lane. The original drops it while the power is off
     /// (`FxSystemTrayView.cpp:313-316`); here it stays, as the window's preset list and the
-    /// command line do, so a preset can be picked before switching on (0.4.0 audit R7). A lane
-    /// with no presets has no submenu.
+    /// command line do, so a preset can be picked before switching on (0.4.0 audit R7) — except
+    /// at «Как в Windows» = Interface and above, where both go with the power as there
+    /// ([`WindowsLook::PresetsNeedPower`]). A lane with no presets has no submenu.
     fn preset_menus(&self) -> Vec<MenuItem<Self>> {
+        if !self.state.power
+            && self
+                .state
+                .windows_parity
+                .windows_look(WindowsLook::PresetsNeedPower)
+        {
+            return Vec::new();
+        }
         DeviceDirection::ALL
             .into_iter()
             .filter_map(|direction| self.preset_menu(direction))
@@ -606,7 +615,12 @@ impl FxTray {
     /// device at «Как в Windows» = Interface and above, in its middle past [`MENU_LABEL_MAX`]
     /// otherwise (0.4.0 audit #31).
     fn device_label(&self, direction: DeviceDirection, name: &str) -> String {
-        if direction == DeviceDirection::Output && self.state.windows_parity.interface() {
+        if direction == DeviceDirection::Output
+            && self
+                .state
+                .windows_parity
+                .windows_look(WindowsLook::TrayNames)
+        {
             truncate_label_as_windows(name)
         } else {
             truncate_label(name)
@@ -1176,6 +1190,29 @@ mod tests {
         // The same items as with the power on, but for the power item's words.
         let on = labels(&on.menu());
         assert_eq!(off.len(), on.len(), "{off:?} / {on:?}");
+    }
+
+    #[test]
+    fn at_interface_the_preset_submenus_go_with_the_power_as_on_windows() {
+        // `FxSystemTrayView.cpp:313-316`, at «Как в Windows» = Interface (R7 set back).
+        for level in [WindowsParity::Interface, WindowsParity::Sound] {
+            let (on, _rx) = with_state(TrayState {
+                windows_parity: level,
+                ..populated()
+            });
+            let (off, _rx) = with_state(TrayState {
+                power: false,
+                windows_parity: level,
+                ..populated()
+            });
+            let on = labels(&on.menu());
+            let off = labels(&off.menu());
+            assert!(on.contains(&tr("Output Presets")), "{on:?}");
+            assert!(!off.contains(&tr("Output Presets")), "{off:?}");
+            assert!(!off.contains(&tr("Input Presets")), "{off:?}");
+            assert_eq!(off[1], "Turn On", "the item says what it will do");
+            assert!(off.contains(&tr("Playback Device Select")));
+        }
     }
 
     #[test]

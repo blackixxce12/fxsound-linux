@@ -114,6 +114,19 @@ pub static LANGUAGES: [Language; 30] = [
     language!("ko", "한국어", "ko"),
 ];
 
+/// The codes of [`LANGUAGES`] in the order the Windows build's language switch runs through them
+/// (`FxLanguage.cpp:25`), which «Как в Windows» = Interface and above bring back — the order only;
+/// the names stay [`LANGUAGES`]' own (0.4.0 audit #28, `fxsound_core::WindowsLook::LanguageOrder`).
+///
+/// The Windows list has Hungarian, which it never shipped a table for, and no Bulgarian, which this
+/// port has; Bulgarian goes where the Windows list, ordered by the languages' English names from
+/// Arabic on, would have put it, after Bosnian.
+pub const WINDOWS_ORDER: [&str; 30] = [
+    ENGLISH, "ar", "ba", "bg", "hr", "cs", "de", "es", "fi", "fr", "id", "it", "ja", "ko", "nl",
+    "no", "fa", "pl", "pt", "pt-br", "ro", "ru", "sl", "sv", "th", "tr", "ua", "vi", "zh-CN",
+    "zh-TW",
+];
+
 impl Language {
     /// The Windows build's table for this language on its own, as it is embedded.
     #[must_use]
@@ -498,6 +511,21 @@ mod tests {
         LANGUAGE_IN_EFFECT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn the_windows_order_holds_every_language_once_with_english_first() {
+        assert_eq!(WINDOWS_ORDER[0], ENGLISH);
+        let mut ours: Vec<&str> = LANGUAGES.iter().map(|language| language.code).collect();
+        let mut windows = WINDOWS_ORDER.to_vec();
+        ours.sort_unstable();
+        windows.sort_unstable();
+        assert_eq!(windows, ours);
+        // Russian is where the Windows switch has it, twenty-one presses on from English.
+        assert_eq!(
+            WINDOWS_ORDER.iter().position(|code| *code == "ru"),
+            Some(21)
+        );
     }
 
     #[test]

@@ -657,6 +657,8 @@ Each of these is a considered decision, not an oversight:
   refused exactly where the hamburger menu greys the item out — an overwrite or rename of a
   factory preset, a rename with unsaved changes, a name already taken, the user-preset limit —
   with the reason on stderr, exit status 1, and `org.fxsound.FxSound.Error.Refused` on D-Bus.
+  «Like FxSound for Windows» = Interface greys the window's list and menu items and drops the tray's
+  preset menu with the power again; the command line and D-Bus still work.
 - **Global hotkeys live in the compositor.** See above.
 - **Window position is not restored.** Wayland gives a client no way to place its own toplevel, so
   the compositor places the window.
@@ -697,7 +699,8 @@ Each of these is a considered decision, not an oversight:
   unless one is picked in Settings ▸ General or with `--language <code>` (`--language system`
   returns to following the desktop). The switch lists English and then every language by its own
   name, in alphabetical order, where Windows used an order of its own and called three of them by
-  the wrong word (Turkish "Türk", Thai "แบบไทย", Czech "Česky"). Strings this port added are in
+  the wrong word (Turkish "Türk", Thai "แบบไทย", Czech "Česky"). «Like FxSound for Windows» = Interface
+  brings back the Windows order, not the wrong words. Strings this port added are in
   `assets/translations/port/`. Right-to-left scripts render left-to-right — egui has no bidi.
 - **Desktop notifications** for preset, output and power changes, the way the original's tray
   balloons announce them, through `org.freedesktop.Notifications`; *Hide notifications* in Settings
@@ -763,10 +766,25 @@ Each of these is a considered decision, not an oversight:
 The original's painting slips are fixed rather than reproduced: the slider fill no longer overshoots
 its track by 8 px, the balance gradient no longer ends 8 px early, and the lit slider thumb is drawn
 at its 16 points instead of a quarter of that (`widgets::slider::Fidelity::Faithful` keeps the first
-two for comparison). In the light theme the power-off spectrum and a bypassed equalizer go a grey
-that can be seen instead of white, the Settings rule and the menu's edge get a colour that shows on
-the light background, and Settings' tab captions are set smaller where a translation would run
-past the rule.
+two, and «Like FxSound for Windows» = Interface paints them). In the light theme the power-off
+spectrum and a bypassed equalizer go a grey that can be seen instead of white, the Settings rule and
+the menu's edge get a colour that shows on the light background, and Settings' tab captions are set
+smaller where a translation would run past the rule.
+
+«Like FxSound for Windows» = Interface puts the window back the way the Windows build draws and
+works it, and changes nothing you hear or have saved: the master gain and the balance step by 2 dB,
+the volume leveling reads "dB", the light theme's power-off graphs turn white and its rules nearly
+vanish again, the slider fill overshoots as it did, a long preset name loses its ` *` with the
+cut, the equalizer's curve joins the band values with straight lines, the first and last wheels on
+five and ten bands turn one way from 62.5 Hz and 16 kHz (a band a preset already put further out
+stays there and can only come back in), a right-click on an effect slider moves it as a click does
+instead of switching the effect off, the tooltips are the Windows build's own and no more (none on
+the title bar, the flip button or the level sliders, none of the right-click and solo lines), the
+Audio, General and Help captions are set in the normal font and cut where their button ends, the
+language switch runs in the Windows order (with the right names), and with the power off the preset
+list, the menu's preset items and the tray's preset menu go grey or away — the command line and
+D-Bus still pick presets. The port's own features, the microphone lane, the applications' presets
+and the other Settings tabs among them, stay as they are.
 
 ## Implementation status
 

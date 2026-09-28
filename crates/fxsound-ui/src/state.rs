@@ -9,6 +9,7 @@
 use fxsound_core::i18n::tr;
 use fxsound_core::{
     AudioDevice, DenoiseLevel, DeviceDirection, Effect, EqBand, SpectrumFrame, ThemeMode, ViewMode,
+    WindowsLook, WindowsParity,
 };
 use std::time::{Duration, Instant};
 
@@ -218,6 +219,11 @@ pub struct UiState {
     pub notice_clock: Option<(String, Instant)>,
     /// Suppresses every tooltip, matching the `hide_help_tooltips` setting.
     pub hide_tooltips: bool,
+    /// The level of «Как в Windows» / "Like FxSound for Windows" in force — the one the
+    /// application runs, Everything read from a later version's file already taken as Interface
+    /// and sound. From Interface on the window follows the Windows build in the rows of
+    /// [`WindowsLook`] ([`UiState::windows_look`]).
+    pub windows_parity: WindowsParity,
 
     // ---- per-application presets -------------------------------------------------------------
     /// Every application the engine has moved onto a route of its own, both lanes, in the order
@@ -276,12 +282,44 @@ impl Default for UiState {
             notification: None,
             notice_clock: None,
             hide_tooltips: false,
+            windows_parity: WindowsParity::Off,
             routed_apps: Vec::new(),
         }
     }
 }
 
 impl UiState {
+    /// Whether the window follows the Windows build in `look` at the level in force.
+    #[must_use]
+    pub const fn windows_look(&self, look: WindowsLook) -> bool {
+        self.windows_parity.windows_look(look)
+    }
+
+    /// Whether a help tip the port added to a control the Windows build has is shown: not while
+    /// help tips are hidden, and not at «Как в Windows» = Interface and above, where only the
+    /// Windows build's own tips are ([`WindowsLook::WindowsTooltips`]).
+    #[must_use]
+    pub const fn port_tips_shown(&self) -> bool {
+        !self.hide_tooltips && !self.windows_look(WindowsLook::WindowsTooltips)
+    }
+
+    /// [`Self::port_tips_shown`] for a control of the lane on screen: the level sliders, the
+    /// equalizer's bands and its wheels. The microphone lane is the port's own, with nothing in the
+    /// Windows build to set it back to, so there those tips go only with "Hide help tips".
+    #[must_use]
+    pub const fn lane_tips_shown(&self) -> bool {
+        self.port_tips_shown()
+            || (!self.hide_tooltips && matches!(self.direction, DeviceDirection::Input))
+    }
+
+    /// Whether the preset list, and what picks a preset in the window, is offered: always with the
+    /// power on, and with it off too except at «Как в Windows» = Interface and above
+    /// ([`WindowsLook::PresetsNeedPower`], 0.4.0 audit R7).
+    #[must_use]
+    pub const fn presets_offered(&self) -> bool {
+        self.power || !self.windows_look(WindowsLook::PresetsNeedPower)
+    }
+
     /// The selected preset, if any.
     #[must_use]
     pub fn preset(&self) -> Option<&PresetEntry> {

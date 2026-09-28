@@ -246,7 +246,8 @@ const fn lane_noun(lane: DeviceDirection) -> &'static str {
 /// [`App::preset_command_allowed`] for its command (`FxMainWindow.cpp:536-543`), with the power on
 /// or off (0.4.0 audit R7). Export and Import are not preset commands; they are offered whether or
 /// not the preset has unsaved changes (0.4.0 audit #18), except at «Как в Windows» = Interface and
-/// above, where unsaved changes grey them out as on Windows.
+/// above, where unsaved changes grey them out as on Windows, and the power off greys out all
+/// seven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PresetMenu {
     pub save_new: bool,
@@ -712,6 +713,7 @@ impl App {
                 balance_db: settings.balance,
                 volume_leveling: settings.volume_leveling,
                 hide_tooltips: settings.hide_help_tooltips,
+                windows_parity: settings.windows_parity.offered_or_below(),
                 ..UiState::default()
             },
             params: DspParams::default(),
@@ -834,10 +836,14 @@ impl App {
         self.set_edit_direction(edit);
     }
 
-    /// The palette the views should use.
+    /// The palette the views should use: the theme chosen, and from «Как в Windows» = Interface on
+    /// the Windows build's own ([`Palette::windows`]).
     #[must_use]
     pub fn palette(&self) -> Palette {
-        Palette::new(self.state.theme)
+        Palette::new(self.state.theme).windows(
+            self.windows_parity()
+                .windows_look(fxsound_core::WindowsLook::Palette),
+        )
     }
 
     /// `true` when the audio engine is running.
@@ -3632,22 +3638,30 @@ impl App {
     /// the preset has unsaved changes (`FxMainWindow.cpp:540-541`), which protects nothing here:
     /// the export writes the presets as saved, and the import skips a name already taken, the
     /// modified preset's included (0.4.0 audit #18). At «Как в Windows» = Interface and above
-    /// they are greyed out as there.
+    /// they are greyed out as there, and so is every preset item while the power is off
+    /// ([`fxsound_core::WindowsLook::PresetsNeedPower`], R7 set back).
     #[must_use]
     pub fn preset_menu(&self) -> PresetMenu {
+        let powered = self.state.power
+            || !self
+                .windows_parity()
+                .windows_look(fxsound_core::WindowsLook::PresetsNeedPower);
         let offered = |command: PresetCommand| {
-            self.preset_command_allowed(&command)
-                .or_else(|refusal| {
-                    if refusal.is_about_the_name() {
-                        Ok(())
-                    } else {
-                        Err(refusal)
-                    }
-                })
-                .is_ok()
+            powered
+                && self
+                    .preset_command_allowed(&command)
+                    .or_else(|refusal| {
+                        if refusal.is_about_the_name() {
+                            Ok(())
+                        } else {
+                            Err(refusal)
+                        }
+                    })
+                    .is_ok()
         };
-        let transfer =
-            !(self.windows_parity().interface() && self.state.preset().is_some_and(|p| p.modified));
+        let transfer = powered
+            && !(self.windows_parity().interface()
+                && self.state.preset().is_some_and(|p| p.modified));
         PresetMenu {
             save_new: offered(PresetCommand::SaveAs(String::new())),
             overwrite: offered(PresetCommand::Overwrite),
@@ -4793,6 +4807,8 @@ impl App {
             return Err(fxsound_core::parity::FULL_REFUSAL.to_owned());
         }
         self.settings.windows_parity = level;
+        // What the window draws from Interface on (W2) follows at the next frame.
+        self.state.windows_parity = self.windows_parity();
         self.persist_settings();
         self.note_windows_parity();
         // The tray's device rows are cut as Windows cuts them from Interface on (0.4.0 audit #31).
@@ -12342,6 +12358,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn at_interface_every_preset_item_goes_grey_with_the_power_as_on_windows() {
+        // `FxMainWindow.cpp:535-541` ands every preset item with the power (0.4.0 audit R7 set
+        // back at «Как в Windows» = Interface). Off offers them either way (above).
+        for factory in [true, false] {
+            for modified in [false, true] {
+                let mut app = choosing(factory, modified);
+                app.set_windows_parity(WindowsParity::Interface, false)
+                    .expect("offered");
+                app.state.power = false;
+                let menu = app.preset_menu();
+                let case = format!("factory {factory}, modified {modified}");
+                assert_eq!(
+                    menu,
+                    PresetMenu {
+                        save_new: false,
+                        overwrite: false,
+                        undo: false,
+                        rename: false,
+                        delete: false,
+                        export: false,
+                        import: false,
+                    },
+                    "{case}"
+                );
+                // The command line and D-Bus still pick and manage presets with the power off.
+                assert!(
+                    app.preset_command_allowed(&P::Delete).is_ok() || factory,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_level_reaches_the_window_and_its_palette_at_once() {
+        // W2: what the window draws from Interface on follows the level set from anywhere.
+        let mut app = headless();
+        app.state.theme = ThemeMode::Light;
+        assert_eq!(app.state.windows_parity, WindowsParity::Off);
+        assert!(!app.palette().is_windows());
+        app.set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        assert_eq!(app.state.windows_parity, WindowsParity::Interface);
+        assert!(app.palette().is_windows());
+        assert_eq!(app.palette().mode(), ThemeMode::Light);
+        app.set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        assert_eq!(app.state.windows_parity, WindowsParity::Off);
+        assert!(!app.palette().is_windows());
     }
 
     #[test]
