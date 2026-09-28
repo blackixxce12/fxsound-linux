@@ -95,6 +95,11 @@
 //!   before, and a glide it had started is dropped: played when the stage came back, it would
 //!   lift the level for 20 ms that the listener last heard unlevelled.
 //!
+//! At «Like FxSound for Windows» = Interface and sound ([`VolumeLeveller::set_compat`]) #1 to #4 are
+//! taken back and the stage plays the Windows build's arithmetic inside the same wrappers: #5 and
+//! #11 stay, since neither changes what a running stage sounds like
+//! (`crates/fxsound-dsp/src/leveller_legacy.rs`).
+//!
 //! The original's RMS normaliser, which sat in front of this stage in `sosProcessBuffer`
 //! (`SosProcess.cpp:678-724`), is not ported: it runs only while `setNormalization` has moved its
 //! target off 1.0, and nothing in the Windows application ever calls `setNormalization` (audit
@@ -115,6 +120,11 @@
 
 use crate::biquad::{MAX_CHANNELS, Real};
 use crate::smooth::{Ramp, glide_frames};
+use fxsound_core::DspCompat;
+
+/// The Windows build's arithmetic, for «Like FxSound for Windows» = Interface and sound.
+#[path = "leveller_legacy.rs"]
+mod legacy;
 
 // ---------------------------------------------------------------------------------------------
 // The constant table, `SosProcess.cpp:38-76`.
@@ -743,6 +753,8 @@ pub struct VolumeLeveller {
     /// ([`VolumeLeveller::sit_out`]): only then is the gain it holds the one being heard, and
     /// only then does switching it off glide.
     heard: bool,
+    /// Whose arithmetic runs: the port's, or the Windows build's ([`VolumeLeveller::set_compat`]).
+    compat: DspCompat,
 }
 
 impl VolumeLeveller {
@@ -794,6 +806,7 @@ impl VolumeLeveller {
             release: Ramp::new(1.0),
             release_ceiling: CEILING,
             heard: false,
+            compat: DspCompat::Linux,
         }
     }
 
@@ -838,6 +851,28 @@ impl VolumeLeveller {
             self.gain = playing;
             self.ramp = GainRamp::hold(playing);
         }
+    }
+
+    /// Play the port's arithmetic, or the Windows build's («Like FxSound for Windows» = Interface
+    /// and sound): the peak safety on the side chain's peak (#1 taken back), a step per call
+    /// (#2), the subwoofer neither analysed nor levelled (#3) and both ends of a step's ramp
+    /// clamped to the peak-safe gain (#4). The state machine carries on from where it is: a step
+    /// half gathered is dropped, and the next one starts from the gain being played.
+    pub fn set_compat(&mut self, compat: DspCompat) {
+        if compat == self.compat {
+            return;
+        }
+        self.compat = compat;
+        self.step = StepStats::default();
+        let playing = self.ramp.at(0);
+        self.gain = playing;
+        self.ramp = GainRamp::hold(playing);
+    }
+
+    /// Whose arithmetic runs ([`VolumeLeveller::set_compat`]).
+    #[must_use]
+    pub const fn compat(&self) -> DspCompat {
+        self.compat
     }
 
     /// The clamped 0..=4 control amount currently in force.
@@ -996,6 +1031,10 @@ impl VolumeLeveller {
         let Some(mut rest) = buffer.get_mut(..frames * channels) else {
             return;
         };
+        if self.compat.windows() {
+            self.process_windows(rest, &layout, effective_sample_rate);
+            return;
+        }
         while !rest.is_empty() {
             let frames_left = rest.len() / channels;
             let length = self
@@ -1115,7 +1154,7 @@ impl VolumeLeveller {
         self.step.analysed_samples += frames * layout.analysed_channels;
 
         let decision = if self.step.frames >= self.step_frames {
-            Some(self.decide(effective_sample_rate))
+            Some(self.decide(effective_sample_rate, false))
         } else {
             None
         };
@@ -1272,8 +1311,10 @@ impl VolumeLeveller {
         }
     }
 
-    /// The gain decision for a whole step (`SosProcess.cpp:205-369`).
-    fn decide(&mut self, effective_sample_rate: Real) -> Decision {
+    /// The gain decision for a whole step (`SosProcess.cpp:205-369`). The peak safety reads the
+    /// unfiltered peak (audit #1), or with `sidechain_safety` the side chain's, as the Windows
+    /// build does.
+    fn decide(&mut self, effective_sample_rate: Real, sidechain_safety: bool) -> Decision {
         let stats = self.step;
         let analysed_samples = stats.analysed_samples as Real;
         let peak = stats.sidechain_peak;
@@ -1434,8 +1475,13 @@ impl VolumeLeveller {
         // audio needs it lower sooner, [`PeakGuard`] takes it down just before it does (audit #4).
         let smoothed_gain_end = clamp_real(gain_end, 0.0, max_gain_cap);
         let mut peak_limited = false;
-        if stats.full_band_peak > TINY {
-            let peak_safe_gain = effective_ceiling / stats.full_band_peak;
+        let safety_peak = if sidechain_safety {
+            peak
+        } else {
+            stats.full_band_peak
+        };
+        if safety_peak > TINY {
+            let peak_safe_gain = effective_ceiling / safety_peak;
             if gain_end > peak_safe_gain {
                 gain_end = peak_safe_gain;
                 peak_limited = true;

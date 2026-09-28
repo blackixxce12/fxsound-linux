@@ -24,10 +24,12 @@
 //!   [`fxsound_core::eq::move_off_the_windows_twenty_band_ladder`]).
 //!
 //! The levels every music chain shares — the filter width, the master gain, the balance and the
-//! volume leveller — are the settings', not the preset's ([`MusicLevels`]).
+//! volume leveller — are the settings', not the preset's ([`MusicLevels`]), and so is whose DSP
+//! plays them: FxSound for Linux's, or at «Like FxSound for Windows» = Interface and sound the
+//! Windows build's ([`DspCompat`]). The same `.fac` is read the same way at every level.
 
 use fxsound_core::messages::DspParams;
-use fxsound_core::{Effect, EqBand, Preset, Settings, scale};
+use fxsound_core::{DspCompat, Effect, EqBand, Preset, Settings, scale};
 
 /// The engine's band ladder for `count` bands: the original's hard-coded table where it has
 /// one, else the geometric ladder [`crate::GraphicEq`] builds.
@@ -110,11 +112,15 @@ pub struct MusicLevels {
     pub master_gain_db: f32,
     pub balance_db: f32,
     pub volume_leveling: f32,
+    /// Whose DSP plays the chain: the Windows build's from «Like FxSound for Windows» =
+    /// Interface and sound on ([`DspCompat::for_level`]).
+    pub compat: DspCompat,
 }
 
 impl MusicLevels {
     /// The levels the settings file holds, which are the speakers' whichever lane the window
-    /// edits.
+    /// edits, and the DSP the level of «Like FxSound for Windows» in force plays (Everything,
+    /// which this version does not offer, runs as Interface and sound).
     #[must_use]
     pub const fn of(settings: &Settings) -> Self {
         Self {
@@ -122,6 +128,25 @@ impl MusicLevels {
             master_gain_db: settings.master_gain,
             balance_db: settings.balance,
             volume_leveling: settings.volume_leveling,
+            compat: DspCompat::for_level(settings.windows_parity.offered_or_below()),
+        }
+    }
+
+    /// The same levels played by the Windows build's DSP, or by FxSound for Linux's.
+    ///
+    /// A `bool` rather than a [`DspCompat`] for the two-build comparisons
+    /// (`tests/windows_parity_bitexact.rs`), whose copy in an older build must compile where there
+    /// is no `DspCompat`: `scripts/reference-checkout.sh` gives such a build a method of this name
+    /// that changes nothing, since it has only the one DSP.
+    #[must_use]
+    pub const fn with_windows_dsp(self, windows: bool) -> Self {
+        Self {
+            compat: if windows {
+                DspCompat::Windows
+            } else {
+                DspCompat::Linux
+            },
+            ..self
         }
     }
 }
@@ -155,6 +180,7 @@ pub fn write_music_params(
     params.master_gain_db = levels.master_gain_db;
     params.balance = levels.balance_db;
     params.volume_leveling_db = levels.volume_leveling;
+    params.compat = levels.compat;
 }
 
 /// A music preset as the application plays it on `ladder` with `levels`: [`music_controls`]
@@ -276,5 +302,51 @@ mod tests {
         assert_eq!(params.master_gain_db, -6.0);
         assert_eq!(params.balance, 4.0);
         assert_eq!(params.volume_leveling_db, 1.5);
+        assert_eq!(params.compat, DspCompat::Linux);
+    }
+
+    #[test]
+    fn interface_and_sound_plays_the_windows_dsp_and_the_levels_below_it_do_not() {
+        use fxsound_core::WindowsParity;
+        for level in WindowsParity::ALL {
+            let mut settings = Settings::default();
+            settings.windows_parity = level;
+            let params = preset_params(
+                &preset([64; 5], &[]),
+                &ladder(10),
+                MusicLevels::of(&settings),
+            );
+            let windows = matches!(level, WindowsParity::Sound | WindowsParity::Full);
+            assert_eq!(params.compat.windows(), windows, "{level:?}");
+        }
+    }
+
+    #[test]
+    fn the_windows_dsp_changes_nothing_else_a_preset_is_read_into() {
+        let bands: Vec<(f32, f32)> = ladder(20).iter().map(|&hz| (hz, 4.0)).collect();
+        let preset = preset([30, 60, 90, 120, 10], &bands);
+        for count in [10, 20, 31] {
+            let linux = preset_params(&preset, &ladder(count), MusicLevels::default());
+            let windows = preset_params(
+                &preset,
+                &ladder(count),
+                MusicLevels::default().with_windows_dsp(true),
+            );
+            assert_eq!(windows.compat, DspCompat::Windows);
+            assert_eq!(
+                DspParams {
+                    compat: DspCompat::Linux,
+                    ..windows
+                },
+                linux,
+                "{count} bands"
+            );
+            assert_eq!(
+                MusicLevels::default()
+                    .with_windows_dsp(true)
+                    .with_windows_dsp(false),
+                MusicLevels::default()
+            );
+        }
     }
 }

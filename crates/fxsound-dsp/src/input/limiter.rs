@@ -51,6 +51,11 @@
 //! original's arithmetic on a mono stream of finite samples. (The other: an infinity is let go of
 //! once it has left the hold window, where the original's envelope stayed infinite for good.)
 //!
+//! Dynamic Boost takes all three back at «Like FxSound for Windows» = Interface and sound: no
+//! channel linked, no hold, and the attack left to overshoot ([`LookaheadLimiter::set_overshoot`]),
+//! which is `Maxi32.c`'s arithmetic sample for sample. The voice chain has no Windows original and
+//! keeps them at every level.
+//!
 //! Real-time safe: the delay arena is allocated once, for the worst case, and nothing here
 //! allocates, locks or branches on anything but its own state.
 
@@ -226,6 +231,9 @@ pub struct LookaheadLimiter {
     hold_ms: Real,
     release_ms: Real,
     release_beta: Real,
+    /// The attack ramp may run past the peak it aims at, as `Maxi32.c`'s does: audit #8 taken
+    /// back ([`LookaheadLimiter::set_overshoot`]).
+    overshoot: bool,
 }
 
 impl std::fmt::Debug for LookaheadLimiter {
@@ -238,6 +246,7 @@ impl std::fmt::Debug for LookaheadLimiter {
             .field("ceiling", &self.ceiling)
             .field("hold_ms", &self.hold_ms)
             .field("release_ms", &self.release_ms)
+            .field("overshoot", &self.overshoot)
             .finish()
     }
 }
@@ -263,6 +272,7 @@ impl LookaheadLimiter {
             hold_ms: DEFAULT_HOLD_MS,
             release_ms,
             release_beta: 0.0,
+            overshoot: false,
         };
         limiter.design();
         limiter
@@ -353,6 +363,24 @@ impl LookaheadLimiter {
         }
         self.release_ms = ms;
         self.design();
+    }
+
+    /// Let the attack ramp run past the peak it is aiming at, as the original's does, or stop it
+    /// there (the default, audit #8).
+    ///
+    /// For Dynamic Boost at «Like FxSound for Windows» = Interface and sound, which plays
+    /// `Maxi32.c`'s arithmetic: a slope kept steep from an earlier retarget carries the envelope
+    /// on up until the countdown ends — a decibel of reduction on a steady 50 Hz sine at twice the
+    /// ceiling. The wall stands either way: the envelope is still at least every sample leaving.
+    /// A ramp under way carries on under the new rule.
+    pub fn set_overshoot(&mut self, overshoot: bool) {
+        self.overshoot = overshoot;
+    }
+
+    /// Whether the attack ramp may run past its peak ([`LookaheadLimiter::set_overshoot`]).
+    #[must_use]
+    pub const fn overshoot(&self) -> bool {
+        self.overshoot
     }
 
     /// Set the release recursion's coefficient directly.
@@ -532,6 +560,7 @@ impl LookaheadLimiter {
             &mut self.holds[0],
             &mut self.rings[0],
             self.release_beta,
+            self.overshoot,
             new_abs,
             abs_out,
             lookahead,
@@ -565,6 +594,7 @@ impl LookaheadLimiter {
         let lookahead = self.lookahead.max(1);
         let ceiling = self.ceiling;
         let release_beta = self.release_beta;
+        let overshoot = self.overshoot;
         let present = channels.min(MAX_CHANNELS);
         let all = (1_u32 << present) - 1;
         let linked = self.linked_mask & all;
@@ -610,6 +640,7 @@ impl LookaheadLimiter {
                     &mut hold_state,
                     ring,
                     release_beta,
+                    overshoot,
                     sample.abs(),
                     delayed.abs(),
                     lookahead,
@@ -663,6 +694,7 @@ impl LookaheadLimiter {
                     &mut hold_state,
                     ring,
                     release_beta,
+                    overshoot,
                     new_abs,
                     abs_out,
                     lookahead,
@@ -683,13 +715,15 @@ impl LookaheadLimiter {
 
     /// The envelope `state`, with its hold window `hold`, one frame on: `new_abs` is the loudest
     /// sample of its channels just written, `abs_out` the loudest one just read (`Maxi32.c:304-362`,
-    /// with the three departures above).
+    /// with the three departures above; with `overshoot`, the attack's is taken back).
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     fn update_envelope(
         state: &mut Envelope,
         hold: &mut PeakHold,
         ring: &mut HoldRing,
         release_beta: Real,
+        overshoot: bool,
         new_abs: Real,
         abs_out: Real,
         lookahead: usize,
@@ -724,13 +758,14 @@ impl LookaheadLimiter {
             state.env += state.delta;
             // Audit #8: a slope kept steep from an earlier retarget must not carry the envelope
             // past the peak it was aiming at. Clamped to that peak, or to what the hold already
-            // holds if that is louder — both at least `abs_out`, so the wall still stands.
+            // holds if that is louder — both at least `abs_out`, so the wall still stands. Not
+            // with `overshoot`, which is the original's ramp.
             let target = if held > state.max_abs {
                 held
             } else {
                 state.max_abs
             };
-            if state.env > target {
+            if !overshoot && state.env > target {
                 state.env = target;
             }
         } else {
@@ -817,6 +852,95 @@ pub(crate) fn thd_n(x: &[Real], hz: f64, sample_rate: Real) -> f64 {
         })
         .sum();
     (residual / x.len() as f64).sqrt() / ((fit[0] * fit[0] + fit[1] * fit[1]) / 2.0).sqrt()
+}
+
+/// `Maxi32.c`'s limiter as the port ran it before the 0.4.0 audit (`0f05ba5`, `git show
+/// 0f05ba5:crates/fxsound-dsp/src/input/limiter.rs`), line for line: an envelope and a delay line
+/// per channel, no hold, and an attack ramp that only ever steepens. The reference the Windows
+/// settings of [`LookaheadLimiter`] are held to, here and in Dynamic Boost's tests.
+#[cfg(test)]
+pub(crate) struct OriginalLimiter {
+    delay: Vec<[Real; MAX_LOOKAHEAD_FRAMES]>,
+    write: [usize; MAX_CHANNELS],
+    env: [Real; MAX_CHANNELS],
+    delta: [Real; MAX_CHANNELS],
+    ramp_count: [usize; MAX_CHANNELS],
+    max_abs: [Real; MAX_CHANNELS],
+    lookahead: usize,
+    ceiling: Real,
+    beta: Real,
+}
+
+#[cfg(test)]
+impl OriginalLimiter {
+    pub(crate) fn new(sample_rate: Real, ceiling: Real, lookahead_ms: Real, beta: Real) -> Self {
+        let frames = (sample_rate * lookahead_ms / 1000.0) as usize;
+        Self {
+            delay: vec![[0.0; MAX_LOOKAHEAD_FRAMES]; MAX_CHANNELS],
+            write: [0; MAX_CHANNELS],
+            env: [0.0; MAX_CHANNELS],
+            delta: [0.0; MAX_CHANNELS],
+            ramp_count: [0; MAX_CHANNELS],
+            max_abs: [0.0; MAX_CHANNELS],
+            lookahead: frames.clamp(1, MAX_LOOKAHEAD_FRAMES),
+            ceiling,
+            beta,
+        }
+    }
+
+    pub(crate) fn envelope(&self, channel: usize) -> Real {
+        self.env.get(channel).copied().unwrap_or(0.0)
+    }
+
+    pub(crate) fn process_frame(&mut self, frame: &mut [Real]) {
+        let lookahead = self.lookahead;
+        let ramp_divisor = lookahead as Real + 1.0;
+        for (c, sample) in frame.iter_mut().enumerate().take(MAX_CHANNELS) {
+            let slot = &mut self.delay[c][self.write[c]];
+            let delayed = *slot;
+            let incoming = *sample;
+            *slot = incoming;
+            let new_abs = incoming.abs();
+            self.write[c] += 1;
+            if self.write[c] >= lookahead {
+                self.write[c] = 0;
+            }
+            if self.ramp_count[c] != 0 {
+                let abs_out = delayed.abs();
+                if abs_out > self.env[c] {
+                    self.env[c] = abs_out;
+                }
+                if new_abs > self.max_abs[c] {
+                    self.max_abs[c] = new_abs;
+                    self.ramp_count[c] = lookahead;
+                    let tmp_delta = (new_abs - self.env[c]) / ramp_divisor;
+                    if tmp_delta > self.delta[c] {
+                        self.delta[c] = tmp_delta;
+                    }
+                } else {
+                    self.ramp_count[c] -= 1;
+                }
+                self.env[c] += self.delta[c];
+            } else {
+                self.env[c] = self.env[c] * self.beta + ENVELOPE_BIAS;
+                let abs_out = delayed.abs();
+                if abs_out > self.env[c] {
+                    self.env[c] = abs_out;
+                }
+                if new_abs > self.env[c] {
+                    self.max_abs[c] = new_abs;
+                    self.delta[c] = (new_abs - self.env[c]) / ramp_divisor;
+                    self.env[c] += self.delta[c];
+                    self.ramp_count[c] = lookahead;
+                }
+            }
+            *sample = if self.env[c] > self.ceiling {
+                delayed * self.ceiling / self.env[c]
+            } else {
+                delayed
+            };
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1280,5 +1404,84 @@ mod tests {
                 "the fixture should keep the limiter working"
             );
         }
+    }
+
+    #[test]
+    fn with_no_link_no_hold_and_the_overshoot_the_limiter_is_the_originals_to_the_bit() {
+        // What Dynamic Boost asks for at «Like FxSound for Windows» = Interface and sound: audit
+        // #8, R1 and R2 taken back. Every sample and every envelope must be `Maxi32.c`'s as the
+        // port ran it before the audit, on mono, stereo, 5.1 and 7.1, in blocks of any length,
+        // with a peak on one channel alone and a low sine driving the attack past its peak.
+        for channels in [1_usize, 2, 6, 8] {
+            let mut limiter = original_timing(0.0);
+            limiter.set_ceiling(0.966_051);
+            limiter.set_linked(&[]);
+            limiter.set_overshoot(true);
+            let mut original = OriginalLimiter::new(FS, 0.966_051, 0.75, 0.997_956_2);
+            let mut seed = 0x9e37_79b9_u32;
+            let mut noise = move || {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 8) as Real / 16_777_216.0 - 0.5
+            };
+            let mut n = 0_usize;
+            for frames in [97_usize, 480, 1, 33, 2048, 480, 512, 200, 4800] {
+                let mut input = vec![0.0; frames * channels];
+                for frame in input.chunks_exact_mut(channels) {
+                    for (channel, sample) in frame.iter_mut().enumerate() {
+                        let hz = 50.0 + 40.0 * channel as Real;
+                        let tone = (std::f32::consts::TAU * hz * n as Real / FS).sin();
+                        let burst = if channel == 0 && (3_000..3_400).contains(&n) {
+                            3.0
+                        } else {
+                            1.0
+                        };
+                        *sample = burst * (1.8 * tone + 0.2 * noise());
+                    }
+                    n += 1;
+                }
+                let mut ours = input.clone();
+                limiter.process(&mut ours, channels);
+                let mut theirs = input;
+                for frame in theirs.chunks_exact_mut(channels) {
+                    original.process_frame(frame);
+                }
+                for (at, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{channels} channels, sample {at}");
+                }
+                for channel in 0..channels {
+                    assert_eq!(
+                        limiter.envelope(channel).to_bits(),
+                        original.envelope(channel).to_bits(),
+                        "{channels} channels, channel {channel}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_overshoot_is_the_originals_2_26_on_a_low_sine_at_twice_the_ceiling() {
+        // The twin of `a_low_sine_cannot_drive_the_envelope_past_its_own_peak`, as Windows plays
+        // it: with the overshoot the envelope climbs past the crest to 2.26, and nothing leaves
+        // above the ceiling all the same.
+        let mut l = original_timing(0.0);
+        l.set_overshoot(true);
+        assert!(l.overshoot());
+        let w = std::f32::consts::TAU * 50.0 / FS;
+        let mut highest: Real = 0.0;
+        let mut loudest_out: Real = 0.0;
+        for n in 0..96_000_usize {
+            let mut frame = [2.0 * (w * n as Real).sin()];
+            l.process_frame(&mut frame);
+            if n >= 48_000 {
+                highest = highest.max(l.envelope(0));
+                loudest_out = loudest_out.max(frame[0].abs());
+            }
+        }
+        assert!(
+            (2.25..2.27).contains(&highest),
+            "the envelope reached {highest}"
+        );
+        assert!(loudest_out <= 1.000_001, "{loudest_out}");
     }
 }

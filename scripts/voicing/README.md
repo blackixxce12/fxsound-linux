@@ -234,6 +234,20 @@ In the tally, `old` is the older engine and `new` the current one; `dry` still
 means the untouched excerpt beat both. `crates/fxsound-dsp/tests/preset_drift.rs`
 is the measuring half of the same question.
 
+The same set-up compares «Like FxSound for Windows» = Interface and sound with Off
+in one build: `process_wav --windows-dsp` plays a preset through the Windows
+build's DSP, as that level does. Point `FXSV_OLD_PROCESS_WAV` at a wrapper that
+adds it, and `old` is the Windows sound:
+
+```sh
+cat > "$FXSV_WORK/windows-dsp" <<SH
+#!/bin/sh
+exec "$PWD/target/release/examples/process_wav" "\$@" --windows-dsp
+SH
+chmod +x "$FXSV_WORK/windows-dsp"
+export FXSV_OLD_PROCESS_WAV="$FXSV_WORK/windows-dsp"
+```
+
 ## Files
 
 | file | what it is |

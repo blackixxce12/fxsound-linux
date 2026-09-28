@@ -15,7 +15,7 @@
 
 use fxsound_audio::EngineHandle;
 use fxsound_core::{
-    AudioDevice, DeviceDirection, Effect, EqBand, Preset, Settings, ThemeMode, ViewMode,
+    AudioDevice, DeviceDirection, DspCompat, Effect, EqBand, Preset, Settings, ThemeMode, ViewMode,
     WindowsParity,
     messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio},
     scale,
@@ -2275,6 +2275,10 @@ impl App {
     fn sync_params_from_state(&mut self) {
         self.params.power = self.state.power;
         self.input_params.power = self.state.power;
+        // Whose DSP the music chain plays is the level's, whichever lane the window edits: the
+        // Windows build's from «Like FxSound for Windows» = Interface and sound on. The voice
+        // chain has no Windows original.
+        self.params.compat = DspCompat::for_level(self.windows_parity());
         // No `mute` for a system asleep: the engine silences both lanes and every route itself
         // (U13, [`App::system_sleeping`]), and gives up on a sleep whose end never came.
         match self.state.direction {
@@ -2300,6 +2304,7 @@ impl App {
 
     /// The window's controls, mapped onto the music chain ([`write_music_params`]).
     fn sync_output_params_from_state(&mut self) {
+        let compat = DspCompat::for_level(self.windows_parity());
         let state = &self.state;
         write_music_params(
             &mut self.params,
@@ -2311,6 +2316,7 @@ impl App {
                 master_gain_db: state.master_gain_db,
                 balance_db: state.balance_db,
                 volume_leveling: state.volume_leveling,
+                compat,
             },
         );
     }
@@ -4622,8 +4628,9 @@ impl App {
     /// asks first, and the command line and D-Bus cannot ask, so they refuse with the words the
     /// question would have used ([`fxsound_core::parity::FULL_REFUSAL`]).
     ///
-    /// The level is recorded, reported and saved; what each level changes arrives with the phases
-    /// that build it (`docs/0.5.0-windows-parity.md`).
+    /// The level is recorded, reported and saved, and from Interface and sound on the output lane
+    /// and the applications' output routes play the Windows build's DSP ([`DspCompat`]); what else
+    /// each level changes arrives with the phases that build it (`docs/0.5.0-windows-parity.md`).
     ///
     /// # Errors
     ///
@@ -4644,6 +4651,11 @@ impl App {
         }
         self.settings.windows_parity = level;
         self.persist_settings();
+        // Interface and sound brings the Windows build's DSP to the output lane and the
+        // applications' output routes; the other levels play FxSound for Linux's.
+        if DspCompat::for_level(level) != DspCompat::for_level(current) {
+            self.sync_params_from_state();
+        }
         self.note_windows_parity();
         Ok(())
     }
@@ -11575,6 +11587,51 @@ mod tests {
     }
 
     #[test]
+    fn interface_and_sound_sends_the_windows_dsp_to_the_output_lane_and_the_other_levels_do_not() {
+        // «Like FxSound for Windows» = Interface and sound plays the Windows build's DSP on the
+        // output lane (and on the applications' output routes, which read the settings' levels,
+        // `MusicLevels::of`): the snapshot says so the moment the level moves, and says so again
+        // the moment it moves back. The other levels leave the sound alone.
+        use WindowsParity::{Interface, Off, Sound};
+        let (mut app, engine, _dir) = started_on(10, &[preset_with("Alpha", &[])]);
+        assert_eq!(engine.params().map(|p| p.compat), Some(DspCompat::Linux));
+        for (level, compat) in [
+            (Interface, DspCompat::Linux),
+            (Sound, DspCompat::Windows),
+            (Off, DspCompat::Linux),
+            (Sound, DspCompat::Windows),
+            (Interface, DspCompat::Linux),
+        ] {
+            assert_eq!(app.set_windows_parity(level, false), Ok(()));
+            assert_eq!(engine.params().map(|p| p.compat), Some(compat), "{level:?}");
+            assert_eq!(app.played_params().compat, compat, "{level:?}");
+            assert_eq!(MusicLevels::of(&app.settings).compat, compat, "{level:?}");
+            assert_eq!(
+                app.played_params(),
+                DspParams {
+                    compat,
+                    ..fxsound_dsp::preset::preset_params(
+                        &preset_with("Alpha", &[]),
+                        &ladder(10),
+                        MusicLevels::of(&app.settings),
+                    )
+                },
+                "{level:?}: the rest of the snapshot is the preset's"
+            );
+        }
+
+        // A start with the level saved plays it from the first snapshot on.
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let mut settings = Settings::default();
+        settings.windows_parity = Sound;
+        let engine = FakeEngine::new();
+        let music = PresetStore::with_dirs(vec![], dir.path().join("user"));
+        let app = App::start_for_tests(settings, music, voices(&dir), &engine);
+        assert_eq!(engine.params().map(|p| p.compat), Some(DspCompat::Windows));
+        assert_eq!(app.played_params().compat, DspCompat::Windows);
+    }
+
+    #[test]
     fn a_preset_with_no_equalizer_turns_it_on_and_flat_on_the_users_ladder() {
         // The original's "old preset" (`DfxDspEq.cpp:144-158`).
         let (mut app, _engine, _dir) = started_on(15, &[preset_with("Alpha", &[])]);
@@ -11609,6 +11666,7 @@ mod tests {
             master_gain_db: -3.0,
             balance_db: 2.0,
             volume_leveling: 1.0,
+            compat: DspCompat::Linux,
         };
         for count in [10, 20, 31] {
             for file in &files {

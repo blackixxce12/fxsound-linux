@@ -6,8 +6,13 @@
 # (crates/fxsound-dsp/tests/windows_parity_bitexact.rs has the cases).
 #
 #   scripts/windows-parity-bitexact.sh v0.4.0             # A3: Off plays as 0.4.0
-#   scripts/windows-parity-bitexact.sh --report 3596e99   # A1: what differs from the engine before
-#                                                         # the 0.4.0 audit's fixes
+#   scripts/windows-parity-bitexact.sh --compat=windows --report 3596e99
+#                                                         # A1: what differs at Interface and sound
+#                                                         # from the engine before the 0.4.0
+#                                                         # audit's fixes
+#
+# --compat=windows has the working tree play the Windows build's DSP, as «Like FxSound for
+# Windows» = Interface and sound does (FXSOUND_BITEXACT_COMPAT); the default is linux, Off's.
 #
 # 3596e99 is the reference for "Interface and sound": its crates/fxsound-dsp and its preset
 # parser are 0f05ba5's, the last engine before the audit's fixes, byte for byte, and its
@@ -21,7 +26,8 @@
 # and passes. Every case's result goes to target/windows-parity-bitexact.tsv. The test file lists
 # the variables that narrow the run.
 #
-# usage: scripts/windows-parity-bitexact.sh [--report] [--dir DIRECTORY] <commit>
+# usage: scripts/windows-parity-bitexact.sh [--report] [--compat=linux|windows] [--dir DIRECTORY]
+#        <commit>
 
 set -euo pipefail
 
@@ -33,16 +39,19 @@ die() {
 report=0
 dir=""
 ref=""
+compat="${FXSOUND_BITEXACT_COMPAT:-linux}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --report) report=1 ;;
+        --compat=linux | --compat=windows) compat="${1#--compat=}" ;;
+        --compat=*) die "--compat takes linux or windows" ;;
         --dir)
             shift
             [ $# -gt 0 ] || die "--dir needs a directory"
             dir="$1"
             ;;
         -h | --help)
-            sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         -*) die "unknown option $1" ;;
@@ -53,7 +62,7 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-[ -n "$ref" ] || die "usage: scripts/windows-parity-bitexact.sh [--report] [--dir DIRECTORY] <commit>"
+[ -n "$ref" ] || die "usage: scripts/windows-parity-bitexact.sh [--report] [--compat=linux|windows] [--dir DIRECTORY] <commit>"
 
 repo_root="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
 [ -n "$dir" ] || dir="$repo_root/target/reference/$ref"
@@ -88,6 +97,7 @@ ours="$(build "$repo_root" "${CARGO_TARGET_DIR:-$repo_root/target}")"
 if [ "$report" = 1 ]; then
     export FXSOUND_BITEXACT_EXPECT=report
 fi
+export FXSOUND_BITEXACT_COMPAT="$compat"
 cd "$repo_root"
 FXSOUND_BITEXACT_REFERENCE="$reference" "$ours" \
     every_shipped_preset_renders_as_the_reference_build_renders_it --exact --ignored --nocapture

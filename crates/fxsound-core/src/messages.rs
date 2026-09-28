@@ -70,6 +70,45 @@ pub struct DspParams {
     pub balance: f32,
     /// Volume-levelling strength in dB.
     pub volume_leveling_db: f32,
+    /// Which build's DSP the music chain plays: FxSound for Linux's, or the Windows one's that
+    /// «Like FxSound for Windows» brings back at Interface and sound ([`DspCompat`]).
+    pub compat: DspCompat,
+}
+
+/// Which build's DSP a music chain plays.
+///
+/// The 0.4.0 audit fixed stages the port had copied from FxSound for Windows, and a preset has
+/// sounded different since. At «Like FxSound for Windows» = Interface and sound
+/// ([`crate::WindowsParity::sound`]) the output lane and the applications' output routes play the
+/// Windows arithmetic again, stage by stage, inside the port's click-free transitions
+/// (`docs/0.5.0-windows-parity.md`, `docs/0.5.0-dsp-inventory.md`). The voice chain has no Windows
+/// original, and [`InputDspParams`] has no such field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum DspCompat {
+    /// FxSound for Linux: the audit's fixes in. The default, and what Off and Interface play.
+    #[default]
+    Linux,
+    /// The Windows build's arithmetic where the audit changed it; the transitions stay the port's.
+    Windows,
+}
+
+impl DspCompat {
+    /// The DSP a level of «Like FxSound for Windows» plays: the Windows one from Interface and
+    /// sound on.
+    #[must_use]
+    pub const fn for_level(level: crate::WindowsParity) -> Self {
+        if level.sound() {
+            Self::Windows
+        } else {
+            Self::Linux
+        }
+    }
+
+    /// Whether this is the Windows build's DSP.
+    #[must_use]
+    pub const fn windows(self) -> bool {
+        matches!(self, Self::Windows)
+    }
 }
 
 impl DspParams {
@@ -184,6 +223,7 @@ impl Default for DspParams {
             master_gain_db: 0.0,
             balance: 0.0,
             volume_leveling_db: 0.0,
+            compat: DspCompat::Linux,
         }
     }
 }

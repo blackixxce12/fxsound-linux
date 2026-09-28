@@ -11,7 +11,8 @@ also fixes defects that came across with it, so a preset voiced on Windows sound
 exactly, the same here; [the deliberate differences](#deliberate-differences-from-the-windows-build)
 say what changed. A mode that restores the original behaviour, «Like FxSound for Windows» in
 Settings ▸ Experimental (`--windows-parity=off|interface|sound`), is being built for 0.5.0: the
-setting is there, and what each of its levels changes arrives over the release
+setting is there, `sound` already plays Volume Leveling and Dynamic Boost as the Windows build
+does, and the rest of what each level changes arrives over the release
 ([`docs/0.5.0-windows-parity.md`](docs/0.5.0-windows-parity.md)). Its fourth level, Everything,
 comes in a later version; 0.5.0 refuses `full`, and runs a `settings.toml` that says `full` as
 `sound` while keeping `full` in the file for that version.
@@ -824,7 +825,8 @@ does, and the setting, option, D-Bus members and status keys that carry it.
 lane's sound since the engine before the 0.4.0 audit, with the level each one belongs to, and
 `scripts/windows-parity-bitexact.sh <commit>` holds the output lane to another build of itself bit
 for bit — every shipped preset as the application plays it, on 10, 20 and 31 bands; CI holds it to
-`v0.4.0`.
+`v0.4.0`, and with `--compat=windows` holds Interface and sound to the engine before the 0.4.0
+audit as far as it is built.
 
 `docs/0.4.0-design.md`, `docs/0.4.0-upstream.md` and `docs/0.4.0-apps.md` record how 0.4.0 was
 built: the two lanes, the voice chain's new stages, D-Bus and the event stream; what was taken from

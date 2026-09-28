@@ -401,7 +401,9 @@ impl Engine {
         }
 
         // Despite its name in the original API, this parameter is an abstract 0..=4 amount, not
-        // decibels (`docs/spec/08-dsp-api.md` §8.4).
+        // decibels (`docs/spec/08-dsp-api.md` §8.4). The Windows arithmetic, when asked for, is
+        // in force before the amount lands, so a stage switched on with it starts on it.
+        self.leveller.set_compat(params.compat);
         self.leveller.set_amount(params.volume_leveling_db);
 
         // `10^(dB/20)`, applied per sample (`GraphicEqSet.cpp:101`); the balance attenuates one
@@ -2883,6 +2885,99 @@ mod tests {
         assert!(
             loudest < 1e-6,
             "the old state rang out at {loudest}, was 0.230"
+        );
+    }
+
+    #[test]
+    fn interface_and_sound_reaches_the_volume_leveller_and_dynamic_boost_through_the_snapshot() {
+        // «Like FxSound for Windows» = Interface and sound travels in the snapshot. The leveller
+        // takes it, and so does Dynamic Boost: at slider 0 a loud tone backs the boost off to the
+        // original's flat floor, ×1.06, where the port plays the static boost of nothing.
+        use fxsound_core::DspCompat;
+        for (compat, gain) in [(DspCompat::Linux, 1.0), (DspCompat::Windows, 1.06)] {
+            let mut engine = Engine::new(48_000.0, 480, 2);
+            engine.apply(&DspParams {
+                compat,
+                volume_leveling_db: 2.0,
+                ..DspParams::default()
+            });
+            assert_eq!(engine.leveller.compat(), compat);
+            engine.apply(&DspParams {
+                compat,
+                ..DspParams::default()
+            });
+            let mut loudest = 0.0_f32;
+            for block in 0..1_000 {
+                let mut buffer = vec![0.0_f32; 960];
+                for (n, frame) in buffer.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+                    let s = 0.7 * (0.05 * (block * 480 + n) as f32).sin();
+                    frame.fill(s);
+                }
+                engine.process(&mut buffer, 2);
+                if block >= 900 {
+                    loudest = buffer.iter().fold(loudest, |most, s| most.max(s.abs()));
+                }
+            }
+            let want = 0.7 * gain * 0.966_051;
+            assert!(
+                (loudest - want).abs() < 2e-3,
+                "{compat:?}: the tone peaked at {loudest}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_to_the_windows_dsp_and_back_under_a_steady_tone_does_not_click() {
+        // «Like FxSound for Windows» moved between Off and Interface and sound under a steady
+        // tone, twice each way, 2 s apart, with the stages the switch reaches at work: Dynamic
+        // Boost backing a loud tone off at slider 0 (the floor that goes from the static boost to
+        // the original's flat 1.06), at a stored 60 and at the top, driving its limiter, and the
+        // leveller lifting a quiet tone. The back-off's floor switched at once stepped the first
+        // case by eight times the tone's own steepest slope, a click whose part above 1 kHz peaked
+        // at −35.6 dBFS; now the loudest of the five is −92.2 dBFS.
+        use fxsound_core::DspCompat;
+        for (boost, leveling, amplitude, hz) in [
+            (0.0, 0.0, 0.5, 50.0),
+            (0.47, 0.0, 0.25, 100.0),
+            (1.0, 0.0, 0.5, 50.0),
+            (1.0, 2.0, 0.1, 100.0),
+            (0.0, 4.0, 0.05, 100.0),
+        ] {
+            let rendered = render_moving(480, 400, (hz, amplitude, 1.0), |block| {
+                let windows = (100..200).contains(&block) || block >= 300;
+                let mut params = DspParams {
+                    compat: if windows {
+                        DspCompat::Windows
+                    } else {
+                        DspCompat::Linux
+                    },
+                    volume_leveling_db: leveling,
+                    ..DspParams::default()
+                };
+                params.set_effect(EffectId::DynamicBoost, boost);
+                params
+            });
+            let left = left_channel(&rendered);
+            let (_, peak) = above(&left, 1_000.0, 40 * 480);
+            assert!(
+                peak < -70.0,
+                "Dynamic Boost {boost}, Volume Leveling {leveling}, {hz} Hz at {amplitude}: a \
+                 click above 1 kHz at {peak} dBFS"
+            );
+        }
+        let rendered = render_moving(480, 200, (50.0, 0.5, 1.0), |block| DspParams {
+            compat: if block >= 100 {
+                DspCompat::Windows
+            } else {
+                DspCompat::Linux
+            },
+            ..DspParams::default()
+        });
+        let left = left_channel(&rendered);
+        let steepest = largest_step(&left[4_800..]);
+        assert!(
+            steepest < own_slope(0.5, 50.0),
+            "the floor stepped the tone by {steepest}"
         );
     }
 }

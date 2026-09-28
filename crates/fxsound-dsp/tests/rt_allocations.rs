@@ -437,6 +437,52 @@ fn switching_effects_off_and_on_and_naming_the_sides_allocates_nothing() {
     );
 }
 
+#[test]
+fn switching_to_the_windows_dsp_and_back_allocates_nothing() {
+    // «Like FxSound for Windows» = Interface and sound reaches the audio thread in the snapshot:
+    // the leveller's arithmetic, Dynamic Boost's floor and level, and its limiter's linking, hold
+    // and attack all change between two blocks, on 5.1 with the sides named, and back. None of it
+    // may allocate.
+    use fxsound_core::DspCompat;
+    use fxsound_dsp::engine::ChannelSide::{Centre, Left, Right};
+    let channels = 6;
+    let mut engine = Engine::new(FS, 1_024, channels);
+    let input: Vec<f32> = stereo_fixture(1_024 * 4)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|frame| [frame[0], frame[1], frame[0], frame[0], frame[0], frame[1]])
+        .collect();
+    let mut block = input.clone();
+    let snapshots: Vec<DspParams> = [DspCompat::Linux, DspCompat::Windows]
+        .into_iter()
+        .cycle()
+        .take(5)
+        .map(|compat| {
+            let mut params = DspParams {
+                compat,
+                volume_leveling_db: 3.0,
+                ..DspParams::default()
+            };
+            params.set_effect(Effect::DynamicBoost, 1.0);
+            params
+        })
+        .collect();
+
+    let n = allocations_on_a_fresh_thread(|| {
+        engine.set_lfe_channel(Some(3));
+        engine.set_channel_sides(Some(&[Left, Right, Centre, Centre, Left, Right]));
+        for params in &snapshots {
+            engine.apply(params);
+            block.copy_from_slice(&input);
+            for chunk in block.chunks_mut(1_024 * channels) {
+                engine.process(chunk, channels);
+            }
+        }
+    });
+    assert_eq!(n, 0, "switching the DSP allocated {n} times");
+}
+
 /// The SSE status register's sticky flags for an arithmetic operand that was subnormal (DE, bit 1)
 /// and for a result that underflowed (UE, bit 4). Each one set is an operation that took the slow
 /// path: a microcode assist on many x86 parts, tens to hundreds of cycles, on the audio thread.

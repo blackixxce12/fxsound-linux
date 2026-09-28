@@ -21,9 +21,17 @@
 //! the reference checkout, builds both and runs it:
 //!
 //! ```text
-//! scripts/windows-parity-bitexact.sh v0.4.0           # A3: Off plays as 0.4.0
-//! scripts/windows-parity-bitexact.sh --report 3596e99 # A1: what differs from the pre-audit engine
+//! scripts/windows-parity-bitexact.sh v0.4.0                            # A3: Off plays as 0.4.0
+//! scripts/windows-parity-bitexact.sh --compat=windows --report 3596e99 # A1: Interface and sound
 //! ```
+//!
+//! **Whose DSP the working tree plays** is `FXSOUND_BITEXACT_COMPAT`: `linux`, the default, for
+//! Off (A3), and `windows` for Interface and sound (A1), where the output lane plays the Windows
+//! build's arithmetic ([`fxsound_core::DspCompat`]). It reaches the engine the way the
+//! application's level does, through [`MusicLevels`] and [`preset_params`]. Both sides are told;
+//! a build with one DSP only, as every reference is so far, plays it either way
+//! (`scripts/reference-checkout.sh` gives it a `MusicLevels::with_windows_dsp` that changes
+//! nothing).
 //!
 //! # The cases
 //!
@@ -72,12 +80,14 @@
 //! | variable | default | what it changes |
 //! | --- | --- | --- |
 //! | `FXSOUND_BITEXACT_REFERENCE` | — | the reference build's copy of this test (required) |
+//! | `FXSOUND_BITEXACT_COMPAT` | `linux` | `windows` plays the Windows build's DSP (Interface and sound) |
 //! | `FXSOUND_BITEXACT_EXPECT` | `match` | `report` prints what differs and passes |
 //! | `FXSOUND_BITEXACT_LIMIT_DB` | `-120` | the largest difference a case may have, in dBFS |
 //! | `FXSOUND_BITEXACT_BANDS` | `10,20,31` | the band counts |
 //! | `FXSOUND_BITEXACT_BLOCKS` | `480,512,1024,2048` | the block sizes, in frames |
 //! | `FXSOUND_BITEXACT_PRESETS` | every one | only the presets whose `dir/stem` contains this |
 //! | `FXSOUND_BITEXACT_PASSES` | `cold,switching` | the passes |
+//! | `FXSOUND_BITEXACT_LEVELS` | `settings,gain` | the sets of levels, by name |
 //! | `FXSOUND_BITEXACT_SETTLE_MS` | `20` ([`GLIDE_SECONDS`]) | how long after a switch goes uncompared |
 //! | `FXSOUND_BITEXACT_OUT` | `target/windows-parity-bitexact.tsv` | every case's result |
 
@@ -116,12 +126,14 @@ const PRESETS_VAR: &str = "FXSOUND_BITEXACT_PRESETS";
 const OUT_VAR: &str = "FXSOUND_BITEXACT_OUT";
 const PASSES_VAR: &str = "FXSOUND_BITEXACT_PASSES";
 const SETTLE_VAR: &str = "FXSOUND_BITEXACT_SETTLE_MS";
+const COMPAT_VAR: &str = "FXSOUND_BITEXACT_COMPAT";
+const LEVELS_VAR: &str = "FXSOUND_BITEXACT_LEVELS";
 
 /// This test's own name, which the working tree runs the reference build's copy of by.
 const TEST_NAME: &str = "every_shipped_preset_renders_as_the_reference_build_renders_it";
 
 /// Bumped whenever the two sides' messages change, so a stale copy says so instead of misreading.
-const PROTOCOL: u32 = 2;
+const PROTOCOL: u32 = 3;
 
 const DEFAULT_LIMIT_DB: f64 = -120.0;
 const DEFAULT_BANDS: [usize; 3] = [10, 20, 31];
@@ -169,9 +181,38 @@ fn level_sets() -> [(&'static str, MusicLevels); 2] {
                 master_gain_db: -6.0,
                 balance_db: 3.0,
                 volume_leveling: 0.0,
+                // Named field by field above, so that the copy compiles in a build whose
+                // `MusicLevels` has nothing more; the DSP is the case's (`Request::windows`).
+                ..MusicLevels::default()
             },
         ),
     ]
+}
+
+/// The sets of levels `FXSOUND_BITEXACT_LEVELS` names, all of them by default.
+fn chosen_level_sets() -> Vec<(&'static str, MusicLevels)> {
+    let all = level_sets();
+    std::env::var(LEVELS_VAR).map_or_else(
+        |_| all.to_vec(),
+        |list| {
+            list.split(',')
+                .map(|name| {
+                    *all.iter()
+                        .find(|(set, _)| *set == name.trim())
+                        .unwrap_or_else(|| panic!("{LEVELS_VAR}: no set of levels {name}"))
+                })
+                .collect()
+        },
+    )
+}
+
+/// Whether the working tree plays the Windows build's DSP: `FXSOUND_BITEXACT_COMPAT`.
+fn windows_dsp() -> bool {
+    match std::env::var(COMPAT_VAR).as_deref().map(str::trim) {
+        Err(_) | Ok("" | "linux") => false,
+        Ok("windows") => true,
+        Ok(other) => panic!("{COMPAT_VAR}: {other} is neither linux nor windows"),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -199,6 +240,8 @@ struct Request {
     material: u32,
     /// `None` for the cold pass.
     switches: Option<Switches>,
+    /// The Windows build's DSP ([`windows_dsp`]).
+    windows: bool,
 }
 
 impl Request {
@@ -209,7 +252,9 @@ impl Request {
             master_gain_db,
             balance_db,
             volume_leveling,
+            ..MusicLevels::default()
         }
+        .with_windows_dsp(self.windows)
     }
 }
 
@@ -361,6 +406,7 @@ fn put_request(out: &mut impl Write, request: &Request, material: Option<&[f32]>
     put_floats(out, &request.levels);
     put_u32(out, request.block);
     put_u32(out, request.material);
+    put_u32(out, u32::from(request.windows));
     match &request.switches {
         Some(switches) => {
             put_u32(out, 1);
@@ -393,6 +439,7 @@ fn get_request(input: &mut impl Read) -> Option<(Request, Option<Vec<f32>>)> {
     let levels: [f32; 4] = get_floats(input)?.try_into().ok()?;
     let block = get_u32(input)?;
     let material = get_u32(input)?;
+    let windows = get_u32(input)? != 0;
     let switches = match get_u32(input)? {
         0 => None,
         _ => Some(Switches {
@@ -412,6 +459,7 @@ fn get_request(input: &mut impl Read) -> Option<(Request, Option<Vec<f32>>)> {
         block,
         material,
         switches,
+        windows,
     };
     Some((request, samples))
 }
@@ -697,6 +745,8 @@ fn run_against(reference: &Path) {
     let blocks = list_var(BLOCKS_VAR, &DEFAULT_BLOCKS);
     let passes = passes();
     let settle = settle_frames();
+    let windows = windows_dsp();
+    let level_sets = chosen_level_sets();
     assert!(
         blocks.iter().all(|&b| (1..=MAX_BLOCK).contains(&b)),
         "blocks go from 1 to {MAX_BLOCK} frames"
@@ -721,7 +771,7 @@ fn run_against(reference: &Path) {
                     bands: u32::try_from(next_band_count(count)).expect("a band count"),
                     effect: u32::try_from((which + 1) % Effect::COUNT).expect("an effect"),
                 });
-                for (name, levels) in level_sets() {
+                for &(name, levels) in &level_sets {
                     for (index, material) in materials.iter().enumerate() {
                         for &block in &blocks {
                             cases.push(Case {
@@ -740,6 +790,7 @@ fn run_against(reference: &Path) {
                                     block: u32::try_from(block).expect("a block size"),
                                     material: u32::try_from(index).expect("a material index"),
                                     switches: switches.clone(),
+                                    windows,
                                 },
                             });
                         }
@@ -768,15 +819,17 @@ fn run_against(reference: &Path) {
     drop(socket_file);
 
     eprintln!(
-        "windows_parity_bitexact: {} cases ({:?} passes × {} presets × {:?} bands × 2 levels × {} \
-         materials × {:?} frames; {settle} frames after a switch not compared) on {workers} \
-         threads against {}",
+        "windows_parity_bitexact: {} cases ({:?} passes × {} presets × {:?} bands × {:?} levels × {} \
+         materials × {:?} frames; {settle} frames after a switch not compared; {} DSP) on \
+         {workers} threads against {}",
         cases.len(),
         passes.iter().map(|pass| pass.name()).collect::<Vec<_>>(),
         presets.len(),
         bands,
+        level_sets.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
         materials.len(),
         blocks,
+        if windows { "the Windows" } else { "the Linux" },
         reference.display()
     );
     let next = AtomicUsize::new(0);
@@ -956,6 +1009,7 @@ fn a_case_crosses_the_wire_as_it_was_sent() {
         block: 480,
         material: 7,
         switches: None,
+        windows: false,
     };
     let switching = Request {
         switches: Some(Switches {
@@ -963,6 +1017,7 @@ fn a_case_crosses_the_wire_as_it_was_sent() {
             bands: 10,
             effect: 3,
         }),
+        windows: true,
         ..cold.clone()
     };
     let samples = vec![0.25, -0.5, f32::MIN_POSITIVE, 1.0];
@@ -1030,6 +1085,7 @@ fn jazz(switches: Option<Switches>) -> (String, Request) {
         block: 480,
         material: 0,
         switches,
+        windows: false,
     };
     (key, request)
 }
@@ -1062,6 +1118,21 @@ fn a_preset_renders_the_same_twice_in_one_build() {
         assert_eq!(first.numbers, second.numbers);
         assert_eq!(first.switched_at, second.switched_at);
     }
+}
+
+#[test]
+fn a_windows_case_is_played_by_the_windows_dsp() {
+    // `FXSOUND_BITEXACT_COMPAT=windows` reaches the engine: the same case renders otherwise,
+    // from the same snapshot but for whose DSP plays it.
+    let material = a_second_of_tone();
+    let (key, linux) = jazz(None);
+    let windows = Request {
+        windows: true,
+        ..linux.clone()
+    };
+    let (linux, windows) = (render(&linux, &material), render(&windows, &material));
+    assert_eq!(linux.numbers, windows.numbers, "{key}");
+    assert_ne!(linux.samples, windows.samples, "{key}");
 }
 
 #[test]

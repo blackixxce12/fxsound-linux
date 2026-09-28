@@ -22,6 +22,8 @@
 //! `--filter-q` — the settings' rather than the preset's. So the blind comparisons of
 //! `scripts/voicing/` hear what the application plays, not the raw values of the file. The
 //! effect flags and `--no-eq` are set over the preset, whatever order they come in.
+//! `--windows-dsp` plays it as «Like FxSound for Windows» = Interface and sound does, through the
+//! Windows build's DSP ([`fxsound_core::DspCompat`]); a build that has one DSP only plays that.
 //!
 //! Only 16-bit PCM WAV is handled, which is what `.wav` almost always means and what the original
 //! engine's `processAudio` took.
@@ -37,7 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "usage: process_wav <in.wav> <out.wav> [--preset FILE] [--bands N] \
              [--fidelity N] [--ambience N] [--surround N] [--dynamic-boost N] [--bass N] \
-             [--master-gain DB] [--balance DB] [--volume-leveling N] [--filter-q N] [--no-eq]\n       \
+             [--master-gain DB] [--balance DB] [--volume-leveling N] [--filter-q N] [--no-eq] \
+             [--windows-dsp]\n       \
              process_wav <mic.wav> <out.wav> --input <voice preset .toml> [--chain NAME] \
              [--source-rate HZ]"
         );
@@ -92,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bands = count as usize;
             }
             "--no-eq" => no_eq = true,
+            "--windows-dsp" => levels = levels.with_windows_dsp(true),
             "--preset" => {
                 i += 1;
                 let path = rest.get(i).ok_or("--preset needs a path")?;

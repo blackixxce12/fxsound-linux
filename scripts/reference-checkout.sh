@@ -14,6 +14,10 @@
 # than the application's music_controls (0f05ba5 and before) played a preset on the preset's own
 # band count, with the effects read through the sliders; its preset.rs says so and does that.
 #
+# A commit older than the Windows DSP of «Like FxSound for Windows» (0.5.0's W1b) has one DSP only,
+# and no MusicLevels::with_windows_dsp to choose it with; the comparisons call it on both sides, so
+# such a commit gets one that changes nothing.
+#
 # The measuring files are this checkout's, copied over: the harness, preset_drift.rs, their
 # material modules and, with --with-process-wav, the process_wav example.
 #
@@ -35,7 +39,7 @@ for arg in "$@"; do
     case "$arg" in
         --with-process-wav) with_process_wav=1 ;;
         -h | --help)
-            sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         -*) die "unknown option $arg" ;;
@@ -75,8 +79,22 @@ if [ "$with_process_wav" = 1 ]; then
 fi
 
 preset_rs="$dir/crates/fxsound-dsp/src/preset.rs"
+one_dsp='
+/// Written by scripts/reference-checkout.sh: this commit has one DSP, which it plays either way.
+impl MusicLevels {
+    #[must_use]
+    pub const fn with_windows_dsp(self, _windows: bool) -> Self {
+        self
+    }
+}
+'
 if [ -f "$preset_rs" ]; then
-    echo "reference-checkout: $ref has fxsound_dsp::preset; nothing to add"
+    if grep -q 'fn with_windows_dsp' "$preset_rs"; then
+        echo "reference-checkout: $ref has fxsound_dsp::preset; nothing to add"
+    else
+        printf '%s' "$one_dsp" >> "$preset_rs"
+        echo "reference-checkout: $ref has fxsound_dsp::preset and one DSP; added with_windows_dsp"
+    fi
 else
     python3 - "$dir/crates/fxsound-app/src/app.rs" "$preset_rs" "$ref" <<'PYTHON'
 import re
@@ -221,6 +239,7 @@ pub fn preset_params(preset: &Preset, _ladder: &[f32], levels: MusicLevels) -> D
 open(preset_rs, "w", encoding="utf-8").write(header + "\n" + body.lstrip("\n"))
 print(f"reference-checkout: wrote fxsound_dsp::preset for {ref}, {note}")
 PYTHON
+    printf '%s' "$one_dsp" >> "$preset_rs"
     lib_rs="$dir/crates/fxsound-dsp/src/lib.rs"
     printf '\n/// Written by scripts/reference-checkout.sh; not part of this commit.\npub mod preset;\n' >> "$lib_rs"
 fi

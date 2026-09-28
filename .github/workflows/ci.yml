@@ -273,9 +273,9 @@ jobs:
   bitexact:
     name: Output DSP bit for bit against 0.4.0
     runs-on: ubuntu-24.04
-    # Two release builds and the comparison; the harness gives the reference build five minutes
+    # Three release builds and the comparisons; the harness gives a reference build five minutes
     # to connect, and this bounds everything else.
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -285,12 +285,26 @@ jobs:
         run: rustc --version
       - name: Off plays as v0.4.0 (A3)
         run: scripts/windows-parity-bitexact.sh --dir "$RUNNER_TEMP/reference-v0.4.0" v0.4.0
+      # «Like FxSound for Windows» = Interface and sound against 3596e99, the engine before the
+      # 0.4.0 audit (A1), as far as 0.5.0 has built it: Volume Leveling, Dynamic Boost and its
+      # limiter (W1b), which ten bands and the settings' levels reach alone. The band counts'
+      # readings of a curve, the gain stage and the switching pass follow in W1c and W1d
+      # (docs/0.5.0-dsp-inventory.md).
+      - name: Interface and sound plays as the engine before the audit (A1, so far)
+        env:
+          FXSOUND_BITEXACT_PASSES: cold
+          FXSOUND_BITEXACT_BANDS: "10"
+          FXSOUND_BITEXACT_LEVELS: settings
+          FXSOUND_BITEXACT_OUT: target/windows-parity-bitexact-a1.tsv
+        run: >-
+          scripts/windows-parity-bitexact.sh --compat=windows
+          --dir "$RUNNER_TEMP/reference-3596e99" 3596e99
       - name: Every case
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
           name: windows-parity-bitexact
-          path: target/windows-parity-bitexact.tsv
+          path: target/windows-parity-bitexact*.tsv
           if-no-files-found: ignore
 
   audit:

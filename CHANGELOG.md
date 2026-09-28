@@ -17,6 +17,13 @@ All notable changes to the FxSound Linux port. The format follows
   `settings.toml` that says `full` runs as `sound` and keeps saying `full`, so the later version
   finds Everything again. A tab caption too long for one line, as
   «Экспериментальное» is, takes two, broken where its translation marks the word.
+- **At «Like FxSound for Windows» = Interface and sound, Volume Leveling and Dynamic Boost play
+  as on Windows.** The levelling steps once a buffer, reads its peak from the bass-light side
+  chain, leaves the subwoofer alone and pulls the gain down at the top of a buffer, and Dynamic
+  Boost lifts loud material by half a decibel at 0, hears the left channel alone and limits each
+  channel on its own, with no hold: the Windows build's arithmetic, sample for sample, on the
+  output and on the applications' output routes. The transitions stay FxSound for Linux's. The
+  rest of the Windows sound follows during 0.5.0.
 - **Settings keep what a later version wrote.** A key of `settings.toml` this version does not
   know is written back as it was, so going back a version and up again keeps the newer version's
   settings. 0.4.0 does not keep them: after a downgrade to 0.4.0 its next save drops the keys 0.5.0
@@ -59,7 +66,9 @@ All notable changes to the FxSound Linux port. The format follows
 - **The sound is checked bit for bit against 0.4.0.** CI renders every shipped preset at 10, 20
   and 31 bands through this version and through v0.4.0, from a cold start and while a preset, the
   band count and a slider are switched, and requires the same output: identical, or nowhere more
-  than −120 dBFS apart. The offline renderer (`process_wav`) and the blind A/B of
+  than −120 dBFS apart. It also renders Interface and sound against the engine before the 0.4.0
+  audit, and requires the same output wherever that level is built so far. The offline renderer
+  (`process_wav`, with `--windows-dsp` for Interface and sound) and the blind A/B of
   `scripts/voicing` now play a preset the way the application does, through the application's
   own reading of a preset.
 
