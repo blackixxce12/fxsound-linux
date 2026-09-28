@@ -19,7 +19,9 @@ use crate::cli::{
     AppPresetChoice, Command, DeviceCommand, PowerCommand, PresetCommand, WindowCommand,
 };
 use fxsound_core::messages::AppStream;
-use fxsound_core::{AppRules, AudioDevice, DeviceDirection, Effect, ThemeMode, ViewMode, eq};
+use fxsound_core::{
+    AppRules, AudioDevice, DeviceDirection, Effect, ParityClass, ThemeMode, ViewMode, eq,
+};
 use fxsound_ui::{UiAction, state::UiState};
 use serde::Serialize;
 use serde_json::Value;
@@ -196,6 +198,12 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
         }
 
         Command::Language(code) => app.set_language(code),
+
+        Command::WindowsParity { level, force } => {
+            if let Err(refusal) = app.set_windows_parity(*level, *force) {
+                return Outcome::refused(refusal);
+            }
+        }
 
         Command::Window(window) => {
             outcome.window = match window {
@@ -860,8 +868,10 @@ pub fn waits_for_the_device_list(app: &App, commands: &[Command]) -> bool {
 }
 
 /// The shape of [`StatusDocument`], as its `schema` key says it. 0.3.0's document had no number
-/// and is schema 1; 2 is 0.4.0's, every key of 1 kept and upstream's `printStatus` keys added.
-pub const STATUS_SCHEMA: u32 = 2;
+/// and is schema 1; 2 is 0.4.0's, every key of 1 kept and upstream's `printStatus` keys added; 3
+/// is 0.5.0's, every key of 2 kept and «Как в Windows» added (`windows_parity`, `apps_hidden`,
+/// `input.hidden`).
+pub const STATUS_SCHEMA: u32 = 3;
 
 /// Everything `--status` reports, in the shape `--status --json` prints it.
 ///
@@ -936,6 +946,11 @@ pub struct StatusDocument {
     /// Every application FxSound remembers, the ones playing or recording now first, with the
     /// presets of their own and what they run through now (`docs/0.4.0-apps.md`).
     pub apps: Vec<AppStatus>,
+    /// «Как в Windows» / "Like FxSound for Windows": `off`, `interface`, `sound` or `full`.
+    pub windows_parity: &'static str,
+    /// Whether the applications' own presets are hidden by «Как в Windows» = Everything, so a
+    /// panel widget can grey its part for them rather than fail.
+    pub apps_hidden: bool,
 }
 
 /// A value on a control's own scale, as the document prints it: exactly, and a whole number
@@ -1104,6 +1119,8 @@ pub struct InputLaneStatus {
     pub noise_suppression: &'static str,
     /// The level the denoiser runs at once the override is applied.
     pub denoise_level: &'static str,
+    /// Whether the microphone lane is hidden by «Как в Windows» = Everything.
+    pub hidden: bool,
 }
 
 /// The microphone's telemetry, as the readout strip shows it. Reductions are positive dB.
@@ -1156,6 +1173,7 @@ pub fn status_document(app: &App) -> StatusDocument {
     let presets = |lane: DeviceDirection| preset_lists(&app.lane_preset_list(lane));
     let output_device_list = device_list(app, DeviceDirection::Output);
     let input_device_list = device_list(app, DeviceDirection::Input);
+    let parity = app.windows_parity();
 
     StatusDocument {
         schema: STATUS_SCHEMA,
@@ -1213,6 +1231,7 @@ pub fn status_document(app: &App) -> StatusDocument {
             lane: lane(DeviceDirection::Input),
             noise_suppression: app.settings().noise_suppression.key(),
             denoise_level: state.denoise_level.key(),
+            hidden: parity.changes(ParityClass::Full),
         },
         input_meters: input_meters(state),
         echo_cancel: EchoCancelStatus {
@@ -1235,6 +1254,8 @@ pub fn status_document(app: &App) -> StatusDocument {
             .map(|d| d.description.clone()),
         equalizer: equalizer(state),
         apps: app_statuses(app.app_rules(), app.app_streams()),
+        windows_parity: parity.key(),
+        apps_hidden: parity.changes(ParityClass::Full),
     }
 }
 
@@ -1393,6 +1414,7 @@ fn status_report(app: &App) -> String {
     let _ = writeln!(out, "direction: {}", doc.direction);
     let _ = writeln!(out, "view: {}", doc.view);
     let _ = writeln!(out, "theme: {}", doc.theme);
+    let _ = writeln!(out, "windows_parity: {}", doc.windows_parity);
 
     let effects = doc.effects;
     for (key, value) in [
@@ -1936,7 +1958,7 @@ mod tests {
         a.receive(fxsound_core::messages::AudioToUi::Devices(mixed_devices()));
         let json = status(&mut a);
         assert_eq!(json["schema"].as_u64(), Some(u64::from(STATUS_SCHEMA)));
-        assert_eq!(STATUS_SCHEMA, 2);
+        assert_eq!(STATUS_SCHEMA, 3);
         assert_upstream_shape(&json);
         assert_eq!(
             json["output_devices"].as_array().map(Vec::len),
@@ -4679,5 +4701,202 @@ mod tests {
         assert!(preset.modified, "the band and the effect are edits to it");
         assert_eq!(a.state.eq_bands[0].boost_db, 3.0);
         assert_eq!(a.state.effect(Effect::Bass), 5.0);
+    }
+
+    // ---- «Как в Windows» (A9) ---------------------------------------------------------------
+
+    use fxsound_core::WindowsParity;
+    use fxsound_core::parity::{FULL_NOT_YET, FULL_REFUSAL};
+
+    // Everything's own tests are ignored until W4 (0.6.0) offers it; until then every path
+    // refuses it with `FULL_NOT_YET`.
+
+    #[test]
+    fn everything_is_refused_in_this_version_whatever_is_in_use_and_with_force_too() {
+        let mut a = app();
+        for level in ["interface", "sound"] {
+            let _ = a.drain_events();
+            for line in [
+                vec!["--windows-parity=full"],
+                vec!["--windows-parity=Everything"],
+                vec!["--windows-parity=full", "--force"],
+            ] {
+                let outcome = run_line(&mut a, &line);
+                assert!(outcome.failed, "{line:?}");
+                assert_eq!(outcome.stderr, FULL_NOT_YET, "{line:?}");
+                assert_eq!(a.drain_events(), [], "{line:?}: nothing happened");
+            }
+            assert!(!run_line(&mut a, &[&format!("--windows-parity={level}")]).failed);
+            let outcome = run_line(&mut a, &["--windows-parity=full", "--force"]);
+            assert!(outcome.failed);
+            assert_eq!(a.windows_parity().key(), level, "unchanged");
+            assert_eq!(status(&mut a)["windows_parity"], level);
+        }
+        assert!(FULL_NOT_YET.contains("later version"), "{FULL_NOT_YET}");
+    }
+
+    #[test]
+    fn windows_parity_is_saved_reported_and_said_on_the_stream() {
+        let mut a = app();
+        let _ = a.drain_events();
+        for (option, level) in [
+            ("interface", WindowsParity::Interface),
+            ("SOUND", WindowsParity::Sound),
+            ("off", WindowsParity::Off),
+        ] {
+            let outcome = run_line(&mut a, &[&format!("--windows-parity={option}")]);
+            assert!(!outcome.failed, "{option}: {}", outcome.stderr);
+            assert!(
+                outcome.window.is_empty(),
+                "a set option leaves the window alone"
+            );
+            assert_eq!(a.settings().windows_parity, level);
+            assert_eq!(a.windows_parity(), level);
+            let json = status(&mut a);
+            assert_eq!(json["windows_parity"], level.key(), "{option}");
+            assert_eq!(json["apps_hidden"], level.full(), "{option}");
+            assert_eq!(json["input"]["hidden"], level.full(), "{option}");
+            assert_eq!(line(&status_lines(&mut a), "windows_parity"), level.key());
+            assert_eq!(
+                a.drain_events(),
+                [crate::events::AppEvent::WindowsParity { level }],
+                "{option}"
+            );
+            assert_eq!(a.unsaid_changes(), [], "{option}");
+        }
+        // The same level again says nothing.
+        let outcome = run_line(&mut a, &["--windows-parity=off"]);
+        assert!(!outcome.failed);
+        assert_eq!(a.drain_events(), []);
+    }
+
+    #[test]
+    fn the_status_document_is_schema_3_and_keeps_every_key_of_2() {
+        let mut a = app();
+        let json = status(&mut a);
+        assert_eq!(json["schema"], 3);
+        assert_eq!(json["windows_parity"], "off");
+        assert_eq!(json["apps_hidden"], false);
+        assert_eq!(json["input"]["hidden"], false);
+        // A few of 2's keys, each still there with its kind.
+        assert!(json["power"].is_boolean());
+        assert!(json["input"]["noise_suppression"].is_string());
+        assert!(json["apps"].is_array());
+        assert!(json["output_device_list"].is_array());
+    }
+
+    #[test]
+    #[ignore = "Everything is offered from 0.6.0 (W4)"]
+    fn a_move_to_everything_that_would_take_the_microphone_away_is_refused_without_force() {
+        let mut a = app();
+        devices_arrive(&mut a);
+        run(
+            &mut a,
+            &[Command::Input(InputCommand::Select(
+                "alsa_input.pci".into(),
+            ))],
+        );
+        assert!(a.parity_would_take_away());
+        let _ = a.drain_events();
+
+        let outcome = run_line(&mut a, &["--windows-parity=full"]);
+        assert!(outcome.failed);
+        assert_eq!(outcome.stderr, FULL_REFUSAL);
+        assert_eq!(a.settings().windows_parity, WindowsParity::Off, "unchanged");
+        assert_eq!(a.drain_events(), [], "nothing happened, so nothing is said");
+
+        // Every other level is no such move.
+        for level in ["interface", "sound"] {
+            let outcome = run_line(&mut a, &[&format!("--windows-parity={level}")]);
+            assert!(!outcome.failed, "{level}: {}", outcome.stderr);
+        }
+        let outcome = run_line(&mut a, &["--windows-parity=everything", "--force"]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(a.settings().windows_parity, WindowsParity::Full);
+        // Already there: nothing to refuse. And back down never is.
+        assert!(!run_line(&mut a, &["--windows-parity=full"]).failed);
+        assert!(!run_line(&mut a, &["--windows-parity=off"]).failed);
+        assert_eq!(a.settings().windows_parity, WindowsParity::Off);
+    }
+
+    #[test]
+    #[ignore = "Everything is offered from 0.6.0 (W4)"]
+    fn a_move_to_everything_with_nothing_in_use_goes_ahead_without_force() {
+        let mut a = app();
+        assert!(!a.parity_would_take_away());
+        let outcome = run_line(&mut a, &["--windows-parity=full"]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(a.settings().windows_parity, WindowsParity::Full);
+    }
+
+    #[test]
+    fn a_line_that_is_refused_the_move_to_everything_still_does_the_rest() {
+        // As every refusal on a line: the command is refused, the others are carried out, and
+        // the line fails. Refused for what is in use once Everything is offered; for not being
+        // offered yet until then.
+        let mut a = app();
+        devices_arrive(&mut a);
+        run(
+            &mut a,
+            &[Command::Input(InputCommand::Select(
+                "alsa_input.pci".into(),
+            ))],
+        );
+        let outcome = run_line(&mut a, &["--windows-parity=full", "--balance=3"]);
+        assert!(outcome.failed);
+        assert_eq!(a.settings().windows_parity, WindowsParity::Off);
+        assert_eq!(a.state.balance_db, 3.0);
+    }
+
+    #[test]
+    fn a_line_with_windows_parity_sets_it_before_anything_else_on_it() {
+        let cli = crate::cli::Cli::try_parse_from([
+            "fxsound",
+            "--power=1",
+            "--language=fr",
+            "--windows-parity=sound",
+        ])
+        .expect("parses");
+        assert_eq!(
+            cli.commands().first(),
+            Some(&Command::WindowsParity {
+                level: WindowsParity::Sound,
+                force: false
+            })
+        );
+        assert!(cli.only_sets_things());
+        assert!(
+            cli.cold_start_commands().contains(&Command::WindowsParity {
+                level: WindowsParity::Sound,
+                force: false
+            }),
+            "a start saves it too"
+        );
+    }
+
+    #[test]
+    #[ignore = "Everything is offered from 0.6.0 (W4)"]
+    fn a_move_to_everything_that_would_take_an_applications_preset_away_is_refused_without_force() {
+        let (mut a, engine, _dir) = with_apps();
+        assert!(a.state.device_for(IN).is_none());
+        assert!(!a.parity_would_take_away());
+        play(
+            &mut a,
+            &engine,
+            vec![on_route(
+                7,
+                DeviceDirection::Output,
+                &battlefield(),
+                "Gaming",
+            )],
+        );
+        assert!(a.parity_would_take_away());
+        let outcome = run_line(&mut a, &["--windows-parity=full"]);
+        assert!(outcome.failed);
+        assert_eq!(outcome.stderr, FULL_REFUSAL);
+        assert_eq!(a.windows_parity(), WindowsParity::Off);
+        let outcome = run_line(&mut a, &["--windows-parity=full", "--force"]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(a.windows_parity(), WindowsParity::Full);
     }
 }

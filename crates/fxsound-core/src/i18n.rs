@@ -364,10 +364,29 @@ pub fn current() -> String {
     CURRENT.load().code.clone()
 }
 
+/// Where a translation says a long word may be broken over two lines: `Эксперимен{-}тальное`.
+///
+/// Only the port's own tables use it, and only in a caption drawn where two lines fit and one does
+/// not — the Settings tabs' ([`tr_breakable`]). Everywhere else [`tr`] takes it out. A soft hyphen
+/// (U+00AD) would have been the standard spelling, but egui neither breaks at one nor hides it.
+pub const BREAK: &str = "{-}";
+
 /// Translate one string. The key is the English text, exactly as the C++ passes it to
-/// `TRANS`; an untranslated key comes back as itself.
+/// `TRANS`; an untranslated key comes back as itself. A [`BREAK`] in the translation is taken out.
 #[must_use]
 pub fn tr(key: &str) -> String {
+    let text = tr_breakable(key);
+    if text.contains(BREAK) {
+        text.replace(BREAK, "")
+    } else {
+        text
+    }
+}
+
+/// [`tr`], with each [`BREAK`] left where the translation put it, for a caption that may take
+/// two lines.
+#[must_use]
+pub fn tr_breakable(key: &str) -> String {
     CURRENT
         .load()
         .get(key)
@@ -770,6 +789,55 @@ mod tests {
         assert!(!set_language("xx"));
         assert_eq!(current(), ENGLISH);
         assert_eq!(tr("Settings"), "Settings");
+    }
+
+    #[test]
+    fn tr_takes_the_break_mark_out_and_tr_breakable_keeps_it() {
+        let _table = hold_the_table();
+        assert!(set_language("ru"));
+        assert_eq!(tr("Experimental"), "Экспериментальное");
+        assert_eq!(tr_breakable("Experimental"), "Эксперимен{-}тальное");
+        // A string without the mark is the same either way.
+        assert_eq!(tr_breakable("Settings"), tr("Settings"));
+        set_language(ENGLISH);
+        assert_eq!(tr("Experimental"), "Experimental");
+    }
+
+    #[test]
+    fn only_a_settings_tab_caption_carries_the_break_mark_in_any_table() {
+        // The captions drawn with `tr_breakable` (`SettingsTab::nav_label`); anywhere else the
+        // mark would be taken out by `tr` and never break anything.
+        let captions = [
+            "Audio",
+            "General",
+            "Help",
+            "Microphone",
+            "Applications",
+            "Experimental",
+        ];
+        for language in &LANGUAGES[1..] {
+            for catalogue in [language.original_catalogue(), language.port_catalogue()] {
+                for key in catalogue.keys() {
+                    let text = catalogue.get(key).unwrap_or_default();
+                    assert!(
+                        !text.contains(BREAK) || captions.contains(&key),
+                        "{}: {key:?} = {text:?}",
+                        language.code
+                    );
+                    // One mark at most, inside a word, never at either end.
+                    assert!(
+                        text.matches(BREAK).count() <= 1,
+                        "{}: {text:?}",
+                        language.code
+                    );
+                    assert!(
+                        !text.starts_with(BREAK) && !text.ends_with(BREAK),
+                        "{}: {text:?}",
+                        language.code
+                    );
+                }
+            }
+        }
     }
 
     #[test]

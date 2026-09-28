@@ -6,6 +6,26 @@ All notable changes to the FxSound Linux port. The format follows
 
 ## [Unreleased]
 
+### Added
+- **«Like FxSound for Windows», in a new Experimental tab of Settings.** A slider of three
+  positions — Off, Interface, Interface and sound — with a line under it that says what each
+  does, and `fxsound --windows-parity=off|interface|sound` for the same. The level is saved,
+  shown in `--status` (`windows_parity`), announced by `--watch` (`windows_parity`) and on D-Bus
+  (the `WindowsParity` property and `SetWindowsParity`); what each level changes arrives over the
+  rest of 0.5.0 (`docs/0.5.0-windows-parity.md`). Everything, the fourth level, comes in a later
+  version: `full` is refused from the command line and D-Bus, `--force` or not, and a
+  `settings.toml` that says `full` runs as `sound` and keeps saying `full`, so the later version
+  finds Everything again. A tab caption too long for one line, as
+  «Экспериментальное» is, takes two, broken where its translation marks the word.
+- **Settings keep what a later version wrote.** A key of `settings.toml` this version does not
+  know is written back as it was, so going back a version and up again keeps the newer version's
+  settings. 0.4.0 does not keep them: after a downgrade to 0.4.0 its next save drops the keys 0.5.0
+  added, `windows_parity` among them.
+
+### Changed
+- **`--status --json` is schema 3.** Every key of schema 2 is kept; `windows_parity`,
+  `apps_hidden` and `input.hidden` are new. `--status` prints a `windows_parity:` line.
+
 ### Fixed
 - **A tray that was already running is found.** FxSound took a system tray that was there before
   it started — KDE's, Waybar's, a Quickshell shell's, Noctalia's, GNOME's with the AppIndicator

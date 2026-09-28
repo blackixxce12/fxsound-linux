@@ -32,7 +32,7 @@
 use std::fmt::Write as _;
 
 use fxsound_core::settings::CalibrationRecord;
-use fxsound_core::{AppKey, AudioDevice, AudioStatus, DeviceDirection};
+use fxsound_core::{AppKey, AudioDevice, AudioStatus, DeviceDirection, WindowsParity};
 use serde_json::Value;
 
 use crate::App;
@@ -98,6 +98,8 @@ pub enum AppEvent {
         direction: DeviceDirection,
         preset: Option<String>,
     },
+    /// «Как в Windows» / "Like FxSound for Windows" moved to another level.
+    WindowsParity { level: WindowsParity },
     /// The window was opened or hidden to the tray.
     Window { visible: bool },
     /// The instance is quitting; the stream ends right after this.
@@ -145,6 +147,7 @@ impl AppEvent {
             Self::EchoCancel { .. } => "echo_cancel",
             Self::Calibrated(_) => "calibrated",
             Self::AppRouted { .. } => "app_routed",
+            Self::WindowsParity { .. } => "windows_parity",
             Self::Window { .. } => "window",
             Self::Quit => "quit",
         }
@@ -314,6 +317,7 @@ impl AppEvent {
                 ("direction", direction(lane)),
                 ("preset", Value::from(preset.clone())),
             ],
+            Self::WindowsParity { level } => vec![("level", Value::from(level.key()))],
             Self::Window { visible } => vec![("visible", Value::from(*visible))],
             Self::Quit => Vec::new(),
         }
@@ -386,6 +390,8 @@ pub struct Published {
     audio: [(LaneState, u32, u16); 2],
     /// Asked for, running, and the audio thread's reason.
     echo_cancel: (bool, bool, String),
+    /// The level of «Как в Windows».
+    windows_parity: WindowsParity,
 }
 
 /// A lane's slot in the per-lane arrays.
@@ -436,7 +442,17 @@ impl Published {
             state.echo_cancel_running,
             app.echo_cancel_detail(),
         ));
+        said.extend(self.windows_parity(app.windows_parity()));
         said
+    }
+
+    /// The level of «Как в Windows».
+    #[must_use = "the event is what tells the stream"]
+    pub(crate) fn windows_parity(&mut self, level: WindowsParity) -> Option<AppEvent> {
+        (self.windows_parity != level).then(|| {
+            self.windows_parity = level;
+            AppEvent::WindowsParity { level }
+        })
     }
 
     /// The power button.
@@ -968,11 +984,35 @@ mod tests {
                 direction: lane,
                 preset: None,
             },
+            AppEvent::WindowsParity {
+                level: WindowsParity::Full,
+            },
             AppEvent::Window { visible: true },
             AppEvent::Quit,
         ] {
             assert!(!event.touches_tray(), "{event:?}");
         }
+    }
+
+    #[test]
+    fn a_new_windows_parity_level_is_the_windows_parity_event_with_its_level() {
+        let event = AppEvent::WindowsParity {
+            level: WindowsParity::Sound,
+        };
+        assert_eq!(event.to_plain(), "windows_parity level=sound");
+        assert_eq!(
+            event.to_json(7),
+            r#"{"v":1,"event":"windows_parity","ts":7,"level":"sound"}"#
+        );
+        let mut record = Published::default();
+        assert_eq!(record.windows_parity(WindowsParity::Off), None);
+        assert_eq!(
+            record.windows_parity(WindowsParity::Full),
+            Some(AppEvent::WindowsParity {
+                level: WindowsParity::Full
+            })
+        );
+        assert_eq!(record.windows_parity(WindowsParity::Full), None);
     }
 
     // ---- the controller's queue ------------------------------------------------------------

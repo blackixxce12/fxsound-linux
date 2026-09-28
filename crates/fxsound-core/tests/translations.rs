@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use fxsound_core::i18n::{Catalogue, LANGUAGES};
 use fxsound_core::{
     DeEsserMode, DenoiseChannelMode, DenoiseChannelsOverride, DenoiseLevel, DereverbLevel,
-    DeviceDirection, Effect, NoiseSuppressionOverride,
+    DeviceDirection, Effect, NoiseSuppressionOverride, WindowsParity,
 };
 
 /// The crates that draw text, relative to this one. Everything else passes strings *to* them.
@@ -46,7 +46,14 @@ const INDIRECT_CALLS: &[(&str, &[&str])] = &[
     // `SettingsTab::nav_label` and `pane_title` in `dialogs/settings.rs`.
     (
         "tab.nav_label()",
-        &["Audio", "General", "Help", "Microphone", "Applications"],
+        &[
+            "Audio",
+            "General",
+            "Help",
+            "Microphone",
+            "Applications",
+            "Experimental",
+        ],
     ),
     (
         "self.state.tab.pane_title()",
@@ -56,6 +63,7 @@ const INDIRECT_CALLS: &[(&str, &[&str])] = &[
             "Help",
             "Microphone",
             "Applications",
+            "Experimental",
         ],
     ),
     // `HotkeyCommand::label` in `dialogs/settings.rs`.
@@ -83,6 +91,10 @@ const INDIRECT_CALLS: &[(&str, &[&str])] = &[
     ("self.denoise.label()", &[]),
     ("effect.label()", &[]),
     ("effect.tooltip()", &[]),
+    // The Experimental pane's positions and hint (`WindowsParity::label` and `hint`).
+    ("shown.hint()", &[]),
+    ("shown.label()", &[]),
+    ("level.label()", &[]),
     // The import window's notice in `dialogs/presets.rs`, which the app files under its English
     // key (`fxsound-app/src/app.rs`, `handle_import`).
     (
@@ -410,7 +422,7 @@ fn calls_to_tr(
     anywhere: &BTreeMap<String, Vec<String>>,
 ) -> Vec<Argument> {
     let mut found = Vec::new();
-    for call in ["tr(", "tr_args("] {
+    for call in ["tr(", "tr_args(", "tr_breakable("] {
         let mut from = 0;
         while let Some(at) = src[from..].find(call) {
             let start = from + at;
@@ -561,6 +573,8 @@ fn core_labels() -> BTreeSet<&'static str> {
     keys.extend(DeviceDirection::ALL.iter().map(|v| v.label()));
     keys.extend(Effect::ALL.iter().map(|e| e.label()));
     keys.extend(Effect::ALL.iter().map(|e| e.tooltip()));
+    keys.extend(WindowsParity::ALL.iter().map(|level| level.label()));
+    keys.extend(WindowsParity::ALL.iter().map(|level| level.hint()));
     keys
 }
 
@@ -855,9 +869,10 @@ fn a_string_that_ends_in_a_space_keeps_the_space_in_every_language() {
 
 /// Strings some language writes exactly as English does: audio terms its engineers borrow
 /// (`Gate`, `De-esser`, `Mono`), words the two languages share (Dutch `Help`, Spanish `No`,
-/// Romanian `General`, the German, French and Spanish `Balance`), and the effect names the Polish
-/// original keeps as FxSound's own. Any other string a table translates as itself is a string
-/// nobody translated.
+/// Romanian `General`, the German, French and Spanish `Balance`, the Spanish, Portuguese and
+/// Romanian `Experimental`, the French, Dutch and Portuguese `Interface`), and the effect names
+/// the Polish original keeps as FxSound's own. Any other string a table translates as itself is a
+/// string nobody translated.
 const SPELLED_AS_IN_ENGLISH: &[&str] = &[
     "Ambience",
     "Applications",
@@ -870,6 +885,7 @@ const SPELLED_AS_IN_ENGLISH: &[&str] = &[
     "De-esser",
     "Dynamic Boost",
     "Echo",
+    "Experimental",
     "Export",
     "Filter Q",
     "FxSound is %s.",
@@ -879,6 +895,7 @@ const SPELLED_AS_IN_ENGLISH: &[&str] = &[
     "Help",
     "Import",
     "Independent",
+    "Interface",
     "Menu",
     "Microphone",
     "Mono",

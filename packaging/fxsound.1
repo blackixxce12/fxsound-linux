@@ -386,6 +386,48 @@ and so is a locale such as
 A language FxSound has no translation for is an error, not a setting that
 quietly shows another language.
 .TP
+.BI \-\-windows\-parity= off|interface|sound
+\(lqLike FxSound for Windows\(rq, the slider in Settings \(-> Experimental,
+saved like it:
+.B off
+(the default) is FxSound for Linux as it is;
+.B interface
+brings the window and its controls back to the Windows build's;
+.B sound
+adds the Windows build's sound, so that a preset sounds as it does there.
+Each level includes the ones before it, none of them changes or deletes
+another setting, and
+.B off
+brings everything back as it was. Some parts of the levels are still being
+built; the level is saved and reported
+.RB ( windows_parity
+in
+.BR \-\-status )
+already.
+The fourth level,
+.B full
+.RB ( everything ),
+which hides and stops what the Windows build does not have, comes in a later
+version: this one refuses it with exit status 1, with or without
+.BR \-\-force ,
+and runs a
+.I settings.toml
+that says
+.B full
+as
+.BR sound ,
+keeping
+.B full
+in the file for the version that offers it.
+.TP
+.B \-\-force
+With
+.BR \-\-windows\-parity=full ,
+in the version that offers it: switch even when that takes something in use
+away. Refused along with
+.B full
+in this one.
+.TP
 .BR \-\-run_minimized ", " \-\-hide
 Start without showing the window, or hide the window of a running instance.
 This is what the autostart entry invokes. Without either, a start shows the
@@ -534,14 +576,18 @@ line per item: the version, whether processing is on, then
 .BR noise_suppression ", " echo_cancel
 and the voice chain's telemetry as
 .B input_
-lines. Every other option on the same command line is ignored.
+lines, with
+.B windows_parity
+after
+.BR theme .
+Every other option on the same command line is ignored.
 .TP
 .B \-\-json
 Print the
 .BR \-\-status ", " \-\-watch ", " \-\-self\-test " or " \-\-list\-apps
 report as JSON instead of as lines: one object for
 .B \-\-status
-(schema 2, described under
+(schema 3, described under
 .BR "STATUS DOCUMENT" ),
 for
 .B \-\-self\-test
@@ -572,8 +618,11 @@ until it succeeds keeps it running. The first event is
 document); after that
 .BR power ", " preset_changed ", " device_changed ", " devices_changed ", "
 .BR audio_state ", " direction ", " notice ", " echo_cancel ", " calibrated ", "
-.BR app_routed ", " window " and " quit
+.BR app_routed ", " windows_parity ", " window " and " quit
 as they happen;
+.B windows_parity
+carries the new
+.BR level ;
 .B app_routed
 says where an application's streams went
 .RB ( app ", " binary ", " flatpak ", " direction ", " preset ,
@@ -644,8 +693,10 @@ every check that ran passed.
 .B 1
 The command failed and standard error or the report says why: the running
 instance refused it (an unknown preset or device name, a factory preset to
-overwrite, a band the equalizer does not have, or a device to forget that is
-connected, for example) or could
+overwrite, a band the equalizer does not have, a device to forget that is
+connected, or
+.BR \-\-windows\-parity=full ,
+which comes in a later version, for example) or could
 not be reached, there is no running instance for
 .BR \-\-status " or " \-\-watch
 to ask or for
@@ -695,7 +746,8 @@ are the edit direction's: the lane the window shows. The effects,
 exist on the output lane only and are always the output lane's.
 .TP
 .B schema
-2. The 0.3.0 document had no number and is schema 1.
+3. The 0.3.0 document had no number and is schema 1; 0.4.0's is 2, and 3
+keeps every key of 2.
 .TP
 .BR version ", " power
 .RI ( upstream )
@@ -738,7 +790,10 @@ and
 .BR active ;
 .B input
 adds
-.BR noise_suppression " and " denoise_level .
+.BR noise_suppression ", " denoise_level " and " hidden ,
+whether \(lqLike FxSound for Windows\(rq at
+.B full
+hides the microphone lane (never in this version).
 A detached lane has
 .B null
 for its device.
@@ -836,6 +891,16 @@ the preset FxSound has moved its streams onto in each lane, or
 .B null
 while they run through the lane's own chain \(en it follows the lane, it is
 not playing or recording there, or its preset could not be run.
+.TP
+.BR windows_parity ", " apps_hidden
+The level of \(lqLike FxSound for Windows\(rq
+.RB ( off ", " interface " or " sound ;
+.B full
+from the later version that offers it),
+and whether it hides the applications' presets, so that a status bar can grey
+its microphone and application parts instead of failing; always
+.B false
+in this version.
 .SH D\-BUS
 A running instance also serves an interface on the session bus, for status
 bars, compositor scripts and anything else that would rather hold a connection
@@ -872,6 +937,7 @@ Apply(as argv) \(-> (b ok, s stdout, s stderr)
 ListPresets() \(-> s          ListDevices() \(-> s
 SetAppPreset(s app, s direction, s preset)
 ListApps() \(-> s             ForgetDevice(s)
+SetWindowsParity(s level, b force)
 .EE
 .RE
 .PP
@@ -900,6 +966,17 @@ takes
 .B ForgetDevice
 is
 .BR \-\-forget\-device .
+.B SetWindowsParity
+is
+.BR \-\-windows\-parity ,
+and
+.I force
+is
+.BR \-\-force ;
+.B full
+is refused with
+.B org.fxsound.FxSound.Error.Refused
+in this version.
 .B SetAppPreset
 is
 .BR \-\-app\-preset " and " \-\-app\-input\-preset :
@@ -953,7 +1030,7 @@ of the status document.
 .PP
 Properties:
 .BR Version " (s, constant), " Power " (b), " Preset " (s), "
-.BR Output " (s), " Input " (s) and " Direction " (s)."
+.BR Output " (s), " Input " (s), " Direction " (s) and " WindowsParity " (s)."
 .B Preset
 is the edit direction's preset, without the
 .B *
@@ -963,7 +1040,11 @@ and
 .B Input
 are the lanes' devices by description, empty while a lane is detached;
 .B Direction
-is the edit direction.
+is the edit direction;
+.B WindowsParity
+is the level of \(lqLike FxSound for Windows\(rq, as
+.B SetWindowsParity
+takes it.
 .PP
 Signals:
 .BR PowerChanged (b),
@@ -1108,6 +1189,8 @@ first, or to
 and so on, never over an earlier one. The Windows keys FxSound does not use
 \(en the hotkey chords, the window position, always-on-top and the update
 check \(en are read from an older file without complaint and not written back.
+Keys this version does not know, such as those a later version wrote, are kept
+and written back as they were; 0.4.0 drops them on its next save.
 This file,
 .I apps.toml
 and a preset may be symbolic links, as a dotfile manager leaves them: a save

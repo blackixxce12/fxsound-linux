@@ -352,6 +352,22 @@ pub fn bold(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name(fonts::BOLD.into()))
 }
 
+/// The pitch of the `nav_caption` role's lines, as a share of its size.
+///
+/// Two lines of the largest caption size, 17 points, take 39.1 of the Settings tab button's 40.
+/// Explicit rather than the face's own: with an Arabic face first in the chain the row height
+/// would be the face's 2.112 em, and two lines of 12 points would take 50.7.
+pub const NAV_CAPTION_PITCH: f32 = 1.15;
+
+/// The `nav_caption` role: a Settings tab's caption set in two lines, Semibold at `size`, with the
+/// explicit line pitch [`NAV_CAPTION_PITCH`].
+#[must_use]
+pub fn nav_caption(size: f32, colour: egui::Color32) -> egui::TextFormat {
+    let mut format = egui::TextFormat::simple(semibold(size), colour);
+    format.line_height = Some(size * NAV_CAPTION_PITCH);
+    format
+}
+
 /// Install fonts and visuals on a context. Call once at startup and again on a theme change.
 pub fn apply(ctx: &egui::Context, palette: Palette) {
     ctx.set_fonts(font_definitions());

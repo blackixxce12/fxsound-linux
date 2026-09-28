@@ -9,7 +9,12 @@ virtual audio driver through WASAPI and COM, none of which exists here. Every la
 re-implemented, but the DSP is ported from the original C rather than reinvented. Since 0.4.0 it
 also fixes defects that came across with it, so a preset voiced on Windows sounds close to, but not
 exactly, the same here; [the deliberate differences](#deliberate-differences-from-the-windows-build)
-say what changed, and a mode that restores the original behaviour is planned.
+say what changed. A mode that restores the original behaviour, «Like FxSound for Windows» in
+Settings ▸ Experimental (`--windows-parity=off|interface|sound`), is being built for 0.5.0: the
+setting is there, and what each of its levels changes arrives over the release
+([`docs/0.5.0-windows-parity.md`](docs/0.5.0-windows-parity.md)). Its fourth level, Everything,
+comes in a later version; 0.5.0 refuses `full`, and runs a `settings.toml` that says `full` as
+`sound` while keeping `full` in the file for that version.
 
 It processes what the machine plays and, at the same time, a microphone: each has a lane of its
 own, with its own device and preset, and an application can have a preset of its own on either.
@@ -564,11 +569,13 @@ The settings file keeps the original's key names so it can be diffed against the
 `FxSound.settings`. Settings and presets are written durably — temporary file, fsync, rename — so an
 interrupted save cannot truncate what was there. A settings file that does not load (a typo, a
 comment saved in a legacy encoding, permissions) is moved aside to `settings.toml.bad`, or
-`settings.toml.2.bad` and so on, never over an earlier one, before the defaults are saved. A
-settings file or preset that is a symbolic link, as GNU Stow or chezmoi leave them, stays one: the
-file it points to is the one replaced. A link to a read-only file, or to one in a directory you may
-not write, is never saved through, so every save of that file fails. home-manager's default links
-into the Nix store are such links; link the file with `mkOutOfStoreSymlink` to let FxSound save it.
+`settings.toml.2.bad` and so on, never over an earlier one, before the defaults are saved. Keys this
+version does not know, such as those a later version wrote, are kept and written back as they
+were; 0.4.0 drops them on its next save. A settings file or preset that is a symbolic link, as GNU
+Stow or chezmoi leave them, stays one: the file it points to is the one replaced. A link to a
+read-only file, or to one in a directory you may not write, is never saved through, so every save of
+that file fails. home-manager's default links into the Nix store are such links; link the file with
+`mkOutOfStoreSymlink` to let FxSound save it.
 
 ## A preset per application
 
@@ -808,6 +815,11 @@ against a Mesa driver before calling it an upstream bug.
 packaging/fxsound.1` to read it there) is the reference for using it: every option and its exit
 status, the `--status --json` document key by key, the `--watch` events, the D-Bus methods,
 properties and signals, and the files FxSound reads and writes.
+
+[`docs/0.5.0-windows-parity.md`](docs/0.5.0-windows-parity.md) is the contract of «Like FxSound
+for Windows»: its levels (three in 0.5.0; Everything, which hides the port's own features, comes
+later), which of the port's changes and features each one reverts or hides and which none ever
+does, and the setting, option, D-Bus members and status keys that carry it.
 
 `docs/0.4.0-design.md`, `docs/0.4.0-upstream.md` and `docs/0.4.0-apps.md` record how 0.4.0 was
 built: the two lanes, the voice chain's new stages, D-Bus and the event stream; what was taken from

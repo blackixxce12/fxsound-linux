@@ -15,12 +15,14 @@ pub mod apps;
 pub mod atomic;
 pub mod i18n;
 pub mod messages;
+pub mod parity;
 pub mod settings;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
 pub use apps::{AppKey, AppPreset, AppRule, AppRules, MAX_ROUTES_PER_LANE};
 pub use messages::{AppRoute, AppStream, AudioToUi, RouteParams, TargetVolume, UiToAudio};
+pub use parity::{ParityClass, WindowsParity};
 pub use settings::{Settings, ThemeMode, ViewMode};
 
 /// The five user-facing effects, in the order the GUI lays them out.

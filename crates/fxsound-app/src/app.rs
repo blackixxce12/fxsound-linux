@@ -16,6 +16,7 @@
 use fxsound_audio::EngineHandle;
 use fxsound_core::{
     AudioDevice, DeviceDirection, Effect, EqBand, Preset, Settings, ThemeMode, ViewMode,
+    WindowsParity,
     messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio},
     scale,
 };
@@ -3191,6 +3192,10 @@ impl App {
         });
     }
 
+    fn note_windows_parity(&mut self) {
+        self.note(|published, app| published.windows_parity(app.windows_parity()));
+    }
+
     fn note_echo_cancel(&mut self) {
         self.note(|published, app| {
             published.echo_cancel(
@@ -4718,6 +4723,68 @@ impl App {
         self.persist_settings();
     }
 
+    /// Set «Как в Windows» / "Like FxSound for Windows" (`--windows-parity`, D-Bus
+    /// `SetWindowsParity`, the slider in Settings ▸ Experimental), save it and say so on the
+    /// stream.
+    ///
+    /// Everything is refused with [`fxsound_core::parity::FULL_NOT_YET`] on every path: 0.5.0 does
+    /// not offer it ([`WindowsParity::offered`]), and 0.6.0 (W4) brings it.
+    ///
+    /// Once it is offered, a move to Everything that would switch off something in use now
+    /// ([`App::parity_would_take_away`]) is refused unless `force` says to go ahead: the window
+    /// asks first, and the command line and D-Bus cannot ask, so they refuse with the words the
+    /// question would have used ([`fxsound_core::parity::FULL_REFUSAL`]).
+    ///
+    /// The level is recorded, reported and saved; what each level changes arrives with the phases
+    /// that build it (`docs/0.5.0-windows-parity.md`).
+    ///
+    /// # Errors
+    ///
+    /// The refusal's text, with nothing changed.
+    pub fn set_windows_parity(&mut self, level: WindowsParity, force: bool) -> Result<(), String> {
+        if !level.offered() {
+            return Err(fxsound_core::parity::FULL_NOT_YET.to_owned());
+        }
+        // The level in force, not the one stored: a file a later version wrote may say `full`,
+        // which runs as Interface and sound, so choosing Interface and sound then changes nothing
+        // and the file keeps its Everything for when that version is back.
+        let current = self.windows_parity();
+        if level == current {
+            return Ok(());
+        }
+        if level.full() && !current.full() && !force && self.parity_would_take_away() {
+            return Err(fxsound_core::parity::FULL_REFUSAL.to_owned());
+        }
+        self.settings.windows_parity = level;
+        self.persist_settings();
+        self.note_windows_parity();
+        Ok(())
+    }
+
+    /// Whether a move to Everything would switch off something in use now: the microphone lane
+    /// attached to a device, an application on a route of a preset of its own, or a calibration
+    /// in progress. What the confirmation in the window and the refusal on the command line and
+    /// D-Bus are about.
+    #[must_use]
+    pub fn parity_would_take_away(&self) -> bool {
+        self.state.device_for(DeviceDirection::Input).is_some()
+            || self
+                .app_streams()
+                .iter()
+                .any(|stream| stream.route.is_some())
+            || self.calibration.is_some()
+    }
+
+    /// The level of «Как в Windows» in force: the one in the settings, except that Everything,
+    /// which a later version's `settings.toml` may hold and this one does not offer, runs as
+    /// Interface and sound ([`WindowsParity::offered_or_below`]). The settings keep what the file
+    /// said, so the next save writes it back unchanged. What `--status`, `--watch`, D-Bus and
+    /// every behaviour of a level go by.
+    #[must_use]
+    pub const fn windows_parity(&self) -> WindowsParity {
+        self.settings.windows_parity.offered_or_below()
+    }
+
     /// Hand a toast to the desktop, unless notifications are hidden or start-up is still going.
     /// With no window up — none there, or one minimised — an echo of a change is all the answer a
     /// tray pick or a keybind gets, so it goes out as an alert ([`Message::raised`]).
@@ -4818,6 +4885,13 @@ impl App {
                 state.settings.language.clone_from(&self.settings.language);
                 state.settings.language_follows_system = self.settings.language_follows_system;
                 self.persist_settings();
+            }
+            // From the window, which asks before a move to Everything that takes something
+            // away, so the move is refused here only while Everything is not offered; the
+            // slider does not offer it then either.
+            A::SetWindowsParity(level) => {
+                let _ = self.set_windows_parity(*level, true);
+                state.settings.windows_parity = self.settings.windows_parity;
             }
             A::SetHideHelpTips(on) => {
                 self.settings.hide_help_tooltips = *on;
@@ -5097,6 +5171,8 @@ impl App {
         state.echo_cancel_running = self.state.echo_cancel_running;
         // The one microphone setting the command line and D-Bus can change under an open pane.
         state.settings.noise_suppression = self.settings.noise_suppression;
+        // And the Experimental pane's slider, which `--windows-parity` and D-Bus move too.
+        state.settings.windows_parity = self.settings.windows_parity;
         state.echo_cancel_trouble = self.state.echo_cancel_trouble;
         state.input_processing = self.state.input_active;
         state.has_microphone = self.microphone_description().is_some();
@@ -14325,5 +14401,69 @@ mod tests {
         app.handle(&[UiAction::SetEffect(Effect::Bass, 5.0), UiAction::SavePreset]);
         assert_eq!(names(&app), [long.as_str()]);
         assert!(dir.path().join(format!("user/{long}.fac")).is_file());
+    }
+
+    #[test]
+    fn the_windows_slider_is_refused_everything_in_this_version_and_the_pane_keeps_the_level() {
+        let mut app = App::headless_for_tests();
+        let mut pane = app.settings_state();
+        app.handle_settings(
+            &SettingsAction::SetWindowsParity(WindowsParity::Sound),
+            &mut pane,
+        );
+        assert_eq!(app.windows_parity(), WindowsParity::Sound);
+        assert_eq!(pane.settings.windows_parity, WindowsParity::Sound);
+        app.handle_settings(
+            &SettingsAction::SetWindowsParity(WindowsParity::Full),
+            &mut pane,
+        );
+        assert_eq!(app.windows_parity(), WindowsParity::Sound);
+        assert_eq!(pane.settings.windows_parity, WindowsParity::Sound);
+        assert_eq!(
+            app.set_windows_parity(WindowsParity::Full, true),
+            Err(fxsound_core::parity::FULL_NOT_YET.to_owned())
+        );
+    }
+
+    #[test]
+    fn a_later_versions_everything_runs_as_sound_everywhere_and_stays_everything_in_the_settings() {
+        // A settings.toml 0.6.0 wrote says `full`; this version runs Interface and sound and
+        // keeps `full` for the next save, so going back up finds Everything again.
+        let mut app = App::headless_for_tests();
+        app.settings.windows_parity = WindowsParity::Full;
+        let _ = app.drain_events();
+
+        assert_eq!(app.windows_parity(), WindowsParity::Sound);
+        assert_eq!(
+            crate::commands::status_document(&app).windows_parity,
+            "sound"
+        );
+        assert_eq!(
+            crate::dbus::Properties::of(&app).windows_parity,
+            WindowsParity::Sound
+        );
+        let mut pane = app.settings_state();
+        assert_eq!(
+            pane.settings.windows_parity.offered_or_below(),
+            WindowsParity::Sound,
+            "the slider shows it at Interface and sound"
+        );
+
+        // Choosing the level in force changes nothing and says nothing.
+        assert_eq!(app.set_windows_parity(WindowsParity::Sound, false), Ok(()));
+        app.handle_settings(
+            &SettingsAction::SetWindowsParity(WindowsParity::Sound),
+            &mut pane,
+        );
+        assert_eq!(app.settings().windows_parity, WindowsParity::Full);
+        assert_eq!(app.drain_events(), []);
+
+        // Choosing another one is the user's new level, and replaces it.
+        assert_eq!(
+            app.set_windows_parity(WindowsParity::Interface, false),
+            Ok(())
+        );
+        assert_eq!(app.settings().windows_parity, WindowsParity::Interface);
+        assert_eq!(app.windows_parity(), WindowsParity::Interface);
     }
 }

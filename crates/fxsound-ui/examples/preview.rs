@@ -17,6 +17,7 @@
 //! cargo run -p fxsound-ui --example preview -- --stored
 //! cargo run -p fxsound-ui --example preview -- --lang=de --message
 //! cargo run -p fxsound-ui --example preview -- --settings=general --light
+//! cargo run -p fxsound-ui --example preview -- --settings=experimental --parity=sound --lang=ru
 //! ```
 //!
 //! Flags: `--light`, `--input` (edit the microphone lane), `--lite`, `--notice[=TEXT]`,
@@ -26,8 +27,12 @@
 //! effects as a Windows preset stores them, between the sliders' positions), `--lang=CODE`
 //! (one of the translation tables' codes; English otherwise), `--apps[=empty]` (Settings ▸
 //! Applications over a made-up list of applications, or none), `--settings=TAB` (Settings on
-//! `audio`, `general`, `help`, `microphone` or `applications`), `--message[=TEXT]` (the Yes/No
-//! message box over the window: `TEXT` is translated, and its `%s` is a long preset name; the
+//! `audio`, `general`, `help`, `microphone`, `applications` or `experimental`),
+//! `--parity=LEVEL` (the level of «Like FxSound for Windows», `off`, `interface` or `sound`:
+//! what the Experimental pane's slider stands at, and what the views follow as each level is
+//! built; `full` shows as `sound`, as the app runs a `settings.toml` that says it),
+//! `--message[=TEXT]` (the Yes/No message box over the window: `TEXT` is translated, and its `%s`
+//! is a long preset name; the
 //! export's overwrite question otherwise), `--exit-after-paint`. Keys while it
 //! runs: `I` switches the edit direction, `N` puts a notice up, `L` flips Pro/Lite, `T` flips the
 //! palette, `Esc` quits.
@@ -37,7 +42,7 @@
 //! routed applications.
 
 use eframe::egui;
-use fxsound_core::{AppKey, AudioDevice, DeviceDirection, ThemeMode, ViewMode};
+use fxsound_core::{AppKey, AudioDevice, DeviceDirection, ThemeMode, ViewMode, WindowsParity};
 use fxsound_ui::dialogs::settings::DevicePriority;
 use fxsound_ui::dialogs::{
     AppLane, AppRow, NavIcons, SettingsAction, SettingsDialog, SettingsState, SettingsTab, settings,
@@ -115,9 +120,20 @@ fn main() -> eframe::Result<()> {
             "help" => SettingsTab::Help,
             "microphone" => SettingsTab::Microphone,
             "applications" => SettingsTab::Applications,
+            "experimental" => SettingsTab::Experimental,
             _ => SettingsTab::Audio,
         };
         preview.settings = Some(settings);
+    }
+    if let Some(level) = args.iter().find_map(|a| a.strip_prefix("--parity=")) {
+        match WindowsParity::parse(level) {
+            Some(level) => {
+                if let Some(settings) = &mut preview.settings {
+                    settings.settings.windows_parity = level.offered_or_below();
+                }
+            }
+            None => eprintln!("no level {level:?}; expected off, interface or sound"),
+        }
     }
     preview.message = args.iter().find_map(|a| {
         a.strip_prefix("--message").map(|rest| {
@@ -580,6 +596,7 @@ impl Preview {
                 settings.microphones.swap(*row, row + 1);
             }
             SettingsAction::SelectDeviceRow(row) => settings.selected_device = Some(*row),
+            SettingsAction::SetWindowsParity(level) => settings.settings.windows_parity = *level,
             SettingsAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => {}
         }

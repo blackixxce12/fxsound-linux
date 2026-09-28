@@ -24,6 +24,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::messages::TargetVolume;
+use crate::parity::WindowsParity;
 use crate::{
     DeEsserMode, DenoiseChannelsOverride, DereverbLevel, DeviceDirection, NoiseSuppressionOverride,
 };
@@ -247,7 +248,44 @@ pub struct Settings {
     pub hide_notifications: bool,
     /// How many presets the user may save, from 10 to 1000 ([`USER_PRESET_LIMITS`]).
     pub max_user_presets: u32,
+
+    // ---- like FxSound for Windows ----------------------------------------------------------
+    /// «Как в Windows» / "Like FxSound for Windows" (`docs/0.5.0-windows-parity.md`). Written only
+    /// when it is not `off`, and read without ever failing: a value it cannot understand is Off
+    /// ([`WindowsParity::from_toml`]), never a reason to move the file aside. Everything (`full`),
+    /// which 0.5.0 does not offer, is kept here as it was read and written back by every save, so
+    /// going back up to 0.6.0 finds it; what runs is [`WindowsParity::offered_or_below`] of it,
+    /// Interface and sound (`App::windows_parity`).
+    #[serde(skip_serializing_if = "WindowsParity::is_off")]
+    pub windows_parity: WindowsParity,
+
+    /// Every key of the file this version does not know, kept and written back as it was read.
+    ///
+    /// A key written by a later version — this one's `windows_parity` read by 0.4.0, a
+    /// customisation key read by this one after a downgrade — survives a save here, so going back
+    /// up a version finds it again. 0.4.0 has no such table and drops what it does not know on its
+    /// next save. The retired Windows keys are the one exception ([`RETIRED_WINDOWS_KEYS`]).
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
+
+/// The Windows keys nothing here reads (0.4.0 audit #35): every file 0.3.0 wrote carries them, and
+/// a hand edit of any of them did nothing. They load, and the next save leaves them out, rather
+/// than being kept in [`Settings::extra`] with the keys of later versions.
+pub const RETIRED_WINDOWS_KEYS: [&str; 12] = [
+    "device_configs_version",
+    "window_x",
+    "window_y",
+    "always_on_top",
+    "hotkeys",
+    "cmd_on_off",
+    "cmd_open_close",
+    "cmd_next_preset",
+    "cmd_previous_preset",
+    "cmd_change_output",
+    "automatic_updates",
+    "last_update_time",
+];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -292,6 +330,9 @@ impl Default for Settings {
             hide_help_tooltips: false,
             hide_notifications: false,
             max_user_presets: 120,
+
+            windows_parity: WindowsParity::Off,
+            extra: toml::Table::new(),
         }
     }
 }
@@ -456,6 +497,11 @@ impl Settings {
         use crate::limits::{self, finite};
 
         let default = Self::default();
+
+        // 0.4.0 audit #35: the Windows keys nothing reads are left out of the next save.
+        for key in RETIRED_WINDOWS_KEYS {
+            self.extra.remove(key);
+        }
 
         // A 0.2.0 file's single preset is this version's *output* preset. It is taken only when
         // the new key is absent — which, with `#[serde(default)]` filling it in, reads as "still
@@ -1881,5 +1927,212 @@ mute = true
         assert_eq!(s.volume_leveling, 4.0);
         assert_eq!(s.filter_q, 1.0);
         assert_eq!(s.num_bands, 1);
+    }
+
+    #[test]
+    fn the_windows_parity_level_is_written_only_when_it_is_not_off() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        Settings::default().save_to(&path).expect("save");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(!written.contains("windows_parity"), "{written}");
+
+        for level in [
+            WindowsParity::Interface,
+            WindowsParity::Sound,
+            WindowsParity::Full,
+        ] {
+            let settings = Settings {
+                windows_parity: level,
+                ..Settings::default()
+            };
+            settings.save_to(&path).expect("save");
+            let written = std::fs::read_to_string(&path).expect("read back");
+            assert!(
+                written.contains(&format!("windows_parity = \"{}\"", level.key())),
+                "{written}"
+            );
+            assert_eq!(Settings::load_from(&path).windows_parity, level);
+        }
+    }
+
+    #[test]
+    fn a_file_that_says_full_survives_a_load_and_a_save_byte_for_byte_while_it_runs_as_sound() {
+        // 0.6.0 writes Everything; 0.5.0 runs it as Interface and sound and writes it back as it
+        // was, so 0.6.0 -> 0.5.0 -> 0.6.0 finds Everything again.
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        Settings {
+            windows_parity: WindowsParity::Full,
+            output_preset: "Rock".into(),
+            ..Settings::default()
+        }
+        .save_to(&path)
+        .expect("save");
+        let written = std::fs::read(&path).expect("read back");
+        assert!(
+            String::from_utf8_lossy(&written).contains("windows_parity = \"full\""),
+            "{}",
+            String::from_utf8_lossy(&written)
+        );
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.windows_parity, WindowsParity::Full);
+        assert_eq!(
+            loaded.windows_parity.offered_or_below(),
+            WindowsParity::Sound
+        );
+        loaded.save_to(&path).expect("save again");
+        assert_eq!(std::fs::read(&path).expect("read again"), written);
+    }
+
+    #[test]
+    fn a_windows_parity_value_that_cannot_be_read_costs_that_key_and_never_the_file() {
+        // A10: a boolean, an unknown word, a number, a table and an array are all read as a level,
+        // and the rest of the file is believed; nothing is moved aside.
+        for (value, level) in [
+            ("true", WindowsParity::Sound),
+            ("false", WindowsParity::Off),
+            ("\"EVERYTHING\"", WindowsParity::Full),
+            ("\"full\"", WindowsParity::Full),
+            ("\"Interface\"", WindowsParity::Interface),
+            ("\"like windows\"", WindowsParity::Off),
+            ("3", WindowsParity::Off),
+            ("-0.5", WindowsParity::Off),
+            ("{ level = \"full\" }", WindowsParity::Off),
+            ("[\"sound\"]", WindowsParity::Off),
+        ] {
+            let dir = tempfile::tempdir().expect("a scratch directory");
+            let path = dir.path().join("settings.toml");
+            std::fs::write(
+                &path,
+                format!("power = false\nwindows_parity = {value}\noutput_preset = \"Rock\"\n"),
+            )
+            .expect("write");
+            let loaded = Settings::load_from(&path);
+            assert!(
+                !Settings::bad_path(&path).exists(),
+                "{value} moved the file"
+            );
+            assert_eq!(loaded.windows_parity, level, "{value}");
+            assert!(!loaded.power, "{value}");
+            assert_eq!(loaded.output_preset, "Rock", "{value}");
+            assert!(loaded.extra.is_empty(), "{value}: {:?}", loaded.extra);
+        }
+        // A table header of that name, rather than an inline table, too.
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "power = false\n\n[windows_parity]\nlevel = \"full\"\n",
+        )
+        .expect("write");
+        let loaded = Settings::load_from(&path);
+        assert!(!Settings::bad_path(&path).exists());
+        assert_eq!(loaded.windows_parity, WindowsParity::Off);
+        assert!(!loaded.power);
+    }
+
+    /// A settings file as a later version might write it: this version's keys, and some it has
+    /// never heard of — a plain value, an array, a table and an array of tables.
+    fn with_later_keys() -> Settings {
+        let later: toml::Table = toml::from_str(
+            "\
+theme = \"studio-light\"
+glass = \"system\"
+visualizer_fps = 60
+visualizer_modes = [\"spectrum\", \"wave\"]
+
+[rainbow]
+speed = 0.5
+saturation = 0.8
+
+[[correction]]
+device = \"alsa_output.usb-headphones\"
+gains = [1.5, -2.0, 0.0]
+",
+        )
+        .expect("a later version's keys");
+        Settings {
+            power: false,
+            output_preset: "Rock".to_owned(),
+            windows_parity: WindowsParity::Sound,
+            extra: later,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn keys_of_a_later_version_survive_a_load_and_a_save_byte_for_byte() {
+        // A10: going back a version and up again must not cost the later version's keys.
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        with_later_keys().save_to(&path).expect("save");
+        let first = std::fs::read(&path).expect("read back");
+
+        let loaded = Settings::load_from(&path);
+        assert!(!Settings::bad_path(&path).exists());
+        assert_eq!(loaded, {
+            let mut expected = with_later_keys();
+            expected.sanitise();
+            expected
+        });
+        loaded.save_to(&path).expect("save again");
+        let second = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&second)
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn keys_this_version_does_not_know_are_kept_wherever_a_hand_put_them() {
+        // Written by hand, in no order a save would choose: the unknown keys come back with the
+        // same values, whatever order the next save puts them in.
+        let text = "\
+future_first = \"kept\"
+power = false
+nested_future = { a = 1, b = [true, false] }
+output_preset = \"Jazz\"
+windows_parity = \"interface\"
+future_last = 2.5
+
+[future_table]
+name = \"x\"
+
+[calibration]
+noise_floor_db = -48.0
+";
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, text).expect("write");
+        let loaded = Settings::load_from(&path);
+        assert!(!Settings::bad_path(&path).exists());
+        assert_eq!(loaded.output_preset, "Jazz");
+        assert_eq!(loaded.windows_parity, WindowsParity::Interface);
+        let keys: Vec<&str> = loaded.extra.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "future_first",
+                "future_last",
+                "future_table",
+                "nested_future"
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        loaded.save_to(&path).expect("save");
+        let saved: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read back")).expect("parse");
+        let original: toml::Table = toml::from_str(text).expect("parse");
+        for key in keys {
+            assert_eq!(saved.get(key), original.get(key), "{key}");
+        }
+        assert_eq!(Settings::load_from(&path), loaded);
     }
 }
