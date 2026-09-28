@@ -52,7 +52,9 @@
 //! 4. the desktop picking another default device (`wpctl set-default`) with FxSound on,
 //! 5. and with FxSound off;
 //!
-//! and the music equalizer and presets, the voice equalizer and presets. Every stream but the
+//! and the music equalizer and presets, the voice equalizer and presets, and «Like FxSound for
+//! Windows» moved between Off and Interface and sound, on the lane and in an application's route
+//! (roadmap 0.5.0 §1 A4). Every stream but the
 //! pinned ones of the first test follows the default, as most applications' do. Both lanes but in
 //! the preset tests, which play into the lane a preset belongs to. Tests 4 and 5 run as the engine
 //! does until the app ranks its devices, following the system's default device: the mode in which
@@ -102,7 +104,7 @@
 //!
 //! `--nocapture` shows the tables; one test at a time keeps the other tests' daemons from causing
 //! the xruns that would discard runs. [`FXSOUND_CLICK_REPORT`](REPORT_FILE) names a file every
-//! table is appended to as well. The eight measurements take about ten minutes together, and
+//! table is appended to as well. The ten measurements take about eleven minutes together, and
 //! their names share the prefix `under_a_steady_tone`, by which CI's Arch Linux leg leaves them out
 //! of its test step and runs them in one of their own, in `report` mode, with the tables in the
 //! job's summary (`.github/workflows/ci.yml`). They also run in a plain `cargo test --workspace`,
@@ -171,6 +173,12 @@
 //! quieter does not read an improvement from a median that moved within these ranges: it runs
 //! several passes and judges by the loudest run of all of them, the `loudest run` of each table.
 //!
+//! «Like FxSound for Windows», measured on 29.09.2026 in the same way at W1d of 0.5.0, both scenarios
+//! at −6 dB of master gain and +4 dB of balance: on the engine before W1d the lane's move to
+//! Interface and sound left −20.0 dBFS and the move back −6.3; since W1d, which glides and
+//! crossfades what the level changes, −64.7 and −53.3 on the lane and −64.0 and −55.7 in an
+//! application's route, the loudest run −52.2, the floor −108.5.
+//!
 //! E6a measured the same switches with the app's release build, where this runs the engine
 //! unoptimised, and in another order. The switches FxSound makes itself agree within a few dB,
 //! except Volume Boost and Noisy Room, which E6a had at −83.1 and −77.8: 6–9 dB louder here, all
@@ -183,7 +191,7 @@
 use super::policy::PolicyGraph;
 use super::*;
 use fxsound_core::messages::{AppRoute, DspEvent, DspParams, InputDspParams, RouteParams};
-use fxsound_core::{AppKey, AudioStatus, Preset, eq};
+use fxsound_core::{AppKey, AudioStatus, DspCompat, Preset, WindowsParity, eq};
 use fxsound_preset::input::InputPreset;
 use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _};
@@ -616,6 +624,10 @@ enum Switch {
     /// — the configured keys of the `default` metadata: the other devices when `true`, the first
     /// ones again when `false`.
     Desktop(bool),
+    /// «Like FxSound for Windows» moved to a level: the music snapshot the app publishes at it
+    /// (`App::set_windows_parity`), to the speakers' lane and to the applications' output routes
+    /// alike, which play the Windows build's DSP from Interface and sound on.
+    Parity(WindowsParity, Box<DspParams>),
 }
 
 impl Switch {
@@ -629,6 +641,7 @@ impl Switch {
             Self::Route(false) => "route off".to_owned(),
             Self::Device(other) => format!("FxSound picks {}", lane_devices(*other).join(", ")),
             Self::Desktop(other) => format!("desktop picks {}", lane_devices(*other).join(", ")),
+            Self::Parity(level, _) => format!("like Windows: {}", level.key()),
         }
     }
 }
@@ -672,6 +685,10 @@ struct Scenario {
     /// both sinks' monitors, both microphones fed the same tone. For the switches that move a lane
     /// or a stream from one device to the other.
     both_devices: bool,
+    /// Switches made before the tone starts, and not measured: the levels a scenario plays at,
+    /// a route of their own for the tone's player and recorder ([`Switch::Route`]), which they
+    /// then start on, so that nothing moves them during the run.
+    before: Vec<Switch>,
 }
 
 /// A recorder of the bench: `pw-record` writing raw stereo `f32` into the graph's directory.
@@ -742,6 +759,8 @@ struct Bench {
     chain: String,
     /// The last status each lane reported, in [`DeviceDirection::ALL`]'s order.
     status: [AudioStatus; 2],
+    /// Whether the tone's player and recorder have routes of their own ([`Switch::Route`]).
+    routed: bool,
 }
 
 impl Bench {
@@ -771,6 +790,7 @@ impl Bench {
             voice: e6_voice(true).to_params(),
             chain: e6_voice(true).chain,
             status: [AudioStatus::default(); 2],
+            routed: false,
         };
         bench.engine.set_params(bench.music);
         bench.engine.set_input_params(bench.voice);
@@ -818,35 +838,20 @@ impl Bench {
                 self.engine.send(UiToAudio::SetInputChain(chain.clone()));
             }
             Switch::Route(on) => {
-                let rule = |name: &str, direction, params, chain: &str| AppRoute {
-                    direction,
-                    app: AppKey {
-                        name: name.to_owned(),
-                        ..AppKey::default()
-                    },
-                    preset: "Clicks".to_owned(),
-                    params,
-                    chain: chain.to_owned(),
+                self.routed = *on;
+                self.send_routes();
+            }
+            Switch::Parity(_, params) => {
+                self.music = DspParams {
+                    power: self.music.power,
+                    ..**params
                 };
-                let rules = if *on {
-                    vec![
-                        rule(
-                            "t_player",
-                            DeviceDirection::Output,
-                            RouteParams::Output(self.music),
-                            "",
-                        ),
-                        rule(
-                            "t_recorder",
-                            DeviceDirection::Input,
-                            RouteParams::Input(self.voice),
-                            &self.chain,
-                        ),
-                    ]
-                } else {
-                    Vec::new()
-                };
-                self.engine.send(UiToAudio::SetAppRoutes(rules));
+                self.engine.set_params(self.music);
+                // The routes share the lane's levels and follow its snapshot
+                // (`App::refresh_app_routes`): their parameters are written in place.
+                if self.routed {
+                    self.send_routes();
+                }
             }
             Switch::Device(other) => {
                 for (direction, node_name) in
@@ -869,6 +874,71 @@ impl Bench {
                 }
             }
         }
+    }
+
+    /// Whether the tone's player is linked into one of FxSound's route nodes, within the
+    /// patience: what a scenario that gives it a route of its own is measuring through.
+    fn player_plays_through_a_route(&self) -> bool {
+        let deadline = Instant::now() + PATIENCE;
+        while Instant::now() < deadline {
+            let player = self.graph.node_id("t_player");
+            let routes: Vec<u64> = self
+                .graph
+                .dump()
+                .unwrap_or_default()
+                .iter()
+                .filter(|object| {
+                    object["type"].as_str() == Some("PipeWire:Interface:Node")
+                        && object["info"]["props"]["node.name"]
+                            .as_str()
+                            .is_some_and(|name| name.starts_with(crate::ROUTE_NODE_PREFIX))
+                })
+                .filter_map(|object| object["id"].as_u64())
+                .collect();
+            if let Some(player) = player
+                && routes
+                    .iter()
+                    .any(|route| self.graph.linked(player, *route) == Some(true))
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// The rules the app sends for the tone's player and recorder: a preset of their own with
+    /// the lanes' own snapshots while [`Bench::routed`], none otherwise.
+    fn send_routes(&mut self) {
+        let rule = |name: &str, direction, params, chain: &str| AppRoute {
+            direction,
+            app: AppKey {
+                name: name.to_owned(),
+                ..AppKey::default()
+            },
+            preset: "Clicks".to_owned(),
+            params,
+            chain: chain.to_owned(),
+        };
+        let rules = if self.routed {
+            vec![
+                rule(
+                    "t_player",
+                    DeviceDirection::Output,
+                    RouteParams::Output(self.music),
+                    "",
+                ),
+                rule(
+                    "t_recorder",
+                    DeviceDirection::Input,
+                    RouteParams::Input(self.voice),
+                    &self.chain,
+                ),
+            ]
+        } else {
+            Vec::new()
+        };
+        self.engine.send(UiToAudio::SetAppRoutes(rules));
     }
 
     /// Write a tone into the graph's directory as a Sun AU file of 32-bit floats: `seconds` long,
@@ -1107,6 +1177,26 @@ fn music_params(preset: &Preset) -> DspParams {
     )
 }
 
+/// «Like FxSound for Windows» moved to `level` with E6a's music preset playing: the snapshot the
+/// app publishes for it there (`App::set_windows_parity`, [`fxsound_dsp::preset::MusicLevels`]),
+/// at −6 dB of master gain and +4 dB of balance — the levels the W1c live check heard the switch
+/// click at, −39.4 dBFS on the way to Interface and sound and −25.1 on the way back
+/// (`docs/0.5.0-dsp-inventory.md`).
+fn to_parity(level: WindowsParity) -> Switch {
+    let levels = fxsound_dsp::preset::MusicLevels {
+        master_gain_db: -6.0,
+        balance_db: 4.0,
+        ..fxsound_dsp::preset::MusicLevels::default()
+    }
+    .with_windows_dsp(DspCompat::for_level(level).windows());
+    let params = fxsound_dsp::preset::preset_params(
+        &e6_music(true),
+        &levels.ladder(eq::DEFAULT_BANDS),
+        levels,
+    );
+    Switch::Parity(level, Box::new(params))
+}
+
 /// A shipped preset's file.
 fn shipped(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1176,6 +1266,10 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
     // Longer than the run by far: the tone must not end inside what is read.
     let length = 15.0 + scenario.spacing.as_secs_f64() * (scenario.switches.len() + 1) as f64;
     let pinned = scenario.streams == Streams::Pinned;
+    // Before any stream exists, so that a route is where the player and the recorder start.
+    for switch in &scenario.before {
+        bench.act(switch);
+    }
     if scenario.off {
         bench.act(&Switch::Power(false));
         for (direction, device) in DeviceDirection::ALL.into_iter().zip(lane_devices(false)) {
@@ -1223,6 +1317,18 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
             .map(|tap| (tap.expect("the recorder records"), Vec::new()))
             .collect();
         lanes.push(Lane { direction, taps });
+    }
+    if scenario
+        .before
+        .iter()
+        .any(|switch| matches!(switch, Switch::Route(true)))
+        && scenario.lanes.contains(&DeviceDirection::Output)
+    {
+        assert!(
+            bench.player_plays_through_a_route(),
+            "{}: the tone's player never reached its route",
+            scenario.title
+        );
     }
     for lane in &lanes {
         assert!(
@@ -1491,6 +1597,7 @@ fn under_a_steady_tone_the_power_switch_does_not_click_in_streams_pinned_to_fxso
         note: "",
         off: false,
         both_devices: false,
+        before: Vec::new(),
     });
 }
 
@@ -1511,6 +1618,7 @@ fn under_a_steady_tone_the_power_switch_moves_the_streams_that_follow_the_defaul
         note: "",
         off: false,
         both_devices: false,
+        before: Vec::new(),
     });
 }
 
@@ -1542,6 +1650,58 @@ fn under_a_steady_tone_the_equalizer_and_the_music_presets_switch_without_a_clic
         note: "",
         off: false,
         both_devices: false,
+        before: Vec::new(),
+    });
+}
+
+/// «Like FxSound for Windows» moved between Off and Interface and sound and back, twice, under
+/// the speakers' tone of an application that follows the default (roadmap 0.5.0 §1 A4): the
+/// output lane changes DSP under the stream, the gain stage moving from before the equalizer to
+/// inside its block, and nothing moves the stream. FxSound's own switch, gated.
+#[test]
+fn under_a_steady_tone_moving_like_fxsound_for_windows_between_off_and_sound_does_not_click() {
+    check(&Scenario {
+        tag: "clk-parity",
+        title: "like Windows, Off and Interface and sound",
+        streams: Streams::Following,
+        lanes: &[DeviceDirection::Output],
+        switches: vec![
+            to_parity(WindowsParity::Sound),
+            to_parity(WindowsParity::Off),
+            to_parity(WindowsParity::Sound),
+            to_parity(WindowsParity::Off),
+        ],
+        spacing: Duration::from_secs(2),
+        gated: true,
+        note: "",
+        off: false,
+        both_devices: false,
+        before: vec![to_parity(WindowsParity::Off)],
+    });
+}
+
+/// The same moves with the tone's player on a route of its own from before it starts: the
+/// application's output route changes DSP with the lane (`App::refresh_app_routes`), its
+/// parameters written in place, and nothing moves the stream. Gated.
+#[test]
+fn under_a_steady_tone_moving_like_fxsound_for_windows_in_an_application_route_does_not_click() {
+    check(&Scenario {
+        tag: "clk-parroute",
+        title: "like Windows, Off and Interface and sound, in an application's route",
+        streams: Streams::Following,
+        lanes: &[DeviceDirection::Output],
+        switches: vec![
+            to_parity(WindowsParity::Sound),
+            to_parity(WindowsParity::Off),
+            to_parity(WindowsParity::Sound),
+            to_parity(WindowsParity::Off),
+        ],
+        spacing: Duration::from_secs(2),
+        gated: true,
+        note: "",
+        off: false,
+        both_devices: false,
+        before: vec![to_parity(WindowsParity::Off), Switch::Route(true)],
     });
 }
 
@@ -1568,6 +1728,7 @@ fn under_a_steady_tone_the_voice_equalizer_and_the_voice_presets_switch_without_
         note: "",
         off: false,
         both_devices: false,
+        before: Vec::new(),
     });
 }
 
@@ -1589,6 +1750,7 @@ fn under_a_steady_tone_an_application_route_moves_the_streams_on_and_off_and_is_
                gates it",
         off: false,
         both_devices: false,
+        before: Vec::new(),
     });
 }
 
@@ -1612,6 +1774,7 @@ fn under_a_steady_tone_fxsound_picking_another_device_is_reported() {
                node and gates it",
         off: false,
         both_devices: true,
+        before: Vec::new(),
     });
 }
 
@@ -1633,6 +1796,7 @@ fn under_a_steady_tone_a_desktop_pick_of_the_default_device_with_fxsound_on_is_r
         note: "",
         off: false,
         both_devices: true,
+        before: Vec::new(),
     });
 }
 
@@ -1652,6 +1816,7 @@ fn under_a_steady_tone_a_desktop_pick_of_the_default_device_with_fxsound_off_is_
         note: "",
         off: true,
         both_devices: true,
+        before: Vec::new(),
     });
 }
 

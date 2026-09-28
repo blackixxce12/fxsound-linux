@@ -235,7 +235,7 @@ means the untouched excerpt beat both. `crates/fxsound-dsp/tests/preset_drift.rs
 is the measuring half of the same question.
 
 The same set-up compares «Like FxSound for Windows» = Interface and sound with Off
-in one build: `process_wav --windows-dsp` plays a preset through the Windows
+in one build: `process_wav --compat windows` plays a preset through the Windows
 build's DSP and reads it as the Windows build does (a curve of another band
 count by position, twenty bands on the Windows ladder), as that level does.
 Point `FXSV_OLD_PROCESS_WAV` at a wrapper that adds it, and `old` is the Windows
@@ -244,11 +244,16 @@ sound:
 ```sh
 cat > "$FXSV_WORK/windows-dsp" <<SH
 #!/bin/sh
-exec "$PWD/target/release/examples/process_wav" "\$@" --windows-dsp
+exec "$PWD/target/release/examples/process_wav" "\$@" --compat windows
 SH
 chmod +x "$FXSV_WORK/windows-dsp"
 export FXSV_OLD_PROCESS_WAV="$FXSV_WORK/windows-dsp"
 ```
+
+The measuring half takes the same choice: `PRESET_DRIFT_COMPAT=windows` renders
+every shipped preset through the Windows build's DSP, and set beside a run at Off
+(`PRESET_DRIFT_BEFORE`) prints what the level changes, preset by preset
+(`crates/fxsound-dsp/tests/preset_drift.rs`).
 
 ## Files
 

@@ -184,10 +184,11 @@ const FALLBACK_SAMPLE_RATE: Real = 48_000.0;
 
 /// The maximizer: auto-gain plus look-ahead brick-wall peak limiter.
 ///
-/// Allocates one delay buffer in [`DynamicBoost::new`], sized for 192 kHz and eight channels
-/// (8 × 144 floats = 4.6 kB), and nothing afterwards. The block size does not enter into it: the
-/// effect works a frame at a time in place, so a 16384-frame block costs no more state than a
-/// 64-frame one.
+/// Allocates in [`DynamicBoost::new`] and nothing afterwards: the limiter's delay, sized for
+/// 192 kHz and eight channels (8 × 144 floats = 4.6 kB), and for the handover between the two
+/// arithmetics ([`DynamicBoost::set_compat`]) a second limiter of the same size and 8 kB of input
+/// for it. The block size does not enter into it: the effect works a frame at a time in place, so
+/// a 16384-frame block costs no more state than a 64-frame one.
 #[derive(Debug)]
 pub struct DynamicBoost {
     sample_rate: Real,
@@ -223,7 +224,17 @@ pub struct DynamicBoost {
     /// the Windows arithmetic, 0 for the port's, and a glide between the two when the arithmetic
     /// changes, since the floor is the one part of it that would step the gain at once.
     flat_floor: Ramp,
+    /// The limiter as it stood when the arithmetic last changed, still limiting in the old design
+    /// while [`DynamicBoost::limiter`] fades in with the new one ([`DynamicBoost::set_compat`]).
+    handover: LookaheadLimiter,
+    /// The new design's share of the output: 0 to 1 over the handover, and still at 1 otherwise.
+    handover_share: Ramp,
+    /// What the old design is handed to limit during the handover, a stretch at a time.
+    handover_input: Box<[Real]>,
 }
+
+/// How much audio [`DynamicBoost::handover_input`] holds: 256 frames of 7.1.
+const HANDOVER_SAMPLES: usize = 256 * MAX_CHANNELS;
 
 impl DynamicBoost {
     /// Build a maximizer for `sample_rate`, with the boost knob at zero.
@@ -250,6 +261,14 @@ impl DynamicBoost {
             sides: None,
             compat: DspCompat::Linux,
             flat_floor: Ramp::new(0.0),
+            handover: LookaheadLimiter::new(
+                sample_rate,
+                MAX_OUTPUT,
+                LOOK_AHEAD_SECONDS * 1000.0,
+                10.0,
+            ),
+            handover_share: Ramp::new(1.0),
+            handover_input: vec![0.0; HANDOVER_SAMPLES].into_boxed_slice(),
         };
         effect.set_front_pair(None);
         effect.set_sample_rate(sample_rate);
@@ -297,16 +316,36 @@ impl DynamicBoost {
     /// attack that runs past its peak (#8). The front pair and the sides are remembered and come
     /// back into use with the port's arithmetic.
     ///
-    /// Allocation-free. The static boost and its glide are untouched; the limiter's envelopes
-    /// start from the one reducing the most when the linking changes, and its held peaks are
-    /// forgotten when the hold does. The back-off's floor glides from one to the other over
-    /// [`crate::smooth::GLIDE_SECONDS`]: at slider 0 under loud material it is half a decibel of
-    /// gain, which switched at once stepped a 50 Hz tone at −6 dBFS by eight times its own
-    /// steepest slope, a click whose part above 1 kHz peaked at −35.6 dBFS.
+    /// Allocation-free. The static boost and its glide are untouched. The back-off's floor glides
+    /// from one to the other over [`crate::smooth::GLIDE_SECONDS`]: at slider 0 under loud
+    /// material it is half a decibel of gain, which switched at once stepped a 50 Hz tone at
+    /// −6 dBFS by eight times its own steepest slope, a click whose part above 1 kHz peaked at
+    /// −35.6 dBFS. The limiter crossfades from its old design to its new one over the same time:
+    /// relinked at once, every envelope started from the one reducing the most, so a channel the
+    /// limiter was turning down less than its neighbours stepped down to theirs: a quiet left
+    /// beside a right deep in the limiter by 0.110 on a 50 Hz tone that moves by 0.0019 a sample,
+    /// and every speaker of 5.1 with every effect at 5 by three to seven times its tone's. Both
+    /// designs limit the same boosted audio in step, the old from a copy of the limiter as it
+    /// stood, and the output mixes from one to the other; each keeps under the ceiling, so the
+    /// mix does too. Moved back before the handover is over, the two trade places and the mix
+    /// carries on from where it had got to.
     pub fn set_compat(&mut self, compat: DspCompat) {
         if compat == self.compat {
             return;
         }
+        if self.handover_share.is_gliding() {
+            // Moved back before the handover is over: the design being faded out is the one
+            // asked for again. The two trade places and the fade carries on from the mix being
+            // heard, where copying the half-faded design over the old one dropped that mix for
+            // the new design alone, a step of several times the tone's own.
+            std::mem::swap(&mut self.limiter, &mut self.handover);
+            self.handover_share = Ramp::new(1.0 - self.handover_share.value());
+        } else {
+            self.handover.copy_from(&self.limiter);
+            self.handover_share = Ramp::new(0.0);
+        }
+        self.handover_share
+            .glide_to(1.0, glide_frames(self.sample_rate));
         self.compat = compat;
         self.flat_floor.glide_to(
             if compat.windows() { 1.0 } else { 0.0 },
@@ -648,6 +687,7 @@ impl Effect for DynamicBoost {
     fn settle(&mut self) {
         self.gain_boost.settle();
         self.flat_floor.settle();
+        self.handover_share.settle();
     }
 
     fn reset(&mut self) {
@@ -655,6 +695,7 @@ impl Effect for DynamicBoost {
         self.level = 0.0;
         self.gain_boost.settle();
         self.flat_floor.settle();
+        self.handover_share.settle();
     }
 
     /// `Maxi32.c:237-482`, in place: the auto-gain a frame at a time, then the limiter over the
@@ -734,7 +775,45 @@ impl DynamicBoost {
         // a frame at a time, and the limiter can run each envelope over the block in one go (audit
         // R2's cost, see `LookaheadLimiter::process`). The two loops apart are cheaper on stereo
         // too: 8.4 ns a frame at slider 10, where one loop doing both cost 13.4.
-        self.limiter.process(buffer, channels);
+        if self.handover_share.is_gliding() {
+            self.limit_handing_over(buffer, channels);
+        } else {
+            self.limiter.process(buffer, channels);
+        }
+    }
+
+    /// The limiter over a block the arithmetic's handover reaches ([`DynamicBoost::set_compat`]):
+    /// the new design and the old each limit the same boosted audio, and the output mixes from
+    /// the old to the new, a stretch of [`HANDOVER_SAMPLES`] at a time; the rest of the block,
+    /// past the handover, the new design alone.
+    fn limit_handing_over(&mut self, buffer: &mut [Real], channels: usize) {
+        let frames = buffer.len() / channels;
+        let fading = frames.min(self.handover_share.frames_left() as usize);
+        let (head, tail) = buffer.split_at_mut(fading * channels);
+        let stretch = (HANDOVER_SAMPLES / channels).max(1) * channels;
+        for part in head.chunks_mut(stretch) {
+            let Some(old) = self.handover_input.get_mut(..part.len()) else {
+                // A frame wider than the stretch: more channels than the limiter reaches. Nothing
+                // to mix; the new design takes it.
+                self.limiter.process(part, channels);
+                continue;
+            };
+            old.copy_from_slice(part);
+            self.limiter.process(part, channels);
+            self.handover.process(old, channels);
+            for (frame, old) in part
+                .chunks_exact_mut(channels)
+                .zip(old.chunks_exact(channels))
+            {
+                let share = self.handover_share.advance();
+                for (sample, old) in frame.iter_mut().zip(old) {
+                    *sample = old + share * (*sample - old);
+                }
+            }
+        }
+        if !tail.is_empty() {
+            self.limiter.process(tail, channels);
+        }
     }
 }
 
@@ -2118,6 +2197,88 @@ mod tests {
             deepest_right_db < -5.0,
             "the right should be limited: {deepest_right_db} dB"
         );
+    }
+
+    /// The left channel of a stereo 50 Hz cosine, `left` on the left and `right` on the right,
+    /// through Dynamic Boost at slider 0 in 480-frame blocks, the arithmetic `compat_for(block)`.
+    /// Every block starts on a crest.
+    fn left_through(left: Real, right: Real, compat_for: impl Fn(usize) -> DspCompat) -> Vec<Real> {
+        let mut boost = DynamicBoost::new(FS);
+        let mut out = Vec::new();
+        for block in 0..300 {
+            boost.set_compat(compat_for(block));
+            let mut buffer: Vec<Real> = (0..480)
+                .flat_map(|i| {
+                    let n = (block * 480 + i) as f64;
+                    let s = (std::f64::consts::TAU * 50.0 * n / f64::from(FS)).cos() as Real;
+                    [left * s, right * s]
+                })
+                .collect();
+            boost.process(&mut buffer, 2);
+            out.extend(buffer.iter().step_by(2));
+        }
+        out
+    }
+
+    fn steepest(signal: &[Real]) -> Real {
+        signal
+            .windows(2)
+            .fold(0.0, |most: Real, pair| most.max((pair[1] - pair[0]).abs()))
+    }
+
+    #[test]
+    fn switching_the_arithmetic_hands_the_limiter_over_rather_than_relinking_it_at_once() {
+        // A quiet left beside a right deep in the limiter: the port turns both sides down
+        // together, the Windows arithmetic the right alone. Relinked between two samples on the
+        // way back, the left's envelope took the right's and the left stepped down by 0.110 on a
+        // tone that moves by 0.0019 a sample; the old design and the new now limit side by side
+        // for 20 ms and the output crossfades from one to the other, both ways.
+        let moved = left_through(0.3, 1.5, |block| {
+            if (100..200).contains(&block) {
+                DspCompat::Windows
+            } else {
+                DspCompat::Linux
+            }
+        });
+        let linux = left_through(0.3, 1.5, |_| DspCompat::Linux);
+        let windows = left_through(0.3, 1.5, |_| DspCompat::Windows);
+        for switch in [100, 200] {
+            let window = (switch - 1) * 480..(switch + 10) * 480;
+            let step = steepest(&moved[window.clone()]);
+            let control = steepest(&linux[window.clone()]).max(steepest(&windows[window]));
+            assert!(
+                step <= control * 1.1,
+                "switched at block {switch}, the left stepped by {step}, the tone by {control}"
+            );
+        }
+        // And once the handover is over, the new design alone plays: the moved render's last
+        // second is Off's, whose level estimate it shared all along.
+        let tail = 250 * 480..;
+        let difference = moved[tail.clone()]
+            .iter()
+            .zip(&linux[tail])
+            .fold(0.0, |most: Real, (a, b)| most.max((a - b).abs()));
+        assert!(difference < 1e-3, "{difference} from Off a second later");
+        // Moved back 10 ms later, before the handover was over, the half-faded design was copied
+        // over the old one and the mix dropped to it alone, the left by 0.050 here; the
+        // two designs now trade places and the mix carries on from where it was. Moved there and
+        // back twice over, 10 ms apart, too.
+        for there in [&[100][..], &[100, 102][..]] {
+            let moved = left_through(0.3, 1.5, |block| {
+                if there.contains(&block) {
+                    DspCompat::Windows
+                } else {
+                    DspCompat::Linux
+                }
+            });
+            let window = 99 * 480..112 * 480;
+            let step = steepest(&moved[window.clone()]);
+            let control = steepest(&linux[window.clone()]).max(steepest(&windows[window]));
+            assert!(
+                step <= control * 1.1,
+                "moved at blocks {there:?}, the left stepped by {step}, the tone by {control}"
+            );
+        }
     }
 
     #[test]

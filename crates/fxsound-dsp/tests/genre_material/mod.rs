@@ -329,6 +329,13 @@ pub fn material(shape: &[f32; NUM_THIRD_OCTAVES], seed: u32, dynamics: Dynamics)
 /// The genre preset `name` as the application plays it on ten bands with the settings' default
 /// levels ([`fxsound_dsp::preset::preset_params`]).
 pub fn preset_params(name: &str) -> DspParams {
+    preset_params_at(name, fxsound_dsp::preset::MusicLevels::default())
+}
+
+/// [`preset_params`] at `levels`: the settings' levels and the DSP a level of «Like FxSound for
+/// Windows» plays (`preset_drift.rs`'s `PRESET_DRIFT_COMPAT`). The ladder is the levels' own,
+/// through a method a build with one ladder is given (`scripts/reference-checkout.sh`).
+pub fn preset_params_at(name: &str, levels: fxsound_dsp::preset::MusicLevels) -> DspParams {
     let path = repo_root()
         .join("assets/presets/BonusPresets")
         .join(format!("{name}.fac"));
@@ -336,8 +343,8 @@ pub fn preset_params(name: &str) -> DspParams {
         fxsound_preset::load(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
     fxsound_dsp::preset::preset_params(
         &preset,
-        &fxsound_dsp::preset::ladder(fxsound_core::eq::DEFAULT_BANDS),
-        fxsound_dsp::preset::MusicLevels::default(),
+        &levels.ladder(fxsound_core::eq::DEFAULT_BANDS),
+        levels,
     )
 }
 

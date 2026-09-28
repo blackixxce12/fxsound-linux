@@ -242,6 +242,44 @@ mod tests {
     }
 
     #[test]
+    fn at_interface_and_sound_an_empty_call_leaves_the_gain_where_it_was() {
+        // The twin of `degenerate_buffers_are_handled_without_panicking` (audit #2): the Windows
+        // build resets the gain to unity on a call with no whole frame (`SosProcess.cpp:146-150`),
+        // and that is the one part of #2 Interface and sound does not take back. A host's empty
+        // call carries no audio; resetting on it drops a lifted programme to x1 between two
+        // samples, a click, and no level brings a click back (roadmap 0.5.0 §1, "Never"). So an
+        // empty call, zero channels and a lone sample change nothing at the Windows arithmetic
+        // either, and the next call plays on as if they had not come.
+        const CHANNELS: usize = 2;
+        let mut leveller = leveller(DspCompat::Windows);
+        let tone = |n: usize, _| sine(300.0, 0.05, n);
+        for index in 0..400 {
+            let mut buffer = block(index * BLOCK, BLOCK, CHANNELS, tone);
+            leveller.process(&mut buffer, CHANNELS);
+        }
+        let lifted = leveller.gain();
+        assert!(lifted > 2.0, "the tone rode x{lifted}");
+        let untouched = leveller.clone();
+        leveller.process(&mut [], CHANNELS);
+        leveller.process(&mut [], 0);
+        let mut lone = [0.5];
+        leveller.process(&mut lone, CHANNELS);
+        assert_eq!(lone, [0.5]);
+        assert_eq!(leveller.gain().to_bits(), lifted.to_bits());
+        let mut after = block(400 * BLOCK, BLOCK, CHANNELS, tone);
+        let mut reference = after.clone();
+        leveller.process(&mut after, CHANNELS);
+        let mut untouched = untouched;
+        untouched.process(&mut reference, CHANNELS);
+        assert!(
+            after
+                .iter()
+                .zip(&reference)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
+
+    #[test]
     fn at_interface_and_sound_the_subwoofer_is_left_at_unity_as_on_windows() {
         // The twin of `the_subwoofer_is_levelled_with_the_rest_but_left_out_of_the_statistics`
         // (audit #3 taken back): a quiet 5.1 scene is lifted by 13 dB and the subwoofer is not,
@@ -274,6 +312,118 @@ mod tests {
             }
         }
         assert!(lifted > 4.0, "the fronts rode x{lifted}");
+    }
+
+    #[test]
+    fn switching_the_arithmetic_crossfades_the_subwoofer_rather_than_stepping_it() {
+        // Levelled at FxSound for Linux, at unity at Interface and sound: a quiet 5.1 scene
+        // being lifted took its subwoofer from the fronts' gain to x1 between two samples when
+        // the level moved, a step of 0.35 on a 50 Hz tone that moves by 0.003 a sample at that
+        // gain. It now fades from one to the other over 20 ms, both ways, and then the subwoofer
+        // is the new arithmetic's alone: at Interface and sound bit for bit the input again.
+        const CHANNELS: usize = 6;
+        const LFE: usize = 3;
+        let scene = |n: usize, channel: usize| {
+            if channel == LFE {
+                // A cosine, at its crest where every switch lands.
+                sine(50.0, 0.1, n + 240)
+            } else {
+                sine(300.0, 0.05, n)
+            }
+        };
+        let mut leveller = leveller(DspCompat::Linux);
+        let mut subwoofer: Vec<Real> = Vec::new();
+        let mut last_dry = Vec::new();
+        let mut last_wet = Vec::new();
+        for index in 0..600 {
+            match index {
+                200 => leveller.set_compat(DspCompat::Windows),
+                400 => leveller.set_compat(DspCompat::Linux),
+                _ => {}
+            }
+            let dry = block(index * BLOCK, BLOCK, CHANNELS, scene);
+            let mut wet = dry.clone();
+            leveller.process_with_lfe(&mut wet, CHANNELS, Some(LFE));
+            subwoofer.extend(wet.iter().skip(LFE).step_by(CHANNELS));
+            if index == 399 {
+                (last_dry, last_wet) = (dry, wet);
+            }
+        }
+        for switch in [200, 400] {
+            let around = &subwoofer[(switch - 1) * BLOCK..(switch + 5) * BLOCK];
+            let steepest = around
+                .windows(2)
+                .fold(0.0_f32, |most, pair| most.max((pair[1] - pair[0]).abs()));
+            // The tone's own steepest at the higher of the two gains, and a hair.
+            let own = 0.1 * 4.6 * core::f32::consts::TAU * 50.0 / FS * 1.1;
+            assert!(
+                steepest < own,
+                "switched at block {switch}, the subwoofer stepped by {steepest}"
+            );
+        }
+        for (dry, wet) in last_dry
+            .as_chunks::<CHANNELS>()
+            .0
+            .iter()
+            .zip(last_wet.as_chunks::<CHANNELS>().0)
+        {
+            assert_eq!(dry[LFE].to_bits(), wet[LFE].to_bits());
+        }
+    }
+
+    #[test]
+    fn moving_the_level_back_before_the_subwoofer_has_crossfaded_starts_from_the_mix_being_heard() {
+        // Moved again before the 20 ms fade was over (Sound, Interface, Sound again, or two calls
+        // over D-Bus 10 ms apart), the new fade started from the old arithmetic alone rather than
+        // from the half-and-half then playing, and the subwoofer of a quiet 5.1 scene stepped by
+        // 0.175 here, where its tone moves by 0.003 a sample at the higher gain. Moved there and
+        // back, and there again, a block apart, it now moves no faster than that tone, and at the
+        // end is the last arithmetic's alone.
+        const CHANNELS: usize = 6;
+        const LFE: usize = 3;
+        let scene = |n: usize, channel: usize| {
+            if channel == LFE {
+                sine(50.0, 0.1, n + 240)
+            } else {
+                sine(300.0, 0.05, n)
+            }
+        };
+        let own = 0.1 * 4.6 * core::f32::consts::TAU * 50.0 / FS * 1.1;
+        for moves in [
+            &[DspCompat::Windows, DspCompat::Linux][..],
+            &[DspCompat::Windows, DspCompat::Linux, DspCompat::Windows][..],
+        ] {
+            let mut leveller = leveller(DspCompat::Linux);
+            let mut subwoofer: Vec<Real> = Vec::new();
+            let mut last = (Vec::new(), Vec::new());
+            for index in 0..400_usize {
+                if let Some(compat) = index.checked_sub(200).and_then(|at| moves.get(at)) {
+                    leveller.set_compat(*compat);
+                }
+                let dry = block(index * BLOCK, BLOCK, CHANNELS, scene);
+                let mut wet = dry.clone();
+                leveller.process_with_lfe(&mut wet, CHANNELS, Some(LFE));
+                subwoofer.extend(wet.iter().skip(LFE).step_by(CHANNELS));
+                last = (dry, wet);
+            }
+            let around = &subwoofer[199 * BLOCK..210 * BLOCK];
+            let steepest = around
+                .windows(2)
+                .fold(0.0_f32, |most, pair| most.max((pair[1] - pair[0]).abs()));
+            assert!(
+                steepest < own,
+                "moved {moves:?} a block apart, the subwoofer stepped by {steepest}"
+            );
+            let windows = moves.last() == Some(&DspCompat::Windows);
+            let (dry, wet) = last;
+            let lifted = dry
+                .as_chunks::<CHANNELS>()
+                .0
+                .iter()
+                .zip(wet.as_chunks::<CHANNELS>().0)
+                .all(|(dry, wet)| dry[LFE].to_bits() == wet[LFE].to_bits());
+            assert_eq!(lifted, windows, "moved {moves:?}");
+        }
     }
 
     #[test]

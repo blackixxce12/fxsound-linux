@@ -22,10 +22,12 @@
 //! `--filter-q` — the settings' rather than the preset's. So the blind comparisons of
 //! `scripts/voicing/` hear what the application plays, not the raw values of the file. The
 //! effect flags and `--no-eq` are set over the preset, whatever order they come in.
-//! `--windows-dsp` plays it as «Like FxSound for Windows» = Interface and sound does, through the
-//! Windows build's DSP ([`fxsound_core::DspCompat`]) and the Windows build's reading of it — a
-//! curve of another count by position, twenty bands on the Windows ladder, Ambience's slider on
-//! its straight line; a build that has one DSP only plays that.
+//! `--compat windows` (or `--windows-dsp`) plays it as «Like FxSound for Windows» = Interface and
+//! sound does, through the Windows build's DSP ([`fxsound_core::DspCompat`]) and the Windows
+//! build's reading of it — a curve of another count by position, twenty bands on the Windows
+//! ladder, Ambience's slider on its straight line; `--compat linux`, the default, is Off's, and
+//! `preset_drift.rs` takes the same choice (`PRESET_DRIFT_COMPAT`). A build that has one DSP only
+//! plays that.
 //!
 //! Only 16-bit PCM WAV is handled, which is what `.wav` almost always means and what the original
 //! engine's `processAudio` took.
@@ -42,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "usage: process_wav <in.wav> <out.wav> [--preset FILE] [--bands N] \
              [--fidelity N] [--ambience N] [--surround N] [--dynamic-boost N] [--bass N] \
              [--master-gain DB] [--balance DB] [--volume-leveling N] [--filter-q N] [--no-eq] \
-             [--windows-dsp]\n       \
+             [--compat linux|windows]\n       \
              process_wav <mic.wav> <out.wav> --input <voice preset .toml> [--chain NAME] \
              [--source-rate HZ]"
         );
@@ -98,6 +100,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--no-eq" => no_eq = true,
             "--windows-dsp" => levels = levels.with_windows_dsp(true),
+            "--compat" => {
+                i += 1;
+                levels = levels.with_windows_dsp(match rest.get(i).map(String::as_str) {
+                    Some("windows") => true,
+                    Some("linux") => false,
+                    _ => return Err("--compat takes linux or windows".into()),
+                });
+            }
             "--preset" => {
                 i += 1;
                 let path = rest.get(i).ok_or("--preset needs a path")?;

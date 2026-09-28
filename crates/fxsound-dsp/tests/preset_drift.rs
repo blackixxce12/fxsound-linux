@@ -34,6 +34,28 @@
 //! render compares two files already on disk; without `PRESET_DRIFT_OUT` the measurement goes to
 //! `target/preset-drift.json`.
 //!
+//! # «Like FxSound for Windows» against Off, in one build
+//!
+//! `PRESET_DRIFT_COMPAT=windows` renders the output presets as «Like FxSound for Windows» =
+//! Interface and sound plays them: the Windows build's DSP, and its reading of a preset
+//! ([`fxsound_dsp::preset::MusicLevels::with_windows_dsp`]); `linux`, the default, is Off's and
+//! every level below. The voice presets have no Windows original and render the same either way.
+//! The file says which it rendered (`"compat"`), and the comparison prints both, so the two sides
+//! of the listening comparison in `scripts/voicing` (`process_wav --compat windows`) can be
+//! measured as well:
+//!
+//! ```text
+//! PRESET_DRIFT_OUT=$PWD/target/off.json \
+//!     cargo test --release -p fxsound-dsp --test preset_drift -- --ignored --nocapture
+//! PRESET_DRIFT_COMPAT=windows PRESET_DRIFT_BEFORE=$PWD/target/off.json \
+//!     PRESET_DRIFT_OUT=$PWD/target/sound.json \
+//!     cargo test --release -p fxsound-dsp --test preset_drift -- --ignored --nocapture
+//! ```
+//!
+//! What moved there is what the level changes, and a flag says the Windows build plays the preset
+//! otherwise, not that one of the two is wrong. A build older than the Windows DSP takes the
+//! variable and plays its one DSP (`scripts/reference-checkout.sh`).
+//!
 //! # The material
 //!
 //! Output presets, each rendered at 48 kHz in 1024-frame blocks as `genre_voicing.rs` renders
@@ -122,7 +144,7 @@ mod voice_material;
 
 use genre_material::{
     BASELINE_FILE, BLOCK, CHANNELS, COLUMNS, COMPARE_HI_HZ, COMPARE_LO_HZ, GENRE_PRESETS, RATE,
-    dynamics_for, load_reference, material, measure, preset_params, render, seed_for,
+    dynamics_for, load_reference, material, measure, preset_params_at, render, seed_for,
 };
 use output_material::{
     Kind, LOUD_RMS_DBFS, Material, TONE_DBFS, UNBALANCED_DB, VOICING_REFERENCE, db_to_gain,
@@ -167,6 +189,8 @@ const SILENCE_FLOOR_DBFS: f64 = -120.0;
 const OUT_VAR: &str = "PRESET_DRIFT_OUT";
 const BEFORE_VAR: &str = "PRESET_DRIFT_BEFORE";
 const AFTER_VAR: &str = "PRESET_DRIFT_AFTER";
+/// Whose DSP renders the output presets: `linux` (Off) or `windows` (Interface and sound).
+const COMPAT_VAR: &str = "PRESET_DRIFT_COMPAT";
 const FORMAT: &str = "fxsound preset drift 1";
 
 /// The pseudo-preset every material's own measurement is filed under. It must come back identical
@@ -219,15 +243,36 @@ fn voice_materials() -> Vec<Material> {
 // Presets and rendering
 // ---------------------------------------------------------------------------------------------
 
+/// Whether the output presets render through the Windows build's DSP: `PRESET_DRIFT_COMPAT`.
+fn windows_dsp() -> bool {
+    match std::env::var(COMPAT_VAR).as_deref().map(str::trim) {
+        Err(_) | Ok("" | "linux") => false,
+        Ok("windows") => true,
+        Ok(other) => panic!("{COMPAT_VAR}: {other} is neither linux nor windows"),
+    }
+}
+
+/// The name a run is filed under for the DSP it rendered with.
+const fn compat_key(windows: bool) -> &'static str {
+    if windows { "windows" } else { "linux" }
+}
+
+/// The settings' default levels, in the DSP [`windows_dsp`] asks for.
+fn levels() -> fxsound_dsp::preset::MusicLevels {
+    fxsound_dsp::preset::MusicLevels::default().with_windows_dsp(windows_dsp())
+}
+
 /// A `.fac` as the application plays it on ten bands with the settings' default levels:
 /// [`fxsound_dsp::preset::preset_params`], the one reading `process_wav --preset`,
 /// `genre_voicing.rs` and the application share, so a drift measured here is a drift the
-/// application plays. Volume Leveling is the material's ([`through_engine`]).
+/// application plays — at the level `PRESET_DRIFT_COMPAT` names. Volume Leveling is the
+/// material's ([`through_engine`]).
 fn params_of(preset: &Preset) -> DspParams {
+    let levels = levels();
     fxsound_dsp::preset::preset_params(
         preset,
-        &fxsound_dsp::preset::ladder(fxsound_core::eq::DEFAULT_BANDS),
-        fxsound_dsp::preset::MusicLevels::default(),
+        &levels.ladder(fxsound_core::eq::DEFAULT_BANDS),
+        levels,
     )
 }
 
@@ -522,7 +567,10 @@ fn sorted(mut scores: Vec<(String, f64)>) -> Vec<(String, f64)> {
 fn genre_voicing_columns() -> Vec<Column> {
     let baseline = load_reference(BASELINE_FILE);
     let range = band_range(COMPARE_LO_HZ, COMPARE_HI_HZ);
-    let params: Vec<DspParams> = GENRE_PRESETS.iter().map(|p| preset_params(p)).collect();
+    let params: Vec<DspParams> = GENRE_PRESETS
+        .iter()
+        .map(|p| preset_params_at(p, levels()))
+        .collect();
     COLUMNS
         .iter()
         .map(|(genre, file)| {
@@ -602,6 +650,8 @@ fn steady_columns(records: &[Record]) -> Vec<Column> {
 
 #[derive(Clone, Debug, PartialEq)]
 struct Run {
+    /// Whose DSP rendered the output presets: `linux` or `windows` ([`COMPAT_VAR`]).
+    compat: String,
     output: Vec<Record>,
     voice: Vec<Record>,
     columns: Vec<Column>,
@@ -655,6 +705,7 @@ fn measure_everything() -> Run {
     let mut columns = genre_voicing_columns();
     columns.extend(steady_columns(&output));
     Run {
+        compat: compat_key(windows_dsp()).to_owned(),
         output,
         voice,
         columns,
@@ -723,6 +774,8 @@ fn to_json(run: &Run) -> String {
     let mut out = String::new();
     out.push_str("{\n  \"format\": ");
     json_string(&mut out, FORMAT);
+    out.push_str(",\n  \"compat\": ");
+    json_string(&mut out, &run.compat);
     let _ = write!(
         out,
         ",\n  \"rate\": {RATE},\n  \"block\": {BLOCK},\n  \"third_octave_centres_hz\": ["
@@ -1004,7 +1057,13 @@ fn run_from_json(text: &str) -> Run {
         "not a file this harness wrote"
     );
     let records = |key: &str| json.get(key).list().iter().map(record_from).collect();
+    // A file from before the key was written is Off's: there was one DSP.
+    let compat = match json.get("compat").text() {
+        "" => compat_key(false),
+        compat => compat,
+    };
     Run {
+        compat: compat.to_owned(),
         output: records("output"),
         voice: records("voice"),
         columns: json
@@ -1412,6 +1471,14 @@ fn compare(before: &Run, after: &Run) {
     let output = pairs(&before.output, &after.output);
     let voice = pairs(&before.voice, &after.voice);
 
+    let dsp = |compat: &str| match compat {
+        "windows" => "the Windows build's DSP («Like FxSound for Windows» = Interface and sound)",
+        _ => "FxSound for Linux's DSP (Off)",
+    };
+    println!();
+    println!("== Before: {}", dsp(&before.compat));
+    println!("== After:  {}", dsp(&after.compat));
+
     let moved_inputs: Vec<String> = output
         .iter()
         .chain(&voice)
@@ -1563,6 +1630,7 @@ fn a_measurement_comes_back_from_json_as_it_went_in() {
         image_sd_db: Some(0.125),
     };
     let run = Run {
+        compat: "windows".to_owned(),
         output: vec![record.clone()],
         voice: vec![Record {
             kind: Kind::Music,
@@ -1575,6 +1643,35 @@ fn a_measurement_comes_back_from_json_as_it_went_in() {
         }],
     };
     assert_eq!(run_from_json(&to_json(&run)), run);
+}
+
+#[test]
+fn a_measurement_without_the_dsp_it_rendered_with_is_offs() {
+    // Files written before `PRESET_DRIFT_COMPAT` have no "compat": there was one DSP, Off's.
+    let run = run_from_json(&format!(
+        "{{\"format\": \"{FORMAT}\", \"output\": [], \"voice\": [], \"columns\": []}}"
+    ));
+    assert_eq!(run.compat, "linux");
+}
+
+#[test]
+fn preset_drift_compat_renders_a_preset_as_interface_and_sound_plays_it() {
+    // What the harness hands the engine is the application's snapshot at the level
+    // `PRESET_DRIFT_COMPAT` names: at `windows`, «Like FxSound for Windows» = Interface and
+    // sound's, the Windows DSP and the Windows build's reading of a preset.
+    let preset = fxsound_preset::load(&repo_root().join("assets/presets/BonusPresets/R&B.fac"))
+        .expect("a shipped preset reads");
+    let at = |windows: bool| {
+        let levels = fxsound_dsp::preset::MusicLevels::default().with_windows_dsp(windows);
+        fxsound_dsp::preset::preset_params(
+            &preset,
+            &levels.ladder(fxsound_core::eq::DEFAULT_BANDS),
+            levels,
+        )
+    };
+    assert_eq!(params_of(&preset), at(windows_dsp()));
+    assert_eq!(at(true).compat, fxsound_core::DspCompat::Windows);
+    assert_eq!(at(false).compat, fxsound_core::DspCompat::Linux);
 }
 
 #[test]

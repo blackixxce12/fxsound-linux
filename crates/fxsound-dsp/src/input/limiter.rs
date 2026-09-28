@@ -505,6 +505,48 @@ impl LookaheadLimiter {
         }
     }
 
+    /// Become a copy of `other`, its design and everything it holds, without allocating: for a
+    /// caller that keeps a second limiter to hand over from one design to another under a playing
+    /// stream (Dynamic Boost's switch of arithmetic, [`crate::effects::DynamicBoost::set_compat`]).
+    pub fn copy_from(&mut self, other: &Self) {
+        let Self {
+            delay,
+            write,
+            envelopes,
+            holds,
+            rings,
+            linked_mask,
+            linked_slot,
+            linked,
+            sample_rate,
+            lookahead,
+            lookahead_ms,
+            ceiling,
+            hold_ms,
+            release_ms,
+            release_beta,
+            overshoot,
+        } = other;
+        // Every limiter's delay is sized for the worst case, so the two are the same length.
+        let len = self.delay.len().min(delay.len());
+        self.delay[..len].copy_from_slice(&delay[..len]);
+        self.write = *write;
+        self.envelopes = *envelopes;
+        self.holds = *holds;
+        self.rings = *rings;
+        self.linked_mask = *linked_mask;
+        self.linked_slot = *linked_slot;
+        self.linked = *linked;
+        self.sample_rate = *sample_rate;
+        self.lookahead = *lookahead;
+        self.lookahead_ms = *lookahead_ms;
+        self.ceiling = *ceiling;
+        self.hold_ms = *hold_ms;
+        self.release_ms = *release_ms;
+        self.release_beta = *release_beta;
+        self.overshoot = *overshoot;
+    }
+
     pub fn reset(&mut self) {
         self.delay.fill(0.0);
         self.write = 0;

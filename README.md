@@ -12,8 +12,9 @@ exactly, the same here; [the deliberate differences](#deliberate-differences-fro
 say what changed. A mode that restores the original behaviour, «Like FxSound for Windows» in
 Settings ▸ Experimental (`--windows-parity=off|interface|sound`), is being built for 0.5.0: the
 setting is there, `sound` already plays Volume Leveling, Dynamic Boost, Ambience, the equalizer,
-the master gain and the balance as the Windows build does and reads a preset as it does, and the
-rest of what each level changes arrives over the release
+the master gain and the balance as the Windows build does and reads a preset as it does, moving
+to it and back while something plays does not click, and the rest of what each level changes
+arrives over the release
 ([`docs/0.5.0-windows-parity.md`](docs/0.5.0-windows-parity.md)). Its fourth level, Everything,
 comes in a later version; 0.5.0 refuses `full`, and runs a `settings.toml` that says `full` as
 `sound` while keeping `full` in the file for that version.

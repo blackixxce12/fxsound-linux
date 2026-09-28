@@ -290,8 +290,11 @@ jobs:
       # «Like FxSound for Windows» = Interface and sound against 3596e99, the engine before the
       # 0.4.0 audit (A1), from a cold start: every shipped preset on 10, 20 and 31 bands with
       # both sets of levels (W1b, W1c). The two presets whose Ambience is stored at 51 are A1's
-      # listed exception, held to the Windows C code instead (#39, A2, the unit tests); the
-      # switching pass follows in W1d (docs/0.5.0-dsp-inventory.md).
+      # listed exception, held to the Windows C code instead (#39, A2, the unit tests). The
+      # switching pass is not gated against 3596e99: the glides every level keeps (#9-#11) change
+      # what Dynamic Boost's level estimate and the leveller hear for 20 ms, and their memory
+      # carries that past -120 dBFS for seconds (W1d, docs/0.5.0-dsp-inventory.md). A3 gates
+      # both passes.
       - name: Interface and sound plays as the engine before the audit (A1, cold)
         env:
           FXSOUND_BITEXACT_PASSES: cold

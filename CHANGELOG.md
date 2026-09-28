@@ -31,8 +31,14 @@ All notable changes to the FxSound Linux port. The format follows
   off the master gain alone plays, while the equalizer is on; the balance plays on stereo only. A
   preset of another band count is read onto yours by position, and twenty bands are the Windows
   build's ladder: a twenty-band preset moves to it and back band for band, and nothing is saved
-  on the way. Switching the level with a master gain or a balance set can still click; that goes
-  during 0.5.0.
+  on the way.
+- **«Like FxSound for Windows» moves between Off and Interface and sound without a click, while
+  it plays.** What the level changes goes from one sound to the other over 20 ms instead of
+  between two samples: the master gain and the balance move to their Windows place and back, the
+  subwoofer under Volume Leveling fades between levelled and not, and Dynamic Boost hands its
+  limiting over from one design to the other. At −6 dB of master gain and +4 dB of balance the
+  switch clicked at −6 to −20 dBFS; it now leaves about −52 dBFS at most, and the same for an
+  application with a preset of its own.
 - **The Export window can keep the end bands where they are.** From «Like FxSound for Windows» =
   Interface and sound on it has a tick box, "Keep the end bands where they are", and
   `fxsound --export-unshifted[=0|1]` sets the same: a `.fac` then keeps its first and last band
@@ -82,9 +88,11 @@ All notable changes to the FxSound Linux port. The format follows
   band count and a slider are switched, and requires the same output: identical, or nowhere more
   than −120 dBFS apart. It also renders Interface and sound against the engine before the 0.4.0
   audit, and requires the same output wherever that level is built so far. The offline renderer
-  (`process_wav`, with `--windows-dsp` for Interface and sound) and the blind A/B of
+  (`process_wav`, with `--compat windows` for Interface and sound) and the blind A/B of
   `scripts/voicing` now play a preset the way the application does, through the application's
-  own reading of a preset.
+  own reading of a preset, and the drift measurement (`preset_drift`) sets Interface and sound
+  beside Off with `PRESET_DRIFT_COMPAT=windows`. Moving the level is in the click tests, on the
+  output and in an application's own preset.
 
 ## [0.4.0] — 2026-09-27
 

@@ -441,8 +441,12 @@ fn switching_effects_off_and_on_and_naming_the_sides_allocates_nothing() {
 fn switching_to_the_windows_dsp_and_back_allocates_nothing() {
     // «Like FxSound for Windows» = Interface and sound reaches the audio thread in the snapshot:
     // the leveller's arithmetic, Dynamic Boost's floor and level, and its limiter's linking, hold
-    // and attack all change between two blocks, on 5.1 with the sides named, and back. None of it
-    // may allocate.
+    // and attack all change between two blocks, on 5.1 with the sides named, and back. Every one
+    // of the crossfades that carries the move (W1d) runs: the gain stage gliding between its two
+    // places with the master gain and the balance set, with the equalizer on and off and the
+    // power off; the leveller's subwoofer; Dynamic Boost's limiter handed over from one design to
+    // the other in stretches, in blocks larger and smaller than a stretch; Ambience's mix; a band
+    // below 20 Hz. None of it may allocate.
     use fxsound_core::DspCompat;
     use fxsound_dsp::engine::ChannelSide::{Centre, Left, Right};
     let channels = 6;
@@ -454,28 +458,43 @@ fn switching_to_the_windows_dsp_and_back_allocates_nothing() {
         .flat_map(|frame| [frame[0], frame[1], frame[0], frame[0], frame[0], frame[1]])
         .collect();
     let mut block = input.clone();
-    let snapshots: Vec<DspParams> = [DspCompat::Linux, DspCompat::Windows]
+    let snapshots: Vec<DspParams> = [(true, true), (true, false), (false, true), (false, false)]
         .into_iter()
-        .cycle()
-        .take(5)
-        .map(|compat| {
-            let mut params = DspParams {
-                compat,
-                volume_leveling_db: 3.0,
-                ..DspParams::default()
-            };
-            params.set_effect(Effect::DynamicBoost, 1.0);
-            params
+        .flat_map(|(power, eq_on)| {
+            [DspCompat::Linux, DspCompat::Windows]
+                .into_iter()
+                .cycle()
+                .take(5)
+                .map(move |compat| {
+                    let mut params = DspParams {
+                        compat,
+                        power,
+                        eq_on,
+                        volume_leveling_db: 3.0,
+                        master_gain_db: -6.0,
+                        balance: 4.0,
+                        ..DspParams::default()
+                    };
+                    params.band_center_hz[0] = 15.0;
+                    params.band_boost_db[0] = 6.0;
+                    params.band_boost_db[2] = 4.0;
+                    for effect in Effect::ALL {
+                        params.set_effect(effect, 0.5);
+                    }
+                    params.set_effect(Effect::DynamicBoost, 1.0);
+                    params
+                })
         })
         .collect();
 
     let n = allocations_on_a_fresh_thread(|| {
         engine.set_lfe_channel(Some(3));
         engine.set_channel_sides(Some(&[Left, Right, Centre, Centre, Left, Right]));
-        for params in &snapshots {
+        for (index, params) in snapshots.iter().enumerate() {
             engine.apply(params);
             block.copy_from_slice(&input);
-            for chunk in block.chunks_mut(1_024 * channels) {
+            let frames = if index % 2 == 0 { 1_024 } else { 100 };
+            for chunk in block.chunks_mut(frames * channels) {
                 engine.process(chunk, channels);
             }
         }

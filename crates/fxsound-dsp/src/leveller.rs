@@ -755,7 +755,20 @@ pub struct VolumeLeveller {
     heard: bool,
     /// Whose arithmetic runs: the port's, or the Windows build's ([`VolumeLeveller::set_compat`]).
     compat: DspCompat,
+    /// The subwoofer's crossfade when [`VolumeLeveller::set_compat`] changes what it gets: the
+    /// share of the new arithmetic's output, gliding from 0 to 1, still at 1 otherwise.
+    subwoofer_fade: Ramp,
+    /// What the subwoofer was multiplied by when the switch was made: the gain being played for
+    /// the port's arithmetic, unity for the Windows build's (#3 taken back), and the mix of the
+    /// two a fade had got to when the switch came before it was over.
+    subwoofer_from: Real,
+    /// The subwoofer's input over the frames of a call that the crossfade covers.
+    subwoofer_dry: [Real; SUBWOOFER_FADE_FRAMES],
 }
+
+/// The longest the subwoofer's crossfade runs, in frames: [`crate::smooth::GLIDE_SECONDS`] up to
+/// 51.2 kHz, and 1 024 frames, 10.7 ms at 96 kHz, above it.
+const SUBWOOFER_FADE_FRAMES: usize = 1_024;
 
 impl VolumeLeveller {
     /// A leveller in its power-on state: amount 0, gain 1.0 (`Sos.cpp:67-86`).
@@ -807,6 +820,9 @@ impl VolumeLeveller {
             release_ceiling: CEILING,
             heard: false,
             compat: DspCompat::Linux,
+            subwoofer_fade: Ramp::new(1.0),
+            subwoofer_from: 1.0,
+            subwoofer_dry: [0.0; SUBWOOFER_FADE_FRAMES],
         }
     }
 
@@ -858,13 +874,33 @@ impl VolumeLeveller {
     /// (#2), the subwoofer neither analysed nor levelled (#3) and both ends of a step's ramp
     /// clamped to the peak-safe gain (#4). The state machine carries on from where it is: a step
     /// half gathered is dropped, and the next one starts from the gain being played.
+    ///
+    /// The subwoofer is the one channel the two treat differently, levelled here and left at
+    /// unity there, and switching between them under a quiet scene lifted by 12 dB moved it by
+    /// that much between two samples, a click at −20 dBFS. Once audio has gone through it
+    /// crossfades from what the old arithmetic made of it to what the new one does, over
+    /// [`crate::smooth::GLIDE_SECONDS`] ([`SUBWOOFER_FADE_FRAMES`] at most). Allocation-free.
     pub fn set_compat(&mut self, compat: DspCompat) {
         if compat == self.compat {
             return;
         }
+        let playing = self.ramp.at(0);
+        // What the arithmetic in force multiplies the subwoofer by, and what is heard of it: that
+        // alone once a fade is over, the mix a fade has got to while one runs. Moved back before
+        // the fade is over, the new one starts from that mix, not from the old arithmetic alone,
+        // which stepped the subwoofer by up to 38 times its tone's own step.
+        let now = if self.compat.windows() { 1.0 } else { playing };
+        let share = self.subwoofer_fade.value();
+        self.subwoofer_from += share * (now - self.subwoofer_from);
+        self.subwoofer_fade = Ramp::new(0.0);
+        let frames = glide_frames(self.sample_rate)
+            .min(u32::try_from(SUBWOOFER_FADE_FRAMES).unwrap_or(u32::MAX));
+        self.subwoofer_fade.glide_to(1.0, frames);
+        if !self.heard {
+            self.subwoofer_fade.settle();
+        }
         self.compat = compat;
         self.step = StepStats::default();
-        let playing = self.ramp.at(0);
         self.gain = playing;
         self.ramp = GainRamp::hold(playing);
     }
@@ -906,6 +942,7 @@ impl VolumeLeveller {
     /// again, switching it off clears it at once, as before audit #11.
     pub fn sit_out(&mut self) {
         self.release = Ramp::new(1.0);
+        self.subwoofer_fade.settle();
         self.heard = false;
     }
 
@@ -947,6 +984,7 @@ impl VolumeLeveller {
         self.quiet_peak_history_count = 0;
 
         self.release = Ramp::new(1.0);
+        self.subwoofer_fade.settle();
     }
 
     /// Level one interleaved buffer in place.
@@ -983,6 +1021,42 @@ impl VolumeLeveller {
         channels: usize,
         lfe_channel: Option<usize>,
     ) {
+        if !self.subwoofer_fade.is_gliding() {
+            self.level(buffer, channels, lfe_channel);
+            return;
+        }
+        // A switch of arithmetic crossfading the subwoofer ([`VolumeLeveller::set_compat`]): keep
+        // its input over the frames the fade covers, level, and mix.
+        let Some(lfe) = lfe_channel.filter(|lfe| *lfe < channels.min(MAX_CHANNELS)) else {
+            self.subwoofer_fade.settle();
+            self.level(buffer, channels, lfe_channel);
+            return;
+        };
+        let fading = (buffer.len() / channels).min(self.subwoofer_fade.frames_left() as usize);
+        for (dry, frame) in self
+            .subwoofer_dry
+            .iter_mut()
+            .zip(buffer.chunks_exact(channels))
+            .take(fading)
+        {
+            *dry = frame[lfe];
+        }
+        self.level(buffer, channels, lfe_channel);
+        let from = self.subwoofer_from;
+        for (dry, frame) in self
+            .subwoofer_dry
+            .iter()
+            .zip(buffer.chunks_exact_mut(channels))
+            .take(fading)
+        {
+            let share = self.subwoofer_fade.advance();
+            let old = (dry * from).clamp(-CEILING, CEILING);
+            frame[lfe] = old + share * (frame[lfe] - old);
+        }
+    }
+
+    /// [`VolumeLeveller::process_with_lfe`] in the arithmetic in force.
+    fn level(&mut self, buffer: &mut [Real], channels: usize, lfe_channel: Option<usize>) {
         if channels > 0 && !buffer.is_empty() {
             self.heard = true;
         }
