@@ -26,6 +26,16 @@ All notable changes to the FxSound Linux port. The format follows
   WirePlumber 0.5, where the tests of WirePlumber's own policy, which Ubuntu's 0.4 has to skip,
   must run. The workflows moved to the Node 24 releases of their actions, run on Ubuntu 24.04
   everywhere rather than on whatever `ubuntu-latest` becomes, and are checked by actionlint.
+- **Clicks are measured by the tests.** A steady tone plays through FxSound on a private PipeWire
+  with WirePlumber while the power button, an application's own preset, FxSound's and the
+  desktop's choice of device, the equalizer and the music and voice presets are switched, and each
+  switch's worst click is read from the recording. The equalizer, the presets and the power button
+  under sound that stays on FxSound must stay below −40 dBFS. A switch that moves an application's
+  sound to another device or node is reported instead, as loud as it is today: −18 to −41 dBFS for
+  the power button, as loud as −5 dBFS for an application's own preset or a device chosen in
+  FxSound, and −19 to −28 dBFS for the desktop's choice with FxSound off. The moves FxSound makes
+  itself are held to −40 dBFS once 0.5.0 makes them quiet. CI shows the measurements in the job's
+  summary.
 
 ## [0.4.0] — 2026-09-27
 

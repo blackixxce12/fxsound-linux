@@ -37,3 +37,8 @@ serde_json = { workspace = true }
 [dev-dependencies]
 # The tests' scratch directories and guarded children (`fxsound_core::test_support`).
 fxsound-core = { workspace = true, features = ["test-support"] }
+# The click tests (`src/graph_churn/clicks.rs`) switch between shipped presets as the app does,
+# read by the crate the app reads them with.
+fxsound-preset = { workspace = true }
+# Their high-pass, as one product of spectra: the crate the DSP computes its spectrum with.
+realfft = { workspace = true }

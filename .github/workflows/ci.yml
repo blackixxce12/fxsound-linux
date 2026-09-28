@@ -163,13 +163,52 @@ jobs:
           runuser -u tester -- cargo --version
 
       # As in the job above: no session bus, no session PipeWire; every test that needs a daemon
-      # starts a private one and takes it down with it.
+      # starts a private one and takes it down with it. The click measurements run in the next
+      # step instead, one at a time.
       - name: Tests
-        run: runuser -u tester -- cargo test --workspace
+        run: runuser -u tester -- cargo test --workspace -- --skip graph_churn::clicks::under_a_steady_tone
         env:
           XDG_RUNTIME_DIR: /run/tester
           FXSOUND_REQUIRE_PIPEWIRE_TOOLS: "1"
           FXSOUND_REQUIRE_WIREPLUMBER: "1"
+
+      # A steady tone through FxSound, and the worst click each switch leaves in it
+      # (crates/fxsound-audio/src/graph_churn/clicks.rs). One at a time, so that the other tests'
+      # daemons do not cause the xruns that would discard its runs. Here it only reports: a shared
+      # runner has xruns of its own, and the hard gate of -40 dBFS is the local check of an audio
+      # phase. The tables go to the job's summary, and a switch over the soft threshold becomes a
+      # warning.
+      - name: Click measurements
+        run: |
+          set -euo pipefail
+          runuser -u tester -- env FXSOUND_CLICK_REPORT="$GITHUB_WORKSPACE/target/click-report.txt" \
+            cargo test -p fxsound-audio --lib graph_churn::clicks::under_a_steady_tone \
+            -- --test-threads=1 --nocapture
+        env:
+          XDG_RUNTIME_DIR: /run/tester
+          FXSOUND_REQUIRE_PIPEWIRE_TOOLS: "1"
+          FXSOUND_REQUIRE_WIREPLUMBER: "1"
+          FXSOUND_CLICK_GATE: report
+
+      - name: Click report
+        if: always()
+        run: |
+          set -euo pipefail
+          report="$GITHUB_WORKSPACE/target/click-report.txt"
+          if [ ! -s "$report" ]; then
+            echo "No click report was written."
+            exit 0
+          fi
+          {
+            echo '## Clicks under a steady tone'
+            echo
+            echo '```text'
+            cat "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          { grep 'WARNING' "$report" || true; } | while IFS= read -r line; do
+            echo "::warning title=Click report::$line"
+          done
 
   # The workflows themselves: actionlint checks their syntax, expressions, runner labels and job
   # dependencies, and hands every `run:` script to shellcheck. Shellcheck's warnings and errors

@@ -69,6 +69,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 mod apps;
+mod clicks;
 mod policy;
 mod routes;
 mod sleep;

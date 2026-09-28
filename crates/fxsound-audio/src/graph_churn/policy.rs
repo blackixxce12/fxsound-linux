@@ -21,8 +21,11 @@ use super::*;
 
 /// The daemon's configuration for a graph with WirePlumber on it: [`CONFIG`]'s daemon, with what
 /// WirePlumber needs besides — and without the `default` metadata object, which WirePlumber makes
-/// for itself. Two stereo sinks and a mono microphone, each with the session priority a real
-/// device carries, so WirePlumber picks the defaults the way it would on a desktop.
+/// for itself. Two stereo sinks and two mono microphones, each with the session priority a real
+/// device carries, so WirePlumber picks the defaults the way it would on a desktop: `t_stereo` and
+/// `t_mic`, the others ranked below them for a switch between devices. The profiler is
+/// loaded for `pw-top`, whose error counts tell the click measurements ([`clicks`](super::clicks))
+/// which runs had xruns.
 const POLICY_CONFIG: &str = r#"
 context.properties = {
     core.daemon                 = true
@@ -40,6 +43,7 @@ context.spa-libs = {
 }
 context.modules = [
     { name = libpipewire-module-protocol-native }
+    { name = libpipewire-module-profiler }
     { name = libpipewire-module-metadata }
     { name = libpipewire-module-spa-device-factory }
     { name = libpipewire-module-spa-node-factory }
@@ -66,6 +70,11 @@ context.objects = [
                  node.description = "Test Microphone"  media.class = Audio/Source/Virtual
                  object.linger = true  audio.channels = 1  audio.position = [ MONO ]
                  priority.session = 2010  priority.driver = 2010  device.api = alsa } }
+    { factory = adapter
+        args = { factory.name = support.null-audio-sink  node.name = "t_mic2"
+                 node.description = "Test Other Microphone"  media.class = Audio/Source/Virtual
+                 object.linger = true  audio.channels = 1  audio.position = [ MONO ]
+                 priority.session = 2009  priority.driver = 2009  device.api = alsa } }
 ]
 "#;
 

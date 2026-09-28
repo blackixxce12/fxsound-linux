@@ -1074,6 +1074,19 @@ mod tests {
                 .expect("a link was followed")
         };
         let link = |url: &str| Message::with_link("Read it.", "Open", url);
+        // The signals are handled on the listener's thread, and the daemon hands out the same id
+        // for every notice in the slot, so a click still queued when the next notice takes the
+        // slot would follow the next notice's link. A fence waits until the listener has handled
+        // every signal sent so far: a notice with an id of its own is clicked, and signals are
+        // handled in order, so a link opened by an earlier click would come before the fence's.
+        let fence = |sink: &mut DesktopSink, slot: u32| {
+            let id = sink
+                .deliver(&link("https://example.org/fence"), None)
+                .expect("delivered");
+            assert_ne!(id, slot, "a notice of its own has an id of its own");
+            click(id);
+            assert_eq!(next_opened(), "https://example.org/fence");
+        };
 
         let id = sink
             .deliver(&link("https://example.org/one"), None)
@@ -1086,18 +1099,32 @@ mod tests {
             .deliver(&Message::presets_restored(), Some(id))
             .expect("delivered");
         click(id);
-        // A notice closed before the click follows nothing either.
+        fence(&mut sink, id);
+
+        // A notice closed before the click follows nothing either. The fence's own notice must
+        // wait until the listener has seen the close, or a late close would pass for the fence's.
         let id = sink
             .deliver(&link("https://example.org/two"), Some(id))
             .expect("delivered");
         closed(id);
         click(id);
-        // Signals arrive in order, so a link opened by either of those would come before this.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sink
+            .link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            assert!(Instant::now() < deadline, "the close was not seen");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fence(&mut sink, id);
+
         let id = sink
             .deliver(&link("https://example.org/three"), Some(id))
             .expect("delivered");
         click(id);
         assert_eq!(next_opened(), "https://example.org/three");
-        assert_eq!(rx.len(), 4, "four notices, four calls");
+        assert_eq!(rx.len(), 6, "six notices, six calls");
     }
 }
