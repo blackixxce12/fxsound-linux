@@ -1139,6 +1139,16 @@ pub(crate) fn unless_skipped<T>(checked: Option<T>, tool: &str, what: &str) -> O
     checked
 }
 
+impl PrivateGraph {
+    /// Whether the daemon has logged, so far, that a tone which drives its group ran out of
+    /// buffers ([`Self::add_tone`]): from then on that group is silent with every node in it still
+    /// `running`, and what a recorder in it hears says nothing about the code under test.
+    pub(crate) fn tone_ran_dry(&self) -> bool {
+        std::fs::read_to_string(self.dir.join(DAEMON_LOG))
+            .is_ok_and(|log| log.contains(A_TONE_RAN_DRY))
+    }
+}
+
 impl Drop for PrivateGraph {
     /// The daemons go first, and their directory after them, with the fields.
     fn drop(&mut self) {
@@ -1148,8 +1158,7 @@ impl Drop for PrivateGraph {
             let _ = bus.kill();
             let _ = bus.wait();
         }
-        let log = std::fs::read_to_string(self.dir.join(DAEMON_LOG)).unwrap_or_default();
-        if log.contains(A_TONE_RAN_DRY) {
+        if self.tone_ran_dry() {
             TONE_RAN_DRY.set(true);
         }
     }

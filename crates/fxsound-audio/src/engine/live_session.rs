@@ -562,6 +562,20 @@ fn a_playback_stream_paced_by_hand_sleeps_while_its_sink_is_paused_and_wakes_the
     });
 }
 
+/// The first PipeWire known to stop a passive pair with the ring's cushion still in it every time
+/// its last sound goes: 1.6.9 does, on this machine and in CI's Arch leg. 1.0.5, on CI's Ubuntu
+/// 24.04 leg, mostly does too, but was seen to stop it with the ring played dry (CI run
+/// 36446837778) — where the test's tone has to drive the group as well
+/// ([`PrivateGraph::add_tone`]), so which of the two makes the difference is not known. Nothing
+/// between was tried.
+const A_PASSIVE_PAIR_STOPS_AT_ONCE_SINCE: (u32, u32, u32) = (1, 6, 0);
+
+/// How many times, on a server older than [`A_PASSIVE_PAIR_STOPS_AT_ONCE_SINCE`], a sound is
+/// played and stopped to have the pair stop with a tail in the ring. Each start is a link made
+/// into a group a tone drives, which runs the tone dry now and then ([`again_if_a_tone_ran_dry`]),
+/// so no more than it takes.
+const ROUNDS_ON_AN_OLDER_SERVER: u32 = 3;
+
 /// On a server that runs a link-group together the output lane's NODE 2 is passive, and it stops
 /// in the same cycle as NODE 1 with the ring's cushion still in it (module docs of `engine`,
 /// "Idle"). The next thing to wake the pair must not be heard behind that tail: NODE 1's `Paused`
@@ -570,6 +584,12 @@ fn a_playback_stream_paced_by_hand_sleeps_while_its_sink_is_paused_and_wakes_the
 ///
 /// This daemon runs the pair itself, so the test watches what the server does and what the ring
 /// holds, and the loop it pumps is only there to hear NODE 1's states.
+///
+/// Whether the pair stops with a tail in the ring is the server's doing, and a server older than
+/// [`A_PASSIVE_PAIR_STOPS_AT_ONCE_SINCE`] does not always leave one: there the sound is played and
+/// stopped up to [`ROUNDS_ON_AN_OLDER_SERVER`] times until a stop does, and when none does, the
+/// test says so and still checks that the next sound takes the mark and primes afresh. On a newer
+/// server the first stop has to leave one.
 #[test]
 fn a_passive_pair_that_stops_does_not_play_its_last_sound_to_the_next_one() {
     again_if_a_tone_ran_dry(|| {
@@ -631,46 +651,85 @@ fn a_passive_pair_that_stops_does_not_play_its_last_sound_to_the_next_one() {
             );
         }
         assert!(harness.meanwhile(|graph| graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo")));
-
-        // A sound plays through the pair.
-        assert!(harness.meanwhile(|graph| graph.link_nodes("t_tone", SINK_NODE_NAME)));
-        assert_eq!(
-            harness
-                .meanwhile(|graph| graph.runs_until(OUTPUT_NODE_NAME, true))
-                .map(drop),
-            Ok(()),
-            "the playback stream should run while something plays into the sink"
-        );
         let ring = Arc::clone(&harness.shared.borrow().lanes.output.ring);
-        assert!(
-            harness.until("the ring to be primed", |_| ring
-                .primed
-                .load(Ordering::Relaxed)),
-            "the tone never reached the playback stream"
-        );
-        assert!(
-            !ring.stale_pending(),
-            "the mark NODE 1's first Paused left should have been taken by NODE 2's first cycle"
-        );
+        let counters = Arc::clone(&harness.shared.borrow().lanes.output.counters);
+        let version = harness.meanwhile(PrivateGraph::server_version);
+        // A server whose version cannot be read is held to the newest one's standard.
+        let stops_at_once =
+            version.is_none_or(|version| version >= A_PASSIVE_PAIR_STOPS_AT_ONCE_SINCE);
+        let rounds = if stops_at_once {
+            1
+        } else {
+            ROUNDS_ON_AN_OLDER_SERVER
+        };
 
-        // It stops, and so does the pair, both nodes in one cycle, with some of the sound still in
-        // the ring for NODE 2 to have played.
-        assert!(harness.meanwhile(|graph| graph.unlink_nodes("t_tone", SINK_NODE_NAME)));
-        assert_eq!(
-            harness
-                .meanwhile(|graph| graph.runs_until(OUTPUT_NODE_NAME, false))
-                .map(drop),
-            Ok(()),
-            "the playback stream should stop once nothing plays into the sink"
-        );
-        assert!(
-            harness.until("NODE 1 to report Paused", |_| ring.stale_pending()),
-            "NODE 1 paused and the ring was not marked stale"
-        );
-        assert!(
-            ring.fill_frames() > 0,
-            "the pair stopped with nothing left in the ring, so this test shows nothing"
-        );
+        let mut left_a_tail = false;
+        for round in 1..=rounds {
+            // A sound plays through the pair. From the second round on it is also the next sound
+            // after a pair that stopped: it wakes the pair as well, and takes the mark too.
+            assert!(harness.meanwhile(|graph| graph.link_nodes("t_tone", SINK_NODE_NAME)));
+            assert_eq!(
+                harness
+                    .meanwhile(|graph| graph.runs_until(OUTPUT_NODE_NAME, true))
+                    .map(drop),
+                Ok(()),
+                "the playback stream should run while something plays into the sink"
+            );
+            assert!(
+                harness.until("the ring to be primed", |_| ring
+                    .primed
+                    .load(Ordering::Relaxed)),
+                "the tone never reached the playback stream"
+            );
+            assert!(
+                !ring.stale_pending(),
+                "the mark NODE 1's last Paused left should have been taken by NODE 2's first cycle"
+            );
+
+            // It stops, and so does the pair, both nodes in one cycle, with some of the sound still
+            // in the ring for NODE 2 to have played.
+            let sink_cycles = counters.sink_cycles.load(Ordering::Relaxed);
+            let output_cycles = counters.output_cycles.load(Ordering::Relaxed);
+            let underruns = ring.underrun_frames.load(Ordering::Relaxed);
+            assert!(harness.meanwhile(|graph| graph.unlink_nodes("t_tone", SINK_NODE_NAME)));
+            assert_eq!(
+                harness
+                    .meanwhile(|graph| graph.runs_until(OUTPUT_NODE_NAME, false))
+                    .map(drop),
+                Ok(()),
+                "the playback stream should stop once nothing plays into the sink"
+            );
+            assert!(
+                harness.until("NODE 1 to report Paused", |_| ring.stale_pending()),
+                "NODE 1 paused and the ring was not marked stale"
+            );
+            if ring.fill_frames() > 0 {
+                left_a_tail = true;
+                break;
+            }
+            // What the server did instead, for the log: how many blocks NODE 1 still processed
+            // after the sound was unlinked, and how many cycles NODE 2 ran and played short.
+            println!(
+                "round {round}: the pair stopped with nothing left in the ring; after the sound \
+                 was unlinked NODE 1 processed {} blocks and NODE 2 ran {} cycles, {} frames of \
+                 them silence",
+                counters.sink_cycles.load(Ordering::Relaxed) - sink_cycles,
+                counters.output_cycles.load(Ordering::Relaxed) - output_cycles,
+                ring.underrun_frames.load(Ordering::Relaxed) - underruns,
+            );
+        }
+        if !left_a_tail {
+            assert!(
+                !stops_at_once,
+                "the pair stopped with nothing left in the ring, so this test shows nothing"
+            );
+            println!(
+                "NOTE: PipeWire {version:?}, older than {A_PASSIVE_PAIR_STOPS_AT_ONCE_SINCE:?}, \
+                 played the ring dry before it stopped the pair in all {rounds} rounds, so there \
+                 was no last sound to leave out; that the next sound takes NODE 1's mark and \
+                 primes afresh is still checked"
+            );
+        }
         let underruns = ring.underrun_frames.load(Ordering::Relaxed);
 
         // Another sound wakes the pair. Its first cycle takes the mark and plays silence while the
