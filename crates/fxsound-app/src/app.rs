@@ -20,6 +20,9 @@ use fxsound_core::{
     messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio},
     scale,
 };
+use fxsound_dsp::preset::{
+    MusicControls, MusicLevels, bands_of, ladder, music_controls, write_music_params,
+};
 use fxsound_preset::{InputPresetStore, PresetFile, PresetStore, Store, input::InputPreset};
 use fxsound_ui::{
     AssetCache, Palette, UiAction, UiState,
@@ -4165,76 +4168,6 @@ pub(crate) const fn detach(lane: DeviceDirection) -> UiAction {
     }
 }
 
-/// The engine's band ladder for `count` bands: the original's hard-coded table where it has
-/// one, else the geometric ladder `GraphicEq` builds.
-fn ladder(count: usize) -> Vec<f32> {
-    fxsound_dsp::eq::band_table(count).map_or_else(
-        || {
-            let mut eq = fxsound_dsp::GraphicEq::new();
-            eq.set_num_bands(count);
-            eq.center_frequencies().to_vec()
-        },
-        |(table, _, _)| table.to_vec(),
-    )
-}
-
-/// An equalizer as the window holds it, from a snapshot's two parallel arrays.
-fn bands_of(centres: &[f32], boosts: &[f32]) -> Vec<EqBand> {
-    centres
-        .iter()
-        .zip(boosts)
-        .map(|(&center_hz, &boost_db)| EqBand {
-            center_hz,
-            boost_db,
-        })
-        .collect()
-}
-
-/// What a music preset puts in the window: the five effects at their slider positions, and the
-/// equalizer's switch and bands.
-#[derive(Debug, Clone, PartialEq)]
-struct MusicControls {
-    effects: [f32; Effect::COUNT],
-    eq_on: bool,
-    eq_bands: Vec<EqBand>,
-}
-
-/// A music preset read into the window's controls on `ladder`, the live band ladder — the one
-/// reading of a `.fac` there is: the lane's own ([`App::apply_preset`]) and an application's
-/// route ([`per_app`]) both go through it, so a preset sounds the same on either.
-///
-/// The effects land where the slider shows them, which is where they sound: a Dynamic Boost past
-/// the slider's dead top is read as the top ([`scale::value_to_slider_for`]). The curve is the
-/// preset's own when it has as many bands as the ladder, fitted onto the ladder by frequency when
-/// it has another count ([`fxsound_dsp::eq::fit_preset_gains`], audit #13), and flat with the
-/// equalizer on when it has none, the original's "old preset".
-///
-/// A twenty-band curve on the Windows ladder — a Windows preset, or one saved before 0.4.0 — is
-/// read on the half-octave ladder that replaced it, band for band (0.4.0 audit R4,
-/// [`fxsound_core::eq::move_off_the_windows_twenty_band_ladder`]), so it plays without the
-/// paired ladder's ripple and is saved on the new one the next time it is saved.
-fn music_controls(preset: &Preset, ladder: &[f32]) -> MusicControls {
-    let effects =
-        Effect::ALL.map(|effect| scale::value_to_slider_for(effect, preset.effect(effect)));
-    let mut preset_bands = preset.eq_bands.clone();
-    fxsound_core::eq::move_off_the_windows_twenty_band_ladder(&mut preset_bands);
-    let (eq_on, eq_bands) = if preset_bands.is_empty() {
-        (true, bands_of(ladder, &vec![0.0; ladder.len()]))
-    } else if preset_bands.len() == ladder.len() {
-        (preset.eq_on, preset_bands)
-    } else {
-        let centres: Vec<f32> = preset_bands.iter().map(|b| b.center_hz).collect();
-        let gains: Vec<f32> = preset_bands.iter().map(|b| b.boost_db).collect();
-        let fitted = fxsound_dsp::eq::fit_preset_gains(&centres, &gains, ladder);
-        (preset.eq_on, bands_of(ladder, &fitted))
-    };
-    MusicControls {
-        effects,
-        eq_on,
-        eq_bands,
-    }
-}
-
 /// A voice preset's own parameters — the one reading of a voice preset there is: the lane's own
 /// ([`App::apply_input_preset`]) and a recording route's ([`per_app`]) both go through it.
 ///
@@ -4249,52 +4182,6 @@ fn voice_params(preset: &InputPreset) -> InputDspParams {
         params.set_bands(&bands);
     }
     params
-}
-
-/// The levels every music chain shares: settings over every `.fac`, as the original's.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct MusicLevels {
-    filter_q: f32,
-    master_gain_db: f32,
-    balance_db: f32,
-    volume_leveling: f32,
-}
-
-impl MusicLevels {
-    /// The levels the settings file holds, which are the speakers' whichever lane the window
-    /// edits.
-    const fn of(settings: &Settings) -> Self {
-        Self {
-            filter_q: settings.filter_q,
-            master_gain_db: settings.master_gain,
-            balance_db: settings.balance,
-            volume_leveling: settings.volume_leveling,
-        }
-    }
-}
-
-/// Map a music chain's controls onto its snapshot: the effects from their slider positions, the
-/// equalizer, and the shared levels. Everything else in `params` is left as it is — the power and
-/// the mute are the whole application's.
-fn write_music_params(
-    params: &mut DspParams,
-    effects: &[f32; Effect::COUNT],
-    eq_on: bool,
-    eq_bands: &[EqBand],
-    levels: MusicLevels,
-) {
-    for effect in Effect::ALL {
-        params.set_effect(
-            effect,
-            scale::slider_to_value_for(effect, effects[effect as usize]),
-        );
-    }
-    params.eq_on = eq_on;
-    params.set_bands(eq_bands);
-    params.filter_q = levels.filter_q;
-    params.master_gain_db = levels.master_gain_db;
-    params.balance = levels.balance_db;
-    params.volume_leveling_db = levels.volume_leveling;
 }
 
 /// Copy what the engine's lanes measured into what the window draws.
@@ -11700,6 +11587,51 @@ mod tests {
         assert_eq!(app.state.eq_bands.len(), 15);
         assert!(gains(&app).iter().all(|&g| g == 0.0), "{:?}", gains(&app));
         assert_eq!(centres(&app), ladder(15));
+    }
+
+    #[test]
+    fn the_music_lane_plays_every_shipped_preset_as_the_shared_reading_does() {
+        // `fxsound_dsp::preset::preset_params` is what the bit-exactness harness of «Like FxSound
+        // for Windows», `preset_drift` and `process_wav` render a `.fac` with. They measure what
+        // the application plays only while the lane plays exactly that, on each band count the
+        // harness renders at, with the speakers' levels wherever they are.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/presets");
+        let mut files: Vec<PathBuf> = ["Factsoft", "BonusPresets"]
+            .iter()
+            .flat_map(|dir| std::fs::read_dir(root.join(dir)).expect("shipped presets"))
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|file| file.extension().is_some_and(|e| e == "fac"))
+            .collect();
+        files.sort();
+        assert!(files.len() >= 30, "only {} shipped presets", files.len());
+        let levels = MusicLevels {
+            filter_q: 1.5,
+            master_gain_db: -3.0,
+            balance_db: 2.0,
+            volume_leveling: 1.0,
+        };
+        for count in [10, 20, 31] {
+            for file in &files {
+                let preset = fxsound_preset::load(file).expect("a shipped preset loads");
+                let (mut app, _engine, _dir) = started_on(count, &[preset_with("Alpha", &[])]);
+                app.handle(&[
+                    UiAction::SetFilterQ(levels.filter_q),
+                    UiAction::SetMasterGain(levels.master_gain_db),
+                    UiAction::SetBalance(levels.balance_db),
+                    UiAction::SetVolumeLeveling(levels.volume_leveling),
+                ]);
+                assert_eq!(MusicLevels::of(&app.settings), levels);
+                app.apply_preset(&preset);
+                let expected =
+                    fxsound_dsp::preset::preset_params(&preset, &ladder(count as usize), levels);
+                assert_eq!(
+                    app.played_params(),
+                    expected,
+                    "{} on {count} bands",
+                    file.display()
+                );
+            }
+        }
     }
 
     #[test]

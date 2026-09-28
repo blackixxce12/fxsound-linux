@@ -10,25 +10,29 @@
 //! JSON another build wrote, prints what moved and flags what moved too far.
 //!
 //! It is `#[ignore]`d because one run proves nothing; it takes two builds. To compare the engine
-//! at `<commit>` with the working tree:
+//! at `<commit>` with the working tree, check the commit out beside it with this file and its
+//! material (`scripts/reference-checkout.sh`), somewhere other than `/tmp` — two release builds
+//! do not fit a tmpfs:
 //!
 //! ```text
-//! git worktree add --detach /tmp/before <commit>
-//! cp crates/fxsound-dsp/tests/preset_drift.rs /tmp/before/crates/fxsound-dsp/tests/
-//! cp -r crates/fxsound-dsp/tests/genre_material crates/fxsound-dsp/tests/voice_material \
-//!     /tmp/before/crates/fxsound-dsp/tests/
-//! (cd /tmp/before && PRESET_DRIFT_OUT=/tmp/before.json \
+//! scripts/reference-checkout.sh <commit> ../before
+//! (cd ../before && PRESET_DRIFT_OUT=$PWD/before.json \
 //!     cargo test --release -p fxsound-dsp --test preset_drift -- --ignored --nocapture)
-//! PRESET_DRIFT_OUT=/tmp/after.json PRESET_DRIFT_BEFORE=/tmp/before.json \
+//! PRESET_DRIFT_OUT=target/after.json PRESET_DRIFT_BEFORE=../before/before.json \
 //!     cargo test --release -p fxsound-dsp --test preset_drift -- --ignored --nocapture
-//! git worktree remove --force /tmp/before   # --force: the copied files are untracked there
+//! git worktree remove --force ../before   # --force: the copied files are untracked there
 //! ```
 //!
-//! The older build needs nothing of this file but `Engine`, `InputChain` and the `analysis`
-//! module, which is why it can be copied into a checkout that predates it. The presets are read
-//! from that checkout's own `assets/`, so a commit that also changed a preset measures its own
-//! version of it. `PRESET_DRIFT_AFTER=<json>` in place of a render compares two files already on
-//! disk; without `PRESET_DRIFT_OUT` the measurement goes to `target/preset-drift.json`.
+//! **A preset is rendered as the application plays it** — its effects through the sliders, its
+//! curve on ten bands, the settings' default levels ([`fxsound_dsp::preset::preset_params`]) —
+//! not from the raw values of the file, so a drift found here is one the application plays. A
+//! commit older than 0.5.0 has no `fxsound_dsp::preset`; the script writes one there from that
+//! commit's own application. Beyond it the older build needs nothing of this file but `Engine`,
+//! `InputChain` and the `analysis` module, which is why it can be copied into a checkout that
+//! predates it. The presets are read from that checkout's own `assets/`, so a commit that also
+//! changed a preset measures its own version of it. `PRESET_DRIFT_AFTER=<json>` in place of a
+//! render compares two files already on disk; without `PRESET_DRIFT_OUT` the measurement goes to
+//! `target/preset-drift.json`.
 //!
 //! # The material
 //!
@@ -100,7 +104,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use fxsound_core::{Effect, Preset, messages::DspParams};
+use fxsound_core::{Preset, messages::DspParams};
 use fxsound_dsp::Engine;
 use fxsound_dsp::analysis::{
     NUM_THIRD_OCTAVES, ProgramMeter, SILENT_BAND_DB, THIRD_OCTAVE_CENTRES, TruePeakMeter,
@@ -112,36 +116,20 @@ use realfft::RealFftPlanner;
 #[allow(dead_code)]
 mod genre_material;
 #[allow(dead_code)]
+mod output_material;
+#[allow(dead_code)]
 mod voice_material;
 
 use genre_material::{
-    BASELINE_FILE, BLOCK, CHANNELS, COLUMNS, COMPARE_HI_HZ, COMPARE_LO_HZ, Dynamics, FRAMES,
-    GENRE_PRESETS, RATE, dynamics_for, load_reference, material, measure, preset_params, render,
-    seed_for,
+    BASELINE_FILE, BLOCK, CHANNELS, COLUMNS, COMPARE_HI_HZ, COMPARE_LO_HZ, GENRE_PRESETS, RATE,
+    dynamics_for, load_reference, material, measure, preset_params, render, seed_for,
+};
+use output_material::{
+    Kind, LOUD_RMS_DBFS, Material, TONE_DBFS, UNBALANCED_DB, VOICING_REFERENCE, db_to_gain,
+    output_materials, rms, tone,
 };
 use voice_material::{CAPTURE_RATE, chain_for, room_floor, sibilance, speech_like};
 
-/// How many times each piece of music is played back to back; only the last pass is measured.
-const PASSES: usize = 3;
-/// The loud material's RMS, and the ceiling it is mastered against.
-const LOUD_RMS_DBFS: f64 = -9.0;
-const LOUD_CEILING: f32 = 0.977;
-/// A modern master's movement: dense, shallow.
-const LOUD_DYNAMICS: Dynamics = Dynamics {
-    bursts_per_second: 4.0,
-    floor_db: -6.0,
-};
-const TONE_DBFS: f32 = -1.0;
-const TONES_HZ: [f32; 2] = [40.0, 80.0];
-const UNBALANCED_DB: f32 = 10.0;
-/// Volume Leveling at its maximum, `VolumeLeveller`'s own `MAX_AMOUNT`.
-const LEVELING_AMOUNT: f32 = 4.0;
-/// The leveller's audit case (#1): a bass tone well under full scale, which it lifts.
-const LEVELED_TONE_HZ: f32 = 50.0;
-const LEVELED_TONE_AMPLITUDE: f32 = 0.3;
-/// How far under the genre material the voicing reference sits, and its name.
-const QUIET_DB: f32 = -40.0;
-const VOICING_REFERENCE: &str = "quiet/Pop";
 /// A band whose input sits this far under the input's loudest band carries no programme, so what
 /// comes out there is made by the chain: distortion, not tone.
 const EMPTY_BAND_DB: f64 = 40.0;
@@ -197,195 +185,6 @@ fn repo_root() -> PathBuf {
 // Material
 // ---------------------------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
-    Music,
-    Tone,
-    Unbalanced,
-    Silence,
-}
-
-impl Kind {
-    const fn key(self) -> &'static str {
-        match self {
-            Self::Music => "music",
-            Self::Tone => "tone",
-            Self::Unbalanced => "unbalanced",
-            Self::Silence => "silence",
-        }
-    }
-
-    fn from_key(key: &str) -> Self {
-        match key {
-            "tone" => Self::Tone,
-            "unbalanced" => Self::Unbalanced,
-            "silence" => Self::Silence,
-            _ => Self::Music,
-        }
-    }
-}
-
-struct Material {
-    name: String,
-    kind: Kind,
-    /// The fundamental, for a tone.
-    tone_hz: f32,
-    leveling: f32,
-    channels: usize,
-    /// Interleaved, the whole render.
-    samples: Vec<f32>,
-    /// The frame the measurement starts at.
-    measure_from: usize,
-}
-
-fn db_to_gain(db: f32) -> f32 {
-    10f32.powf(db / 20.0)
-}
-
-fn rms(samples: &[f32]) -> f64 {
-    let sum: f64 = samples.iter().map(|s| f64::from(*s).powi(2)).sum();
-    (sum / samples.len().max(1) as f64).sqrt()
-}
-
-/// One pass of music, played [`PASSES`] times, measured on the last.
-fn music(name: &str, kind: Kind, pass: &[f32], leveling: f32) -> Material {
-    Material {
-        name: name.to_owned(),
-        kind,
-        tone_hz: 0.0,
-        leveling,
-        channels: CHANNELS,
-        samples: pass.repeat(PASSES),
-        measure_from: (PASSES - 1) * pass.len() / CHANNELS,
-    }
-}
-
-/// A sine on both channels, faded in over 10 ms, `passes` material lengths long, measured on the
-/// last of them.
-fn tone(name: &str, hz: f32, amplitude: f32, passes: usize, leveling: f32) -> Material {
-    let frames = FRAMES * passes;
-    let fade = (0.01 * RATE) as usize;
-    let mut samples = Vec::with_capacity(frames * CHANNELS);
-    for n in 0..frames {
-        let phase = std::f64::consts::TAU * f64::from(hz) * n as f64 / f64::from(RATE);
-        let ramp = if n < fade {
-            0.5 - 0.5 * (std::f64::consts::PI * n as f64 / fade as f64).cos()
-        } else {
-            1.0
-        };
-        let value = (phase.sin() * ramp * f64::from(amplitude)) as f32;
-        samples.extend(std::iter::repeat_n(value, CHANNELS));
-    }
-    Material {
-        name: name.to_owned(),
-        kind: Kind::Tone,
-        tone_hz: hz,
-        leveling,
-        channels: CHANNELS,
-        samples,
-        measure_from: frames - FRAMES,
-    }
-}
-
-/// Raise `pass` into a hard ceiling until its RMS is [`LOUD_RMS_DBFS`]: the crudest mastering
-/// there is, and deliberately built from nothing in the engine, so that it is the same material
-/// whichever engine is being measured.
-fn mastered(pass: &[f32]) -> Vec<f32> {
-    let target = 10f64.powf(LOUD_RMS_DBFS / 20.0);
-    let clip = |gain: f32| -> Vec<f32> {
-        pass.iter()
-            .map(|s| (s * gain).clamp(-LOUD_CEILING, LOUD_CEILING))
-            .collect()
-    };
-    let (mut lo, mut hi) = (0.01f32, 100.0f32);
-    for _ in 0..60 {
-        let mid = (lo * hi).sqrt();
-        if rms(&clip(mid)) < target {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    clip((lo * hi).sqrt())
-}
-
-fn output_materials() -> Vec<Material> {
-    let baseline = load_reference(BASELINE_FILE);
-    let mut out = Vec::new();
-    for genre in GENRE_PRESETS {
-        let pass = material(&baseline.level_db, seed_for(genre), dynamics_for(genre));
-        out.push(music(&format!("genre/{genre}"), Kind::Music, &pass, 0.0));
-    }
-
-    let pink = [0.0f32; NUM_THIRD_OCTAVES];
-    let loud = mastered(&material(&pink, seed_for("loud"), LOUD_DYNAMICS));
-    out.push(music("loud", Kind::Music, &loud, 0.0));
-    // The same master with one channel copied to the other. Real mixes sit between the two: the
-    // genre and loud material's channels are independent noise, which is the worst case for a
-    // limiter that turns both sides down together, and a mono mix is the best.
-    let mono: Vec<f32> = loud
-        .as_chunks::<CHANNELS>()
-        .0
-        .iter()
-        .flat_map(|frame| [frame[1]; CHANNELS])
-        .collect();
-    out.push(music("loud/mono", Kind::Music, &mono, 0.0));
-
-    for hz in TONES_HZ {
-        out.push(tone(
-            &format!("tone/{hz}Hz"),
-            hz,
-            db_to_gain(TONE_DBFS),
-            PASSES,
-            0.0,
-        ));
-    }
-
-    let mut unbalanced = mastered(&material(&pink, seed_for("unbalanced"), LOUD_DYNAMICS));
-    let quiet = db_to_gain(-UNBALANCED_DB);
-    for frame in unbalanced.as_chunks_mut::<CHANNELS>().0 {
-        frame[0] *= quiet;
-    }
-    out.push(music("unbalanced", Kind::Unbalanced, &unbalanced, 0.0));
-
-    out.push(Material {
-        name: "silence".to_owned(),
-        kind: Kind::Silence,
-        tone_hz: 0.0,
-        leveling: 0.0,
-        channels: CHANNELS,
-        samples: vec![0.0; FRAMES * CHANNELS],
-        measure_from: 0,
-    });
-
-    let classical = material(
-        &baseline.level_db,
-        seed_for("Classical"),
-        dynamics_for("Classical"),
-    );
-    out.push(music(
-        "leveling/Classical",
-        Kind::Music,
-        &classical,
-        LEVELING_AMOUNT,
-    ));
-    // The Pop material 40 dB down, where nothing in the chain is working hard: the preset's own
-    // voicing, which the comparison measures every other render's change of shape against.
-    let quiet: Vec<f32> = material(&baseline.level_db, seed_for("Pop"), dynamics_for("Pop"))
-        .iter()
-        .map(|s| s * db_to_gain(QUIET_DB))
-        .collect();
-    out.push(music(VOICING_REFERENCE, Kind::Music, &quiet, 0.0));
-    out.push(tone(
-        "leveling/tone50Hz",
-        LEVELED_TONE_HZ,
-        LEVELED_TONE_AMPLITUDE,
-        PASSES + 1,
-        LEVELING_AMOUNT,
-    ));
-    out
-}
-
 fn voice_materials() -> Vec<Material> {
     let signals = [
         ("speech/-6dBFS", speech_like(db_to_gain(-6.0), VOICE_FRAMES)),
@@ -420,16 +219,16 @@ fn voice_materials() -> Vec<Material> {
 // Presets and rendering
 // ---------------------------------------------------------------------------------------------
 
-/// What `process_wav --preset` and `genre_voicing.rs` make of a `.fac`: the five effects, the
-/// bands and the equalizer switch, everything else at its default.
+/// A `.fac` as the application plays it on ten bands with the settings' default levels:
+/// [`fxsound_dsp::preset::preset_params`], the one reading `process_wav --preset`,
+/// `genre_voicing.rs` and the application share, so a drift measured here is a drift the
+/// application plays. Volume Leveling is the material's ([`through_engine`]).
 fn params_of(preset: &Preset) -> DspParams {
-    let mut params = DspParams::default();
-    for effect in Effect::ALL {
-        params.set_effect(effect, preset.effect(effect));
-    }
-    params.set_bands(&preset.eq_bands);
-    params.eq_on = preset.eq_on;
-    params
+    fxsound_dsp::preset::preset_params(
+        preset,
+        &fxsound_dsp::preset::ladder(fxsound_core::eq::DEFAULT_BANDS),
+        fxsound_dsp::preset::MusicLevels::default(),
+    )
 }
 
 /// Every shipped `.fac`, keyed by directory and file stem.

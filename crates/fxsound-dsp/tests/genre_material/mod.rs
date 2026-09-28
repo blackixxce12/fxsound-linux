@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use fxsound_core::{Effect, messages::DspParams};
+use fxsound_core::messages::DspParams;
 use fxsound_dsp::Engine;
 use fxsound_dsp::analysis::{Measurement, NUM_THIRD_OCTAVES, ProgramMeter, THIRD_OCTAVE_CENTRES};
 use realfft::RealFftPlanner;
@@ -326,20 +326,19 @@ pub fn material(shape: &[f32; NUM_THIRD_OCTAVES], seed: u32, dynamics: Dynamics)
 // Rendering and measuring
 // ---------------------------------------------------------------------------------------------
 
+/// The genre preset `name` as the application plays it on ten bands with the settings' default
+/// levels ([`fxsound_dsp::preset::preset_params`]).
 pub fn preset_params(name: &str) -> DspParams {
     let path = repo_root()
         .join("assets/presets/BonusPresets")
         .join(format!("{name}.fac"));
     let preset =
         fxsound_preset::load(&path).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
-
-    let mut params = DspParams::default();
-    for effect in Effect::ALL {
-        params.set_effect(effect, preset.effect(effect));
-    }
-    params.set_bands(&preset.eq_bands);
-    params.eq_on = preset.eq_on;
-    params
+    fxsound_dsp::preset::preset_params(
+        &preset,
+        &fxsound_dsp::preset::ladder(fxsound_core::eq::DEFAULT_BANDS),
+        fxsound_dsp::preset::MusicLevels::default(),
+    )
 }
 
 pub struct Render {

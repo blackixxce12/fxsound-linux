@@ -183,7 +183,7 @@
 use super::policy::PolicyGraph;
 use super::*;
 use fxsound_core::messages::{AppRoute, DspEvent, DspParams, InputDspParams, RouteParams};
-use fxsound_core::{AppKey, AudioStatus, Effect, EqBand, Preset, eq, scale};
+use fxsound_core::{AppKey, AudioStatus, Preset, eq};
 use fxsound_preset::input::InputPreset;
 use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _};
@@ -1098,33 +1098,13 @@ Band 2\n   115.734: CF\n   9: Boost/Cut\nBand 3\n   250: CF\n   2: Boost/Cut\nBa
    -1: Boost/Cut\nBand 9\n   8640.48: CF\n   0: Boost/Cut\nBand 10\n   13800: CF\n   2: Boost/Cut\n";
 
 /// The snapshot the app publishes for a music preset on the default ladder with the default
-/// levels: `music_controls` and `write_music_params` of `fxsound-app`.
+/// levels: `fxsound_dsp::preset::preset_params`, the one path from a preset to its snapshot.
 fn music_params(preset: &Preset) -> DspParams {
-    let mut params = DspParams::default();
-    for effect in Effect::ALL {
-        let slider = scale::value_to_slider_for(effect, preset.effect(effect));
-        params.set_effect(effect, scale::slider_to_value_for(effect, slider));
-    }
-    let ladder = eq::DEFAULT_CENTERS_HZ;
-    let mut bands = preset.eq_bands.clone();
-    eq::move_off_the_windows_twenty_band_ladder(&mut bands);
-    let centres: Vec<f32> = bands.iter().map(|band| band.center_hz).collect();
-    let gains: Vec<f32> = bands.iter().map(|band| band.boost_db).collect();
-    let fitted = if bands.len() == ladder.len() {
-        bands
-    } else {
-        fxsound_dsp::eq::fit_preset_gains(&centres, &gains, &ladder)
-            .into_iter()
-            .zip(ladder)
-            .map(|(boost_db, center_hz)| EqBand {
-                center_hz,
-                boost_db,
-            })
-            .collect()
-    };
-    params.eq_on = preset.eq_on || preset.eq_bands.is_empty();
-    params.set_bands(&fitted);
-    params
+    fxsound_dsp::preset::preset_params(
+        preset,
+        &fxsound_dsp::preset::ladder(eq::DEFAULT_BANDS),
+        fxsound_dsp::preset::MusicLevels::default(),
+    )
 }
 
 /// A shipped preset's file.

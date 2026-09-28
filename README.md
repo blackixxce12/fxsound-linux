@@ -820,6 +820,11 @@ properties and signals, and the files FxSound reads and writes.
 for Windows»: its levels (three in 0.5.0; Everything, which hides the port's own features, comes
 later), which of the port's changes and features each one reverts or hides and which none ever
 does, and the setting, option, D-Bus members and status keys that carry it.
+[`docs/0.5.0-dsp-inventory.md`](docs/0.5.0-dsp-inventory.md) lists every change to the output
+lane's sound since the engine before the 0.4.0 audit, with the level each one belongs to, and
+`scripts/windows-parity-bitexact.sh <commit>` holds the output lane to another build of itself bit
+for bit — every shipped preset as the application plays it, on 10, 20 and 31 bands; CI holds it to
+`v0.4.0`.
 
 `docs/0.4.0-design.md`, `docs/0.4.0-upstream.md` and `docs/0.4.0-apps.md` record how 0.4.0 was
 built: the two lanes, the voice chain's new stages, D-Bus and the event stream; what was taken from

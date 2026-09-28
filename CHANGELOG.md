@@ -56,6 +56,12 @@ All notable changes to the FxSound Linux port. The format follows
   FxSound, and −19 to −28 dBFS for the desktop's choice with FxSound off. The moves FxSound makes
   itself are held to −40 dBFS once 0.5.0 makes them quiet. CI shows the measurements in the job's
   summary.
+- **The sound is checked bit for bit against 0.4.0.** CI renders every shipped preset at 10, 20
+  and 31 bands through this version and through v0.4.0, from a cold start and while a preset, the
+  band count and a slider are switched, and requires the same output: identical, or nowhere more
+  than −120 dBFS apart. The offline renderer (`process_wav`) and the blind A/B of
+  `scripts/voicing` now play a preset the way the application does, through the application's
+  own reading of a preset.
 
 ## [0.4.0] — 2026-09-27
 

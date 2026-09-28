@@ -22,10 +22,10 @@
 //!
 //! The app resolves a rule to parameters because it owns the preset stores; the engine only runs
 //! them. A route is built the way its lane's own snapshot is — the same reading of the preset into
-//! controls ([`super::music_controls`]), the same mapping onto the chain
-//! ([`super::write_music_params`], [`super::apply_microphone_settings`]), and the same things the
-//! lane shares with every chain of its kind — so a preset sounds the same on a route as on the
-//! lane:
+//! controls ([`fxsound_dsp::preset::music_controls`]), the same mapping onto the chain
+//! ([`fxsound_dsp::preset::write_music_params`], [`super::apply_microphone_settings`]), and the
+//! same things the lane shares with every chain of its kind — so a preset sounds the same on a
+//! route as on the lane:
 //!
 //! - a playback route runs the `.fac`'s five effects and equalizer on the user's band count, with
 //!   the speakers' filter width, master gain, balance and volume leveller;
@@ -63,10 +63,9 @@ use fxsound_preset::input::InputPreset;
 use fxsound_ui::dialogs::settings::{AppLane, AppRow};
 use fxsound_ui::state::RoutedApp;
 
-use super::{
-    App, MusicControls, MusicLevels, PresetVoicing, apply_microphone_settings, ladder, lane_index,
-    music_controls, voice_params, write_music_params,
-};
+use fxsound_dsp::preset::{MusicLevels, ladder, preset_params};
+
+use super::{App, PresetVoicing, apply_microphone_settings, lane_index, voice_params};
 use crate::events::AppEvent;
 use fxsound_core::i18n::tr_args;
 
@@ -1076,7 +1075,8 @@ impl App {
     }
 
     /// A music preset as a playback route runs it: read into controls on the ladder of the user's
-    /// band count, with the speakers' levels, as the output lane's own snapshot is built.
+    /// band count, with the speakers' levels, as the output lane's own snapshot is built — the
+    /// shared [`preset_params`], which the bit-exactness harness and the offline renderers use too.
     ///
     /// The ladder is the engine's own for the band count. The lane fits a preset of another count
     /// onto the centres its window holds at that moment, which are the same ones unless the
@@ -1084,19 +1084,7 @@ impl App {
     /// to show.
     fn music_route_params(&self, preset: &Preset) -> DspParams {
         let count = (self.settings.num_bands as usize).clamp(1, fxsound_core::eq::MAX_BANDS);
-        let MusicControls {
-            effects,
-            eq_on,
-            eq_bands,
-        } = music_controls(preset, &ladder(count));
-        let mut params = DspParams::default();
-        write_music_params(
-            &mut params,
-            &effects,
-            eq_on,
-            &eq_bands,
-            MusicLevels::of(&self.settings),
-        );
+        let mut params = preset_params(preset, &ladder(count), MusicLevels::of(&self.settings));
         // On, since routes are sent only while it is ([`App::refresh_app_routes`]); said all the
         // same, so a route never runs a power the lane does not.
         params.power = self.state.power;
