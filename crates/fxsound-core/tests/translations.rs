@@ -957,6 +957,63 @@ fn the_level_labels_do_not_borrow_the_theme_switchs_word() {
     assert_eq!(DenoiseLevel::from_key("light"), Some(DenoiseLevel::Light));
 }
 
+/// Strings the interface shows side by side, or that name two different things, and so must not
+/// read alike in any language. Each group is checked pair by pair.
+const TOLD_APART: &[(&str, &[&str])] = &[
+    // Settings ▸ General's hotkey list, one line per command.
+    (
+        "the hotkey list",
+        &[
+            "Turn FxSound On/Off",
+            "Open/Close FxSound",
+            "Use Next Preset",
+            "Use Previous Preset",
+            "Change Playback Device",
+        ],
+    ),
+    // The tray menu (`tray.rs`), top level.
+    (
+        "the tray menu",
+        &[
+            "Open",
+            "Turn Off",
+            "Turn On",
+            "Output Presets",
+            "Input Presets",
+            "Playback Device Select",
+            "Recording Device Select",
+            "Settings",
+            "Theme",
+            "Exit",
+        ],
+    ),
+];
+
+#[test]
+fn no_table_gives_two_strings_shown_side_by_side_the_same_words() {
+    // Simplified and Traditional Chinese wrote 开启/关闭 FxSound for both the power and the window
+    // in the hotkey list; the port's layer repairs both, and this keeps any table from doing it
+    // again.
+    let tables = tables();
+    let mut alike = Vec::new();
+    for (what, keys) in TOLD_APART {
+        for table in &tables {
+            for (i, a) in keys.iter().enumerate() {
+                for b in &keys[i + 1..] {
+                    let (ta, tb) = (table.get(a).unwrap_or(a), table.get(b).unwrap_or(b));
+                    if ta.trim() == tb.trim() {
+                        alike.push(format!(
+                            "{}: {what}: {a:?} and {b:?} both read {ta:?}",
+                            table.code()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(alike.is_empty(), "{}", alike.join("\n"));
+}
+
 #[test]
 fn a_placeholder_dropped_by_a_translation_is_reported() {
     // The check `untranslated` makes, on a table built by hand, so that a real table passing it

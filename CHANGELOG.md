@@ -33,6 +33,12 @@ All notable changes to the FxSound Linux port. The format follows
 ### Changed
 - **`--status --json` is schema 3.** Every key of schema 2 is kept; `windows_parity`,
   `apps_hidden` and `input.hidden` are new. `--status` prints a `windows_parity:` line.
+- **The JSON's compatibility rule is written down** (`man fxsound`, STATUS DOCUMENT). `schema` and
+  the events' `v` are compatibility numbers: a new key never changes them; a key removed, renamed
+  or given another meaning or type raises them. `schema` stays 3 while keys are only added.
+- **A deleted preset on another drive goes to that drive's trash**, `.Trash-UID` at its top (or
+  the shared `.Trash`), where file managers list it, instead of staying beside itself as
+  `NAME.fac.1.bak`, which is kept for a drive FxSound cannot write a trash to.
 
 ### Fixed
 - **A tray that was already running is found.** FxSound took a system tray that was there before
@@ -47,6 +53,22 @@ All notable changes to the FxSound Linux port. The format follows
   list until it is dismissed or FxSound quits.
 - **The notifications have their icon.** The packages install the application icon under the
   name the notifications ask for, `com.fxsound.FxSound`, as well as `fxsound`.
+- **`NextOutput` and `NextInput` over D-Bus step when they start FxSound.** A call that started
+  FxSound through the bus reached it before PipeWire had listed the devices, went nowhere and still
+  succeeded; it now waits for the list, up to three seconds, as `ForgetDevice` does, and so does a
+  `--next-output` or `--next-input` sent to an FxSound that has only just started.
+- **A band count the window does not offer sounds as it is drawn.** Twelve bands, say, from a
+  microphone preset made by hand or a `num_bands` edited in `settings.toml`, were played with the
+  band width of whichever count came before them, and drawn with another; they now play and are
+  drawn with the ten-band equalizer's edges, whatever came before. (A `.fac` of such a count is
+  still fitted onto the window's count, as before.)
+- **A band dragged while the same preset is read back stops following the pointer.** An undo
+  from the command line, the tray or D-Bus with the button down on a band let the drag go on over
+  the curve read back, writing the pointer's gain into it.
+- **Translations.** Arabic's Bass Boost is no longer left in English; Simplified and Traditional
+  Chinese no longer name the window's hotkey as the power's (打开/关闭 FxSound 窗口,
+  開啟/關閉 FxSound 視窗); Italian's tray says Esci to quit, where it said Uscita, its word for the
+  output, and Seleziona dispositivo di riproduzione, with the verb first.
 
 ### Changed
 - **Tested on the newest PipeWire as well as the oldest.** Besides Ubuntu 24.04 and its

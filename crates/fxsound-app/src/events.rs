@@ -39,8 +39,9 @@ use crate::App;
 use crate::commands::{InputMeters, rounded};
 use crate::tray::TrayState;
 
-/// The envelope's `v`. Bump when an event changes shape incompatibly; adding an event or a field
-/// is not that.
+/// The envelope's `v`, a compatibility number under the rule of
+/// [`crate::commands::STATUS_SCHEMA`]: adding an event or a field never changes it; removing or
+/// renaming one, or changing its meaning or its JSON type, raises it.
 pub const EVENT_VERSION: u32 = 1;
 
 /// One thing that happened in the running instance.

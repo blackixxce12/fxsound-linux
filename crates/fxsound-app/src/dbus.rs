@@ -44,8 +44,9 @@
 //! D-Bus additions, the prerequisites of an MCP server). `SetAppPreset` and `ListApps` are
 //! `--app-preset` / `--app-input-preset` and `--list-apps --json` (per-application presets,
 //! `docs/0.4.0-apps.md`), and `AppRouted` is the `app_routed` event. `ForgetDevice` is
-//! `--forget-device` (0.4.0 audit #34); an instance the call has just started holds it until
-//! PipeWire has listed the devices (`commands::waits_for_the_device_list`). The bus starts FxSound for
+//! `--forget-device` (0.4.0 audit #34); an instance the call has just started holds it, and
+//! `NextOutput` and `NextInput`, until PipeWire has listed the devices
+//! (`commands::waits_for_the_device_list`). The bus starts FxSound for
 //! a call when it is not running — any call, a property read included, unless the caller sets
 //! `NO_AUTO_START` (`busctl --auto-start=no call`; `get-property` ignores the flag), which the
 //! manual tells pollers to:

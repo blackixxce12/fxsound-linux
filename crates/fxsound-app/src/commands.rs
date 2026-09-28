@@ -909,32 +909,46 @@ pub fn forget_in_the_settings_file(commands: &[Command], path: &Path) -> Outcome
     }
 }
 
-/// How long a running FxSound holds a forwarded line with a `--forget-device` in it for
-/// PipeWire's first device list ([`waits_for_the_device_list`]): long enough for a PipeWire that
-/// answers at all, and a second short of [`crate::ipc::HANDLER_TIMEOUT`], so the caller still
-/// hears the refusal rather than its own timeout when none comes.
+/// How long a running FxSound holds a forwarded line with a `--forget-device`, a `--next-output`
+/// or a `--next-input` in it for PipeWire's first device list ([`waits_for_the_device_list`]):
+/// long enough for a PipeWire that answers at all, and a second short of
+/// [`crate::ipc::HANDLER_TIMEOUT`], so the caller still hears back rather than its own timeout
+/// when none comes.
 pub const DEVICE_LIST_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Whether `commands` should wait for the device list before `app` runs them: a
-/// `--forget-device` (or D-Bus `ForgetDevice`) that reaches an instance so young that PipeWire has
-/// not listed the devices yet — a call that started FxSound through the bus
-/// (`--activated`), or a script that runs `fxsound --forget-device` right after `fxsound &`.
-/// [`App::forget_device`] can only refuse it then; held until the list is in, for at most
-/// [`DEVICE_LIST_WAIT`], it does what it says. Without an engine no list will come, and the line
-/// runs, and is refused, at once.
+/// `--forget-device`, `--next-output` or `--next-input` (or D-Bus `ForgetDevice`, `NextOutput`,
+/// `NextInput`) that reaches an instance so young that PipeWire has not listed the devices yet — a
+/// call that started FxSound through the bus (`--activated`), or a script that runs
+/// `fxsound --next-output` right after `fxsound &`. [`App::forget_device`] can only refuse then,
+/// and a step has no list to step through, so it went nowhere and still succeeded (0.4.0); held
+/// until the list is in, for at most [`DEVICE_LIST_WAIT`], each does what it says. Without an
+/// engine no list will come, and the line runs at once.
 #[must_use]
 pub fn waits_for_the_device_list(app: &App, commands: &[Command]) -> bool {
     !app.has_seen_devices()
         && app.has_audio()
-        && commands
-            .iter()
-            .any(|command| matches!(command, Command::ForgetDevice(_)))
+        && commands.iter().any(|command| {
+            matches!(
+                command,
+                Command::ForgetDevice(_)
+                    | Command::Output(DeviceCommand::Next)
+                    | Command::Input(DeviceCommand::Next)
+            )
+        })
 }
 
-/// The shape of [`StatusDocument`], as its `schema` key says it. 0.3.0's document had no number
-/// and is schema 1; 2 is 0.4.0's, every key of 1 kept and upstream's `printStatus` keys added; 3
-/// is 0.5.0's, every key of 2 kept and «Как в Windows» added (`windows_parity`, `apps_hidden`,
-/// `input.hidden`).
+/// The compatibility number of [`StatusDocument`], its `schema` key, which the listings
+/// (`--list-apps --json`, D-Bus `ListPresets`, `ListDevices`, `ListApps`) carry too.
+///
+/// The rule, as the man page's STATUS DOCUMENT writes it for clients: adding a key never changes
+/// the number; removing or renaming a key, or changing its meaning or its JSON type, raises it by
+/// one — and a meaning that has to change gets a new key beside the old one instead, as
+/// `edit_direction` beside `direction`. 0.3.0's document had no number and is schema 1; 2 is
+/// 0.4.0's, every key of 1 kept and upstream's `printStatus` keys added; 3 is 0.5.0's, every key
+/// of 2 kept and «Как в Windows» added (`windows_parity`, `apps_hidden`, `input.hidden`). Those
+/// two raises came with additions, before the rule was written down; from 3 on, keys are added
+/// under 3.
 pub const STATUS_SCHEMA: u32 = 3;
 
 /// Everything `--status` reports, in the shape `--status --json` prints it.
@@ -1816,6 +1830,53 @@ mod tests {
     }
 
     #[test]
+    fn a_next_output_or_next_input_waits_for_the_first_device_list_and_then_steps() {
+        // 0.4.0: a D-Bus `NextOutput` that started FxSound through the bus reached an instance
+        // with no list to step through, went nowhere, and still succeeded.
+        let next_output = [Command::Output(OutputCommand::Next)];
+        let next_input = [Command::Input(InputCommand::Next)];
+        assert!(
+            !waits_for_the_device_list(&app(), &next_output),
+            "no engine, no list to wait for"
+        );
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let engine = crate::audio_link::FakeEngine::new();
+        let mut a = App::start_for_tests(
+            fxsound_core::Settings::default(),
+            fxsound_preset::PresetStore::with_dirs(Vec::new(), dir.path().join("presets")),
+            fxsound_preset::InputPresetStore::with_dirs(Vec::new(), dir.path().join("input")),
+            &engine,
+        );
+        assert!(waits_for_the_device_list(&a, &next_output));
+        assert!(waits_for_the_device_list(&a, &next_input));
+        assert!(
+            !waits_for_the_device_list(&a, &[Command::Output(OutputCommand::Detach)]),
+            "a line that names no step does not wait"
+        );
+
+        engine.feed(fxsound_core::messages::AudioToUi::Devices(mixed_devices()));
+        a.poll_audio();
+        assert!(
+            !waits_for_the_device_list(&a, &next_output),
+            "the list is in"
+        );
+        for (line, lane) in [
+            (&next_output, fxsound_core::DeviceDirection::Output),
+            (&next_input, fxsound_core::DeviceDirection::Input),
+        ] {
+            let before = a.state.selection(lane);
+            let outcome = run(&mut a, line);
+            assert!(!outcome.failed, "{:?}", outcome.stderr);
+            let after = a.state.selection(lane);
+            assert!(
+                after.is_some() && after != before,
+                "{lane:?}: {before:?} → {after:?}"
+            );
+            assert_eq!(a.state.devices[after.unwrap()].direction, lane);
+        }
+    }
+
+    #[test]
     fn forget_device_fails_the_line_with_the_reason_when_it_forgets_nothing() {
         // Before the first device list nothing is known to be unplugged (0.4.0 audit #34).
         let mut a = app();
@@ -1902,6 +1963,165 @@ mod tests {
         let json = status(&mut a);
         assert!(json.is_object(), "{json}");
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Every key of schema 3 as 0.5.0 prints it, nested ones by their path (`[]` for an element
+    /// of an array), for a window with presets and devices. The applications' own keys are
+    /// checked where the applications are (`dbus.rs` and this file's `apps` tests).
+    const SCHEMA_THREE_KEYS: &[&str] = &[
+        "apps",
+        "apps_hidden",
+        "audio",
+        "balance_db",
+        "device",
+        "direction",
+        "echo_cancel",
+        "echo_cancel.on",
+        "echo_cancel.running",
+        "edit_direction",
+        "effects",
+        "effects.ambience",
+        "effects.bass",
+        "effects.clarity",
+        "effects.dynamic_boost",
+        "effects.dynamicboost",
+        "effects.fidelity",
+        "effects.surround",
+        "eq",
+        "eq.bands",
+        "eq.enabled",
+        "eq.max_bands",
+        "equalizer",
+        "equalizer.balance",
+        "equalizer.bands",
+        "equalizer.bands[].frequency",
+        "equalizer.bands[].gain",
+        "equalizer.bands[].index",
+        "equalizer.bands[].max_frequency",
+        "equalizer.bands[].min_frequency",
+        "equalizer.filter_q",
+        "equalizer.master_gain",
+        "equalizer.num_bands",
+        "equalizer.volume_leveling",
+        "filter_q",
+        "format",
+        "format.channels",
+        "format.sample_rate",
+        "input",
+        "input.active",
+        "input.denoise_level",
+        "input.device",
+        "input.enabled",
+        "input.hidden",
+        "input.modified",
+        "input.node_name",
+        "input.noise_suppression",
+        "input.preset",
+        "input_device_list",
+        "input_device_list[].description",
+        "input_device_list[].node_name",
+        "input_device_list[].present",
+        "input_devices",
+        "input_meters",
+        "input_meters.compressor_reduction_db",
+        "input_meters.deesser_reduction_db",
+        "input_meters.deesser_running",
+        "input_meters.denoise_reduction_db",
+        "input_meters.denoise_running",
+        "input_meters.gate_reduction_db",
+        "input_meters.noise_floor_db",
+        "input_meters.voice_probability",
+        "input_presets",
+        "input_presets.built_in",
+        "input_presets.built_in[].modified",
+        "input_presets.built_in[].name",
+        "input_presets.user_defined",
+        "master_gain_db",
+        "output",
+        "output.active",
+        "output.device",
+        "output.enabled",
+        "output.modified",
+        "output.node_name",
+        "output.preset",
+        "output_device_list",
+        "output_device_list[].description",
+        "output_device_list[].node_name",
+        "output_device_list[].present",
+        "output_devices",
+        "output_presets",
+        "output_presets.built_in",
+        "output_presets.built_in[].modified",
+        "output_presets.built_in[].name",
+        "output_presets.user_defined",
+        "power",
+        "preset",
+        "presets",
+        "presets.built_in",
+        "presets.built_in[].modified",
+        "presets.built_in[].name",
+        "presets.user_defined",
+        "ring",
+        "ring.dropped_frames",
+        "ring.format_mismatches",
+        "ring.resyncs",
+        "ring.underrun_frames",
+        "schema",
+        "selected_input",
+        "selected_output",
+        "selected_preset",
+        "theme",
+        "version",
+        "view",
+        "volume_leveling",
+        "windows_parity",
+    ];
+
+    /// Every key in `value`, by its path.
+    fn key_paths(value: &Value, path: &str, out: &mut std::collections::BTreeSet<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    key_paths(value, &path, out);
+                    out.insert(path);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    key_paths(item, &format!("{path}[]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn every_key_schema_three_printed_is_still_printed_while_the_schema_is_three() {
+        // The compatibility rule (the man page's STATUS DOCUMENT): `schema` is a compatibility
+        // number. Keys are only added, which leaves it alone; a key removed or renamed raises it,
+        // and this list goes with the old number.
+        let mut a = app_with_presets("schema-three");
+        a.receive(fxsound_core::messages::AudioToUi::Devices(mixed_devices()));
+        let json = status(&mut a);
+        assert_eq!(
+            STATUS_SCHEMA, 3,
+            "a new number takes a new list of what it keeps"
+        );
+        let mut printed = std::collections::BTreeSet::new();
+        key_paths(&json, "", &mut printed);
+        let gone: Vec<&&str> = SCHEMA_THREE_KEYS
+            .iter()
+            .filter(|key| !printed.contains(**key))
+            .collect();
+        assert!(
+            gone.is_empty(),
+            "schema 3 printed these and this document does not: {gone:?}"
+        );
     }
 
     #[test]

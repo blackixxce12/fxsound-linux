@@ -191,6 +191,11 @@ f_k = min_band_freq * (max_band_freq / min_band_freq) ^ ((k-1)/(N-1))      k = 1
 `N == 1` is special-cased first: `Q = 1.0`, `f_1 = min_band_freq`
 (`GraphicEqSet.cpp:386-392`).
 
+The port takes `min_band_freq` and `max_band_freq` for such an `N` from the ten-band edges,
+62.5 Hz to 16 kHz (`fxsound_core::eq::band_edges_hz`), in both the engine and the drawn curve.
+The original, and the port before 0.5.0, played it with whatever edges the last table count left,
+while the window drew it on a new equalizer, with the ten-band edges; see `09-dsp-eq.md` §3.1.
+
 Global clamps applied by `GraphicEqSetBandFreq()`:
 `GRAPHIC_EQ_MIN_BAND_FREQ = 10`, `GRAPHIC_EQ_MAX_BAND_FREQ = 21000.0`
 (`dsp/ptutil/include/GraphicEq.h:42-43`, applied at `GraphicEqSet.cpp:555-559`).

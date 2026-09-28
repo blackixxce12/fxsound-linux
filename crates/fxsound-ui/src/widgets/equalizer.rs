@@ -60,8 +60,9 @@
 //! * **A press on a thumb holds its value** until the pointer has moved two points, as on every
 //!   slider (0.4.0 audit #14); JUCE jumps to the pointer there too, which moved a band a decibel
 //!   for a press half a thumb off centre and snapped a gain between two steps.
-//! * **A press outlives its curve.** A preset, a band count or a lane that comes from outside
-//!   with the button down on a band or a wheel — or the application ending the solo — ends the
+//! * **A press outlives its curve.** A preset (the one shown, read again, included), a band count
+//!   or a lane that comes from outside with the button down on a band or a wheel — or the
+//!   application ending the solo — ends the
 //!   gesture: nothing follows the pointer until the button is let go, where egui would hand the
 //!   press on to the same band of the new curve.
 //! * **The end bands turn both ways** (0.4.0 audit R6): see [`band_frequency_range`].
@@ -376,19 +377,6 @@ pub fn snap_gain(gain_db: f32) -> f32 {
 // ---------------------------------------------------------------------------------------------
 // Band frequencies
 // ---------------------------------------------------------------------------------------------
-
-/// The spectrum edges a band count implies (`GraphicEqSet.cpp:430-486`).
-///
-/// The five counts the UI offers each overwrite `min_band_freq` / `max_band_freq` with their own
-/// pair ([`fxsound_core::eq::ladder_edges_hz`]); anything else keeps whatever the engine had, which
-/// is taken here as the full 20 Hz … 20 kHz span.
-#[must_use]
-pub fn band_span_hz(num_bands: usize) -> (f32, f32) {
-    fxsound_core::eq::ladder_edges_hz(num_bands).unwrap_or((
-        fxsound_core::eq::TUNING_FLOOR_HZ,
-        fxsound_core::eq::TUNING_CEILING_HZ,
-    ))
-}
 
 /// How far band `band`'s wheel tunes it, in Hz: [`fxsound_core::eq::band_frequency_range`].
 ///
@@ -786,15 +774,17 @@ struct Still {
 /// the sliders' two points ([`slider`]).
 pub const HOLD_DISTANCE: f32 = 2.0;
 
-/// Which curve a gesture is on: its band count, its lane and its preset. Any of them changing
-/// under a press comes from outside the window — a preset from the tray or a device, a band count
-/// from the command line, a lane from D-Bus — since the pointer that would pick one here is busy
-/// holding a band.
+/// Which curve a gesture is on: its band count, its lane, its preset, and which reading of a
+/// preset ([`UiState::eq_curve_generation`]). Any of them changing under a press comes from
+/// outside the window — a preset from the tray or a device, the same preset read again by an
+/// undo from the command line, a band count from the command line, a lane from D-Bus — since the
+/// pointer that would pick one here is busy holding a band.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CurveKey {
     bands: usize,
     lane: fxsound_core::DeviceDirection,
     preset: Option<String>,
+    generation: u64,
 }
 
 impl CurveKey {
@@ -803,6 +793,7 @@ impl CurveKey {
             bands: state.eq_bands.len(),
             lane: state.direction,
             preset: state.preset().map(|p| p.name.clone()),
+            generation: state.eq_curve_generation,
         }
     }
 
@@ -810,6 +801,7 @@ impl CurveKey {
         self.bands == state.eq_bands.len()
             && self.lane == state.direction
             && self.preset.as_deref() == state.preset().map(|p| p.name.as_str())
+            && self.generation == state.eq_curve_generation
     }
 }
 
@@ -2327,6 +2319,38 @@ mod tests {
     }
 
     #[test]
+    fn a_band_count_the_window_does_not_offer_is_drawn_as_the_engine_plays_it_after_any_other() {
+        // Twelve bands, from a hand-made microphone preset or a `num_bands` edited in
+        // settings.toml (a `.fac` is fitted onto the window's count): the curve is worked out on
+        // a fresh equalizer, the sound on one that played another count before it. Until 0.5.0 the engine kept the last
+        // table's edges for such a count, and so another Q than the one drawn.
+        let count = 12;
+        let layout = EqLayout::new(count);
+        let ladder: Vec<f32> = (0..count)
+            .map(|band| 30.0 * 600.0_f32.powf(band as f32 / (count - 1) as f32))
+            .collect();
+        let gains: Vec<f32> = (0..count)
+            .map(|band| if band % 3 == 0 { 9.0 } else { -3.0 })
+            .collect();
+        let response = response_curve(&layout, &ladder, &gains, 1.0, 48_000);
+        assert!(!response.is_empty());
+        for before in [5, 10, 15, 20, 31] {
+            let mut eq = fxsound_dsp::eq::GraphicEq::new();
+            eq.set_bands(&centres(before), &vec![0.0; before]);
+            eq.set_bands(&ladder, &gains);
+            for point in &response {
+                let played = eq.response_db(point.hz);
+                assert!(
+                    (played - point.db).abs() < 0.01,
+                    "after {before} bands, at {} Hz: drawn {} dB, played {played} dB",
+                    point.hz,
+                    point.db
+                );
+            }
+        }
+    }
+
+    #[test]
     fn the_curve_follows_a_band_moved_by_its_wheel() {
         // The fader stays in its column; the curve's peak follows the frequency the band plays at.
         let layout = EqLayout::new(10);
@@ -3041,10 +3065,14 @@ mod tests {
 
         #[test]
         fn a_drag_writes_nothing_once_a_preset_a_band_count_or_a_lane_comes_from_outside() {
-            // FA: an ordinary drag, no solo, so no generation to move: the curve itself says it
-            // is another one.
+            // FA: an ordinary drag, no solo, so no solo generation to move: the curve itself says
+            // it is another one. Undo from the command line reads the preset shown again, under
+            // the same name, count and lane; only the curve's own generation tells.
             type Change = fn(&mut UiState);
-            let changes: [(&str, Change); 3] = [
+            let changes: [(&str, Change); 4] = [
+                ("the same preset read again", |state| {
+                    state.eq_curve_generation += 1;
+                }),
                 ("a preset", |state| state.selected_preset = Some(1)),
                 ("a band count", |state| {
                     state.eq_bands = centres(15)

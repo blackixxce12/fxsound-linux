@@ -278,10 +278,15 @@ is a rename.
 .TP
 .B \-\-delete_preset
 Delete the selected user preset: its file goes to the desktop's trash
-.RI ( $XDG_DATA_HOME/Trash ),
-where a file manager can restore it, or stays beside itself as
+.RI ( $XDG_DATA_HOME/Trash ,
+or for a preset on another filesystem that filesystem's own,
+.I .Trash/UID
+or
+.I .Trash\-UID
+at the top of it), where a file manager can restore it, or stays beside
+itself as
 .I NAME.fac.1.bak
-(or the next free number) when the trash is on another filesystem. Its
+(or the next free number) when no trash can take it. Its
 unsaved changes go the same way from
 .IR AutoSave/ ;
 restore both and the preset is back with them. A factory preset is refused.
@@ -569,14 +574,20 @@ it never crosses into the microphones. With no FxSound running there is no
 device to step from: the command line is refused (exit status 1) and nothing
 on it is done or started;
 .BI \-\-output= NAME
-starts FxSound on a device.
+starts FxSound on a device. An FxSound that has only just started (the bus
+may have started it for
+.BR NextOutput )
+holds the command for up to three seconds until PipeWire has listed the
+devices, and steps then.
 .TP
 .B \-\-next\-input
 Cycle the microphone lane to the next usable capture device, wrapping, in the
 order of the microphones' priority list (Settings \(-> Microphone). Capture
 devices only. With no FxSound running it is refused as
 .B \-\-next\-output
-is.
+is, and an FxSound that has only just started waits for the device list as
+.B \-\-next\-output
+does.
 .SS Control
 .TP
 .B \-\-status
@@ -749,8 +760,12 @@ and every key the Windows build's
 writes (marked
 .IR upstream ),
 with that build's meaning and JSON type, so a client written for either reads
-it. Keys are only ever added; a key that changed its meaning would change
-.BR schema .
+it. Keys are only ever added; a key removed, renamed or given another meaning
+would change
+.B schema
+(see
+.B Compatibility
+below).
 The equalizer and
 .BR preset ", " presets " and " selected_preset
 are the edit direction's: the lane the window shows. The effects,
@@ -758,8 +773,10 @@ are the edit direction's: the lane the window shows. The effects,
 exist on the output lane only and are always the output lane's.
 .TP
 .B schema
-3. The 0.3.0 document had no number and is schema 1; 0.4.0's is 2, and 3
-keeps every key of 2.
+3, the compatibility number described under
+.BR Compatibility .
+The 0.3.0 document had no number and is schema 1; 0.4.0's is 2, and 3 keeps
+every key of 2.
 .TP
 .BR version ", " power
 .RI ( upstream )
@@ -913,6 +930,43 @@ and whether it hides the applications' presets, so that a status bar can grey
 its microphone and application parts instead of failing; always
 .B false
 in this version.
+.SS Compatibility
+The JSON FxSound prints \(en this document and D-Bus
+.BR GetStatus ,
+the
+.BR ListPresets ", " ListDevices " and " ListApps
+answers and
+.B \-\-list\-apps \-\-json
+(which carry this document's
+.BR schema ),
+and the events of
+.B \-\-watch \-\-json
+(which carry
+.BR \(dqv\(dq )
+\(en follows one rule.
+.B schema
+and
+.B v
+are compatibility numbers, not versions. Adding a key or an event never
+changes them, so a later FxSound may print keys this page does not list, and a
+client ignores what it does not know. Removing or
+renaming a key, or changing its meaning or its JSON type, raises the number by
+one; where a meaning has to change, the new meaning gets a key of its own and
+the old key keeps the old one, as
+.B edit_direction
+did beside
+.BR direction .
+A client written for schema 3 reads any document that says 3, and one that
+needs a key added later looks for the key rather than at the number.
+.B schema
+went from 1 to 2 and to 3 with keys that 0.4.0 and 0.5.0 added, before the
+rule was written; it stays 3 while keys are only added.
+.B \-\-self\-test \-\-json
+carries no number and follows the same rule: its
+.BR version ", " checks " (" name ", " status ", " detail ") and " ok
+keep their meaning, new checks may appear, and
+.B detail
+is words for a person, not for parsing.
 .SH D\-BUS
 A running instance also serves an interface on the session bus, for status
 bars, compositor scripts and anything else that would rather hold a connection
@@ -1091,10 +1145,10 @@ and hands the start to the systemd user unit,
 or runs
 .B fxsound \-\-activated
 itself where the bus has no systemd. A
-.BR NextOutput " or " NextInput
-call that starts FxSound this way steps nowhere, since the new instance has no
-device list yet to step through, and it still succeeds; with no FxSound
-running,
+.BR NextOutput ", " NextInput " or " ForgetDevice
+call that starts FxSound this way waits, up to three seconds, for PipeWire to
+list the devices, and then steps or forgets as it would in an instance that
+had been running; with no FxSound running,
 .BR \-\-next\-output " and " \-\-next\-input
 are refused instead. A started FxSound takes over the
 session's default devices, so anything that only reads or polls \(en a status

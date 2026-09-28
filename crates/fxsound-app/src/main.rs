@@ -552,8 +552,9 @@ impl Runtime {
                 log::info!("not running a command whose caller stopped waiting for it");
                 continue;
             }
-            // A `--forget-device` for an instance PipeWire has not listed the devices to yet: the
-            // whole line waits for the list, or until `until`, and is refused only then. A line
+            // A `--forget-device`, `--next-output` or `--next-input` for an instance PipeWire has
+            // not listed the devices to yet: the whole line waits for the list, or until `until`,
+            // and runs then. A line
             // that came after a waiting one waits behind it (0.4.0 review FA): run first, a
             // keybind's `--preset=Day` would be undone by the held `--preset=Night` before it
             // when the list came. Its own wait is never the longer one — the line ahead of it

@@ -213,6 +213,21 @@ f[i] = min_band_freq * (max_band_freq / min_band_freq) ^ ( i / (N - 1) )     i =
 `num_bands == 1` is a special case handled before the table: `Q` is forced to `1.0` and the single
 band sits at `min_band_freq` (`GraphicEqSet.cpp:386-393`).
 
+**The port departs (0.5.0, phase Z).** The original keeps whatever `min_band_freq` and
+`max_band_freq` the last table count left, so a count with no table got another ladder and
+another Q after a 31-band preset (20 Hz to 20 kHz) than after a ten-band one (62.5 Hz to 16 kHz).
+The port lays out and designs such a count between the ten-band edges, 62.5 Hz to 16 kHz
+(`fxsound_core::eq::band_edges_hz`, used by `GraphicEq::set_num_bands` in
+`crates/fxsound-dsp/src/eq.rs`), whatever count came before; a single band sits at 62.5 Hz. The
+window draws the curve for such a count with `response_curve`
+(`crates/fxsound-ui/src/widgets/equalizer.rs`) on a new `GraphicEq`, which gets the same pair
+through `GraphicEq::set_num_bands`, so its ladder and Q no longer depend on the count played
+before it, and the curve drawn is the one played. Only a hand-made microphone preset
+(`crates/fxsound-preset/src/input.rs`, any count) or a `num_bands` edited in `settings.toml` has
+such a count: a `.fac` of another count is fitted onto the window's count before it reaches the
+engine, and the command line takes only 5, 10, 15, 20 and 31. The five counts the window offers
+keep their tables and edges.
+
 ### 3.2 Per-band frequency override and clamping
 
 `GraphicEqSetBandFreq(handle, band_num /*1-based*/, freq)` (`GraphicEqSet.cpp:537-578`):

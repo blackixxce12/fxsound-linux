@@ -124,6 +124,12 @@ pub struct UiState {
     /// window began under the number it saw at the press and ends once the number has moved, so
     /// the window never draws a solo the equalizer has stopped playing.
     pub eq_solo_generation: u64,
+    /// Moves on each time the application puts a preset's curve in the window — a pick, an undo,
+    /// a device's or an application's preset, from the window or from outside it — including
+    /// the curve of the preset already shown, read again. A band held in the window under the
+    /// old number stops following the pointer: its curve is gone, even where the new one has the
+    /// same name, the same band count and the same lane.
+    pub eq_curve_generation: u64,
 
     // ---- levels ----------------------------------------------------------------------------
     /// `-20..=20` dB in steps of 2.
@@ -240,6 +246,7 @@ impl Default for UiState {
             eq_bands: fxsound_core::eq::default_bands(),
             filter_q: 1.0,
             eq_solo_generation: 0,
+            eq_curve_generation: 0,
             master_gain_db: 0.0,
             balance_db: 0.0,
             volume_leveling: 0.0,

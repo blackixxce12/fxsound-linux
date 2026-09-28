@@ -1603,6 +1603,7 @@ impl App {
         let (centres, boosts) = params.bands();
         self.state.eq_on = params.eq_on;
         self.state.eq_bands = bands_of(centres, boosts);
+        self.new_curve_in_the_window();
         self.state.filter_q = params.filter_q;
         self.state.master_gain_db = params.makeup_db;
         self.state.denoise_on = params.rnnoise;
@@ -1785,7 +1786,14 @@ impl App {
         self.state.effects = effects;
         self.state.eq_on = eq_on;
         self.state.eq_bands = eq_bands;
+        self.new_curve_in_the_window();
         self.sync_params_from_state();
+    }
+
+    /// Tell the window the curve it shows is a preset's, read now: a band it still holds under
+    /// the old one lets go ([`UiState::eq_curve_generation`]), also when the preset is the same.
+    fn new_curve_in_the_window(&mut self) {
+        self.state.eq_curve_generation = self.state.eq_curve_generation.wrapping_add(1);
     }
 
     /// The music lane's live band ladder: the user's band count (`settings.num_bands`), at the
@@ -2540,6 +2548,10 @@ impl App {
     /// Presets in Settings, where the lane off screen must change in the engine now rather than
     /// the next time it is looked at. The edit direction is not touched, and nothing `act` says
     /// about the lane off screen reaches the desktop.
+    ///
+    /// Nor does a preset `act` reads into the lane off screen reach the window's curve: the lane
+    /// on screen comes back as it was parked, so [`UiState::eq_curve_generation`] comes back too,
+    /// and a band held on it goes on following the pointer.
     fn in_lane(&mut self, lane: DeviceDirection, act: impl FnOnce(&mut Self)) {
         let edit = self.state.direction;
         if lane == edit {
@@ -2547,9 +2559,11 @@ impl App {
             return;
         }
         let armed = std::mem::replace(&mut self.notifications_armed, false);
+        let generation = self.state.eq_curve_generation;
         self.show_lane(lane);
         act(self);
         self.show_lane(edit);
+        self.state.eq_curve_generation = generation;
         self.notifications_armed = armed;
     }
 
@@ -9168,6 +9182,62 @@ mod tests {
                 "{what}: nor was its preset marked"
             );
         }
+    }
+
+    #[test]
+    fn every_preset_read_into_the_window_moves_the_curve_generation_and_an_edit_does_not() {
+        // 0.4.0 left it: an undo from outside reads the preset shown again, same name, count and
+        // lane, and a band dragged in the window went on over the curve read back.
+        let (mut app, _engine, _dir) = started_with(saved_settings(OUT));
+        app.handle(&[UiAction::SelectPreset(0)]);
+        let at_start = app.state.eq_curve_generation;
+        app.handle(&[UiAction::SetBandGain(3, 6.0), UiAction::SetBandGain(3, 7.0)]);
+        assert_eq!(
+            app.state.eq_curve_generation, at_start,
+            "the window's own drag is the same curve"
+        );
+        assert!(app.state.preset().is_some_and(|p| p.modified));
+        let name = app.state.preset().map(|p| p.name.clone());
+        app.handle(&[UiAction::UndoPresetChanges]);
+        assert_eq!(
+            app.state.preset().map(|p| p.name.clone()),
+            name,
+            "the same preset"
+        );
+        assert_ne!(
+            app.state.eq_curve_generation, at_start,
+            "read again, it is a new curve"
+        );
+        let after_undo = app.state.eq_curve_generation;
+        app.handle(&[UiAction::SelectPreset(1)]);
+        assert_ne!(app.state.eq_curve_generation, after_undo, "another preset");
+    }
+
+    #[test]
+    fn a_voice_preset_read_into_the_lane_off_screen_leaves_the_curve_generation_alone() {
+        // A microphone that brings back its own voice preset while the music lane is on screen
+        // changes nothing the window shows: a band held there goes on following the pointer.
+        let (mut app, _engine, _dir) = started_with(saved_settings(OUT));
+        app.settings
+            .remember_device_preset(MIC, "Microphone", "Quiet", "", IN);
+        let curve = app.state.eq_bands.clone();
+        let at_start = app.state.eq_curve_generation;
+
+        app.bring_back_device_preset(IN, MIC);
+
+        assert_eq!(
+            app.settings.input_preset, "Quiet",
+            "the voice preset was read"
+        );
+        assert_eq!(
+            app.state.direction, OUT,
+            "the music lane is still on screen"
+        );
+        assert_eq!(app.state.eq_bands, curve, "with its own curve");
+        assert_eq!(
+            app.state.eq_curve_generation, at_start,
+            "the curve on screen is the same curve"
+        );
     }
 
     #[test]

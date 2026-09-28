@@ -891,9 +891,10 @@ the factory `Factsoft/` directory → `/usr/share/fxsound/presets` with a per-us
 `FOF_ALLOWUNDO` deletes for good; the port does not map it to `std::fs::remove_file`. The preset
 file and its autosave go to the home trash of the FreeDesktop.org Trash specification
 (`$XDG_DATA_HOME/Trash/files`, with a `.trashinfo` under `Trash/info`), where a file manager can
-restore them (`fxsound_preset::trash`). When the trash is on another filesystem, the file is set
-aside beside itself as `<name>.fac.1.bak` or the next free number, never over the overwrite's
-`<name>.fac.bak`. A rename moves the file and its autosave (#19) instead of saving a copy and
+restore them (`fxsound_preset::trash`). A preset on another filesystem than the home trash goes
+to that filesystem's own trash (`$topdir/.Trash/$uid`, or else `$topdir/.Trash-$uid`, at the top of
+its mount). Only when no trash can take it is it kept beside itself as `<name>.fac.1.bak` or the
+next free number, never over the overwrite's `<name>.fac.bak`. A rename moves the file and its autosave (#19) instead of saving a copy and
 deleting the old file.
 
 ---

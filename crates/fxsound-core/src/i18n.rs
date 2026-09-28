@@ -11,7 +11,9 @@
 //! the same file format, layered on top of the original's table for the same language — and,
 //! for the few strings a Windows table misspells, omits or gets wrong where the port shows them
 //! (Croatian's `on`/`off` left in English, Italian's `on` as "su", eleven `"Output: "`s without
-//! the space the device name needs), a repaired copy: a layer over a file that is embedded
+//! the space the device name needs, Arabic's Bass Boost left in English, both Chinese tables
+//! naming the window's hotkey as the power's, Italian's tray quitting with its word for the output
+//! lane and putting "Select" last), a repaired copy: a layer over a file that is embedded
 //! unchanged is the one place such a repair can live.
 //!
 //! `tests/translations.rs` audits every string the interface passes to [`tr`] against every
@@ -628,6 +630,65 @@ mod tests {
         };
         assert_eq!(original("it", "on").as_deref(), Some("su"));
         assert_eq!(original("de", "Output: ").as_deref(), Some("Ausgabe:"));
+    }
+
+    #[test]
+    fn the_port_repairs_the_bass_boost_the_hotkey_list_and_the_italian_tray() {
+        let get = |code: &str, key: &str| {
+            Catalogue::for_language(language(code).expect(code))
+                .get(key)
+                .map(str::to_owned)
+        };
+        let original = |code: &str, key: &str| {
+            language(code)
+                .expect(code)
+                .original_catalogue()
+                .get(key)
+                .map(str::to_owned)
+        };
+        // Arabic translated every effect but Bass Boost, which it left in English; the table's
+        // own word for bass is الجهير.
+        assert_eq!(original("ar", "Bass Boost").as_deref(), Some("Bass Boost"));
+        assert_eq!(get("ar", "Bass Boost").as_deref(), Some("تعزيز الجهير"));
+        // Both Chinese tables said "turn FxSound on/off" for the window's hotkey too.
+        for code in ["zh-CN", "zh-TW"] {
+            assert_eq!(
+                original(code, "Turn FxSound On/Off"),
+                original(code, "Open/Close FxSound"),
+                "{code}"
+            );
+            assert_ne!(
+                get(code, "Turn FxSound On/Off"),
+                get(code, "Open/Close FxSound"),
+                "{code}"
+            );
+            assert_eq!(
+                get(code, "Turn FxSound On/Off"),
+                original(code, "Turn FxSound On/Off"),
+                "{code}: the power's line keeps its words"
+            );
+        }
+        assert_eq!(
+            get("zh-CN", "Open/Close FxSound").as_deref(),
+            Some("打开/关闭 FxSound 窗口")
+        );
+        assert_eq!(
+            get("zh-TW", "Open/Close FxSound").as_deref(),
+            Some("開啟/關閉 FxSound 視窗")
+        );
+        // Italian's tray put the verb last ("Playback device Select") and quit with the word its
+        // window uses for the output lane.
+        assert_eq!(
+            original("it", "Playback Device Select").as_deref(),
+            Some("Dispositivo di riproduzione Seleziona")
+        );
+        assert_eq!(
+            get("it", "Playback Device Select").as_deref(),
+            Some("Seleziona dispositivo di riproduzione")
+        );
+        assert_eq!(original("it", "Exit").as_deref(), Some("Uscita"));
+        assert_eq!(get("it", "Exit").as_deref(), Some("Esci"));
+        assert_eq!(get("it", "Output").as_deref(), Some("Uscita"));
     }
 
     #[test]

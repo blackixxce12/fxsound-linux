@@ -128,3 +128,4 @@ countries: cn sg
 "Plus the Windows sound: presets sound the same." = "再加 Windows 的声音：预设听起来一样。"
 "Only what Windows has; the rest is hidden." = "只保留 Windows 版有的功能，其余隐藏。"
 "Always kept: the preset trash and autosave, fixed port errors, click-free switching, the command line and D-Bus. No setting is deleted." = "始终保留：预设回收站和自动保存、已修复的移植错误、无咔嗒声的切换、命令行和 D-Bus。不会删除任何设置。"
+"Open/Close FxSound" = "打开/关闭 FxSound 窗口"

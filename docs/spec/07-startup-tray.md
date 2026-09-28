@@ -881,8 +881,9 @@ schema change.
   (`crates/fxsound-app/src/cli.rs` `Command::honoured_at_cold_start`,
   `crates/fxsound-app/src/commands.rs` `answer_without_an_instance`). D-Bus `NextOutput` and
   `NextInput` cannot be refused that way: the bus starts FxSound first, and the call reaches an
-  instance with no device list yet, steps nowhere and succeeds (the man page says so; waiting
-  for the list, as `ForgetDevice` does, is left for 0.5.0).
+  instance with no device list yet. In 0.4.0 it stepped nowhere and succeeded; since 0.5.0 it
+  waits for the first list, for at most three seconds, as `ForgetDevice` does, and then steps
+  (`commands::waits_for_the_device_list`).
 
 ---
 

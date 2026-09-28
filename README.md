@@ -293,6 +293,11 @@ fxsound --watch --json | jq --unbuffered -c -n '
 The module hides while FxSound is not running, and `restart-interval` picks the stream up again
 once it is. `--meters` adds the microphone's readouts, at most four times a second.
 
+The JSON is meant to be built on. Its `schema` (3), and `v` in each event, are compatibility
+numbers: a new key never changes them, so read the keys you know and ignore the rest; a key
+removed, renamed or given another meaning or type would raise them, and FxSound gives a changed
+meaning a key of its own instead. `man fxsound` has the rule under *STATUS DOCUMENT*.
+
 The same commands are a D-Bus interface, `org.fxsound.FxSound` at `/org/fxsound/FxSound` on the
 session bus, for anything that would rather hold a connection than start a process:
 

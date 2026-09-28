@@ -144,15 +144,15 @@ pub fn band_frequency_range(
 }
 
 /// The ladder a band count gets when nothing else supplies one: the table for the counts that have
-/// one, and otherwise the geometric ladder a fresh equalizer spreads between the ten-band edges —
-/// the ladder [`GraphicEq::set_num_bands`] builds from a new equalizer, and the one the window
-/// takes for the count.
+/// one, and otherwise the geometric ladder between the ten-band edges
+/// ([`fxsound_core::eq::band_edges_hz`]) — the ladder [`GraphicEq::set_num_bands`] builds, whatever
+/// count the equalizer had before, and the one the window takes for the count.
 #[must_use]
 pub fn standard_centres(count: usize) -> Vec<Real> {
     if let Some((table, _, _)) = band_table(count) {
         return table.to_vec();
     }
-    let (min_hz, max_hz) = band_table(10).map_or((62.5, 16_000.0), |(_, lo, hi)| (lo, hi));
+    let (min_hz, max_hz) = fxsound_core::eq::band_edges_hz(count);
     let mut centres = vec![0.0; count];
     if count > 0 {
         geometric_ladder(count, f64::from(min_hz), f64::from(max_hz), &mut centres);
@@ -773,9 +773,19 @@ impl GraphicEq {
             self.max_band_hz = max_hz;
             self.center_hz[..num_bands].copy_from_slice(table);
         } else {
-            // Keep whatever edges are current and spread the bands geometrically between them.
-            let (min_hz, max_hz) = (f64::from(self.min_band_hz), f64::from(self.max_band_hz));
-            geometric_ladder(num_bands, min_hz, max_hz, &mut self.center_hz);
+            // The original keeps whatever edges the last table count left and spreads the bands
+            // geometrically between them, so the same curve's Q depended on the preset played
+            // before it; here a count with no table has edges of its own
+            // (`fxsound_core::eq::band_edges_hz`), the ones the window draws it with.
+            let (min_hz, max_hz) = fxsound_core::eq::band_edges_hz(num_bands);
+            self.min_band_hz = min_hz;
+            self.max_band_hz = max_hz;
+            geometric_ladder(
+                num_bands,
+                f64::from(min_hz),
+                f64::from(max_hz),
+                &mut self.center_hz,
+            );
         }
 
         self.recompute_q();
@@ -1147,6 +1157,32 @@ mod tests {
         let first = f[1] / f[0];
         let last = f[6] / f[5];
         assert!((first - last).abs() < 1e-3, "{first} vs {last}");
+    }
+
+    #[test]
+    fn a_band_count_with_no_table_gets_the_same_ladder_and_q_whatever_count_came_before() {
+        let mut fresh = GraphicEq::new();
+        fresh.set_num_bands(12);
+        let (low, high) = fxsound_core::eq::band_edges_hz(12);
+        assert_eq!((low, high), (62.5, 16_000.0), "a new equalizer's");
+        assert!((fresh.center_frequencies()[0] - low).abs() < 1e-3);
+        assert!((fresh.center_frequencies()[11] - high).abs() < 1.0);
+        for before in [1, 5, 10, 15, 20, 31, 7] {
+            let mut eq = GraphicEq::new();
+            eq.set_num_bands(before);
+            eq.set_num_bands(12);
+            assert_eq!(eq.q(), fresh.q(), "after {before} bands");
+            assert_eq!(
+                eq.center_frequencies(),
+                fresh.center_frequencies(),
+                "after {before} bands"
+            );
+            assert_eq!(
+                eq.band_range(0),
+                fresh.band_range(0),
+                "after {before} bands"
+            );
+        }
     }
 
     #[test]
@@ -2205,6 +2241,7 @@ mod tests {
                 eq.center_frequencies(),
                 "{count} bands"
             );
+            assert_eq!(standard_centres(count)[0], 62.5, "{count} bands");
         }
         assert!(standard_centres(0).is_empty());
     }

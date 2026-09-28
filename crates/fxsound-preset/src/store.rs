@@ -418,8 +418,9 @@ impl<F: PresetFile> Store<F> {
         Ok(path)
     }
 
-    /// Delete a user preset: its file goes to the desktop's trash, where a file manager can
-    /// restore it, or when the trash cannot take it, is set aside beside itself as
+    /// Delete a user preset: its file goes to the desktop's trash — the home trash, or the trash
+    /// of its own filesystem when that is another one — where a file manager can restore it, or
+    /// when no trash can take it, is set aside beside itself as
     /// `<file>.1.bak` or the next free number ([`trash::set_aside`]) (0.4.0 audit #16; the
     /// original deletes it for good). Factory presets are refused, as in the original.
     ///

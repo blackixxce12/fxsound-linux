@@ -584,6 +584,27 @@ pub mod eq {
         }
     }
 
+    /// The edges every band count is laid out and designed between: its table's
+    /// ([`ladder_edges_hz`]), or for a count with no table — only a microphone preset made by hand
+    /// or a `num_bands` edited in `settings.toml` has one, since a `.fac` is fitted onto the
+    /// window's count — the ten-band table's, which a new equalizer starts with.
+    ///
+    /// The Windows engine keeps whatever edges the last table count left for such a count
+    /// (`GraphicEqSet.cpp:495-508`), so the same preset got another Q after a 31-band preset than
+    /// after a ten-band one, and the window, which works out its curve on a new equalizer, drew
+    /// only the second. One pair for the engine's ladder and Q (`fxsound_dsp::eq::GraphicEq`) and
+    /// the curve drawn from it, so what is drawn is what plays, whatever came before. The ten-band
+    /// edges sit inside every table's, so a curve carried to or from such a count by frequency
+    /// never reads past a table's ends. The wheels still tune such a count across the whole span
+    /// ([`band_frequency_range`]).
+    #[must_use]
+    pub const fn band_edges_hz(num_bands: usize) -> (f32, f32) {
+        match ladder_edges_hz(num_bands) {
+            Some(edges) => edges,
+            None => (62.5, 16_000.0),
+        }
+    }
+
     /// How far band `band` may be tuned in the Windows build, between the ladder's edges `min_hz`
     /// and `max_hz` (`GraphicEqGet.cpp:105-168`).
     ///
