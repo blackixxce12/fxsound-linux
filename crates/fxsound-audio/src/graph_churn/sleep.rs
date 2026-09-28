@@ -200,12 +200,12 @@ fn a_microphone_runs_only_while_something_records_from_fxsound_input() {
                 !graph.a_following_tone_is_heard() && graph.tone_ran_dry(),
                 "the next recording was not handed the microphone"
             );
-            println!(
-                "NOTE: on PipeWire {:?}, older than {TONE_FOLLOWS_SINCE:?}, the driving tone ran out \
-                 of buffers as the group started again, so what the next recording was handed was \
+            note(&format!(
+                "on PipeWire {:?}, older than {TONE_FOLLOWS_SINCE:?}, the driving tone ran out of \
+                 buffers as the group started again, so what the next recording was handed was \
                  not checked; that the nodes ran again and nothing was rebuilt was",
                 graph.server_version()
-            );
+            ));
         }
         assert_eq!(
             graph.our_nodes(),

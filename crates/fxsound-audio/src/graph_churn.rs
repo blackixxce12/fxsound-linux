@@ -108,6 +108,51 @@ pub(crate) fn skip(reason: &str) {
     println!("SKIPPED: {reason}");
 }
 
+/// Say what a test that passes left unchecked because the server under it could not show it: an
+/// older PipeWire in CI, above all. Unlike a `SKIPPED` line this is no failure under
+/// [`REQUIRE_TOOLS`], and unlike `println!` it is not kept back with the rest of a passing test's
+/// output: it is written to the process's own standard error, past the harness, and on GitHub
+/// Actions as a warning the run's summary lists. A pass that checked less must never be a silent
+/// one.
+pub(crate) fn note(what: &str) {
+    let on_github = std::env::var_os("GITHUB_ACTIONS").is_some_and(|value| value == "true");
+    let _ = emit_note(&mut std::io::stderr().lock(), what, on_github);
+}
+
+/// The line [`note`] writes: `NOTE: …`, or GitHub's `::warning` command carrying it, whose message
+/// must stay on one line, with `%`, CR and LF escaped.
+fn emit_note(out: &mut impl std::io::Write, what: &str, on_github: bool) -> std::io::Result<()> {
+    if on_github {
+        let what = what
+            .replace('%', "%25")
+            .replace('\r', "%0D")
+            .replace('\n', "%0A");
+        writeln!(
+            out,
+            "::warning title=Checked less on this server::NOTE: {what}"
+        )
+    } else {
+        writeln!(out, "NOTE: {what}")
+    }
+}
+
+#[test]
+fn a_note_is_one_plain_line_and_on_github_actions_a_warning_that_keeps_to_its_line() {
+    let mut plain = Vec::new();
+    emit_note(&mut plain, "the tail was not checked", false).expect("a Vec takes it");
+    assert_eq!(
+        String::from_utf8(plain).expect("UTF-8"),
+        "NOTE: the tail was not checked\n"
+    );
+
+    let mut github = Vec::new();
+    emit_note(&mut github, "100% dry\r\nin 3 rounds", true).expect("a Vec takes it");
+    assert_eq!(
+        String::from_utf8(github).expect("UTF-8"),
+        "::warning title=Checked less on this server::NOTE: 100%25 dry%0D%0Ain 3 rounds\n"
+    );
+}
+
 /// A PipeWire daemon of our own: one stereo sink, one 7.1 sink, one virtual microphone, and the
 /// `default` metadata object a session manager would otherwise create — with no session manager
 /// behind it, so nothing links anything and nothing moves a default but us. Like every daemon it
@@ -3862,11 +3907,11 @@ fn echo_cancellation_holds_nothing_awake_while_nothing_records_from_fxsound_inpu
     } else {
         // Everything ran, which is what this test is about; that the tone came through as well
         // is not something this server's following `audiotestsrc` can show.
-        println!(
-            "NOTE: PipeWire {:?} is older than {TONE_FOLLOWS_SINCE:?}, whose following tone is \
-             silent, so what the recorder heard through the canceller was not checked",
+        note(&format!(
+            "PipeWire {:?} is older than {TONE_FOLLOWS_SINCE:?}, whose following tone is silent, \
+             so what the recorder heard through the canceller was not checked",
             graph.server_version()
-        );
+        ));
     }
 
     // It stops, and all of it sleeps again with echo cancellation still on.

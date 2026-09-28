@@ -92,7 +92,9 @@ jobs:
       #
       # FXSOUND_REQUIRE_PIPEWIRE_TOOLS=1 makes every place those tests would print SKIPPED fail
       # instead. The harness hides a passing test's output, so here a skip would be invisible, and
-      # with everything installed a skip means something that should work did not.
+      # with everything installed a skip means something that should work did not. A test that
+      # passes having checked less on an older PipeWire says so past the harness, as a warning of
+      # this run (`graph_churn::note`).
       - name: Tests
         run: cargo test --workspace
         env:

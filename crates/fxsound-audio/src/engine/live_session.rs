@@ -11,7 +11,7 @@
 
 use super::*;
 use crate::graph_churn::{
-    PATIENCE, PrivateGraph, again_if_a_tone_ran_dry, canceller_missing, installed, skip,
+    PATIENCE, PrivateGraph, again_if_a_tone_ran_dry, canceller_missing, installed, note, skip,
     unless_skipped,
 };
 use crate::lane_dsp::tests::lanes_for_tests;
@@ -675,15 +675,18 @@ fn a_passive_pair_that_stops_does_not_play_its_last_sound_to_the_next_one() {
                 Ok(()),
                 "the playback stream should run while something plays into the sink"
             );
+            // NODE 2's first cycle takes the mark before anything else is asked. A stop that
+            // drained the ring exactly leaves `primed` set from the round before, so waiting for
+            // it alone could return before NODE 2 has run since the wake.
+            assert!(
+                harness.until("NODE 2's first cycle since", |_| !ring.stale_pending()),
+                "the mark NODE 1's last Paused left should have been taken by NODE 2's first cycle"
+            );
             assert!(
                 harness.until("the ring to be primed", |_| ring
                     .primed
                     .load(Ordering::Relaxed)),
                 "the tone never reached the playback stream"
-            );
-            assert!(
-                !ring.stale_pending(),
-                "the mark NODE 1's last Paused left should have been taken by NODE 2's first cycle"
             );
 
             // It stops, and so does the pair, both nodes in one cycle, with some of the sound still
@@ -709,26 +712,26 @@ fn a_passive_pair_that_stops_does_not_play_its_last_sound_to_the_next_one() {
             }
             // What the server did instead, for the log: how many blocks NODE 1 still processed
             // after the sound was unlinked, and how many cycles NODE 2 ran and played short.
-            println!(
+            note(&format!(
                 "round {round}: the pair stopped with nothing left in the ring; after the sound \
                  was unlinked NODE 1 processed {} blocks and NODE 2 ran {} cycles, {} frames of \
                  them silence",
                 counters.sink_cycles.load(Ordering::Relaxed) - sink_cycles,
                 counters.output_cycles.load(Ordering::Relaxed) - output_cycles,
                 ring.underrun_frames.load(Ordering::Relaxed) - underruns,
-            );
+            ));
         }
         if !left_a_tail {
             assert!(
                 !stops_at_once,
                 "the pair stopped with nothing left in the ring, so this test shows nothing"
             );
-            println!(
-                "NOTE: PipeWire {version:?}, older than {A_PASSIVE_PAIR_STOPS_AT_ONCE_SINCE:?}, \
-                 played the ring dry before it stopped the pair in all {rounds} rounds, so there \
-                 was no last sound to leave out; that the next sound takes NODE 1's mark and \
-                 primes afresh is still checked"
-            );
+            note(&format!(
+                "PipeWire {version:?}, older than {A_PASSIVE_PAIR_STOPS_AT_ONCE_SINCE:?}, played \
+                 the ring dry before it stopped the pair in all {rounds} rounds, so there was no \
+                 last sound to leave out; that the next sound takes NODE 1's mark and primes \
+                 afresh is still checked"
+            ));
         }
         let underruns = ring.underrun_frames.load(Ordering::Relaxed);
 
