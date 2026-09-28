@@ -6,6 +6,20 @@ All notable changes to the FxSound Linux port. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **A tray that was already running is found.** FxSound took a system tray that was there before
+  it started — KDE's, Waybar's, a Quickshell shell's, Noctalia's, GNOME's with the AppIndicator
+  extension — for none, until the tray restarted: minimise went to the taskbar, closing into the
+  tray was not remembered, and a start with the tray remembered brought the window up minimised.
+- **Notifications show on GNOME.** GNOME never shows a banner for low urgency and removed every
+  FxSound notification a few milliseconds after it arrived. What you have to see — where the
+  window went and how to get it back, a lost output, a refused save, the power toggled from a
+  keybind, and any change made while the window is hidden or minimised — now pops up, a preset or
+  an output picked in the window goes quietly to the message list, and every notice stays in the
+  list until it is dismissed or FxSound quits.
+- **The notifications have their icon.** The packages install the application icon under the
+  name the notifications ask for, `com.fxsound.FxSound`, as well as `fxsound`.
+
 ### Changed
 - **Tested on the newest PipeWire as well as the oldest.** Besides Ubuntu 24.04 and its
   PipeWire 1.0, CI runs the tests in an Arch Linux container with the newest PipeWire and

@@ -425,6 +425,13 @@ pub struct FxTray {
     /// window hides, is there anything left on screen? On a GNOME session without the
     /// AppIndicator extension there is not — no window, no icon, and until now no message saying
     /// so, which leaves a running process the user cannot see or reach.
+    ///
+    /// ksni reports changes, not the state: a registration that succeeds calls nothing at all,
+    /// and [`Tray::watcher_online`] comes only after a [`Tray::watcher_offline`]
+    /// (`ksni-0.3.6/src/service.rs:82-100`, `:138-142`). So [`spawn`] sets it before registering
+    /// ([`FxTray::expecting_a_watcher`]) and ksni's callbacks correct it from there: a watcher
+    /// missing at the start is a `watcher_offline` inside the spawn itself, before it returns.
+    /// Starting from `false` instead, as 0.4.0 did, took a tray that was already running for none.
     watcher: Arc<AtomicBool>,
 }
 
@@ -445,6 +452,15 @@ impl FxTray {
     #[must_use]
     pub fn with_pixmaps(self, pixmaps: TrayPixmaps) -> Self {
         Self { pixmaps, ..self }
+    }
+
+    /// Count the icon as shown until ksni says otherwise: what a successful registration looks
+    /// like, since ksni calls nothing for one (see the `watcher` field). An item built by
+    /// [`FxTray::new`] alone, which nothing registers, is not shown.
+    #[must_use]
+    pub fn expecting_a_watcher(self) -> Self {
+        self.watcher.store(true, Ordering::Relaxed);
+        self
     }
 
     /// The flag the GUI thread reads to find out whether the icon is really there.
@@ -791,7 +807,8 @@ impl Tray for FxTray {
         true
     }
 
-    /// A watcher appeared — a panel starting, or the session finally providing one.
+    /// A watcher appeared — a panel starting, or the session finally providing one. ksni calls it
+    /// only when the watcher's name had no owner before, which is after a `watcher_offline`.
     fn watcher_online(&self) {
         log::info!("a StatusNotifierWatcher is present; the tray icon is visible");
         self.watcher.store(true, Ordering::Relaxed);
@@ -869,6 +886,11 @@ impl crate::events::TraySink for TrayHandle {
 /// user when nothing has registered after a few seconds; with the window hidden and no tray the
 /// app is otherwise invisible (`docs/spec/07-startup-tray.md` §5.8).
 ///
+/// The icon counts as shown from the start ([`FxTray::expecting_a_watcher`]): a watcher that is
+/// already there takes the item without any callback, and one that is not is reported through
+/// `watcher_offline` before this returns, so [`TrayHandle::is_visible`] is right from the first
+/// call.
+///
 /// # Errors
 ///
 /// If the session bus is unreachable or the item cannot be registered.
@@ -876,7 +898,9 @@ pub fn spawn(
     state: TrayState,
     tx: impl Into<WakingSender<TrayCommand>>,
 ) -> Result<TrayHandle, ksni::Error> {
-    let tray = FxTray::new(state, tx).with_pixmaps(TrayPixmaps::rasterised());
+    let tray = FxTray::new(state, tx)
+        .with_pixmaps(TrayPixmaps::rasterised())
+        .expecting_a_watcher();
     let watcher = tray.watcher_flag();
     let handle = tray.assume_sni_available(true).spawn()?;
     Ok(TrayHandle { handle, watcher })
@@ -1692,5 +1716,207 @@ mod tests {
             truncate_label("Navi 31 HDMI/DP Audio Controller Digital Stereo (HDMI 3) Output"),
             "Navi 31 HDMI/DP Audio Control…Digital Stereo (HDMI 3) Output"
         );
+    }
+
+    // ---- whether the icon is shown ----------------------------------------------------------
+    // ksni 0.3.6 reports changes, not the state: a registration that succeeds calls nothing,
+    // one that finds no watcher calls `watcher_offline` before `spawn` returns, and
+    // `watcher_online` follows only a watcher's name that had no owner before
+    // (`ksni-0.3.6/src/service.rs:82-100`, `:134-165`). The first three tests play that order
+    // on the item alone; the last two run the real ksni against a watcher on a private bus.
+
+    #[test]
+    fn a_registration_that_ksni_reports_nothing_about_counts_as_shown() {
+        // A tray that was running before FxSound: ksni registers and says nothing. 0.4.0 started
+        // the flag at `false` and took it for no tray at all.
+        let (tray, _rx) = with_state(TrayState::default());
+        let tray = tray.expecting_a_watcher();
+        assert!(tray.watcher_flag().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_watcher_missing_at_the_start_is_reported_offline_and_the_icon_counts_as_hidden() {
+        // GNOME without the AppIndicator extension: the registration fails with ServiceUnknown,
+        // and `assume_sni_available` turns that into `watcher_offline` inside `spawn`.
+        let (tray, _rx) = with_state(TrayState::default());
+        let tray = tray.expecting_a_watcher();
+        assert!(
+            tray.watcher_offline(ksni::OfflineReason::No),
+            "the service keeps waiting for a watcher rather than shutting down"
+        );
+        assert!(!tray.watcher_flag().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_watcher_that_comes_after_one_went_counts_the_icon_as_shown_again() {
+        let (tray, _rx) = with_state(TrayState::default());
+        let tray = tray.expecting_a_watcher();
+        let flag = tray.watcher_flag();
+        tray.watcher_offline(ksni::OfflineReason::No);
+        tray.watcher_online();
+        assert!(flag.load(Ordering::Relaxed));
+        tray.watcher_offline(ksni::OfflineReason::No);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a panel restarting hides it again"
+        );
+    }
+
+    #[test]
+    fn an_item_nothing_registered_is_not_shown() {
+        let (tray, _rx) = with_state(TrayState::default());
+        assert!(!tray.watcher_flag().load(Ordering::Relaxed));
+    }
+
+    /// Set, to the private bus's address, in the child process the two tests below run their
+    /// body in. ksni connects to `DBUS_SESSION_BUS_ADDRESS` and to nothing else, and setting that
+    /// in this process would be unsound with other tests' threads running — and would point them
+    /// all at the private bus.
+    const TRAY_CHILD_BUS: &str = "FXSOUND_TEST_TRAY_BUS";
+
+    /// A `StatusNotifierWatcher` that takes every item and remembers which registered.
+    struct Watcher {
+        registered: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
+    impl Watcher {
+        fn register_status_notifier_item(&self, service: &str) {
+            self.registered
+                .lock()
+                .expect("not poisoned")
+                .push(service.to_owned());
+        }
+
+        #[zbus(property)]
+        fn is_status_notifier_host_registered(&self) -> bool {
+            true
+        }
+    }
+
+    /// A watcher on the bus at `address`, and what has registered with it.
+    fn watcher(
+        address: &str,
+    ) -> (
+        zbus::blocking::Connection,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let registered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connection = zbus::blocking::connection::Builder::address(address)
+            .expect("an address")
+            .name("org.kde.StatusNotifierWatcher")
+            .expect("a well-known name")
+            .serve_at(
+                "/StatusNotifierWatcher",
+                Watcher {
+                    registered: Arc::clone(&registered),
+                },
+            )
+            .expect("a path")
+            .build()
+            .expect("the watcher is on the bus");
+        (connection, registered)
+    }
+
+    /// Wait up to ten seconds for `what` to hold.
+    fn within_ten_seconds(what: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if what() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        what()
+    }
+
+    fn tray_on_the_private_bus() -> TrayHandle {
+        let (tx, _rx) = unbounded();
+        spawn(TrayState::default(), tx).expect("the item registers on the private bus")
+    }
+
+    /// Run the test called `name` again in a child process of this binary, with a private bus of
+    /// its own as its session bus, and say whether it ran there. `None` when there is no
+    /// `dbus-daemon` to start one.
+    fn in_a_child_on_a_private_bus(name: &str) -> Option<()> {
+        let bus = crate::private_bus::PrivateBus::start()?;
+        let (_, module) = module_path!()
+            .split_once("::")
+            .expect("a module of the crate");
+        let name = format!("{module}::{name}");
+        let output =
+            fxsound_core::test_support::command(std::env::current_exe().expect("this test binary"))
+                .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+                .env(TRAY_CHILD_BUS, &bus.address)
+                .output()
+                .expect("the child ran");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the child failed: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // An `--exact` name that matched nothing passes too; the line says the body ran.
+        assert!(stdout.contains("tray child ran"), "the child ran no {name}");
+        Some(())
+    }
+
+    #[test]
+    fn a_watcher_already_running_when_the_tray_starts_counts_the_icon_as_shown_at_once() {
+        let Ok(address) = std::env::var(TRAY_CHILD_BUS) else {
+            let _ = in_a_child_on_a_private_bus(
+                "a_watcher_already_running_when_the_tray_starts_counts_the_icon_as_shown_at_once",
+            );
+            return;
+        };
+        let (connection, registered) = watcher(&address);
+        let tray = tray_on_the_private_bus();
+        assert!(
+            tray.is_visible(),
+            "a tray that was there first is taken for none"
+        );
+        assert!(within_ten_seconds(|| registered
+            .lock()
+            .expect("not poisoned")
+            .len()
+            == 1));
+
+        // The panel restarts: gone, then back.
+        connection.close().expect("the watcher leaves the bus");
+        assert!(within_ten_seconds(|| !tray.is_visible()));
+        let (_connection, registered) = watcher(&address);
+        assert!(within_ten_seconds(|| tray.is_visible()));
+        assert!(within_ten_seconds(|| registered
+            .lock()
+            .expect("not poisoned")
+            .len()
+            == 1));
+        tray.shutdown();
+        println!("tray child ran");
+    }
+
+    #[test]
+    fn a_tray_started_before_any_watcher_counts_as_hidden_until_one_comes() {
+        let Ok(address) = std::env::var(TRAY_CHILD_BUS) else {
+            let _ = in_a_child_on_a_private_bus(
+                "a_tray_started_before_any_watcher_counts_as_hidden_until_one_comes",
+            );
+            return;
+        };
+        let tray = tray_on_the_private_bus();
+        assert!(
+            !tray.is_visible(),
+            "with no watcher on the bus the icon is shown nowhere"
+        );
+        let (_connection, registered) = watcher(&address);
+        assert!(within_ten_seconds(|| tray.is_visible()));
+        assert!(within_ten_seconds(|| registered
+            .lock()
+            .expect("not poisoned")
+            .len()
+            == 1));
+        tray.shutdown();
+        println!("tray child ran");
     }
 }

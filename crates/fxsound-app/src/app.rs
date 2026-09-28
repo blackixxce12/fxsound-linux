@@ -641,6 +641,9 @@ pub struct App {
     apps: per_app::AppPresets,
     /// The window is up ([`App::set_window_shown`]): its microphone meters can be looking.
     window_shown: bool,
+    /// The window is up but minimised, with no tray to hide in ([`App::set_window_minimised`]):
+    /// a change made now is out of sight, like one made with no window at all.
+    window_minimised: bool,
     /// The calibration wizard's hold on the microphone, as it last asked (U9, U19).
     wizard_holds_microphone: bool,
     /// What the engine was last told about holding the microphone awake
@@ -752,6 +755,7 @@ impl App {
                 per_app::AppPresets::default()
             },
             window_shown: false,
+            window_minimised: false,
             wizard_holds_microphone: false,
             microphone_held: false,
         };
@@ -2967,6 +2971,7 @@ impl App {
             meters_moved: false,
             apps: per_app::AppPresets::default(),
             window_shown: false,
+            window_minimised: false,
             wizard_holds_microphone: false,
             microphone_held: false,
         };
@@ -4714,8 +4719,15 @@ impl App {
     }
 
     /// Hand a toast to the desktop, unless notifications are hidden or start-up is still going.
+    /// With no window up — none there, or one minimised — an echo of a change is all the answer a
+    /// tray pick or a keybind gets, so it goes out as an alert ([`Message::raised`]).
     fn notify(&self, message: Message) {
         if self.notifications_armed {
+            let message = if self.window_shown && !self.window_minimised {
+                message
+            } else {
+                message.raised()
+            };
             let _ = self.notifier.notify(message);
         }
     }
@@ -5253,7 +5265,17 @@ impl App {
     /// microphone awake ([`App::hold_microphone_as_needed`]).
     pub fn set_window_shown(&mut self, shown: bool) {
         self.window_shown = shown;
+        // Each window comes up out of the minimised state, and one gone is not minimised.
+        self.window_minimised = false;
         self.hold_microphone_as_needed();
+    }
+
+    /// The window went into the minimised state (`true`) — the minimise button with no tray
+    /// there, or a start in the tray that found none — or came back out of it (`false`). A
+    /// change made while it is minimised is not on screen, so its notice is an alert
+    /// ([`App::notify`]).
+    pub fn set_window_minimised(&mut self, minimised: bool) {
+        self.window_minimised = minimised;
     }
 
     /// Whether the microphone meters are in sight: the window is up in the Pro view, editing a
@@ -6049,6 +6071,80 @@ mod tests {
         assert!(app.tray_tip_shown);
         app.notify_hidden_to_tray(true);
         assert!(app.tray_tip_shown, "the second call must be a no-op");
+    }
+
+    /// A sink that hands each delivered message to the test instead of a daemon.
+    struct Delivered(crossbeam_channel::Sender<Message>);
+
+    impl crate::notify::Sink for Delivered {
+        fn deliver(&mut self, message: &Message, _replaces: Option<u32>) -> Option<u32> {
+            let _ = self.0.send(message.clone());
+            Some(1)
+        }
+    }
+
+    #[test]
+    fn a_change_the_window_shows_is_echoed_quietly_and_one_made_without_a_window_is_an_alert() {
+        // GNOME files a low-urgency notification without a banner. A preset picked in the window
+        // is on screen already; one picked from the tray or a keybind with the window hidden has
+        // nothing else to say so.
+        use crate::notify::Weight;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = app_with_two_presets("notice-weight");
+        app.notifier = Notifier::with_sink(false, Delivered(tx));
+        let next = || {
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a notification was sent")
+        };
+
+        app.set_window_shown(true);
+        app.handle(&[UiAction::SelectPreset(1)]);
+        let echoed = next();
+        assert_eq!(echoed.body, "Preset: Beta");
+        assert_eq!(echoed.weight, Weight::Echo);
+
+        app.set_window_shown(false);
+        app.handle(&[UiAction::SelectPreset(0)]);
+        let alerted = next();
+        assert_eq!(alerted.body, "Preset: Alpha");
+        assert_eq!(alerted.weight, Weight::Alert);
+
+        // Where the window went is never an echo, with a tray or without.
+        app.notify_hidden_to_tray(false);
+        assert_eq!(next().weight, Weight::Alert);
+    }
+
+    #[test]
+    fn a_change_made_with_the_window_minimised_is_an_alert() {
+        // GNOME without AppIndicator: the minimise button minimises, the window stays up, and a
+        // preset a keybind or `fxsound --next-preset` picks then is on no screen either.
+        use crate::notify::Weight;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = app_with_two_presets("notice-weight-minimised");
+        app.notifier = Notifier::with_sink(false, Delivered(tx));
+        let next = || {
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a notification was sent")
+        };
+
+        app.set_window_shown(true);
+        app.set_window_minimised(true);
+        app.handle(&[UiAction::SelectPreset(1)]);
+        let alerted = next();
+        assert_eq!(alerted.body, "Preset: Beta");
+        assert_eq!(alerted.weight, Weight::Alert);
+
+        // Back out of the minimised state, the window shows the change again.
+        app.set_window_minimised(false);
+        app.handle(&[UiAction::SelectPreset(0)]);
+        assert_eq!(next().weight, Weight::Echo);
+
+        // A fresh window is never minimised, whatever the last one was.
+        app.set_window_minimised(true);
+        app.set_window_shown(false);
+        app.set_window_shown(true);
+        app.handle(&[UiAction::SelectPreset(1)]);
+        assert_eq!(next().weight, Weight::Echo);
     }
 
     #[test]

@@ -17,7 +17,7 @@
 #   lib/systemd/user/fxsound.service
 #   share/dbus-1/services/org.fxsound.FxSound.service
 #   share/applications/com.fxsound.FxSound.desktop
-#   share/icons/hicolor/{256x256,32x32}/apps/fxsound.png
+#   share/icons/hicolor/{256x256,32x32}/apps/{fxsound,com.fxsound.FxSound}.png
 #   share/icons/hicolor/scalable/status/com.fxsound.FxSound-{off,on,processing}.svg
 #   share/fxsound/presets/{Factsoft,BonusPresets}/*.fac  share/fxsound/presets/Input/*.toml
 #   share/man/man1/fxsound.1
@@ -76,6 +76,12 @@ install -Dm644 assets/images/fxsound_large.png \
   "${pkg}/share/icons/hicolor/256x256/apps/fxsound.png"
 install -Dm644 assets/images/fxsound.png \
   "${pkg}/share/icons/hicolor/32x32/apps/fxsound.png"
+# The same two under the application id, the icon name every notification is sent with
+# (crates/fxsound-app/src/notify.rs).
+install -Dm644 assets/images/fxsound_large.png \
+  "${pkg}/share/icons/hicolor/256x256/apps/com.fxsound.FxSound.png"
+install -Dm644 assets/images/fxsound.png \
+  "${pkg}/share/icons/hicolor/32x32/apps/com.fxsound.FxSound.png"
 # The tray icon's three states, resolved by name through the theme; without them the tray shows
 # a blank where the icon should be.
 install -Dm644 assets/icons/status/com.fxsound.FxSound-{off,on,processing}.svg \

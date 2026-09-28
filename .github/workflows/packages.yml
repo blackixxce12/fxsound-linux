@@ -369,8 +369,12 @@ jobs:
           for state in off on processing; do
             test -f "$prefix/share/icons/hicolor/scalable/status/com.fxsound.FxSound-$state.svg"
           done
-          test -f "$prefix/share/icons/hicolor/256x256/apps/fxsound.png"
-          test -f "$prefix/share/icons/hicolor/32x32/apps/fxsound.png"
+          # The application icon under both names: `Icon=fxsound`, and the application id every
+          # notification is sent with.
+          for name in fxsound com.fxsound.FxSound; do
+            test -f "$prefix/share/icons/hicolor/256x256/apps/$name.png"
+            test -f "$prefix/share/icons/hicolor/32x32/apps/$name.png"
+          done
           echo "::endgroup::"
 
           # Two parts of the binary are not AGPL, and each licence makes shipping its text a

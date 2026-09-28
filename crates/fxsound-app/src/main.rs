@@ -1161,7 +1161,7 @@ impl<'a> Shell<'a> {
                 ShowAction::Restore => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.minimised = false;
+                    self.set_minimised(false);
                 }
                 ShowAction::Reopen => {
                     self.rt.exit = WindowExit::Reopen;
@@ -1187,9 +1187,16 @@ impl<'a> Shell<'a> {
             MinimiseAction::HideToTray => Self::hide(ctx),
             MinimiseAction::Minimise => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                self.minimised = true;
+                self.set_minimised(true);
             }
         }
+    }
+
+    /// The window went into the minimised state or out of it: the shell's own record for
+    /// `--show`, and the app's, which weighs the notices of changes made out of sight.
+    fn set_minimised(&mut self, minimised: bool) {
+        self.minimised = minimised;
+        self.rt.app.set_window_minimised(minimised);
     }
 
     /// Notice the window coming back from minimised by the user's own hand — the dock, the
@@ -1198,7 +1205,7 @@ impl<'a> Shell<'a> {
         let (focused, pressed) = ctx.input(|i| (i.viewport().focused, i.pointer.any_pressed()));
         if self.minimised && (pressed || (focused == Some(true) && self.was_focused == Some(false)))
         {
-            self.minimised = false;
+            self.set_minimised(false);
         }
         self.was_focused = focused;
     }

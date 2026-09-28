@@ -362,6 +362,12 @@ install -D -m 0644 "$REPO/assets/images/fxsound_large.png" \
     "$DATA/usr/share/icons/hicolor/256x256/apps/fxsound.png"
 install -D -m 0644 "$REPO/assets/images/fxsound.png" \
     "$DATA/usr/share/icons/hicolor/32x32/apps/fxsound.png"
+# The same two under the application id, the icon name every notification is
+# sent with (crates/fxsound-app/src/notify.rs).
+install -D -m 0644 "$REPO/assets/images/fxsound_large.png" \
+    "$DATA/usr/share/icons/hicolor/256x256/apps/com.fxsound.FxSound.png"
+install -D -m 0644 "$REPO/assets/images/fxsound.png" \
+    "$DATA/usr/share/icons/hicolor/32x32/apps/com.fxsound.FxSound.png"
 
 # The tray icon's three states. A StatusNotifier host resolves an icon *name*
 # through the theme, so without these under hicolor's status context the tray

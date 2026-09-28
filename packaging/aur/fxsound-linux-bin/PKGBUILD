@@ -59,6 +59,11 @@ package() {
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fxsound.png"
   install -Dm644 "share/icons/hicolor/32x32/apps/fxsound.png" \
     "${pkgdir}/usr/share/icons/hicolor/32x32/apps/fxsound.png"
+  # The same two under the application id, the icon name the notifications are sent with.
+  install -Dm644 "share/icons/hicolor/256x256/apps/com.fxsound.FxSound.png" \
+    "${pkgdir}/usr/share/icons/hicolor/256x256/apps/com.fxsound.FxSound.png"
+  install -Dm644 "share/icons/hicolor/32x32/apps/com.fxsound.FxSound.png" \
+    "${pkgdir}/usr/share/icons/hicolor/32x32/apps/com.fxsound.FxSound.png"
   # The tray icon's three states, resolved by name through the theme.
   install -Dm644 share/icons/hicolor/scalable/status/com.fxsound.FxSound-*.svg \
     -t "${pkgdir}/usr/share/icons/hicolor/scalable/status/"

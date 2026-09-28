@@ -285,6 +285,12 @@ install -Dpm0644 assets/images/fxsound_large.png \
     %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/fxsound.png
 install -Dpm0644 assets/images/fxsound.png \
     %{buildroot}%{_datadir}/icons/hicolor/32x32/apps/fxsound.png
+# The same two under the application id, the icon name every notification is sent with
+# (crates/fxsound-app/src/notify.rs).
+install -Dpm0644 assets/images/fxsound_large.png \
+    %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/com.fxsound.FxSound.png
+install -Dpm0644 assets/images/fxsound.png \
+    %{buildroot}%{_datadir}/icons/hicolor/32x32/apps/com.fxsound.FxSound.png
 
 # The tray icon's three states. A StatusNotifier host resolves an icon *name* through the theme,
 # so without these under hicolor's status context the tray shows a blank where the icon should be.
@@ -354,6 +360,8 @@ appstreamcli validate --no-net %{buildroot}%{_metainfodir}/com.fxsound.FxSound.m
 %{_datadir}/fxsound/presets/Input/
 %{_datadir}/icons/hicolor/256x256/apps/fxsound.png
 %{_datadir}/icons/hicolor/32x32/apps/fxsound.png
+%{_datadir}/icons/hicolor/256x256/apps/com.fxsound.FxSound.png
+%{_datadir}/icons/hicolor/32x32/apps/com.fxsound.FxSound.png
 %{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-off.svg
 %{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-on.svg
 %{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-processing.svg

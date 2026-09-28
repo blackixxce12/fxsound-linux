@@ -158,6 +158,7 @@ for presets. On an older distribution than Debian 12, build from source instead.
 | `/usr/lib/systemd/user/fxsound.service` | `systemctl --user enable --now fxsound` |
 | `/usr/share/dbus-1/services/org.fxsound.FxSound.service` | starts FxSound, through that unit, for a D-Bus call |
 | `/usr/share/icons/hicolor/*/apps/fxsound.png` | the icon |
+| `/usr/share/icons/hicolor/*/apps/com.fxsound.FxSound.png` | the same icon under the application id, the name the notifications carry |
 | `/usr/share/icons/hicolor/scalable/status/` | the tray's three status icons |
 | `/usr/share/man/man1/fxsound.1` | the manual page: every option, the status document and the D-Bus interface |
 | `/usr/share/metainfo/com.fxsound.FxSound.metainfo.xml` | what GNOME Software and Discover show |
@@ -684,7 +685,11 @@ Each of these is a considered decision, not an oversight:
   `assets/translations/port/`. Right-to-left scripts render left-to-right — egui has no bidi.
 - **Desktop notifications** for preset, output and power changes, the way the original's tray
   balloons announce them, through `org.freedesktop.Notifications`; *Hide notifications* in Settings
-  silences them.
+  silences them. What has to be seen — where the window went, a lost output, a refused save, the
+  power toggled from a keybind, a change made while the window is hidden or minimised — is sent at
+  normal urgency; a preset or an output picked in the window is sent at low urgency, which GNOME
+  files in the message list without a banner. Every notice stays in GNOME's list until it is
+  dismissed or FxSound quits.
 - **FxSound takes the session default automatically — politely.** Picking an output device makes
   `FxSound (Output)` the default sink so every application plays through it without any manual
   routing; the previous default is remembered first and handed back on exit or when a lane is

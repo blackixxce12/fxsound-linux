@@ -647,3 +647,152 @@ fn the_noto_notice_covers_every_noto_face_in_the_tree() {
         );
     }
 }
+
+/// The icon name every notification is sent with (`crates/fxsound-app/src/notify.rs`), which a
+/// notification daemon resolves through the icon theme: installed only as `fxsound.png`, it named
+/// an icon no package shipped, and Noctalia logged "theme icon not found" for each notice.
+const NOTIFICATION_ICON: &str = fxsound_app::tray::APP_ID;
+
+/// Each size of the application icon under `share/icons/hicolor`, as (size, source in the tree).
+const APPLICATION_ICONS: [(&str, &str); 2] = [
+    ("256x256", "assets/images/fxsound_large.png"),
+    ("32x32", "assets/images/fxsound.png"),
+];
+
+/// `share` holds the application icon at every size under both of its names, `fxsound` for the
+/// desktop entry and the application id for the notifications, byte for byte the tree's file.
+fn assert_notification_icon_in(share: &Path, package: &str) {
+    for (size, source) in APPLICATION_ICONS {
+        for name in ["fxsound", NOTIFICATION_ICON] {
+            let installed = share.join(format!("icons/hicolor/{size}/apps/{name}.png"));
+            assert!(
+                installed.is_file(),
+                "{package} does not install {}",
+                installed.display()
+            );
+            assert_eq!(
+                read(&installed),
+                read(repo().join(source)),
+                "{package}: {} is not {source}",
+                installed.display()
+            );
+        }
+    }
+}
+
+/// The shell commands of a script or a spec section, each with its `\` continuations joined into
+/// one line of words.
+fn shell_commands<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<Vec<String>> {
+    let mut commands = Vec::new();
+    let mut current = String::new();
+    for line in lines {
+        let line = line.trim();
+        match line.strip_suffix('\\') {
+            Some(start) => {
+                current.push_str(start);
+                current.push(' ');
+            }
+            None => {
+                current.push_str(line);
+                commands.push(current.split_whitespace().map(str::to_owned).collect());
+                current.clear();
+            }
+        }
+    }
+    commands
+}
+
+/// Whether one of `commands` is an `install` of a file whose path ends in `source` to a path that
+/// ends in `destination`.
+fn installs(commands: &[Vec<String>], source: &str, destination: &str) -> bool {
+    commands.iter().any(|words| {
+        words.first().map(String::as_str) == Some("install")
+            && words
+                .iter()
+                .any(|word| word.trim_matches('"').ends_with(source))
+            && words
+                .last()
+                .is_some_and(|word| word.trim_matches('"').ends_with(destination))
+    })
+}
+
+#[test]
+fn the_tarball_and_the_bin_package_made_from_it_install_the_notification_icon_under_the_application_id()
+ {
+    let tree = Tree::new("tarball-icon");
+    let run = tree.build_tarball(Some(TREE_VERSION), None);
+    assert!(run.status.success(), "{}", transcript(&run));
+
+    let unpacked = tree.scratch.join("unpacked");
+    tree.unpack_tarball(&unpacked);
+    assert_notification_icon_in(&unpacked.join("share"), "the tarball");
+
+    let srcdir = tree.scratch.join("src");
+    let (pkgdir, _) = tree.run_package(
+        &repo().join("packaging/aur/fxsound-linux-bin/PKGBUILD"),
+        &srcdir,
+        &srcdir,
+        (
+            "mkdir -p \"$srcdir/${_pkgname}-${pkgver}-x86_64\"\n\
+             cp -a \"$UNPACKED\"/. \"$srcdir/${_pkgname}-${pkgver}-x86_64\"/",
+            &unpacked,
+        ),
+    );
+    assert_notification_icon_in(&pkgdir.join("usr/share"), "fxsound-linux-bin");
+}
+
+#[test]
+fn the_arch_package_installs_the_notification_icon_under_the_application_id() {
+    let tree = Tree::new("arch-icon");
+    tree.leave_binary(TREE_VERSION, "built from this tree");
+    let startdir = tree.root().join("packaging");
+
+    let (pkgdir, _) = tree.run_package(
+        &startdir.join("PKGBUILD"),
+        &tree.scratch.join("src"),
+        &startdir,
+        ("", Path::new("")),
+    );
+
+    assert_notification_icon_in(&pkgdir.join("usr/share"), "packaging/PKGBUILD");
+}
+
+#[test]
+fn the_fedora_package_installs_and_lists_the_notification_icon_under_the_application_id() {
+    let spec = text(repo().join("packaging/fedora/fxsound.spec"));
+    let install = shell_commands(spec_section(&spec, "%install"));
+    let files = spec_section(&spec, "%files");
+    for (size, source) in APPLICATION_ICONS {
+        let path = format!("%{{_datadir}}/icons/hicolor/{size}/apps/{NOTIFICATION_ICON}.png");
+        assert!(
+            installs(&install, source, &path),
+            "the spec's %install does not install {source} as {path}"
+        );
+        assert!(
+            files.iter().any(|line| line.trim() == path),
+            "the spec's %files does not list {path}"
+        );
+    }
+}
+
+#[test]
+fn both_debian_builds_install_the_notification_icon_under_the_application_id() {
+    for recipe in ["packaging/debian/rules", "packaging/build-deb.sh"] {
+        let commands = shell_commands(text(repo().join(recipe)).lines());
+        for (size, source) in APPLICATION_ICONS {
+            let path = format!("/usr/share/icons/hicolor/{size}/apps/{NOTIFICATION_ICON}.png");
+            assert!(
+                installs(&commands, source, &path),
+                "{recipe} does not install {source} as {path}"
+            );
+        }
+    }
+    // debian/rules installs into debian/tmp; the .install file is what moves it into the package.
+    let moved = text(repo().join("packaging/debian/fxsound-linux.install"));
+    assert!(
+        moved
+            .lines()
+            .any(|line| line.trim() == "usr/share/icons/hicolor"),
+        "fxsound-linux.install does not carry usr/share/icons/hicolor into the package"
+    );
+}
