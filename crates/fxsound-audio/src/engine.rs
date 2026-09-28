@@ -243,6 +243,7 @@ use crate::lane_dsp::{self, ChainHandover, LaneDsp};
 use crate::per_direction::PerDirection;
 use crate::routes::{self, CardRoutes, Route, RouteList};
 use crate::stranded::Stranded;
+use crate::stream_handover;
 use crate::volume::{self, Debounce, LaneVolume, NodeVolume, PropsUpdate};
 use crate::{
     AEC_SOURCE_NODE_NAME, AudioError, CAPTURE_NODE_NAME, CAPTURE_STREAM_DESCRIPTION,
@@ -1224,6 +1225,9 @@ pub(crate) struct Config {
     /// How long a per-application route nobody uses is kept ([`crate::app_routes::ROUTE_IDLE`]);
     /// shorter in the tests, which would otherwise wait ten seconds to see one go.
     pub(crate) route_idle: Duration,
+    /// The handover's journal ([`crate::stream_handover::journal_file`]); `None` to keep it in
+    /// memory only, which is what the tests do: nothing a test fades may reach the user's file.
+    pub(crate) handover_journal: Option<std::path::PathBuf>,
 }
 
 /// One lane's two PipeWire nodes and everything that must die with them.
@@ -1531,6 +1535,9 @@ enum Bound {
 ///
 /// Every listener is declared before the proxy it hooks, for the reason [`NodeProbe`] gives.
 struct Session {
+    /// The connection application streams' master volume is written through, for a handover
+    /// (`fades`); `None` when it could not be made, and a handover then moves without fading.
+    fade_line: Option<fades::FadeLine>,
     /// The connection the lanes write their own virtual nodes' volume through
     /// ([`adopt_own_node`]), and its registry. A second connection because the server stops
     /// reading a client that sets a param on a node another client owns until that owner answers
@@ -1957,6 +1964,13 @@ struct Shared {
     /// the whole connection — with nothing to show for it but an output lane paced by hand on a
     /// server where that never lets it sleep.
     link_groups_scheduled: Rc<Cell<bool>>,
+    /// The server ramps a stream's master volume, so a handover can fade what it moves
+    /// ([`ramps_volume`]). Learned from the server's core info on every connect, beside
+    /// [`Self::link_groups_scheduled`] and for the same reason a cell, and `false` until then.
+    volume_ramps: Rc<Cell<bool>>,
+    /// The smooth handover of application streams: what is known of their volume, the handover in
+    /// progress and the journal (`fades`, `crate::stream_handover`). Kept across reconnects.
+    fades: fades::Fades,
     /// Wakes the main loop to [`pace_second_node`] the moment an output lane's NODE 1 reports a
     /// state, rather than on the next tick. `None` until [`run`] attaches its receiver — so in
     /// tests, which pace by hand — and then the supervisor alone does the pacing.
@@ -2044,6 +2058,8 @@ impl Shared {
             last_devices: Vec::new(),
             connection_error: None,
             link_groups_scheduled: Rc::new(Cell::new(false)),
+            volume_ramps: Rc::new(Cell::new(false)),
+            fades: fades::Fades::new(None),
             wake: None,
             aec: EchoCancel::new(aec::WEBRTC_LIBRARY),
             headset_warned: None,
@@ -2210,6 +2226,20 @@ fn republish_latency(shared: &mut Shared, direction: DeviceDirection) {
 /// ([`LINK_GROUPS_SCHEDULED_SINCE`]). A version that cannot be read is taken to be older: that
 /// answer, when wrong, costs idle power, where the other would cost the user their sound.
 fn schedules_link_groups(version: &str) -> bool {
+    version_at_least(version, LINK_GROUPS_SCHEDULED_SINCE)
+}
+
+/// Whether a server reporting `version` ramps a stream's master volume
+/// ([`stream_handover::RAMPS_SINCE`]): what a handover fades with. A version that cannot be read is
+/// taken to be older, and its streams are moved as they were before 0.5.0 — with the click, but
+/// without a jump to silence of their own.
+fn ramps_volume(version: &str) -> bool {
+    version_at_least(version, stream_handover::RAMPS_SINCE)
+}
+
+/// Whether `version`, as a server reports it — three numbers, each perhaps followed by more — is
+/// `since` or later. `false` for one that does not read as three numbers.
+fn version_at_least(version: &str, since: (u32, u32, u32)) -> bool {
     let mut parts = version.trim().split('.').map(|part| {
         let digits = part
             .find(|c: char| !c.is_ascii_digit())
@@ -2221,7 +2251,7 @@ fn schedules_link_groups(version: &str) -> bool {
     else {
         return false;
     };
-    (major, minor, micro) >= LINK_GROUPS_SCHEDULED_SINCE
+    (major, minor, micro) >= since
 }
 
 /// The word for a direction in log lines.
@@ -2277,6 +2307,7 @@ pub(crate) fn run(config: Config) {
         output_enabled,
         wireplumber_state,
         route_idle,
+        handover_journal,
     } = config;
 
     pw::init();
@@ -2328,6 +2359,9 @@ pub(crate) fn run(config: Config) {
         start_ranked(&mut state, device_priority);
         start_lanes(&mut state, output_enabled, want_default);
         state.routes.set_idle(route_idle);
+        // Read before the first connection, so a stream met on it that a killed run left at 0 is
+        // found in it ([`fades`]).
+        state.fades = fades::Fades::new(handover_journal);
         if let Some(path) = wireplumber_state {
             state.inherited_volumes = volume::inherited_from(&path);
             for (direction, inherited) in state.inherited_volumes.iter() {
@@ -2350,6 +2384,7 @@ pub(crate) fn run(config: Config) {
     });
 
     let wake_source = attach_wake(mainloop.loop_(), &shared);
+    let fade_clock = fades::attach_clock(mainloop.loop_(), &shared);
 
     // The first attempt is made synchronously so `AudioEngine::start` can report it. Connecting
     // to a socket that is not there fails at `connect(2)`, so this does not delay start-up.
@@ -2381,6 +2416,10 @@ pub(crate) fn run(config: Config) {
     drop(timer);
     drop(control_source);
     drop(wake_source);
+    drop(fade_clock);
+    // A stream a handover left silent gets its volume back while it is still where the handover
+    // left it, before the hand-back moves it again.
+    fades::restore_before_exit(&shared, mainloop.loop_());
     release_defaults_before_exit(&shared, &mainloop);
     close_session(&mut shared.borrow_mut());
     log::info!("FxSound audio thread stopped");
@@ -3122,16 +3161,20 @@ fn connect(
     shared: &Rc<RefCell<Shared>>,
     context: &pw::context::ContextRc,
 ) -> Result<(), AudioError> {
-    let (remote, link_groups_scheduled) = {
+    let (remote, link_groups_scheduled, volume_ramps) = {
         let shared = shared.borrow();
         (
             shared.remote.clone(),
             Rc::clone(&shared.link_groups_scheduled),
+            Rc::clone(&shared.volume_ramps),
         )
     };
     // Whatever the last server was, this one has not said yet.
     link_groups_scheduled.set(false);
+    volume_ramps.set(false);
     let remote_for_volume = remote.clone();
+    let remote_for_fades = remote.clone();
+    let volume_ramps_for_fades = Rc::clone(&volume_ramps);
     let props = remote.map(|name| {
         properties! {
             *pw::keys::REMOTE_NAME => name,
@@ -3161,6 +3204,15 @@ fn connect(
                 }
             );
             link_groups_scheduled.set(scheduled);
+            let ramps = ramps_volume(info.version());
+            if !ramps {
+                log::info!(
+                    "PipeWire {} does not ramp a stream's volume: streams FxSound moves are moved \
+                     without a fade",
+                    info.version()
+                );
+            }
+            volume_ramps.set(ramps);
         })
         .error({
             let shared = Rc::clone(shared);
@@ -3226,6 +3278,15 @@ fn connect(
             }
         };
 
+    let fade_line = fades::fade_line(shared, context, remote_for_fades, volume_ramps_for_fades)
+        .inspect_err(|error| {
+            log::warn!(
+                "could not connect a third time to fade the streams FxSound moves, so they are \
+                 moved without a fade: {error}"
+            );
+        })
+        .ok();
+
     let mut guard = shared.borrow_mut();
     // Everything learned from a server is learned again from this one. The probes went with the
     // last session ([`close_session`]); emptying them here as well means a probe can only ever
@@ -3243,6 +3304,7 @@ fn connect(
     guard.state = State::Connecting;
     guard.barrier = Barrier::Registry;
     guard.session = Some(Session {
+        fade_line,
         _volume_registry_listener: volume_registry_listener,
         _volume_registry: volume_registry,
         _volume_core: volume_core,
@@ -3325,6 +3387,8 @@ fn volume_connection(
 /// its DSP, so whatever comes next — a reconnect, or the end of the thread — finds the lanes as
 /// the user left them.
 fn close_session(shared: &mut Shared) {
+    // A handover in progress goes with the connection; its move does not ([`fades`]).
+    fades::session_closed(shared);
     // The echo canceller first. It is on a connection of its own (`aec`), so nothing here depends
     // on it, but it was loaded for this server and these devices, and it is loaded again for the
     // next ones once the lanes are back. Its source goes from the registry with the rest.
@@ -3502,6 +3566,11 @@ fn supervise(shared: &Rc<RefCell<Shared>>, context: &pw::context::ContextRc) {
         // 4c. A stream that follows a default FxSound holds and was moved onto nothing is moved
         //     onto FxSound again.
         rescue_stranded_streams(&mut guard, now);
+
+        // 4d. The handover: its connection, if an application is holding it, and whatever its
+        //     clock has not woken it for.
+        fades::watch_line(&mut guard, shared, context, now);
+        fades::drive(&mut guard);
 
         // 5. Tell the GUI what changed.
         publish(&mut guard);
@@ -3879,6 +3948,8 @@ fn on_global(
             if let (Some(output), Some(input)) = (node("link.output.node"), node("link.input.node"))
             {
                 guard.stranded.link_appeared(global.id, output, input);
+                // A new link of a stream a handover moved ends its move.
+                fades::link_appeared(&mut guard, output, input);
             }
         }
         pw::types::ObjectType::Client => {
@@ -4167,6 +4238,7 @@ fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
             log::debug!("application stream {id} went");
             retire_probe(&mut guard, id);
             route_pairs::stream_removed(&mut guard, id);
+            fades::stream_removed(&mut guard, id);
             return;
         }
         Some(Tracked::Client) => {
@@ -6999,6 +7071,7 @@ fn published_devices(shared: &Shared) -> Vec<AudioDevice> {
     published
 }
 
+mod fades;
 mod route_pairs;
 
 #[cfg(test)]
@@ -7668,6 +7741,19 @@ mod tests {
         // guessing wrong that way costs idle power, guessing wrong the other way costs the sound.
         for version in ["0.3.65", "0.3.67", "0.2.99", "", "1.6", "pipewire", "x.y.z"] {
             assert!(!schedules_link_groups(version), "{version:?}");
+        }
+    }
+
+    #[test]
+    fn a_handover_fades_only_on_a_server_that_ramps_a_volume_and_moves_as_before_elsewhere() {
+        for version in ["0.3.68", "0.3.85", "1.0.5", "1.6.9", " 1.6.9 ", "1.4.2-rc1"] {
+            assert!(ramps_volume(version), "{version}");
+        }
+        // Debian 12's 0.3.65 and the rest of 0.3.64-0.3.67: a volume written there jumps.
+        for version in [
+            "0.3.64", "0.3.65", "0.3.66", "0.3.67", "", "1.6", "pipewire",
+        ] {
+            assert!(!ramps_volume(version), "{version:?}");
         }
     }
 

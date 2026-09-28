@@ -1350,8 +1350,10 @@ dependencies = [
  "pipewire",
  "pipewire-sys",
  "realfft",
+ "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "toml",
  "triple_buffer",
 ]
 

@@ -68,7 +68,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-mod apps;
+pub(crate) mod apps;
 mod clicks;
 mod policy;
 mod routes;
@@ -592,6 +592,35 @@ impl PrivateGraph {
         Self::node_object(&objects, name)?["info"]["state"]
             .as_str()
             .map(str::to_owned)
+    }
+
+    /// The master volume of the node called `name` — the `volume` of its `Props` — as the server
+    /// holds it. `None` when `pw-dump` is not there to ask; `Some(None)` when the node is not in
+    /// the graph or lists no volume.
+    pub(crate) fn node_volume(&self, name: &str) -> Option<Option<f64>> {
+        let objects = self.dump()?;
+        Some(Self::node_object(&objects, name).and_then(|node| {
+            node["info"]["params"]["Props"]
+                .as_array()?
+                .iter()
+                .find_map(|props| props["volume"].as_f64())
+        }))
+    }
+
+    /// Set the master volume of the node called `name` as a mixer would, with `pw-cli`. `None`
+    /// when the node is not in the graph or the tool is not there or failed.
+    pub(crate) fn set_node_volume(&self, name: &str, volume: f32) -> Option<()> {
+        let id = self.node_id(name)?.to_string();
+        self.tool(
+            "pw-cli",
+            &[
+                "set-param",
+                &id,
+                "Props",
+                &format!("{{ volume: {volume} }}"),
+            ],
+        )
+        .map(drop)
     }
 
     /// Wait until `name` runs (`running`) or does not. `Ok` with the state it settled in, `Err`

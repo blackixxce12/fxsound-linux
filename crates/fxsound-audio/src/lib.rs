@@ -173,6 +173,7 @@ pub mod locale;
 mod per_direction;
 mod routes;
 mod stranded;
+mod stream_handover;
 mod volume;
 
 use std::thread::JoinHandle;
@@ -603,6 +604,7 @@ impl AudioEngine {
             aec::WEBRTC_LIBRARY,
             volume::wireplumber_state_file(),
             app_routes::ROUTE_IDLE,
+            stream_handover::journal_file(),
         )
     }
 
@@ -621,6 +623,7 @@ impl AudioEngine {
             aec::WEBRTC_LIBRARY,
             None,
             app_routes::ROUTE_IDLE,
+            None,
         )
     }
 
@@ -638,6 +641,7 @@ impl AudioEngine {
             aec::WEBRTC_LIBRARY,
             None,
             idle,
+            None,
         )
     }
 
@@ -655,6 +659,7 @@ impl AudioEngine {
             aec::WEBRTC_LIBRARY,
             wireplumber_state,
             app_routes::ROUTE_IDLE,
+            None,
         )
     }
 
@@ -674,6 +679,7 @@ impl AudioEngine {
             library,
             None,
             app_routes::ROUTE_IDLE,
+            None,
         )
     }
 
@@ -683,6 +689,7 @@ impl AudioEngine {
         aec_library: &'static str,
         wireplumber_state: Option<std::path::PathBuf>,
         route_idle: Duration,
+        handover_journal: Option<std::path::PathBuf>,
     ) -> Result<EngineHandle, AudioError> {
         // Whether the *socket* exists is left to `pw_context_connect`, which resolves
         // `remote.name` itself and reports the failure precisely. What has to be checked first is
@@ -710,6 +717,7 @@ impl AudioEngine {
         config.output_enabled = output_enabled;
         config.wireplumber_state = wireplumber_state;
         config.route_idle = route_idle;
+        config.handover_journal = handover_journal;
         let join = std::thread::Builder::new()
             .name("fxsound-audio".to_owned())
             .spawn(move || engine::run(config))
@@ -830,6 +838,7 @@ impl EngineHandle {
             output_enabled: true,
             wireplumber_state: None,
             route_idle: app_routes::ROUTE_IDLE,
+            handover_journal: None,
         };
         let handle = Self {
             engine: AudioEngine {
