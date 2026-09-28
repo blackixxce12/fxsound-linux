@@ -111,206 +111,210 @@ fn tools_and_a_tone(graph: &PrivateGraph, tone: Option<&str>, what: &str) -> boo
 
 #[test]
 fn a_microphone_runs_only_while_something_records_from_fxsound_input() {
-    let Some(graph) = PrivateGraph::start("u19") else {
-        return;
-    };
-    if !tools_and_a_tone(&graph, Some("t_tone"), "the microphone's idle") {
-        return;
-    }
-    let (mut handle, _said) = engine_on_the_microphone(&graph, "t_tone");
-    assert_eq!(
-        graph.node_prop(CAPTURE_NODE_NAME, "node.passive"),
-        Some(Some("true".to_owned())),
-        "the capture stream should be passive on a server that runs a link-group together"
-    );
-    // An application that will record from FxSound (Input), running already — on its own clock,
-    // as a real one runs on its device's — and not recording from it yet.
-    let recorder = graph
-        .clocked_recorder("t_recorder")
-        .expect("a recorder for FxSound (Input)");
-
-    // Linked to its microphone, and nobody recording: in 0.3.0 that ran the microphone for as long
-    // as FxSound was open. Now neither it nor the pair runs, and the lane hears nothing.
-    assert_eq!(
-        none_runs_for_a_while(&graph, &["t_tone", CAPTURE_NODE_NAME, SOURCE_NODE_NAME]),
-        Ok(()),
-        "the microphone was held open with nothing recording from FxSound (Input)"
-    );
-    assert!(
-        handle.meters(DeviceDirection::Input).input_peak < 1e-3,
-        "the input lane heard the microphone with nothing recording from it"
-    );
-
-    // It records from FxSound (Input): the source runs, the input lane's group runs the capture
-    // stream with it, and the capture stream's link runs the microphone — and what the application
-    // is handed is the processed microphone.
-    let from = recorder.written();
-    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recorder.name));
-    for node in [SOURCE_NODE_NAME, CAPTURE_NODE_NAME, "t_tone"] {
+    again_if_a_tone_ran_dry(|| {
+        let Some(graph) = PrivateGraph::start("u19") else {
+            return;
+        };
+        if !tools_and_a_tone(&graph, Some("t_tone"), "the microphone's idle") {
+            return;
+        }
+        let (mut handle, _said) = engine_on_the_microphone(&graph, "t_tone");
         assert_eq!(
-            graph.runs_until(node, true).map(drop),
-            Ok(()),
-            "{node} should run while something records from FxSound (Input)"
+            graph.node_prop(CAPTURE_NODE_NAME, "node.passive"),
+            Some(Some("true".to_owned())),
+            "the capture stream should be passive on a server that runs a link-group together"
         );
-    }
-    assert!(
-        meters_until(&mut handle, DeviceDirection::Input, |m| m.input_peak > 0.1).is_some(),
-        "the tone never reached the input lane"
-    );
-    assert!(
-        recorder.hears_since(from),
-        "the recorder was not handed the microphone"
-    );
+        // An application that will record from FxSound (Input), running already — on its own clock,
+        // as a real one runs on its device's — and not recording from it yet.
+        let recorder = graph
+            .clocked_recorder("t_recorder")
+            .expect("a recorder for FxSound (Input)");
 
-    // It stops recording, and the microphone goes idle with the pair.
-    assert!(graph.unlink_nodes(SOURCE_NODE_NAME, &recorder.name));
-    for node in [SOURCE_NODE_NAME, CAPTURE_NODE_NAME, "t_tone"] {
+        // Linked to its microphone, and nobody recording: in 0.3.0 that ran the microphone for as long
+        // as FxSound was open. Now neither it nor the pair runs, and the lane hears nothing.
         assert_eq!(
-            graph.runs_until(node, false).map(drop),
+            none_runs_for_a_while(&graph, &["t_tone", CAPTURE_NODE_NAME, SOURCE_NODE_NAME]),
             Ok(()),
-            "{node} should stop once nothing records from FxSound (Input)"
+            "the microphone was held open with nothing recording from FxSound (Input)"
         );
-    }
-    assert_eq!(
-        none_runs_for_a_while(&graph, &["t_tone", CAPTURE_NODE_NAME]),
-        Ok(()),
-        "the microphone woke again with nothing recording"
-    );
+        assert!(
+            handle.meters(DeviceDirection::Input).input_peak < 1e-3,
+            "the input lane heard the microphone with nothing recording from it"
+        );
 
-    // And the next recording wakes it again, with the pair that was built for the first.
-    let before = graph.our_nodes().expect("pw-dump answered a moment ago");
-    let from = recorder.written();
-    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recorder.name));
-    for node in [SOURCE_NODE_NAME, CAPTURE_NODE_NAME, "t_tone"] {
-        assert_eq!(
-            graph.runs_until(node, true).map(drop),
-            Ok(()),
-            "{node} should wake for the next recording"
+        // It records from FxSound (Input): the source runs, the input lane's group runs the capture
+        // stream with it, and the capture stream's link runs the microphone — and what the application
+        // is handed is the processed microphone.
+        let from = recorder.written();
+        assert!(graph.link_nodes(SOURCE_NODE_NAME, &recorder.name));
+        for node in [SOURCE_NODE_NAME, CAPTURE_NODE_NAME, "t_tone"] {
+            assert_eq!(
+                graph.runs_until(node, true).map(drop),
+                Ok(()),
+                "{node} should run while something records from FxSound (Input)"
+            );
+        }
+        assert!(
+            meters_until(&mut handle, DeviceDirection::Input, |m| m.input_peak > 0.1).is_some(),
+            "the tone never reached the input lane"
         );
-    }
-    assert!(
-        recorder.hears_since(from),
-        "the next recording was not handed the microphone"
-    );
-    assert_eq!(
-        graph.our_nodes(),
-        Some(before),
-        "sleeping and waking is the server's business: nothing was rebuilt"
-    );
-    handle.shutdown();
+        assert!(
+            recorder.hears_since(from),
+            "the recorder was not handed the microphone"
+        );
+
+        // It stops recording, and the microphone goes idle with the pair.
+        assert!(graph.unlink_nodes(SOURCE_NODE_NAME, &recorder.name));
+        for node in [SOURCE_NODE_NAME, CAPTURE_NODE_NAME, "t_tone"] {
+            assert_eq!(
+                graph.runs_until(node, false).map(drop),
+                Ok(()),
+                "{node} should stop once nothing records from FxSound (Input)"
+            );
+        }
+        assert_eq!(
+            none_runs_for_a_while(&graph, &["t_tone", CAPTURE_NODE_NAME]),
+            Ok(()),
+            "the microphone woke again with nothing recording"
+        );
+
+        // And the next recording wakes it again, with the pair that was built for the first.
+        let before = graph.our_nodes().expect("pw-dump answered a moment ago");
+        let from = recorder.written();
+        assert!(graph.link_nodes(SOURCE_NODE_NAME, &recorder.name));
+        for node in [SOURCE_NODE_NAME, CAPTURE_NODE_NAME, "t_tone"] {
+            assert_eq!(
+                graph.runs_until(node, true).map(drop),
+                Ok(()),
+                "{node} should wake for the next recording"
+            );
+        }
+        assert!(
+            recorder.hears_since(from),
+            "the next recording was not handed the microphone"
+        );
+        assert_eq!(
+            graph.our_nodes(),
+            Some(before),
+            "sleeping and waking is the server's business: nothing was rebuilt"
+        );
+        handle.shutdown();
+    });
 }
 
 #[test]
 fn holding_the_microphone_awake_runs_it_with_nobody_recording_and_lets_it_sleep_after() {
-    let Some(graph) = PrivateGraph::start("keepawake") else {
-        return;
-    };
-    if !tools_and_a_tone(&graph, Some("t_tone"), "holding the microphone awake") {
-        return;
-    }
-    let (mut handle, mut said) = engine_on_the_microphone(&graph, "t_tone");
-    assert_eq!(
-        none_runs_for_a_while(&graph, &["t_tone", CAPTURE_NODE_NAME]),
-        Ok(()),
-        "nothing records yet"
-    );
-
-    // The calibration wizard opens: the engine records its own source.
-    handle.send(UiToAudio::KeepInputAwake(true));
-    let recorder =
-        graph.nodes_until(|nodes| nodes.iter().any(|(name, _)| *name == KEEP_AWAKE_NODE_NAME));
-    assert!(
-        matches!(recorder, Some(Ok(_))),
-        "the engine never made a stream to hold the microphone awake: {recorder:?}"
-    );
-    for (key, want) in [
-        ("media.class", Some("Stream/Input/Audio")),
-        ("target.object", Some(SOURCE_NODE_NAME)),
-        ("node.passive", Some("false")),
-        ("node.link-group", None),
-        ("stream.monitor", None),
-    ] {
+    again_if_a_tone_ran_dry(|| {
+        let Some(graph) = PrivateGraph::start("keepawake") else {
+            return;
+        };
+        if !tools_and_a_tone(&graph, Some("t_tone"), "holding the microphone awake") {
+            return;
+        }
+        let (mut handle, mut said) = engine_on_the_microphone(&graph, "t_tone");
         assert_eq!(
-            graph.node_prop(KEEP_AWAKE_NODE_NAME, key),
-            Some(want.map(str::to_owned)),
-            "{KEEP_AWAKE_NODE_NAME}'s {key}"
-        );
-    }
-    // WirePlumber links it to its target; here, by hand. And, since nothing here is a real
-    // device, a clock is linked into it too, to drive what it records as a device would
-    // ([`PrivateGraph::clocked_recorder`] says why the tone must not).
-    assert!(
-        graph
-            .configure_ports(KEEP_AWAKE_NODE_NAME, "Input", &["FL", "FR"])
-            .is_some()
-    );
-    assert!(graph.add_clock().is_some(), "the clock never appeared");
-    assert!(graph.link_nodes(CLOCK, KEEP_AWAKE_NODE_NAME));
-    assert!(graph.link_nodes(SOURCE_NODE_NAME, KEEP_AWAKE_NODE_NAME));
-    for node in [SOURCE_NODE_NAME, CAPTURE_NODE_NAME, "t_tone"] {
-        assert_eq!(
-            graph.runs_until(node, true).map(drop),
+            none_runs_for_a_while(&graph, &["t_tone", CAPTURE_NODE_NAME]),
             Ok(()),
-            "{node} should run while the microphone is held awake"
+            "nothing records yet"
         );
-    }
-    assert!(
-        meters_until(&mut handle, DeviceDirection::Input, |m| m.input_peak > 0.1).is_some(),
-        "the microphone held awake never reached the input lane's meters"
-    );
 
-    // Another microphone while it is held: a new pair, and a recorder of its own with it — the
-    // old one's link went with the old source, and WirePlumber never relinks a stream like it.
-    let first = graph
-        .our_nodes()
-        .and_then(|nodes| serial_of(&nodes, KEEP_AWAKE_NODE_NAME))
-        .expect("the recorder is in the graph");
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_mic".to_owned(),
-        direction: DeviceDirection::Input,
-    });
-    assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
-    let again = graph.nodes_until(|nodes| {
-        serial_of(nodes, KEEP_AWAKE_NODE_NAME).is_some_and(|serial| serial != first)
-    });
-    assert!(
-        matches!(again, Some(Ok(_))),
-        "the new pair was not held awake: {again:?}"
-    );
-    assert_eq!(
-        graph
-            .node_prop(KEEP_AWAKE_NODE_NAME, "target.object")
-            .flatten(),
-        Some(SOURCE_NODE_NAME.to_owned())
-    );
+        // The calibration wizard opens: the engine records its own source.
+        handle.send(UiToAudio::KeepInputAwake(true));
+        let recorder =
+            graph.nodes_until(|nodes| nodes.iter().any(|(name, _)| *name == KEEP_AWAKE_NODE_NAME));
+        assert!(
+            matches!(recorder, Some(Ok(_))),
+            "the engine never made a stream to hold the microphone awake: {recorder:?}"
+        );
+        for (key, want) in [
+            ("media.class", Some("Stream/Input/Audio")),
+            ("target.object", Some(SOURCE_NODE_NAME)),
+            ("node.passive", Some("false")),
+            ("node.link-group", None),
+            ("stream.monitor", None),
+        ] {
+            assert_eq!(
+                graph.node_prop(KEEP_AWAKE_NODE_NAME, key),
+                Some(want.map(str::to_owned)),
+                "{KEEP_AWAKE_NODE_NAME}'s {key}"
+            );
+        }
+        // WirePlumber links it to its target; here, by hand. And, since nothing here is a real
+        // device, a clock is linked into it too, to drive what it records as a device would
+        // ([`PrivateGraph::clocked_recorder`] says why the tone must not).
+        assert!(
+            graph
+                .configure_ports(KEEP_AWAKE_NODE_NAME, "Input", &["FL", "FR"])
+                .is_some()
+        );
+        assert!(graph.add_clock().is_some(), "the clock never appeared");
+        assert!(graph.link_nodes(CLOCK, KEEP_AWAKE_NODE_NAME));
+        assert!(graph.link_nodes(SOURCE_NODE_NAME, KEEP_AWAKE_NODE_NAME));
+        for node in [SOURCE_NODE_NAME, CAPTURE_NODE_NAME, "t_tone"] {
+            assert_eq!(
+                graph.runs_until(node, true).map(drop),
+                Ok(()),
+                "{node} should run while the microphone is held awake"
+            );
+        }
+        assert!(
+            meters_until(&mut handle, DeviceDirection::Input, |m| m.input_peak > 0.1).is_some(),
+            "the microphone held awake never reached the input lane's meters"
+        );
 
-    // Back on the tone, the wizard closes: the recorder goes, and nothing keeps the microphone
-    // from sleeping.
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_tone".to_owned(),
-        direction: DeviceDirection::Input,
+        // Another microphone while it is held: a new pair, and a recorder of its own with it — the
+        // old one's link went with the old source, and WirePlumber never relinks a stream like it.
+        let first = graph
+            .our_nodes()
+            .and_then(|nodes| serial_of(&nodes, KEEP_AWAKE_NODE_NAME))
+            .expect("the recorder is in the graph");
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_mic".to_owned(),
+            direction: DeviceDirection::Input,
+        });
+        assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
+        let again = graph.nodes_until(|nodes| {
+            serial_of(nodes, KEEP_AWAKE_NODE_NAME).is_some_and(|serial| serial != first)
+        });
+        assert!(
+            matches!(again, Some(Ok(_))),
+            "the new pair was not held awake: {again:?}"
+        );
+        assert_eq!(
+            graph
+                .node_prop(KEEP_AWAKE_NODE_NAME, "target.object")
+                .flatten(),
+            Some(SOURCE_NODE_NAME.to_owned())
+        );
+
+        // Back on the tone, the wizard closes: the recorder goes, and nothing keeps the microphone
+        // from sleeping.
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_tone".to_owned(),
+            direction: DeviceDirection::Input,
+        });
+        assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
+        handle.send(UiToAudio::KeepInputAwake(false));
+        let gone =
+            graph.nodes_until(|nodes| !nodes.iter().any(|(name, _)| *name == KEEP_AWAKE_NODE_NAME));
+        assert!(
+            matches!(gone, Some(Ok(_))),
+            "the recorder outlived the wish: {gone:?}"
+        );
+        for (node, direction, positions) in [
+            (CAPTURE_NODE_NAME, "Input", &["FL", "FR"][..]),
+            (SOURCE_NODE_NAME, "Output", &["FL", "FR"][..]),
+        ] {
+            assert!(graph.configure_ports(node, direction, positions).is_some());
+        }
+        assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
+        assert_eq!(
+            none_runs_for_a_while(&graph, &["t_tone", CAPTURE_NODE_NAME, SOURCE_NODE_NAME]),
+            Ok(()),
+            "the microphone was held open after it was let go of"
+        );
+        handle.shutdown();
     });
-    assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
-    handle.send(UiToAudio::KeepInputAwake(false));
-    let gone =
-        graph.nodes_until(|nodes| !nodes.iter().any(|(name, _)| *name == KEEP_AWAKE_NODE_NAME));
-    assert!(
-        matches!(gone, Some(Ok(_))),
-        "the recorder outlived the wish: {gone:?}"
-    );
-    for (node, direction, positions) in [
-        (CAPTURE_NODE_NAME, "Input", &["FL", "FR"][..]),
-        (SOURCE_NODE_NAME, "Output", &["FL", "FR"][..]),
-    ] {
-        assert!(graph.configure_ports(node, direction, positions).is_some());
-    }
-    assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
-    assert_eq!(
-        none_runs_for_a_while(&graph, &["t_tone", CAPTURE_NODE_NAME, SOURCE_NODE_NAME]),
-        Ok(()),
-        "the microphone was held open after it was let go of"
-    );
-    handle.shutdown();
 }
 
 /// Whether WirePlumber 0.5.17 would switch the headset whose loopback microphone is `loopback` to
@@ -441,195 +445,201 @@ fn switch_settles_on(graph: &PrivateGraph, want: bool) -> Option<bool> {
 
 #[test]
 fn a_headsets_microphone_held_awake_is_switched_to_its_call_profile_as_a_call_would_switch_it() {
-    let Some(graph) = PrivateGraph::start("hfp") else {
-        return;
-    };
-    if !tools_and_a_tone(&graph, None, "the headset's call profile") {
-        return;
-    }
-    // WirePlumber 0.5's microphone for a headset, as `create-loopback-node.lua` marks it — with a
-    // tone behind it, where the real one has the headset's SCO source.
-    if graph
-        .add_adapter(
-            LOOPBACK,
-            &format!(
-                "factory.name = audiotestsrc node.name = \"{LOOPBACK}\" \
+    again_if_a_tone_ran_dry(|| {
+        let Some(graph) = PrivateGraph::start("hfp") else {
+            return;
+        };
+        if !tools_and_a_tone(&graph, None, "the headset's call profile") {
+            return;
+        }
+        // WirePlumber 0.5's microphone for a headset, as `create-loopback-node.lua` marks it — with a
+        // tone behind it, where the real one has the headset's SCO source.
+        if graph
+            .add_adapter(
+                LOOPBACK,
+                &format!(
+                    "factory.name = audiotestsrc node.name = \"{LOOPBACK}\" \
                  node.description = \"Test Headset\" media.class = Audio/Source \
                  bluez5.loopback = true device.id = 4242 priority.session = 2010"
+                ),
+            )
+            .is_none()
+        {
+            skip(concat!(
+                "the headset's microphone never appeared (is audiotestsrc installed?), ",
+                "so the headset's call profile was not checked"
+            ));
+            return;
+        }
+        let (handle, _said) = engine_on_the_microphone(&graph, LOOPBACK);
+
+        // With nothing recording from FxSound (Input), the capture stream is linked to the headset and
+        // does not run it. Before it was passive it did, and the headset stayed in A2DP all the same:
+        // the script passes over a stream in a link-group, and the input lane's microphone recorded
+        // the silence of a loopback with no call profile behind it.
+        assert_eq!(
+            none_runs_for_a_while(&graph, &[LOOPBACK]),
+            Ok(()),
+            "the headset's microphone was held open with nothing recording from FxSound (Input)"
+        );
+        assert_eq!(
+            wireplumber_would_switch_to_headset(&graph, LOOPBACK),
+            Some(false)
+        );
+
+        // The microphone meters open.
+        handle.send(UiToAudio::KeepInputAwake(true));
+        assert!(
+            matches!(
+                graph.nodes_until(|nodes| nodes
+                    .iter()
+                    .any(|(name, _)| *name == KEEP_AWAKE_NODE_NAME)),
+                Some(Ok(_))
             ),
-        )
-        .is_none()
-    {
-        skip(concat!(
-            "the headset's microphone never appeared (is audiotestsrc installed?), ",
-            "so the headset's call profile was not checked"
-        ));
-        return;
-    }
-    let (handle, _said) = engine_on_the_microphone(&graph, LOOPBACK);
+            "the engine never made a stream to hold the microphone awake"
+        );
+        assert!(
+            graph
+                .configure_ports(KEEP_AWAKE_NODE_NAME, "Input", &["FL", "FR"])
+                .is_some()
+        );
+        assert!(graph.link_nodes(SOURCE_NODE_NAME, KEEP_AWAKE_NODE_NAME));
+        assert_eq!(
+            switch_settles_on(&graph, true),
+            Some(true),
+            "WirePlumber would leave the headset in A2DP, and its microphone silent"
+        );
 
-    // With nothing recording from FxSound (Input), the capture stream is linked to the headset and
-    // does not run it. Before it was passive it did, and the headset stayed in A2DP all the same:
-    // the script passes over a stream in a link-group, and the input lane's microphone recorded
-    // the silence of a loopback with no call profile behind it.
-    assert_eq!(
-        none_runs_for_a_while(&graph, &[LOOPBACK]),
-        Ok(()),
-        "the headset's microphone was held open with nothing recording from FxSound (Input)"
-    );
-    assert_eq!(
-        wireplumber_would_switch_to_headset(&graph, LOOPBACK),
-        Some(false)
-    );
+        // They close: back to A2DP, as WirePlumber restores it two seconds after the last recorder.
+        handle.send(UiToAudio::KeepInputAwake(false));
+        assert_eq!(
+            switch_settles_on(&graph, false),
+            Some(true),
+            "the headset would be kept in its call profile after the meters closed"
+        );
 
-    // The microphone meters open.
-    handle.send(UiToAudio::KeepInputAwake(true));
-    assert!(
-        matches!(
-            graph.nodes_until(|nodes| nodes.iter().any(|(name, _)| *name == KEEP_AWAKE_NODE_NAME)),
-            Some(Ok(_))
-        ),
-        "the engine never made a stream to hold the microphone awake"
-    );
-    assert!(
-        graph
-            .configure_ports(KEEP_AWAKE_NODE_NAME, "Input", &["FL", "FR"])
-            .is_some()
-    );
-    assert!(graph.link_nodes(SOURCE_NODE_NAME, KEEP_AWAKE_NODE_NAME));
-    assert_eq!(
-        switch_settles_on(&graph, true),
-        Some(true),
-        "WirePlumber would leave the headset in A2DP, and its microphone silent"
-    );
-
-    // They close: back to A2DP, as WirePlumber restores it two seconds after the last recorder.
-    handle.send(UiToAudio::KeepInputAwake(false));
-    assert_eq!(
-        switch_settles_on(&graph, false),
-        Some(true),
-        "the headset would be kept in its call profile after the meters closed"
-    );
-
-    // An application recording from FxSound (Input) is what switched it before the meters did, and
-    // what switches it still: the same walk, through the source's group, finds the headset.
-    // Recording from nothing else, as a call does: the script follows a stream's first link only,
-    // so a recorder that also took a clock's monitor, as the recorders elsewhere here do, would
-    // not be what a call looks like to it.
-    let call = graph
-        .record_from(SOURCE_NODE_NAME, "t_call")
-        .expect("a recorder on FxSound (Input)");
-    assert_eq!(
-        switch_settles_on(&graph, true),
-        Some(true),
-        "a call recording from FxSound (Input) would not switch the headset"
-    );
-    drop(call);
-    handle.shutdown();
+        // An application recording from FxSound (Input) is what switched it before the meters did, and
+        // what switches it still: the same walk, through the source's group, finds the headset.
+        // Recording from nothing else, as a call does: the script follows a stream's first link only,
+        // so a recorder that also took a clock's monitor, as the recorders elsewhere here do, would
+        // not be what a call looks like to it.
+        let call = graph
+            .record_from(SOURCE_NODE_NAME, "t_call")
+            .expect("a recorder on FxSound (Input)");
+        assert_eq!(
+            switch_settles_on(&graph, true),
+            Some(true),
+            "a call recording from FxSound (Input) would not switch the headset"
+        );
+        drop(call);
+        handle.shutdown();
+    });
 }
 
 #[test]
 fn both_lanes_fall_silent_while_the_system_sleeps_and_are_heard_the_moment_they_are_attached_again()
 {
-    let Some(graph) = PrivateGraph::start("u13") else {
-        return;
-    };
-    if !tools_and_a_tone(&graph, Some("t_tone"), "the sleep's silence") {
-        return;
-    }
-    let (mut handle, mut said) = engine_on_the_microphone(&graph, "t_tone");
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_stereo".to_owned(),
-        direction: DeviceDirection::Output,
-    });
-    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
-    for (node, direction, positions) in [
-        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
-        (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
-    ] {
-        assert!(
-            graph.configure_ports(node, direction, positions).is_some(),
-            "{node} was not given ports"
-        );
-    }
-    assert!(
-        graph
-            .configure_monitored_ports("t_stereo", &["FL", "FR"])
-            .is_some(),
-        "the speakers were not given ports and a monitor"
-    );
-    // The tone plays through the music lane into the speakers, whose monitor is recorded, and is
-    // recorded from FxSound (Input) through the voice lane.
-    assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
-    assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
-    let speakers = graph
-        .record_from("t_stereo", "t_speakers")
-        .expect("a recorder on the speakers' monitor");
-    let recording = graph
-        .clocked_recorder("t_recorder")
-        .expect("a recorder for FxSound (Input)");
-    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
-    let both = [&speakers, &recording];
-    for recorder in both {
-        assert!(
-            recorder.hears_since(0),
-            "{} heard nothing before the sleep",
-            recorder.name
-        );
-    }
-    let before = graph.our_nodes().expect("pw-dump answered a moment ago");
-
-    // The system is about to sleep. Within a block or two, both lanes hand on silence — the
-    // chains still running under it, the graph as it was.
-    handle.send(UiToAudio::SystemSleeping(true));
-    std::thread::sleep(Duration::from_millis(300));
-    for recorder in both {
-        let from = recorder.written();
-        let peak = recorder.heard_since(from, HEARD);
-        assert_eq!(
-            peak,
-            Some(0.0),
-            "{} heard something while the system slept",
-            recorder.name
-        );
-    }
-    let asleep = handle.meters(DeviceDirection::Input);
-    assert!(
-        asleep.input_peak > 0.1,
-        "the voice chain stopped following the microphone: {asleep:?}"
-    );
-
-    // It wakes. Both lanes' devices are there, their rules find them attached already, and both
-    // are heard again on the tick after — long before the two seconds a lane waiting for its
-    // device is given.
-    let marks = both.map(Recorder::written);
-    let woke = Instant::now();
-    handle.send(UiToAudio::SystemSleeping(false));
-    for (recorder, from) in both.into_iter().zip(marks) {
-        let deadline = woke + engine::WAKE_MUTE;
-        let heard = loop {
-            let (peak, _) = recorder.peak_since(from);
-            if peak > 0.1 {
-                break Some(woke.elapsed());
-            }
-            if Instant::now() >= deadline {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+    again_if_a_tone_ran_dry(|| {
+        let Some(graph) = PrivateGraph::start("u13") else {
+            return;
         };
-        println!("{} heard again {heard:?} after the wake", recorder.name);
+        if !tools_and_a_tone(&graph, Some("t_tone"), "the sleep's silence") {
+            return;
+        }
+        let (mut handle, mut said) = engine_on_the_microphone(&graph, "t_tone");
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_stereo".to_owned(),
+            direction: DeviceDirection::Output,
+        });
+        assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+        for (node, direction, positions) in [
+            (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+            (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
+        ] {
+            assert!(
+                graph.configure_ports(node, direction, positions).is_some(),
+                "{node} was not given ports"
+            );
+        }
         assert!(
-            heard.is_some(),
-            "{} was not heard again before the wake's mute ran out",
-            recorder.name
+            graph
+                .configure_monitored_ports("t_stereo", &["FL", "FR"])
+                .is_some(),
+            "the speakers were not given ports and a monitor"
         );
-    }
-    assert_eq!(
-        graph.our_nodes(),
-        Some(before),
-        "a wake with every device where it was rebuilds nothing"
-    );
-    handle.shutdown();
+        // The tone plays through the music lane into the speakers, whose monitor is recorded, and is
+        // recorded from FxSound (Input) through the voice lane.
+        assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
+        assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
+        let speakers = graph
+            .record_from("t_stereo", "t_speakers")
+            .expect("a recorder on the speakers' monitor");
+        let recording = graph
+            .clocked_recorder("t_recorder")
+            .expect("a recorder for FxSound (Input)");
+        assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
+        let both = [&speakers, &recording];
+        for recorder in both {
+            assert!(
+                recorder.hears_since(0),
+                "{} heard nothing before the sleep",
+                recorder.name
+            );
+        }
+        let before = graph.our_nodes().expect("pw-dump answered a moment ago");
+
+        // The system is about to sleep. Within a block or two, both lanes hand on silence — the
+        // chains still running under it, the graph as it was.
+        handle.send(UiToAudio::SystemSleeping(true));
+        std::thread::sleep(Duration::from_millis(300));
+        for recorder in both {
+            let from = recorder.written();
+            let peak = recorder.heard_since(from, HEARD);
+            assert_eq!(
+                peak,
+                Some(0.0),
+                "{} heard something while the system slept",
+                recorder.name
+            );
+        }
+        let asleep = handle.meters(DeviceDirection::Input);
+        assert!(
+            asleep.input_peak > 0.1,
+            "the voice chain stopped following the microphone: {asleep:?}"
+        );
+
+        // It wakes. Both lanes' devices are there, their rules find them attached already, and both
+        // are heard again on the tick after — long before the two seconds a lane waiting for its
+        // device is given.
+        let marks = both.map(Recorder::written);
+        let woke = Instant::now();
+        handle.send(UiToAudio::SystemSleeping(false));
+        for (recorder, from) in both.into_iter().zip(marks) {
+            let deadline = woke + engine::WAKE_MUTE;
+            let heard = loop {
+                let (peak, _) = recorder.peak_since(from);
+                if peak > 0.1 {
+                    break Some(woke.elapsed());
+                }
+                if Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            println!("{} heard again {heard:?} after the wake", recorder.name);
+            assert!(
+                heard.is_some(),
+                "{} was not heard again before the wake's mute ran out",
+                recorder.name
+            );
+        }
+        assert_eq!(
+            graph.our_nodes(),
+            Some(before),
+            "a wake with every device where it was rebuilds nothing"
+        );
+        handle.shutdown();
+    });
 }
 
 #[test]
