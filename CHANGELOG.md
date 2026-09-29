@@ -76,11 +76,23 @@ All notable changes to the FxSound Linux port. The format follows
   FxSound's own lane, moving to the picked device after it, still clicks the application that has
   just arrived there, at −23 to −32 dBFS. It changes WirePlumber's policy for every application, so
   it is an option: it needs WirePlumber 0.5 or newer, WirePlumber reads it when it starts —
-  *Restart WirePlumber* is offered, and asks first — and unticking takes it away again.
-  WirePlumber loads it as an optional component, which it skips rather than stop over when it
-  cannot load it. An application closed in the tenth of a second the script holds it silent starts
-  again at its own volume: WirePlumber, which keeps each application's volume for its next start,
-  never keeps the script's silence.
+  *Restart WirePlumber* is offered, asks first, and restarts it without holding up the window —
+  and unticking takes it away again. WirePlumber loads it as an optional component, which it skips
+  rather than stop over when it cannot load it. An application closed in the tenth of a second the
+  script holds it silent starts again at its own volume: WirePlumber, which keeps each
+  application's volume for its next start, never keeps the script's silence, nor a point of its
+  fades that PipeWire's converter reported on the way. Since the converter may never report the
+  end of a fade, the script says the volume once more when its fade back is over, until PipeWire
+  shows it; otherwise an application could stay silent, or 20 dB down, while every mixer said
+  100 %. While the script holds an application it says so in PipeWire's `default` metadata
+  (`fxsound.held`), and FxSound's own fade leaves that application to it. An application with a
+  libpipewire of its own older than 0.3.68 — from an older Flatpak runtime, say — is moved without
+  a fade, by the script and by FxSound alike: its converter has no ramp, and would jump to silence
+  and back, two clicks for one. FxSound, taking the default back after the desktop's pick, leaves
+  out of its own fade an application WirePlumber has not moved yet, which the script fades if
+  WirePlumber still moves it; and the script gives an application whose new link failed its volume
+  back only once it is linked again. Before, either clicked at −18 to −38 dBFS on about one claim
+  in twenty in the click test.
 - **Settings keep what a later version wrote.** A key of `settings.toml` this version does not
   know is written back as it was, so going back a version and up again keeps the newer version's
   settings. 0.4.0 does not keep them: after a downgrade to 0.4.0 its next save drops the keys 0.5.0
@@ -118,7 +130,8 @@ All notable changes to the FxSound Linux port. The format follows
   recording application at about one power switch in a hundred. FxSound makes it rarer, and
   cannot end it. An application given a preset of its own, or losing it, is moved the same way,
   where it clicked as loud as −5 dBFS, and the preset's own reverb tail fades out rather than
-  stopping. PipeWire older than 0.3.68 has no such fade, and moves them as before. Should FxSound
+  stopping. PipeWire older than 0.3.68 has no such fade, and moves them as before — the server's,
+  or an application's own libpipewire, whose converter does the fade. Should FxSound
   be killed within that tenth of a second, its next start gives the application its volume back
   (`~/.local/state/fxsound/handover.toml`).
 - **Changing the device no longer clicks.** A lane moved to another device took FxSound's own

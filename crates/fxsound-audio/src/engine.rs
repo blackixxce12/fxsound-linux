@@ -2472,21 +2472,29 @@ fn ramps_volume(version: &str) -> bool {
     version_at_least(version, stream_handover::RAMPS_SINCE)
 }
 
+/// Whether a client whose libpipewire is `version` (its `core.version`) ramps its streams' master
+/// volume: the audio converter in front of each of its streams is its own
+/// (`stream_handover`, "A stream without the ramp"). `None` for a version that cannot be read, of
+/// which the server's word is taken instead.
+fn client_ramps_volume(version: &str) -> Option<bool> {
+    read_version(version).map(|version| version >= stream_handover::RAMPS_SINCE)
+}
+
 /// Whether `version`, as a server reports it — three numbers, each perhaps followed by more — is
 /// `since` or later. `false` for one that does not read as three numbers.
 fn version_at_least(version: &str, since: (u32, u32, u32)) -> bool {
+    read_version(version).is_some_and(|version| version >= since)
+}
+
+/// `version` as three numbers, each perhaps followed by more; `None` when it does not read so.
+fn read_version(version: &str) -> Option<(u32, u32, u32)> {
     let mut parts = version.trim().split('.').map(|part| {
         let digits = part
             .find(|c: char| !c.is_ascii_digit())
             .map_or(part, |end| &part[..end]);
         digits.parse::<u32>().ok()
     });
-    let (Some(Some(major)), Some(Some(minor)), Some(Some(micro))) =
-        (parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    (major, minor, micro) >= since
+    Some((parts.next()??, parts.next()??, parts.next()??))
 }
 
 /// The word for a direction in log lines.
@@ -4234,6 +4242,7 @@ fn on_global(
             if name == "default" {
                 session._metadata_listener = Some(listener);
                 session.metadata = Some(metadata);
+                fades::default_metadata_bound(&mut guard, global.id);
             } else {
                 // The `settings` object is only ever read, but it has to be *kept*. Its properties
                 // are not in the registry global; they arrive after the bind, as events on this
@@ -4384,6 +4393,7 @@ fn track_client(
                     && let Ok(mut guard) = shared.try_borrow_mut()
                 {
                     guard.apps.client_info(id, &|key: &str| props.get(key));
+                    fades::client_info(&mut guard, id, props.get("core.version"));
                 }
             }
         })
@@ -4481,6 +4491,10 @@ fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
     if guard.stranded.removed(id) {
         rescue_stranded_streams(&mut guard, Instant::now());
     }
+    // The `default` metadata object: WirePlumber went, and the hook's word with it.
+    if fades::metadata_removed(&mut guard, id) {
+        return;
+    }
     // An application's stream or a client goes with its probe; a node of ours is forgotten here
     // and may still be something below — the echo canceller's source.
     match guard.apps.remove(id) {
@@ -4493,6 +4507,7 @@ fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
         }
         Some(Tracked::Client) => {
             retire_probe(&mut guard, id);
+            fades::client_removed(&mut guard, id);
             return;
         }
         Some(Tracked::Own) => route_pairs::node_removed(&mut guard, id),
@@ -4950,11 +4965,18 @@ fn on_metadata_event(
         on_metadata_property(shared, key, value);
         return;
     }
-    if default
-        && key.is_none_or(|key| key == crate::app_routes::TARGET_OBJECT_KEY)
-        && let Ok(mut guard) = shared.try_borrow_mut()
-    {
+    if !default {
+        return;
+    }
+    let Ok(mut guard) = shared.try_borrow_mut() else {
+        return;
+    };
+    // `None`: every key of the subject cleared.
+    if key.is_none_or(|key| key == crate::app_routes::TARGET_OBJECT_KEY) {
         route_pairs::metadata_target(&mut guard, subject, value.filter(|_| key.is_some()));
+    }
+    if key.is_none_or(|key| key == crate::wireplumber_hook::HELD_KEY) {
+        fades::hook_holds(&mut guard, subject, key.is_some() && value.is_some());
     }
 }
 
@@ -5060,7 +5082,7 @@ fn claim_default_then(shared: &mut Shared, direction: DeviceDirection, first: fa
     }
     let lane = shared.lanes.get(direction);
     let (wanted, had_nodes) = (lane.want_default, lane.nodes.is_some());
-    let streams = fades::following(shared, direction);
+    let streams = claimed_streams(shared, direction);
     remember_default_before_us(shared, direction);
     shared.defaults.get_mut(direction).claiming = true;
     fades::hand_over(
@@ -5079,6 +5101,26 @@ fn claim_default_then(shared: &mut Shared, direction: DeviceDirection, first: fa
             take_default(shared, direction)
         }),
     );
+}
+
+/// The application streams a claim of `direction`'s default moves onto FxSound, and fades first:
+/// every one that follows the default ([`fades::following`]) but one still linked to FxSound's own
+/// node, which the key naming that node again does not move.
+///
+/// Such a stream is one WirePlumber has not moved yet after the desktop's pick. It moves the
+/// streams one by one, and with FxSound's hook in WirePlumber ([`crate::wireplumber_hook`]) each
+/// that plays waits for its fade before the next is looked at: a claim after the desktop's pick,
+/// which FxSound makes within milliseconds, then comes while the second stream is still on
+/// FxSound's node. Faded there by the claim, the stream was silent when WirePlumber's move came, so
+/// the hook left it alone, and WirePlumber moved it off and back on under the claim's fade, or
+/// the hook's fade met the claim's: measured, a recorder or a player clicked at −19 to −35 dBFS as
+/// FxSound took the default back, 5 claims of 144 in the click test. Left alone, it is faded by
+/// the hook if WirePlumber still moves it, and stays on FxSound's node if the claim comes first.
+fn claimed_streams(shared: &Shared, direction: DeviceDirection) -> Vec<u32> {
+    fades::following(shared, direction)
+        .into_iter()
+        .filter(|&id| !shared.stranded.linked_to_ours(id, direction))
+        .collect()
 }
 
 /// What [`claim_default`] notes before it writes the key: the default a lane's claim displaces,
@@ -5901,7 +5943,9 @@ fn attached(
 ///
 /// This is the move after the desktop picked the device (module docs, "Another device, the same
 /// virtual node"): WirePlumber has moved every application that follows the default onto it
-/// already, and they play there unprocessed. A stream of FxSound's linked to the same device in
+/// already, and they play there unprocessed — or, with FxSound's hook in WirePlumber, is still
+/// moving them one fade at a time, and those still on FxSound's node are no part of the claim
+/// ([`claimed_streams`]). A stream of FxSound's linked to the same device in
 /// the middle of that joins their graph and changes its quantum, and a player or a recorder whose
 /// quantum changes under it can skip a few samples: FxSound's own claim clicked at −23 to −32
 /// dBFS in the click test so, 20 to 30 ms after it began, until the stream on the device was
@@ -9018,6 +9062,20 @@ mod tests {
         // guessing wrong that way costs idle power, guessing wrong the other way costs the sound.
         for version in ["0.3.65", "0.3.67", "0.2.99", "", "1.6", "pipewire", "x.y.z"] {
             assert!(!schedules_link_groups(version), "{version:?}");
+        }
+    }
+
+    #[test]
+    fn a_client_s_converter_ramps_from_libpipewire_0_3_68_and_one_whose_version_cannot_be_read_is_not_known()
+     {
+        for version in ["0.3.68", "1.0.5", "1.6.9", "1.4.2-rc1"] {
+            assert_eq!(client_ramps_volume(version), Some(true), "{version}");
+        }
+        for version in ["0.3.65", "0.3.67", "0.2.99"] {
+            assert_eq!(client_ramps_volume(version), Some(false), "{version}");
+        }
+        for version in ["", "1.6", "pipewire", "x.y.z"] {
+            assert_eq!(client_ramps_volume(version), None, "{version:?}");
         }
     }
 

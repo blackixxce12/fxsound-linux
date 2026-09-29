@@ -130,6 +130,18 @@ impl Stranded {
         })
     }
 
+    /// Whether the stream `id`, of `direction`, is linked to FxSound's own node of that direction:
+    /// a player into FxSound's sink, a recorder out of FxSound's source.
+    pub(crate) fn linked_to_ours(&self, id: u32, direction: DeviceDirection) -> bool {
+        let Some((own, _)) = *self.ours.get(direction) else {
+            return false;
+        };
+        self.links.values().any(|link| match direction {
+            DeviceDirection::Output => link.output == id && link.input == own,
+            DeviceDirection::Input => link.output == own && link.input == id,
+        })
+    }
+
     /// Which of `followers` — streams that follow a default FxSound holds, with the direction of
     /// each — are stranded as of `now`, and are to be moved onto FxSound's node now. Each one
     /// returned is counted, and waits [`STRANDED_AFTER`] again before it is returned again. A
@@ -214,6 +226,29 @@ mod tests {
         let followers = [(77, OUT), (78, IN)];
         assert!(stranded.due(&followers, start).is_empty());
         assert_eq!(stranded.due(&followers, later), [(78, IN)]);
+    }
+
+    #[test]
+    fn a_player_is_on_fxsound_linked_into_its_sink_and_a_recorder_linked_out_of_its_source() {
+        let mut stranded = Stranded::default();
+        stranded.own_node_appeared(OUT, 60, 1_050);
+        stranded.own_node_appeared(IN, 63, 1_055);
+        // The player 77 plays into FxSound's sink, the player 79 into a device; the recorder 78
+        // records FxSound's source, the recorder 80 a microphone.
+        stranded.link_appeared(1, 77, 60);
+        stranded.link_appeared(2, 79, 90);
+        stranded.link_appeared(3, 63, 78);
+        stranded.link_appeared(4, 91, 80);
+        assert!(stranded.linked_to_ours(77, OUT));
+        assert!(!stranded.linked_to_ours(79, OUT));
+        assert!(stranded.linked_to_ours(78, IN));
+        assert!(!stranded.linked_to_ours(80, IN));
+        // Each in its own direction only, and not once the link, or FxSound's node, has gone.
+        assert!(!stranded.linked_to_ours(78, OUT));
+        assert!(stranded.removed(1));
+        assert!(!stranded.linked_to_ours(77, OUT));
+        assert!(!stranded.removed(63));
+        assert!(!stranded.linked_to_ours(78, IN));
     }
 
     #[test]

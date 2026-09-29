@@ -1330,8 +1330,14 @@ FxSound's hook in WirePlumber, there only while \(lqSmooth moves in
 WirePlumber\(rq in Settings \(-> Experimental is ticked: a WirePlumber 0.5
 script that fades each playing stream WirePlumber moves, and the fragment that
 makes it an optional component, which WirePlumber skips, logging why, when it
-cannot load it. The silence the script holds a stream in never reaches the
-volume WirePlumber keeps for the application's next start. WirePlumber reads
+cannot load it. The silence the script holds a stream in, and a point of its
+fades reported on the way, never reach the volume WirePlumber keeps for the
+application's next start; while it holds a stream, the script says so in the
+.B default
+metadata, under the stream's id, as
+.BR fxsound.held ,
+and FxSound's own fade leaves the stream to it. A stream whose new link failed
+gets its volume back only once it has a link again. WirePlumber reads
 them when it starts. Unticking deletes both;
 FxSound brings them up to its own version when it starts, and deletes them
 under a WirePlumber older than 0.5. Under

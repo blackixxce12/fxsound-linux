@@ -18,8 +18,42 @@
 //! longer after its new link (`CLAIM_WAIT_MS` in the script): FxSound takes the default back a
 //! moment later and has the stream moved back, and the hook must not be giving the volume back
 //! then, or FxSound's fade and the hook's ramp meet on the stream and PipeWire's converter jumps.
-//! Held, the stream is silent when FxSound's handover looks at it, which then leaves it to the hook
-//! (`crate::stream_handover`, "not silent already").
+//! Held, the stream is silent when FxSound's handover looks at it, which then leaves it to the
+//! hook. Silent, but not always *reported* silent: PipeWire's converter reports a point of a ramp
+//! when the stream's `Props` are sent again in the middle of one, and may never report its end. So
+//! the hook says in the `default` metadata that it holds the stream ([`HELD_KEY`], under the
+//! stream's id, from its fade until it gives the volume back), and FxSound's handover leaves such a
+//! stream alone as it leaves one that is silent (`crate::stream_handover::Watched::hook_held`) —
+//! rather than take a point of the hook's fade for the stream's own volume, journal it, fade from
+//! it and give it back.
+//!
+//! The hook mirrors FxSound's handover in what it counts as its own. While it holds a stream, a
+//! reported volume below the one it is to give back is a point of its ramps, not somebody else's
+//! write; only one above it, or one that rises once its fade has been played out (`SETTLE_MS` in
+//! the script), is — PipeWire reports a ramp's target first and the points on the way after it, so
+//! a rise during the fade is the hook's own. And once the volume has been given back and its ramp
+//! played, it says the volume once more, at once, and again until the server reports it
+//! (`RAMP_IN_DONE_MS`, `CONFIRM_WAIT_MS` in the script; [`stream_handover`]'s `RAMP_IN_DONE` and
+//! `CONFIRM_WAIT`): a converter that last reported a point 0.10 of the way up otherwise leaves the
+//! server showing 0.10 for good, and WirePlumber keeping it for the application's next stream. A
+//! recorder gets its volume back later after its new link than a player, as in FxSound's handover
+//! (`RECORDER_LINKED`): the first cycles of its new link bring it nothing yet, and a ramp spent on
+//! them leaves the sound to start at full volume — measured at −18 to −21 dBFS for a recorder
+//! FxSound took back after the desktop's pick, once FxSound left the stream to the hook. Nor does a
+//! stream whose new link failed get its volume back before it has one (`UNLINKED_POLL_MS` in the
+//! script): FxSound links a recorder WirePlumber stranded a quarter of a second later
+//! (`crate::stranded`), and the sound would start at full volume then. A stream whose converter
+//! has no ramp — its client's libpipewire older than 0.3.68 (`core.version`) — is moved as it is,
+//! as FxSound's handover moves it.
+//!
+//! WirePlumber moves the streams of a pick one at a time, and with the hook each that plays waits
+//! for its fade: the second is still on FxSound's node when FxSound takes the default back, a few
+//! milliseconds after the pick. FxSound's claim leaves such a stream out of its own fade
+//! (`crate::engine`, `claimed_streams`) — faded by the claim, it was silent when WirePlumber moved
+//! it, the hook left it alone, and it clicked — so the hook fades it if WirePlumber still moves it,
+//! and it stays where it is if the claim comes first.
+//!
+//! [`stream_handover`]: crate::stream_handover
 //!
 //! # The volume WirePlumber keeps
 //!
@@ -68,6 +102,11 @@ use std::time::{Duration, SystemTime};
 
 /// The hook itself, a WirePlumber 0.5 Lua script.
 pub const SCRIPT: &str = include_str!("wireplumber_hook/fade-on-move.lua");
+
+/// The key the hook sets in the `default` metadata, under a stream's id, while it holds the stream
+/// silent for a move (module docs): FxSound's handover leaves that stream alone. Its value is the
+/// volume the hook will give back.
+pub const HELD_KEY: &str = "fxsound.held";
 
 /// The configuration fragment that makes [`SCRIPT`] an optional component of every profile.
 pub const FRAGMENT: &str = include_str!("wireplumber_hook/90-fxsound-fade-on-move.conf");
@@ -298,6 +337,10 @@ pub fn supported(version: Version) -> bool {
 /// try-restart wireplumber.service`, which restarts it only if systemd started it. A WirePlumber
 /// the desktop started some other way is left running: starting a second one beside it would be
 /// worse than the restart a new login brings.
+///
+/// It returns once systemd has stopped and started WirePlumber, which for one stuck on a device
+/// takes as long as systemd's stop timeout, 90 s by default: a window calls it from a thread of its
+/// own.
 ///
 /// # Errors
 ///
@@ -561,6 +604,38 @@ mod tests {
             "volumeRampStepSamples",
         ] {
             assert!(SCRIPT.contains(needle), "{needle}");
+        }
+        // What FxSound's handover reads of it, and the version it takes a client's converter to
+        // ramp from: the same as FxSound's own.
+        assert!(SCRIPT.contains(&format!("local HELD_KEY = \"{HELD_KEY}\"")));
+        let (major, minor, micro) = crate::stream_handover::RAMPS_SINCE;
+        assert!(SCRIPT.contains(&format!(
+            "local RAMPS_SINCE = {{ {major}, {minor}, {micro} }}"
+        )));
+        assert!(SCRIPT.contains("client.properties [\"core.version\"]"));
+        // The volume given back is said once more after the ramp, as FxSound's handover says it.
+        for (name, value) in [
+            (
+                "RAMP_IN_DONE_MS",
+                crate::stream_handover::RAMP_IN_DONE.as_millis(),
+            ),
+            (
+                "CONFIRM_WAIT_MS",
+                crate::stream_handover::CONFIRM_WAIT.as_millis(),
+            ),
+            (
+                "CONFIRM_TRIES",
+                u128::from(crate::stream_handover::CONFIRM_TRIES),
+            ),
+            (
+                "RECORDER_LINKED_MS",
+                crate::stream_handover::RECORDER_LINKED.as_millis(),
+            ),
+        ] {
+            assert!(
+                SCRIPT.contains(&format!("local {name} = {value}\n")),
+                "{name}"
+            );
         }
         // Optional, never required: a component WirePlumber requires stops it when it fails.
         assert!(FRAGMENT.contains("wants = [ custom.fxsound.fade-on-move ]"));

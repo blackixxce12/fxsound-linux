@@ -64,11 +64,18 @@
 //! - An echo that never comes (an application that has stopped answering holds the request) does
 //!   not hold the move up: after [`ECHO_WAIT`] the stream counts as settled, whatever it is.
 //!
-//! # A server without the ramp
+//! # A stream without the ramp
 //!
-//! The ramp arrived in PipeWire 0.3.68 ([`RAMPS_SINCE`]); Debian 12 ships 0.3.65. There a volume
-//! written to 0 would jump — a click of its own — so on such a server a handover is the move alone,
-//! at once, as before 0.5.0 ([`Handover::begin`]).
+//! The ramp arrived in PipeWire 0.3.68 ([`RAMPS_SINCE`]); Debian 12 ships 0.3.65. A volume written
+//! to 0 without it would jump — a click of its own — so a stream without it is moved alone, at
+//! once, as before 0.5.0 ([`Handover::begin`]). The ramp is the audio converter's, and the
+//! converter runs in the process of the stream's own client, of that client's libpipewire: a
+//! `pipewire-pulse` stream's is the server's, but an application from an older Flatpak runtime, or
+//! with a libpipewire of its own, may play natively on a newer server with a converter that
+//! ignores `volumeRampTime` and jumps. Its `PropInfo` says nothing of the ramp either way — 1.6.9's
+//! converter lists no `volumeRamp*` there — but its client says its libpipewire's version
+//! (`core.version`), and that decides, stream by stream ([`Watched::converter_ramps`]). A client
+//! that says none is taken at the server's word, as every stream was before.
 //!
 //! # The journal
 //!
@@ -212,14 +219,29 @@ pub(crate) struct Watched {
     /// It records (`Stream/Input/Audio`): its volume comes back [`RECORDER_LINKED`] after its new
     /// link is active, not at once.
     pub(crate) records: bool,
+    /// `client.id`: the connection the stream is on, whose libpipewire its audio converter is of
+    /// (module docs, "A stream without the ramp").
+    pub(crate) client: Option<u32>,
+    /// Whether the stream's audio converter ramps a volume, as its client's libpipewire says;
+    /// `None` when that is not known, and the server's word is taken ([`Handover::set_ramps`]).
+    pub(crate) converter_ramps: Option<bool>,
+    /// FxSound's hook in WirePlumber holds the stream silent for a move of WirePlumber's own
+    /// (`crate::wireplumber_hook`, [`crate::wireplumber_hook::HELD_KEY`]): the volume it reports
+    /// may be a point of the hook's fade, and is not the stream's to note, fade or give back.
+    pub(crate) hook_held: bool,
 }
 
 impl Watched {
     /// Whether a handover fades this stream: it plays, it has a volume to ramp and may have it
-    /// changed, and it is not silent already.
+    /// changed, it is not silent already, and FxSound's hook in WirePlumber is not holding it
+    /// silent — as a stream silent already, the hook's is moved without a fade of FxSound's, and
+    /// the hook gives it its volume back.
     #[must_use]
     pub(crate) fn fades(&self) -> bool {
-        self.running && !self.locked && self.level.is_some_and(|level| level > SAME)
+        self.running
+            && !self.locked
+            && !self.hook_held
+            && self.level.is_some_and(|level| level > SAME)
     }
 }
 
@@ -347,7 +369,8 @@ pub(crate) struct Handover {
 
 impl Handover {
     /// Tell the handover whether the server ramps a volume: learned from the server's version on
-    /// each connection, and `false` until then.
+    /// each connection, and `false` until then. The word for a stream whose own converter is not
+    /// known ([`Watched::converter_ramps`]).
     pub(crate) fn set_ramps(&mut self, ramps: bool) {
         self.ramps = ramps;
     }
@@ -380,44 +403,47 @@ impl Handover {
     }
 
     /// Begin a handover of `streams`, each with what is known of it. The streams that fade are
-    /// noted and sent to 0; with none — none plays, or the server has no ramp — the move is made
-    /// at once and the handover is over in the same breath.
+    /// noted and sent to 0; with none — none plays, or none has a converter that ramps
+    /// ([`Watched::converter_ramps`], and the server's word for a stream whose is not known) — the
+    /// move is made at once and the handover is over in the same breath.
     ///
     /// Only when not [`Self::busy`]; the engine queues a handover asked for meanwhile.
     pub(crate) fn begin(&mut self, streams: &[(u32, &Watched)], now: Instant) -> Vec<Step> {
         debug_assert!(!self.busy(), "one handover at a time");
         let mut steps = Vec::new();
         let mut faded: Vec<Faded> = Vec::new();
-        if self.ramps {
-            for &(id, watched) in streams {
-                let Some(level) = watched.level.filter(|_| watched.fades()) else {
-                    continue;
-                };
-                if faded.iter().any(|stream| stream.id == id) {
-                    continue;
-                }
-                if let Some(key) = &watched.key
-                    && !faded.iter().any(|stream| stream.key.as_ref() == Some(key))
-                {
-                    steps.push(Step::Remember {
-                        key: key.clone(),
-                        serial: watched.serial,
-                        level,
-                    });
-                }
-                steps.push(Step::Volume {
-                    id,
-                    level: 0.0,
-                    ramp_ms: RAMP_MS,
-                });
-                faded.push(Faded {
-                    id,
-                    key: watched.key.clone(),
-                    saved: level,
-                    records: watched.records,
-                    phase: Phase::FadingOut { sent: now },
+        for &(id, watched) in streams {
+            // A stream whose converter would jump to the volume written is moved as it is.
+            if !watched.converter_ramps.unwrap_or(self.ramps) {
+                continue;
+            }
+            let Some(level) = watched.level.filter(|_| watched.fades()) else {
+                continue;
+            };
+            if faded.iter().any(|stream| stream.id == id) {
+                continue;
+            }
+            if let Some(key) = &watched.key
+                && !faded.iter().any(|stream| stream.key.as_ref() == Some(key))
+            {
+                steps.push(Step::Remember {
+                    key: key.clone(),
+                    serial: watched.serial,
+                    level,
                 });
             }
+            steps.push(Step::Volume {
+                id,
+                level: 0.0,
+                ramp_ms: RAMP_MS,
+            });
+            faded.push(Faded {
+                id,
+                key: watched.key.clone(),
+                saved: level,
+                records: watched.records,
+                phase: Phase::FadingOut { sent: now },
+            });
         }
         if faded.is_empty() {
             steps.extend([Step::Move, Step::Finished]);
@@ -908,6 +934,9 @@ mod tests {
             locked: false,
             known: true,
             records: false,
+            client: None,
+            converter_ramps: None,
+            hook_held: false,
         }
     }
 
@@ -977,6 +1006,45 @@ mod tests {
         let quiet = playing("Output/Audio:application.name:C", 0.0);
         let steps = handover.begin(&[(1, &locked), (2, &unknown), (3, &quiet)], Instant::now());
         assert_eq!(steps, [Step::Move, Step::Finished]);
+    }
+
+    #[test]
+    fn a_stream_whose_converter_has_no_ramp_is_moved_without_a_fade_on_a_server_that_has_one() {
+        // An application with a libpipewire of its own older than 0.3.68, on a newer server: its
+        // converter would jump to 0 and back, two clicks where the move alone makes one.
+        let mut handover = ramping();
+        let old = Watched {
+            converter_ramps: Some(false),
+            ..playing("Output/Audio:application.name:Old", 0.8)
+        };
+        let steps = handover.begin(&[(7, &old)], Instant::now());
+        assert_eq!(steps, [Step::Move, Step::Finished]);
+
+        // The converter is the client's, not the server's: one that ramps is faded whatever the
+        // server's word, and one whose client is not known is taken at it.
+        let mut handover = Handover::default();
+        let new = Watched {
+            converter_ramps: Some(true),
+            ..playing("Output/Audio:application.name:New", 0.8)
+        };
+        let unknown = playing("Output/Audio:application.name:Unknown", 0.8);
+        let steps = handover.begin(&[(7, &new), (8, &unknown)], Instant::now());
+        assert_eq!(volumes(&steps), [(7, 0.0)]);
+    }
+
+    #[test]
+    fn a_stream_the_hook_in_wireplumber_holds_is_moved_without_a_fade_and_its_level_not_noted() {
+        // The hook faded it for the desktop's pick, and the last volume the converter reported is
+        // a point on the way down: not the stream's own, to journal, fade from and give back.
+        let mut handover = ramping();
+        let held = Watched {
+            hook_held: true,
+            ..playing("Output/Audio:application.name:Player", 0.2)
+        };
+        assert!(!held.fades());
+        let steps = handover.begin(&[(7, &held)], Instant::now());
+        assert_eq!(steps, [Step::Move, Step::Finished]);
+        assert!(!handover.busy());
     }
 
     #[test]

@@ -142,6 +142,13 @@ pub(super) struct Fades {
     /// ([`session_closed`]): a move that is only worth making on a live connection — a default
     /// claimed or handed back, which the reconnect settles for itself — says it moved nothing.
     closing: bool,
+    /// Whether each client's libpipewire ramps a volume, by registry id: the converter of every
+    /// stream on that connection is of it (`crate::stream_handover`, "A stream without the
+    /// ramp"). `None` for a client that says no version this can read.
+    clients: HashMap<u32, Option<bool>>,
+    /// The registry id of the `default` metadata object whose [`crate::wireplumber_hook::HELD_KEY`]
+    /// keys say which streams the hook in WirePlumber holds ([`Watched::hook_held`]).
+    hook_metadata: Option<u32>,
     /// Every volume written to an application stream, in order: its id, the level and the ramp.
     #[cfg(test)]
     writes: Vec<(u32, f32, i32)>,
@@ -198,6 +205,8 @@ impl Fades {
             armed: None,
             lines_remade: 0,
             closing: false,
+            clients: HashMap::new(),
+            hook_metadata: None,
             #[cfg(test)]
             writes: Vec::new(),
         }
@@ -613,6 +622,7 @@ fn stream_props<'a>(shared: &mut Shared, id: u32, get: &impl Fn(&str) -> Option<
     watched.key = stream_handover::state_key(get);
     watched.records = get("media.class") == Some("Stream/Input/Audio");
     watched.serial = get("object.serial").and_then(|serial| serial.parse().ok());
+    watched.client = get("client.id").and_then(|client| client.parse().ok());
     watched.known = true;
     repair(shared, id);
     // Until now the stream could have been the one another application's line waits for.
@@ -622,6 +632,67 @@ fn stream_props<'a>(shared: &mut Shared, id: u32, get: &impl Fn(&str) -> Option<
 /// An application stream's state changed: whether it is `running`.
 fn stream_state(shared: &mut Shared, id: u32, running: bool) {
     shared.fades.watched.entry(id).or_default().running = running;
+}
+
+/// A client's properties arrived, with `version`, its libpipewire's (`core.version`): whether the
+/// converters of its streams ramp a volume ([`converter_ramps`]).
+pub(super) fn client_info(shared: &mut Shared, id: u32, version: Option<&str>) {
+    let ramps = version.and_then(super::client_ramps_volume);
+    shared.fades.clients.insert(id, ramps);
+}
+
+/// A client left the graph.
+pub(super) fn client_removed(shared: &mut Shared, id: u32) {
+    shared.fades.clients.remove(&id);
+}
+
+/// FxSound's hook in WirePlumber says it holds the stream `id` silent for a move of WirePlumber's
+/// own, or no longer ([`crate::wireplumber_hook::HELD_KEY`] in the `default` metadata): a handover
+/// leaves the stream alone meanwhile ([`Watched::hook_held`]). Only for a stream already watched:
+/// an entry made here for anything else would be one [`Journal::outlived`] waits for.
+pub(super) fn hook_holds(shared: &mut Shared, id: u32, held: bool) {
+    if let Some(watched) = shared.fades.watched.get_mut(&id) {
+        watched.hook_held = held;
+    }
+}
+
+/// A `default` metadata object was bound, under the registry id `id`: WirePlumber started, or
+/// started again. Its keys are all there are now; a stream the hook in WirePlumber held under the
+/// object before is held no longer — a WirePlumber that restarted or died in the middle of a move
+/// never cleared its key, and the stream would be moved without a fade of FxSound's for the rest of
+/// its life ([`Watched::hook_held`]). A stream the new one holds says so in its own keys, which
+/// arrive after this.
+pub(super) fn default_metadata_bound(shared: &mut Shared, id: u32) {
+    shared.fades.hook_metadata = Some(id);
+    let_go_of_what_the_hook_held(shared);
+}
+
+/// A global left the graph: when it is the `default` metadata object ([`default_metadata_bound`]),
+/// the hook's word on every stream goes with it. Whether it was.
+pub(super) fn metadata_removed(shared: &mut Shared, id: u32) -> bool {
+    if shared.fades.hook_metadata != Some(id) {
+        return false;
+    }
+    shared.fades.hook_metadata = None;
+    let_go_of_what_the_hook_held(shared);
+    true
+}
+
+/// No stream is held by the hook in WirePlumber any more.
+fn let_go_of_what_the_hook_held(shared: &mut Shared) {
+    for watched in shared.fades.watched.values_mut() {
+        watched.hook_held = false;
+    }
+}
+
+/// Whether the audio converter of `watched` ramps a volume: as its client's libpipewire says, and
+/// as the server's does for a stream whose client is not known or says nothing
+/// (`crate::stream_handover`, "A stream without the ramp").
+fn converter_ramps(shared: &Shared, watched: &Watched) -> bool {
+    watched
+        .client
+        .and_then(|client| shared.fades.clients.get(&client).copied().flatten())
+        .unwrap_or_else(|| shared.volume_ramps.get())
 }
 
 /// An application stream's `Props` arrived — its master volume, and whether its converter locks
@@ -723,7 +794,7 @@ fn repair(shared: &mut Shared, id: u32) {
             // Not the handover's word on the ramp: that is learned when a handover begins, and a
             // repair comes before any — on the very first connection of a run after a killed one.
             // A write with no line to go through is not sent at all ([`write_volume`]).
-            let ramp = if shared.volume_ramps.get() && watched.running {
+            let ramp = if converter_ramps(shared, watched) && watched.running {
                 stream_handover::RAMP_IN_MS
             } else {
                 0
@@ -822,14 +893,20 @@ fn begin(shared: &mut Shared, streams: &[u32], then: Move) {
         .fades
         .handover
         .set_ramps(writable && shared.volume_ramps.get());
+    // Each stream's converter decides whether it is faded, not the server
+    // (`crate::stream_handover`, "A stream without the ramp").
     let candidates: Vec<(u32, Watched)> = streams
         .iter()
         .filter_map(|&id| {
-            shared
-                .fades
-                .watched
-                .get(&id)
-                .map(|watched| (id, watched.clone()))
+            let watched = shared.fades.watched.get(&id)?;
+            let ramps = writable && converter_ramps(shared, watched);
+            Some((
+                id,
+                Watched {
+                    converter_ramps: Some(ramps),
+                    ..watched.clone()
+                },
+            ))
         })
         .collect();
     let candidates: Vec<(u32, &Watched)> = candidates
@@ -1024,6 +1101,7 @@ pub(super) fn session_closed(shared: &mut Shared) {
     }
     shared.fades.closing = false;
     shared.fades.watched.clear();
+    shared.fades.hook_metadata = None;
     shared.fades.repairs.clear();
     shared.fades.pending = None;
     shared.fades.armed = None;
@@ -1073,9 +1151,125 @@ pub(super) fn restore_before_exit(shared: &Rc<RefCell<Shared>>, loop_: &pw::loop
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wireplumber_hook::HELD_KEY;
 
     /// How long a test waits for a wake-up that should come: far past any instant asked for here.
     const PATIENCE: Duration = Duration::from_secs(5);
+
+    /// An engine's state before it has connected: no session, nothing held.
+    fn shared_for_tests() -> Shared {
+        let (notify, _) = crossbeam_channel::unbounded();
+        Shared::new(
+            notify,
+            None,
+            None,
+            PerDirection::default(),
+            ChainHandover::new().0,
+        )
+    }
+
+    #[test]
+    fn a_stream_the_hook_in_wireplumber_says_it_holds_is_left_out_of_a_handover_until_it_lets_go() {
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        {
+            let mut guard = shared.borrow_mut();
+            stream_state(&mut guard, 42, true);
+            // A point of the hook's fade, last reported before its end.
+            stream_volume(&mut guard, 42, Some(0.2), false);
+            assert!(guard.fades.watched(42).is_some_and(Watched::fades));
+        }
+        let fades = |shared: &Rc<RefCell<Shared>>| {
+            shared
+                .borrow()
+                .fades
+                .watched(42)
+                .map(|watched| (watched.hook_held, watched.fades()))
+        };
+        super::super::on_metadata_event(&shared, true, 42, Some(HELD_KEY), Some("1.0"));
+        assert_eq!(fades(&shared), Some((true, false)));
+        // Another metadata object's key of the same name is not the hook's.
+        super::super::on_metadata_event(&shared, false, 42, Some(HELD_KEY), None);
+        assert_eq!(fades(&shared), Some((true, false)));
+        super::super::on_metadata_event(&shared, true, 42, Some(HELD_KEY), None);
+        assert_eq!(fades(&shared), Some((false, true)));
+        // Every key of the stream cleared at once lets go of it too.
+        super::super::on_metadata_event(&shared, true, 42, Some(HELD_KEY), Some("1.0"));
+        super::super::on_metadata_event(&shared, true, 42, None, None);
+        assert_eq!(fades(&shared), Some((false, true)));
+        // A subject the handover does not watch gets no entry, which the journal would wait for.
+        super::super::on_metadata_event(&shared, true, 77, Some(HELD_KEY), Some("1.0"));
+        assert!(shared.borrow().fades.watched(77).is_none());
+    }
+
+    #[test]
+    fn a_new_default_metadata_lets_go_of_every_stream_the_hook_held() {
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        let held = |shared: &Rc<RefCell<Shared>>, id: u32| {
+            shared
+                .borrow()
+                .fades
+                .watched(id)
+                .map(|watched| (watched.hook_held, watched.fades()))
+        };
+        {
+            let mut guard = shared.borrow_mut();
+            default_metadata_bound(&mut guard, 30);
+            for id in [42, 43] {
+                stream_state(&mut guard, id, true);
+                stream_volume(&mut guard, id, Some(0.2), false);
+            }
+        }
+        for id in [42, 43] {
+            super::super::on_metadata_event(&shared, true, id, Some(HELD_KEY), Some("1.0"));
+            assert_eq!(held(&shared, id), Some((true, false)));
+        }
+        // WirePlumber restarted in the middle of the move: its new object never heard of the key.
+        default_metadata_bound(&mut shared.borrow_mut(), 31);
+        for id in [42, 43] {
+            assert_eq!(held(&shared, id), Some((false, true)), "{id}");
+        }
+        // And one that died: its object goes, and nothing holds the stream any more.
+        super::super::on_metadata_event(&shared, true, 42, Some(HELD_KEY), Some("1.0"));
+        assert!(
+            !metadata_removed(&mut shared.borrow_mut(), 30),
+            "not the object of now"
+        );
+        assert_eq!(held(&shared, 42), Some((true, false)));
+        assert!(metadata_removed(&mut shared.borrow_mut(), 31));
+        assert_eq!(held(&shared, 42), Some((false, true)));
+        assert!(!metadata_removed(&mut shared.borrow_mut(), 31), "said once");
+    }
+
+    #[test]
+    fn a_stream_is_faded_as_its_own_client_s_libpipewire_ramps_and_not_as_the_server_does() {
+        let mut shared = shared_for_tests();
+        let on = |client: Option<u32>| Watched {
+            client,
+            ..Watched::default()
+        };
+        shared.volume_ramps.set(true);
+        client_info(&mut shared, 5, Some("0.3.65"));
+        client_info(&mut shared, 6, Some("1.6.9"));
+        client_info(&mut shared, 7, None);
+        client_info(&mut shared, 8, Some("pipewire"));
+        // An application with an older libpipewire of its own, on a server that ramps.
+        assert!(!converter_ramps(&shared, &on(Some(5))));
+        assert!(converter_ramps(&shared, &on(Some(6))));
+        // A client that says no version, or none that reads, one not known, and no client at
+        // all: the server's word.
+        for client in [Some(7), Some(8), Some(9), None] {
+            assert!(converter_ramps(&shared, &on(client)), "{client:?}");
+        }
+        shared.volume_ramps.set(false);
+        assert!(converter_ramps(&shared, &on(Some(6))));
+        for client in [Some(5), Some(7), Some(9), None] {
+            assert!(!converter_ramps(&shared, &on(client)), "{client:?}");
+        }
+        // A client gone is not known any more.
+        shared.volume_ramps.set(true);
+        client_removed(&mut shared, 5);
+        assert!(converter_ramps(&shared, &on(Some(5))));
+    }
 
     /// The clock's thread, started on channels of the test's own: what is asked of it, the instant
     /// of each wake-up it gives, and the thread.

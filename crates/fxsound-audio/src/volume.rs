@@ -594,7 +594,7 @@ const LOCK_VOLUMES_KEY: &str = "channelmix.lock-volumes";
 /// `SPA_PROP_volumeRampStepSamples` and `SPA_PROP_volumeRampTime` (`spa/param/props.h`), by
 /// value: `libspa-sys` generates its constants from the headers it is built against, and the
 /// release is built against PipeWire 0.3.65's, which predate them ([`crate::stream_handover`]'s
-/// "A server without the ramp").
+/// "A stream without the ramp").
 const PROP_VOLUME_RAMP_STEP_SAMPLES: u32 = 0x10013;
 const PROP_VOLUME_RAMP_TIME: u32 = 0x10014;
 

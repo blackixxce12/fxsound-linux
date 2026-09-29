@@ -737,28 +737,35 @@ Each of these is a considered decision, not an oversight:
   to it), and that one clicks as before. The desktop's own device switcher still moves
   applications as plain Linux does, click and all — unless *Smooth moves in WirePlumber* is ticked
   (below).
-- **Smooth moves in WirePlumber (Settings ▸ Experimental, off by default).** A device picked in
-  the desktop's sound settings is moved by WirePlumber itself, before FxSound hears of it, so only
+- **Smooth moves in WirePlumber (Settings ▸ Experimental, off by default).** A device picked in the
+  desktop's sound settings is moved by WirePlumber itself, before FxSound hears of it, so only
   WirePlumber can fade that move. Ticked, FxSound puts a small WirePlumber 0.5 script,
   `~/.local/share/wireplumber/scripts/fxsound/fade-on-move.lua`, and the fragment that loads it,
   `~/.config/wireplumber/wireplumber.conf.d/90-fxsound-fade-on-move.conf`, where WirePlumber reads
   them: every stream WirePlumber moves while it plays — with FxSound or without, on or off — is
-  faded out before the move and back in after it, a dip of about a tenth of a second instead of
-  the click (measured below −52 dBFS where it was −19 to −28). It changes WirePlumber's own policy
-  for every application, needs WirePlumber 0.5 or newer (Ubuntu 24.04 ships 0.4, and the box is
-  greyed out there), and WirePlumber reads it only when it starts: the pane then offers
-  *Restart WirePlumber*, which asks first, since every application's sound stops for a moment, and
-  restarts it with `systemctl --user try-restart wireplumber` — a WirePlumber not started by
-  systemd takes the change at the next login. The script is loaded as an optional component: one
-  that fails on a later WirePlumber is logged and skipped, and never stops WirePlumber. Unticking
-  deletes both files; by hand, delete them and restart WirePlumber. With *Follow the system's
-  default device* ticked and the power off, FxSound's own lane moving to the picked device still
-  clicks the application that has just arrived there. An application closed in the tenth of a
-  second the script holds it silent keeps its own volume: WirePlumber, which keeps each
-  application's volume for its next start, never sees the script's silence. Should an application
-  ever start silent while the desktop's mixer shows 100 % all the same, `pw-cli set-param <id>
-  Props '{ volume: 1.0 }'` on its node while it plays gives it its volume back for good (`wpctl
-  status` lists the ids).
+  faded out before the move and back in after it, a dip of about a tenth of a second instead of the
+  click (measured below −52 dBFS where it was −19 to −28). It changes WirePlumber's own policy for
+  every application, needs WirePlumber 0.5 or newer (Ubuntu 24.04 ships 0.4, and the box is greyed
+  out there), and WirePlumber reads it only when it starts: the pane then offers *Restart
+  WirePlumber*, which asks first, since every application's sound stops for a moment, and restarts
+  it with `systemctl --user try-restart wireplumber`, in the background, so the window never waits
+  for it — a WirePlumber not started by systemd takes the change at the next login. The script is
+  loaded as an optional component: one that fails on a later WirePlumber is logged and skipped, and
+  never stops WirePlumber. Unticking deletes both files; by hand, delete them and restart
+  WirePlumber. With *Follow the system's default device* ticked and the power off, FxSound's own
+  lane moving to the picked device still clicks the application that has just arrived there. An
+  application closed in the tenth of a second the script holds it silent keeps its own volume:
+  WirePlumber, which keeps each application's volume for its next start, never sees the script's
+  silence, nor a point of its fades PipeWire reports on the way, and the script says the volume once
+  more once its fade back is over, until PipeWire shows it. While it holds an application it says so
+  in the `default` metadata (`fxsound.held`), and FxSound's own fade leaves that application to it.
+  An application whose own libpipewire is older than 0.3.68 has no ramp to fade with, and is moved
+  as it is. An application whose new link fails — a recorder WirePlumber strands between a mono
+  microphone and FxSound's stereo source — gets its volume back only once FxSound has linked it
+  again, and one WirePlumber has not moved yet when FxSound takes the default back is left to the
+  script rather than faded by FxSound too. Should an application ever start silent while the
+  desktop's mixer shows 100 % all the same, `pw-cli set-param <id> Props '{ volume: 1.0 }'` on its
+  node while it plays gives it its volume back for good (`wpctl status` lists the ids).
 - **Changing the device keeps `FxSound (Output)` and `FxSound (Input)`.** A lane moved to another
   device — picked in FxSound, `--output`, `--next-output`, `--input`, or followed from the
   desktop's sound settings — replaces only its own stream on the device when the new one takes the

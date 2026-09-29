@@ -11,6 +11,8 @@
 //! and not made — WirePlumber not started by systemd — is said too; the next login brings the
 //! change then.
 
+use std::cell::{Cell, RefCell};
+use std::sync::mpsc;
 use std::time::SystemTime;
 
 use fxsound_audio::wireplumber_hook::{self, Installed, Place, Version};
@@ -29,12 +31,20 @@ pub(crate) struct WirePlumberHost {
     /// Whether a WirePlumber of this user has run since before a time
     /// ([`wireplumber_hook::running_since_before`]).
     pub(crate) running_since_before: fn(SystemTime) -> Option<bool>,
-    /// Restart it ([`wireplumber_hook::restart`]).
+    /// Restart it ([`wireplumber_hook::restart`]). It waits for systemd to have stopped and started
+    /// WirePlumber — up to systemd's stop timeout, 90 s by default, for one stuck on a device — so
+    /// it runs on a thread of its own ([`Self::restart`]), never on the window's.
     pub(crate) restart: fn() -> std::io::Result<()>,
     /// When the box was last ticked or unticked in this run.
     changed: Option<SystemTime>,
     /// A restart was asked for since, and the WirePlumber from before is still the one running.
-    restart_failed: bool,
+    restart_failed: Cell<bool>,
+    /// The restart under way, until its thread says how it went ([`Self::restart_settled`]).
+    restarting: RefCell<Option<mpsc::Receiver<std::io::Result<()>>>>,
+    /// The change the restart under way was asked for: the time the WirePlumber running must be
+    /// newer than once it is over. A change made while it runs is not one it was asked for, so a
+    /// restart that did its part leaves that change due, not failed.
+    restart_asked_for: Cell<Option<SystemTime>>,
 }
 
 impl WirePlumberHost {
@@ -46,7 +56,9 @@ impl WirePlumberHost {
             running_since_before: wireplumber_hook::running_since_before,
             restart: wireplumber_hook::restart,
             changed: None,
-            restart_failed: false,
+            restart_failed: Cell::new(false),
+            restarting: RefCell::new(None),
+            restart_asked_for: Cell::new(None),
         }
     }
 
@@ -58,7 +70,9 @@ impl WirePlumberHost {
             running_since_before: |_| None,
             restart: || Err(std::io::Error::other("no WirePlumber to restart")),
             changed: None,
-            restart_failed: false,
+            restart_failed: Cell::new(false),
+            restarting: RefCell::new(None),
+            restart_asked_for: Cell::new(None),
         }
     }
 
@@ -76,7 +90,9 @@ impl WirePlumberHost {
             running_since_before,
             restart,
             changed: None,
-            restart_failed: false,
+            restart_failed: Cell::new(false),
+            restarting: RefCell::new(None),
+            restart_asked_for: Cell::new(None),
         }
     }
 
@@ -91,20 +107,37 @@ impl WirePlumberHost {
             return WirePlumberHook::default();
         };
         let on = place.installed().is_on();
-        // Changed in this run, or installed by an earlier one: the fragment's time.
-        let since = self
-            .changed
-            .or_else(|| on.then(|| place.installed_at()).flatten());
-        let due = since.is_some_and(|since| (self.running_since_before)(since) == Some(true));
+        let due = self.predates(self.since());
+        // Due, not failed, while a restart is under way: it has not had its chance yet.
+        let failed = self.restart_failed.get() && self.restarting.borrow().is_none();
         WirePlumberHook {
             available: self.available(),
             on,
-            restart: match (due, self.restart_failed) {
+            restart: match (due, failed) {
                 (false, _) => WirePlumberRestart::NotNeeded,
                 (true, false) => WirePlumberRestart::Due,
                 (true, true) => WirePlumberRestart::Failed,
             },
         }
+    }
+
+    /// The time the WirePlumber running must have started after to have read the files as they
+    /// are: the box's last change in this run, or the fragment's time for a hook an earlier run
+    /// installed. `None`: nothing for WirePlumber to read.
+    fn since(&self) -> Option<SystemTime> {
+        let place = self.place.as_ref()?;
+        self.changed.or_else(|| {
+            place
+                .installed()
+                .is_on()
+                .then(|| place.installed_at())
+                .flatten()
+        })
+    }
+
+    /// Whether the WirePlumber running started before `since`.
+    fn predates(&self, since: Option<SystemTime>) -> bool {
+        since.is_some_and(|since| (self.running_since_before)(since) == Some(true))
     }
 
     /// Tick (`on`) or untick the box: install the hook, or take it away. Ticking needs WirePlumber
@@ -127,18 +160,75 @@ impl WirePlumberHost {
         let result = if on { place.install() } else { place.remove() };
         // Even a half-done change is a change WirePlumber has not read.
         self.changed = Some(SystemTime::now());
-        self.restart_failed = false;
+        self.restart_failed.set(false);
         result
     }
 
-    /// Restart WirePlumber, once the user said yes. Whether the WirePlumber that runs afterwards
-    /// has read the hook's files as they are; if not, the pane says it could not be restarted.
-    pub(crate) fn restart(&mut self) -> bool {
-        if let Err(error) = (self.restart)() {
+    /// Restart WirePlumber, once the user said yes: on a thread of its own, since systemd may take
+    /// as long as its stop timeout to stop a WirePlumber stuck on a device, and the window would
+    /// hang meanwhile. The pane learns how it went from [`Self::restart_settled`]. Asked again
+    /// while one is under way, nothing more is done.
+    pub(crate) fn restart(&self) {
+        if self.restarting.borrow().is_some() {
+            return;
+        }
+        let (done, outcome) = mpsc::channel();
+        let restart = self.restart;
+        let spawned = std::thread::Builder::new()
+            .name("wireplumber-restart".to_owned())
+            .spawn(move || {
+                let _ = done.send(restart());
+            });
+        match spawned {
+            Ok(_) => {
+                *self.restarting.borrow_mut() = Some(outcome);
+                self.restart_asked_for.set(self.since());
+            }
+            Err(error) => {
+                log::warn!("WirePlumber could not be restarted: no thread to do it on: {error}");
+                self.restart_failed.set(true);
+            }
+        }
+    }
+
+    /// Whether a restart asked for has finished since this was last asked, and what the pane
+    /// shows now if it has: the WirePlumber that runs afterwards has read the hook's files as they
+    /// are, or the pane says it could not be restarted. `None` while none is under way or it still
+    /// is: asked on every frame the pane is drawn, it costs a look at a channel and nothing more.
+    pub(crate) fn restart_settled(&self) -> Option<WirePlumberHook> {
+        let outcome = match self.restarting.borrow().as_ref()?.try_recv() {
+            Ok(outcome) => outcome,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => Err(std::io::Error::other(
+                "the restart's thread ended without a word",
+            )),
+        };
+        Some(self.settle(outcome))
+    }
+
+    /// The restart under way is over, with `outcome`: what the pane shows now. Failed only when
+    /// the WirePlumber running still predates the change the restart was asked for; one made
+    /// while it ran is still due, since the restart may have come before it.
+    fn settle(&self, outcome: std::io::Result<()>) -> WirePlumberHook {
+        self.restarting.replace(None);
+        let asked_for = self.restart_asked_for.take();
+        if let Err(error) = outcome {
             log::warn!("WirePlumber could not be restarted: {error}");
         }
-        self.restart_failed = self.state().restart != WirePlumberRestart::NotNeeded;
-        !self.restart_failed
+        self.restart_failed.set(self.predates(asked_for));
+        self.state()
+    }
+
+    /// Wait for the restart under way, if any, to finish, and say what the pane shows then: for the
+    /// tests, which ask for a restart and then look.
+    #[cfg(test)]
+    pub(crate) fn finish_restart(&self) -> WirePlumberHook {
+        let outcome = self
+            .restarting
+            .borrow()
+            .as_ref()
+            .map(|restarting| restarting.recv().unwrap_or(Ok(())));
+        outcome.map_or_else(|| self.state(), |outcome| self.settle(outcome))
     }
 
     /// At start-up: bring a hook an earlier run installed up to this build — a newer FxSound's
@@ -308,7 +398,8 @@ mod tests {
         };
         host.running_since_before = |_| Some(true);
         host.set(true).expect("the hook installs");
-        assert!(!host.restart());
+        host.restart();
+        assert_eq!(host.finish_restart().restart, WirePlumberRestart::Failed);
         assert_eq!(RESTARTS.load(Ordering::SeqCst), 1);
         assert_eq!(host.state().restart, WirePlumberRestart::Failed);
 
@@ -318,14 +409,112 @@ mod tests {
 
         // A restart that takes: a WirePlumber started after the change.
         host.running_since_before = |_| Some(false);
-        assert!(host.restart());
-        assert_eq!(host.state().restart, WirePlumberRestart::NotNeeded);
+        host.restart();
+        assert_eq!(host.finish_restart().restart, WirePlumberRestart::NotNeeded);
 
         // systemctl failing, the old WirePlumber still there: failed.
         host.running_since_before = |_| Some(true);
         host.restart = || Err(std::io::Error::other("no systemd"));
-        assert!(!host.restart());
+        host.restart();
+        assert_eq!(host.finish_restart().restart, WirePlumberRestart::Failed);
         assert_eq!(host.state().restart, WirePlumberRestart::Failed);
+    }
+
+    #[test]
+    fn a_restart_that_systemd_takes_long_over_leaves_the_window_free_and_is_said_once_it_is_over() {
+        // A WirePlumber stuck on a device: systemctl waits for systemd's stop timeout. Here, until
+        // the test lets it go.
+        static HELD: std::sync::Mutex<bool> = std::sync::Mutex::new(true);
+        static LET_GO: std::sync::Condvar = std::sync::Condvar::new();
+        static RESTARTS: AtomicUsize = AtomicUsize::new(0);
+        let dir = tempfile::TempDir::new().expect("a scratch directory");
+        let mut host = host(dir.path(), wp_0_5);
+        host.restart = || {
+            RESTARTS.fetch_add(1, Ordering::SeqCst);
+            let mut held = HELD.lock().expect("the stand-in's lock");
+            while *held {
+                held = LET_GO.wait(held).expect("the stand-in's lock");
+            }
+            Ok(())
+        };
+        host.running_since_before = |_| Some(true);
+        host.set(true).expect("the hook installs");
+
+        let asked = std::time::Instant::now();
+        host.restart();
+        assert!(
+            asked.elapsed() < std::time::Duration::from_secs(1),
+            "the restart held the window for {:?}",
+            asked.elapsed()
+        );
+        // Under way: still due, not failed, and nothing to say yet. Asked again, nothing more.
+        assert_eq!(host.state().restart, WirePlumberRestart::Due);
+        assert_eq!(host.restart_settled(), None);
+        host.restart();
+
+        *HELD.lock().expect("the stand-in's lock") = false;
+        LET_GO.notify_all();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let settled = loop {
+            if let Some(settled) = host.restart_settled() {
+                break settled;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the restart never said it was over"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        // The WirePlumber from before still runs: the stand-in restarted nothing.
+        assert_eq!(settled.restart, WirePlumberRestart::Failed);
+        assert_eq!(RESTARTS.load(Ordering::SeqCst), 1);
+        assert_eq!(host.restart_settled(), None);
+    }
+
+    #[test]
+    fn a_change_made_while_a_restart_is_running_leaves_the_pane_at_due_not_failed() {
+        // The restart starts a new WirePlumber after the first change, then systemd holds it until
+        // the test lets it go; the box is unticked meanwhile, after the new WirePlumber started.
+        static STARTED: std::sync::Mutex<Option<SystemTime>> = std::sync::Mutex::new(None);
+        static HELD: std::sync::Mutex<bool> = std::sync::Mutex::new(true);
+        static LET_GO: std::sync::Condvar = std::sync::Condvar::new();
+        let dir = tempfile::TempDir::new().expect("a scratch directory");
+        let mut host = host(dir.path(), wp_0_5);
+        host.restart = || {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            *STARTED.lock().expect("the start's lock") = Some(SystemTime::now());
+            let mut held = HELD.lock().expect("the stand-in's lock");
+            while *held {
+                held = LET_GO.wait(held).expect("the stand-in's lock");
+            }
+            Ok(())
+        };
+        host.running_since_before = |since| {
+            let started = *STARTED.lock().expect("the start's lock");
+            Some(started.is_none_or(|started| started < since))
+        };
+        host.set(true).expect("the hook installs");
+        assert_eq!(host.state().restart, WirePlumberRestart::Due);
+        host.restart();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while STARTED.lock().expect("the start's lock").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the restart never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        host.set(false).expect("the hook goes");
+        assert_eq!(host.state().restart, WirePlumberRestart::Due);
+
+        *HELD.lock().expect("the stand-in's lock") = false;
+        LET_GO.notify_all();
+        // The restart did its part: the new WirePlumber read the files as they were when it was
+        // asked for. The change after it is due another, not a restart that failed.
+        assert_eq!(host.finish_restart().restart, WirePlumberRestart::Due);
+        assert_eq!(host.state().restart, WirePlumberRestart::Due);
     }
 
     #[test]

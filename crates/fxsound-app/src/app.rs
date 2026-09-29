@@ -5075,6 +5075,9 @@ impl App {
                 }
                 state.wireplumber_hook = self.wireplumber.state();
             }
+            // On a thread of its own: systemd may take up to its stop timeout to restart a
+            // WirePlumber stuck on a device, and the window is not to hang meanwhile. The pane
+            // learns how it went in [`App::refresh_settings_state`].
             A::RestartWirePlumber => {
                 self.wireplumber.restart();
                 state.wireplumber_hook = self.wireplumber.state();
@@ -5341,6 +5344,10 @@ impl App {
             state.apps = apps;
         }
         state.can_reset_presets = self.can_reset_presets();
+        // A restart of WirePlumber asked for from the pane, over.
+        if let Some(hook) = self.wireplumber.restart_settled() {
+            state.wireplumber_hook = hook;
+        }
         self.refresh_device_rows(state);
         state.echo_cancel_running = self.state.echo_cancel_running;
         // The one microphone setting the command line and D-Bus can change under an open pane.
@@ -15315,6 +15322,14 @@ mod tests {
         assert_eq!(state.wireplumber_hook.restart, WirePlumberRestart::Due);
         // The stand-in's WirePlumber is still the one from before the change.
         app.handle_settings(&SettingsAction::RestartWirePlumber, &mut state);
+        // Made on a thread of its own; the pane, drawn again, learns how it went.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.wireplumber_hook.restart == WirePlumberRestart::Due
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.refresh_settings_state(&mut state);
+        }
         assert_eq!(state.wireplumber_hook.restart, WirePlumberRestart::Failed);
 
         app.handle_settings(&SettingsAction::SetWirePlumberHook(false), &mut state);

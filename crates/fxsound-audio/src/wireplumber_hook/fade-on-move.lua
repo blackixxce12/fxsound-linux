@@ -46,16 +46,52 @@ local LINKED_MS = 20
 -- made in silence too; given back meanwhile, FxSound's own fade of it would meet this one's ramp,
 -- which PipeWire's converter refuses and jumps instead: a click (measured at D5, −19 to −31 dBFS).
 local CLAIM_WAIT_MS = 250
+-- For a recorder, LINKED_MS and this much more: a recorder is handed what its source played in
+-- the cycle before, so the first cycles after its new link bring it nothing yet, and a ramp given
+-- back at once is spent on them; the sound then starts at full volume in the middle of a wave. As
+-- FxSound's own handover waits (stream_handover.rs, RECORDER_LINKED). Given back 20 ms after its
+-- link, a recorder FxSound took back after the desktop's pick clicked at −18 to −21 dBFS, two to
+-- four switches in 24.
+local RECORDER_LINKED_MS = 50
 -- The volume comes back after this whatever happened to the move.
 local GIVE_BACK_MS = 1500
+-- How often a stream whose new link failed is looked at again, until it has one: WirePlumber gives
+-- up on a link to a port that is replaced during the move (a recorder moved from a mono microphone
+-- onto FxSound's stereo source), and FxSound moves the stream again a quarter of a second later
+-- (crates/fxsound-audio/src/stranded.rs). Given back while it had no link, a recorder started at
+-- full volume in the middle of a wave once it had one: −17.7 to −38.3 dBFS, 3 of 120 recorders
+-- FxSound took back after the desktop's pick in the click test.
+local UNLINKED_POLL_MS = 20
+-- From the volume given back to the end of its ramp, with a margin for a quantum of up to 2048
+-- frames: the volume is then said once more, at once, and again every CONFIRM_WAIT_MS until the
+-- server reports it, CONFIRM_TRIES times at most (stream_handover.rs, RAMP_IN_DONE, CONFIRM_WAIT,
+-- CONFIRM_TRIES). The converter reports a point of a ramp when its Props are sent again in the
+-- middle of one, and may never report its end: seen on PipeWire 1.6.9, a stream whose last report
+-- was 0.10 of the way up kept showing 0.10 — what WirePlumber keeps for the application's next
+-- stream, and what the next move reads as the stream's volume.
+local RAMP_IN_DONE_MS = 100
+local CONFIRM_WAIT_MS = 50
+local CONFIRM_TRIES = 4
 -- A master volume at or below this is silent already: FxSound's own handover faded the stream
--- before it had it moved, or someone muted it. Nothing to fade, and nothing to give back.
+-- before it had it moved, or someone muted it. Nothing to fade, and nothing to give back. Within
+-- it of each other, two volumes are the same, as WirePlumber compares them (state-stream.lua).
 local SILENT = 0.0001
+-- The first PipeWire whose audio converter ramps a volume (stream_handover.rs, RAMPS_SINCE).
+local RAMPS_SINCE = { 0, 3, 68 }
+-- The key in the default metadata that says, under a stream's id, that this hook holds it silent
+-- for its move: FxSound's own handover leaves such a stream alone (stream_handover.rs,
+-- Watched::hook_held), rather than take the point of this hook's fade it may read for the
+-- stream's own volume.
+local HELD_KEY = "fxsound.held"
 
--- The streams held at 0, by session item: the node, its object's id in WirePlumber, its name, the
--- volume to give back, which fade holds it, so that a timer of an earlier move does not end a
--- later one, how long after its new link the volume comes back, and whether it went away
--- meanwhile.
+-- The streams held, by session item: the node, its object's id in WirePlumber and its id in
+-- PipeWire, its name, the volume to give back, which fade holds it, so that a timer of an earlier
+-- move does not end a later one, how long after its new link the volume comes back, whether it
+-- went away meanwhile, and where it is: "out", faded and held silent — the volume last reported in
+-- `last`, and whether the fade has been played out in `played` — or "back", its volume given back
+-- and said once more until the server reports it. `theirs`: someone else wrote a volume meanwhile,
+-- which is theirs to keep. `polling`: it had no link when its volume was to come back, and is
+-- looked at again until it has one (`await_link`).
 local held = {}
 local fades = 0
 
@@ -67,6 +103,10 @@ local function master_volume (node)
     end
   end
   return nil
+end
+
+local function same (a, b)
+  return math.abs (a - b) <= SILENT
 end
 
 local function node_name (om, item_id)
@@ -81,9 +121,73 @@ local function ramp (node, volume, ms)
   })
 end
 
--- The stream this hook holds silent whose node is `node`, by its object's id in WirePlumber,
--- which a removed node keeps where its id in PipeWire and its properties are gone; nil when it
--- holds none.
+-- The volume, at once: to say where a ramp back has ended.
+local function say (node, volume)
+  node:set_param ("Props", Pod.Object {
+    "Spa:Pod:Object:Param:Props", "Props", volume = volume,
+  })
+end
+
+-- Whether `text`, a version as libpipewire says it, is `since` or later; nil when it does not read
+-- as three numbers.
+local function version_at_least (text, since)
+  if type (text) ~= "string" then
+    return nil
+  end
+  local major, minor, micro = text:match ("^%s*(%d+)%.(%d+)%.(%d+)")
+  if not major then
+    return nil
+  end
+  local version = { tonumber (major), tonumber (minor), tonumber (micro) }
+  for i = 1, 3 do
+    if version [i] ~= since [i] then
+      return version [i] > since [i]
+    end
+  end
+  return true
+end
+
+-- Whether the audio converter of the stream on `node` ramps a volume. The converter is in the
+-- stream's own process, and of its own libpipewire: an application from an older runtime, or with
+-- a libpipewire of its own older than 0.3.68, ignores the ramp and jumps to the volume written, a
+-- click where the move alone makes one. Its client says which libpipewire it is (core.version); a
+-- stream with no client, or one that says nothing that can be read, is taken at the word of the
+-- server under this WirePlumber, which ramps: WirePlumber 0.5 needs PipeWire 1.0.
+local function ramps (node)
+  local client_id = node.properties ["client.id"]
+  if not client_id then
+    return true
+  end
+  local client = cutils.get_object_manager ("client"):lookup {
+    Constraint { "bound-id", "=", client_id, type = "gobject" },
+  }
+  local at_least = version_at_least (client and client.properties ["core.version"], RAMPS_SINCE)
+  if at_least == nil then
+    return true
+  end
+  return at_least
+end
+
+-- Say in the default metadata whether this hook holds `h` silent (HELD_KEY).
+local function mark (h, on)
+  local ok, err = pcall (function ()
+    local metadata = cutils.get_default_metadata_object ()
+    if not metadata then
+      return
+    end
+    if on then
+      metadata:set (h.bound_id, HELD_KEY, "Spa:String", tostring (h.volume))
+    else
+      metadata:set (h.bound_id, HELD_KEY, nil, nil)
+    end
+  end)
+  if not ok then
+    log:info ("fxsound: could not say whether " .. h.name .. " is held: " .. tostring (err))
+  end
+end
+
+-- The stream this hook holds whose node is `node`, by its object's id in WirePlumber, which a
+-- removed node keeps where its id in PipeWire and its properties are gone; nil when it holds none.
 local function held_node (node)
   for _, h in pairs (held) do
     if h.node_id == node.id then
@@ -93,26 +197,129 @@ local function held_node (node)
   return nil
 end
 
-local function give_back (id, fade)
+-- Let go of the stream held under `id`.
+local function release (id)
   local h = held [id]
-  if not h or h.fade ~= fade then
+  held [id] = nil
+  if h and h.phase == "out" then
+    mark (h, false)
+  end
+end
+
+-- The volume given back, said once more where its ramp has ended, and again until the server
+-- reports it (RAMP_IN_DONE_MS): `tries` is how many times it has been said.
+local function confirm (id, fade, tries)
+  local h = held [id]
+  if not h or h.fade ~= fade or h.phase ~= "back" then
     return
   end
-  held [id] = nil
-  if h.gone then
+  if h.gone or h.theirs then
+    release (id)
     return
   end
   local ok, err = pcall (function ()
-    -- A volume someone else wrote meanwhile — a mixer, WirePlumber's ducking, FxSound — is
-    -- theirs.
     local now = master_volume (h.node)
-    if now ~= nil and now > SILENT then
-      log:info (h.node, "fxsound: the volume moved meanwhile; leaving it at " .. tostring (now))
+    if tries > 0 and now ~= nil and same (now, h.volume) then
+      release (id)
       return
     end
-    ramp (h.node, h.volume, FADE_IN_MS)
+    if tries >= CONFIRM_TRIES then
+      log:info (h.node, "fxsound: " .. h.name
+          .. " never reported its volume back; letting it go at " .. tostring (now))
+      release (id)
+      return
+    end
+    say (h.node, h.volume)
+    Core.timeout_add (CONFIRM_WAIT_MS, function ()
+      confirm (id, fade, tries + 1)
+      return false
+    end)
   end)
   if not ok then
+    release (id)
+    log:info ("fxsound: the stream went away before its volume was back: " .. tostring (err))
+  end
+end
+
+-- Whether the stream `h` holds has a link: any, into its node or out of it.
+local function linked (h)
+  for l in cutils.get_object_manager ("link"):iterate () do
+    local p = l.properties
+    if tonumber (p ["link.input.node"]) == h.bound_id
+        or tonumber (p ["link.output.node"]) == h.bound_id then
+      return true
+    end
+  end
+  return false
+end
+
+local give_back
+
+-- The stream held under `id` had no link when its volume was to come back: look again every
+-- UNLINKED_POLL_MS, and give the volume back `h.linked_ms` after a link is there. GIVE_BACK_MS
+-- still gives it back whatever happens.
+local function await_link (id, fade)
+  Core.timeout_add (UNLINKED_POLL_MS, function ()
+    local h = held [id]
+    if not h or h.fade ~= fade or h.phase ~= "out" or h.gone then
+      return false
+    end
+    local ok, has_link = pcall (linked, h)
+    if ok and not has_link then
+      await_link (id, fade)
+      return false
+    end
+    h.polling = false
+    Core.timeout_add (h.linked_ms, function ()
+      give_back (id, fade)
+      return false
+    end)
+    return false
+  end)
+end
+
+-- Give the stream held under `id` its volume back, if `fade` still holds it: not while it has no
+-- link (`await_link`), unless `always`, when GIVE_BACK_MS is up.
+give_back = function (id, fade, always)
+  local h = held [id]
+  if not h or h.fade ~= fade or h.phase ~= "out" then
+    return
+  end
+  if h.gone then
+    release (id)
+    return
+  end
+  if not always then
+    local ok, has_link = pcall (linked, h)
+    if ok and not has_link then
+      if not h.polling then
+        h.polling = true
+        log:info (h.node, "fxsound: " .. h.name .. " has no link yet; its volume waits for one")
+        await_link (id, fade)
+      end
+      return
+    end
+  end
+  local ok, err = pcall (function ()
+    -- A volume someone else wrote meanwhile — a mixer, WirePlumber's ducking, FxSound — is
+    -- theirs. A point on the way down is this hook's own fade, last reported before its end.
+    local now = master_volume (h.node)
+    if h.theirs or (now ~= nil and now > h.volume + SILENT) then
+      log:info (h.node, "fxsound: the volume moved meanwhile; leaving it at " .. tostring (now))
+      release (id)
+      return
+    end
+    mark (h, false)
+    h.phase = "back"
+    log:info (h.node, "fxsound: giving " .. h.name .. " its volume back")
+    ramp (h.node, h.volume, FADE_IN_MS)
+    Core.timeout_add (RAMP_IN_DONE_MS, function ()
+      confirm (id, fade, 0)
+      return false
+    end)
+  end)
+  if not ok then
+    release (id)
     log:info ("fxsound: the stream went away before its volume came back: " .. tostring (err))
   end
 end
@@ -146,8 +353,20 @@ AsyncEventHook {
           transition:advance ()
           return
         end
+        -- So is one whose converter has no ramp: written a volume, it would jump to it, a click
+        -- of its own, and another when its volume came back.
+        local has_ramp, answer = pcall (ramps, node)
+        if has_ramp and not answer then
+          log:info (node, "fxsound: " .. name .. " has no volume ramp; moving it as it is")
+          transition:advance ()
+          return
+        end
         local id = si.id
         local earlier = held [id]
+        if earlier and (earlier.gone or earlier.theirs) then
+          release (id)
+          earlier = nil
+        end
         local volume = earlier and earlier.volume or master_volume (node)
         if volume == nil or volume <= SILENT then
           transition:advance ()
@@ -155,24 +374,37 @@ AsyncEventHook {
         end
         local off_fxsound = node_name (om, si_flags.peer_id):find ("^fxsound") ~= nil
         local onto_fxsound = (target.properties ["node.name"] or ""):find ("^fxsound") ~= nil
+        local records = (si_props ["media.class"] or ""):find ("^Stream/Input") ~= nil
+        -- Moved again while the last move holds it silent: it is silent already. Moved again
+        -- while its volume comes back, it is faded anew.
+        local silent_already = earlier ~= nil and earlier.phase == "out"
         fades = fades + 1
         local fade = fades
-        held [id] = {
-          node = node, node_id = node.id, name = name, volume = volume, fade = fade,
-          linked_ms = (off_fxsound and not onto_fxsound) and CLAIM_WAIT_MS or LINKED_MS,
+        local h = {
+          node = node, node_id = node.id, bound_id = node ["bound-id"], name = name,
+          volume = volume, fade = fade, phase = "out",
+          last = silent_already and earlier.last or volume,
+          played = silent_already and earlier.played or false,
+          linked_ms = (off_fxsound and not onto_fxsound) and CLAIM_WAIT_MS
+              or (records and LINKED_MS + RECORDER_LINKED_MS or LINKED_MS),
         }
+        held [id] = h
         Core.timeout_add (GIVE_BACK_MS, function ()
-          give_back (id, fade)
+          give_back (id, fade, true)
           return false
         end)
-        if earlier then
-          -- Moved again before the last move gave its volume back: it is silent already.
+        if silent_already then
           transition:advance ()
           return
         end
+        mark (h, true)
         log:info (node, "fxsound: fading " .. name .. " out for its move")
         ramp (node, 0.0, FADE_OUT_MS)
         Core.timeout_add (SETTLE_MS, function ()
+          local e = held [id]
+          if e and e.phase == "out" then
+            e.played = true
+          end
           transition:advance ()
           return false
         end)
@@ -206,13 +438,22 @@ SimpleEventHook {
 -- WirePlumber keeps a stream's master volume for the application's next stream: its
 -- node/state-stream.lua saves it each time the stream's Props change (store_stream_props_hook) and
 -- gives it to the application's next stream (restore_stream_hook). The 0 this hook holds a stream
--- at is not the stream's own. Kept, a stream closed while it is held — a player stopped, a tab
--- closed, a short sound ended — would have every later stream of the application play silent
--- while the desktop's mixer, which shows the channel volumes, says 100 %. So a held stream's
--- change to silence goes no further than this hook, and state-stream keeps the volume it had; the
--- volume given back is a change like any other, which it sees. Writing state-stream's state file
--- from here instead would not do: state-stream keeps what it saved in memory, gives that to the
--- next stream, and writes it over the file at its next save.
+-- at is not the stream's own, nor is any point of its ramps down and back that the converter
+-- reports on the way — and it may report one and never the end of the ramp. Kept, a stream closed
+-- while it is held — a player stopped, a tab closed, a short sound ended — would have every later
+-- stream of the application play silent, or 30 dB down, while the desktop's mixer, which shows the
+-- channel volumes, says 100 %. So while a stream is held, a report of a volume below the one it
+-- is to get back goes no further than this hook, and state-stream keeps the volume it had; the
+-- volume given back, said once more where its ramp has ended, is a change like any other, which
+-- it sees. Writing state-stream's state file from here instead would not do: state-stream keeps
+-- what it saved in memory, gives that to the next stream, and writes it over the file at its
+-- next save.
+--
+-- A report is someone else's — a mixer's, WirePlumber's ducking, FxSound's — when it is above the
+-- volume to give back, or when it rises once the fade has been played out (SETTLE_MS). Not before:
+-- the converter's first report of a ramp is where the ramp goes, and the points it reports on the
+-- way come after it — measured on PipeWire 1.6.9, a ramp back to 0.5 reported 0.5, then 0.09,
+-- 0.19, 0.28, 0.37. Theirs, it goes on to state-stream, and the hook gives nothing back over it.
 SimpleEventHook {
   name = "fxsound/keep-the-silence-unsaved",
   before = "node/store-stream-props",
@@ -225,11 +466,27 @@ SimpleEventHook {
   },
   execute = function (event)
     local node = event:get_subject ()
-    if not held_node (node) then
+    local h = held_node (node)
+    if not h or h.theirs then
       return
     end
     local ok, now = pcall (master_volume, node)
-    if ok and now ~= nil and now <= SILENT then
+    if not ok or now == nil then
+      return
+    end
+    if now > h.volume + SILENT or (h.phase == "out" and h.played and now > h.last + SILENT) then
+      h.theirs = true
+      if h.phase == "out" then
+        mark (h, false)
+      end
+      log:info (node, "fxsound: " .. h.name .. " was given a volume of " .. tostring (now)
+          .. " while held; it is theirs")
+      return
+    end
+    if h.phase == "out" then
+      h.last = now
+    end
+    if now < h.volume - SILENT then
       event:stop_processing ()
     end
   end,
@@ -247,7 +504,12 @@ SimpleEventHook {
     local h = held_node (event:get_subject ())
     if h and not h.gone then
       h.gone = true
-      log:info ("fxsound: " .. h.name .. " went away while silent for its move")
+      if h.phase == "out" then
+        mark (h, false)
+        log:info ("fxsound: " .. h.name .. " went away while silent for its move")
+      else
+        log:info ("fxsound: " .. h.name .. " went away while its volume came back")
+      end
     end
   end,
 }:register ()

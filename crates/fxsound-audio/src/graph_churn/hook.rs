@@ -7,10 +7,13 @@
 use super::policy::PolicyGraph;
 use super::*;
 use crate::stream_handover::JOURNAL_FILE;
-use crate::wireplumber_hook::Place;
+use crate::wireplumber_hook::{HELD_KEY, Place};
 
 /// What the hook logs for each stream it fades.
 const FADING: &str = "fxsound: fading t_player out for its move";
+
+/// What the hook logs as it gives the stream its volume back.
+const GIVING: &str = "fxsound: giving t_player its volume back";
 
 /// A player that follows the default sink. `None`, said why, when a tool is missing.
 fn following_player(graph: &PolicyGraph) -> Option<apps::App> {
@@ -74,6 +77,91 @@ fn logged(graph: &PolicyGraph, line: &str, times: usize) -> bool {
     }
     println!(
         "WirePlumber never logged {line:?} {times} times:\n{}",
+        graph.session_manager_log()
+    );
+    false
+}
+
+/// Whether the `default` metadata says the hook holds a stream ([`HELD_KEY`]). `None` when
+/// `pw-metadata` could not say.
+fn hook_holds_any(graph: &PolicyGraph) -> Option<bool> {
+    graph
+        .tool("pw-metadata", &["-n", "default"])
+        .map(|listing| listing.contains(&format!("key:'{HELD_KEY}'")))
+}
+
+/// The master volume WirePlumber keeps for the application `name`'s next stream: its
+/// `node/state-stream.lua`'s, in the graph's state directory, under the key it forms for a
+/// player. `None` until it has kept one.
+fn kept_volume(graph: &PolicyGraph, name: &str) -> Option<f64> {
+    let state =
+        std::fs::read_to_string(graph.dir.join("state/wireplumber/stream-properties")).ok()?;
+    let line = state
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("Output/Audio:application.name:{name}=")))?;
+    let after = &line[line.find("\"volume\":")? + "\"volume\":".len()..];
+    let end = after
+        .find(|c: char| c != '.' && c != '-' && !c.is_ascii_digit())
+        .unwrap_or(after.len());
+    after[..end].trim().parse().ok()
+}
+
+/// `pw-cli`, kept running with its commands on a pipe, to have a stream send its `Props` again at
+/// a moment of the test's choosing: a millisecond or so after it is asked, where a `pw-cli` started
+/// for each would take tens.
+struct Prodder {
+    stdin: std::process::ChildStdin,
+    _cli: Guarded,
+}
+
+impl Prodder {
+    /// `None`, said why, when it could not be started.
+    fn start(graph: &PolicyGraph) -> Option<Self> {
+        let mut command = support::command("pw-cli");
+        command
+            .arg("-r")
+            .arg(graph.socket())
+            .env("XDG_RUNTIME_DIR", graph.dir.join("run"))
+            .env("PIPEWIRE_REMOTE", graph.socket())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null());
+        graph.stderr_log(&mut command, "pw-cli-prodder");
+        let mut cli = support::spawn(command)
+            .inspect_err(|error| println!("pw-cli could not be started: {error}"))
+            .ok()?;
+        let stdin = cli.take_stdin()?;
+        let mut prodder = Self { stdin, _cli: cli };
+        // Its first command may come before it knows the graph's objects: one to spare, and time
+        // to learn them.
+        prodder.prod(0, 1);
+        std::thread::sleep(Duration::from_millis(500));
+        Some(prodder)
+    }
+
+    /// Have the node `id` send its `Props` again: its monitor's mute, which a playback stream's
+    /// sound does not pass through, turned on for an odd `n`, off for an even one. The volume it
+    /// reports is where its converter's ramp has come to.
+    fn prod(&mut self, id: u64, n: usize) {
+        let _ = writeln!(
+            self.stdin,
+            "set-param {id} Props {{ monitorMute: {} }}",
+            n % 2 == 1
+        );
+        let _ = self.stdin.flush();
+    }
+}
+
+/// Wait, a millisecond at a time, until the graph's WirePlumber has logged `line`. Whether it did.
+fn logs_now(graph: &PolicyGraph, line: &str) -> bool {
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        if graph.session_manager_log().contains(line) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    println!(
+        "WirePlumber never logged {line:?}:\n{}",
         graph.session_manager_log()
     );
     false
@@ -201,9 +289,18 @@ fn a_player_closed_while_the_hook_holds_it_silent_starts_again_at_its_own_volume
         );
         std::thread::sleep(Duration::from_millis(2));
     }
+    let faded = Instant::now();
+    // The hook says it holds the player: FxSound's handover leaves it alone meanwhile.
+    assert_eq!(
+        hook_holds_any(&graph),
+        Some(true),
+        "the hook did not say in the default metadata that it held the player"
+    );
     // After the move, 70 ms after the fade, and well before the volume comes back, a quarter of a
     // second after the move.
-    std::thread::sleep(Duration::from_millis(170));
+    if let Some(left) = Duration::from_millis(170).checked_sub(faded.elapsed()) {
+        std::thread::sleep(left);
+    }
     drop(player);
     assert!(
         logged(
@@ -229,6 +326,95 @@ fn a_player_closed_while_the_hook_holds_it_silent_starts_again_at_its_own_volume
     // Given the time to have been put at anything else.
     std::thread::sleep(Duration::from_secs(1));
     assert!(volume_settles_on(&graph, PLAYER, 0.5));
+    // And the hook's word that it held the player went with the player.
+    assert_eq!(hook_holds_any(&graph), Some(false));
+    assert!(graph.session_manager_runs());
+}
+
+/// PipeWire's converter reports a point of a ramp when a stream's `Props` are sent again in the
+/// middle of one, and may never report its end. Sent again in the middle of the hook's fade, the
+/// stream's last report may be a point on the way down while it plays at 0: taken for someone
+/// else's volume, the hook would give nothing back, and the stream would stay silent while every
+/// mixer says 100 %. Sent again in the middle of its ramp back, the last report is a point on the
+/// way up — 0.37 of 0.5, every time, before the fix: kept by WirePlumber for the application's
+/// next stream, and read by the next move as the stream's volume. The hook takes a point of its
+/// own ramps for its own, keeps it from WirePlumber's state, and says the volume once more at the
+/// end of the ramp back, until the server reports it. At a quantum of 64 frames, each ramp spans a
+/// dozen cycles and more, and a report in the middle of one is a point on the way.
+#[test]
+fn a_stream_whose_ramps_are_reported_part_way_gets_its_own_volume_back_and_wireplumber_keeps_that()
+{
+    const PLAYER: &str = "t_player";
+    let Some(mut graph) = PolicyGraph::start_with_the_hook("wpmid") else {
+        return;
+    };
+    if let Some(missing) = ["pw-cat", "pw-cli", "pw-dump", "pw-metadata"]
+        .into_iter()
+        .find(|tool| !installed(tool))
+    {
+        skip(&format!(
+            "{missing} is not installed, so a ramp reported part way was not checked"
+        ));
+        return;
+    }
+    let _player = graph
+        .pw_cat(
+            "--playback",
+            PLAYER,
+            "application.name = t_player",
+            &["--latency", "64"],
+        )
+        .expect("pw-cat should play");
+    assert!(links(&graph, PLAYER, "t_stereo"));
+    assert!(graph.set_node_volume(PLAYER, 0.5).is_some());
+    assert!(volume_settles_on(&graph, PLAYER, 0.5));
+    let id = graph.node_id(PLAYER).expect("the player's id");
+    let mut prodder = Prodder::start(&graph).expect("pw-cli should run");
+
+    desktop_picks(&graph, "t_other");
+    assert!(logs_now(&graph, FADING), "the hook did not fade the move");
+    // In the middle of the fade out, 20 ms long.
+    for n in 1..=4 {
+        std::thread::sleep(Duration::from_millis(3));
+        prodder.prod(id, n);
+    }
+    assert!(
+        logs_now(&graph, GIVING),
+        "the hook did not give the player its volume back"
+    );
+    // In the middle of the ramp back, 50 ms long.
+    for n in 1..=4 {
+        std::thread::sleep(Duration::from_millis(9));
+        prodder.prod(id, n);
+    }
+    assert!(links(&graph, PLAYER, "t_other"));
+    assert!(
+        volume_settles_on(&graph, PLAYER, 0.5),
+        "the player was not given its own volume back"
+    );
+    // Given the time to have been put at anything else, and WirePlumber to write what it keeps.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(volume_settles_on(&graph, PLAYER, 0.5));
+    let deadline = Instant::now() + PATIENCE;
+    while kept_volume(&graph, PLAYER).is_none_or(|kept| (kept - 0.5).abs() > 1e-3)
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        kept_volume(&graph, PLAYER).map(|kept| (kept * 1e3).round() / 1e3),
+        Some(0.5),
+        "WirePlumber keeps a point of the hook's ramps for the player's next stream"
+    );
+    let log = graph.session_manager_log();
+    for wrong in [
+        "it is theirs",
+        "moved meanwhile",
+        "never reported its volume back",
+    ] {
+        assert!(!log.contains(wrong), "{wrong}:\n{log}");
+    }
+    assert_eq!(hook_holds_any(&graph), Some(false));
     assert!(graph.session_manager_runs());
 }
 
