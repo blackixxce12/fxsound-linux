@@ -1075,6 +1075,27 @@ impl App {
                     self.settings_dirty = true;
                 }
             }
+            // A device the desktop picked as the system's default while the lane follows it: the
+            // lane's device from now on, as a pick in FxSound would be, so the next start begins
+            // there (0.4.0 began on the device last picked in FxSound). Nothing goes back to the
+            // engine, which has moved the lane already; and with the priority list in force
+            // meanwhile, a pick on its way is the list's to decide, and not kept.
+            AudioToUi::DesktopPick {
+                direction,
+                node_name,
+            } => {
+                if self.settings.follow_system_default
+                    && self.settings.device_name(direction) != node_name
+                {
+                    log::info!(
+                        "the desktop picked {node_name} for the {} lane, which follows the \
+                         system's default device: kept for the next start",
+                        direction.key()
+                    );
+                    self.settings.set_device_name(direction, &node_name);
+                    self.settings_dirty = true;
+                }
+            }
             // The volume of FxSound's own node while attached to one device (U10), so the next
             // pair built for that device starts where the user left it. Remembered at once, and
             // written with the next flush once `VOLUME_SAVE_DELAY` has passed: a mixer drag
@@ -9703,6 +9724,55 @@ mod tests {
             select_devices(&engine.take_sent()),
             [&select(HEADPHONES, OUT)]
         );
+    }
+
+    #[test]
+    fn while_the_system_decides_the_device_the_desktop_picked_last_is_where_the_next_start_begins()
+    {
+        // roadmap 0.5.0 §3.2 (deferred from 0.4.0): a start in this mode began on the device last
+        // picked in FxSound, not on the one the desktop picked last before the quit.
+        let mut settings = saved_settings(OUT);
+        settings.follow_system_default = true;
+        let (mut app, engine, _dir) = started_with(settings);
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+        let _ = engine.take_sent();
+
+        engine.feed(AudioToUi::DesktopPick {
+            direction: OUT,
+            node_name: SPEAKERS.to_owned(),
+        });
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
+        assert_eq!(app.settings.device_name(OUT), SPEAKERS);
+        assert_eq!(
+            select_devices(&engine.take_sent()),
+            [] as [&UiToAudio; 0],
+            "the engine moved the lane already, and is asked for nothing"
+        );
+
+        // The next start announces the desktop's pick as the lane's device.
+        let (mut next, engine, _dir) = started_with(app.settings.clone());
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        next.poll_audio();
+        assert_eq!(
+            select_devices(&engine.take_sent()),
+            [&select(SPEAKERS, OUT), &select(MIC, IN)]
+        );
+    }
+
+    #[test]
+    fn a_device_the_desktop_picks_is_not_kept_while_the_priority_list_decides() {
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        app.poll_audio();
+        engine.feed(AudioToUi::DesktopPick {
+            direction: OUT,
+            node_name: SPEAKERS.to_owned(),
+        });
+        app.poll_audio();
+        assert_eq!(app.settings.device_name(OUT), HEADPHONES);
     }
 
     #[test]

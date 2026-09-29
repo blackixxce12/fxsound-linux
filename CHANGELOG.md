@@ -64,6 +64,30 @@ All notable changes to the FxSound Linux port. The format follows
   keybind, and any change made while the window is hidden or minimised — now pops up, a preset or
   an output picked in the window goes quietly to the message list, and every notice stays in the
   list until it is dismissed or FxSound quits.
+- **The power button no longer clicks in the applications it moves.** Power off hands the
+  defaults back to your devices and power on takes them again, and WirePlumber moved every
+  application that follows the default in the middle of its sound: −18 to −41 dBFS on the
+  speakers and in a recording. FxSound now fades each application it is about to have moved to
+  silence over 20 ms, and back in over 50 ms once it plays or records where it went: a gap of
+  about a tenth of a second, which usually leaves −46 dBFS or less. Not always: PipeWire's own
+  converter applies a new volume a moment before it starts the ramp to it, and now and then plays
+  one cycle at the new volume first, a click as loud as the sound itself — measured for a
+  recording application at about one power switch in a hundred. FxSound makes it rarer, and
+  cannot end it. An application given a preset of its own, or losing it, is moved the same way,
+  where it clicked as loud as −5 dBFS, and the preset's own reverb tail fades out rather than
+  stopping. PipeWire older than 0.3.68 has no such fade, and moves them as before. Should FxSound
+  be killed within that tenth of a second, its next start gives the application its volume back
+  (`~/.local/state/fxsound/handover.toml`).
+- **Following the system's default device, FxSound starts where the desktop last put it.** With
+  *Follow the system's default device* on, a device picked in the desktop's sound settings moved
+  the lane but was forgotten at the next start, which began on the device last picked in FxSound.
+- **A recording application is not left recording nothing when the power goes off.** WirePlumber
+  now and then linked an application that records from the default source to nothing when the
+  power button handed the microphone back — about one power off in fifteen, with four such
+  applications — and it then recorded silence until the default changed again. For three seconds
+  after it hands a default back, FxSound now moves such an application onto the device, as it
+  already did onto FxSound when the power comes back on; and it finds one sooner, a quarter of a
+  second after it lost its link, so that it records again within a second of the switch.
 - **The notifications have their icon.** The packages install the application icon under the
   name the notifications ask for, `com.fxsound.FxSound`, as well as `fxsound`.
 
@@ -81,8 +105,12 @@ All notable changes to the FxSound Linux port. The format follows
   sound to another device or node is reported instead, as loud as it is today: −18 to −41 dBFS for
   the power button, as loud as −5 dBFS for an application's own preset or a device chosen in
   FxSound, and −19 to −28 dBFS for the desktop's choice with FxSound off. The moves FxSound makes
-  itself are held to −40 dBFS once 0.5.0 makes them quiet. CI shows the measurements in the job's
-  summary.
+  itself are held to −40 dBFS once 0.5.0 makes them quiet — the power button's and an
+  application's own preset's already, with the gap they leave held to 200 ms, for `pw-cat` and for
+  PulseAudio applications alike, and every run of them counted, not only the median: one switch
+  over −40 dBFS in a pass is listed (PipeWire's own, above), a second fails it. An application
+  recording from the default source has to record again within a second of each switch of the
+  power button. CI shows the measurements in the job's summary.
 - **The sound is checked bit for bit against 0.4.0.** CI renders every shipped preset at 10, 20
   and 31 bands through this version and through v0.4.0, from a cold start and while a preset, the
   band count and a slider are switched, and requires the same output: identical, or nowhere more

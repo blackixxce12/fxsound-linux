@@ -1437,6 +1437,7 @@ fn hand_over_noting(harness: &Harness, id: u32) -> Rc<Cell<Option<Option<f32>>>>
             noted.set(Some(
                 shared.fades.watched(id).and_then(|watched| watched.level),
             ));
+            true
         }),
     );
     assert!(
@@ -1785,16 +1786,23 @@ fn a_playing_stream_a_killed_run_left_at_zero_gets_its_volume_back_over_the_ramp
         .filter(|&&(written, ..)| written == id)
         .map(|&(_, level, ramp)| (level, ramp))
         .collect();
-    let [(level, ramp)] = writes[..] else {
-        panic!("one write was expected for the repair, not {writes:?}");
+    // The repair, and — once its ramp has been played — the same volume said once more, at once.
+    let [(level, ramp), ref settled @ ..] = writes[..] else {
+        panic!("a write was expected for the repair, not {writes:?}");
     };
+    assert!(
+        settled
+            .iter()
+            .all(|&(again, ramp)| (again - level).abs() < 1e-6 && ramp == 0),
+        "{writes:?}"
+    );
     assert!(
         (level - 0.7).abs() < 1e-4,
         "the journal said 0.7, not {level}"
     );
     assert_eq!(
         ramp,
-        stream_handover::RAMP_MS,
+        stream_handover::RAMP_IN_MS,
         "a playing stream was put back from silence to its volume in one step"
     );
 }

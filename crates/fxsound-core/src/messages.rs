@@ -978,6 +978,15 @@ pub enum AudioToUi {
         direction: DeviceDirection,
         node_name: String,
     },
+    /// The desktop's sound settings picked `node_name` as the system's default device of
+    /// `direction`, and the lane, which follows the system's default device (no ranking), takes it
+    /// as the user's pick and moves there. The app keeps it as the lane's device, so the next start
+    /// begins where the desktop left it. Never sent for a move the engine makes on its own — a
+    /// device gone, and the lane falling back to another — which leaves the saved device as it is.
+    DesktopPick {
+        direction: DeviceDirection,
+        node_name: String,
+    },
     /// Whether echo cancellation is running — the module loaded and its source present — and,
     /// when it is not, why: the load error verbatim, so a missing `libspa-aec-webrtc` reads as
     /// `Echo  unavailable` in the strip rather than as a stage that silently did nothing.

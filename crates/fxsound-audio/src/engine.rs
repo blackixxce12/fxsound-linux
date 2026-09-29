@@ -209,6 +209,17 @@
 //! follow their lanes — built beside a lane's pair, rebuilt with it on another device, taken down
 //! with it — and go once nothing has used them for a while. On the way out the keys are deleted
 //! with the hand-back of the defaults, confirmed by the same `sync`, before any node goes.
+//!
+//! # Moving an application without a click
+//!
+//! A move of an application's stream — WirePlumber following a default FxSound claims or hands
+//! back, or a key FxSound writes — cuts the stream off one node and links it to the next in the
+//! middle of its sound. So every such move FxSound makes waits for the streams it moves to be faded
+//! to silence, and they get their volume back once linked where they went (`fades`,
+//! `crate::stream_handover`): the power button's claims and hand-backs, and the routes' keys. The
+//! ways that take a lane's pair down at once — a lane detached, no device left — and the way out
+//! hand the default back at once, as before; the way out gives a stream it had faded its volume
+//! back first.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -1620,6 +1631,16 @@ struct DefaultState {
     /// in the desktop's sound settings ([`desktop_pick`]). The server reports each change once, in
     /// order, and nothing for a write of the value it holds, which is therefore never noted.
     unconfirmed: VecDeque<String>,
+    /// A claim of this default is waiting for the streams that follow it to fall silent
+    /// ([`claim_default`]): asking again meanwhile asks for nothing more.
+    claiming: bool,
+    /// A hand-back of this default is waiting for the streams that follow it to fall silent
+    /// ([`release_default_smoothly`]).
+    releasing: bool,
+    /// When this engine last handed the default back to a device, until it takes it again: for
+    /// [`crate::stranded::AFTER_HAND_BACK`] after it, a stream the hand-back left linked to nothing
+    /// is moved onto the device ([`rescue_stranded_streams`]).
+    handed_back: Option<Instant>,
 }
 
 /// How far the GUI has got with the device lists it is sent: whether it has had its chance to act
@@ -2590,7 +2611,7 @@ fn control(shared: &mut Shared, message: UiToAudio) {
                     shared.lanes.get_mut(direction).last_target = None;
                 }
             } else {
-                release_default(shared, direction);
+                release_default_smoothly(shared, direction);
             }
         }
         UiToAudio::Restart => {
@@ -3485,10 +3506,17 @@ fn disconnect(shared: &mut Shared, reason: &str) {
     for direction in DeviceDirection::ALL {
         let state = shared.defaults.get(direction);
         let lane = shared.lanes.get_mut(direction);
-        if state.holding {
+        // A claim still waiting for its streams to fall silent is one the lane made: the
+        // reconnect makes it again ([`claim_default`]). A hand-back still waiting is the lane's
+        // word that the default is not to be FxSound's, not the user's pick of FxSound.
+        if state.holding || state.claiming {
             lane.last_target = None;
         }
-        lane.kept_by_hand = state.holding && !state.disowned && lane.enabled && !lane.want_default;
+        lane.kept_by_hand = state.holding
+            && !state.disowned
+            && !state.releasing
+            && lane.enabled
+            && !lane.want_default;
     }
     shared.defaults = PerDirection::default();
     // Both lanes' pairs go with the connection. Each lane stays enabled or detached as it was, so
@@ -3948,8 +3976,6 @@ fn on_global(
             if let (Some(output), Some(input)) = (node("link.output.node"), node("link.input.node"))
             {
                 guard.stranded.link_appeared(global.id, output, input);
-                // A new link of a stream a handover moved ends its move.
-                fades::link_appeared(&mut guard, output, input);
             }
         }
         pw::types::ObjectType::Client => {
@@ -4229,8 +4255,11 @@ fn on_global_remove(shared: &Rc<RefCell<Shared>>, id: u32) {
     let Ok(mut guard) = shared.try_borrow_mut() else {
         return;
     };
-    // A link, or anything a link can name.
-    guard.stranded.removed(id);
+    // A link, or anything a link can name. A stream a link went from may be left with none: its
+    // wait to be rescued starts now, and not at the next tick (`crate::stranded`).
+    if guard.stranded.removed(id) {
+        rescue_stranded_streams(&mut guard, Instant::now());
+    }
     // An application's stream or a client goes with its probe; a node of ours is forgotten here
     // and may still be something below — the echo canceller's source.
     match guard.apps.remove(id) {
@@ -4784,16 +4813,50 @@ fn is_ours(node_name: &str) -> bool {
     is_fxsound_node(node_name)
 }
 
-/// Become the session default for a lane's direction, politely: remember what was there first.
+/// Become the session default for a lane's direction, politely: remember what was there first
+/// ([`remember_default_before_us`]), and write FxSound's node to the key ([`take_default`]) once
+/// every application stream the claim moves onto FxSound has faded to silence (`fades`) — each
+/// stream that follows the default, and so goes from the device to FxSound's node when the key
+/// names it. The streams get their volume back once they are linked there.
+///
+/// The claim is made only if the lane still stands where it stood when it asked: a power switched
+/// off while the streams were fading, or a pair that went meanwhile, leaves the default where it is
+/// and the streams their volume at once. One claim at a time: asked for again while one waits, it
+/// asks for nothing more.
+fn claim_default(shared: &mut Shared, direction: DeviceDirection) {
+    let state = shared.defaults.get(direction);
+    if state.holding || state.claiming {
+        return;
+    }
+    let lane = shared.lanes.get(direction);
+    let (wanted, had_nodes) = (lane.want_default, lane.nodes.is_some());
+    let streams = fades::following(shared, direction);
+    remember_default_before_us(shared, direction);
+    shared.defaults.get_mut(direction).claiming = true;
+    fades::hand_over(
+        shared,
+        streams,
+        Box::new(move |shared: &mut Shared| {
+            shared.defaults.get_mut(direction).claiming = false;
+            let lane = shared.lanes.get(direction);
+            let stands = !shared.fades.closing()
+                && lane.want_default == wanted
+                && (lane.nodes.is_some() || !had_nodes);
+            if !stands || shared.defaults.get(direction).holding {
+                return false;
+            }
+            take_default(shared, direction)
+        }),
+    );
+}
+
+/// What [`claim_default`] notes before it writes the key: the default a lane's claim displaces,
+/// politely remembered first.
 ///
 /// Each lane holds its own claim — `default.configured.audio.sink` for the output lane,
 /// `default.configured.audio.source` for the input lane — so claiming one never touches the
 /// other.
-fn claim_default(shared: &mut Shared, direction: DeviceDirection) {
-    let ours = our_node_name(direction);
-    if shared.defaults.get(direction).holding {
-        return;
-    }
+fn remember_default_before_us(shared: &mut Shared, direction: DeviceDirection) {
     // Read and persist before writing (`docs/spec/12-audio-io.md` §21.1). The configured key is
     // the user's own choice and is preferred; the current key is what WirePlumber picked when
     // nobody chose. A stale configured value that already names us — a previous FxSound that was
@@ -4828,13 +4891,22 @@ fn claim_default(shared: &mut Shared, direction: DeviceDirection) {
             node_name: previous,
         });
     }
-    if write_configured_default(shared, direction, ours) {
-        shared.defaults.get_mut(direction).holding = true;
-        // Every stream that follows this default is about to be moved onto FxSound, and may be
-        // moved onto it again should the move leave it linked to nothing.
-        shared.stranded.claimed();
-        log::info!("FxSound is now the default {}", noun(direction));
+}
+
+/// Write FxSound's node of `direction` to the configured key: the claim itself, once
+/// [`remember_default_before_us`] has noted what it displaces. Whether the key was written.
+fn take_default(shared: &mut Shared, direction: DeviceDirection) -> bool {
+    if !write_configured_default(shared, direction, our_node_name(direction)) {
+        return false;
     }
+    let state = shared.defaults.get_mut(direction);
+    state.holding = true;
+    state.handed_back = None;
+    // Every stream that follows this default is about to be moved onto FxSound, and may be
+    // moved onto it again should the move leave it linked to nothing.
+    shared.stranded.claimed();
+    log::info!("FxSound is now the default {}", noun(direction));
+    true
 }
 
 /// Whether `value`, the configured key's new value, is the report of a write of this engine's
@@ -4888,28 +4960,59 @@ fn desktop_pick(shared: &mut Shared, direction: DeviceDirection) {
             direction.key(),
             noun(direction)
         );
-        memory.user_selected = picked;
+        memory.user_selected.clone_from(&picked);
+        // For the settings file: the next start begins on the device the desktop picked last,
+        // not on the one last picked in FxSound. Only a pick says so; a device that goes, and the
+        // lane falling back to another, leaves the saved one as it is.
+        shared.notify(AudioToUi::DesktopPick {
+            direction,
+            node_name: picked,
+        });
     }
     shared.mark_lane_for_rules(direction);
 }
 
 /// Move onto FxSound's node, for WirePlumber to link it again, every application stream that
 /// follows a default FxSound holds and has been linked to nothing for a while (`crate::stranded`,
-/// which says why WirePlumber leaves such a stream so, and how often it is moved).
+/// which says why WirePlumber leaves such a stream so, and how often it is moved); and, for
+/// [`crate::stranded::AFTER_HAND_BACK`] after FxSound handed a default back, every one that
+/// follows it onto the device it went to, which WirePlumber can leave so as well.
 ///
 /// A direction counts while FxSound holds its default and its lane's pair is up with its node in
-/// the graph. A stream follows the default when its own properties say it does
+/// the graph, or for a while after the hand-back while the device the default is on is in the
+/// graph. A stream follows the default when its own properties say it does
 /// ([`AppStreams::followers`]) and the `default` metadata names no target for it: a stream on a
 /// per-application route, or one a mixer moved, is somebody's choice, and stays where it is.
 fn rescue_stranded_streams(shared: &mut Shared, now: Instant) {
     let mut followers = Vec::new();
+    let mut targets = PerDirection::<Option<u64>>::default();
     for direction in DeviceDirection::ALL {
-        if !shared.defaults.get(direction).holding
-            || shared.lanes.get(direction).nodes.is_none()
-            || shared.stranded.our_serial(direction).is_none()
+        let state = shared.defaults.get(direction);
+        let target = if state.holding {
+            shared
+                .lanes
+                .get(direction)
+                .nodes
+                .as_ref()
+                .and_then(|_| shared.stranded.our_serial(direction))
+        } else if state
+            .handed_back
+            .is_some_and(|at| now.saturating_duration_since(at) < crate::stranded::AFTER_HAND_BACK)
         {
+            state.current.as_deref().and_then(|name| {
+                shared
+                    .devices
+                    .iter()
+                    .find(|device| device.direction == direction && device.name == name)
+                    .and_then(|device| device.object_serial)
+            })
+        } else {
+            None
+        };
+        let Some(target) = target else {
             continue;
-        }
+        };
+        *targets.get_mut(direction) = Some(target);
         followers.extend(
             shared
                 .apps
@@ -4920,11 +5023,16 @@ fn rescue_stranded_streams(shared: &mut Shared, now: Instant) {
         );
     }
     for (id, direction) in shared.stranded.due(&followers, now) {
-        let Some(serial) = shared.stranded.our_serial(direction) else {
+        let Some(serial) = *targets.get(direction) else {
             continue;
         };
+        let onto = if shared.defaults.get(direction).holding {
+            "FxSound".to_owned()
+        } else {
+            format!("the {} FxSound handed the default back to", noun(direction))
+        };
         log::info!(
-            "{}: linked to nothing since FxSound became the default {}, so moved onto FxSound \
+            "{}: linked to nothing since it was moved with the default {}, so moved onto {onto} \
              for the session manager to link it again",
             shared
                 .apps
@@ -4955,6 +5063,35 @@ fn reclaim_followed_default(shared: &mut Shared, direction: DeviceDirection, tar
     if wants && follows && picked_here {
         claim_default(shared, direction);
     }
+}
+
+/// Hand one direction's default back, as [`release_default`] does, once every application stream
+/// the hand-back moves off FxSound has faded to silence (`fades`): each stream that follows the
+/// default, on FxSound's node until the key names the device. The streams get their volume back
+/// once they are linked to the device. The power button's way of handing the default back (U12);
+/// the ways that take the lane's pair down at once, or leave the process, hand it back at once.
+///
+/// Made only if the lane still does not want the default when the streams are silent: the power
+/// switched back on meanwhile keeps FxSound where it is, and the streams get their volume back at
+/// once.
+fn release_default_smoothly(shared: &mut Shared, direction: DeviceDirection) {
+    let state = shared.defaults.get(direction);
+    if !state.holding || state.releasing {
+        return;
+    }
+    let streams = fades::following(shared, direction);
+    shared.defaults.get_mut(direction).releasing = true;
+    fades::hand_over(
+        shared,
+        streams,
+        Box::new(move |shared: &mut Shared| {
+            shared.defaults.get_mut(direction).releasing = false;
+            if shared.fades.closing() || shared.lanes.get(direction).want_default {
+                return false;
+            }
+            release_default(shared, direction)
+        }),
+    );
 }
 
 /// Hand one direction's default back to a real device. Returns whether the key was written.
@@ -4992,6 +5129,12 @@ fn release_default(shared: &mut Shared, direction: DeviceDirection) -> bool {
         }
     };
     shared.defaults.get_mut(direction).holding = false;
+    if written {
+        // Every stream that follows this default is about to be moved onto the device, and may
+        // be moved onto it again should the move leave it linked to nothing.
+        shared.defaults.get_mut(direction).handed_back = Some(Instant::now());
+        shared.stranded.claimed();
+    }
     written
 }
 
@@ -7159,6 +7302,35 @@ mod tests {
         assert_eq!(
             picked(false, DeviceDirection::Input, "alsa_input.usb-mic"),
             ("alsa_saved".to_owned(), false)
+        );
+    }
+
+    #[test]
+    fn a_desktop_pick_the_lane_follows_is_told_to_the_app_once_and_a_fallback_never() {
+        const PICKED: &str = "alsa_output.usb-headphones";
+        let (mut shared, messages) = shared_with_messages();
+        shared.lanes.output.enabled = true;
+        shared.memory.output.user_selected = "alsa_saved".to_owned();
+        shared.defaults.output.configured = Some(PICKED.to_owned());
+        desktop_pick(&mut shared, DeviceDirection::Output);
+        assert_eq!(
+            drained(&messages),
+            [AudioToUi::DesktopPick {
+                direction: DeviceDirection::Output,
+                node_name: PICKED.to_owned(),
+            }]
+        );
+        // The same device reported again is no news.
+        desktop_pick(&mut shared, DeviceDirection::Output);
+        assert_eq!(drained(&messages), []);
+        // The lane's own fallback, when the device goes, is the rules' and not a pick: nothing
+        // reaches the app however the lane moves.
+        shared.devices.clear();
+        apply_rules(&mut shared, DeviceDirection::Output);
+        assert!(
+            !drained(&messages)
+                .iter()
+                .any(|message| matches!(message, AudioToUi::DesktopPick { .. }))
         );
     }
 

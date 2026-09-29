@@ -663,6 +663,24 @@ impl AudioEngine {
         )
     }
 
+    /// [`Self::start_with_remote`], with the handover's journal kept at `journal` — a file of the
+    /// test's — rather than in memory: what a test of a run killed in the middle of a handover
+    /// reads, and hands the next run.
+    #[cfg(test)]
+    pub(crate) fn start_with_journal(
+        remote: Option<&str>,
+        journal: std::path::PathBuf,
+    ) -> Result<EngineHandle, AudioError> {
+        Self::start_with(
+            remote,
+            StartOptions::default(),
+            aec::WEBRTC_LIBRARY,
+            None,
+            app_routes::ROUTE_IDLE,
+            Some(journal),
+        )
+    }
+
     /// [`Self::start_with_remote`], with the echo canceller running `library` rather than WebRTC.
     ///
     /// For the tests: `aec/libspa-aec-null` passes the microphone through untouched, which is all a

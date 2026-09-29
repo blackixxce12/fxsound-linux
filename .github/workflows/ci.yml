@@ -130,7 +130,9 @@ jobs:
       # is the daemon and pw-dump, pw-metadata, pw-cli and pw-link; `libpipewire` the headers and
       # the SPA plugins (audiotestsrc, the null AEC); `pipewire-audio` pw-cat, pw-record and the
       # Bluetooth plugin the tests of a headset between profiles use; `dbus` the dbus-daemon of the
-      # private buses; `util-linux` the `setpriv --pdeathsig` that the tests' children die by.
+      # private buses; `util-linux` the `setpriv --pdeathsig` that the tests' children die by;
+      # `pipewire-pulse` the PulseAudio server a private graph starts for the tests of PulseAudio
+      # applications, and `libpulse` the `pacat` and `pactl` they play, record and ask it with.
       # rustup rather than Arch's rust, so that the compiler is rust-toolchain.toml's and
       # RUSTFLAGS=-D warnings means what it means in the job above. The image keeps no manual
       # pages or docs, which nothing here reads.
@@ -139,7 +141,8 @@ jobs:
           set -euo pipefail
           pacman -Syu --noconfirm --needed \
             base-devel clang pkgconf rustup git \
-            pipewire libpipewire pipewire-audio wireplumber dbus util-linux
+            pipewire libpipewire pipewire-audio pipewire-pulse libpulse wireplumber dbus \
+            util-linux
           pipewire --version
           wireplumber --version
           setpriv --version

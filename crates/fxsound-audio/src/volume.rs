@@ -599,7 +599,8 @@ const PROP_VOLUME_RAMP_STEP_SAMPLES: u32 = 0x10013;
 const PROP_VOLUME_RAMP_TIME: u32 = 0x10014;
 
 /// A `Props` object that takes an application stream's master volume to `level` over
-/// `ramp_ms` milliseconds, one sample at a time — or at once, with `ramp_ms` 0 — and changes
+/// `ramp_ms` milliseconds, [`crate::stream_handover::RAMP_STEP_SAMPLES`] samples a step — or at
+/// once, with `ramp_ms` 0 — and changes
 /// nothing else: not `channelVolumes`, the level a desktop's slider shows (`crate::stream_handover`).
 pub(crate) fn master_volume_pod(level: f32, ramp_ms: i32) -> Vec<u8> {
     use libspa::pod::{Object, Property, PropertyFlags};
@@ -612,7 +613,10 @@ pub(crate) fn master_volume_pod(level: f32, ramp_ms: i32) -> Vec<u8> {
     let mut properties = Vec::with_capacity(3);
     if ramp_ms > 0 {
         properties.push(property(PROP_VOLUME_RAMP_TIME, Value::Int(ramp_ms)));
-        properties.push(property(PROP_VOLUME_RAMP_STEP_SAMPLES, Value::Int(1)));
+        properties.push(property(
+            PROP_VOLUME_RAMP_STEP_SAMPLES,
+            Value::Int(crate::stream_handover::RAMP_STEP_SAMPLES),
+        ));
     }
     properties.push(property(libspa::sys::SPA_PROP_volume, Value::Float(level)));
     libspa::pod::serialize::PodSerializer::serialize(
@@ -1024,8 +1028,7 @@ mod tests {
         assert_eq!(int(PROP_VOLUME_RAMP_TIME), Some(20));
         assert_eq!(
             int(PROP_VOLUME_RAMP_STEP_SAMPLES),
-            Some(1),
-            "one sample a step"
+            Some(crate::stream_handover::RAMP_STEP_SAMPLES)
         );
 
         let at_once = master_volume_pod(0.8, 0);

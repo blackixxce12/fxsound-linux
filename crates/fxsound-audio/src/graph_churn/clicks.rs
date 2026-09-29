@@ -33,7 +33,8 @@
 //! is measured. The engine runs on it as the app drives it — the power switch is both lanes'
 //! snapshots and both default claims ([`Bench::act`]); a preset is the snapshot the app would
 //! publish for it; a route is the rules it would send. Tones are `pw-cat` playing a Sun AU file,
-//! recorders `pw-record` writing a raw file: no `--raw`, which PipeWire 1.0's tools lack.
+//! recorders `pw-record` writing a raw file: no `--raw`, which PipeWire 1.0's tools lack. A
+//! scenario of PulseAudio applications plays and records with `pacat` instead ([`Scenario::pulse`]).
 //!
 //! A switch between devices is heard on both: the speakers' lane is recorded at both sinks'
 //! monitors, and one player feeds both microphones the same wave, in step. The recordings are read
@@ -45,7 +46,8 @@
 //! One test each, the numbers of roadmap §7's list where it has them:
 //!
 //! 1. the power switch with streams pinned to FxSound's own nodes, and with streams that follow
-//!    the default, which WirePlumber moves;
+//!    the default, which WirePlumber moves: `pw-cat`'s and `pw-record`'s, and PulseAudio
+//!    applications' through the graph's own `pipewire-pulse`;
 //! 2. an application's route on and off ([`UiToAudio::SetAppRoutes`]);
 //! 3. FxSound picking another device for both lanes, as the device list, `--output`,
 //!    `--next-output` and `--input` do ([`UiToAudio::SelectDevice`]);
@@ -91,10 +93,13 @@
 //! A stream that follows the default is moved by WirePlumber when the power switch hands the
 //! default back or takes it, when a route is made or taken away, and when a lane's nodes go and
 //! come back on another device, and WirePlumber unlinks before it links, in the middle of the
-//! wave. In 0.4.0 all of these are over the gate, so they are reported, not gated. The power
+//! wave. In 0.4.0 all of these are over the gate, so they were reported, not gated. The power
 //! switch, the route and FxSound's own pick of a device are FxSound's own switches all the same,
-//! held to the gate once 0.5.0 makes them quiet (roadmap §7 D1–D3), and their tables say so. The
-//! desktop's pick is reported for good until the roadmap's §14 #16 says what it is held to.
+//! held to the gate once 0.5.0 makes them quiet (roadmap §7 D1–D3): since D2 the power switch and
+//! the route fade the streams they move (`crate::stream_handover`) and are gated, the gap they
+//! leave held to [`HANDOVER_BUDGET`]; FxSound's own pick waits for D3, and says so in its table.
+//! The desktop's pick is reported for good: roadmap §14 #16 accepted that it stays where plain
+//! Linux has it, unless WirePlumber itself is taught to fade (D5).
 //!
 //! # Running it
 //!
@@ -120,9 +125,10 @@
 //! * A phase that adds a switch or a parameter change adds it here: a [`Switch`] that makes it
 //!   as the app does, and a [`Scenario`] — or a place in one — that makes it under the tone. The
 //!   end state alone is not the test (roadmap §12 item 2).
-//! * A phase that makes a reported switch quiet sets its scenario's `gated`: D2 does it for the
-//!   power switch with following streams and for the route, D3 for FxSound's own pick of a device,
-//!   and each holds the dip to its budget with [`EventResult::dip_ms`] as well.
+//! * A phase that makes a reported switch quiet sets its scenario's `gated`: D2 did it for the
+//!   power switch with following streams and for the route, D3 is to for FxSound's own pick of a
+//!   device, and each holds the dip to its budget with [`EventResult::dip_ms`] as well
+//!   ([`Scenario::budget`]).
 //! * A phase that says a reported switch got quieter judges by the loudest run, of several passes,
 //!   not by a shift of the median: what WirePlumber's move leaves spreads over about 20 dB (below).
 //! * A phase that changes what a scenario sets up — a new node between the tone and the recorder,
@@ -178,6 +184,52 @@
 //! Interface and sound left −20.0 dBFS and the move back −6.3; since W1d, which glides and
 //! crossfades what the level changes, −64.7 and −53.3 on the lane and −64.0 and −55.7 in an
 //! application's route, the loudest run −52.2, the floor −108.5.
+//!
+//! The smooth handover, measured on 29.09.2026 in the same way at D2 of 0.5.0, each switch the
+//! median of three clean runs, and the loudest run beside it. With ramps of one sample a step, as
+//! first made, over three passes: the power switch with following streams, on the speakers' lane
+//! off −71.2…−91.3 and on −47.7…−51.5, a dip of 40–100 ms; on the microphone's lane off
+//! −76.2…−84.2 and on −72.9…−76.9, a dip of 100–130 ms, the recorder's volume given back 50 ms
+//! after its new link is active. The route on and off: on the speakers' lane on −46.9…−47.8 and
+//! off −52.6…−54.4, a dip of 40–60 ms; on the microphone's lane −68.9…−81.4, a dip of 100–120 ms.
+//! With eight samples a step (`crate::stream_handover::RAMP_STEP_SAMPLES`, below): the power
+//! switch off −59.9…−60.8 and on −47.0…−50.5 on the speakers' lane, −65.9…−66.7 on the
+//! microphone's; the route on −44.3…−46.9 and off −49.9…−52.7, −58.6…−59.1 on the microphone's
+//! lane; the dips as before. The quiet ones are the steps' staircase now, 10–20 dB louder; the
+//! loud ones hardly moved. Floors as before. Before the volume came back over 50 ms rather than
+//! 20, the route going on left −40.6…−43.8: the route's chain, which has heard nothing yet, took
+//! the onset at full level. Before the route's chain was switched off and let play its tail out
+//! before its pair went, the route going off left −35.6…−37.8: its reverb's tail stopped in the
+//! middle of its wave. The desktop's pick and FxSound's own pick are as before (D3).
+//!
+//! The power switch with PulseAudio applications following the default, measured the same day in
+//! the same way: on the speakers' lane off −53.8…−57.6 and on −45.9…−49.6, a dip of 60–90 ms; on
+//! the microphone's lane −65.9…−66.3, a dip of 100–120 ms (with one sample a step, over nine
+//! passes: off −66.9…−79.9 and on −47.7…−50.0; −76.2…−80.4). Not in every run, which the median
+//! of three does not show. PipeWire's converter applies a ramped write's new volume at once and
+//! only then hands its data thread the ramp, and a cycle played in between is heard at the new
+//! volume: before a fade in, a whole quantum at full level, then silence, then the ramp. Counted
+//! switch by switch over runs of four switches: the recorder played its tone so, at −17.7 to
+//! −24.9 dBFS, at 1 switch in 96 with one sample a step and 2 in 160 with eight; the player at
+//! −11.7 to −18.6, 3 in 96 with one and none in 160 with eight. It was put down, before it was
+//! found, to the recorder's channels changing in its move from the microphone's one to FxSound's
+//! two: it is not that — without FxSound, on a private graph, a `parec` stream faded out and in
+//! over 50 ms by `pw-cli` did it 21 times in 2400 writes at one sample a step, and once in 1600 at
+//! eight. It is PipeWire's, and FxSound's steps make it rarer and do not end it; so a handover's
+//! scenario counts every run, lists each switch over the gate, and fails a pass with more than one
+//! ([`Budget::loud_runs`]). With a player that asks for 20 ms rather than 85, the recorder jumped
+//! at −17.7 to −28.6 on one run in three, 90 ms after the switch and before its own handover
+//! began: the player's move changes the quantum of the graph the recorder is in, and a PulseAudio
+//! recorder drops samples when the quantum falls — without FxSound too
+//! (`PolicyGraph::pulse_player`'s latency).
+//!
+//! Two faults of the handover's own were mended with it. A second point of a ramp down, reported
+//! by the converter, was taken for somebody else's volume: the stream let go, and its journal line
+//! taken out, while the ramp went on to 0 (found in review, not seen in these runs). And, seen in
+//! a run of sixteen switches 1.5 s apart, a converter that reported a point near the start of its
+//! ramp back and then never echoed the volume said once more after it left the server showing that
+//! point, 0.10, which the next power switch faded from and gave back: a player left 20 dB down for
+//! good (`crate::stream_handover::CONFIRM_WAIT`).
 //!
 //! E6a measured the same switches with the app's release build, where this runs the engine
 //! unoptimised, and in another order. The switches FxSound makes itself agree within a few dB,
@@ -556,7 +608,7 @@ fn errors_between(before: &[(String, u64)], after: &[(String, u64)]) -> u64 {
 
 /// What a loud switch does ([`GATE_MODE`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gate {
+pub(super) enum Gate {
     /// A gated switch at [`HARD_GATE_DBFS`] or louder fails the test.
     Hard,
     /// Nothing fails for loudness; a switch at [`SOFT_GATE_DBFS`] or louder is a warning.
@@ -566,7 +618,7 @@ enum Gate {
 impl Gate {
     /// The mode the environment asks for: [`GATE_MODE`] when it is set, [`Gate::Report`] under
     /// CI, [`Gate::Hard`] otherwise.
-    fn from_env() -> Self {
+    pub(super) fn from_env() -> Self {
         Self::of(
             std::env::var(GATE_MODE).ok().as_deref(),
             std::env::var("CI").ok().as_deref(),
@@ -689,7 +741,41 @@ struct Scenario {
     /// a route of their own for the tone's player and recorder ([`Switch::Route`]), which they
     /// then start on, so that nothing moves them during the run.
     before: Vec<Switch>,
+    /// What a gated scenario holds its switches to beside the gate, where it holds them to more.
+    budget: Option<Budget>,
+    /// Whether the tone's player and the microphone's recorder are PulseAudio applications —
+    /// `pacat` through the graph's own `pipewire-pulse` ([`PolicyGraph::start_pulse`]) — rather
+    /// than `pw-cat` and `pw-record`. The recorders at the sinks' monitors stand for the devices,
+    /// and stay `pw-record`.
+    pulse: bool,
 }
+
+/// What a switch that moves streams, and fades them to do it, is held to beside the gate (roadmap
+/// §7, test 1): the gap it leaves in the tone and the steady state around it, and how many of its
+/// switches may go over the gate run by run.
+#[derive(Debug, Clone, Copy)]
+struct Budget {
+    /// The longest a switch may leave the tone dipped ([`EventResult::dip_ms`]): the fade, the
+    /// move, the new link and the fade back.
+    dip: Duration,
+    /// The loudest the steady state may be ([`Analysis::floor_dbfs`]): a handover that left a
+    /// stream somewhere it should not be, or at a volume it should not have, shows here.
+    floor_dbfs: f64,
+    /// How many switches of all the clean runs of a pass may each go over the gate, the median
+    /// aside, before the pass fails. Every one is listed in a warning. One: PipeWire's converter
+    /// plays a quantum at the new volume before the ramp to it now and then, a race FxSound can
+    /// make rarer and cannot end (`crate::stream_handover::RAMP_STEP_SAMPLES`) — measured at two
+    /// recorder switches in 160; a handover that goes wrong on its own leaves more than one.
+    loud_runs: usize,
+}
+
+/// The power switch's and a route's moves (D2): a gap of a tenth of a second or so instead of the
+/// click, and a steady state as quiet as FxSound's own.
+const HANDOVER_BUDGET: Budget = Budget {
+    dip: Duration::from_millis(200),
+    floor_dbfs: -90.0,
+    loud_runs: 1,
+};
 
 /// A recorder of the bench: `pw-record` writing raw stereo `f32` into the graph's directory.
 struct Tap {
@@ -941,23 +1027,28 @@ impl Bench {
         self.engine.send(UiToAudio::SetAppRoutes(rules));
     }
 
-    /// Write a tone into the graph's directory as a Sun AU file of 32-bit floats: `seconds` long,
-    /// with 20 ms raised-cosine fades at both ends, the same on every channel.
+    /// Write a tone into the graph's directory as a Sun AU file of 32-bit floats, for `pw-cat`,
+    /// or as raw little-endian ones, for `pacat` (`raw`): `seconds` long, with 20 ms raised-cosine
+    /// fades at both ends, the same on every channel.
     fn tone_file(
         &self,
         name: &str,
         (hz, level): (f64, f64),
         channels: usize,
         seconds: f64,
+        raw: bool,
     ) -> PathBuf {
         const AU_FLOAT: u32 = 6;
         let frames = (seconds * RATE as f64) as usize;
         let fade = RATE / 50;
         let amplitude = 10_f64.powf(level / 20.0);
         let data = u32::try_from(frames * channels * 4).expect("a tone of minutes at most");
-        let mut bytes = b".snd".to_vec();
-        for word in [24, data, AU_FLOAT, RATE as u32, channels as u32] {
-            bytes.extend_from_slice(&word.to_be_bytes());
+        let mut bytes = Vec::new();
+        if !raw {
+            bytes.extend_from_slice(b".snd");
+            for word in [24, data, AU_FLOAT, RATE as u32, channels as u32] {
+                bytes.extend_from_slice(&word.to_be_bytes());
+            }
         }
         for n in 0..frames {
             let edge = n.min(frames - 1 - n);
@@ -969,10 +1060,17 @@ impl Bench {
             let phase = 2.0 * std::f64::consts::PI * hz * n as f64 / RATE as f64;
             let sample = (amplitude * gain * phase.sin()) as f32;
             for _ in 0..channels {
-                bytes.extend_from_slice(&sample.to_be_bytes());
+                if raw {
+                    bytes.extend_from_slice(&sample.to_le_bytes());
+                } else {
+                    bytes.extend_from_slice(&sample.to_be_bytes());
+                }
             }
         }
-        let file = self.graph.dir.join(format!("{name}.au"));
+        let file = self
+            .graph
+            .dir
+            .join(format!("{name}.{}", if raw { "raw" } else { "au" }));
         std::fs::write(&file, bytes).expect("the graph's directory is ours");
         file
     }
@@ -1021,10 +1119,14 @@ impl Bench {
     }
 
     /// `pw-record` as `name`, kept on `target` — the monitor of a sink when `monitor` — or following
-    /// the default source when there is no target.
-    fn record(&self, name: &str, target: Option<&str>, monitor: bool) -> Option<Tap> {
+    /// the default source when there is no target: then `pacat` instead when `pulse`.
+    fn record(&self, name: &str, target: Option<&str>, monitor: bool, pulse: bool) -> Option<Tap> {
         let Some(target) = target else {
-            let (child, file) = self.graph.follow_default_recorder(name)?;
+            let (child, file) = if pulse {
+                self.graph.pulse_recorder(name)?
+            } else {
+                self.graph.follow_default_recorder(name)?
+            };
             return Some(Tap {
                 _child: child,
                 file,
@@ -1263,6 +1365,9 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
             return None;
         }
     }
+    if scenario.pulse && !bench.graph.start_pulse() {
+        return None;
+    }
     // Longer than the run by far: the tone must not end inside what is read.
     let length = 15.0 + scenario.spacing.as_secs_f64() * (scenario.switches.len() + 1) as f64;
     let pinned = scenario.streams == Streams::Pinned;
@@ -1295,21 +1400,32 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
     for &direction in scenario.lanes {
         let taps = match direction {
             DeviceDirection::Output => {
-                let tone = bench.tone_file("t_tone", OUTPUT_TONE, 2, length);
+                let tone = bench.tone_file("t_tone", OUTPUT_TONE, 2, length, scenario.pulse);
                 let target = pinned.then_some(SINK_NODE_NAME);
-                let player = bench.play("t_player", &tone, target, "");
+                let player = if scenario.pulse {
+                    bench.graph.pulse_player("t_player", Some(&tone))
+                } else {
+                    bench.play("t_player", &tone, target, "")
+                };
                 streams.push(player.expect("the tone plays"));
-                let at = |sink: &str| bench.record(&format!("t_monitor_{sink}"), Some(sink), true);
+                let at = |sink: &str| {
+                    bench.record(&format!("t_monitor_{sink}"), Some(sink), true, false)
+                };
                 speakers.iter().map(|sink| at(sink)).collect::<Vec<_>>()
             }
             DeviceDirection::Input => {
-                let tone = bench.tone_file("t_voice", INPUT_TONE, 1, length);
+                let tone = bench.tone_file("t_voice", INPUT_TONE, 1, length, false);
                 streams.push(
                     bench
                         .feed_the_microphone(&tone, &microphones)
                         .expect("the microphone is fed"),
                 );
-                vec![bench.record("t_recorder", pinned.then_some(SOURCE_NODE_NAME), false)]
+                vec![bench.record(
+                    "t_recorder",
+                    pinned.then_some(SOURCE_NODE_NAME),
+                    false,
+                    scenario.pulse,
+                )]
             }
         };
         let taps = taps
@@ -1450,6 +1566,8 @@ fn report(scenario: &Scenario, gate: Gate, clean: &[Run], discarded: &[u64]) -> 
     if clean.iter().any(|run| run.xruns.is_none()) {
         let _ = writeln!(text, "(xruns were not counted: pw-top gave no answer)");
     }
+    // The runs of a handover's scenario whose switch went over the gate, whatever the median says.
+    let mut over: Vec<String> = Vec::new();
     for (lane, direction) in scenario.lanes.iter().enumerate() {
         let (hz, level) = match direction {
             DeviceDirection::Output => OUTPUT_TONE,
@@ -1510,6 +1628,20 @@ fn report(scenario: &Scenario, gate: Gate, clean: &[Run], discarded: &[u64]) -> 
                 "FxSound's ring came up short or overflowed by {ring:?} frames in the runs"
             );
         }
+        if let Some(budget) = scenario.budget.filter(|_| scenario.gated)
+            && floor > budget.floor_dbfs
+        {
+            let line = format!(
+                "{} ({}): the steady state, {floor:.1} dBFS, is over {:.1} dBFS",
+                scenario.title,
+                direction.key(),
+                budget.floor_dbfs
+            );
+            let _ = writeln!(text, "WARNING: {line}");
+            if gate == Gate::Hard {
+                failures.push(line);
+            }
+        }
         if floor >= FLOOR_LIMIT_DBFS && scenario.gated {
             let line = format!(
                 "{} ({}): the floor, {floor:.1} dBFS, is too high to tell a click",
@@ -1544,6 +1676,49 @@ fn report(scenario: &Scenario, gate: Gate, clean: &[Run], discarded: &[u64]) -> 
                     switch.label()
                 ));
             }
+            // A handover's switches are counted run by run too: the median hides a run in
+            // twenty, and a run in twenty is a click a user hears (`Budget::loud_runs`).
+            if scenario.budget.is_some() && scenario.gated {
+                for (number, run) in clean.iter().enumerate() {
+                    let value = run.lanes[lane].events[n].worst_dbfs;
+                    if value >= HARD_GATE_DBFS {
+                        over.push(format!(
+                            "{} {} in run {} at {value:.1} dBFS",
+                            direction.key(),
+                            switch.label(),
+                            number + 1
+                        ));
+                    }
+                }
+            }
+            if let Some(budget) = scenario.budget.filter(|_| scenario.gated)
+                && dip > budget.dip.as_secs_f64() * 1000.0
+            {
+                let line = format!(
+                    "{} ({}): {} left the tone dipped for {dip:.0} ms, over {} ms",
+                    scenario.title,
+                    direction.key(),
+                    switch.label(),
+                    budget.dip.as_millis()
+                );
+                let _ = writeln!(text, "    WARNING: {line}");
+                if gate == Gate::Hard {
+                    failures.push(line);
+                }
+            }
+        }
+    }
+    if let Some(budget) = scenario.budget.filter(|_| !over.is_empty()) {
+        let switches = clean.len() * scenario.lanes.len() * scenario.switches.len();
+        let line = format!(
+            "{}: {} of {switches} switches over {HARD_GATE_DBFS} dBFS, run by run: {}",
+            scenario.title,
+            over.len(),
+            over.join("; ")
+        );
+        let _ = writeln!(text, "WARNING: {line}");
+        if gate == Gate::Hard && over.len() > budget.loud_runs {
+            failures.push(line);
         }
     }
     Report { text, failures }
@@ -1598,14 +1773,18 @@ fn under_a_steady_tone_the_power_switch_does_not_click_in_streams_pinned_to_fxso
         off: false,
         both_devices: false,
         before: Vec::new(),
+        budget: None,
+        pulse: false,
     });
 }
 
 /// With streams that follow the default, the power switch hands the defaults back or takes them,
-/// and WirePlumber moves the streams — unlinking before it links, in the middle of the wave. The
-/// click of that move is reported and not gated (module docs).
+/// and WirePlumber moves the streams — unlinking before it links, in the middle of the wave. Since
+/// D2 FxSound fades each stream it is about to have moved to silence first, and gives it its volume
+/// back once it is linked where it went (`crate::stream_handover`): gated, with the dip each move
+/// leaves held to [`HANDOVER_BUDGET`] (roadmap §7, test 1).
 #[test]
-fn under_a_steady_tone_the_power_switch_moves_the_streams_that_follow_the_default_and_is_reported()
+fn under_a_steady_tone_the_power_switch_moves_the_streams_that_follow_the_default_without_a_click()
 {
     check(&Scenario {
         tag: "clk-follow",
@@ -1614,11 +1793,39 @@ fn under_a_steady_tone_the_power_switch_moves_the_streams_that_follow_the_defaul
         lanes: &DeviceDirection::ALL,
         switches: [false, true, false, true].map(Switch::Power).to_vec(),
         spacing: Duration::from_secs(3),
-        gated: false,
+        gated: true,
         note: "",
         off: false,
         both_devices: false,
         before: Vec::new(),
+        budget: Some(HANDOVER_BUDGET),
+        pulse: false,
+    });
+}
+
+/// The same with PulseAudio applications (roadmap §7, test 1: «pw-cat and pulse»): the tone's
+/// player and the microphone's recorder are `pacat`, through the graph's own `pipewire-pulse`, as
+/// most applications on a desktop still are. Their streams are `pipewire-pulse`'s, each with the
+/// audio converter the fade is made in; and it is a PulseAudio application that a fade left at 0
+/// would leave silent for good, with WirePlumber giving the silence back to its next stream while
+/// the desktop's mixer shows 100 % (`crate::stream_handover`, the journal).
+#[test]
+fn under_a_steady_tone_the_power_switch_moves_pulseaudio_applications_that_follow_the_default_without_a_click()
+ {
+    check(&Scenario {
+        tag: "clk-pulse",
+        title: "power, PulseAudio applications following the default",
+        streams: Streams::Following,
+        lanes: &DeviceDirection::ALL,
+        switches: [false, true, false, true].map(Switch::Power).to_vec(),
+        spacing: Duration::from_secs(3),
+        gated: true,
+        note: "",
+        off: false,
+        both_devices: false,
+        before: Vec::new(),
+        budget: Some(HANDOVER_BUDGET),
+        pulse: true,
     });
 }
 
@@ -1651,6 +1858,8 @@ fn under_a_steady_tone_the_equalizer_and_the_music_presets_switch_without_a_clic
         off: false,
         both_devices: false,
         before: Vec::new(),
+        budget: None,
+        pulse: false,
     });
 }
 
@@ -1677,6 +1886,8 @@ fn under_a_steady_tone_moving_like_fxsound_for_windows_between_off_and_sound_doe
         off: false,
         both_devices: false,
         before: vec![to_parity(WindowsParity::Off)],
+        budget: None,
+        pulse: false,
     });
 }
 
@@ -1702,6 +1913,8 @@ fn under_a_steady_tone_moving_like_fxsound_for_windows_in_an_application_route_d
         off: false,
         both_devices: false,
         before: vec![to_parity(WindowsParity::Off), Switch::Route(true)],
+        budget: None,
+        pulse: false,
     });
 }
 
@@ -1729,15 +1942,18 @@ fn under_a_steady_tone_the_voice_equalizer_and_the_voice_presets_switch_without_
         off: false,
         both_devices: false,
         before: Vec::new(),
+        budget: None,
+        pulse: false,
     });
 }
 
 /// A preset of its own for the tone's player and recorder, then none, twice (roadmap §7, test 2):
 /// the engine writes each stream's target, and WirePlumber moves it onto the route and back —
-/// unlinking before it links, as for the power switch. FxSound's own switch, and in 0.4.0 over the
-/// gate, so reported until D2 hands the streams over quietly and gates it.
+/// unlinking before it links, as for the power switch. Since D2 each stream is faded to silence
+/// before its key is written, and the route it leaves goes only once it is off it: gated, with the
+/// dip held to [`HANDOVER_BUDGET`].
 #[test]
-fn under_a_steady_tone_an_application_route_moves_the_streams_on_and_off_and_is_reported() {
+fn under_a_steady_tone_an_application_route_moves_the_streams_on_and_off_without_a_click() {
     check(&Scenario {
         tag: "clk-route",
         title: "application route on and off",
@@ -1745,12 +1961,13 @@ fn under_a_steady_tone_an_application_route_moves_the_streams_on_and_off_and_is_
         lanes: &DeviceDirection::ALL,
         switches: [true, false, true, false].map(Switch::Route).to_vec(),
         spacing: Duration::from_secs(3),
-        gated: false,
-        note: "FxSound's own switch, over the gate in 0.4.0: reported until D2 makes it quiet and \
-               gates it",
+        gated: true,
+        note: "",
         off: false,
         both_devices: false,
         before: Vec::new(),
+        budget: Some(HANDOVER_BUDGET),
+        pulse: false,
     });
 }
 
@@ -1775,6 +1992,8 @@ fn under_a_steady_tone_fxsound_picking_another_device_is_reported() {
         off: false,
         both_devices: true,
         before: Vec::new(),
+        budget: None,
+        pulse: false,
     });
 }
 
@@ -1797,6 +2016,8 @@ fn under_a_steady_tone_a_desktop_pick_of_the_default_device_with_fxsound_on_is_r
         off: false,
         both_devices: true,
         before: Vec::new(),
+        budget: None,
+        pulse: false,
     });
 }
 
@@ -1817,6 +2038,8 @@ fn under_a_steady_tone_a_desktop_pick_of_the_default_device_with_fxsound_off_is_
         off: true,
         both_devices: true,
         before: Vec::new(),
+        budget: None,
+        pulse: false,
     });
 }
 
@@ -1981,6 +2204,65 @@ fn the_gate_fails_only_a_gated_switch_and_only_when_it_is_hard() {
     );
     assert_eq!(Gate::Report.judge(-35.0, true), ("over the gate", false));
     assert_eq!(Gate::Report.judge(-45.0, true), ("ok", false));
+}
+
+#[test]
+fn a_handovers_switch_over_the_gate_in_one_run_is_listed_and_in_two_fails_the_hard_gate() {
+    let scenario = Scenario {
+        tag: "clk-t",
+        title: "handover",
+        streams: Streams::Following,
+        lanes: &[DeviceDirection::Input],
+        switches: [false, true].map(Switch::Power).to_vec(),
+        spacing: Duration::from_secs(3),
+        gated: true,
+        note: "",
+        off: false,
+        both_devices: false,
+        before: Vec::new(),
+        budget: Some(HANDOVER_BUDGET),
+        pulse: true,
+    };
+    let run = |worst: [f64; 2]| Run {
+        lanes: vec![Analysis {
+            floor_dbfs: -120.0,
+            floor_at_s: 1.0,
+            tone_dbfs: -18.0,
+            events: worst
+                .map(|worst_dbfs| EventResult {
+                    worst_dbfs,
+                    at_s: 0.25,
+                    dip_ms: 110.0,
+                })
+                .to_vec(),
+        }],
+        xruns: Some(0),
+        ring: [0, 0],
+    };
+    let quiet = [-70.0, -70.0];
+
+    let once = [run(quiet), run([-70.0, -17.7]), run(quiet)];
+    let report_once = report(&scenario, Gate::Hard, &once, &[]);
+    assert!(
+        report_once.failures.is_empty(),
+        "the median hides it, and one is allowed: {:?}",
+        report_once.failures
+    );
+    assert!(
+        report_once
+            .text
+            .contains("1 of 6 switches over -40 dBFS, run by run: input power on in run 2"),
+        "but it is listed: {}",
+        report_once.text
+    );
+
+    let twice = [run(quiet), run([-70.0, -17.7]), run([-25.0, -70.0])];
+    assert_eq!(report(&scenario, Gate::Hard, &twice, &[]).failures.len(), 1);
+    assert!(
+        report(&scenario, Gate::Report, &twice, &[])
+            .failures
+            .is_empty()
+    );
 }
 
 #[test]

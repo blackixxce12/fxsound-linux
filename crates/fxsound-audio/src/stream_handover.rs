@@ -14,10 +14,11 @@
 //! What can reach it is the ramp PipeWire itself puts on a stream's master volume. The audio
 //! converter in front of every `pw_stream` — `pipewire-pulse`'s streams included — takes, beside a
 //! new `volume` in its `Props`, `volumeRampTime` and `volumeRampStepSamples`, and walks from the
-//! old volume to the new one over that time, sample by sample (`spa/plugins/audioconvert/
-//! audioconvert.c`, `apply_props`, `generate_ramp_seq`). Only the master `volume` moves;
-//! `channelVolumes`, the level a desktop's slider shows, stays. Faded to silence over 20 ms,
-//! moved, and faded back once it has its new link, a stream's move measured −50.5…−94.5 dBFS.
+//! old volume to the new one over that time, a few samples a step (`spa/plugins/audioconvert/
+//! audioconvert.c`, `apply_props`, `generate_ramp_seq`; [`RAMP_STEP_SAMPLES`]). Only the master
+//! `volume` moves; `channelVolumes`, the level a desktop's slider shows, stays. Faded to silence
+//! over 20 ms, moved, and faded back once it has its new link, a stream's move measured
+//! −50.5…−94.5 dBFS.
 //!
 //! # What this module is
 //!
@@ -37,12 +38,21 @@
 //! 2. The server's echo of each write — the stream's `Props`, now at 0 — starts its settling:
 //!    the ramp itself, and then what the stream has buffered and a quantum ([`SETTLE`]).
 //! 3. Once every stream has settled, the move is made ([`Step::Move`]) — whatever the caller
-//!    wanted: a default written, a target set, the DSP switched.
-//! 4. Each stream's next new link — WirePlumber's, or the one `stranded` makes for a recorder
-//!    WirePlumber failed to link — ends its move, and its volume is sent back over the same ramp.
-//!    One that has none within [`LINK_WAIT`] gets its volume back all the same.
-//! 5. The echo of the volume written back ends the stream's handover, and takes its line out of the
-//!    journal.
+//!    wanted: a default written, a target set or deleted. The lanes' DSP is not held for it: the
+//!    power switch reaches the chain at the press, through the app's snapshot, and dips there on
+//!    its own (`fxsound_dsp::smooth::Dip`), before the streams that follow the default are faded
+//!    (`docs/spec/12-audio-io.md`, step 4b).
+//! 4. Each stream's next new link to become active — WirePlumber's, or the one `stranded` makes
+//!    for a recorder WirePlumber failed to link — ends its move, and its volume is sent back over
+//!    the same ramp: a player's at once, a recorder's [`RECORDER_LINKED`] later, once what its
+//!    source plays has reached it. One that has none within [`LINK_WAIT`] gets its volume back all
+//!    the same, and one whose move turned out to move nothing gets it back at once.
+//! 5. The echo of the volume written back, and the ramp's own length after it ([`RAMP_IN_DONE`]),
+//!    have the volume said once more, at once, where the ramp has taken it; the server reporting
+//!    it ends the stream's handover, and takes its line out of the journal. Until it does, it is
+//!    said again every [`CONFIRM_WAIT`], [`CONFIRM_TRIES`] times at most. A volume comes back over
+//!    [`RAMP_IN_MS`], longer than the fade: what it comes back to may be a chain that has heard
+//!    nothing for a while.
 //!
 //! Rules the measurements taught, on the same private graph:
 //!
@@ -94,9 +104,52 @@ pub(crate) const RAMPS_SINCE: (u32, u32, u32) = (0, 3, 68);
 /// measured −64.4 and the move without them −18.8; longer only lengthens the gap in the sound.
 pub(crate) const RAMP_MS: i32 = 20;
 
+/// How many samples each step of a ramp holds: `volumeRampStepSamples`.
+///
+/// Not one. The converter takes a ramped write in two moves on the thread the write arrives on:
+/// it applies the new volume at once, and only then builds the ramp — a `Props` object for every
+/// step, in a pod it grows 4 KiB at a time — and hands it to the data thread
+/// (`audioconvert.c` 1.6, `apply_props`, `generate_ramp_seq`). A cycle the data thread plays in
+/// between plays at the new volume, and the ramp then starts from the old one: before a fade in,
+/// a whole quantum at full level, then silence, then the ramp. Measured so in the click test: a
+/// PulseAudio recorder given its volume back after the power switch played 512 frames at −17.7
+/// dBFS, now and then. Without FxSound, on a private graph, a `parec` stream faded out and in over
+/// 50 ms with `pw-cli`: at one sample a step — 2400 steps to build — 21 writes in 2400 did it; at
+/// 8 samples 1 in 1600, at 4 and at 16 none in 800. Fewer steps make it rarer and do not end it:
+/// the race is PipeWire's. Eight samples make a fade 120 steps and a fade in 300, each moving the
+/// gain by 1/120 or 1/300 of the way: a staircase at 6 kHz whose residual lies under what the
+/// click test measures of the moves (`graph_churn::clicks`).
+pub(crate) const RAMP_STEP_SAMPLES: i32 = 8;
+
 /// How long after a write's echo its ramp has surely been played out, and a second one would be
 /// taken: [`RAMP_MS`] and a margin.
 pub(crate) const RAMP_DONE: Duration = Duration::from_millis(30);
+
+/// How long a volume given back takes, in milliseconds: longer than the fade, because what the
+/// stream comes back to may be a chain that has heard nothing for a while. A stream moved onto an
+/// application's own route — a chain that has never heard it — came back at −40.6 to −43.8 dBFS
+/// over 20 ms, the levelling and the limiter taking its onset at full level, and at −47 over 50
+/// ms; FxSound's own sink, at the power button, the same or better. At −20 dB within the first
+/// 5 ms of it, it lengthens the gap in the sound by next to nothing.
+pub(crate) const RAMP_IN_MS: i32 = 50;
+
+/// How long after the echo of a volume given back its ramp has surely been played out: the stream
+/// is held until then, so that the next handover's fade is not refused for it, and its volume is
+/// then said once more where the ramp has taken it ([`RAMP_IN_MS`], and a margin for a quantum of
+/// up to 2048 frames, over which a ramp is spent a cycle at a time).
+pub(crate) const RAMP_IN_DONE: Duration = Duration::from_millis(100);
+
+/// How long the volume said once more after a ramp back ([`RAMP_IN_DONE`]) may go without the
+/// server reporting it before it is said again. The echo of that write can go missing: seen on
+/// PipeWire 1.6.9, a converter that had reported a point 0.10 of the way up its ramp answered the
+/// write of the volume it had come to with nothing, and the server kept showing 0.10 — what the
+/// next handover then read as the stream's volume, faded from and gave back, leaving the
+/// application 20 dB down for good. Its echo takes under a millisecond when it comes.
+pub(crate) const CONFIRM_WAIT: Duration = Duration::from_millis(50);
+
+/// How many times the volume is said once more after a ramp back before the handover lets the
+/// stream go without hearing it ([`CONFIRM_WAIT`]).
+pub(crate) const CONFIRM_TRIES: u8 = 4;
 
 /// How long after its fade's echo a stream counts as silent where it is heard: the ramp, then
 /// what the stream and the device behind it have buffered, and a quantum.
@@ -104,9 +157,19 @@ pub(crate) const SETTLE: Duration = Duration::from_millis(70);
 
 /// How long a moved stream waits for its new link before its volume is put back regardless. A
 /// recorder WirePlumber failed to link is linked by `stranded` once it has had no link for
-/// `STRANDED_AFTER` (500 ms), on the supervisor's next tick (200 ms), so a shorter wait would put
-/// its volume back before its link, and start its recording with a step.
+/// `STRANDED_AFTER` (250 ms from when its last link went), on the supervisor's next tick (200 ms):
+/// within half a second of its move, and a shorter wait than this one's would, on a slow server,
+/// put its volume back before its link, and start its recording with a step.
 pub(crate) const LINK_WAIT: Duration = Duration::from_secs(1);
+
+/// How long a recorder's new link has to have been active before its volume comes back. A recorder
+/// is handed what its source played in the cycle before: the first cycles after its link is active
+/// bring it nothing yet, and a ramp written at once is spent on them — within one cycle, at the
+/// default quantum of 1024 frames — and the sound then starts at full volume in the middle of a
+/// wave. Measured so: a recorder moved by the power switch clicked at −21 to −34 dBFS with its
+/// volume given back as its link became active. Two cycles at a quantum of 1024, and a margin. A
+/// player's own sound is there from its first cycle, and it gets its volume back at once.
+pub(crate) const RECORDER_LINKED: Duration = Duration::from_millis(50);
 
 /// How long a write's echo may take before the write is taken as not made, or not to be heard
 /// of: an application that no longer answers its server holds it.
@@ -146,6 +209,9 @@ pub(crate) struct Watched {
     /// Its properties are in: `key` and `serial` are what they will be. A stream is watched from
     /// the moment it is bound, before anything of it is known ([`Journal::outlived`]).
     pub(crate) known: bool,
+    /// It records (`Stream/Input/Audio`): its volume comes back [`RECORDER_LINKED`] after its new
+    /// link is active, not at once.
+    pub(crate) records: bool,
 }
 
 impl Watched {
@@ -182,8 +248,14 @@ pub(crate) fn silent(level: f32) -> bool {
     level <= SAME
 }
 
-fn same(a: f32, b: f32) -> bool {
+pub(crate) fn same(a: f32, b: f32) -> bool {
     (a - b).abs() <= SAME
+}
+
+/// Whether `level` lies strictly between silence and `saved`: a point a ramp between the two
+/// passes through.
+fn on_the_way(level: f32, saved: f32) -> bool {
+    level > SAME && level < saved - SAME
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -193,8 +265,9 @@ fn same(a: f32, b: f32) -> bool {
 /// What the engine is to do next for a handover.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Step {
-    /// Write `level` to the stream's master volume, over the ramp.
-    Volume { id: u32, level: f32 },
+    /// Write `level` to the stream's master volume, over `ramp_ms` milliseconds: [`RAMP_MS`] to
+    /// silence, [`RAMP_IN_MS`] back, and 0 — at once — to say where a ramp back has ended.
+    Volume { id: u32, level: f32, ramp_ms: i32 },
     /// Put the stream's volume in the journal before it is faded.
     Remember {
         key: String,
@@ -215,8 +288,13 @@ enum Phase {
     /// Its fade to 0 is written, and the echo has not come back.
     FadingOut { sent: Instant },
     /// The echo came: the ramp plays out until `ramped`, and what is buffered drains until
-    /// `settled`.
-    Silent { ramped: Instant, settled: Instant },
+    /// `settled`. `last` is the lowest volume reported on the way down so far: a converter at a
+    /// small quantum may report more than one point of the same ramp.
+    Silent {
+        ramped: Instant,
+        settled: Instant,
+        last: f32,
+    },
     /// Silent where it is heard, and ready to be moved.
     Settled,
     /// The echo never came within [`ECHO_WAIT`]: whether it is silent is not known, and the move
@@ -224,8 +302,16 @@ enum Phase {
     Unconfirmed,
     /// Moved: waiting for its new link, until `until`.
     Moved { until: Instant },
+    /// A recorder whose new link is active: its volume comes back at `at` ([`RECORDER_LINKED`]).
+    Linked { at: Instant },
     /// Its volume is written back, and the echo has not come.
     FadingIn { sent: Instant },
+    /// The echo of its volume came: the ramp back plays out until `done` ([`RAMP_IN_DONE`]).
+    Restoring { done: Instant },
+    /// Its ramp back is over, and its volume has been said once more, at once, where the ramp has
+    /// taken it: the stream is let go once the server reports that volume, and the volume is said
+    /// again every [`CONFIRM_WAIT`] until it does — `tries` times at most ([`CONFIRM_TRIES`]).
+    Confirming { sent: Instant, tries: u8 },
 }
 
 /// One stream a handover faded.
@@ -235,6 +321,8 @@ struct Faded {
     key: Option<String>,
     /// Its master volume before the fade: what it gets back.
     saved: f32,
+    /// It records ([`Watched::records`]).
+    records: bool,
     phase: Phase,
 }
 
@@ -317,11 +405,16 @@ impl Handover {
                         level,
                     });
                 }
-                steps.push(Step::Volume { id, level: 0.0 });
+                steps.push(Step::Volume {
+                    id,
+                    level: 0.0,
+                    ramp_ms: RAMP_MS,
+                });
                 faded.push(Faded {
                     id,
                     key: watched.key.clone(),
                     saved: level,
+                    records: watched.records,
                     phase: Phase::FadingOut { sent: now },
                 });
             }
@@ -357,24 +450,58 @@ impl Handover {
             steps.extend(self.advance(now));
             return steps;
         };
+        let saved = stream.saved;
         let ours = match stream.phase {
-            Phase::FadingOut { .. } | Phase::Unconfirmed if silent(level) => {
+            // The echo — or the ramp under way: the converter reports the volume it has come to
+            // when its `Props` are sent again in the middle of a ramp longer than a cycle, and
+            // may never report the end of it.
+            Phase::FadingOut { .. } | Phase::Unconfirmed
+                if silent(level) || on_the_way(level, saved) =>
+            {
                 stream.phase = Phase::Silent {
                     ramped: now + RAMP_DONE,
                     settled: now + SETTLE,
+                    last: level,
                 };
                 true
             }
             // What the stream said before our write reached it.
-            Phase::FadingOut { .. } | Phase::Unconfirmed => same(level, stream.saved),
-            Phase::Silent { .. } | Phase::Settled | Phase::Moved { .. } => silent(level),
-            Phase::FadingIn { .. } if same(level, stream.saved) => {
+            Phase::FadingOut { .. } | Phase::Unconfirmed => same(level, saved),
+            // A further point of the same ramp down: not above the last one reported. The ramp
+            // began with the first report, so its end is not moved.
+            Phase::Silent {
+                ramped,
+                settled,
+                last,
+            } if silent(level) || (on_the_way(level, saved) && level <= last + SAME) => {
+                stream.phase = Phase::Silent {
+                    ramped,
+                    settled,
+                    last: level,
+                };
+                true
+            }
+            Phase::Silent { .. } | Phase::Settled | Phase::Moved { .. } | Phase::Linked { .. } => {
+                silent(level)
+            }
+            Phase::FadingIn { .. } if same(level, saved) || on_the_way(level, saved) => {
+                stream.phase = Phase::Restoring {
+                    done: now + RAMP_IN_DONE,
+                };
+                steps.extend(self.advance(now));
+                return steps;
+            }
+            Phase::FadingIn { .. } => silent(level),
+            Phase::Restoring { .. } => same(level, saved) || on_the_way(level, saved),
+            // The server has the volume back: the stream's handover is over.
+            Phase::Confirming { .. } if same(level, saved) => {
                 let done = batch.streams.remove(index);
                 steps.extend(forget_if_last(&batch.streams, done.key));
                 steps.extend(self.advance(now));
                 return steps;
             }
-            Phase::FadingIn { .. } => silent(level),
+            // A point of the ramp back, reported late: the volume is said again when it is due.
+            Phase::Confirming { .. } => on_the_way(level, saved),
         };
         if !ours {
             // Somebody else's volume: theirs to keep.
@@ -385,8 +512,9 @@ impl Handover {
         steps
     }
 
-    /// The stream under `id` has a new link: after the move, its move is over, and its volume goes
-    /// back. Before the move a link is not the one being waited for, and changes nothing.
+    /// The stream under `id` has a new link, active: after the move, its move is over, and its
+    /// volume goes back — a player's now, a recorder's [`RECORDER_LINKED`] from now. Before the
+    /// move a link is not the one being waited for, and changes nothing.
     pub(crate) fn linked(&mut self, id: u32, now: Instant) -> Vec<Step> {
         let Some(stream) = self
             .batch
@@ -398,10 +526,17 @@ impl Handover {
         if !matches!(stream.phase, Phase::Moved { .. }) {
             return Vec::new();
         }
+        if stream.records {
+            stream.phase = Phase::Linked {
+                at: now + RECORDER_LINKED,
+            };
+            return Vec::new();
+        }
         stream.phase = Phase::FadingIn { sent: now };
         vec![Step::Volume {
             id,
             level: stream.saved,
+            ramp_ms: RAMP_IN_MS,
         }]
     }
 
@@ -415,9 +550,10 @@ impl Handover {
         self.advance(now)
     }
 
-    /// The engine is closing, or its connection has: every faded stream gets its volume back as
-    /// soon as a ramp may be written to it, and the move is not made — the caller makes it, or
-    /// has no graph to make it in.
+    /// The engine is closing, or its connection has, or the move moved nothing: every faded stream
+    /// gets its volume back as soon as a ramp may be written to it, without waiting for a new
+    /// link, and a move not made yet is not made — the caller makes it, or has no graph to make it
+    /// in.
     pub(crate) fn restore_all(&mut self, now: Instant) -> Vec<Step> {
         if let Some(batch) = self.batch.as_mut() {
             batch.leaving = true;
@@ -449,6 +585,9 @@ impl Handover {
                 Phase::Silent { ramped, .. } if batch.leaving => Some(ramped),
                 Phase::Silent { settled, .. } => Some(settled),
                 Phase::Moved { until } => Some(until),
+                Phase::Linked { at } => Some(at),
+                Phase::Restoring { done } => Some(done),
+                Phase::Confirming { sent, .. } => Some(sent + CONFIRM_WAIT),
                 Phase::Settled | Phase::Unconfirmed => None,
             })
             .min()
@@ -460,18 +599,53 @@ impl Handover {
             return steps;
         };
         let mut given_up = Vec::new();
+        let mut unheard = Vec::new();
         for stream in &mut batch.streams {
             match stream.phase {
+                // A volume back and its ramp played out. The volume is written once more, at
+                // once, where the ramp has taken it: the converter may have last reported a
+                // point on the way, and what the server shows would otherwise stay there — what
+                // the next handover reads as the stream's volume, and what WirePlumber keeps for
+                // the application's next start. On the way out too.
+                Phase::Restoring { done } if now >= done => {
+                    stream.phase = Phase::Confirming {
+                        sent: now,
+                        tries: 1,
+                    };
+                    steps.push(Step::Volume {
+                        id: stream.id,
+                        level: stream.saved,
+                        ramp_ms: 0,
+                    });
+                }
+                Phase::Confirming { sent, tries } if now >= sent + CONFIRM_WAIT => {
+                    if tries < CONFIRM_TRIES {
+                        stream.phase = Phase::Confirming {
+                            sent: now,
+                            tries: tries + 1,
+                        };
+                        steps.push(Step::Volume {
+                            id: stream.id,
+                            level: stream.saved,
+                            ramp_ms: 0,
+                        });
+                    } else {
+                        unheard.push(stream.id);
+                    }
+                }
                 Phase::FadingOut { sent } if now >= sent + ECHO_WAIT => {
                     stream.phase = Phase::Unconfirmed;
                 }
                 Phase::FadingIn { sent } if now >= sent + ECHO_WAIT => given_up.push(stream.id),
                 Phase::Silent { settled, .. } if now >= settled => stream.phase = Phase::Settled,
-                Phase::Moved { until } if now >= until || batch.leaving => {
+                Phase::Moved { until: due } | Phase::Linked { at: due }
+                    if now >= due || batch.leaving =>
+                {
                     stream.phase = Phase::FadingIn { sent: now };
                     steps.push(Step::Volume {
                         id: stream.id,
                         level: stream.saved,
+                        ramp_ms: RAMP_IN_MS,
                     });
                 }
                 _ => {}
@@ -487,6 +661,7 @@ impl Handover {
                     steps.push(Step::Volume {
                         id: stream.id,
                         level: stream.saved,
+                        ramp_ms: RAMP_IN_MS,
                     });
                 }
             }
@@ -496,6 +671,15 @@ impl Handover {
         batch
             .streams
             .retain(|stream| !given_up.contains(&stream.id));
+        // A volume said again and again without the server reporting it: the stream is let go
+        // all the same. The write was made, and what it plays at is the volume; the journal line
+        // goes with it, as a line for a stream at a volume of its own would.
+        for id in unheard {
+            if let Some(index) = batch.streams.iter().position(|stream| stream.id == id) {
+                let done = batch.streams.remove(index);
+                steps.extend(forget_if_last(&batch.streams, done.key));
+            }
+        }
 
         if !batch.moved && !batch.leaving {
             let ready = batch
@@ -723,6 +907,7 @@ mod tests {
             level: Some(level),
             locked: false,
             known: true,
+            records: false,
         }
     }
 
@@ -740,7 +925,7 @@ mod tests {
         steps
             .iter()
             .filter_map(|step| match step {
-                Step::Volume { id, level } => Some((*id, *level)),
+                Step::Volume { id, level, .. } => Some((*id, *level)),
                 _ => None,
             })
             .collect()
@@ -807,7 +992,11 @@ mod tests {
                     serial: Some(40),
                     level: 0.8,
                 },
-                Step::Volume { id: 7, level: 0.0 },
+                Step::Volume {
+                    id: 7,
+                    level: 0.0,
+                    ramp_ms: RAMP_MS
+                },
             ]
         );
         assert!(handover.busy() && handover.holds(7));
@@ -865,7 +1054,160 @@ mod tests {
         );
         assert!(moves(&handover.tick(after(start, 75))));
         assert_eq!(volumes(&handover.linked(7, after(start, 90))), [(7, 0.8)]);
-        let steps = handover.volume(7, Some(0.8), after(start, 95));
+        // The echo: the ramp back plays out before the stream is let go, so that the next
+        // handover's fade of it is not refused.
+        assert!(handover.volume(7, Some(0.8), after(start, 95)).is_empty());
+        assert!(handover.holds(7));
+        let done = after(start, 95) + RAMP_IN_DONE;
+        assert_eq!(handover.next_deadline(), Some(done));
+        assert_eq!(
+            handover.tick(done),
+            [Step::Volume {
+                id: 7,
+                level: 0.8,
+                ramp_ms: 0
+            }]
+        );
+        assert!(handover.holds(7), "until the server reports the volume");
+        assert_eq!(
+            handover.volume(7, Some(0.8), after(start, 196)),
+            [
+                Step::Forget {
+                    key: "Output/Audio:application.name:Player".to_owned()
+                },
+                Step::Finished
+            ]
+        );
+        assert!(!handover.busy());
+    }
+
+    #[test]
+    fn a_volume_reported_on_the_way_of_a_ramp_is_the_ramp_and_not_somebody_elses() {
+        // Measured: a converter asked to ramp longer than a cycle sends its `Props` again in the
+        // middle of it, at the volume it has come to — 0.64 of the way back — and not at its end.
+        let start = Instant::now();
+        let mut handover = ramping();
+        let player = playing("Output/Audio:application.name:Player", 0.8);
+        handover.begin(&[(7, &player)], start);
+        assert!(
+            handover.volume(7, Some(0.5), after(start, 10)).is_empty(),
+            "on the way down"
+        );
+        assert!(moves(&handover.tick(after(start, 80))));
+        assert_eq!(volumes(&handover.linked(7, after(start, 90))), [(7, 0.8)]);
+        assert!(handover.volume(7, Some(0.51), after(start, 110)).is_empty());
+        assert!(handover.holds(7), "a point on the way up let the stream go");
+        let steps = handover.tick(after(start, 110) + RAMP_IN_DONE);
+        assert_eq!(
+            volumes(&steps),
+            [(7, 0.8)],
+            "the volume is said again where the ramp ended"
+        );
+        let steps = handover.volume(7, Some(0.8), after(start, 211));
+        assert!(steps.contains(&Step::Finished));
+    }
+
+    #[test]
+    fn two_falling_points_of_the_same_ramp_down_keep_the_stream_held_and_its_volume_comes_back() {
+        // At a small quantum the 20 ms fade spans several cycles, and the converter may report
+        // more than one point of it on the way down.
+        let start = Instant::now();
+        let mut handover = ramping();
+        let player = playing("Output/Audio:application.name:Player", 0.8);
+        handover.begin(&[(7, &player)], start);
+        assert!(handover.volume(7, Some(0.5), after(start, 5)).is_empty());
+        assert!(
+            handover.volume(7, Some(0.2), after(start, 10)).is_empty(),
+            "a second point further down is the same ramp"
+        );
+        assert!(
+            handover.holds(7),
+            "the journal line is still the handover's"
+        );
+        assert!(handover.volume(7, Some(0.0), after(start, 15)).is_empty());
+        assert!(moves(&handover.tick(after(start, 75))));
+        assert_eq!(volumes(&handover.linked(7, after(start, 90))), [(7, 0.8)]);
+        assert!(handover.volume(7, Some(0.8), after(start, 95)).is_empty());
+        let steps = handover.tick(after(start, 95) + RAMP_IN_DONE);
+        assert_eq!(volumes(&steps), [(7, 0.8)]);
+        let steps = handover.volume(7, Some(0.8), after(start, 196));
+        assert!(steps.contains(&Step::Finished));
+    }
+
+    #[test]
+    fn a_volume_that_rises_after_the_ramp_down_began_is_somebody_elses() {
+        let start = Instant::now();
+        let mut handover = ramping();
+        let player = playing("Output/Audio:application.name:Player", 0.8);
+        handover.begin(&[(7, &player)], start);
+        assert!(handover.volume(7, Some(0.2), after(start, 5)).is_empty());
+        let steps = handover.volume(7, Some(0.6), after(start, 10));
+        assert!(
+            steps.contains(&Step::Forget {
+                key: "Output/Audio:application.name:Player".to_owned()
+            }),
+            "a ramp down does not go up"
+        );
+        assert!(!handover.holds(7));
+    }
+
+    /// A handover's stream brought back to 0.8 and its ramp played out, at `+195 ms`: its volume
+    /// has just been said once more, at once.
+    fn brought_back(handover: &mut Handover, start: Instant) -> Instant {
+        faded_one(handover, start);
+        assert!(moves(&handover.tick(after(start, 75))));
+        handover.linked(7, after(start, 90));
+        // Measured: the converter reports a point near the start of its ramp back, and nothing at
+        // its end.
+        assert!(handover.volume(7, Some(0.08), after(start, 95)).is_empty());
+        let done = after(start, 95) + RAMP_IN_DONE;
+        assert_eq!(volumes(&handover.tick(done)), [(7, 0.8)]);
+        done
+    }
+
+    #[test]
+    fn the_volume_said_once_more_is_said_again_until_the_server_reports_it() {
+        let start = Instant::now();
+        let mut handover = ramping();
+        let said = brought_back(&mut handover, start);
+        assert_eq!(handover.next_deadline(), Some(said + CONFIRM_WAIT));
+        assert!(volumes(&handover.tick(said + CONFIRM_WAIT - Duration::from_millis(1))).is_empty());
+        let again = said + CONFIRM_WAIT;
+        assert_eq!(
+            handover.tick(again),
+            [Step::Volume {
+                id: 7,
+                level: 0.8,
+                ramp_ms: 0
+            }],
+            "the echo went missing: said again"
+        );
+        assert!(handover.holds(7));
+        let steps = handover.volume(7, Some(0.8), again + Duration::from_millis(1));
+        assert!(steps.contains(&Step::Finished));
+        assert!(!handover.busy());
+    }
+
+    #[test]
+    fn a_point_of_the_ramp_back_reported_late_is_not_somebody_elses() {
+        let start = Instant::now();
+        let mut handover = ramping();
+        let said = brought_back(&mut handover, start);
+        assert!(
+            handover
+                .volume(7, Some(0.5), said + Duration::from_millis(1))
+                .is_empty()
+        );
+        assert!(handover.holds(7));
+        assert_eq!(volumes(&handover.tick(said + CONFIRM_WAIT)), [(7, 0.8)]);
+    }
+
+    #[test]
+    fn a_volume_somebody_else_writes_while_the_volume_is_said_once_more_is_theirs() {
+        let start = Instant::now();
+        let mut handover = ramping();
+        let said = brought_back(&mut handover, start);
+        let steps = handover.volume(7, Some(1.0), said + Duration::from_millis(1));
         assert_eq!(
             steps,
             [
@@ -875,6 +1217,96 @@ mod tests {
                 Step::Finished
             ]
         );
+        assert!(volumes(&handover.tick(said + ECHO_WAIT)).is_empty());
+    }
+
+    #[test]
+    fn a_volume_the_server_never_reports_lets_the_stream_go_after_its_tries() {
+        let start = Instant::now();
+        let mut handover = ramping();
+        let mut at = brought_back(&mut handover, start);
+        for _ in 1..CONFIRM_TRIES {
+            at += CONFIRM_WAIT;
+            assert_eq!(volumes(&handover.tick(at)), [(7, 0.8)]);
+        }
+        at += CONFIRM_WAIT;
+        assert_eq!(
+            handover.tick(at),
+            [
+                Step::Forget {
+                    key: "Output/Audio:application.name:Player".to_owned()
+                },
+                Step::Finished
+            ]
+        );
+        assert!(!handover.busy());
+    }
+
+    #[test]
+    fn a_volume_comes_back_over_a_longer_ramp_than_it_went() {
+        let start = Instant::now();
+        let mut handover = ramping();
+        let player = playing("Output/Audio:application.name:Player", 0.8);
+        let ramps = |steps: &[Step]| -> Vec<i32> {
+            steps
+                .iter()
+                .filter_map(|step| match step {
+                    Step::Volume { ramp_ms, .. } => Some(*ramp_ms),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(ramps(&handover.begin(&[(7, &player)], start)), [RAMP_MS]);
+        handover.volume(7, Some(0.0), after(start, 5));
+        assert!(moves(&handover.tick(after(start, 75))));
+        assert_eq!(ramps(&handover.linked(7, after(start, 90))), [RAMP_IN_MS]);
+        const {
+            assert!(RAMP_IN_MS > RAMP_MS);
+            assert!(RAMP_IN_DONE.as_millis() > RAMP_IN_MS.unsigned_abs() as u128);
+        }
+    }
+
+    #[test]
+    fn a_recorder_gets_its_volume_back_only_a_moment_after_its_new_link_is_active() {
+        let start = Instant::now();
+        let mut handover = ramping();
+        let recorder = Watched {
+            records: true,
+            ..playing("Input/Audio:application.name:Recorder", 0.8)
+        };
+        assert_eq!(
+            volumes(&handover.begin(&[(9, &recorder)], start)),
+            [(9, 0.0)]
+        );
+        assert!(handover.volume(9, Some(0.0), after(start, 5)).is_empty());
+        assert!(moves(&handover.tick(after(start, 75))));
+        assert!(
+            handover.linked(9, after(start, 90)).is_empty(),
+            "the first cycles on the new link bring the recorder nothing yet"
+        );
+        let due = after(start, 90) + RECORDER_LINKED;
+        assert_eq!(handover.next_deadline(), Some(due));
+        assert!(volumes(&handover.tick(due - Duration::from_millis(1))).is_empty());
+        assert_eq!(volumes(&handover.tick(due)), [(9, 0.8)]);
+    }
+
+    #[test]
+    fn a_move_that_moved_nothing_gives_every_volume_back_at_once() {
+        // The power switched back before its hand-back's turn: nothing is linked anew, and nothing
+        // is to wait for one.
+        let start = Instant::now();
+        let mut handover = ramping();
+        faded_one(&mut handover, start);
+        assert!(moves(&handover.tick(after(start, 75))));
+        let steps = handover.restore_all(after(start, 75));
+        assert_eq!(volumes(&steps), [(7, 0.8)]);
+        assert!(handover.volume(7, Some(0.8), after(start, 80)).is_empty());
+        assert_eq!(
+            volumes(&handover.tick(after(start, 80) + RAMP_IN_DONE)),
+            [(7, 0.8)]
+        );
+        let steps = handover.volume(7, Some(0.8), after(start, 181));
+        assert!(steps.contains(&Step::Finished));
         assert!(!handover.busy());
     }
 
@@ -964,7 +1396,20 @@ mod tests {
         handover.linked(1, after(start, 80));
         handover.linked(2, after(start, 80));
         assert!(handover.volume(1, Some(0.8), after(start, 85)).is_empty());
-        let steps = handover.volume(2, Some(0.6), after(start, 86));
+        assert!(handover.volume(2, Some(0.6), after(start, 86)).is_empty());
+        let steps = handover.tick(after(start, 85) + RAMP_IN_DONE);
+        assert_eq!(
+            volumes(&steps),
+            [(1, 0.8)],
+            "the first stream's volume is said where its ramp ended"
+        );
+        assert!(
+            handover.volume(1, Some(0.8), after(start, 185)).is_empty(),
+            "the second stream's ramp is still being played"
+        );
+        let steps = handover.tick(after(start, 86) + RAMP_IN_DONE);
+        assert_eq!(volumes(&steps), [(2, 0.6)]);
+        let steps = handover.volume(2, Some(0.6), after(start, 187));
         assert!(steps.contains(&Step::Forget {
             key: "Output/Audio:application.name:Browser".to_owned()
         }));
@@ -989,11 +1434,15 @@ mod tests {
         handover.linked(1, after(start, 80));
         handover.linked(2, after(start, 80));
         handover.volume(1, Some(0.8), after(start, 85));
+        handover.tick(after(start, 85) + RAMP_IN_DONE);
+        handover.volume(1, Some(0.8), after(start, 185));
         assert!(
             handover.holds_key(browser),
             "the second stream is still faded"
         );
         handover.volume(2, Some(0.6), after(start, 86));
+        handover.tick(after(start, 86) + RAMP_IN_DONE);
+        handover.volume(2, Some(0.6), after(start, 187));
         assert!(!handover.holds_key(browser));
     }
 
@@ -1005,7 +1454,12 @@ mod tests {
         let steps = handover.restore_all(after(start, 40));
         assert_eq!(volumes(&steps), [(7, 0.8)]);
         assert!(!moves(&steps));
-        let steps = handover.volume(7, Some(0.8), after(start, 45));
+        assert!(handover.volume(7, Some(0.8), after(start, 45)).is_empty());
+        // Said once more where the ramp ended — WirePlumber keeps what the server shows — and then
+        // over, the move never made.
+        let steps = handover.tick(after(start, 45) + RAMP_IN_DONE);
+        assert_eq!(volumes(&steps), [(7, 0.8)]);
+        let steps = handover.volume(7, Some(0.8), after(start, 146));
         assert!(steps.contains(&Step::Finished) && !moves(&steps));
     }
 

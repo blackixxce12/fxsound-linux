@@ -16,6 +16,13 @@
 //! pass, even under [`REQUIRE_TOOLS`], which is for the tools every leg installs. CI's second leg,
 //! an Arch Linux container, has 0.5 and sets [`REQUIRE_WIREPLUMBER`], under which such a skip fails
 //! instead: there the tests here have to run.
+//!
+//! A test can also have `pipewire-pulse` on the graph ([`PolicyGraph::start_pulse`]): the
+//! PulseAudio server most applications on a desktop still play and record through, whose streams
+//! WirePlumber moves and keeps the volume of as it does `pw-cat`'s, and whose clients show the
+//! desktop's mixer the channel volumes only. Its socket is in the graph's runtime directory, its
+//! clients are told of it and of nothing else (`PULSE_SERVER`), and it has the session
+//! manager's environment: no bus, no home but the graph's.
 
 use super::*;
 
@@ -103,9 +110,11 @@ wireplumber.profiles = {
 }
 ";
 
-/// A [`PrivateGraph`] with WirePlumber managing it. The session manager goes first when it is
-/// dropped, then the daemon and its directory.
+/// A [`PrivateGraph`] with WirePlumber managing it. The PulseAudio server goes first when it is
+/// dropped, then the session manager, then the daemon and its directory.
 pub(crate) struct PolicyGraph {
+    /// `pipewire-pulse`, once a test has asked for it ([`Self::start_pulse`]).
+    pulse: Option<Guarded>,
     session_manager: Guarded,
     graph: PrivateGraph,
 }
@@ -154,6 +163,42 @@ fn wireplumber_05() -> bool {
         .is_some_and(|version| version >= (0, 5))
 }
 
+/// The environment every process of `graph`'s own runs in beside the daemon: its runtime
+/// directory and socket, a configuration, state, data and home directory of the graph's, bus
+/// addresses naming sockets that do not exist, and the graph's own PulseAudio server
+/// ([`pulse_socket`]) for a PulseAudio client.
+fn private_environment(graph: &PrivateGraph, command: &mut std::process::Command) {
+    command
+        .env("XDG_RUNTIME_DIR", graph.dir.join("run"))
+        .env("PIPEWIRE_REMOTE", graph.socket())
+        .env("XDG_CONFIG_HOME", graph.dir.join("config"))
+        .env("XDG_STATE_HOME", graph.dir.join("state"))
+        .env("XDG_DATA_HOME", graph.dir.join("data"))
+        .env("HOME", graph.dir.join("home"))
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", graph.dir.join("no-session-bus").display()),
+        )
+        .env(
+            "DBUS_SYSTEM_BUS_ADDRESS",
+            format!("unix:path={}", graph.dir.join("no-system-bus").display()),
+        )
+        .env(
+            "PULSE_SERVER",
+            format!("unix:{}", pulse_socket(graph).display()),
+        )
+        .env_remove("PULSE_RUNTIME_PATH")
+        .env_remove("PULSE_COOKIE")
+        .env_remove("PIPEWIRE_DEBUG")
+        .env_remove("PIPEWIRE_RUNTIME_DIR");
+}
+
+/// Where `pipewire-pulse` listens on `graph`: `pulse/native` in the graph's runtime directory, as
+/// its own configuration has it (`unix:native`).
+fn pulse_socket(graph: &PrivateGraph) -> PathBuf {
+    graph.dir.join("run/pulse/native")
+}
+
 impl PolicyGraph {
     /// A private graph with WirePlumber on it, once WirePlumber has picked the defaults. `None`
     /// when there is no `pipewire` (a skip, as for every graph here) or no WirePlumber 0.5 (a skip
@@ -184,31 +229,17 @@ impl PolicyGraph {
         )
         .expect("the graph's directory is ours");
         let mut command = support::command("wireplumber");
+        private_environment(&graph, &mut command);
         command
             .args(["-p", "fxsound-test"])
-            .env("XDG_RUNTIME_DIR", graph.dir.join("run"))
-            .env("PIPEWIRE_REMOTE", graph.socket())
-            .env("XDG_CONFIG_HOME", graph.dir.join("config"))
-            .env("XDG_STATE_HOME", graph.dir.join("state"))
-            .env("XDG_DATA_HOME", graph.dir.join("data"))
-            .env("HOME", graph.dir.join("home"))
-            .env(
-                "DBUS_SESSION_BUS_ADDRESS",
-                format!("unix:path={}", graph.dir.join("no-session-bus").display()),
-            )
-            .env(
-                "DBUS_SYSTEM_BUS_ADDRESS",
-                format!("unix:path={}", graph.dir.join("no-system-bus").display()),
-            )
             .env_remove("WIREPLUMBER_DEBUG")
             .env_remove("WIREPLUMBER_CONFIG_DIR")
-            .env_remove("PIPEWIRE_DEBUG")
-            .env_remove("PIPEWIRE_RUNTIME_DIR")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let session_manager = support::spawn(command).expect("wireplumber should start");
         let graph = Self {
+            pulse: None,
             session_manager,
             graph,
         };
@@ -224,6 +255,137 @@ impl PolicyGraph {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("the private WirePlumber never picked a default sink");
+    }
+
+    /// Start `pipewire-pulse` on this graph, with the configuration it is installed with, and wait
+    /// until it answers `pactl`. Whether it did; `false`, said why, when `pipewire-pulse`, `pactl`
+    /// or `pacat` is not installed (a skip, as for every tool here). Started once: asked again, it
+    /// says whether it runs.
+    pub(crate) fn start_pulse(&mut self) -> bool {
+        if self.pulse.is_some() {
+            return true;
+        }
+        if let Some(missing) = ["pipewire-pulse", "pactl", "pacat"]
+            .into_iter()
+            .find(|tool| !installed(tool))
+        {
+            skip(&format!(
+                "{missing} is not installed, so no PulseAudio application could be checked"
+            ));
+            return false;
+        }
+        let mut server = support::command("pipewire-pulse");
+        private_environment(&self.graph, &mut server);
+        server.stdin(Stdio::null()).stdout(Stdio::null());
+        let log = self.stderr_log(&mut server, "pipewire-pulse");
+        let mut server = support::spawn(server).expect("pipewire-pulse should start");
+        let deadline = Instant::now() + PATIENCE;
+        while Instant::now() < deadline {
+            let mut info = support::command("pactl");
+            private_environment(&self.graph, &mut info);
+            let answers = info
+                .arg("info")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if answers {
+                self.pulse = Some(server);
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!(
+            "the private pipewire-pulse never answered: {}",
+            server.account(Some(&log))
+        );
+    }
+
+    /// `pacat` as the PulseAudio application `name` — its client and its stream so called, which
+    /// `pipewire-pulse` makes the node's `node.name` and `application.name` — in `mode`,
+    /// `--playback` or `--record`, raw stereo `f32` at 48 kHz on `file`, following the default
+    /// device as an application that names none does. Wait until its node is in the graph. `None`,
+    /// said why, when it could not start or never appeared. [`Self::start_pulse`] first.
+    ///
+    /// Its latency is asked for, so that its node asks the graph for no shorter a quantum than the
+    /// graph's own, 1024 frames: 85 ms of buffer for a player, 25 ms of fragments for a recorder,
+    /// which `pipewire-pulse` 1.6.9 makes 1080 and 1200 frames. A client that asks for none is
+    /// given two seconds of fragments to record into, which it writes in bursts. And one that asks
+    /// for less lowers the quantum of the graph it joins, and a PulseAudio recorder in that graph
+    /// then drops samples: measured without FxSound, on this graph, a `pacat` recording `t_mic`
+    /// jumped in the middle of its wave each of four times a player of 256 frames was linked into
+    /// `t_mic`, and not once when it went. That is PipeWire's, whoever moves the player — and a
+    /// player of 20 ms, moved by the power switch, had the click scenario's recorder jump at −17.7
+    /// to −28.6 dBFS 90 ms after the switch, while it was still where it was, before its own
+    /// handover began ([`clicks`](super::clicks)).
+    fn pacat(&self, mode: &str, name: &str, file: &std::path::Path) -> Option<Guarded> {
+        let mut client = if mode == "--record" {
+            support::command_writing_at_most("pacat", RECORDING_LIMIT)
+        } else {
+            support::command("pacat")
+        };
+        client
+            .arg(mode)
+            .args([
+                "--raw",
+                "--format=float32le",
+                "--rate=48000",
+                "--channels=2",
+            ])
+            .arg(format!(
+                "--latency-msec={}",
+                if mode == "--record" { 25 } else { 85 }
+            ))
+            .arg(format!("--client-name={name}"))
+            .arg(format!("--stream-name={name}"))
+            .arg(file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null());
+        private_environment(&self.graph, &mut client);
+        let log = self.stderr_log(&mut client, name);
+        let mut child = match support::spawn(client) {
+            Ok(child) => child,
+            Err(error) => {
+                println!("pacat could not be started for {name}: {error}");
+                return None;
+            }
+        };
+        let deadline = Instant::now() + PATIENCE;
+        while self.node_id(name).is_none() {
+            if Instant::now() >= deadline {
+                println!(
+                    "{name} never appeared: pacat {mode}; {}",
+                    child.account(Some(&log))
+                );
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(child)
+    }
+
+    /// A PulseAudio application called `name` playing `file` — raw stereo `f32` at 48 kHz — or
+    /// endless silence when there is none, to the default sink ([`Self::pacat`]).
+    pub(crate) fn pulse_player(
+        &self,
+        name: &str,
+        file: Option<&std::path::Path>,
+    ) -> Option<Guarded> {
+        self.pacat(
+            "--playback",
+            name,
+            file.unwrap_or_else(|| std::path::Path::new("/dev/zero")),
+        )
+    }
+
+    /// A PulseAudio application called `name` recording the default source into a file in the
+    /// graph's directory, raw stereo `f32` at 48 kHz, capped at [`RECORDING_LIMIT`]
+    /// ([`Self::pacat`]); and that file.
+    pub(crate) fn pulse_recorder(&self, name: &str) -> Option<(Guarded, PathBuf)> {
+        let file = self.dir.join(format!("{name}.raw"));
+        let child = self.pacat("--record", name, &file)?;
+        Some((child, file))
     }
 
     /// Whether the session manager is still running: a test that finds its own checks failing

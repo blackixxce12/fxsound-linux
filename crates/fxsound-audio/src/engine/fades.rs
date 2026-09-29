@@ -2,10 +2,24 @@
 //! writes application streams' volume through, what it learns there, the clock that wakes it for
 //! a handover's next step, and the journal on disk.
 //!
-//! [`hand_over`] is the primitive; the moves that use it — the power button, the applications'
-//! routes, the recorder's rescue — take it up one at a time. Everything around it runs whether or
-//! not anything does: the connection, the streams' volumes read, and the journal put right, so a
-//! volume a handover left behind is found by the first run that can find it.
+//! [`hand_over`] is the primitive, and every move of an application stream FxSound makes goes
+//! through it:
+//!
+//! - **the power button**: a default claimed or handed back ([`claim_default`],
+//!   [`release_default_smoothly`]) moves every stream that follows it ([`following`]) — and so does
+//!   a claim taken back after the desktop picked a device while the lane follows the system's
+//!   default device, which moves them off that device and onto FxSound again;
+//! - **the applications' routes**: the `target.object` keys written and deleted for them, the
+//!   `SetAppRoutes([])` of the power going off among them, and a route that goes only once its
+//!   streams are off it (`route_pairs::reconcile`);
+//! - **the recorder's rescue**: a recorder WirePlumber linked to a port that went (`stranded`) is
+//!   still held at 0 when FxSound links it again, and the rescue's link is what ends its move —
+//!   only a link that becomes active counts ([`link_announced`]).
+//!
+//! Everything around it runs whether or not anything moves: the connection, the streams' volumes
+//! read, and the journal put right, so a volume a handover left behind is found by the first run
+//! that can find it. The handover is the same at every level of «Like FxSound for Windows»: a
+//! click is no part of the Windows build's sound.
 //!
 //! # A third connection
 //!
@@ -50,15 +64,24 @@ use std::collections::{HashMap, VecDeque};
 use super::*;
 use crate::stream_handover::{self, Handover, Journal, Repair, Step, Watched};
 
-/// A handover's move, made once every stream it fades is silent ([`hand_over`]).
-pub(super) type Move = Box<dyn FnOnce(&mut Shared)>;
+/// A handover's move, made once every stream it fades is silent ([`hand_over`]). It says whether it
+/// moved anything: one that finds nothing left to do — the power switched back before its turn
+/// came, a claim somebody else made meanwhile — has the faded streams given their volume back at
+/// once, rather than after [`stream_handover::LINK_WAIT`] of waiting for a new link that is not
+/// coming.
+pub(super) type Move = Box<dyn FnOnce(&mut Shared) -> bool>;
 
 /// How long a write on the [`FadeLine`] may go unanswered before the connection is taken for held
 /// by an application that has stopped answering, and made again.
 pub(super) const LINE_WATCHDOG: Duration = Duration::from_millis(500);
 
-/// How long the way out waits for the streams a handover left silent to get their volume back.
-pub(super) const EXIT_WAIT: Duration = Duration::from_millis(400);
+/// How long the way out waits for the streams a handover left silent to get their volume back: the
+/// longest a stream can take — a fade whose echo has not come ([`stream_handover::ECHO_WAIT`]), the
+/// ramp after it ([`stream_handover::RAMP_DONE`]), and the echo of the volume written back — and a
+/// margin for a machine under load. The power button, the handover's first user, makes one on the
+/// way out whenever it was pressed a moment before the quit, and a stream left at 0 is what the
+/// journal is for, not what the way out is to leave.
+pub(super) const EXIT_WAIT: Duration = Duration::from_secs(1);
 
 /// The third connection: application streams' volume is read and written through it and nothing
 /// else (module docs). Every proxy on it is declared before the core, and so dropped first, and
@@ -66,6 +89,9 @@ pub(super) const EXIT_WAIT: Duration = Duration::from_millis(400);
 pub(super) struct FadeLine {
     /// Every application stream, bound on this connection, by registry id.
     streams: HashMap<u32, StreamProbe>,
+    /// The links of the streams a handover holds, bound on this connection, by registry id: a
+    /// moved stream's move is over once one of them is active ([`link_announced`]).
+    links: HashMap<u32, LinkProbe>,
     _registry_listener: pw::registry::Listener,
     _listener: pw::core::Listener,
     registry: pw::registry::RegistryRc,
@@ -77,6 +103,12 @@ pub(super) struct FadeLine {
 struct StreamProbe {
     _listener: Option<pw::node::NodeListener>,
     node: pw::node::Node,
+}
+
+/// A link of a stream a handover holds, bound on the [`FadeLine`] for its state.
+struct LinkProbe {
+    _listener: pw::link::LinkListener,
+    _link: pw::link::Link,
 }
 
 /// Everything the handover keeps between two events. Kept across connections, like the journal it
@@ -106,6 +138,10 @@ pub(super) struct Fades {
     armed: Option<Instant>,
     /// How many times [`watch_line`] has made the [`FadeLine`] again.
     lines_remade: u32,
+    /// The connection is closing, and the moves not made yet are being made without their fades
+    /// ([`session_closed`]): a move that is only worth making on a live connection — a default
+    /// claimed or handed back, which the reconnect settles for itself — says it moved nothing.
+    closing: bool,
     /// Every volume written to an application stream, in order: its id, the level and the ramp.
     #[cfg(test)]
     writes: Vec<(u32, f32, i32)>,
@@ -119,6 +155,18 @@ struct Repaired {
     /// holding another stream of the same application at 0 as the volume was written: the line is
     /// that stream's too, and only the handover's own [`Step::Forget`] takes it out.
     forget: bool,
+    /// The volume written back.
+    level: f32,
+    /// When the ramp back has surely been played, and the volume is to be written once more, at
+    /// once, where it has taken the stream ([`stream_handover::RAMP_IN_DONE`]): the converter may
+    /// last have reported a point on the way, and WirePlumber keeps what it reports. `None` once
+    /// written, or when the volume went back in one step.
+    settle_at: Option<Instant>,
+    /// Once the volume has been said once more: when, and how many times, until the server
+    /// reports it ([`stream_handover::CONFIRM_WAIT`]). `None` once it has, or the tries are spent.
+    confirm: Option<(Instant, u8)>,
+    /// The stream has been heard at a volume since.
+    heard: bool,
 }
 
 impl Fades {
@@ -149,6 +197,7 @@ impl Fades {
             clock: None,
             armed: None,
             lines_remade: 0,
+            closing: false,
             #[cfg(test)]
             writes: Vec::new(),
         }
@@ -165,6 +214,12 @@ impl Fades {
     #[cfg(test)]
     pub(super) fn writes(&self) -> &[(u32, f32, i32)] {
         &self.writes
+    }
+
+    /// Whether the connection is closing, and the move being made is one of those it leaves
+    /// behind ([`Fades::closing`]).
+    pub(super) const fn closing(&self) -> bool {
+        self.closing
     }
 
     /// Whether a handover is in progress.
@@ -267,6 +322,10 @@ pub(super) fn fade_line(
             let shared = Rc::clone(shared);
             let registry = registry.clone();
             move |global| {
+                if global.type_ == pw::types::ObjectType::Link {
+                    link_announced(&shared, &registry, global);
+                    return;
+                }
                 if global.type_ != pw::types::ObjectType::Node {
                     return;
                 }
@@ -305,6 +364,7 @@ pub(super) fn fade_line(
                         .and_then(|session| session.fade_line.as_mut())
                 {
                     line.streams.remove(&id);
+                    line.links.remove(&id);
                     if guard.fades.watched.remove(&id).is_some() {
                         drop_outlived(&mut guard);
                     }
@@ -314,11 +374,80 @@ pub(super) fn fade_line(
         .register();
     Ok(FadeLine {
         streams: HashMap::new(),
+        links: HashMap::new(),
         _registry_listener: registry_listener,
         _listener: listener,
         registry,
         core,
     })
+}
+
+/// A link was announced on the [`FadeLine`]. One from or into a stream a handover holds is bound,
+/// and its state listened to ([`link_active`]); every other is none of the handover's business.
+///
+/// The link's announcement is not the end of a move. WirePlumber creates the link, and the server
+/// negotiates its format and buffers before anything flows through it — a recorder moved between a
+/// mono microphone and FxSound's stereo source has its ports replaced meanwhile. A volume given back
+/// as the link appears is ramped over what the stream processes before the sound arrives, and the
+/// sound then starts at full volume in the middle of a wave: measured, a recorder moved by the power
+/// switch clicked at −21 to −25 dBFS so. And a link WirePlumber makes to a port that is about to go
+/// (`crate::stranded`) never becomes active at all: the stream's move ends with the link FxSound's
+/// rescue has made instead.
+fn link_announced(
+    shared: &Rc<RefCell<Shared>>,
+    registry: &pw::registry::RegistryRc,
+    global: &pw::registry::GlobalObject<&libspa::utils::dict::DictRef>,
+) {
+    let Some(props) = global.props else {
+        return;
+    };
+    let node = |key: &str| props.get(key).and_then(|value| value.parse::<u32>().ok());
+    let ends = [node("link.output.node"), node("link.input.node")];
+    let held = {
+        let Ok(guard) = shared.try_borrow() else {
+            return;
+        };
+        ends.into_iter()
+            .flatten()
+            .any(|end| guard.fades.handover.holds(end))
+    };
+    if !held {
+        return;
+    }
+    let id = global.id;
+    let Ok(link) = registry
+        .bind::<pw::link::Link, _>(global)
+        .inspect_err(|error| log::debug!("could not bind link {id} to follow it: {error}"))
+    else {
+        return;
+    };
+    let listener = link
+        .add_listener_local()
+        .info({
+            let shared = Rc::clone(shared);
+            move |info| {
+                if matches!(info.state(), pw::link::LinkState::Active)
+                    && let Ok(mut guard) = shared.try_borrow_mut()
+                {
+                    link_active(&mut guard, info.output_node_id(), info.input_node_id());
+                }
+            }
+        })
+        .register();
+    if let Ok(mut guard) = shared.try_borrow_mut()
+        && let Some(line) = guard
+            .session
+            .as_mut()
+            .and_then(|session| session.fade_line.as_mut())
+    {
+        line.links.insert(
+            id,
+            LinkProbe {
+                _listener: listener,
+                _link: link,
+            },
+        );
+    }
 }
 
 /// Bind an application stream on the [`FadeLine`] and listen for what the handover reads of it:
@@ -478,6 +607,7 @@ pub(super) fn watch_line(
 fn stream_props<'a>(shared: &mut Shared, id: u32, get: &impl Fn(&str) -> Option<&'a str>) {
     let watched = shared.fades.watched.entry(id).or_default();
     watched.key = stream_handover::state_key(get);
+    watched.records = get("media.class") == Some("Stream/Input/Audio");
     watched.serial = get("object.serial").and_then(|serial| serial.parse().ok());
     watched.known = true;
     repair(shared, id);
@@ -502,10 +632,15 @@ fn stream_volume(shared: &mut Shared, id: u32, level: Option<f32>, locked: bool)
         apply(shared, steps);
         return;
     }
-    if shared.fades.repairs.contains_key(&id) {
-        if level.is_some_and(|level| !stream_handover::silent(level))
-            && let Some(Repaired { key, forget }) = shared.fades.repairs.remove(&id)
+    if let Some(repaired) = shared.fades.repairs.get_mut(&id) {
+        if repaired.settle_at.is_none()
+            && level.is_some_and(|level| stream_handover::same(level, repaired.level))
         {
+            repaired.confirm = None;
+        }
+        if level.is_some_and(|level| !stream_handover::silent(level)) && !repaired.heard {
+            repaired.heard = true;
+            let (key, forget) = (repaired.key.clone(), repaired.forget);
             log::info!("{key} plays again at its volume from before the handover");
             // Not while another stream of the application may still be at 0: one a handover since
             // holds there, one repaired a moment ago whose echo is still on its way, one not known
@@ -514,14 +649,15 @@ fn stream_volume(shared: &mut Shared, id: u32, level: Option<f32>, locked: bool)
                 drop_if_outlived(shared, &key);
             }
         }
+        settle_repairs(shared, now);
         return;
     }
     repair(shared, id);
 }
 
-/// A link appeared from the node `output` to the node `input`: a new link of a stream a handover
-/// has moved ends its move.
-pub(super) fn link_appeared(shared: &mut Shared, output: u32, input: u32) {
+/// A link from the node `output` to the node `input` became active ([`link_announced`]): a new link
+/// of a stream a handover has moved ends its move.
+fn link_active(shared: &mut Shared, output: u32, input: u32) {
     let now = Instant::now();
     for id in [output, input] {
         if shared.fades.handover.holds(id) {
@@ -584,7 +720,7 @@ fn repair(shared: &mut Shared, id: u32) {
             // repair comes before any — on the very first connection of a run after a killed one.
             // A write with no line to go through is not sent at all ([`write_volume`]).
             let ramp = if shared.volume_ramps.get() && watched.running {
-                stream_handover::RAMP_MS
+                stream_handover::RAMP_IN_MS
             } else {
                 0
             };
@@ -597,10 +733,18 @@ fn repair(shared: &mut Shared, id: u32) {
                         |serial| format!("stream {serial}")
                     )
                 );
-                shared
-                    .fades
-                    .repairs
-                    .insert(id, Repaired { key, forget: !held });
+                let settle_at = (ramp > 0).then(|| Instant::now() + stream_handover::RAMP_IN_DONE);
+                shared.fades.repairs.insert(
+                    id,
+                    Repaired {
+                        key,
+                        forget: !held,
+                        level,
+                        settle_at,
+                        confirm: None,
+                        heard: false,
+                    },
+                );
             }
         }
     }
@@ -639,12 +783,23 @@ fn drop_outlived(shared: &mut Shared) {
 // The handover
 // ---------------------------------------------------------------------------------------------
 
+/// The application streams a move of `direction`'s default takes along: every one that follows the
+/// default ([`AppStreams::followers`]) and has no target of its own in the `default` metadata — a
+/// stream on a per-application route, or one a mixer moved, stays where it is.
+pub(super) fn following(shared: &Shared, direction: DeviceDirection) -> Vec<u32> {
+    shared
+        .apps
+        .followers(direction)
+        .into_iter()
+        .filter(|&id| !route_pairs::has_target(shared, id))
+        .collect()
+}
+
 /// Hand the application streams under `streams` over: fade each one that plays to silence, make
 /// `then` once they are all silent, and give each its volume back once it has its new link
 /// (`crate::stream_handover`). With nothing to fade — no stream plays, the server has no ramp, no
 /// connection to write through — `then` is made before this returns. While another handover is in
 /// progress this one waits for it to finish.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn hand_over(shared: &mut Shared, streams: Vec<u32>, then: Move) {
     if shared.fades.handover.busy() {
         shared.fades.queued.push_back((streams, then));
@@ -686,8 +841,8 @@ fn begin(shared: &mut Shared, streams: &[u32], then: Move) {
 fn apply(shared: &mut Shared, steps: Vec<Step>) {
     for step in steps {
         match step {
-            Step::Volume { id, level } => {
-                write_volume(shared, id, level, stream_handover::RAMP_MS);
+            Step::Volume { id, level, ramp_ms } => {
+                write_volume(shared, id, level, ramp_ms);
             }
             Step::Remember { key, serial, level } => {
                 if shared.fades.journal.remember(&key, serial, level) {
@@ -700,8 +855,13 @@ fn apply(shared: &mut Shared, steps: Vec<Step>) {
                 }
             }
             Step::Move => {
-                if let Some(then) = shared.fades.then.take() {
-                    then(shared);
+                if let Some(then) = shared.fades.then.take()
+                    && !then(shared)
+                {
+                    // Nothing moved: nothing is linked anew, and every stream gets its volume
+                    // back as soon as a ramp may be written to it.
+                    let steps = shared.fades.handover.restore_all(Instant::now());
+                    apply(shared, steps);
                 }
             }
             Step::Finished => {
@@ -719,8 +879,51 @@ fn apply(shared: &mut Shared, steps: Vec<Step>) {
 /// What time has made due in the handover: the clock's wake-up, the supervisor's tick, and the
 /// tests' turns of the loop.
 pub(super) fn drive(shared: &mut Shared) {
-    let steps = shared.fades.handover.tick(Instant::now());
+    let now = Instant::now();
+    let steps = shared.fades.handover.tick(now);
     apply(shared, steps);
+    settle_repairs(shared, now);
+}
+
+/// Write each repaired volume once more, at once, once its ramp back has been played
+/// ([`Repaired::settle_at`]), and again until the server reports it, as a handover does
+/// ([`stream_handover::CONFIRM_WAIT`]); and let go of each repair that is settled, reported and
+/// heard.
+fn settle_repairs(shared: &mut Shared, now: Instant) {
+    let due: Vec<(u32, f32, u8)> = shared
+        .fades
+        .repairs
+        .iter()
+        .filter_map(
+            |(&id, repaired)| match (repaired.settle_at, repaired.confirm) {
+                (Some(at), _) if now >= at => Some((id, repaired.level, 1)),
+                (None, Some((sent, tries)))
+                    if now >= sent + stream_handover::CONFIRM_WAIT
+                        && tries < stream_handover::CONFIRM_TRIES =>
+                {
+                    Some((id, repaired.level, tries + 1))
+                }
+                _ => None,
+            },
+        )
+        .collect();
+    for (id, level, tries) in due {
+        write_volume(shared, id, level, 0);
+        if let Some(repaired) = shared.fades.repairs.get_mut(&id) {
+            repaired.settle_at = None;
+            repaired.confirm = Some((now, tries));
+        }
+    }
+    for repaired in shared.fades.repairs.values_mut() {
+        if repaired.confirm.is_some_and(|(sent, tries)| {
+            tries >= stream_handover::CONFIRM_TRIES && now >= sent + stream_handover::CONFIRM_WAIT
+        }) {
+            repaired.confirm = None;
+        }
+    }
+    shared.fades.repairs.retain(|_, repaired| {
+        repaired.settle_at.is_some() || repaired.confirm.is_some() || !repaired.heard
+    });
 }
 
 /// Start the clock's thread (module docs, "A clock"), and have what it sends wake the main loop and
@@ -790,6 +993,7 @@ pub(super) fn stop_clock(shared: &mut Shared) {
 pub(super) fn session_closed(shared: &mut Shared) {
     // A move may ask for another handover; on this connection that one is abandoned too, and its
     // move made in the next round.
+    shared.fades.closing = true;
     loop {
         shared.fades.handover.abandon();
         let mut moves: Vec<Move> = shared.fades.then.take().into_iter().collect();
@@ -798,9 +1002,10 @@ pub(super) fn session_closed(shared: &mut Shared) {
             break;
         }
         for then in moves {
-            then(shared);
+            let _ = then(shared);
         }
     }
+    shared.fades.closing = false;
     shared.fades.watched.clear();
     shared.fades.repairs.clear();
     shared.fades.pending = None;

@@ -59,8 +59,9 @@ or chosen by the priority list when it is plugged in, or, with Settings \(->
 Audio's
 .I Follow the system's default device
 on, picked in the desktop's sound settings, which FxSound then follows even
-after a device was picked in FxSound \(en the device brings its
-preset back; a device used for the first time leaves the preset alone.
+after a device was picked in FxSound, and starts on the next time \(en the
+device brings its preset back; a device used for the first time leaves the
+preset alone.
 Settings \(-> Audio sets the preset of each playback device, and Settings \(->
 Microphone the voice preset of each microphone, in the device's row of its
 priority list; set on the device a lane is on, it takes over at once. A renamed
@@ -127,7 +128,11 @@ process per query can use the D-Bus interface instead; see
 Turn audio processing on or off, for both lanes. Off also hands the session's
 default output and input back to the real devices, so applications play and
 record past FxSound until it is turned on again, which takes them back; an
-application with a preset of its own is moved back onto it then.
+application with a preset of its own is moved back onto it then. Each
+application that is moved is faded out first and back in once it plays or
+records where it went: a gap of about a tenth of a second instead of a click.
+Now and then PipeWire itself plays a moment at full volume before the fade,
+and that one still clicks.
 Any non-zero integer means on;
 .B toggle
 inverts the current state.
@@ -1237,6 +1242,14 @@ than 500 of those. One that does not load is moved aside to
 .I apps.toml.2.bad
 and so on, never over an earlier one) when FxSound starts, and the list starts
 empty.
+.TP
+.I ~/.local/state/fxsound/handover.toml
+The volume of each application FxSound is fading out to move it, from before
+the fade, while the move lasts. It is there only for a tenth of a second or so;
+one left behind by a FxSound that was killed then is read at the next start,
+which gives each application found silent its volume back. Under
+.I $XDG_STATE_HOME/fxsound/
+when that is set.
 .TP
 .I $XDG_RUNTIME_DIR/fxsound/instance.lock
 Holds the running instance's pid under an exclusive

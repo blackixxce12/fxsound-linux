@@ -716,14 +716,27 @@ Each of these is a considered decision, not an oversight:
   takes them onto their presets again (a stream that holds on to its preset's node by itself stays
   there, unprocessed). While it is off, the device lists show the system's
   default device, which is where the sound goes; a device picked then is the one FxSound takes
-  over when the power comes back on.
+  over when the power comes back on. Moving an application in the middle of its sound used to
+  click; FxSound now fades each application it is about to have moved to silence, and back in once
+  it plays or records where it went — a short dip of about a tenth of a second instead of a click,
+  for the power button and for an application's own preset switched on or off. Now and then —
+  for a recording application, about one power switch in a hundred — PipeWire itself still plays a
+  moment at full volume before the fade (it applies a new volume just before it starts the ramp
+  to it), and that one clicks as before. The desktop's own device switcher still moves
+  applications as plain Linux does, click and all.
+- **An application silenced in the middle of a move gets its volume back.** For that tenth of a
+  second FxSound keeps each faded application's volume in `~/.local/state/fxsound/handover.toml`.
+  Should FxSound be killed right then, the application is left silent — WirePlumber even keeps the
+  silence for its next start, while the desktop's mixer shows 100 % — and the next start of
+  FxSound gives it its volume back. Without FxSound, `pw-cli set-param <id> Props '{ volume: 1.0 }'`
+  on the application's node while it plays does the same (`wpctl status` lists the ids).
 - **The device priority list can be told to step aside.** Settings ▸ Audio's list (and Settings ▸
   Microphone's list of microphones, a port addition) picks the device as the Windows build's does:
   every device seen joins it, at the bottom or, with *Prioritize new output devices*, at the top.
   *Follow the system's default device*, which the Windows build does not have (its issue #629),
   hands that choice back to the desktop's sound settings and keeps the list for later: a device
   picked there moves the lane and FxSound stays the default, even after a device was picked in
-  FxSound. A device that
+  FxSound, and the next start begins on the device picked there last. A device that
   is not connected has a ✕ beside it that forgets it and the preset it remembers, and
   `fxsound --forget-device=NAME` (D-Bus `ForgetDevice`) does the same from a script. With no
   FxSound running it forgets the name from the settings file and exits, without starting FxSound.
