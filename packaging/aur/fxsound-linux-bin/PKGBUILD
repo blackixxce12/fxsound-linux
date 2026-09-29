@@ -33,7 +33,7 @@ source=("${url}/releases/download/v${pkgver}/${_pkgname}-${pkgver}-x86_64.tar.gz
 # release workflow prints the exact `sha256sums=(...)` line in its job summary — or let
 # `makepkg -g` regenerate it. Never SKIP here — a checksum is the only thing standing between a
 # user and a tampered release asset.
-sha256sums=('0000000000000000000000000000000000000000000000000000000000000000')
+sha256sums=('4bb713c9243acc96c8d10fdb561ea703e9f42c4602e8ca83eb399b100ddb77d8')
 
 package() {
   cd "${srcdir}/${_pkgname}-${pkgver}-x86_64"
