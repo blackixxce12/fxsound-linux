@@ -29,7 +29,7 @@ mod store;
 pub mod trash;
 
 pub use input_store::InputPresetStore;
-pub use store::{PresetEntry, PresetFile, PresetSource, PresetStore, Store};
+pub use store::{EndBands, PresetEntry, PresetFile, PresetSource, PresetStore, Store};
 
 use fxsound_core::{EqBand, Preset, eq};
 use std::fmt::Write as _;

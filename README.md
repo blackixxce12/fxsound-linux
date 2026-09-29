@@ -10,8 +10,11 @@ re-implemented, but the DSP is ported from the original C rather than reinvented
 also fixes defects that came across with it, so a preset voiced on Windows sounds close to, but not
 exactly, the same here; [the deliberate differences](#deliberate-differences-from-the-windows-build)
 say what changed. A mode that restores the original behaviour, «Like FxSound for Windows» in
-Settings ▸ Experimental (`--windows-parity=off|interface|sound`), is being built for 0.5.0: the
-setting is there, and what each of its levels changes arrives over the release
+Settings ▸ Experimental (`--windows-parity=off|interface|sound`), comes with 0.5.0: `interface`
+brings back the Windows build's window, command line and tray without changing the sound, and
+`sound` also plays Volume Leveling, Dynamic Boost, Ambience, the equalizer, the master gain and the
+balance as the Windows build does and reads a preset as it does; moving between the levels while
+something plays does not click
 ([`docs/0.5.0-windows-parity.md`](docs/0.5.0-windows-parity.md)). Its fourth level, Everything,
 comes in a later version; 0.5.0 refuses `full`, and runs a `settings.toml` that says `full` as
 `sound` while keeping `full` in the file for that version.
@@ -543,13 +546,14 @@ The equalizer's curve is the response the equalizer really has, filter width and
 Windows build joins the band values with straight lines: bands boosted side by side add up, and a
 narrower filter width draws a narrower peak. The first and last band's wheels on five and ten bands
 turn both ways, reaching half a band past the ladder (on ten bands 46 Hz and 20 kHz); a preset
-exported for Windows has such a band put back at 62.5 Hz or 16 kHz, where its wheels stop.
-**Ctrl+Alt**+drag on a band solos it, as Alt+drag does on Windows: every other band sinks to
-−10 dB while you listen and comes back when you let go, or when a preset, the band count or the
-lane changes under it, and the preset is not marked as changed. The solo is offered while the
-equalizer plays, not while it is switched off. A press on a band's knob moves nothing until the
-pointer does, as on the sliders, and a band held when a preset, the band count or the lane arrives
-from elsewhere stays where the new curve puts it until you let go.
+exported for Windows has such a band put back at 62.5 Hz or 16 kHz, where its wheels stop, unless,
+at «Like FxSound for Windows» = Interface and sound, "Keep the end bands where they are" is ticked
+in the Export window (`--export-unshifted`). **Ctrl+Alt**+drag on a band solos it, as Alt+drag does
+on Windows: every other band sinks to −10 dB while you listen and comes back when you let go, or
+when a preset, the band count or the lane changes under it, and the preset is not marked as changed.
+The solo is offered while the equalizer plays, not while it is switched off. A press on a band's
+knob moves nothing until the pointer does, as on the sliders, and a band held when a preset, the
+band count or the lane arrives from elsewhere stays where the new curve puts it until you let go.
 
 A preset lands on your band count, as in the original since 1.2.11: pick a ten-band preset while on
 31 bands and its curve is fitted onto the 31, and changing the band count carries the curve over
@@ -724,14 +728,62 @@ Each of these is a considered decision, not an oversight:
   takes them onto their presets again (a stream that holds on to its preset's node by itself stays
   there, unprocessed). While it is off, the device lists show the system's
   default device, which is where the sound goes; a device picked then is the one FxSound takes
-  over when the power comes back on.
+  over when the power comes back on. Moving an application in the middle of its sound used to
+  click; FxSound now fades each application it is about to have moved to silence, and back in once
+  it plays or records where it went — a short dip of about a tenth of a second instead of a click,
+  for the power button and for an application's own preset switched on or off. Now and then —
+  for a recording application, about one power switch in a hundred — PipeWire itself still plays a
+  moment at full volume before the fade (it applies a new volume just before it starts the ramp
+  to it), and that one clicks as before. The desktop's own device switcher still moves
+  applications as plain Linux does, click and all — unless *Smooth moves in WirePlumber* is ticked
+  (below).
+- **Smooth moves in WirePlumber (Settings ▸ Experimental, off by default).** A device picked in
+  the desktop's sound settings is moved by WirePlumber itself, before FxSound hears of it, so only
+  WirePlumber can fade that move. Ticked, FxSound puts a small WirePlumber 0.5 script,
+  `~/.local/share/wireplumber/scripts/fxsound/fade-on-move.lua`, and the fragment that loads it,
+  `~/.config/wireplumber/wireplumber.conf.d/90-fxsound-fade-on-move.conf`, where WirePlumber reads
+  them: every stream WirePlumber moves while it plays — with FxSound or without, on or off — is
+  faded out before the move and back in after it, a dip of about a tenth of a second instead of
+  the click (measured below −52 dBFS where it was −19 to −28). It changes WirePlumber's own policy
+  for every application, needs WirePlumber 0.5 or newer (Ubuntu 24.04 ships 0.4, and the box is
+  greyed out there), and WirePlumber reads it only when it starts: the pane then offers
+  *Restart WirePlumber*, which asks first, since every application's sound stops for a moment, and
+  restarts it with `systemctl --user try-restart wireplumber` — a WirePlumber not started by
+  systemd takes the change at the next login. The script is loaded as an optional component: one
+  that fails on a later WirePlumber is logged and skipped, and never stops WirePlumber. Unticking
+  deletes both files; by hand, delete them and restart WirePlumber. With *Follow the system's
+  default device* ticked and the power off, FxSound's own lane moving to the picked device still
+  clicks the application that has just arrived there. An application closed in the tenth of a
+  second the script holds it silent keeps its own volume: WirePlumber, which keeps each
+  application's volume for its next start, never sees the script's silence. Should an application
+  ever start silent while the desktop's mixer shows 100 % all the same, `pw-cli set-param <id>
+  Props '{ volume: 1.0 }'` on its node while it plays gives it its volume back for good (`wpctl
+  status` lists the ids).
+- **Changing the device keeps `FxSound (Output)` and `FxSound (Input)`.** A lane moved to another
+  device — picked in FxSound, `--output`, `--next-output`, `--input`, or followed from the
+  desktop's sound settings — replaces only its own stream on the device when the new one takes the
+  same channel count and rate, so nothing playing or recording through FxSound is moved: the sound
+  dips for about a tenth of a second instead of clicking twice as WirePlumber moved it away and
+  back. After a pick in the desktop's sound settings, WirePlumber's own move to the picked device
+  still clicks as plain Linux does where the application arrives, unprocessed; on the speakers
+  FxSound was playing through, the part of the sound it had not played yet fades out over 10 ms,
+  as it does whenever an application is taken off FxSound in the middle of its sound (the preset's
+  ring-out after it is dropped, and the next sound fades in over 30 ms), and FxSound's taking the
+  default back is faded. A device with another channel count or rate still has both
+  nodes built anew, as before.
+- **An application silenced in the middle of a move gets its volume back.** For that tenth of a
+  second FxSound keeps each faded application's volume in `~/.local/state/fxsound/handover.toml`.
+  Should FxSound be killed right then, the application is left silent — WirePlumber even keeps the
+  silence for its next start, while the desktop's mixer shows 100 % — and the next start of
+  FxSound gives it its volume back. Without FxSound, `pw-cli set-param <id> Props '{ volume: 1.0 }'`
+  on the application's node while it plays does the same (`wpctl status` lists the ids).
 - **The device priority list can be told to step aside.** Settings ▸ Audio's list (and Settings ▸
   Microphone's list of microphones, a port addition) picks the device as the Windows build's does:
   every device seen joins it, at the bottom or, with *Prioritize new output devices*, at the top.
   *Follow the system's default device*, which the Windows build does not have (its issue #629),
   hands that choice back to the desktop's sound settings and keeps the list for later: a device
   picked there moves the lane and FxSound stays the default, even after a device was picked in
-  FxSound. A device that
+  FxSound, and the next start begins on the device picked there last. A device that
   is not connected has a ✕ beside it that forgets it and the preset it remembers, and
   `fxsound --forget-device=NAME` (D-Bus `ForgetDevice`) does the same from a script. With no
   FxSound running it forgets the name from the settings file and exits, without starting FxSound.
@@ -847,6 +899,14 @@ properties and signals, and the files FxSound reads and writes.
 for Windows»: its levels (three in 0.5.0; Everything, which hides the port's own features, comes
 later), which of the port's changes and features each one reverts or hides and which none ever
 does, and the setting, option, D-Bus members and status keys that carry it.
+[`docs/0.5.0-dsp-inventory.md`](docs/0.5.0-dsp-inventory.md) lists every change to the output
+lane's sound since the engine before the 0.4.0 audit, with the level each one belongs to, and
+`scripts/windows-parity-bitexact.sh <commit>` holds the output lane to another build of itself bit
+for bit — every shipped preset as the application plays it, on 10, 20 and 31 bands; CI holds it to
+`v0.4.0`, and with `--compat=windows` holds Interface and sound to the engine before the 0.4.0
+audit from a cold start. Where the Windows C code is the reference instead (Ambience, the balance
+on surround), `scripts/windows-vectors/build.sh` compiles it into the golden vectors the unit
+tests hold.
 
 `docs/0.4.0-design.md`, `docs/0.4.0-upstream.md` and `docs/0.4.0-apps.md` record how 0.4.0 was
 built: the two lanes, the voice chain's new stages, D-Bus and the event stream; what was taken from

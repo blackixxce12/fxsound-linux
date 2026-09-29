@@ -280,6 +280,23 @@ pub struct Cli {
     #[arg(long = "force", requires = "windows_parity")]
     pub force: bool,
 
+    /// Export a `.fac` with its first and last band where they are (1, or no value), or back
+    /// inside the range FxSound for Windows tunes them in (0), as the Export window's tick box
+    /// says; saved.
+    ///
+    /// Linux addition (`docs/0.5.0-windows-parity.md` §2, roadmap 0.5.0 §14 #56). Followed from
+    /// «Like FxSound for Windows» = Interface and sound on; below it every export shifts them, as
+    /// 0.4.0 does, and the choice waits.
+    #[arg(
+        long = "export-unshifted",
+        alias = "export_unshifted",
+        value_name = "0|1",
+        num_args = 0..=1,
+        default_missing_value = "1",
+        value_parser = parse_zero_or_one
+    )]
+    pub export_unshifted: Option<bool>,
+
     /// Number of equalizer bands: 5, 10, 15, 20 or 31.
     ///
     /// `--num_bands=<n>` — `docs/COMMAND_LINE_OPTIONS.md:27`, `FxController.cpp:283-293`, `:468-473`.
@@ -652,6 +669,9 @@ pub enum Command {
         level: WindowsParity,
         force: bool,
     },
+    /// Whether an export keeps the end bands where they are (`--export-unshifted`), followed
+    /// from «Like FxSound for Windows» = Interface and sound on.
+    ExportUnshifted(bool),
     Window(WindowCommand),
     /// `(band index, Hz)` pairs. The caller refuses the whole list, naming the bands, when one of
     /// them is past the live band count (0.4.0 audit #51) — that count is not knowable here.
@@ -844,6 +864,9 @@ impl Cli {
         }
         if let Some(language) = &self.language {
             commands.push(Command::Language(language.clone()));
+        }
+        if let Some(as_they_are) = self.export_unshifted {
+            commands.push(Command::ExportUnshifted(as_they_are));
         }
         commands
     }
@@ -1064,7 +1087,7 @@ impl Command {
             | Self::Language(_) => true,
             // Saved like `--language`; at a start nothing is in use yet for a move to Everything
             // to take away.
-            Self::WindowsParity { .. } => true,
+            Self::WindowsParity { .. } | Self::ExportUnshifted(_) => true,
             // Past §4.3: the presets are read by step 4, so the band lists, the effects and every
             // preset command work on the preset the start has selected, as they would a moment
             // later on the running instance — where `initConfig` drops them without a word.
@@ -1157,6 +1180,9 @@ impl Command {
             | Self::BandGains(_)
             | Self::Effects(_) => ParityClass::Interface,
             Self::WindowsParity { .. } | Self::Window(_) | Self::Quit => ParityClass::Never,
+            // A choice of the port's own, followed from Interface and sound on and hidden by no
+            // level: the Windows build has no such option to set it back to.
+            Self::ExportUnshifted(_) => ParityClass::Never,
         }
     }
 }
@@ -1296,6 +1322,15 @@ fn parse_power(value: &str) -> Result<PowerArg, String> {
             Ok(_) => Ok(PowerArg::On),
             Err(_) => Err(format!("expected 0, 1 or toggle, got `{value}`")),
         },
+    }
+}
+
+/// `--export-unshifted`'s value: `0` or `1`, or `off` / `on`.
+fn parse_zero_or_one(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" => Ok(true),
+        "0" | "off" => Ok(false),
+        _ => Err(format!("expected 0 or 1, got `{value}`")),
     }
 }
 
@@ -2822,6 +2857,26 @@ mod tests {
     }
 
     #[test]
+    fn export_unshifted_reads_one_zero_or_nothing_and_sets_it_silently() {
+        // Roadmap 0.5.0 §14 #56: the Export window's choice from the command line.
+        for (args, want) in [
+            (vec!["--export-unshifted"], true),
+            (vec!["--export-unshifted=1"], true),
+            (vec!["--export-unshifted=0"], false),
+            (vec!["--export_unshifted", "off"], false),
+            (vec!["--export-unshifted=ON"], true),
+        ] {
+            let cli = parse(&args);
+            assert_eq!(cli.export_unshifted, Some(want), "{args:?}");
+            assert_eq!(cli.commands(), [Command::ExportUnshifted(want)], "{args:?}");
+            assert!(cli.only_sets_things(), "{args:?}");
+        }
+        assert!(error(&["--export-unshifted=2"]).contains("expected 0 or 1"));
+        assert!(Command::ExportUnshifted(true).honoured_at_cold_start());
+        assert_eq!(parse(&["--preset=Jazz"]).export_unshifted, None);
+    }
+
+    #[test]
     fn every_command_declares_the_level_that_changes_it() {
         // The classification is an exhaustive match, so a new command cannot compile without a
         // level; this pins the decisions of the contract (`docs/0.5.0-windows-parity.md`).
@@ -2882,6 +2937,7 @@ mod tests {
                 },
                 Never,
             ),
+            (Command::ExportUnshifted(true), Never),
             (Command::Window(WindowCommand::Show), Never),
             (Command::Quit, Never),
         ];

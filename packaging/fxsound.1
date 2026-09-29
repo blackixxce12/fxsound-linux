@@ -59,8 +59,13 @@ or chosen by the priority list when it is plugged in, or, with Settings \(->
 Audio's
 .I Follow the system's default device
 on, picked in the desktop's sound settings, which FxSound then follows even
-after a device was picked in FxSound \(en the device brings its
-preset back; a device used for the first time leaves the preset alone.
+after a device was picked in FxSound, and starts on the next time \(en the
+device brings its preset back; a device used for the first time leaves the
+preset alone.
+A lane that moves to a device of the same channel count and rate keeps
+FxSound's own output or input, and replaces only its stream on the device, so
+an application playing or recording through FxSound is never moved: it hears
+a gap of about a tenth of a second instead of a click.
 Settings \(-> Audio sets the preset of each playback device, and Settings \(->
 Microphone the voice preset of each microphone, in the device's row of its
 priority list; set on the device a lane is on, it takes over at once. A renamed
@@ -134,7 +139,11 @@ process per query can use the D-Bus interface instead; see
 Turn audio processing on or off, for both lanes. Off also hands the session's
 default output and input back to the real devices, so applications play and
 record past FxSound until it is turned on again, which takes them back; an
-application with a preset of its own is moved back onto it then.
+application with a preset of its own is moved back onto it then. Each
+application that is moved is faded out first and back in once it plays or
+records where it went: a gap of about a tenth of a second instead of a click.
+Now and then PipeWire itself plays a moment at full volume before the fade,
+and that one still clicks.
 Any non-zero integer means on;
 .B toggle
 inverts the current state.
@@ -419,12 +428,17 @@ adds the Windows build's sound, so that a preset sounds as it does there.
 Each level includes the ones before it, none of them changes or deletes
 another setting, and
 .B off
-brings everything back as it was. Some parts of the levels are still being
-built; the level is saved and reported
+brings everything back as it was.
+.B sound
+plays Volume Leveling, Dynamic Boost, Ambience, the equalizer, the master gain
+and the balance as the Windows build does, and reads a preset as it does \(en a
+curve of another band count by position, twenty bands on the Windows build's
+ladder; switching to it and back while something plays glides over 20 ms,
+without a click.
+The level is saved and reported
 .RB ( windows_parity
 in
-.BR \-\-status )
-already.
+.BR \-\-status ).
 The fourth level,
 .B full
 .RB ( everything ),
@@ -440,6 +454,19 @@ as
 keeping
 .B full
 in the file for the version that offers it.
+.TP
+.BR \-\-export\-unshifted [ =0|1 ]
+Where an exported preset puts its first and last equalizer band, as the tick box
+\(lqKeep the end bands where they are\(rq of the Export Presets window says;
+saved.
+.B 1
+(or no value) keeps them where they are, limited only to 10\ Hz\(en21\ kHz;
+.BR 0 ,
+the default, moves them back into the range FxSound for Windows tunes them in,
+as 0.4.0 does. Followed from
+.B \-\-windows\-parity=sound
+on, where the window offers the tick box; below it every export moves them and
+the choice waits.
 .TP
 .B \-\-force
 With
@@ -1261,6 +1288,10 @@ and so on, never over an earlier one. The Windows keys FxSound does not use
 check \(en are read from an older file without complaint and not written back.
 Keys this version does not know, such as those a later version wrote, are kept
 and written back as they were; 0.4.0 drops them on its next save.
+.B windows_parity
+and
+.B export_unshifted
+are written only when they are not the default.
 This file,
 .I apps.toml
 and a preset may be symbolic links, as a dotfile manager leaves them: a save
@@ -1283,6 +1314,31 @@ than 500 of those. One that does not load is moved aside to
 .I apps.toml.2.bad
 and so on, never over an earlier one) when FxSound starts, and the list starts
 empty.
+.TP
+.I ~/.local/state/fxsound/handover.toml
+The volume of each application FxSound is fading out to move it, from before
+the fade, while the move lasts. It is there only for a tenth of a second or so;
+one left behind by a FxSound that was killed then is read at the next start,
+which gives each application found silent its volume back. Under
+.I $XDG_STATE_HOME/fxsound/
+when that is set.
+.TP
+.I ~/.local/share/wireplumber/scripts/fxsound/fade-on-move.lua
+.TQ
+.I ~/.config/wireplumber/wireplumber.conf.d/90-fxsound-fade-on-move.conf
+FxSound's hook in WirePlumber, there only while \(lqSmooth moves in
+WirePlumber\(rq in Settings \(-> Experimental is ticked: a WirePlumber 0.5
+script that fades each playing stream WirePlumber moves, and the fragment that
+makes it an optional component, which WirePlumber skips, logging why, when it
+cannot load it. The silence the script holds a stream in never reaches the
+volume WirePlumber keeps for the application's next start. WirePlumber reads
+them when it starts. Unticking deletes both;
+FxSound brings them up to its own version when it starts, and deletes them
+under a WirePlumber older than 0.5. Under
+.I $XDG_DATA_HOME
+and
+.I $XDG_CONFIG_HOME
+when those are set.
 .TP
 .I $XDG_RUNTIME_DIR/fxsound/instance.lock
 Holds the running instance's pid under an exclusive

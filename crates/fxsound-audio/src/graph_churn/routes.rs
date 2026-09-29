@@ -854,12 +854,19 @@ fn a_fifth_preset_stays_on_the_lane_and_the_window_is_told_once() {
     else {
         panic!("four route pairs should be built, and no fifth");
     };
-    // The four started first are moved, in the order they started; the fifth stays.
-    let keys: Vec<(u64, String, String)> = ids[..MAX_ROUTES_PER_LANE]
+    // The engine plans streams by id, and the server hands ids out in the order the nodes reach
+    // it — not always the order the players were started in on a busy machine. The four with the
+    // lowest ids are moved, in that order; the fifth stays.
+    let mut by_id: Vec<(u64, &str)> = ids.iter().copied().zip(presets).collect();
+    by_id.sort_unstable();
+    let keys: Vec<(u64, String, String)> = by_id[..MAX_ROUTES_PER_LANE]
         .iter()
         .enumerate()
-        .map(|(index, &id)| moved(id, serial(&nodes, &format!("fxsound_route_o{}", index + 1))))
+        .map(|(index, &(id, _))| {
+            moved(id, serial(&nodes, &format!("fxsound_route_o{}", index + 1)))
+        })
         .collect();
+    let left = format!("App {}", by_id[MAX_ROUTES_PER_LANE].1);
     if let Some(targets) = unless_skipped(
         graph.targets_settle_on(&keys),
         "pw-metadata",
@@ -869,11 +876,11 @@ fn a_fifth_preset_stays_on_the_lane_and_the_window_is_told_once() {
     }
     let warning = |message: &AudioToUi| {
         matches!(message, AudioToUi::Warning { direction: Some(DeviceDirection::Output), message }
-            if message.contains("App Five"))
+            if message.contains(left.as_str()))
     };
     assert!(
-        said.heard(&handle, "the warning about App Five", warning),
-        "the window should be told why App Five stays on the lane"
+        said.heard(&handle, &format!("the warning about {left}"), warning),
+        "the window should be told why {left} stays on the lane"
     );
     // Told once, however many ticks it goes on not getting a route.
     std::thread::sleep(Duration::from_millis(800));

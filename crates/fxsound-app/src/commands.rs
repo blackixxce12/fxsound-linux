@@ -214,6 +214,7 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
         }
 
         Command::Language(code) => app.set_language(code),
+        Command::ExportUnshifted(as_they_are) => app.set_export_unshifted(*as_they_are),
 
         Command::WindowsParity { level, force } => {
             if let Err(refusal) = app.set_windows_parity(*level, *force) {

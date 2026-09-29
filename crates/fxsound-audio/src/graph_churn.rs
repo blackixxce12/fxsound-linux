@@ -68,11 +68,14 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-mod apps;
+pub(crate) mod apps;
 mod clicks;
+mod handover;
+mod hook;
 mod policy;
 mod routes;
 mod sleep;
+mod switch;
 mod volume;
 
 /// How long to wait for anything the server has to do.
@@ -106,6 +109,51 @@ pub(crate) fn skip(reason: &str) {
         "{reason}, and {REQUIRE_TOOLS}=1 says nothing here may be skipped"
     );
     println!("SKIPPED: {reason}");
+}
+
+/// Say what a test that passes left unchecked because the server under it could not show it: an
+/// older PipeWire in CI, above all. Unlike a `SKIPPED` line this is no failure under
+/// [`REQUIRE_TOOLS`], and unlike `println!` it is not kept back with the rest of a passing test's
+/// output: it is written to the process's own standard error, past the harness, and on GitHub
+/// Actions as a warning the run's summary lists. A pass that checked less must never be a silent
+/// one.
+pub(crate) fn note(what: &str) {
+    let on_github = std::env::var_os("GITHUB_ACTIONS").is_some_and(|value| value == "true");
+    let _ = emit_note(&mut std::io::stderr().lock(), what, on_github);
+}
+
+/// The line [`note`] writes: `NOTE: …`, or GitHub's `::warning` command carrying it, whose message
+/// must stay on one line, with `%`, CR and LF escaped.
+fn emit_note(out: &mut impl std::io::Write, what: &str, on_github: bool) -> std::io::Result<()> {
+    if on_github {
+        let what = what
+            .replace('%', "%25")
+            .replace('\r', "%0D")
+            .replace('\n', "%0A");
+        writeln!(
+            out,
+            "::warning title=Checked less on this server::NOTE: {what}"
+        )
+    } else {
+        writeln!(out, "NOTE: {what}")
+    }
+}
+
+#[test]
+fn a_note_is_one_plain_line_and_on_github_actions_a_warning_that_keeps_to_its_line() {
+    let mut plain = Vec::new();
+    emit_note(&mut plain, "the tail was not checked", false).expect("a Vec takes it");
+    assert_eq!(
+        String::from_utf8(plain).expect("UTF-8"),
+        "NOTE: the tail was not checked\n"
+    );
+
+    let mut github = Vec::new();
+    emit_note(&mut github, "100% dry\r\nin 3 rounds", true).expect("a Vec takes it");
+    assert_eq!(
+        String::from_utf8(github).expect("UTF-8"),
+        "::warning title=Checked less on this server::NOTE: 100%25 dry%0D%0Ain 3 rounds\n"
+    );
 }
 
 /// A PipeWire daemon of our own: one stereo sink, one 7.1 sink, one virtual microphone, and the
@@ -547,6 +595,35 @@ impl PrivateGraph {
         Self::node_object(&objects, name)?["info"]["state"]
             .as_str()
             .map(str::to_owned)
+    }
+
+    /// The master volume of the node called `name` — the `volume` of its `Props` — as the server
+    /// holds it. `None` when `pw-dump` is not there to ask; `Some(None)` when the node is not in
+    /// the graph or lists no volume.
+    pub(crate) fn node_volume(&self, name: &str) -> Option<Option<f64>> {
+        let objects = self.dump()?;
+        Some(Self::node_object(&objects, name).and_then(|node| {
+            node["info"]["params"]["Props"]
+                .as_array()?
+                .iter()
+                .find_map(|props| props["volume"].as_f64())
+        }))
+    }
+
+    /// Set the master volume of the node called `name` as a mixer would, with `pw-cli`. `None`
+    /// when the node is not in the graph or the tool is not there or failed.
+    pub(crate) fn set_node_volume(&self, name: &str, volume: f32) -> Option<()> {
+        let id = self.node_id(name)?.to_string();
+        self.tool(
+            "pw-cli",
+            &[
+                "set-param",
+                &id,
+                "Props",
+                &format!("{{ volume: {volume} }}"),
+            ],
+        )
+        .map(drop)
     }
 
     /// Wait until `name` runs (`running`) or does not. `Ok` with the state it settled in, `Err`
@@ -1139,6 +1216,16 @@ pub(crate) fn unless_skipped<T>(checked: Option<T>, tool: &str, what: &str) -> O
     checked
 }
 
+impl PrivateGraph {
+    /// Whether the daemon has logged, so far, that a tone which drives its group ran out of
+    /// buffers ([`Self::add_tone`]): from then on that group is silent with every node in it still
+    /// `running`, and what a recorder in it hears says nothing about the code under test.
+    pub(crate) fn tone_ran_dry(&self) -> bool {
+        std::fs::read_to_string(self.dir.join(DAEMON_LOG))
+            .is_ok_and(|log| log.contains(A_TONE_RAN_DRY))
+    }
+}
+
 impl Drop for PrivateGraph {
     /// The daemons go first, and their directory after them, with the fields.
     fn drop(&mut self) {
@@ -1148,8 +1235,7 @@ impl Drop for PrivateGraph {
             let _ = bus.kill();
             let _ = bus.wait();
         }
-        let log = std::fs::read_to_string(self.dir.join(DAEMON_LOG)).unwrap_or_default();
-        if log.contains(A_TONE_RAN_DRY) {
+        if self.tone_ran_dry() {
             TONE_RAN_DRY.set(true);
         }
     }
@@ -2302,21 +2388,83 @@ fn a_saved_pick_does_not_keep_a_following_lane_from_the_sinks_the_desktop_picks(
     handle.shutdown();
 }
 
-/// How long after the power comes back on a recorder that follows the default source has to be
-/// recording FxSound again: time for WirePlumber's move, and for FxSound to find one that left the
-/// recorder linked to nothing and move it again (`crate::stranded`), with room for a slow runner.
+/// How long after a power switch a recorder that follows the default source may take to record
+/// where the default went, before it counts as never doing so: time for WirePlumber's move, and
+/// for FxSound to find one that left the recorder linked to nothing and move it again
+/// (`crate::stranded`), with room for a slow runner.
 const RELINKED_WITHIN: Duration = Duration::from_secs(4);
 
-/// Whether the recorder `recorder` is linked from FxSound's source and its recording `file` grows,
-/// within [`RELINKED_WITHIN`].
-fn records_fxsound(graph: &policy::PolicyGraph, recorder: u64, file: &std::path::Path) -> bool {
+/// How soon after a power switch a recorder that follows the default source has to record again
+/// where the default went (roadmap 0.5.0 §7, test 1): linked from it, the link active, and its
+/// volume back from the switch's handover (`crate::stream_handover`). Held to it where the click
+/// tests hold their gate hard ([`clicks::Gate`]): on a developer's machine, and not on a shared CI
+/// runner, where it is reported and [`RELINKED_WITHIN`] is what fails.
+const RECORDS_AGAIN_WITHIN: Duration = Duration::from_secs(1);
+
+/// How long after `since` each of `recorders` — `(node.name, id)` — was first seen linked from
+/// the node called `from`, the link active, at a master volume of 1: all of them read from one
+/// `pw-dump` a turn, so that one slow recorder does not delay the others' reading. `None` for one
+/// never seen so within [`RELINKED_WITHIN`]. The time is when it was seen, a turn of `pw-dump`
+/// after it happened at most.
+fn recording_again(
+    graph: &policy::PolicyGraph,
+    recorders: &[(&str, u64)],
+    from: &str,
+    since: Instant,
+) -> Vec<Option<Duration>> {
+    let mut seen: Vec<Option<Duration>> = vec![None; recorders.len()];
+    let deadline = since + RELINKED_WITHIN;
+    while seen.iter().any(Option::is_none) && Instant::now() < deadline {
+        let Some(objects) = graph.dump() else {
+            break;
+        };
+        let at = since.elapsed();
+        let source = PrivateGraph::node_object(&objects, from).and_then(|node| node["id"].as_u64());
+        for (when, (name, id)) in seen.iter_mut().zip(recorders) {
+            if when.is_some() {
+                continue;
+            }
+            let linked = objects.iter().any(|object| {
+                object["type"].as_str() == Some("PipeWire:Interface:Link")
+                    && object["info"]["output-node-id"].as_u64() == source
+                    && object["info"]["input-node-id"].as_u64() == Some(*id)
+                    && object["info"]["state"].as_str() == Some("active")
+            });
+            let heard = PrivateGraph::node_object(&objects, name)
+                .and_then(|node| node["info"]["params"]["Props"].as_array())
+                .and_then(|props| props.iter().find_map(|props| props["volume"].as_f64()))
+                .is_some_and(|volume| (volume - 1.0).abs() < 1e-3);
+            if linked && heard {
+                *when = Some(at);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    seen
+}
+
+/// Whether the recorder `recorder`, called `name`, is linked from the node called `from`, has its
+/// volume back from the power switch's handover (`crate::stream_handover`), and its recording
+/// `file` grows, within [`RELINKED_WITHIN`]. A recorder left at 0 would write a file that grows,
+/// and hear nothing.
+fn records_from(
+    graph: &policy::PolicyGraph,
+    from: &str,
+    name: &str,
+    recorder: u64,
+    file: &std::path::Path,
+) -> bool {
     let deadline = Instant::now() + RELINKED_WITHIN;
     while Instant::now() < deadline {
         let linked = graph
-            .node_id(SOURCE_NODE_NAME)
+            .node_id(from)
             .and_then(|source| graph.linked(source, recorder))
             .unwrap_or(false);
-        if linked {
+        let heard = graph
+            .node_volume(name)
+            .flatten()
+            .is_some_and(|volume| (volume - 1.0).abs() < 1e-3);
+        if linked && heard {
             let before = policy::size_of(file);
             std::thread::sleep(Duration::from_millis(300));
             if policy::size_of(file) > before {
@@ -2335,11 +2483,22 @@ fn records_fxsound(graph: &policy::PolicyGraph, recorder: u64, file: &std::path:
 /// (`crate::stranded`). The 0.4.0 live check found such a recorder recording nothing until the
 /// default changed again, on 3 to 6 of 9 quick toggles with something playing to the default sink.
 /// Here with WirePlumber itself, in an environment of the graph's own ([`policy`]): after each of
-/// eight power toggles, every one of three such recorders is linked from FxSound's source and
-/// receiving. Without FxSound's rescue of stranded streams this failed on the first toggle in
-/// every run tried, with WirePlumber 0.5.17 and PipeWire 1.6.9.
+/// eight power toggles, every one of four such recorders — three `pw-record` and a PulseAudio
+/// application — is linked from FxSound's source and receiving, at its own volume. Without
+/// FxSound's rescue of stranded streams this failed on the first toggle in every run tried, with
+/// WirePlumber 0.5.17 and PipeWire 1.6.9. And since the power switch fades what it moves (D2), the
+/// rescue's link is what ends a stranded recorder's move: a handover that gave its volume back at
+/// the link WirePlumber failed to make would have it start recording at full volume in the middle
+/// of a wave.
+///
+/// How soon each records again is timed at every switch, off and on, from the switch to the
+/// recorder linked where the default went and at its volume again, and held to
+/// [`RECORDS_AGAIN_WITHIN`] (roadmap 0.5.0 §7, test 1: «≤ 1 s»), a stranded recorder's rescue
+/// included.
 #[test]
 fn a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_toggle() {
+    use std::fmt::Write as _;
+
     let Some(mut graph) = policy::PolicyGraph::start("relink") else {
         return;
     };
@@ -2352,13 +2511,16 @@ fn a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_
         ));
         return;
     }
+    if !graph.start_pulse() {
+        return;
+    }
     // Something plays to the default sink meanwhile, and is moved at the same moment: the live
-    // check never stranded the recorder without it. And three recorders rather than one: each is
-    // moved on its own, and each move is another chance for WirePlumber to lose one.
+    // check never stranded the recorder without it. And several recorders rather than one: each
+    // is moved on its own, and each move is another chance for WirePlumber to lose one.
     let _player = graph
         .pw_cat("--playback", "t_player", "application.name = t_player", &[])
         .expect("pw-cat should play");
-    let recorders: Vec<(String, Guarded, PathBuf, u64)> = (1..=3)
+    let mut recorders: Vec<(String, Guarded, PathBuf, u64)> = (1..=3)
         .map(|n| {
             let name = format!("t_recorder{n}");
             let (child, file) = graph
@@ -2368,10 +2530,18 @@ fn a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_
             (name, child, file, id)
         })
         .collect();
-    let stranded = |graph: &policy::PolicyGraph| -> Vec<&str> {
+    let name = "t_pulse_recorder".to_owned();
+    let (child, file) = graph.pulse_recorder(&name).expect("pacat should record");
+    let id = graph.node_id(&name).expect("the recorder is there");
+    recorders.push((name, child, file, id));
+    let ids: Vec<(&str, u64)> = recorders
+        .iter()
+        .map(|(name, _, _, id)| (name.as_str(), *id))
+        .collect();
+    let silent_from = |graph: &policy::PolicyGraph, from: &str| -> Vec<&str> {
         recorders
             .iter()
-            .filter(|(_, _, file, id)| !records_fxsound(graph, *id, file))
+            .filter(|(name, _, file, id)| !records_from(graph, from, name, *id, file))
             .map(|(name, ..)| name.as_str())
             .collect()
     };
@@ -2393,33 +2563,73 @@ fn a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_
         );
     }
     assert_eq!(
-        stranded(&graph),
+        silent_from(&graph, SOURCE_NODE_NAME),
         Vec::<&str>::new(),
         "these never recorded FxSound"
     );
 
+    // Every switch's time for every recorder: (toggle, the power, the recorder, the time).
+    let mut times: Vec<(u32, bool, &str, Option<Duration>)> = Vec::new();
     for toggle in 1..=8 {
-        for want in [false, true] {
+        for (want, from) in [(false, "t_mic"), (true, SOURCE_NODE_NAME)] {
             for direction in DeviceDirection::ALL {
                 handle.send(UiToAudio::SetAsDefault { direction, want });
             }
-            if !want {
-                // Long enough for WirePlumber to have moved everything onto the devices.
-                std::thread::sleep(Duration::from_millis(1_200));
-            }
+            let since = Instant::now();
+            let again = recording_again(&graph, &ids, from, since);
+            times.extend(
+                ids.iter()
+                    .zip(again)
+                    .map(|((name, _), time)| (toggle, want, *name, time)),
+            );
+            let left = silent_from(&graph, from);
+            assert!(
+                graph.session_manager_runs(),
+                "the private WirePlumber went away"
+            );
+            assert!(
+                left.is_empty(),
+                "power toggle {toggle}, power {}: {left:?} followed the default source and were \
+                 left recording nothing from {from}",
+                if want { "on" } else { "off" }
+            );
         }
-        let left = stranded(&graph);
-        assert!(
-            graph.session_manager_runs(),
-            "the private WirePlumber went away"
-        );
-        assert!(
-            left.is_empty(),
-            "power toggle {toggle}: {left:?} followed the default source and were left linked \
-             to nothing"
-        );
     }
     handle.shutdown();
+
+    let slowest = times
+        .iter()
+        .max_by_key(|(.., time)| time.unwrap_or(Duration::MAX))
+        .copied()
+        .expect("sixteen switches were timed");
+    let mut table = String::from("how soon each recorder recorded again after each switch:\n");
+    for (toggle, want, name, time) in &times {
+        let _ = writeln!(
+            table,
+            "  toggle {toggle}, power {:<3} {name:<17} {}",
+            if *want { "on" } else { "off" },
+            time.map_or_else(
+                || "never".to_owned(),
+                |time| format!("{} ms", time.as_millis())
+            )
+        );
+    }
+    println!("{table}");
+    let (toggle, want, name, time) = slowest;
+    let time = time.expect("every recorder recorded again, as checked above");
+    if time > RECORDS_AGAIN_WITHIN {
+        let line = format!(
+            "power toggle {toggle}, power {}: {name} recorded again only after {} ms, over {} ms",
+            if want { "on" } else { "off" },
+            time.as_millis(),
+            RECORDS_AGAIN_WITHIN.as_millis()
+        );
+        assert!(
+            clicks::Gate::from_env() != clicks::Gate::Hard,
+            "{line}\n{table}"
+        );
+        note(&line);
+    }
 }
 
 /// A run that was killed rather than quit leaves both configured defaults naming nodes that died
@@ -3733,9 +3943,9 @@ fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
         "the speakers run while the canceller listens to them"
     );
 
-    // Off. The canceller goes, the capture stream is rebuilt on the microphone, and once it is
-    // linked there — the session manager's job, done here by hand — the microphone lane runs on
-    // without keeping the speakers awake.
+    // Off. The canceller goes, the capture stream is replaced on the microphone, FxSound's source
+    // kept (roadmap 0.5.0 §7, D3), and once it is linked there — the session manager's job, done
+    // here by hand — the microphone lane runs on without keeping the speakers awake.
     let mark = said.0.len();
     handle.send(UiToAudio::SetEchoCancel(false));
     assert!(heard_echo_cancel(
@@ -3763,16 +3973,13 @@ fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
             .is_some(),
         "the rebuilt capture stream was not given ports"
     );
-    assert!(
-        graph
-            .configure_ports(SOURCE_NODE_NAME, "Output", &["FL", "FR"])
-            .is_some(),
-        "the rebuilt source was not given ports"
-    );
     assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
-    // The pair was rebuilt whole, so the recorder is linked to the new source as a session manager
-    // would link it.
-    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
+    // The source stayed, and the recorder with it, on the link it had.
+    assert_eq!(
+        graph.linked(SOURCE_NODE_NAME, &recording.name),
+        Some(true),
+        "the recorder of FxSound (Input) lost its link when the canceller went"
+    );
     assert_eq!(
         graph.runs_until(CAPTURE_NODE_NAME, true).map(drop),
         Ok(()),
@@ -3853,11 +4060,11 @@ fn echo_cancellation_holds_nothing_awake_while_nothing_records_from_fxsound_inpu
     } else {
         // Everything ran, which is what this test is about; that the tone came through as well
         // is not something this server's following `audiotestsrc` can show.
-        println!(
-            "NOTE: PipeWire {:?} is older than {TONE_FOLLOWS_SINCE:?}, whose following tone is \
-             silent, so what the recorder heard through the canceller was not checked",
+        note(&format!(
+            "PipeWire {:?} is older than {TONE_FOLLOWS_SINCE:?}, whose following tone is silent, \
+             so what the recorder heard through the canceller was not checked",
             graph.server_version()
-        );
+        ));
     }
 
     // It stops, and all of it sleeps again with echo cancellation still on.
@@ -4223,10 +4430,9 @@ fn a_headset_between_profiles_keeps_the_output_lane_and_its_sink_is_linked_again
         "the playback stream could not be linked to the headset"
     );
     assert_eq!(graph.linked(OUTPUT_NODE_NAME, HEADSET), Some(true));
-    let first = graph
-        .our_nodes()
-        .and_then(|nodes| serial_of(&nodes, OUTPUT_NODE_NAME))
-        .expect("the playback stream is in the graph");
+    let nodes = graph.our_nodes().expect("pw-dump answered a moment ago");
+    let first = serial_of(&nodes, OUTPUT_NODE_NAME).expect("the playback stream is in the graph");
+    let sink = serial_of(&nodes, SINK_NODE_NAME).expect("FxSound's sink is in the graph");
     let from = said.0.len();
 
     // The headset switches profile: its sink goes, and comes back under the same name a moment
@@ -4268,14 +4474,19 @@ fn a_headset_between_profiles_keeps_the_output_lane_and_its_sink_is_linked_again
          slow for this test to say anything"
     );
 
-    // The pair is rebuilt on the node that came back, because the stream WirePlumber linked
-    // once is never linked again — and the new stream is linked.
+    // The playback stream is replaced on the node that came back, because the stream WirePlumber
+    // linked once is never linked again — and the new stream is linked. FxSound's sink stays, at
+    // the same format, and with it every application on it (roadmap 0.5.0 §7, D3).
     let rebuilt = graph.nodes_until(|nodes| {
         serial_of(nodes, OUTPUT_NODE_NAME).is_some_and(|serial| serial != first)
     });
-    assert!(
-        matches!(rebuilt, Some(Ok(_))),
-        "the playback stream was never rebuilt for the sink that came back: {rebuilt:?}"
+    let Some(Ok(rebuilt)) = rebuilt else {
+        panic!("the playback stream was never rebuilt for the sink that came back: {rebuilt:?}");
+    };
+    assert_eq!(
+        serial_of(&rebuilt, SINK_NODE_NAME),
+        Some(sink),
+        "FxSound's sink went with the headset's profile switch"
     );
     said.settle(&handle);
     assert_eq!(

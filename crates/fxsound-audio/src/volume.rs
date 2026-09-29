@@ -341,14 +341,28 @@ fn wireplumber_state_file_in(
     xdg_state_home: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
-    let base = xdg_state_home
+    Some(
+        state_dir_in(xdg_state_home, home)?
+            .join("wireplumber")
+            .join(WIREPLUMBER_STATE),
+    )
+}
+
+/// The user's state directory, given `$XDG_STATE_HOME` and `$HOME`: the first, or `.local/state`
+/// in the second when the first is not set to a path (the XDG spec ignores a relative one). `None`
+/// with neither. WirePlumber's state is kept under it, and FxSound's handover journal
+/// (`crate::stream_handover`).
+pub(crate) fn state_dir_in(
+    xdg_state_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    xdg_state_home
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
         .or_else(|| {
             home.filter(|home| !home.is_empty())
                 .map(|home| PathBuf::from(home).join(".local").join("state"))
-        })?;
-    Some(base.join("wireplumber").join(WIREPLUMBER_STATE))
+        })
 }
 
 /// What WirePlumber last saved for each of FxSound's two nodes, read from the state file at
@@ -484,6 +498,10 @@ pub(crate) struct PropsUpdate {
     /// that carries `params` names only the settings it changes, and one that changes some other
     /// setting reads here as `Some(false)`, an adapter that does not clamp.
     pub(crate) clamped: Option<bool>,
+    /// Whether the adapter ignores every volume written to it (`channelmix.lock-volumes`), as its
+    /// own `Props` list its settings in `params`; `None` for a `Props` without `params`. What tells
+    /// the handover a stream it cannot fade (`crate::stream_handover`).
+    pub(crate) locked: Option<bool>,
     /// Whether the object carries `softVolumes`: the volumes the adapter derives and applies
     /// itself, which only its own whole `Props` list. A desktop's write carries what it sets —
     /// `channelVolumes`, `mute`, now and then a setting in `params` — and never them.
@@ -511,6 +529,7 @@ impl PropsUpdate {
             channel_volumes: prop(libspa::sys::SPA_PROP_channelVolumes).and_then(float_array),
             mute: prop(libspa::sys::SPA_PROP_mute).and_then(|value| value.get_bool().ok()),
             clamped: prop(libspa::sys::SPA_PROP_params).and_then(clamped),
+            locked: prop(libspa::sys::SPA_PROP_params).and_then(locked),
             whole: prop(libspa::sys::SPA_PROP_softVolumes).is_some(),
         })
     }
@@ -549,6 +568,67 @@ fn clamped(params: &Pod) -> Option<bool> {
         }
     }
     Some(min == Some(1.0) && max == Some(1.0))
+}
+
+/// Whether the `params` struct of an adapter's `Props` says `channelmix.lock-volumes = true`.
+/// `Some(false)` for one that does not list it.
+fn locked(params: &Pod) -> Option<bool> {
+    let fields = params.as_struct().ok()?;
+    let mut fields = fields.fields();
+    while let (Some(key), Some(value)) = (fields.next(), fields.next()) {
+        if key
+            .get_string_raw()
+            .ok()
+            .flatten()
+            .is_some_and(|key| key.to_bytes() == LOCK_VOLUMES_KEY.as_bytes())
+        {
+            return Some(value.get_bool().unwrap_or(false));
+        }
+    }
+    Some(false)
+}
+
+/// The adapter setting that has it ignore every volume written to it.
+const LOCK_VOLUMES_KEY: &str = "channelmix.lock-volumes";
+
+/// `SPA_PROP_volumeRampStepSamples` and `SPA_PROP_volumeRampTime` (`spa/param/props.h`), by
+/// value: `libspa-sys` generates its constants from the headers it is built against, and the
+/// release is built against PipeWire 0.3.65's, which predate them ([`crate::stream_handover`]'s
+/// "A server without the ramp").
+const PROP_VOLUME_RAMP_STEP_SAMPLES: u32 = 0x10013;
+const PROP_VOLUME_RAMP_TIME: u32 = 0x10014;
+
+/// A `Props` object that takes an application stream's master volume to `level` over
+/// `ramp_ms` milliseconds, [`crate::stream_handover::RAMP_STEP_SAMPLES`] samples a step — or at
+/// once, with `ramp_ms` 0 — and changes
+/// nothing else: not `channelVolumes`, the level a desktop's slider shows (`crate::stream_handover`).
+pub(crate) fn master_volume_pod(level: f32, ramp_ms: i32) -> Vec<u8> {
+    use libspa::pod::{Object, Property, PropertyFlags};
+
+    let property = |key: u32, value: Value| Property {
+        key,
+        flags: PropertyFlags::empty(),
+        value,
+    };
+    let mut properties = Vec::with_capacity(3);
+    if ramp_ms > 0 {
+        properties.push(property(PROP_VOLUME_RAMP_TIME, Value::Int(ramp_ms)));
+        properties.push(property(
+            PROP_VOLUME_RAMP_STEP_SAMPLES,
+            Value::Int(crate::stream_handover::RAMP_STEP_SAMPLES),
+        ));
+    }
+    properties.push(property(libspa::sys::SPA_PROP_volume, Value::Float(level)));
+    libspa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &Value::Object(Object {
+            type_: libspa::sys::SPA_TYPE_OBJECT_Props,
+            id: libspa::param::ParamType::Props.as_raw(),
+            properties,
+        }),
+    )
+    .map(|(cursor, _)| cursor.into_inner())
+    .unwrap_or_default()
 }
 
 /// A `Props` object that sets a node's volume to `volume` over `channels` channels: the master
@@ -896,6 +976,82 @@ mod tests {
         assert_eq!(update.mute, Some(false));
         assert_eq!(update.channel_volumes, Some(vec![0.1; 6]));
         assert_eq!(update.clamped, None, "no params, no opinion on the clamp");
+    }
+
+    #[test]
+    fn an_adapter_that_locks_its_volumes_says_so_in_its_params() {
+        let locked = pod_of(vec![params(vec![
+            Value::String(MIN_VOLUME_KEY.to_owned()),
+            Value::Float(0.0),
+            Value::String(LOCK_VOLUMES_KEY.to_owned()),
+            Value::Bool(true),
+        ])]);
+        assert_eq!(parse(&locked).and_then(|update| update.locked), Some(true));
+        let free = pod_of(vec![params(vec![
+            Value::String(LOCK_VOLUMES_KEY.to_owned()),
+            Value::Bool(false),
+        ])]);
+        assert_eq!(parse(&free).and_then(|update| update.locked), Some(false));
+        let old = pod_of(vec![params(vec![
+            Value::String(MIN_VOLUME_KEY.to_owned()),
+            Value::Float(0.0),
+        ])]);
+        assert_eq!(
+            parse(&old).and_then(|update| update.locked),
+            Some(false),
+            "an adapter that does not know the setting locks nothing"
+        );
+        let write = pod_of(vec![property(
+            libspa::sys::SPA_PROP_volume,
+            Value::Float(0.5),
+        )]);
+        assert_eq!(parse(&write).and_then(|update| update.locked), None);
+    }
+
+    #[test]
+    fn a_master_volume_write_ramps_the_master_volume_and_nothing_else() {
+        let bytes = master_volume_pod(0.0, 20);
+        let update = parse(&bytes).expect("a Props object");
+        assert_eq!(update.volume, Some(0.0));
+        assert_eq!(
+            update.channel_volumes, None,
+            "the slider's level is not touched"
+        );
+        assert_eq!(update.mute, None);
+        let pod = Pod::from_bytes(&bytes).expect("a pod");
+        let object = pod.as_object().expect("an object");
+        let int = |key: u32| {
+            object
+                .find_prop(Id(key))
+                .and_then(|prop| prop.value().get_int().ok())
+        };
+        assert_eq!(int(PROP_VOLUME_RAMP_TIME), Some(20));
+        assert_eq!(
+            int(PROP_VOLUME_RAMP_STEP_SAMPLES),
+            Some(crate::stream_handover::RAMP_STEP_SAMPLES)
+        );
+
+        let at_once = master_volume_pod(0.8, 0);
+        let pod = Pod::from_bytes(&at_once).expect("a pod");
+        let object = pod.as_object().expect("an object");
+        assert!(object.find_prop(Id(PROP_VOLUME_RAMP_TIME)).is_none());
+        assert_eq!(parse(&at_once).and_then(|update| update.volume), Some(0.8));
+    }
+
+    #[test]
+    fn the_ramp_properties_are_where_the_header_lists_them() {
+        // `SPA_PROP_START_Audio` is 0x10000, and the audio properties follow it one by one:
+        // waveType, frequency, volume, mute, patternType, ditherType, truncate, channelVolumes,
+        // volumeBase, volumeStep, channelMap, monitorMute, monitorVolumes, latencyOffsetNsec,
+        // softMute, softVolumes, iec958Codecs, volumeRampSamples, volumeRampStepSamples,
+        // volumeRampTime. The ones every PipeWire has anchor the count.
+        assert_eq!(libspa::sys::SPA_PROP_volume, 0x10003);
+        assert_eq!(libspa::sys::SPA_PROP_softVolumes, 0x10010);
+        assert_eq!(
+            PROP_VOLUME_RAMP_STEP_SAMPLES,
+            libspa::sys::SPA_PROP_softVolumes + 3
+        );
+        assert_eq!(PROP_VOLUME_RAMP_TIME, libspa::sys::SPA_PROP_softVolumes + 4);
     }
 
     #[test]
@@ -1379,6 +1535,7 @@ Audio/Sink:application.id:com.fxsound.FxSound=\\s{\"channelVolumes\":[0.2,\\t0.2
             channel_volumes: Some(vec![0.5, 0.5]),
             mute: Some(false),
             clamped: None,
+            locked: None,
             whole: false,
         };
         assert!(!lane.update(&echo), "the engine's own write coming back");

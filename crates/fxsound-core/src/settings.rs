@@ -258,6 +258,13 @@ pub struct Settings {
     /// Interface and sound (`App::windows_parity`).
     #[serde(skip_serializing_if = "WindowsParity::is_off")]
     pub windows_parity: WindowsParity,
+    /// Export a `.fac` with its end bands where they are, limited only to the equalizer's
+    /// 10 Hz–21 kHz, instead of back inside the range the Windows build tunes them in (0.4.0
+    /// audit R6): the export window's choice and `--export-unshifted`. Offered, and followed, from
+    /// «Like FxSound for Windows» = Interface and sound on; below it every export shifts them, as
+    /// 0.4.0 does. Written only when set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub export_unshifted: bool,
 
     /// Every key of the file this version does not know, kept and written back as it was read.
     ///
@@ -332,6 +339,7 @@ impl Default for Settings {
             max_user_presets: 120,
 
             windows_parity: WindowsParity::Off,
+            export_unshifted: false,
             extra: toml::Table::new(),
         }
     }
@@ -1954,6 +1962,26 @@ mute = true
             );
             assert_eq!(Settings::load_from(&path).windows_parity, level);
         }
+    }
+
+    #[test]
+    fn the_unshifted_export_is_written_only_when_it_is_chosen() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        Settings::default().save_to(&path).expect("save");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(!written.contains("export_unshifted"), "{written}");
+        assert!(!Settings::load_from(&path).export_unshifted);
+
+        Settings {
+            export_unshifted: true,
+            ..Settings::default()
+        }
+        .save_to(&path)
+        .expect("save");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(written.contains("export_unshifted = true"), "{written}");
+        assert!(Settings::load_from(&path).export_unshifted);
     }
 
     #[test]

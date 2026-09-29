@@ -8,8 +8,8 @@
 
 use fxsound_core::i18n::tr;
 use fxsound_core::{
-    AudioDevice, DenoiseLevel, DeviceDirection, Effect, EqBand, SpectrumFrame, ThemeMode, ViewMode,
-    WindowsLook, WindowsParity,
+    AudioDevice, DenoiseLevel, DeviceDirection, DspCompat, Effect, EqBand, SpectrumFrame,
+    ThemeMode, ViewMode, WindowsLook, WindowsParity,
 };
 use std::time::{Duration, Instant};
 
@@ -222,7 +222,9 @@ pub struct UiState {
     /// The level of «Как в Windows» / "Like FxSound for Windows" in force — the one the
     /// application runs, Everything read from a later version's file already taken as Interface
     /// and sound. From Interface on the window follows the Windows build in the rows of
-    /// [`WindowsLook`] ([`UiState::windows_look`]).
+    /// [`WindowsLook`] ([`UiState::windows_look`]); from Interface and sound on the effect
+    /// sliders show and step through the stored values as the Windows build maps them
+    /// ([`UiState::dsp_compat`]).
     pub windows_parity: WindowsParity,
 
     // ---- per-application presets -------------------------------------------------------------
@@ -318,6 +320,15 @@ impl UiState {
     #[must_use]
     pub const fn presets_offered(&self) -> bool {
         self.power || !self.windows_look(WindowsLook::PresetsNeedPower)
+    }
+
+    /// Whose mapping of an effect slider to a stored value the window shows: the Windows build's
+    /// from «Like FxSound for Windows» = Interface and sound on (Ambience's straight line, audit
+    /// report #39), as the application reads and writes the values
+    /// ([`fxsound_core::scale::slider_to_value_in`]).
+    #[must_use]
+    pub const fn dsp_compat(&self) -> DspCompat {
+        DspCompat::for_level(self.windows_parity)
     }
 
     /// The selected preset, if any.

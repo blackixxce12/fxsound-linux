@@ -9,6 +9,8 @@
 //! against *these* coefficients. A textbook RBJ peaking filter would be defensible engineering and
 //! would still sound wrong on a preset someone tuned in 2009.
 
+use fxsound_core::DspCompat;
+
 /// The original's `realtype` (`codedefs.h:150`).
 pub type Real = f32;
 
@@ -170,12 +172,28 @@ fn butterworth(fs: Real, f0: Real, shape: Shape) -> BiquadCoeffs {
     }
 }
 
-/// `filtCalcParametric` (`FiltCalcBiqd.cpp:109-222`).
-///
-/// `q` is taken by value because the original mutates only its local copy, so the equalizer's
-/// nominal Q survives the design-time limiters below.
+/// `filtCalcParametric` (`FiltCalcBiqd.cpp:109-222`), as FxSound for Linux designs it:
+/// [`calc_parametric_in`] with [`DspCompat::Linux`].
 #[must_use]
 pub fn calc_parametric(fs: Real, f0: Real, boost_db: Real, q: Real) -> BiquadCoeffs {
+    calc_parametric_in(fs, f0, boost_db, q, DspCompat::Linux)
+}
+
+/// `filtCalcParametric` (`FiltCalcBiqd.cpp:109-222`), in the DSP `compat` plays.
+///
+/// `q` is taken by value because the original mutates only its local copy, so the equalizer's
+/// nominal Q survives the design-time limiters below. The two DSPs differ below 20 Hz only
+/// (audit report #12, see the body): at «Like FxSound for Windows» = Interface and sound
+/// ([`DspCompat::Windows`]) the Q cap goes on down the original's line there, negative under
+/// 17.9 Hz, and a band below 20 Hz is the flat gain the Windows build plays.
+#[must_use]
+pub fn calc_parametric_in(
+    fs: Real,
+    f0: Real,
+    boost_db: Real,
+    q: Real,
+    compat: DspCompat,
+) -> BiquadCoeffs {
     // An exact zero bypasses the section rather than designing a unity filter.
     if boost_db == 0.0 {
         return BiquadCoeffs::UNITY;
@@ -193,8 +211,14 @@ pub fn calc_parametric(fs: Real, f0: Real, boost_db: Real, q: Real) -> BiquadCoe
     // Its own comment says what it meant, "limit to Q of 1 at 20 hz" (`:140-142`), and that floor
     // is held below 20 Hz, so a band there is as wide as the 20 Hz band and stays in the
     // sub-bass. At 20 Hz and above nothing changes: the line never goes under the floor there.
+    // The Windows DSP goes on down the line.
     if f0 < Q_UPPER_LIMIT_FREQ {
-        let max_q = ((f0 - Q_LOWER_LIMIT_FREQ) * Q_LIMIT_SCALE + Q_LOWER_LIMIT).max(Q_LOWER_LIMIT);
+        let line = (f0 - Q_LOWER_LIMIT_FREQ) * Q_LIMIT_SCALE + Q_LOWER_LIMIT;
+        let max_q = if compat.windows() {
+            line
+        } else {
+            line.max(Q_LOWER_LIMIT)
+        };
         if q > max_q {
             q = max_q;
         }
@@ -396,6 +420,13 @@ mod tests {
     }
 
     fn check(fs: Real, f0: Real, boost: Real, q: Real, expect: [Real; 4]) {
+        // At 20 Hz and above the two DSPs design alike, so every vector holds both
+        // (A2 of «Like FxSound for Windows»: they pass at Interface and sound too).
+        assert_eq!(
+            calc_parametric_in(fs, f0, boost, q, DspCompat::Windows),
+            calc_parametric(fs, f0, boost, q),
+            "{f0} Hz at {boost} dB"
+        );
         let c = calc_parametric(fs, f0, boost, q);
         assert!(c.on, "{f0} Hz @ {boost} dB should design a live section");
         assert_eq!(c.a1, c.b1, "the parametric design requires a1 == b1");
@@ -607,6 +638,143 @@ mod tests {
         let wide = calc_parametric(48_000.0, 20.0, 6.0, 1.0);
         let narrow = calc_parametric(48_000.0, 20.0, 6.0, 4.333_365_4);
         assert_eq!(wide, narrow);
+    }
+
+    /// `filtCalcParametric` below 20 Hz, where the Windows build's Q cap goes negative (audit
+    /// report #12): `(f0, boost, [b0, b1, b2, a2])` at 48 kHz and the 31-band Q, made as the
+    /// vectors of `docs/spec/09-dsp-eq.md` §13 are — `FiltCalcBiqd.cpp` compiled as it is with
+    /// `realtype = float` and glibc's libm on x86-64 (`scripts/windows-vectors/build.sh`).
+    #[allow(clippy::excessive_precision)]
+    const WINDOWS_BELOW_20_HZ: [(Real, Real, [Real; 4]); 16] = [
+        (
+            10.0,
+            6.0,
+            [1.995_021_8, -4.840_044_4e-4, -1.994_537_7, -0.999_516_07],
+        ),
+        (
+            10.0,
+            -6.0,
+            [0.501_247_64, -2.426_061_1e-4, -0.501_005_1, -0.999_757_35],
+        ),
+        (
+            10.0,
+            12.0,
+            [3.980_527_4, -3.652_726_3e-4, -3.980_162_4, -0.999_634_8],
+        ),
+        (
+            10.0,
+            3.0,
+            [1.412_454, -4.058_042_8e-4, -1.412_048_2, -0.999_594_27],
+        ),
+        (
+            15.0,
+            6.0,
+            [1.994_257, -2.020_553_7e-3, -1.992_236_4, -0.997_979_4],
+        ),
+        (
+            15.0,
+            -6.0,
+            [0.501_439_93, -1.013_186_4e-3, -0.500_426_7, -0.998_986_84],
+        ),
+        (
+            15.0,
+            12.0,
+            [3.978_798_4, -1.525_176_5e-3, -3.977_273_2, -0.998_474_84],
+        ),
+        (
+            15.0,
+            3.0,
+            [1.412_188, -1.694_305e-3, -1.410_493_7, -0.998_305_7],
+        ),
+        (
+            17.9,
+            6.0,
+            [1.261_602_9, -1.474_299_6, 0.212_700_72, 0.474_303_63],
+        ),
+        (
+            17.9,
+            -6.0,
+            [0.792_642_5, -1.168_592_5, 0.375_953_23, 0.168_595_7],
+        ),
+        (
+            17.9,
+            12.0,
+            [1.956_581_2, -1.358_226_3, -0.598_351_1, 0.358_230_08],
+        ),
+        (
+            17.9,
+            3.0,
+            [1.123_099, -1.403_207_2, 0.280_112_2, 0.403_211_12],
+        ),
+        (
+            19.99,
+            6.0,
+            [1.000_922_1, -1.998_140_1, 0.997_224_9, 0.998_147],
+        ),
+        (
+            19.99,
+            -6.0,
+            [0.999_078_75, -1.996_299_3, 0.997_227_5, 0.996_306_24],
+        ),
+        (
+            19.99,
+            12.0,
+            [1.003_658_8, -1.997_538_4, 0.993_886_6, 0.997_545_36],
+        ),
+        (
+            19.99,
+            3.0,
+            [1.000_455_9, -1.997_783_4, 0.997_334_5, 0.997_790_3],
+        ),
+    ];
+
+    #[test]
+    fn below_20hz_the_windows_dsp_designs_the_windows_builds_sections() {
+        // A2 of «Like FxSound for Windows»: at Interface and sound a band under 20 Hz is designed
+        // as the Windows build designs it, negative Q and all. Judged by the response rather than
+        // coefficient by coefficient: this close to DC, and with a Q near zero at 17.9 Hz, the
+        // design is ill-conditioned, and the port's warp, rounded in `f64` where the C rounds it
+        // to `float` first (as at every frequency and every level), moves a coefficient by up to
+        // 2e-3 and the response from 20 Hz up by under 0.02 dB.
+        for (f0, boost, expect) in WINDOWS_BELOW_20_HZ {
+            let c = calc_parametric_in(48_000.0, f0, boost, 4.333_365_4, DspCompat::Windows);
+            assert!(c.on);
+            assert_eq!(c.a1, c.b1);
+            let windows = BiquadCoeffs {
+                b0: expect[0],
+                b1: expect[1],
+                b2: expect[2],
+                a1: expect[1],
+                a2: expect[3],
+                on: true,
+            };
+            for hz in [20.0, 50.0, 200.0, 1_000.0, 10_000.0, 20_000.0] {
+                let got = 20.0 * magnitude(&c, hz / 48_000.0).log10();
+                let want = 20.0 * magnitude(&windows, hz / 48_000.0).log10();
+                assert!(
+                    (got - want).abs() < 0.02,
+                    "{f0} Hz at {boost} dB: {got} dB at {hz} Hz, the Windows build {want} dB"
+                );
+            }
+            // FxSound for Linux holds the 20 Hz floor there instead (below).
+            assert_ne!(
+                c,
+                calc_parametric(48_000.0, f0, boost, 4.333_365_4),
+                "{f0} Hz"
+            );
+        }
+    }
+
+    #[test]
+    fn a_windows_band_at_15hz_lifts_the_whole_spectrum_as_the_windows_build_does() {
+        // Audit report #12, the Windows side: Q = -1.375 at 15 Hz is a negative bandwidth, and the
+        // "peak" is a flat +6 dB across the spectrum — what a Windows preset with such a band
+        // plays there, and so at Interface and sound.
+        let c = calc_parametric_in(48_000.0, 15.0, 6.0, 4.333_365_4, DspCompat::Windows);
+        for hz in [1_000.0, 10_000.0] {
+            let db = 20.0 * magnitude(&c, hz / 48_000.0).log10();
+            assert!((db - 6.0).abs() < 0.1, "{hz} Hz: {db} dB");
+        }
     }
 
     #[test]

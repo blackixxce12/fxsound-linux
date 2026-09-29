@@ -29,8 +29,11 @@
 //! Applications over a made-up list of applications, or none), `--settings=TAB` (Settings on
 //! `audio`, `general`, `help`, `microphone`, `applications` or `experimental`),
 //! `--parity=LEVEL` (the level of «Like FxSound for Windows», `off`, `interface` or `sound`:
-//! what the Experimental pane's slider stands at, and what the views follow as each level is
-//! built; `full` shows as `sound`, as the app runs a `settings.toml` that says it),
+//! what the Experimental pane's slider stands at, and what the main window's readouts, fine
+//! steps and `--stored` sliders follow, with or without `--settings`; `full` shows as `sound`, as
+//! the app runs a `settings.toml` that says it), `--wireplumber-hook=STATE` (the Experimental
+//! pane's "Smooth moves in WirePlumber": `off`, `on`, `due`, `failed` or `old`, a WirePlumber
+//! older than 0.5; available and off otherwise),
 //! `--message[=TEXT]` (the Yes/No message box over the window: `TEXT` is translated, and its `%s`
 //! is a long preset name; the
 //! export's overwrite question otherwise), `--exit-after-paint`. Keys while it
@@ -87,6 +90,21 @@ fn main() -> eframe::Result<()> {
     if flag("--power-off") {
         state.power = false;
     }
+    // The level goes to the main window too: its readouts and fine steps follow it (W1c), and
+    // `--stored` places the stored values as that level's sliders do.
+    let parity = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--parity="))
+        .and_then(|level| {
+            let parsed = WindowsParity::parse(level).map(WindowsParity::offered_or_below);
+            if parsed.is_none() {
+                eprintln!("no level {level:?}; expected off, interface or sound");
+            }
+            parsed
+        });
+    if let Some(level) = parity {
+        state.windows_parity = level;
+    }
     if flag("--stored") {
         // General's stored values: 50, 64, 20, 60 and 60 of 127, most of them between positions.
         use fxsound_core::{Effect, scale};
@@ -97,7 +115,8 @@ fn main() -> eframe::Result<()> {
             (Effect::DynamicBoost, 60),
             (Effect::Bass, 60),
         ] {
-            state.effects[effect as usize] = scale::midi_to_slider_for(effect, midi);
+            state.effects[effect as usize] =
+                scale::midi_to_slider_in(state.dsp_compat(), effect, midi);
         }
     }
     let mut preview = Preview::new(state, flag("--exit-after-paint"));
@@ -125,16 +144,24 @@ fn main() -> eframe::Result<()> {
         };
         preview.settings = Some(settings);
     }
-    if let Some(level) = args.iter().find_map(|a| a.strip_prefix("--parity=")) {
-        match WindowsParity::parse(level) {
-            Some(level) => {
-                preview.state.windows_parity = level.offered_or_below();
-                if let Some(settings) = &mut preview.settings {
-                    settings.settings.windows_parity = level.offered_or_below();
-                }
-            }
-            None => eprintln!("no level {level:?}; expected off, interface or sound"),
-        }
+    if let (Some(level), Some(settings)) = (parity, &mut preview.settings) {
+        settings.settings.windows_parity = level;
+    }
+    if let Some(settings) = &mut preview.settings {
+        use fxsound_ui::dialogs::settings::{WirePlumberHook, WirePlumberRestart};
+        let which = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--wireplumber-hook="))
+            .unwrap_or("off");
+        settings.wireplumber_hook = WirePlumberHook {
+            available: which != "old",
+            on: matches!(which, "on" | "due" | "failed"),
+            restart: match which {
+                "due" => WirePlumberRestart::Due,
+                "failed" => WirePlumberRestart::Failed,
+                _ => WirePlumberRestart::NotNeeded,
+            },
+        };
     }
     preview.message = args.iter().find_map(|a| {
         a.strip_prefix("--message").map(|rest| {
@@ -608,6 +635,15 @@ impl Preview {
                 self.state.windows_parity = *level;
                 // The level decides the popups' and tooltips' edges too (`Palette::windows`).
                 theme::apply(ctx, self.palette());
+            }
+            SettingsAction::SetWirePlumberHook(on) => {
+                settings.wireplumber_hook.on = *on;
+                settings.wireplumber_hook.restart =
+                    fxsound_ui::dialogs::settings::WirePlumberRestart::Due;
+            }
+            SettingsAction::RestartWirePlumber => {
+                settings.wireplumber_hook.restart =
+                    fxsound_ui::dialogs::settings::WirePlumberRestart::NotNeeded;
             }
             SettingsAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => {}

@@ -33,6 +33,11 @@ thiserror = { workspace = true }
 # out of a status the engine is right not to send, and `routes`', to read the UCM laptop
 # fixture's card routes, whose nested structs the device tests' minimal reader does not cover.
 serde_json = { workspace = true }
+# The handover's journal, `$XDG_STATE_HOME/fxsound/handover.toml` (`src/stream_handover.rs`): the
+# volumes of the streams a handover has faded and not given back yet, in the format and with the
+# crates the settings file is written with.
+serde = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 # The tests' scratch directories and guarded children (`fxsound_core::test_support`).

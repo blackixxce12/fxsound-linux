@@ -78,6 +78,11 @@
 //!   cycle and raised the RMS was the distortion — so a kick-heavy mix at sliders 6 to 10 comes
 //!   out 0.6 to 1 dB less loud.
 //!
+//! At «Like FxSound for Windows» = Interface and sound ([`DynamicBoost::set_compat`]) all five
+//! are taken back and the arithmetic is `Maxi32.c`'s again: the flat 1.06 floor, the left
+//! channel's level, an envelope per channel with no hold and an attack that overshoots. The
+//! glide of the static boost (audit #11) stays: it changes nothing once the slider has stopped.
+//!
 //! # What is not ported
 //!
 //! * The dither/quantizer block (`Maxi32.c:483-582`) is dead: `quantize_on_flag` sits in a
@@ -93,6 +98,7 @@ use crate::biquad::{MAX_CHANNELS, Real};
 use crate::engine::ChannelSide;
 use crate::input::LookaheadLimiter;
 use crate::smooth::{Ramp, glide_frames};
+use fxsound_core::DspCompat;
 
 /// The permanent output ceiling, `MAXIMIZE_MAX_OUTPUT` (`Maxi32.c:91`, `Play32.c:411`).
 ///
@@ -178,10 +184,11 @@ const FALLBACK_SAMPLE_RATE: Real = 48_000.0;
 
 /// The maximizer: auto-gain plus look-ahead brick-wall peak limiter.
 ///
-/// Allocates one delay buffer in [`DynamicBoost::new`], sized for 192 kHz and eight channels
-/// (8 × 144 floats = 4.6 kB), and nothing afterwards. The block size does not enter into it: the
-/// effect works a frame at a time in place, so a 16384-frame block costs no more state than a
-/// 64-frame one.
+/// Allocates in [`DynamicBoost::new`] and nothing afterwards: the limiter's delay, sized for
+/// 192 kHz and eight channels (8 × 144 floats = 4.6 kB), and for the handover between the two
+/// arithmetics ([`DynamicBoost::set_compat`]) a second limiter of the same size and 8 kB of input
+/// for it. The block size does not enter into it: the effect works a frame at a time in place, so
+/// a 16384-frame block costs no more state than a 64-frame one.
 #[derive(Debug)]
 pub struct DynamicBoost {
     sample_rate: Real,
@@ -211,7 +218,23 @@ pub struct DynamicBoost {
     /// The side of the room each channel stands on, and for how many, once the owner has said:
     /// what decides which channels the limiter turns down together.
     sides: Option<([ChannelSide; MAX_CHANNELS], usize)>,
+    /// Whose arithmetic runs: the port's, or `Maxi32.c`'s ([`DynamicBoost::set_compat`]).
+    compat: DspCompat,
+    /// How much of the back-off's floor is the original's flat 1.06 rather than the port's: 1 for
+    /// the Windows arithmetic, 0 for the port's, and a glide between the two when the arithmetic
+    /// changes, since the floor is the one part of it that would step the gain at once.
+    flat_floor: Ramp,
+    /// The limiter as it stood when the arithmetic last changed, still limiting in the old design
+    /// while [`DynamicBoost::limiter`] fades in with the new one ([`DynamicBoost::set_compat`]).
+    handover: LookaheadLimiter,
+    /// The new design's share of the output: 0 to 1 over the handover, and still at 1 otherwise.
+    handover_share: Ramp,
+    /// What the old design is handed to limit during the handover, a stretch at a time.
+    handover_input: Box<[Real]>,
 }
+
+/// How much audio [`DynamicBoost::handover_input`] holds: 256 frames of 7.1.
+const HANDOVER_SAMPLES: usize = 256 * MAX_CHANNELS;
 
 impl DynamicBoost {
     /// Build a maximizer for `sample_rate`, with the boost knob at zero.
@@ -236,6 +259,16 @@ impl DynamicBoost {
             ),
             front_pair: DEFAULT_FRONT_PAIR,
             sides: None,
+            compat: DspCompat::Linux,
+            flat_floor: Ramp::new(0.0),
+            handover: LookaheadLimiter::new(
+                sample_rate,
+                MAX_OUTPUT,
+                LOOK_AHEAD_SECONDS * 1000.0,
+                10.0,
+            ),
+            handover_share: Ramp::new(1.0),
+            handover_input: vec![0.0; HANDOVER_SAMPLES].into_boxed_slice(),
         };
         effect.set_front_pair(None);
         effect.set_sample_rate(sample_rate);
@@ -277,10 +310,68 @@ impl DynamicBoost {
         self.relink();
     }
 
+    /// Play the port's arithmetic, or the Windows build's (`Maxi32.c`, «Like FxSound for
+    /// Windows» = Interface and sound): the flat 1.06 floor of the back-off (#6 taken back), the
+    /// left channel alone as the level (#7), an envelope per channel (R2) with no hold (R1) and an
+    /// attack that runs past its peak (#8). The front pair and the sides are remembered and come
+    /// back into use with the port's arithmetic.
+    ///
+    /// Allocation-free. The static boost and its glide are untouched. The back-off's floor glides
+    /// from one to the other over [`crate::smooth::GLIDE_SECONDS`]: at slider 0 under loud
+    /// material it is half a decibel of gain, which switched at once stepped a 50 Hz tone at
+    /// −6 dBFS by eight times its own steepest slope, a click whose part above 1 kHz peaked at
+    /// −35.6 dBFS. The limiter crossfades from its old design to its new one over the same time:
+    /// relinked at once, every envelope started from the one reducing the most, so a channel the
+    /// limiter was turning down less than its neighbours stepped down to theirs: a quiet left
+    /// beside a right deep in the limiter by 0.110 on a 50 Hz tone that moves by 0.0019 a sample,
+    /// and every speaker of 5.1 with every effect at 5 by three to seven times its tone's. Both
+    /// designs limit the same boosted audio in step, the old from a copy of the limiter as it
+    /// stood, and the output mixes from one to the other; each keeps under the ceiling, so the
+    /// mix does too. Moved back before the handover is over, the two trade places and the mix
+    /// carries on from where it had got to.
+    pub fn set_compat(&mut self, compat: DspCompat) {
+        if compat == self.compat {
+            return;
+        }
+        if self.handover_share.is_gliding() {
+            // Moved back before the handover is over: the design being faded out is the one
+            // asked for again. The two trade places and the fade carries on from the mix being
+            // heard, where copying the half-faded design over the old one dropped that mix for
+            // the new design alone, a step of several times the tone's own.
+            std::mem::swap(&mut self.limiter, &mut self.handover);
+            self.handover_share = Ramp::new(1.0 - self.handover_share.value());
+        } else {
+            self.handover.copy_from(&self.limiter);
+            self.handover_share = Ramp::new(0.0);
+        }
+        self.handover_share
+            .glide_to(1.0, glide_frames(self.sample_rate));
+        self.compat = compat;
+        self.flat_floor.glide_to(
+            if compat.windows() { 1.0 } else { 0.0 },
+            glide_frames(self.sample_rate),
+        );
+        self.limiter
+            .set_hold_ms(if compat.windows() { 0.0 } else { HOLD_MS });
+        self.limiter.set_overshoot(compat.windows());
+        self.relink();
+    }
+
+    /// Whose arithmetic runs ([`DynamicBoost::set_compat`]).
+    #[must_use]
+    pub const fn compat(&self) -> DspCompat {
+        self.compat
+    }
+
     /// Tell the limiter which channels share an envelope: the front pair and every channel on
-    /// either side of the room, and every other channel one of its own.
+    /// either side of the room, and every other channel one of its own. None at all for the
+    /// Windows arithmetic, whose envelopes are one per channel.
     fn relink(&mut self) {
         let mut linked = [false; MAX_CHANNELS];
+        if self.compat.windows() {
+            self.limiter.set_linked(&linked);
+            return;
+        }
         if let Some((sides, len)) = &self.sides {
             for (link, side) in linked.iter_mut().zip(sides).take(*len) {
                 *link = *side != ChannelSide::Centre;
@@ -380,7 +471,8 @@ impl DynamicBoost {
         self.limiter.set_sample_rate(self.sample_rate);
         self.limiter.set_lookahead_ms(LOOK_AHEAD_SECONDS * 1000.0);
         self.limiter.set_ceiling(MAX_OUTPUT);
-        self.limiter.set_hold_ms(HOLD_MS);
+        self.limiter
+            .set_hold_ms(if self.compat.windows() { 0.0 } else { HOLD_MS });
         self.limiter.set_release_beta(self.release_time_beta);
     }
 
@@ -388,9 +480,9 @@ impl DynamicBoost {
     ///
     /// `in_sqr` is the frame's detector power, [`detector_power`]: the mean square of the front
     /// pair, where the original took the left channel alone. `gain_boost` is this frame's static
-    /// boost, from the glide.
+    /// boost, from the glide, and `flat_floor` this frame's share of the original's floor.
     #[inline]
-    fn update_gain(&mut self, in_sqr: Real, gain_boost: Real) -> Real {
+    fn update_gain(&mut self, in_sqr: Real, gain_boost: Real, flat_floor: Real) -> Real {
         // `level` is a one-pole recursion with no upper bound, and the floor below is a `<`
         // comparison — false for both NaN and `+inf`, so either value latches for the rest of the
         // session. With NaN the back-off never engages again; with `+inf` it pins the gain at
@@ -420,8 +512,16 @@ impl DynamicBoost {
             // itself become one. Below +0.5 dB of static boost — slider 0, and stored values 1 to
             // 4 — there is nothing to remove, so the floor is the static boost: the original's
             // flat 1.06 lifted loud material by half a decibel at a setting that promises none,
-            // and stepped there the moment the level crossed −10 dBFS RMS.
-            let floor = MIN_BACKOFF_GAIN.min(gain_boost);
+            // and stepped there the moment the level crossed −10 dBFS RMS. The Windows arithmetic
+            // keeps the flat floor, and a change between the two glides.
+            let port_floor = MIN_BACKOFF_GAIN.min(gain_boost);
+            let floor = if flat_floor >= 1.0 {
+                MIN_BACKOFF_GAIN
+            } else if flat_floor <= 0.0 {
+                port_floor
+            } else {
+                port_floor + flat_floor * (MIN_BACKOFF_GAIN - port_floor)
+            };
             if backed_off < floor {
                 floor
             } else {
@@ -452,6 +552,14 @@ fn front_pair_is_quiet(buffer: &[Real], channels: usize, (left, right): (usize, 
     buffer
         .chunks_exact(channels)
         .all(|frame| quiet(&frame[left]) && quiet(&frame[right]))
+}
+
+/// Whether every sample of the first channel in a block is under [`SQUARE_FLOOR`]: the one the
+/// Windows arithmetic's estimator hears, the quiet test of [`front_pair_is_quiet`] for it.
+fn left_is_quiet(buffer: &[Real], channels: usize) -> bool {
+    buffer
+        .chunks_exact(channels)
+        .all(|frame| frame.first().is_none_or(|left| left.abs() < SQUARE_FLOOR))
 }
 
 /// What the level estimator hears of one frame: `(L² + R²) / 2` of the front pair, `M²` for mono.
@@ -578,12 +686,16 @@ impl Effect for DynamicBoost {
 
     fn settle(&mut self) {
         self.gain_boost.settle();
+        self.flat_floor.settle();
+        self.handover_share.settle();
     }
 
     fn reset(&mut self) {
         self.limiter.reset();
         self.level = 0.0;
         self.gain_boost.settle();
+        self.flat_floor.settle();
+        self.handover_share.settle();
     }
 
     /// `Maxi32.c:237-482`, in place: the auto-gain a frame at a time, then the limiter over the
@@ -608,6 +720,17 @@ impl Effect for DynamicBoost {
         // biquad in it — is heard as silence by an instance of the loop that squares nothing (see
         // `detector_power`): a test inside the loop would not do, since a compiler may square
         // first and test after.
+        if self.compat.windows() {
+            // `Maxi32.c:258-259`: the left channel alone, `in1 * in1` in f32 (audit #7 taken back).
+            if left_is_quiet(buffer, channels) {
+                self.process_frames(buffer, channels, |_| 0.0);
+            } else {
+                self.process_frames(buffer, channels, |frame| {
+                    frame.first().map_or(0.0, |left| left * left)
+                });
+            }
+            return;
+        }
         let pair = self.front_pair;
         if front_pair_is_quiet(buffer, channels, pair) {
             self.process_frames(buffer, channels, |_| 0.0);
@@ -637,7 +760,8 @@ impl DynamicBoost {
             // The auto-gain, and the permanent ceiling, folded into one multiply before the frame
             // reaches the delay line — exactly where `Maxi32.c:296-301` applies them.
             let gain_boost = self.gain_boost.advance();
-            let boost = self.update_gain(power(frame), gain_boost) * MAX_OUTPUT;
+            let flat_floor = self.flat_floor.advance();
+            let boost = self.update_gain(power(frame), gain_boost, flat_floor) * MAX_OUTPUT;
             // Only as far as the limiter reaches. A channel past `MAX_CHANNELS` has no delay
             // line and no envelope, so boosting it would hand it an unlimited gain — it passes
             // through untouched instead, which is what the original's per-pair host guarantees and
@@ -651,7 +775,45 @@ impl DynamicBoost {
         // a frame at a time, and the limiter can run each envelope over the block in one go (audit
         // R2's cost, see `LookaheadLimiter::process`). The two loops apart are cheaper on stereo
         // too: 8.4 ns a frame at slider 10, where one loop doing both cost 13.4.
-        self.limiter.process(buffer, channels);
+        if self.handover_share.is_gliding() {
+            self.limit_handing_over(buffer, channels);
+        } else {
+            self.limiter.process(buffer, channels);
+        }
+    }
+
+    /// The limiter over a block the arithmetic's handover reaches ([`DynamicBoost::set_compat`]):
+    /// the new design and the old each limit the same boosted audio, and the output mixes from
+    /// the old to the new, a stretch of [`HANDOVER_SAMPLES`] at a time; the rest of the block,
+    /// past the handover, the new design alone.
+    fn limit_handing_over(&mut self, buffer: &mut [Real], channels: usize) {
+        let frames = buffer.len() / channels;
+        let fading = frames.min(self.handover_share.frames_left() as usize);
+        let (head, tail) = buffer.split_at_mut(fading * channels);
+        let stretch = (HANDOVER_SAMPLES / channels).max(1) * channels;
+        for part in head.chunks_mut(stretch) {
+            let Some(old) = self.handover_input.get_mut(..part.len()) else {
+                // A frame wider than the stretch: more channels than the limiter reaches. Nothing
+                // to mix; the new design takes it.
+                self.limiter.process(part, channels);
+                continue;
+            };
+            old.copy_from_slice(part);
+            self.limiter.process(part, channels);
+            self.handover.process(old, channels);
+            for (frame, old) in part
+                .chunks_exact_mut(channels)
+                .zip(old.chunks_exact(channels))
+            {
+                let share = self.handover_share.advance();
+                for (sample, old) in frame.iter_mut().zip(old) {
+                    *sample = old + share * (*sample - old);
+                }
+            }
+        }
+        if !tail.is_empty() {
+            self.limiter.process(tail, channels);
+        }
     }
 }
 
@@ -1822,5 +1984,325 @@ mod tests {
             boost.set_front_pair(nonsense);
             assert_eq!(boost.front_pair(), (0, 1), "{nonsense:?}");
         }
+    }
+
+    // -- «Like FxSound for Windows» = Interface and sound ----------------------------------------
+
+    /// Dynamic Boost as the port ran it before the 0.4.0 audit (`0f05ba5`), line for line: the
+    /// left channel's level, the flat 1.06 floor, and `Maxi32.c`'s limiter
+    /// ([`crate::input::limiter::OriginalLimiter`]).
+    struct OriginalBoost {
+        gain_boost: Real,
+        level: f64,
+        a0: f64,
+        filt_gain: f64,
+        limiter: crate::input::limiter::OriginalLimiter,
+    }
+
+    impl OriginalBoost {
+        fn new(amount: Real) -> Self {
+            let designed = DynamicBoost::new(FS);
+            Self {
+                gain_boost: gain_boost_for_amount(amount),
+                level: 0.0,
+                a0: designed.level_filter_a0(),
+                filt_gain: 1.0 - designed.level_filter_a0(),
+                limiter: crate::input::limiter::OriginalLimiter::new(
+                    FS,
+                    MAX_OUTPUT,
+                    LOOK_AHEAD_SECONDS * 1000.0,
+                    designed.release_beta(),
+                ),
+            }
+        }
+
+        fn process(&mut self, buffer: &mut [Real], channels: usize) {
+            for frame in buffer.chunks_exact_mut(channels) {
+                let input = frame.first().copied().unwrap_or(0.0);
+                let in_sqr: Real = input * input;
+                let next = self.level * self.a0 + f64::from(in_sqr) * self.filt_gain;
+                self.level = if next.is_finite() { next } else { 0.0 };
+                if self.level < LEVEL_FLOOR {
+                    self.level = 0.0;
+                }
+                let rms = self.level.sqrt() as Real;
+                let gain = if self.gain_boost * rms > TARGET_LEVEL {
+                    let backed_off = TARGET_LEVEL / rms;
+                    if backed_off < MIN_BACKOFF_GAIN {
+                        MIN_BACKOFF_GAIN
+                    } else {
+                        backed_off
+                    }
+                } else {
+                    self.gain_boost
+                };
+                let boost = gain * MAX_OUTPUT;
+                for sample in frame.iter_mut().take(MAX_CHANNELS) {
+                    *sample *= boost;
+                }
+                self.limiter.process_frame(frame);
+            }
+        }
+    }
+
+    /// A Dynamic Boost playing the Windows build's arithmetic, at `amount`, its glide landed.
+    fn windows_boost(amount: Real) -> DynamicBoost {
+        let mut boost = DynamicBoost::new(FS);
+        boost.set_compat(DspCompat::Windows);
+        boost.set_amount(amount);
+        boost.settle();
+        boost
+    }
+
+    #[test]
+    fn at_interface_and_sound_dynamic_boost_is_maxi32s_to_the_bit() {
+        // Audit #6, #7, #8, R1 and R2 taken back: every sample must be the one the port played
+        // before the audit, on mono, stereo, 5.1 and 7.1, at slider 0, at a stored 38 and at the
+        // top, in blocks of any length, with the left channel quiet and the right loud, a burst on
+        // one channel and loud stretches that engage the back-off and its floor. The layout's
+        // front pair and sides are named, and ignored, as the original knew nothing of them.
+        use crate::engine::ChannelSide::{Centre as C, Left as L, Right as R};
+        for channels in [1_usize, 2, 6, 8] {
+            for amount in [0.0, fxsound_core::scale::midi_to_value(38), 1.0] {
+                let mut ours = windows_boost(amount);
+                if channels >= 6 {
+                    ours.set_front_pair(Some((0, 2)));
+                    ours.set_channel_sides(Some(&[L, C, R, C, L, R, L, R][..channels]));
+                }
+                let mut original = OriginalBoost::new(amount);
+                let mut n = 0_usize;
+                for frames in [97_usize, 480, 1, 33, 2048, 48_000, 512, 200, 96_000, 4800] {
+                    let mut input = vec![0.0; frames * channels];
+                    for frame in input.chunks_exact_mut(channels) {
+                        let loud = if (60_000..150_000).contains(&n) {
+                            4.0
+                        } else {
+                            1.0
+                        };
+                        for (channel, sample) in frame.iter_mut().enumerate() {
+                            let hz = 55.0 + 97.0 * channel as Real;
+                            let tone = (std::f32::consts::TAU * hz * n as Real / FS).sin();
+                            let level = if channel == 0 { 0.05 } else { 0.2 };
+                            let burst = if channel == 1 && (3_000..3_400).contains(&n) {
+                                5.0
+                            } else {
+                                1.0
+                            };
+                            *sample = loud * burst * level * tone;
+                        }
+                        n += 1;
+                    }
+                    let mut theirs = input.clone();
+                    original.process(&mut theirs, channels);
+                    let mut mine = input;
+                    ours.process(&mut mine, channels);
+                    for (at, (a, b)) in mine.iter().zip(&theirs).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{channels} channels at {amount}: sample {at} of a {frames}-frame block"
+                        );
+                    }
+                }
+                assert_eq!(ours.level_rms(), original.level.sqrt() as Real);
+            }
+        }
+    }
+
+    #[test]
+    fn at_interface_and_sound_loud_material_at_slider_zero_is_lifted_half_a_decibel_as_on_windows()
+    {
+        // The twin of `loud_material_at_slider_zero_is_not_boosted`: the flat anti-pumping floor
+        // is back, and loud material at slider 0 comes out at 0.7·1.06·0.966, +0.2 dB.
+        let mut boost = windows_boost(0.0);
+        let mut block = vec![0.7; (FS * 10.0) as usize * 2];
+        boost.process(&mut block, 2);
+        let want = 0.7 * MIN_BACKOFF_GAIN * MAX_OUTPUT;
+        for s in &block[block.len() - 200..] {
+            assert!((s - want).abs() < 1e-6, "got {s}, expected {want}");
+        }
+        let gain_db = 20.0 * (block[block.len() - 1] / 0.7).log10();
+        assert!((gain_db - 0.2).abs() < 0.01, "{gain_db} dB");
+    }
+
+    #[test]
+    fn at_interface_and_sound_the_level_is_the_left_channels_as_on_windows() {
+        // The twin of `a_mix_loud_only_on_the_right_is_backed_off_like_any_other`: a quiet left
+        // and a loud right at slider 10. The estimator hears the left alone, the whole mix takes
+        // the full +11.6 dB, and the right channel sits deep in the limiter.
+        let mut boost = windows_boost(1.0);
+        let frames = (FS * 10.0) as usize;
+        let w_left = std::f32::consts::TAU * 440.0 / FS;
+        let w_right = std::f32::consts::TAU * 660.0 / FS;
+        let mut buffer = vec![0.0; frames * 2];
+        for (n, frame) in buffer.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            frame[0] = 0.05 * (w_left * n as Real).sin();
+            frame[1] = 0.5 * (w_right * n as Real).sin();
+        }
+        boost.process(&mut buffer, 2);
+        let left_rms = 0.05 / std::f32::consts::SQRT_2;
+        assert!(
+            (boost.level_rms() - left_rms).abs() / left_rms < 0.01,
+            "the estimator reads {}, the left channel's RMS is {left_rms}",
+            boost.level_rms()
+        );
+        let tail = &buffer.as_chunks::<2>().0[frames - FS as usize..];
+        let left: Vec<Real> = tail.iter().map(|f| f[0]).collect();
+        let left_gain_db = 20.0 * (rms(&left) / left_rms).log10();
+        assert!(
+            (left_gain_db - 11.3).abs() < 0.1,
+            "the left channel got {left_gain_db} dB"
+        );
+        assert!(
+            boost.envelope(1) > 1.8,
+            "the right channel should be deep in the limiter: {}",
+            boost.envelope(1)
+        );
+    }
+
+    #[test]
+    fn at_interface_and_sound_a_peak_on_one_side_turns_that_side_alone_down_as_on_windows() {
+        // The twin of `a_peak_on_one_side_turns_both_sides_down_together`: an envelope per
+        // channel, so a peak on the right leaves the left where it was and the image lurches to
+        // the left for as long as the right is limited.
+        let mut boost = windows_boost(0.0);
+        let frames = FS as usize;
+        let burst = (FS * 0.5) as usize..(FS * 0.7) as usize;
+        let w = std::f32::consts::TAU * 1_000.0 / FS;
+        let input: Vec<[Real; 2]> = (0..frames)
+            .map(|n| {
+                let s = (w * n as Real).sin();
+                let right = if burst.contains(&n) { 1.9 } else { 0.5 };
+                [0.5 * s, right * s]
+            })
+            .collect();
+        let mut buffer: Vec<Real> = input.iter().flatten().copied().collect();
+        boost.process(&mut buffer, 2);
+        let delay = boost.latency_frames();
+        let (mut deepest_left_db, mut deepest_right_db): (Real, Real) = (0.0, 0.0);
+        for (n, out) in buffer.as_chunks::<2>().0.iter().enumerate().skip(delay) {
+            let [left_in, right_in] = input[n - delay];
+            if left_in.abs() < 0.1 {
+                continue;
+            }
+            deepest_left_db = deepest_left_db.min(20.0 * (out[0] / (left_in * MAX_OUTPUT)).log10());
+            deepest_right_db =
+                deepest_right_db.min(20.0 * (out[1] / (right_in * MAX_OUTPUT)).log10());
+        }
+        assert!(
+            deepest_left_db.abs() < 1e-4,
+            "the left should be untouched: {deepest_left_db} dB"
+        );
+        assert!(
+            deepest_right_db < -5.0,
+            "the right should be limited: {deepest_right_db} dB"
+        );
+    }
+
+    /// The left channel of a stereo 50 Hz cosine, `left` on the left and `right` on the right,
+    /// through Dynamic Boost at slider 0 in 480-frame blocks, the arithmetic `compat_for(block)`.
+    /// Every block starts on a crest.
+    fn left_through(left: Real, right: Real, compat_for: impl Fn(usize) -> DspCompat) -> Vec<Real> {
+        let mut boost = DynamicBoost::new(FS);
+        let mut out = Vec::new();
+        for block in 0..300 {
+            boost.set_compat(compat_for(block));
+            let mut buffer: Vec<Real> = (0..480)
+                .flat_map(|i| {
+                    let n = (block * 480 + i) as f64;
+                    let s = (std::f64::consts::TAU * 50.0 * n / f64::from(FS)).cos() as Real;
+                    [left * s, right * s]
+                })
+                .collect();
+            boost.process(&mut buffer, 2);
+            out.extend(buffer.iter().step_by(2));
+        }
+        out
+    }
+
+    fn steepest(signal: &[Real]) -> Real {
+        signal
+            .windows(2)
+            .fold(0.0, |most: Real, pair| most.max((pair[1] - pair[0]).abs()))
+    }
+
+    #[test]
+    fn switching_the_arithmetic_hands_the_limiter_over_rather_than_relinking_it_at_once() {
+        // A quiet left beside a right deep in the limiter: the port turns both sides down
+        // together, the Windows arithmetic the right alone. Relinked between two samples on the
+        // way back, the left's envelope took the right's and the left stepped down by 0.110 on a
+        // tone that moves by 0.0019 a sample; the old design and the new now limit side by side
+        // for 20 ms and the output crossfades from one to the other, both ways.
+        let moved = left_through(0.3, 1.5, |block| {
+            if (100..200).contains(&block) {
+                DspCompat::Windows
+            } else {
+                DspCompat::Linux
+            }
+        });
+        let linux = left_through(0.3, 1.5, |_| DspCompat::Linux);
+        let windows = left_through(0.3, 1.5, |_| DspCompat::Windows);
+        for switch in [100, 200] {
+            let window = (switch - 1) * 480..(switch + 10) * 480;
+            let step = steepest(&moved[window.clone()]);
+            let control = steepest(&linux[window.clone()]).max(steepest(&windows[window]));
+            assert!(
+                step <= control * 1.1,
+                "switched at block {switch}, the left stepped by {step}, the tone by {control}"
+            );
+        }
+        // And once the handover is over, the new design alone plays: the moved render's last
+        // second is Off's, whose level estimate it shared all along.
+        let tail = 250 * 480..;
+        let difference = moved[tail.clone()]
+            .iter()
+            .zip(&linux[tail])
+            .fold(0.0, |most: Real, (a, b)| most.max((a - b).abs()));
+        assert!(difference < 1e-3, "{difference} from Off a second later");
+        // Moved back 10 ms later, before the handover was over, the half-faded design was copied
+        // over the old one and the mix dropped to it alone, the left by 0.050 here; the
+        // two designs now trade places and the mix carries on from where it was. Moved there and
+        // back twice over, 10 ms apart, too.
+        for there in [&[100][..], &[100, 102][..]] {
+            let moved = left_through(0.3, 1.5, |block| {
+                if there.contains(&block) {
+                    DspCompat::Windows
+                } else {
+                    DspCompat::Linux
+                }
+            });
+            let window = 99 * 480..112 * 480;
+            let step = steepest(&moved[window.clone()]);
+            let control = steepest(&linux[window.clone()]).max(steepest(&windows[window]));
+            assert!(
+                step <= control * 1.1,
+                "moved at blocks {there:?}, the left stepped by {step}, the tone by {control}"
+            );
+        }
+    }
+
+    #[test]
+    fn back_at_off_the_ports_linking_and_level_come_back_with_the_layout_it_was_given() {
+        // The arithmetic is switched, not the layout forgotten: a front pair named while the
+        // Windows arithmetic played is the one the port's estimator hears once it is back, and a
+        // peak on one side turns both down together again.
+        let mut boost = windows_boost(0.0);
+        boost.set_front_pair(Some((1, 0)));
+        assert_eq!(boost.compat(), DspCompat::Windows);
+        boost.set_compat(DspCompat::Linux);
+        assert_eq!(boost.compat(), DspCompat::Linux);
+        assert_eq!(boost.front_pair(), (1, 0));
+        let mut buffer: Vec<Real> = (0..4_800)
+            .flat_map(|n| {
+                let s = (std::f32::consts::TAU * 1_000.0 * n as Real / FS).sin();
+                [0.5 * s, 1.9 * s]
+            })
+            .collect();
+        boost.process(&mut buffer, 2);
+        assert_eq!(
+            boost.envelope(0).to_bits(),
+            boost.envelope(1).to_bits(),
+            "both sides of the pair share one envelope again"
+        );
     }
 }

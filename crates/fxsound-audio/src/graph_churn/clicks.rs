@@ -16,7 +16,8 @@
 //! * **The worst residual around each switch** is the loudest high-passed sample from 0.3 s
 //!   before the switch to 0.6 s after it, in dBFS ([`EventResult::worst_dbfs`]).
 //! * **The control** is the loudest high-passed sample of the steady state: everything more than
-//!   0.5 s before and 0.8 s after every switch, and away from both ends ([`Analysis::floor_dbfs`]).
+//!   0.5 s before and 0.8 s after every switch — 1.5 s after a route coming in, whose chain starts
+//!   afresh ([`ROUTE_IN_CLEAR`]) — and away from both ends ([`Analysis::floor_dbfs`]).
 //!   A floor near the threshold means the instrument cannot tell a click, not that there is none.
 //! * **The dip** is the longest stretch from 0.3 s before a switch to 1 s after it in which the
 //!   tone itself, unfiltered, is more than 20 dB below its steady level, in 10 ms steps
@@ -33,7 +34,8 @@
 //! is measured. The engine runs on it as the app drives it — the power switch is both lanes'
 //! snapshots and both default claims ([`Bench::act`]); a preset is the snapshot the app would
 //! publish for it; a route is the rules it would send. Tones are `pw-cat` playing a Sun AU file,
-//! recorders `pw-record` writing a raw file: no `--raw`, which PipeWire 1.0's tools lack.
+//! recorders `pw-record` writing a raw file: no `--raw`, which PipeWire 1.0's tools lack. A
+//! scenario of PulseAudio applications plays and records with `pacat` instead ([`Scenario::pulse`]).
 //!
 //! A switch between devices is heard on both: the speakers' lane is recorded at both sinks'
 //! monitors, and one player feeds both microphones the same wave, in step. The recordings are read
@@ -45,14 +47,20 @@
 //! One test each, the numbers of roadmap §7's list where it has them:
 //!
 //! 1. the power switch with streams pinned to FxSound's own nodes, and with streams that follow
-//!    the default, which WirePlumber moves;
+//!    the default, which WirePlumber moves: `pw-cat`'s and `pw-record`'s, and PulseAudio
+//!    applications' through the graph's own `pipewire-pulse`;
 //! 2. an application's route on and off ([`UiToAudio::SetAppRoutes`]);
 //! 3. FxSound picking another device for both lanes, as the device list, `--output`,
 //!    `--next-output` and `--input` do ([`UiToAudio::SelectDevice`]);
 //! 4. the desktop picking another default device (`wpctl set-default`) with FxSound on,
 //! 5. and with FxSound off;
 //!
-//! and the music equalizer and presets, the voice equalizer and presets. Every stream but the
+//! 4 and 5 again with FxSound's hook in WirePlumber (`crate::wireplumber_hook`, D5), which fades
+//! the moves WirePlumber makes itself;
+//!
+//! and the music equalizer and presets, the voice equalizer and presets, and «Like FxSound for
+//! Windows» moved between Off and Interface and sound, on the lane and in an application's route
+//! (roadmap 0.5.0 §1 A4). Every stream but the
 //! pinned ones of the first test follows the default, as most applications' do. Both lanes but in
 //! the preset tests, which play into the lane a preset belongs to. Tests 4 and 5 run as the engine
 //! does until the app ranks its devices, following the system's default device: the mode in which
@@ -89,10 +97,26 @@
 //! A stream that follows the default is moved by WirePlumber when the power switch hands the
 //! default back or takes it, when a route is made or taken away, and when a lane's nodes go and
 //! come back on another device, and WirePlumber unlinks before it links, in the middle of the
-//! wave. In 0.4.0 all of these are over the gate, so they are reported, not gated. The power
+//! wave. In 0.4.0 all of these are over the gate, so they were reported, not gated. The power
 //! switch, the route and FxSound's own pick of a device are FxSound's own switches all the same,
-//! held to the gate once 0.5.0 makes them quiet (roadmap §7 D1–D3), and their tables say so. The
-//! desktop's pick is reported for good until the roadmap's §14 #16 says what it is held to.
+//! held to the gate once 0.5.0 makes them quiet (roadmap §7 D1–D3): since D2 the power switch and
+//! the route fade the streams they move (`crate::stream_handover`) and are gated, the gap they
+//! leave held to [`HANDOVER_BUDGET`]; since D3 FxSound's own pick moves no stream at all, its
+//! virtual nodes kept (`crate::engine`, "Another device, the same virtual node"), and is gated the
+//! same way. The desktop's pick with FxSound on is two moves, read as two rows
+//! ([`Scenario::claims`]): WirePlumber's, which roadmap §14 #16 accepted stays where plain Linux
+//! has it unless WirePlumber itself is taught to fade (D5), and FxSound's claim of the default back
+//! after it, gated. WirePlumber's move is not gated but held to the same picks with FxSound off,
+//! plus [`BARE_MARGIN_DB`] (§7, test 4; [`against_bare_linux`]): its loudest run of all against
+//! plain Linux's, each read above the tone ([`above_the_tone`]) rather than in dBFS, since
+//! FxSound's chain plays the tone louder than plain Linux and every cut of it with it — a user
+//! hears a click beside the sound it cuts. What the move leaves at the monitor of the speakers
+//! FxSound played through, read on that monitor alone — the end of the sound it cut off in
+//! FxSound's chain, faded since D4 — is gated ([`left_behind`]). With FxSound off the pick is
+//! WirePlumber's alone, and reported: it is what the other is held to. With FxSound's hook in
+//! WirePlumber (D5, an option of Settings ▸ Experimental) WirePlumber fades its own moves too, and
+//! the same picks, with FxSound on and with it off, are gated, WirePlumber's move and FxSound's
+//! claim alike ([`Scenario::hook`]).
 //!
 //! # Running it
 //!
@@ -102,7 +126,7 @@
 //!
 //! `--nocapture` shows the tables; one test at a time keeps the other tests' daemons from causing
 //! the xruns that would discard runs. [`FXSOUND_CLICK_REPORT`](REPORT_FILE) names a file every
-//! table is appended to as well. The eight measurements take about ten minutes together, and
+//! table is appended to as well. The thirteen measurements take about twenty minutes, and
 //! their names share the prefix `under_a_steady_tone`, by which CI's Arch Linux leg leaves them out
 //! of its test step and runs them in one of their own, in `report` mode, with the tables in the
 //! job's summary (`.github/workflows/ci.yml`). They also run in a plain `cargo test --workspace`,
@@ -118,9 +142,14 @@
 //! * A phase that adds a switch or a parameter change adds it here: a [`Switch`] that makes it
 //!   as the app does, and a [`Scenario`] — or a place in one — that makes it under the tone. The
 //!   end state alone is not the test (roadmap §12 item 2).
-//! * A phase that makes a reported switch quiet sets its scenario's `gated`: D2 does it for the
-//!   power switch with following streams and for the route, D3 for FxSound's own pick of a device,
-//!   and each holds the dip to its budget with [`EventResult::dip_ms`] as well.
+//! * A phase that makes a reported switch quiet sets its scenario's `gated`: D2 did it for the
+//!   power switch with following streams and for the route, D3 for FxSound's own pick of a device
+//!   and for its claim after the desktop's, and each holds the dip to its budget with
+//!   [`EventResult::dip_ms`] as well ([`Scenario::budget`]). D3 also held WirePlumber's move after
+//!   the desktop's pick to plain Linux + 3 dB ([`against_bare_linux`]); D4 faded FxSound's part
+//!   of it, the tail it cut off in FxSound's chain, and gates it at the monitor of the speakers
+//!   FxSound played through, read on its own ([`left_behind`]); D5, whose hook in WirePlumber
+//!   makes the rest fade, gates the desktop's picks with it in tests of their own.
 //! * A phase that says a reported switch got quieter judges by the loudest run, of several passes,
 //!   not by a shift of the median: what WirePlumber's move leaves spreads over about 20 dB (below).
 //! * A phase that changes what a scenario sets up — a new node between the tone and the recorder,
@@ -171,6 +200,109 @@
 //! quieter does not read an improvement from a median that moved within these ranges: it runs
 //! several passes and judges by the loudest run of all of them, the `loudest run` of each table.
 //!
+//! FxSound's hook in WirePlumber, measured on 29.09.2026 at D5 in the same way: the desktop's picks
+//! with FxSound on left, over two passes, −53.8…−61.2 dBFS for WirePlumber's move (the loudest run
+//! −52.9) and −61.8…−63.8 for FxSound's claim on the speakers' lane, −58.6…−69.0 and −71.8…−76.6
+//! on the microphone's, dips 100–160 ms; with FxSound off and ranking its devices, −59.8…−60.7
+//! and −65.9…−66.7, dips 50–100 ms. The microphone's claim is not always under the gate: in one
+//! run of a pass it jumped once in 24 switches, at −34.1 in the pass above and at −17.7 in a
+//! later one (`t_other` to `t_mic2`), as loud as plain Linux — the converter's new volume played
+//! before its ramp, below, which the hook does not end — and the scenario passes within
+//! [`Budget::loud_runs`]. Without the hook WirePlumber's move is plain Linux's −19 to −28. A first
+//! version of the hook gave the volume back 20 ms after the new link whatever the stream had left:
+//! run beside the rest of the tests, FxSound's claim then met the hook's fade in on the same
+//! stream, and the converter, refusing a second ramp, jumped: −18.8 to −31.1 in two runs of three.
+//! A stream moved off FxSound's nodes is now held silent until FxSound has moved it back.
+//!
+//! «Like FxSound for Windows», measured on 29.09.2026 in the same way at W1d of 0.5.0, both scenarios
+//! at −6 dB of master gain and +4 dB of balance: on the engine before W1d the lane's move to
+//! Interface and sound left −20.0 dBFS and the move back −6.3; since W1d, which glides and
+//! crossfades what the level changes, −64.7 and −53.3 on the lane and −64.0 and −55.7 in an
+//! application's route, the loudest run −52.2, the floor −108.5.
+//!
+//! The smooth handover, measured on 29.09.2026 in the same way at D2 of 0.5.0, each switch the
+//! median of three clean runs, and the loudest run beside it. With ramps of one sample a step, as
+//! first made, over three passes: the power switch with following streams, on the speakers' lane
+//! off −71.2…−91.3 and on −47.7…−51.5, a dip of 40–100 ms; on the microphone's lane off
+//! −76.2…−84.2 and on −72.9…−76.9, a dip of 100–130 ms, the recorder's volume given back 50 ms
+//! after its new link is active. The route on and off: on the speakers' lane on −46.9…−47.8 and
+//! off −52.6…−54.4, a dip of 40–60 ms; on the microphone's lane −68.9…−81.4, a dip of 100–120 ms.
+//! With eight samples a step (`crate::stream_handover::RAMP_STEP_SAMPLES`, below): the power
+//! switch off −59.9…−60.8 and on −47.0…−50.5 on the speakers' lane, −65.9…−66.7 on the
+//! microphone's; the route on −44.3…−46.9 and off −49.9…−52.7, −58.6…−59.1 on the microphone's
+//! lane; the dips as before. The quiet ones are the steps' staircase now, 10–20 dB louder; the
+//! loud ones hardly moved. Floors as before. Before the volume came back over 50 ms rather than
+//! 20, the route going on left −40.6…−43.8: the route's chain, which has heard nothing yet, took
+//! the onset at full level. Before the route's chain was switched off and let play its tail out
+//! before its pair went, the route going off left −35.6…−37.8: its reverb's tail stopped in the
+//! middle of its wave. The desktop's pick and FxSound's own pick are as before (for D3, below).
+//!
+//! The power switch with PulseAudio applications following the default, measured the same day in
+//! the same way: on the speakers' lane off −53.8…−57.6 and on −45.9…−49.6, a dip of 60–90 ms; on
+//! the microphone's lane −65.9…−66.3, a dip of 100–120 ms (with one sample a step, over nine
+//! passes: off −66.9…−79.9 and on −47.7…−50.0; −76.2…−80.4). Not in every run, which the median
+//! of three does not show. PipeWire's converter applies a ramped write's new volume at once and
+//! only then hands its data thread the ramp, and a cycle played in between is heard at the new
+//! volume: before a fade in, a whole quantum at full level, then silence, then the ramp. Counted
+//! switch by switch over runs of four switches: the recorder played its tone so, at −17.7 to
+//! −24.9 dBFS, at 1 switch in 96 with one sample a step and 2 in 160 with eight; the player at
+//! −11.7 to −18.6, 3 in 96 with one and none in 160 with eight. It was put down, before it was
+//! found, to the recorder's channels changing in its move from the microphone's one to FxSound's
+//! two: it is not that — without FxSound, on a private graph, a `parec` stream faded out and in
+//! over 50 ms by `pw-cli` did it 21 times in 2400 writes at one sample a step, and once in 1600 at
+//! eight. It is PipeWire's, and FxSound's steps make it rarer and do not end it; so a handover's
+//! scenario counts every run, lists each switch over the gate, and fails a pass with more than one
+//! ([`Budget::loud_runs`]). With a player that asks for 20 ms rather than 85, the recorder jumped
+//! at −17.7 to −28.6 on one run in three, 90 ms after the switch and before its own handover
+//! began: the player's move changes the quantum of the graph the recorder is in, and a PulseAudio
+//! recorder drops samples when the quantum falls — without FxSound too
+//! (`PolicyGraph::pulse_player`'s latency).
+//!
+//! Two faults of the handover's own were mended with it. A second point of a ramp down, reported
+//! by the converter, was taken for somebody else's volume: the stream let go, and its journal line
+//! taken out, while the ramp went on to 0 (found in review, not seen in these runs). And, seen in
+//! a run of sixteen switches 1.5 s apart, a converter that reported a point near the start of its
+//! ramp back and then never echoed the volume said once more after it left the server showing that
+//! point, 0.10, which the next power switch faded from and gave back: a player left 20 dB down for
+//! good (`crate::stream_handover::CONFIRM_WAIT`).
+//!
+//! FxSound's own pick of a device and the desktop's pick with FxSound on, measured on 29.09.2026 in
+//! the same way at D3 of 0.5.0, each switch the median of three clean runs and the loudest run
+//! beside it, over three passes. FxSound's pick, both lanes' virtual nodes kept: −59.4 to −68.4
+//! dBFS on the speakers' lane, the loudest run −59.1, and −69.0 to −75.6 on the microphone's, a
+//! dip of 100–140 ms. Before the chain waited for its new stream's link to be active and settled,
+//! it clicked at −20 to −30, 40 to 60 ms after the move: let out on the new stream's first block,
+//! which the virtual node's link-group runs before anything links it, it faded in into nothing,
+//! and let out at the link itself, it faded in over the first cycles on the new device's clock,
+//! which left the ring a block short. The desktop's pick: FxSound's claim after it −59.9 to −60.8
+//! and −65.9 to −66.7, a dip of 110–160 ms. Made before the applications were silent there,
+//! FxSound's move onto the picked device clicked in them at −23 to −32: the stream it linked there
+//! changed the quantum under them. WirePlumber's move −11.6 to −23.1 dBFS on the speakers' lane
+//! and −17.7 to −24.9 on the microphone's, over plain Linux's −18.8 to −25.9 and −23.3 to −28.2 in
+//! dBFS, since the chain plays the speakers' tone at −1.1 dBFS and the microphone's at −10.8, 10.9
+//! and 7.2 dB above the bare ones. Above the tone, the loudest run of all: −10.5 dB against plain
+//! Linux's −6.8 on the speakers' lane, −6.9 against −5.3 on the microphone's; the same in a fourth
+//! pass made with [`against_bare_linux`], and −8.8 and −6.9 in a fifth, the gate's, with every
+//! measurement at once. FxSound's chain makes it no louder, and that holds it there. Floors as
+//! before.
+//!
+//! The tail de-click, measured on 29.09.2026 at D4 of 0.5.0 (`crate::engine`, "A sound cut off"):
+//! WirePlumber's move after the desktop's pick with FxSound on, over twelve passes of the test
+//! above, each speakers' monitor also read on its own. On the speakers FxSound had played through,
+//! the move left −88.8 to −105.6 dBFS in 136 picks of 144, where it had left a step of the chain's
+//! tone; in the other 8, six of them the third pick, the recording skipped a few milliseconds of
+//! the fade downstream of FxSound, whose own blocks were played whole (traced), and jumped into it
+//! at −8.4 to −16.3. On the picked speakers the application arrived unprocessed at −18.8 to −48.0,
+//! as in plain Linux. The move's median, switch by switch, went from −11.6…−26.2 dBFS to
+//! −18.8…−31.6 (plain Linux −18.8…−25.9); its loudest run above the tone to −17.7 dB in the five
+//! passes with no skip, −7.3 to −15.1 in the others (−8.8 to −10.5 at D3), and −17.7 in a
+//! thirteenth, the gate's, with every measurement at once. The microphone's lane, whose device
+//! never goes silent, and FxSound's own switches, as at D3. The monitor of the speakers FxSound had
+//! played through is read on its own in the test since, each pick in its own row, and gated
+//! ([`left_behind`]): −89.2 to −97.1 dBFS in a fourteenth pass, the loudest run −89.2, and −89.0
+//! to −97.0 in the gate's; with the fade taken out of the engine, 10 of a pass's 12 picks at −11.6
+//! to −26.2, and it fails.
+//!
 //! E6a measured the same switches with the app's release build, where this runs the engine
 //! unoptimised, and in another order. The switches FxSound makes itself agree within a few dB,
 //! except Volume Boost and Noisy Room, which E6a had at −83.1 and −77.8: 6–9 dB louder here, all
@@ -183,7 +315,7 @@
 use super::policy::PolicyGraph;
 use super::*;
 use fxsound_core::messages::{AppRoute, DspEvent, DspParams, InputDspParams, RouteParams};
-use fxsound_core::{AppKey, AudioStatus, Effect, EqBand, Preset, eq, scale};
+use fxsound_core::{AppKey, AudioStatus, DspCompat, Preset, WindowsParity, eq};
 use fxsound_preset::input::InputPreset;
 use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _};
@@ -203,12 +335,25 @@ const WINDOW: (f64, f64) = (0.3, 0.6);
 /// What the steady state keeps clear of around every switch, in seconds.
 const CLEAR: (f64, f64) = (0.5, 0.8);
 
+/// What the steady state keeps clear of after a route comes in ([`Switch::Route`]), in seconds,
+/// instead of [`CLEAR`]'s. The stream moves onto a chain of its own that starts afresh, and its
+/// leveller and boost settle on the tone as the lane's did before the steady state began
+/// ([`SETTLE`]): the residual stays near −50 dBFS for 0.6–0.7 s after a route comes in, against
+/// 0.3–0.4 s after it goes, and on a machine loaded by the other tests its last milliseconds, at
+/// about −87 dBFS, land past [`CLEAR`]'s 0.8 s — the switch's own, read as the steady state's.
+const ROUTE_IN_CLEAR: f64 = 1.5;
+
 /// What the steady state keeps clear of at the end of a recording, in seconds: a recorder that is
 /// being stopped.
 const TAIL: f64 = 1.0;
 
 /// How far after a switch a dip is looked for, in seconds.
 const DIP_AFTER: f64 = 1.0;
+
+/// How much longer than a switch's window FxSound's own move after it is read
+/// ([`Window::split`]): its handover may wait for another lane's before it begins
+/// (`crate::engine::fades`, one handover at a time).
+const CLAIM_EXTRA: f64 = 0.4;
 
 /// How far below its steady level the tone has to be to count as dipped.
 const DIP_DB: f64 = 20.0;
@@ -224,6 +369,10 @@ const SOFT_GATE_DBFS: f64 = -30.0;
 
 /// A floor at or above this cannot tell a click from the steady state.
 const FLOOR_LIMIT_DBFS: f64 = -60.0;
+
+/// How much louder than plain Linux WirePlumber's move after a desktop pick may be with FxSound on,
+/// read above the tone ([`above_the_tone`]): roadmap 0.5.0 §7, test 4.
+const BARE_MARGIN_DB: f64 = 3.0;
 
 /// How long a tone plays through the chains before the steady state starts.
 const SETTLE: Duration = Duration::from_secs(2);
@@ -245,6 +394,11 @@ const OUTPUT_TONE: (f64, f64) = (100.0, -12.0);
 
 /// The tone fed into the microphone.
 const INPUT_TONE: (f64, f64) = (300.0, -18.0);
+
+/// How long FxSound may take to begin to take a default back after the desktop picked another
+/// device ([`Bench::mark_claims`]): a supervisor tick for the lane's rules, the fade before its
+/// stream on the device is replaced, and room for a slow machine.
+const CLAIM_PATIENCE: Duration = Duration::from_millis(1500);
 
 /// The loudest a tone is when it is not heard: −40 dBFS.
 const HEARD: f32 = 0.01;
@@ -393,11 +547,74 @@ struct Analysis {
     events: Vec<EventResult>,
 }
 
+/// Where one row of a switch's table is read in a recording, in frames: the moment it is timed
+/// from, the stretch its worst residual is looked for in, and the stretch its dip is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Window {
+    at: usize,
+    from: usize,
+    to: usize,
+    dip_to: usize,
+}
+
+impl Window {
+    /// The window of a switch at frame `at`: [`WINDOW`] around it, the dip up to [`DIP_AFTER`]
+    /// after it.
+    fn around(at: usize) -> Self {
+        Self {
+            at,
+            from: at.saturating_sub(seconds(WINDOW.0)),
+            to: at + seconds(WINDOW.1),
+            dip_to: at + seconds(DIP_AFTER),
+        }
+    }
+
+    /// A switch at `at` that FxSound follows at `then` with a move of its own
+    /// ([`Scenario::claims`]), read as two rows: what came before FxSound's move, from [`WINDOW`]
+    /// before the switch — the session manager's move, which has no dip of its own to be held to —
+    /// and FxSound's move from `then` on, for as long as a switch's window and a dip's.
+    fn split(at: usize, then: usize) -> [Self; 2] {
+        let from = at.saturating_sub(seconds(WINDOW.0));
+        [
+            Self {
+                at,
+                from,
+                to: then.max(from),
+                dip_to: from,
+            },
+            Self {
+                at: then,
+                from: then,
+                to: then + seconds(WINDOW.1 + CLAIM_EXTRA),
+                dip_to: then + seconds(DIP_AFTER + CLAIM_EXTRA),
+            },
+        ]
+    }
+}
+
+/// Seconds as frames.
+fn seconds(s: f64) -> usize {
+    (s * RATE as f64) as usize
+}
+
 /// Read `recording` from frame `start` on, with a switch at each of `events` (frames). Nothing
 /// before `start` counts: the recorder was running before the tone was.
 fn analyse(recording: &Channels, start: usize, events: &[usize]) -> Analysis {
+    let windows: Vec<Window> = events.iter().map(|&at| Window::around(at)).collect();
+    analyse_windows(recording, start, &windows, events, &[])
+}
+
+/// [`analyse`] with each row's own [`Window`], and the steady state kept clear of every frame of
+/// `clear` — the switches, and every moment a row is timed from — and for [`ROUTE_IN_CLEAR`] after
+/// each frame of `routes_in`, where a route came in.
+fn analyse_windows(
+    recording: &Channels,
+    start: usize,
+    windows: &[Window],
+    clear: &[usize],
+    routes_in: &[usize],
+) -> Analysis {
     let frames = recording.first().map_or(0, Vec::len);
-    let seconds = |s: f64| (s * RATE as f64) as usize;
     let kernel = high_pass_kernel(HIGH_PASS_HZ, TAPS);
     let mut residual = vec![0.0_f64; frames];
     let mut raw = vec![0.0_f64; frames];
@@ -416,10 +633,16 @@ fn analyse(recording: &Channels, start: usize, events: &[usize]) -> Analysis {
     for flag in steady.iter_mut().take(end).skip(start) {
         *flag = true;
     }
-    for &event in events {
+    for &event in clear.iter().chain(windows.iter().map(|window| &window.at)) {
         let from = event.saturating_sub(seconds(CLEAR.0));
         let to = (event + seconds(CLEAR.1)).min(frames);
         for flag in steady.iter_mut().take(to).skip(from) {
+            *flag = false;
+        }
+    }
+    for &event in routes_in {
+        let to = (event + seconds(ROUTE_IN_CLEAR)).min(frames);
+        for flag in steady.iter_mut().take(to).skip(event) {
             *flag = false;
         }
     }
@@ -455,11 +678,11 @@ fn analyse(recording: &Channels, start: usize, events: &[usize]) -> Analysis {
     let tone = median(&mut steady_steps).unwrap_or(0.0);
     let dipped = tone * 10_f64.powf(-DIP_DB / 20.0);
 
-    let events = events
+    let events = windows
         .iter()
-        .map(|&event| {
-            let from = event.saturating_sub(seconds(WINDOW.0));
-            let to = (event + seconds(WINDOW.1)).min(frames);
+        .map(|window| {
+            let (event, from) = (window.at, window.from);
+            let to = window.to.min(frames).max(from);
             let (at, worst) = residual
                 .get(from..to)
                 .unwrap_or_default()
@@ -473,7 +696,7 @@ fn analyse(recording: &Channels, start: usize, events: &[usize]) -> Analysis {
                     }
                 });
             let first = from / LEVEL_STEP;
-            let last = ((event + seconds(DIP_AFTER)) / LEVEL_STEP).min(steps.len());
+            let last = (window.dip_to / LEVEL_STEP).min(steps.len()).max(first);
             let longest = steps
                 .get(first..last)
                 .unwrap_or_default()
@@ -496,6 +719,14 @@ fn analyse(recording: &Channels, start: usize, events: &[usize]) -> Analysis {
         tone_dbfs: dbfs(tone),
         events,
     }
+}
+
+/// How far above the tone's steady level row `row`'s worst residual is, in dB. A cut in the middle
+/// of the wave is as loud as the wave it cuts, so this is what a click is worth whatever gain the
+/// tone was played at: FxSound's chain plays the speakers' tone 11 dB above the bare one, and
+/// every click on its way with it.
+fn above_the_tone(analysis: &Analysis, row: usize) -> f64 {
+    analysis.events[row].worst_dbfs - analysis.tone_dbfs
 }
 
 /// The median of `values`, sorted in place; the mean of the middle two of an even count. `None`
@@ -548,7 +779,7 @@ fn errors_between(before: &[(String, u64)], after: &[(String, u64)]) -> u64 {
 
 /// What a loud switch does ([`GATE_MODE`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gate {
+pub(super) enum Gate {
     /// A gated switch at [`HARD_GATE_DBFS`] or louder fails the test.
     Hard,
     /// Nothing fails for loudness; a switch at [`SOFT_GATE_DBFS`] or louder is a warning.
@@ -558,7 +789,7 @@ enum Gate {
 impl Gate {
     /// The mode the environment asks for: [`GATE_MODE`] when it is set, [`Gate::Report`] under
     /// CI, [`Gate::Hard`] otherwise.
-    fn from_env() -> Self {
+    pub(super) fn from_env() -> Self {
         Self::of(
             std::env::var(GATE_MODE).ok().as_deref(),
             std::env::var("CI").ok().as_deref(),
@@ -616,6 +847,10 @@ enum Switch {
     /// — the configured keys of the `default` metadata: the other devices when `true`, the first
     /// ones again when `false`.
     Desktop(bool),
+    /// «Like FxSound for Windows» moved to a level: the music snapshot the app publishes at it
+    /// (`App::set_windows_parity`), to the speakers' lane and to the applications' output routes
+    /// alike, which play the Windows build's DSP from Interface and sound on.
+    Parity(WindowsParity, Box<DspParams>),
 }
 
 impl Switch {
@@ -629,6 +864,7 @@ impl Switch {
             Self::Route(false) => "route off".to_owned(),
             Self::Device(other) => format!("FxSound picks {}", lane_devices(*other).join(", ")),
             Self::Desktop(other) => format!("desktop picks {}", lane_devices(*other).join(", ")),
+            Self::Parity(level, _) => format!("like Windows: {}", level.key()),
         }
     }
 }
@@ -672,7 +908,83 @@ struct Scenario {
     /// both sinks' monitors, both microphones fed the same tone. For the switches that move a lane
     /// or a stream from one device to the other.
     both_devices: bool,
+    /// Switches made before the tone starts, and not measured: the levels a scenario plays at,
+    /// a route of their own for the tone's player and recorder ([`Switch::Route`]), which they
+    /// then start on, so that nothing moves them during the run.
+    before: Vec<Switch>,
+    /// What a gated scenario holds its switches to beside the gate, where it holds them to more.
+    budget: Option<Budget>,
+    /// Whether the tone's player and the microphone's recorder are PulseAudio applications —
+    /// `pacat` through the graph's own `pipewire-pulse` ([`PolicyGraph::start_pulse`]) — rather
+    /// than `pw-cat` and `pw-record`. The recorders at the sinks' monitors stand for the devices,
+    /// and stay `pw-record`.
+    pulse: bool,
+    /// Whether FxSound takes each lane's default back after each switch — the desktop's pick with
+    /// FxSound on — so that each switch is two moves, WirePlumber's and then FxSound's, and is read
+    /// as two rows ([`Window::split`]): the first from the switch to the moment FxSound begins its
+    /// claim (its [`AudioToUi::RememberedDefault`]), reported; FxSound's from then on, held to the
+    /// gate when the scenario is `gated`.
+    claims: bool,
+    /// Whether the graph's WirePlumber runs FxSound's hook ([`crate::wireplumber_hook`]), which
+    /// fades the streams it moves itself: then WirePlumber's move after a desktop pick is held to
+    /// the gate too ([`Self::rows`]).
+    hook: bool,
+    /// Whether FxSound ranks the graph's devices, the first ones of each direction above the
+    /// others ([`UiToAudio::SetDevicePriority`]), as the app has it unless *Follow the system's
+    /// default device* is ticked; otherwise the engine follows the system's default, as it does
+    /// until the app ranks its devices.
+    ranked: bool,
 }
+
+impl Scenario {
+    /// The rows of each lane's table, in order, and whether each is held to the gate: one per
+    /// switch, or two for a scenario whose switches FxSound follows with a claim
+    /// ([`Self::claims`]).
+    fn rows(&self) -> Vec<(String, bool)> {
+        self.switches
+            .iter()
+            .flat_map(|switch| {
+                let label = switch.label();
+                if self.claims {
+                    vec![
+                        (format!("{label}: the move"), self.gated && self.hook),
+                        (format!("{label}: FxSound's claim"), self.gated),
+                    ]
+                } else {
+                    vec![(label, self.gated)]
+                }
+            })
+            .collect()
+    }
+}
+
+/// What a switch that moves streams, and fades them to do it, is held to beside the gate (roadmap
+/// §7, test 1): the gap it leaves in the tone and the steady state around it, and how many of its
+/// switches may go over the gate run by run.
+#[derive(Debug, Clone, Copy)]
+struct Budget {
+    /// The longest a switch may leave the tone dipped ([`EventResult::dip_ms`]): the fade, the
+    /// move, the new link and the fade back.
+    dip: Duration,
+    /// The loudest the steady state may be ([`Analysis::floor_dbfs`]): a handover that left a
+    /// stream somewhere it should not be, or at a volume it should not have, shows here.
+    floor_dbfs: f64,
+    /// How many switches of all the clean runs of a pass may each go over the gate, the median
+    /// aside, before the pass fails. Every one is listed in a warning. One: PipeWire's converter
+    /// plays a quantum at the new volume before the ramp to it now and then, a race FxSound can
+    /// make rarer and cannot end (`crate::stream_handover::RAMP_STEP_SAMPLES`) — measured at two
+    /// recorder switches in 160; a handover that goes wrong on its own leaves more than one.
+    loud_runs: usize,
+}
+
+/// The moves FxSound makes itself — the power switch's and a route's (D2), a device FxSound picks
+/// and the default it takes back after the desktop's pick (D3): a gap of a tenth of a second or so
+/// instead of the click, and a steady state as quiet as FxSound's own.
+const HANDOVER_BUDGET: Budget = Budget {
+    dip: Duration::from_millis(200),
+    floor_dbfs: -90.0,
+    loud_runs: 1,
+};
 
 /// A recorder of the bench: `pw-record` writing raw stereo `f32` into the graph's directory.
 struct Tap {
@@ -742,12 +1054,19 @@ struct Bench {
     chain: String,
     /// The last status each lane reported, in [`DeviceDirection::ALL`]'s order.
     status: [AudioStatus; 2],
+    /// Whether the tone's player and recorder have routes of their own ([`Switch::Route`]).
+    routed: bool,
 }
 
 impl Bench {
-    /// `None` when the graph could not run here (a skip, said by [`PolicyGraph::start`]).
-    fn start(tag: &str) -> Option<Self> {
-        let graph = PolicyGraph::start(tag)?;
+    /// `None` when the graph could not run here (a skip, said by [`PolicyGraph::start`]). With
+    /// FxSound's `hook` in the graph's WirePlumber, or without it.
+    fn start(tag: &str, hook: bool) -> Option<Self> {
+        let graph = if hook {
+            PolicyGraph::start_with_the_hook(tag)?
+        } else {
+            PolicyGraph::start(tag)?
+        };
         let engine =
             AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
         let mut said = Transcript::default();
@@ -771,6 +1090,7 @@ impl Bench {
             voice: e6_voice(true).to_params(),
             chain: e6_voice(true).chain,
             status: [AudioStatus::default(); 2],
+            routed: false,
         };
         bench.engine.set_params(bench.music);
         bench.engine.set_input_params(bench.voice);
@@ -818,35 +1138,20 @@ impl Bench {
                 self.engine.send(UiToAudio::SetInputChain(chain.clone()));
             }
             Switch::Route(on) => {
-                let rule = |name: &str, direction, params, chain: &str| AppRoute {
-                    direction,
-                    app: AppKey {
-                        name: name.to_owned(),
-                        ..AppKey::default()
-                    },
-                    preset: "Clicks".to_owned(),
-                    params,
-                    chain: chain.to_owned(),
+                self.routed = *on;
+                self.send_routes();
+            }
+            Switch::Parity(_, params) => {
+                self.music = DspParams {
+                    power: self.music.power,
+                    ..**params
                 };
-                let rules = if *on {
-                    vec![
-                        rule(
-                            "t_player",
-                            DeviceDirection::Output,
-                            RouteParams::Output(self.music),
-                            "",
-                        ),
-                        rule(
-                            "t_recorder",
-                            DeviceDirection::Input,
-                            RouteParams::Input(self.voice),
-                            &self.chain,
-                        ),
-                    ]
-                } else {
-                    Vec::new()
-                };
-                self.engine.send(UiToAudio::SetAppRoutes(rules));
+                self.engine.set_params(self.music);
+                // The routes share the lane's levels and follow its snapshot
+                // (`App::refresh_app_routes`): their parameters are written in place.
+                if self.routed {
+                    self.send_routes();
+                }
             }
             Switch::Device(other) => {
                 for (direction, node_name) in
@@ -871,23 +1176,93 @@ impl Bench {
         }
     }
 
-    /// Write a tone into the graph's directory as a Sun AU file of 32-bit floats: `seconds` long,
-    /// with 20 ms raised-cosine fades at both ends, the same on every channel.
+    /// Whether the tone's player is linked into one of FxSound's route nodes, within the
+    /// patience: what a scenario that gives it a route of its own is measuring through.
+    fn player_plays_through_a_route(&self) -> bool {
+        let deadline = Instant::now() + PATIENCE;
+        while Instant::now() < deadline {
+            let player = self.graph.node_id("t_player");
+            let routes: Vec<u64> = self
+                .graph
+                .dump()
+                .unwrap_or_default()
+                .iter()
+                .filter(|object| {
+                    object["type"].as_str() == Some("PipeWire:Interface:Node")
+                        && object["info"]["props"]["node.name"]
+                            .as_str()
+                            .is_some_and(|name| name.starts_with(crate::ROUTE_NODE_PREFIX))
+                })
+                .filter_map(|object| object["id"].as_u64())
+                .collect();
+            if let Some(player) = player
+                && routes
+                    .iter()
+                    .any(|route| self.graph.linked(player, *route) == Some(true))
+            {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// The rules the app sends for the tone's player and recorder: a preset of their own with
+    /// the lanes' own snapshots while [`Bench::routed`], none otherwise.
+    fn send_routes(&mut self) {
+        let rule = |name: &str, direction, params, chain: &str| AppRoute {
+            direction,
+            app: AppKey {
+                name: name.to_owned(),
+                ..AppKey::default()
+            },
+            preset: "Clicks".to_owned(),
+            params,
+            chain: chain.to_owned(),
+        };
+        let rules = if self.routed {
+            vec![
+                rule(
+                    "t_player",
+                    DeviceDirection::Output,
+                    RouteParams::Output(self.music),
+                    "",
+                ),
+                rule(
+                    "t_recorder",
+                    DeviceDirection::Input,
+                    RouteParams::Input(self.voice),
+                    &self.chain,
+                ),
+            ]
+        } else {
+            Vec::new()
+        };
+        self.engine.send(UiToAudio::SetAppRoutes(rules));
+    }
+
+    /// Write a tone into the graph's directory as a Sun AU file of 32-bit floats, for `pw-cat`,
+    /// or as raw little-endian ones, for `pacat` (`raw`): `seconds` long, with 20 ms raised-cosine
+    /// fades at both ends, the same on every channel.
     fn tone_file(
         &self,
         name: &str,
         (hz, level): (f64, f64),
         channels: usize,
         seconds: f64,
+        raw: bool,
     ) -> PathBuf {
         const AU_FLOAT: u32 = 6;
         let frames = (seconds * RATE as f64) as usize;
         let fade = RATE / 50;
         let amplitude = 10_f64.powf(level / 20.0);
         let data = u32::try_from(frames * channels * 4).expect("a tone of minutes at most");
-        let mut bytes = b".snd".to_vec();
-        for word in [24, data, AU_FLOAT, RATE as u32, channels as u32] {
-            bytes.extend_from_slice(&word.to_be_bytes());
+        let mut bytes = Vec::new();
+        if !raw {
+            bytes.extend_from_slice(b".snd");
+            for word in [24, data, AU_FLOAT, RATE as u32, channels as u32] {
+                bytes.extend_from_slice(&word.to_be_bytes());
+            }
         }
         for n in 0..frames {
             let edge = n.min(frames - 1 - n);
@@ -899,10 +1274,17 @@ impl Bench {
             let phase = 2.0 * std::f64::consts::PI * hz * n as f64 / RATE as f64;
             let sample = (amplitude * gain * phase.sin()) as f32;
             for _ in 0..channels {
-                bytes.extend_from_slice(&sample.to_be_bytes());
+                if raw {
+                    bytes.extend_from_slice(&sample.to_le_bytes());
+                } else {
+                    bytes.extend_from_slice(&sample.to_be_bytes());
+                }
             }
         }
-        let file = self.graph.dir.join(format!("{name}.au"));
+        let file = self
+            .graph
+            .dir
+            .join(format!("{name}.{}", if raw { "raw" } else { "au" }));
         std::fs::write(&file, bytes).expect("the graph's directory is ours");
         file
     }
@@ -951,10 +1333,14 @@ impl Bench {
     }
 
     /// `pw-record` as `name`, kept on `target` — the monitor of a sink when `monitor` — or following
-    /// the default source when there is no target.
-    fn record(&self, name: &str, target: Option<&str>, monitor: bool) -> Option<Tap> {
+    /// the default source when there is no target: then `pacat` instead when `pulse`.
+    fn record(&self, name: &str, target: Option<&str>, monitor: bool, pulse: bool) -> Option<Tap> {
         let Some(target) = target else {
-            let (child, file) = self.graph.follow_default_recorder(name)?;
+            let (child, file) = if pulse {
+                self.graph.pulse_recorder(name)?
+            } else {
+                self.graph.follow_default_recorder(name)?
+            };
             return Some(Tap {
                 _child: child,
                 file,
@@ -1028,6 +1414,38 @@ impl Bench {
             .map(|status| status.underrun_frames + status.dropped_frames + status.resyncs)
     }
 
+    /// Wait until FxSound has begun to take the default of every lane of `lanes` back after a
+    /// switch — its [`AudioToUi::RememberedDefault`] for the lane, said as the claim begins — and
+    /// note how much each lane's first recorder had written by then ([`Lane::claims`]).
+    fn mark_claims(&mut self, lanes: &mut [Lane], title: &str) {
+        let deadline = Instant::now() + CLAIM_PATIENCE;
+        let mut waiting: Vec<DeviceDirection> = lanes.iter().map(|lane| lane.direction).collect();
+        while !waiting.is_empty() && Instant::now() < deadline {
+            while let Some(message) = self.engine.try_recv() {
+                match message {
+                    AudioToUi::Status { direction, status } => {
+                        self.status[lane_of(direction)] = status;
+                    }
+                    AudioToUi::RememberedDefault { direction, .. } => {
+                        waiting.retain(|waits| *waits != direction);
+                        if let Some(lane) =
+                            lanes.iter_mut().find(|lane| lane.direction == direction)
+                            && let Some((tap, _)) = lane.taps.first()
+                        {
+                            lane.claims.push(tap.frames());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            waiting.is_empty(),
+            "{title}: FxSound never took the default back for {waiting:?}"
+        );
+    }
+
     /// Every node's error count now; `None` when `pw-top` gave no answer.
     fn node_errors(&self) -> Option<Vec<(String, u64)>> {
         self.graph
@@ -1098,33 +1516,33 @@ Band 2\n   115.734: CF\n   9: Boost/Cut\nBand 3\n   250: CF\n   2: Boost/Cut\nBa
    -1: Boost/Cut\nBand 9\n   8640.48: CF\n   0: Boost/Cut\nBand 10\n   13800: CF\n   2: Boost/Cut\n";
 
 /// The snapshot the app publishes for a music preset on the default ladder with the default
-/// levels: `music_controls` and `write_music_params` of `fxsound-app`.
+/// levels: `fxsound_dsp::preset::preset_params`, the one path from a preset to its snapshot.
 fn music_params(preset: &Preset) -> DspParams {
-    let mut params = DspParams::default();
-    for effect in Effect::ALL {
-        let slider = scale::value_to_slider_for(effect, preset.effect(effect));
-        params.set_effect(effect, scale::slider_to_value_for(effect, slider));
+    fxsound_dsp::preset::preset_params(
+        preset,
+        &fxsound_dsp::preset::ladder(eq::DEFAULT_BANDS),
+        fxsound_dsp::preset::MusicLevels::default(),
+    )
+}
+
+/// «Like FxSound for Windows» moved to `level` with E6a's music preset playing: the snapshot the
+/// app publishes for it there (`App::set_windows_parity`, [`fxsound_dsp::preset::MusicLevels`]),
+/// at −6 dB of master gain and +4 dB of balance — the levels the W1c live check heard the switch
+/// click at, −39.4 dBFS on the way to Interface and sound and −25.1 on the way back
+/// (`docs/0.5.0-dsp-inventory.md`).
+fn to_parity(level: WindowsParity) -> Switch {
+    let levels = fxsound_dsp::preset::MusicLevels {
+        master_gain_db: -6.0,
+        balance_db: 4.0,
+        ..fxsound_dsp::preset::MusicLevels::default()
     }
-    let ladder = eq::DEFAULT_CENTERS_HZ;
-    let mut bands = preset.eq_bands.clone();
-    eq::move_off_the_windows_twenty_band_ladder(&mut bands);
-    let centres: Vec<f32> = bands.iter().map(|band| band.center_hz).collect();
-    let gains: Vec<f32> = bands.iter().map(|band| band.boost_db).collect();
-    let fitted = if bands.len() == ladder.len() {
-        bands
-    } else {
-        fxsound_dsp::eq::fit_preset_gains(&centres, &gains, &ladder)
-            .into_iter()
-            .zip(ladder)
-            .map(|(boost_db, center_hz)| EqBand {
-                center_hz,
-                boost_db,
-            })
-            .collect()
-    };
-    params.eq_on = preset.eq_on || preset.eq_bands.is_empty();
-    params.set_bands(&fitted);
-    params
+    .with_windows_dsp(DspCompat::for_level(level).windows());
+    let params = fxsound_dsp::preset::preset_params(
+        &e6_music(true),
+        &levels.ladder(eq::DEFAULT_BANDS),
+        levels,
+    );
+    Switch::Parity(level, Box::new(params))
 }
 
 /// A shipped preset's file.
@@ -1169,6 +1587,9 @@ fn lane_of(direction: DeviceDirection) -> usize {
 struct Lane {
     direction: DeviceDirection,
     taps: Vec<(Tap, Vec<usize>)>,
+    /// How much the first recorder had written when FxSound began to take the lane's default back
+    /// after each switch ([`Scenario::claims`]).
+    claims: Vec<usize>,
 }
 
 /// One run of a scenario: each lane's recording read, in the scenario's order of lanes, and
@@ -1179,11 +1600,16 @@ struct Run {
     /// The frames each lane's ring came up short or overflowed by, and its resyncs, in
     /// [`DeviceDirection::ALL`]'s order.
     ring: [u64; 2],
+    /// A scenario of the desktop's picks with FxSound on ([`Scenario::claims`]), heard on both
+    /// speakers: each pick's WirePlumber's move read at the monitor of the speakers FxSound had
+    /// played through before it alone, the loudest high-passed sample in dBFS
+    /// ([`left_behind`]). Empty for any other scenario.
+    left_behind: Vec<f64>,
 }
 
 /// Run `scenario` once on a fresh bench. `None` when it cannot run here.
 fn run_once(scenario: &Scenario) -> Option<Run> {
-    let mut bench = Bench::start(scenario.tag)?;
+    let mut bench = Bench::start(scenario.tag, scenario.hook)?;
     for tool in ["pw-cat", "pw-record", "pw-dump", "pw-link", "pw-metadata"] {
         if !installed(tool) {
             skip(&format!(
@@ -1193,9 +1619,27 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
             return None;
         }
     }
+    if scenario.pulse && !bench.graph.start_pulse() {
+        return None;
+    }
     // Longer than the run by far: the tone must not end inside what is read.
     let length = 15.0 + scenario.spacing.as_secs_f64() * (scenario.switches.len() + 1) as f64;
     let pinned = scenario.streams == Streams::Pinned;
+    if scenario.ranked {
+        for (lane, direction) in DeviceDirection::ALL.into_iter().enumerate() {
+            bench.engine.send(UiToAudio::SetDevicePriority {
+                direction,
+                names: [false, true]
+                    .map(|other| lane_devices(other)[lane].to_owned())
+                    .to_vec(),
+                new_devices_first: false,
+            });
+        }
+    }
+    // Before any stream exists, so that a route is where the player and the recorder start.
+    for switch in &scenario.before {
+        bench.act(switch);
+    }
     if scenario.off {
         bench.act(&Switch::Power(false));
         for (direction, device) in DeviceDirection::ALL.into_iter().zip(lane_devices(false)) {
@@ -1221,28 +1665,55 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
     for &direction in scenario.lanes {
         let taps = match direction {
             DeviceDirection::Output => {
-                let tone = bench.tone_file("t_tone", OUTPUT_TONE, 2, length);
+                let tone = bench.tone_file("t_tone", OUTPUT_TONE, 2, length, scenario.pulse);
                 let target = pinned.then_some(SINK_NODE_NAME);
-                let player = bench.play("t_player", &tone, target, "");
+                let player = if scenario.pulse {
+                    bench.graph.pulse_player("t_player", Some(&tone))
+                } else {
+                    bench.play("t_player", &tone, target, "")
+                };
                 streams.push(player.expect("the tone plays"));
-                let at = |sink: &str| bench.record(&format!("t_monitor_{sink}"), Some(sink), true);
+                let at = |sink: &str| {
+                    bench.record(&format!("t_monitor_{sink}"), Some(sink), true, false)
+                };
                 speakers.iter().map(|sink| at(sink)).collect::<Vec<_>>()
             }
             DeviceDirection::Input => {
-                let tone = bench.tone_file("t_voice", INPUT_TONE, 1, length);
+                let tone = bench.tone_file("t_voice", INPUT_TONE, 1, length, false);
                 streams.push(
                     bench
                         .feed_the_microphone(&tone, &microphones)
                         .expect("the microphone is fed"),
                 );
-                vec![bench.record("t_recorder", pinned.then_some(SOURCE_NODE_NAME), false)]
+                vec![bench.record(
+                    "t_recorder",
+                    pinned.then_some(SOURCE_NODE_NAME),
+                    false,
+                    scenario.pulse,
+                )]
             }
         };
         let taps = taps
             .into_iter()
             .map(|tap| (tap.expect("the recorder records"), Vec::new()))
             .collect();
-        lanes.push(Lane { direction, taps });
+        lanes.push(Lane {
+            direction,
+            taps,
+            claims: Vec::new(),
+        });
+    }
+    if scenario
+        .before
+        .iter()
+        .any(|switch| matches!(switch, Switch::Route(true)))
+        && scenario.lanes.contains(&DeviceDirection::Output)
+    {
+        assert!(
+            bench.player_plays_through_a_route(),
+            "{}: the tone's player never reached its route",
+            scenario.title
+        );
     }
     for lane in &lanes {
         assert!(
@@ -1270,6 +1741,9 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
         std::thread::sleep(due.saturating_duration_since(Instant::now()));
         mark(&mut lanes);
         bench.act(switch);
+        if scenario.claims {
+            bench.mark_claims(&mut lanes, scenario.title);
+        }
     }
     std::thread::sleep(scenario.spacing.max(Duration::from_millis(2_200)));
     let ends: Vec<Vec<usize>> = lanes
@@ -1292,6 +1766,7 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
         "the private WirePlumber went away"
     );
     drop(streams);
+    let mut left_behind = Vec::new();
     let lanes = lanes
         .iter()
         .zip(ends)
@@ -1303,11 +1778,77 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
                 .map(|((tap, frames), end)| (tap.read_until(end), frames.clone()))
                 .collect();
             let (recording, frames) = joined(recordings);
-            analyse(&recording, frames[0], &frames[1..])
+            if scenario.claims {
+                let windows: Vec<Window> = frames[1..]
+                    .iter()
+                    .zip(&lane.claims)
+                    .flat_map(|(&at, &then)| Window::split(at, then))
+                    .collect();
+                let clear: Vec<usize> = frames[1..].iter().chain(&lane.claims).copied().collect();
+                if lane.direction == DeviceDirection::Output && scenario.both_devices {
+                    left_behind = speakers_left_behind(scenario, &recording, &frames, &windows);
+                }
+                analyse_windows(&recording, frames[0], &windows, &clear, &[])
+            } else {
+                let switches = &frames[1..];
+                let windows: Vec<Window> = switches.iter().map(|&at| Window::around(at)).collect();
+                let routes_in: Vec<usize> = scenario
+                    .switches
+                    .iter()
+                    .zip(switches)
+                    .filter(|(switch, _)| matches!(switch, Switch::Route(true)))
+                    .map(|(_, &at)| at)
+                    .collect();
+                analyse_windows(&recording, frames[0], &windows, switches, &routes_in)
+            }
         })
         .collect();
     bench.engine.shutdown();
-    Some(Run { lanes, xruns, ring })
+    Some(Run {
+        lanes,
+        xruns,
+        ring,
+        left_behind,
+    })
+}
+
+/// Each desktop pick's WirePlumber's move — the first of its two rows ([`Window::split`]) — read
+/// at the monitor of the speakers FxSound had played through before it alone, out of a speakers'
+/// lane `recording` [`joined`] from both monitors, each one's two channels in the order of
+/// [`lane_devices`]: the loudest high-passed sample in dBFS, pick by pick. What is heard there is
+/// the end of the sound FxSound's chain played, cut off by the move ([`left_behind`]).
+fn speakers_left_behind(
+    scenario: &Scenario,
+    recording: &Channels,
+    frames: &[usize],
+    windows: &[Window],
+) -> Vec<f64> {
+    let speakers = [lane_devices(false)[0], lane_devices(true)[0]];
+    let monitors: Vec<Analysis> = (0..speakers.len())
+        .map(|monitor| {
+            let channels = recording
+                .iter()
+                .skip(monitor * Tap::CHANNELS)
+                .take(Tap::CHANNELS)
+                .cloned()
+                .collect();
+            analyse_windows(&channels, frames[0], windows, &frames[1..], &[])
+        })
+        .collect();
+    scenario
+        .switches
+        .iter()
+        .enumerate()
+        .filter_map(|(n, switch)| {
+            let Switch::Desktop(other) = switch else {
+                return None;
+            };
+            // Before the pick of the `other` devices, FxSound played through the first ones.
+            let before = lane_devices(!other)[0];
+            let monitor = speakers.iter().position(|sink| *sink == before)?;
+            Some(monitors.get(monitor)?.events.get(2 * n)?.worst_dbfs)
+        })
+        .collect()
 }
 
 /// A scenario's result: the median of its clean runs.
@@ -1316,9 +1857,15 @@ struct Report {
     failures: Vec<String>,
 }
 
-/// Run `scenario` until [`REPEATS`] runs are clean or [`ATTEMPTS`] have been made, and report
-/// the median of the clean ones. `None` when it cannot run here.
-fn measure(scenario: &Scenario, gate: Gate) -> Option<Report> {
+/// A scenario's runs: the clean ones, and the xruns of each one discarded.
+struct Measured {
+    clean: Vec<Run>,
+    discarded: Vec<u64>,
+}
+
+/// Run `scenario` until [`REPEATS`] runs are clean or [`ATTEMPTS`] have been made. `None` when it
+/// cannot run here.
+fn measure(scenario: &Scenario) -> Option<Measured> {
     let mut clean = Vec::new();
     let mut discarded = Vec::new();
     for _ in 0..ATTEMPTS {
@@ -1331,7 +1878,7 @@ fn measure(scenario: &Scenario, gate: Gate) -> Option<Report> {
             _ => clean.push(run),
         }
     }
-    Some(report(scenario, gate, &clean, &discarded))
+    Some(Measured { clean, discarded })
 }
 
 /// The table for `scenario` from its `clean` runs, with a line on the `discarded` ones, and every
@@ -1364,6 +1911,8 @@ fn report(scenario: &Scenario, gate: Gate, clean: &[Run], discarded: &[u64]) -> 
     if clean.iter().any(|run| run.xruns.is_none()) {
         let _ = writeln!(text, "(xruns were not counted: pw-top gave no answer)");
     }
+    // The runs of a handover's scenario whose switch went over the gate, whatever the median says.
+    let mut over: Vec<String> = Vec::new();
     for (lane, direction) in scenario.lanes.iter().enumerate() {
         let (hz, level) = match direction {
             DeviceDirection::Output => OUTPUT_TONE,
@@ -1424,6 +1973,20 @@ fn report(scenario: &Scenario, gate: Gate, clean: &[Run], discarded: &[u64]) -> 
                 "FxSound's ring came up short or overflowed by {ring:?} frames in the runs"
             );
         }
+        if let Some(budget) = scenario.budget.filter(|_| scenario.gated)
+            && floor > budget.floor_dbfs
+        {
+            let line = format!(
+                "{} ({}): the steady state, {floor:.1} dBFS, is over {:.1} dBFS",
+                scenario.title,
+                direction.key(),
+                budget.floor_dbfs
+            );
+            let _ = writeln!(text, "WARNING: {line}");
+            if gate == Gate::Hard {
+                failures.push(line);
+            }
+        }
         if floor >= FLOOR_LIMIT_DBFS && scenario.gated {
             let line = format!(
                 "{} ({}): the floor, {floor:.1} dBFS, is too high to tell a click",
@@ -1435,7 +1998,8 @@ fn report(scenario: &Scenario, gate: Gate, clean: &[Run], discarded: &[u64]) -> 
                 failures.push(line);
             }
         }
-        for (n, switch) in scenario.switches.iter().enumerate() {
+        for (n, (label, gated)) in scenario.rows().iter().enumerate() {
+            let gated = *gated;
             let worst = pick(&|analysis| analysis.events[n].worst_dbfs);
             let at = pick(&|analysis| analysis.events[n].at_s);
             let dip = pick(&|analysis| analysis.events[n].dip_ms);
@@ -1443,22 +2007,222 @@ fn report(scenario: &Scenario, gate: Gate, clean: &[Run], discarded: &[u64]) -> 
                 .iter()
                 .map(|run| run.lanes[lane].events[n].worst_dbfs)
                 .fold(f64::NEG_INFINITY, f64::max);
-            let (mark, fails) = gate.judge(worst, scenario.gated);
+            let (mark, fails) = gate.judge(worst, gated);
             let _ = writeln!(
                 text,
-                "  {:<32} worst {worst:6.1} dBFS (loudest run {loudest:6.1}) at {at:+.3} s  \
-                 dip {dip:4.0} ms  {mark}",
-                switch.label()
+                "  {label:<32} worst {worst:6.1} dBFS (loudest run {loudest:6.1}) at {at:+.3} s  \
+                 dip {dip:4.0} ms  {mark}"
             );
             if fails {
                 failures.push(format!(
-                    "{} ({}): {} left {worst:.1} dBFS, over {HARD_GATE_DBFS} dBFS",
+                    "{} ({}): {label} left {worst:.1} dBFS, over {HARD_GATE_DBFS} dBFS",
                     scenario.title,
                     direction.key(),
-                    switch.label()
                 ));
             }
+            // A handover's switches are counted run by run too: the median hides a run in
+            // twenty, and a run in twenty is a click a user hears (`Budget::loud_runs`).
+            if scenario.budget.is_some() && gated {
+                for (number, run) in clean.iter().enumerate() {
+                    let value = run.lanes[lane].events[n].worst_dbfs;
+                    if value >= HARD_GATE_DBFS {
+                        over.push(format!(
+                            "{} {label} in run {} at {value:.1} dBFS",
+                            direction.key(),
+                            number + 1
+                        ));
+                    }
+                }
+            }
+            if let Some(budget) = scenario.budget.filter(|_| gated)
+                && dip > budget.dip.as_secs_f64() * 1000.0
+            {
+                let line = format!(
+                    "{} ({}): {label} left the tone dipped for {dip:.0} ms, over {} ms",
+                    scenario.title,
+                    direction.key(),
+                    budget.dip.as_millis()
+                );
+                let _ = writeln!(text, "    WARNING: {line}");
+                if gate == Gate::Hard {
+                    failures.push(line);
+                }
+            }
         }
+    }
+    if let Some(budget) = scenario.budget.filter(|_| !over.is_empty()) {
+        let switches = clean.len() * scenario.lanes.len() * scenario.switches.len();
+        // (A scenario read in two rows a switch counts only FxSound's, the gated one.)
+        let line = format!(
+            "{}: {} of {switches} switches over {HARD_GATE_DBFS} dBFS, run by run: {}",
+            scenario.title,
+            over.len(),
+            over.join("; ")
+        );
+        let _ = writeln!(text, "WARNING: {line}");
+        if gate == Gate::Hard && over.len() > budget.loud_runs {
+            failures.push(line);
+        }
+    }
+    Report { text, failures }
+}
+
+/// Hold WirePlumber's move after each desktop pick with FxSound on — the ungated rows of a
+/// scenario that `claims` ([`Scenario::rows`]) — to plain Linux + [`BARE_MARGIN_DB`], lane by lane
+/// (roadmap 0.5.0 §7, test 4): the loudest of all the `clean` runs' moves against the loudest of
+/// all the `bare` runs' switches of the same scenario with FxSound off, both read above the tone
+/// ([`above_the_tone`]). The text for the table, and what the gate fails.
+fn against_bare_linux(
+    scenario: &Scenario,
+    gate: Gate,
+    clean: &[Run],
+    bare: &Scenario,
+    bare_clean: &[Run],
+) -> Report {
+    let mut text = String::new();
+    let mut failures = Vec::new();
+    let moves: Vec<usize> = scenario
+        .rows()
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, gated))| !gated)
+        .map(|(n, _)| n)
+        .collect();
+    let loudest = |runs: &[Run], lane: usize, rows: &[usize]| {
+        runs.iter()
+            .flat_map(|run| {
+                rows.iter()
+                    .map(|&row| above_the_tone(&run.lanes[lane], row))
+            })
+            .fold(None, |max: Option<f64>, value| {
+                Some(max.map_or(value, |max| max.max(value)))
+            })
+    };
+    for (lane, direction) in scenario.lanes.iter().enumerate() {
+        let Some(bare_lane) = bare.lanes.iter().position(|other| other == direction) else {
+            continue;
+        };
+        let bare_rows: Vec<usize> = (0..bare.rows().len()).collect();
+        let (Some(on), Some(off)) = (
+            loudest(clean, lane, &moves),
+            loudest(bare_clean, bare_lane, &bare_rows),
+        ) else {
+            let line = format!(
+                "{} ({}): no clean run to hold WirePlumber's move to plain Linux + \
+                 {BARE_MARGIN_DB} dB",
+                scenario.title,
+                direction.key()
+            );
+            let _ = writeln!(text, "WARNING: {line}");
+            if gate == Gate::Hard {
+                failures.push(line);
+            }
+            continue;
+        };
+        let held = off + BARE_MARGIN_DB;
+        let _ = writeln!(
+            text,
+            "## {}: WirePlumber's move, above the tone: loudest run {on:+.1} dB; plain Linux \
+             ({}) {off:+.1} dB; held to {held:+.1} dB  {}",
+            direction.key(),
+            bare.title,
+            if on <= held { "ok" } else { "LOUD" }
+        );
+        if on > held {
+            let line = format!(
+                "{} ({}): WirePlumber's move left {on:+.1} dB above the tone, over plain Linux's \
+                 {off:+.1} + {BARE_MARGIN_DB} dB",
+                scenario.title,
+                direction.key()
+            );
+            let _ = writeln!(text, "WARNING: {line}");
+            if gate == Gate::Hard {
+                failures.push(line);
+            }
+        }
+    }
+    Report { text, failures }
+}
+
+/// How many of a pass's picks may leave [`HARD_GATE_DBFS`] or more at the speakers FxSound played
+/// through, of all the clean runs, before [`left_behind`] fails it: a quarter. Now and then the
+/// monitor's recorder skips a few milliseconds of the fade downstream of FxSound, whose own blocks
+/// were played whole, and jumps into it — 8 picks in 144 over twelve passes at D4, six of them the
+/// third, at −8.4 to −16.3 dBFS — which its recording cannot tell from a sound FxSound left cut
+/// off. Without the fade every pick is one (roadmap 0.5.0 §7, D4).
+const SKIPPED_FADES: f64 = 0.25;
+
+/// Hold what WirePlumber's move after each desktop pick with FxSound on leaves on the speakers
+/// FxSound had played through ([`Run::left_behind`]) to the gate, run by run: since D4 the end of
+/// the sound the move cut off in FxSound's chain fades there (`crate::engine`, "A sound cut off"),
+/// and what is left of the move is the application arriving on the picked speakers, unprocessed,
+/// as in plain Linux ([`against_bare_linux`]). Every pick over the gate is listed; more than
+/// [`SKIPPED_FADES`] of them fail the pass. The text for the table, and what the gate fails.
+fn left_behind(scenario: &Scenario, gate: Gate, clean: &[Run]) -> Report {
+    let mut text = String::new();
+    let mut failures = Vec::new();
+    let picks: Vec<(usize, usize, f64)> = clean
+        .iter()
+        .enumerate()
+        .flat_map(|(run, measured)| {
+            measured
+                .left_behind
+                .iter()
+                .enumerate()
+                .map(move |(pick, &worst)| (run, pick, worst))
+        })
+        .collect();
+    let labels: Vec<String> = scenario.switches.iter().map(Switch::label).collect();
+    if picks.is_empty() {
+        let line = format!(
+            "{}: no clean run read the speakers FxSound played through",
+            scenario.title
+        );
+        let _ = writeln!(text, "WARNING: {line}");
+        if gate == Gate::Hard {
+            failures.push(line);
+        }
+        return Report { text, failures };
+    }
+    let _ = writeln!(
+        text,
+        "## output: WirePlumber's move at the monitor of the speakers FxSound played through"
+    );
+    for (n, label) in labels.iter().enumerate() {
+        let mut values: Vec<f64> = picks
+            .iter()
+            .filter(|(_, pick, _)| *pick == n)
+            .map(|(.., worst)| *worst)
+            .collect();
+        let loudest = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let worst = median(&mut values).unwrap_or(f64::NAN);
+        let _ = writeln!(
+            text,
+            "  {label:<32} worst {worst:6.1} dBFS (loudest run {loudest:6.1})"
+        );
+    }
+    let loud: Vec<String> = picks
+        .iter()
+        .filter(|(.., worst)| *worst >= HARD_GATE_DBFS)
+        .map(|&(run, pick, worst)| {
+            let label = labels.get(pick).map_or("?", String::as_str);
+            format!("{label} in run {} at {worst:.1} dBFS", run + 1)
+        })
+        .collect();
+    if loud.is_empty() {
+        return Report { text, failures };
+    }
+    let line = format!(
+        "{}: at the speakers FxSound played through, {} of {} picks over {HARD_GATE_DBFS} dBFS, \
+         run by run: {}",
+        scenario.title,
+        loud.len(),
+        picks.len(),
+        loud.join("; ")
+    );
+    let _ = writeln!(text, "WARNING: {line}");
+    if gate == Gate::Hard && loud.len() as f64 > picks.len() as f64 * SKIPPED_FADES {
+        failures.push(line);
     }
     Report { text, failures }
 }
@@ -1467,9 +2231,14 @@ fn report(scenario: &Scenario, gate: Gate, clean: &[Run], discarded: &[u64]) -> 
 /// gate fails.
 fn check(scenario: &Scenario) {
     let gate = Gate::from_env();
-    let Some(report) = measure(scenario, gate) else {
+    let Some(measured) = measure(scenario) else {
         return;
     };
+    conclude(report(scenario, gate, &measured.clean, &measured.discarded));
+}
+
+/// Print `report`, add it to [`REPORT_FILE`], and fail the test on what the gate failed.
+fn conclude(report: Report) {
     println!("{}", report.text);
     if let Some(path) = std::env::var_os(REPORT_FILE) {
         let written = std::fs::OpenOptions::new()
@@ -1511,14 +2280,22 @@ fn under_a_steady_tone_the_power_switch_does_not_click_in_streams_pinned_to_fxso
         note: "",
         off: false,
         both_devices: false,
+        before: Vec::new(),
+        budget: None,
+        pulse: false,
+        claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
 /// With streams that follow the default, the power switch hands the defaults back or takes them,
-/// and WirePlumber moves the streams — unlinking before it links, in the middle of the wave. The
-/// click of that move is reported and not gated (module docs).
+/// and WirePlumber moves the streams — unlinking before it links, in the middle of the wave. Since
+/// D2 FxSound fades each stream it is about to have moved to silence first, and gives it its volume
+/// back once it is linked where it went (`crate::stream_handover`): gated, with the dip each move
+/// leaves held to [`HANDOVER_BUDGET`] (roadmap §7, test 1).
 #[test]
-fn under_a_steady_tone_the_power_switch_moves_the_streams_that_follow_the_default_and_is_reported()
+fn under_a_steady_tone_the_power_switch_moves_the_streams_that_follow_the_default_without_a_click()
 {
     check(&Scenario {
         tag: "clk-follow",
@@ -1527,10 +2304,45 @@ fn under_a_steady_tone_the_power_switch_moves_the_streams_that_follow_the_defaul
         lanes: &DeviceDirection::ALL,
         switches: [false, true, false, true].map(Switch::Power).to_vec(),
         spacing: Duration::from_secs(3),
-        gated: false,
+        gated: true,
         note: "",
         off: false,
         both_devices: false,
+        before: Vec::new(),
+        budget: Some(HANDOVER_BUDGET),
+        pulse: false,
+        claims: false,
+        hook: false,
+        ranked: false,
+    });
+}
+
+/// The same with PulseAudio applications (roadmap §7, test 1: «pw-cat and pulse»): the tone's
+/// player and the microphone's recorder are `pacat`, through the graph's own `pipewire-pulse`, as
+/// most applications on a desktop still are. Their streams are `pipewire-pulse`'s, each with the
+/// audio converter the fade is made in; and it is a PulseAudio application that a fade left at 0
+/// would leave silent for good, with WirePlumber giving the silence back to its next stream while
+/// the desktop's mixer shows 100 % (`crate::stream_handover`, the journal).
+#[test]
+fn under_a_steady_tone_the_power_switch_moves_pulseaudio_applications_that_follow_the_default_without_a_click()
+ {
+    check(&Scenario {
+        tag: "clk-pulse",
+        title: "power, PulseAudio applications following the default",
+        streams: Streams::Following,
+        lanes: &DeviceDirection::ALL,
+        switches: [false, true, false, true].map(Switch::Power).to_vec(),
+        spacing: Duration::from_secs(3),
+        gated: true,
+        note: "",
+        off: false,
+        both_devices: false,
+        before: Vec::new(),
+        budget: Some(HANDOVER_BUDGET),
+        pulse: true,
+        claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
@@ -1562,6 +2374,73 @@ fn under_a_steady_tone_the_equalizer_and_the_music_presets_switch_without_a_clic
         note: "",
         off: false,
         both_devices: false,
+        before: Vec::new(),
+        budget: None,
+        pulse: false,
+        claims: false,
+        hook: false,
+        ranked: false,
+    });
+}
+
+/// «Like FxSound for Windows» moved between Off and Interface and sound and back, twice, under
+/// the speakers' tone of an application that follows the default (roadmap 0.5.0 §1 A4): the
+/// output lane changes DSP under the stream, the gain stage moving from before the equalizer to
+/// inside its block, and nothing moves the stream. FxSound's own switch, gated.
+#[test]
+fn under_a_steady_tone_moving_like_fxsound_for_windows_between_off_and_sound_does_not_click() {
+    check(&Scenario {
+        tag: "clk-parity",
+        title: "like Windows, Off and Interface and sound",
+        streams: Streams::Following,
+        lanes: &[DeviceDirection::Output],
+        switches: vec![
+            to_parity(WindowsParity::Sound),
+            to_parity(WindowsParity::Off),
+            to_parity(WindowsParity::Sound),
+            to_parity(WindowsParity::Off),
+        ],
+        spacing: Duration::from_secs(2),
+        gated: true,
+        note: "",
+        off: false,
+        both_devices: false,
+        before: vec![to_parity(WindowsParity::Off)],
+        budget: None,
+        pulse: false,
+        claims: false,
+        hook: false,
+        ranked: false,
+    });
+}
+
+/// The same moves with the tone's player on a route of its own from before it starts: the
+/// application's output route changes DSP with the lane (`App::refresh_app_routes`), its
+/// parameters written in place, and nothing moves the stream. Gated.
+#[test]
+fn under_a_steady_tone_moving_like_fxsound_for_windows_in_an_application_route_does_not_click() {
+    check(&Scenario {
+        tag: "clk-parroute",
+        title: "like Windows, Off and Interface and sound, in an application's route",
+        streams: Streams::Following,
+        lanes: &[DeviceDirection::Output],
+        switches: vec![
+            to_parity(WindowsParity::Sound),
+            to_parity(WindowsParity::Off),
+            to_parity(WindowsParity::Sound),
+            to_parity(WindowsParity::Off),
+        ],
+        spacing: Duration::from_secs(2),
+        gated: true,
+        note: "",
+        off: false,
+        both_devices: false,
+        before: vec![to_parity(WindowsParity::Off), Switch::Route(true)],
+        budget: None,
+        pulse: false,
+        claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
@@ -1588,15 +2467,23 @@ fn under_a_steady_tone_the_voice_equalizer_and_the_voice_presets_switch_without_
         note: "",
         off: false,
         both_devices: false,
+        before: Vec::new(),
+        budget: None,
+        pulse: false,
+        claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
 /// A preset of its own for the tone's player and recorder, then none, twice (roadmap §7, test 2):
 /// the engine writes each stream's target, and WirePlumber moves it onto the route and back —
-/// unlinking before it links, as for the power switch. FxSound's own switch, and in 0.4.0 over the
-/// gate, so reported until D2 hands the streams over quietly and gates it.
+/// unlinking before it links, as for the power switch. Since D2 each stream is faded to silence
+/// before its key is written, and the route it leaves goes only once it is off it: gated, with the
+/// dip held to [`HANDOVER_BUDGET`]. The route's chain starts afresh and settles on the tone, so the
+/// steady state keeps clear of [`ROUTE_IN_CLEAR`] after a route comes in.
 #[test]
-fn under_a_steady_tone_an_application_route_moves_the_streams_on_and_off_and_is_reported() {
+fn under_a_steady_tone_an_application_route_moves_the_streams_on_and_off_without_a_click() {
     check(&Scenario {
         tag: "clk-route",
         title: "application route on and off",
@@ -1604,22 +2491,29 @@ fn under_a_steady_tone_an_application_route_moves_the_streams_on_and_off_and_is_
         lanes: &DeviceDirection::ALL,
         switches: [true, false, true, false].map(Switch::Route).to_vec(),
         spacing: Duration::from_secs(3),
-        gated: false,
-        note: "FxSound's own switch, over the gate in 0.4.0: reported until D2 makes it quiet and \
-               gates it",
+        gated: true,
+        note: "",
         off: false,
         both_devices: false,
+        before: Vec::new(),
+        budget: Some(HANDOVER_BUDGET),
+        pulse: false,
+        claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
 /// FxSound picks the other speakers and the other microphone, then the first ones again, twice
 /// (roadmap §7, test 3), as the device list, `--output`, `--next-output` and `--input` do. 0.4.0
-/// takes both of a lane's nodes down and builds them again on the new device, and meanwhile
-/// WirePlumber moves the streams that follow the default onto a device of its own and back. The
-/// tone is heard on both devices of each direction. FxSound's own switch, and in 0.4.0 over the
-/// gate, so reported until D3 keeps the virtual node and gates it.
+/// took both of a lane's nodes down and built them again on the new device, and meanwhile
+/// WirePlumber moved the streams that follow the default onto a device of its own and back. Since
+/// D3 the lane keeps its virtual node, nothing moves the streams, and the chain falls silent while
+/// its stream on the device is replaced (`crate::engine`, "Another device, the same virtual
+/// node"): gated, with the gap held to [`HANDOVER_BUDGET`]. The tone is heard on both devices of
+/// each direction.
 #[test]
-fn under_a_steady_tone_fxsound_picking_another_device_is_reported() {
+fn under_a_steady_tone_fxsound_picks_another_device_without_a_click() {
     check(&Scenario {
         tag: "clk-device",
         title: "FxSound picks another device",
@@ -1627,33 +2521,159 @@ fn under_a_steady_tone_fxsound_picking_another_device_is_reported() {
         lanes: &DeviceDirection::ALL,
         switches: [true, false, true, false].map(Switch::Device).to_vec(),
         spacing: Duration::from_secs(3),
-        gated: false,
-        note: "FxSound's own switch, over the gate in 0.4.0: reported until D3 keeps the virtual \
-               node and gates it",
+        gated: true,
+        note: "",
         off: false,
         both_devices: true,
+        before: Vec::new(),
+        budget: Some(HANDOVER_BUDGET),
+        pulse: false,
+        claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
-/// The desktop picks the other speakers and the other microphone as the defaults, then the first
-/// ones again, twice, with FxSound on (roadmap §7, test 4): FxSound, following the system's
-/// default device as the engine does until the app ranks its devices, moves its lanes there and
-/// takes the defaults back, and WirePlumber moves the streams twice meanwhile. The desktop's
-/// switch: reported, until the roadmap's §14 #16 says what it is held to.
-#[test]
-fn under_a_steady_tone_a_desktop_pick_of_the_default_device_with_fxsound_on_is_reported() {
-    check(&Scenario {
-        tag: "clk-deskon",
-        title: "desktop picks the default device, FxSound on",
+/// The desktop's pick of the other speakers and the other microphone as the defaults, then of the
+/// first ones again, twice, with FxSound `on` (roadmap §7, test 4) or off (test 5). The tone is
+/// heard on both devices of each direction.
+fn desktop_picks(on: bool) -> Scenario {
+    Scenario {
+        tag: if on { "clk-deskon" } else { "clk-deskoff" },
+        title: if on {
+            "desktop picks the default device, FxSound on"
+        } else {
+            "desktop picks the default device, FxSound off"
+        },
         streams: Streams::Following,
         lanes: &DeviceDirection::ALL,
         switches: [true, false, true, false].map(Switch::Desktop).to_vec(),
         spacing: Duration::from_secs(3),
-        gated: false,
-        note: "",
-        off: false,
+        gated: on,
+        note: if on {
+            "Each pick is two moves: WirePlumber's, from the switch to FxSound's claim, held to \
+             plain Linux + 3 dB above the tone (roadmap 0.5.0 §7 test 4, §14 #16), and FxSound's \
+             claim of the default back, gated"
+        } else {
+            ""
+        },
+        off: !on,
         both_devices: true,
-    });
+        before: Vec::new(),
+        budget: on.then_some(HANDOVER_BUDGET),
+        pulse: false,
+        claims: on,
+        hook: false,
+        ranked: false,
+    }
+}
+
+/// [`desktop_picks`] with FxSound's hook in the graph's WirePlumber (roadmap §7, D5; test 4 "with
+/// the hook"): every move WirePlumber makes itself is faded, so each pick is held to the gate,
+/// WirePlumber's move as well as FxSound's claim after it with FxSound `on`.
+///
+/// With FxSound off, FxSound ranks its devices ([`Scenario::ranked`]), as it does unless *Follow
+/// the system's default device* is ticked. Following it, FxSound's lane — out of the sound, with
+/// the power off — moves to the picked device too, about 0.2 s after the pick, and that move
+/// clicks the stream the hook has just faded in there: −23 to −32 dBFS where the pick itself was
+/// −60 (measured for D5, 3 runs × 4 picks; with the hook's fade in held back 300 ms, past it, the
+/// click went). That is FxSound's own lane moving under another application's sound, not
+/// WirePlumber's move, and not this scenario's.
+fn desktop_picks_with_the_hook(on: bool) -> Scenario {
+    Scenario {
+        tag: if on { "clk-hookon" } else { "clk-hookoff" },
+        title: if on {
+            "desktop picks the default device, FxSound on, FxSound's hook in WirePlumber"
+        } else {
+            "desktop picks the default device, FxSound off, FxSound's hook in WirePlumber"
+        },
+        gated: true,
+        note: if on {
+            "Each pick is two moves: WirePlumber's, faded by FxSound's hook in WirePlumber, and \
+             FxSound's claim of the default back; both gated (roadmap 0.5.0 §7 test 4, D5)"
+        } else {
+            "WirePlumber's move alone, faded by FxSound's hook in WirePlumber, with FxSound \
+             ranking its devices; gated (roadmap 0.5.0 §7, D5)"
+        },
+        budget: Some(HANDOVER_BUDGET),
+        hook: true,
+        ranked: !on,
+        ..desktop_picks(on)
+    }
+}
+
+/// The desktop's picks with FxSound off, measured once for both the tests that read them: plain
+/// Linux, which the picks with FxSound on are held to. `None` when they cannot run here.
+fn bare_desktop_picks() -> Option<&'static Measured> {
+    static MEASURED: std::sync::OnceLock<Option<Measured>> = std::sync::OnceLock::new();
+    MEASURED
+        .get_or_init(|| measure(&desktop_picks(false)))
+        .as_ref()
+}
+
+/// The desktop picks the other speakers and the other microphone as the defaults, then the first
+/// ones again, twice, with FxSound on (roadmap §7, test 4). WirePlumber moves the streams off
+/// FxSound's nodes onto the picked devices at once, as it would without FxSound; FxSound, following
+/// the system's default device as the engine does until the app ranks its devices, moves its lanes
+/// there, keeping its virtual nodes, and takes the defaults back, fading the streams it moves.
+/// Each switch is read as two rows ([`Scenario::claims`]): FxSound's claim, gated, with the gap
+/// held to [`HANDOVER_BUDGET`]; and WirePlumber's move, which roadmap §14 #16 leaves where plain
+/// Linux has it, held to the same picks with FxSound off + 3 dB ([`against_bare_linux`]): heard in
+/// FxSound's chain, above the tone and not in dBFS, since the chain plays the tone louder than
+/// plain Linux does. The tail it cuts off in FxSound's chain fades since D4 (`crate::engine`, "A
+/// sound cut off"), held to the gate at the monitor of the speakers FxSound played through
+/// ([`left_behind`]), and what is left is the application's arrival on the picked device.
+#[test]
+fn under_a_steady_tone_a_desktop_pick_with_fxsound_on_is_taken_back_without_a_click() {
+    let gate = Gate::from_env();
+    let scenario = desktop_picks(true);
+    let Some(measured) = measure(&scenario) else {
+        return;
+    };
+    let mut result = report(&scenario, gate, &measured.clean, &measured.discarded);
+    let faded = left_behind(&scenario, gate, &measured.clean);
+    result.text.push_str(&faded.text);
+    result.failures.extend(faded.failures);
+    if let Some(bare) = bare_desktop_picks() {
+        let held = against_bare_linux(
+            &scenario,
+            gate,
+            &measured.clean,
+            &desktop_picks(false),
+            &bare.clean,
+        );
+        result.text.push_str(&held.text);
+        result.failures.extend(held.failures);
+    }
+    conclude(result);
+}
+
+/// The desktop's picks with FxSound on, with FxSound's hook in WirePlumber (roadmap §7, test 4
+/// with the hook; D5): WirePlumber fades each stream it moves off FxSound's nodes onto the picked
+/// device and back in once it is there, and FxSound takes the default back as without it. Both
+/// moves of each pick are gated, and what the move leaves at the speakers FxSound played through is
+/// held as without the hook ([`left_behind`]).
+#[test]
+fn under_a_steady_tone_a_desktop_pick_with_fxsound_on_and_its_hook_in_wireplumber_does_not_click() {
+    let gate = Gate::from_env();
+    let scenario = desktop_picks_with_the_hook(true);
+    let Some(measured) = measure(&scenario) else {
+        return;
+    };
+    let mut result = report(&scenario, gate, &measured.clean, &measured.discarded);
+    let faded = left_behind(&scenario, gate, &measured.clean);
+    result.text.push_str(&faded.text);
+    result.failures.extend(faded.failures);
+    conclude(result);
+}
+
+/// The desktop's picks with FxSound off, with FxSound's hook in WirePlumber and FxSound ranking its
+/// devices: WirePlumber alone moves the streams, and the hook fades each move. Plain Linux's
+/// click, which the option takes away with FxSound out of the sound too; gated.
+#[test]
+fn under_a_steady_tone_a_desktop_pick_with_fxsound_off_and_its_hook_in_wireplumber_does_not_click()
+{
+    check(&desktop_picks_with_the_hook(false));
 }
 
 /// The same picks with FxSound's power off (roadmap §7, test 5): FxSound is out of the sound, and
@@ -1661,18 +2681,15 @@ fn under_a_steady_tone_a_desktop_pick_of_the_default_device_with_fxsound_on_is_r
 /// other device switch is set beside. Reported.
 #[test]
 fn under_a_steady_tone_a_desktop_pick_of_the_default_device_with_fxsound_off_is_reported() {
-    check(&Scenario {
-        tag: "clk-deskoff",
-        title: "desktop picks the default device, FxSound off",
-        streams: Streams::Following,
-        lanes: &DeviceDirection::ALL,
-        switches: [true, false, true, false].map(Switch::Desktop).to_vec(),
-        spacing: Duration::from_secs(3),
-        gated: false,
-        note: "",
-        off: true,
-        both_devices: true,
-    });
+    let Some(measured) = bare_desktop_picks() else {
+        return;
+    };
+    conclude(report(
+        &desktop_picks(false),
+        Gate::from_env(),
+        &measured.clean,
+        &measured.discarded,
+    ));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1735,6 +2752,187 @@ fn a_step_in_the_tone_is_found_at_its_switch_and_the_steady_state_stays_below_it
 }
 
 #[test]
+fn a_switch_followed_by_fxsounds_own_move_is_read_as_the_click_before_it_and_the_gap_after() {
+    let mut tone = sine(OUTPUT_TONE.0, OUTPUT_TONE.1, 6.0);
+    let switch = 3 * RATE;
+    // The session manager's move: a jump 20 ms after the switch. FxSound's, 150 ms after: 100 ms
+    // of silence, faded out and in over 20 ms, which is no click.
+    tone[switch + RATE / 50] += 0.2;
+    let claim = switch + 3 * RATE / 20;
+    let fade = RATE / 50;
+    for n in 0..RATE / 10 + 2 * fade {
+        let gain = if n < fade {
+            1.0 - n as f64 / fade as f64
+        } else if n >= RATE / 10 + fade {
+            (n - RATE / 10 - fade) as f64 / fade as f64
+        } else {
+            0.0
+        };
+        tone[claim + n] *= gain;
+    }
+    let windows = Window::split(switch, claim);
+    let analysis = analyse_windows(&vec![tone], RATE / 2, &windows, &[switch, claim], &[]);
+    let [the_move, fxsounds] = [analysis.events[0], analysis.events[1]];
+    assert!(the_move.worst_dbfs > -40.0, "{analysis:?}");
+    assert!((the_move.at_s - 0.02).abs() < 0.002, "{analysis:?}");
+    assert!(
+        the_move.dip_ms < 1.0,
+        "the move's row has no dip to hold: {analysis:?}"
+    );
+    assert!(fxsounds.worst_dbfs < -60.0, "{analysis:?}");
+    assert!((90.0..=120.0).contains(&fxsounds.dip_ms), "{analysis:?}");
+    assert!(analysis.floor_dbfs < -100.0, "{analysis:?}");
+}
+
+#[test]
+fn a_click_is_read_above_the_tone_so_the_gain_the_tone_was_played_at_cancels() {
+    // The same cut at two levels, 11 dB apart as the speakers' tone with and without FxSound's
+    // chain: the stream stopped at the crest of a wave for 20 ms, and back.
+    let cut = |level: f64| {
+        let mut tone = sine(OUTPUT_TONE.0, level, 6.0);
+        let switch = 3 * RATE;
+        let at = switch + RATE / 50 + RATE / 400;
+        for sample in &mut tone[at..at + RATE / 50] {
+            *sample = 0.0;
+        }
+        let analysis = analyse(&vec![tone], RATE / 2, &[switch]);
+        (analysis.events[0].worst_dbfs, above_the_tone(&analysis, 0))
+    };
+    let (bare, bare_above) = cut(-12.0);
+    let (louder, louder_above) = cut(-1.0);
+    assert!(bare > -40.0, "the cut is a click: {bare}");
+    assert!((louder - bare - 11.0).abs() < 0.5, "{bare} and {louder}");
+    assert!(
+        (louder_above - bare_above).abs() < 0.5,
+        "{bare_above} and {louder_above}"
+    );
+}
+
+#[test]
+fn wireplumbers_move_with_fxsound_on_is_held_to_plain_linux_plus_3_db_above_the_tone() {
+    let (on, bare) = (desktop_picks(true), desktop_picks(false));
+    let analysis = |tone_dbfs: f64, worst: &[f64]| Analysis {
+        floor_dbfs: -110.0,
+        floor_at_s: 1.0,
+        tone_dbfs,
+        events: worst
+            .iter()
+            .map(|&worst_dbfs| EventResult {
+                worst_dbfs,
+                at_s: 0.04,
+                dip_ms: 0.0,
+            })
+            .collect(),
+    };
+    let run = |tone: f64, worst: &[f64]| Run {
+        lanes: vec![analysis(tone, worst), analysis(tone, worst)],
+        xruns: Some(0),
+        ring: [0, 0],
+        left_behind: Vec::new(),
+    };
+    // Plain Linux: the tone at −12 dBFS, its loudest move at −19, 7 dB below it.
+    let bare_runs = [
+        run(-12.0, &[-19.0, -21.0, -20.0, -23.0]),
+        run(-12.0, &[-22.0, -20.0, -25.0, -21.0]),
+    ];
+    // FxSound on: the tone at −1 dBFS, WirePlumber's moves (the even rows) 11 dB louder in dBFS
+    // than plain Linux's and 2 dB above them over the tone; FxSound's claims (the odd rows) are
+    // loud here only to show that they are the gate's, not this.
+    let moves = [-6.0, -2.0, -9.0, -2.0, -8.0, -2.0, -10.0, -2.0];
+    let quiet = [run(-1.0, &moves), run(-1.0, &moves)];
+    let held = against_bare_linux(&on, Gate::Hard, &quiet, &bare, &bare_runs);
+    assert!(held.failures.is_empty(), "{:?}", held.failures);
+    assert!(
+        held.text.contains(
+            "## output: WirePlumber's move, above the tone: loudest run -5.0 dB; plain Linux \
+             (desktop picks the default device, FxSound off) -7.0 dB; held to -4.0 dB  ok"
+        ),
+        "{}",
+        held.text
+    );
+
+    // One run's move 3.5 dB above the tone: 3.5 dB over plain Linux + 3.
+    let mut louder = moves;
+    louder[4] = -4.5;
+    let loud = [run(-1.0, &moves), run(-1.0, &louder)];
+    let held = against_bare_linux(&on, Gate::Hard, &loud, &bare, &bare_runs);
+    assert_eq!(held.failures.len(), 2, "both lanes: {:?}", held.failures);
+    let reported = against_bare_linux(&on, Gate::Report, &loud, &bare, &bare_runs);
+    assert!(reported.failures.is_empty());
+    assert!(reported.text.contains("WARNING"), "{}", reported.text);
+
+    // Nothing to hold it to is no pass.
+    let held = against_bare_linux(&on, Gate::Hard, &quiet, &bare, &[]);
+    assert_eq!(held.failures.len(), 2, "{:?}", held.failures);
+}
+
+#[test]
+fn a_desktop_pick_that_leaves_the_speakers_fxsound_played_through_loud_in_more_than_a_quarter_of_runs_fails()
+ {
+    let scenario = desktop_picks(true);
+    let run = |left_behind: [f64; 4]| Run {
+        lanes: Vec::new(),
+        xruns: Some(0),
+        ring: [0, 0],
+        left_behind: left_behind.to_vec(),
+    };
+    let faded = [-95.0, -101.2, -88.8, -99.0];
+    let quiet = [run(faded), run(faded), run(faded)];
+    let held = left_behind(&scenario, Gate::Hard, &quiet);
+    assert!(held.failures.is_empty(), "{:?}", held.failures);
+    assert!(
+        held.text
+            .contains("  desktop picks t_other, t_mic2    worst  -88.8 dBFS (loudest run  -88.8)"),
+        "{}",
+        held.text
+    );
+    assert!(!held.text.contains("WARNING"), "{}", held.text);
+
+    // The recorder skipped into the fade at the third pick of one run: listed, not failed.
+    let skipped = [run(faded), run([-95.0, -101.2, -12.4, -99.0]), run(faded)];
+    let held = left_behind(&scenario, Gate::Hard, &skipped);
+    assert!(held.failures.is_empty(), "{:?}", held.failures);
+    assert!(
+        held.text.contains(
+            "at the speakers FxSound played through, 1 of 12 picks over -40 dBFS, run by run: \
+             desktop picks t_other, t_mic2 in run 2 at -12.4 dBFS"
+        ),
+        "{}",
+        held.text
+    );
+
+    // Four picks of twelve: more than a quarter. Every pick, as before D4: the tail cut off.
+    let four = [
+        run([-12.0, -101.2, -12.4, -99.0]),
+        run([-95.0, -14.0, -88.8, -9.0]),
+        run(faded),
+    ];
+    assert_eq!(left_behind(&scenario, Gate::Hard, &four).failures.len(), 1);
+    let cut = [-11.6, -14.0, -12.4, -9.0];
+    let unfaded = [run(cut), run(cut), run(cut)];
+    assert_eq!(
+        left_behind(&scenario, Gate::Hard, &unfaded).failures.len(),
+        1
+    );
+    assert!(
+        left_behind(&scenario, Gate::Report, &unfaded)
+            .failures
+            .is_empty()
+    );
+
+    // Nothing read is no pass.
+    assert_eq!(left_behind(&scenario, Gate::Hard, &[]).failures.len(), 1);
+    let unread = [run(faded)].map(|mut run| {
+        run.left_behind.clear();
+        run
+    });
+    assert_eq!(
+        left_behind(&scenario, Gate::Hard, &unread).failures.len(),
+        1
+    );
+}
+
+#[test]
 fn a_gap_in_the_tone_is_measured_as_a_dip() {
     let mut tone = sine(INPUT_TONE.0, INPUT_TONE.1, 6.0);
     let switch = 3 * RATE;
@@ -1788,6 +2986,20 @@ fn a_tone_that_moves_from_one_recorder_to_another_is_heard_across_the_move() {
 }
 
 #[test]
+fn what_a_route_coming_in_leaves_past_a_switchs_clearance_is_not_read_as_the_steady_state() {
+    let mut tone = sine(OUTPUT_TONE.0, OUTPUT_TONE.1, 6.0);
+    let switch = 2 * RATE;
+    // A fresh chain still settling 0.9 s after the switch: a small jump in the wave.
+    tone[switch + 9 * RATE / 10] += 0.001;
+    let windows = [Window::around(switch)];
+    let plain = analyse_windows(&vec![tone.clone()], RATE / 2, &windows, &[switch], &[]);
+    assert!(plain.floor_dbfs > -80.0, "{plain:?}");
+    assert!((plain.floor_at_s - 2.4).abs() < 0.01, "{plain:?}");
+    let route_in = analyse_windows(&vec![tone], RATE / 2, &windows, &[switch], &[switch]);
+    assert!(route_in.floor_dbfs < -100.0, "{route_in:?}");
+}
+
+#[test]
 fn a_switch_in_a_steady_tone_that_does_nothing_leaves_the_floor() {
     let tone = sine(OUTPUT_TONE.0, OUTPUT_TONE.1, 6.0);
     let analysis = analyse(&vec![tone], RATE / 2, &[3 * RATE]);
@@ -1836,6 +3048,69 @@ fn the_gate_fails_only_a_gated_switch_and_only_when_it_is_hard() {
     );
     assert_eq!(Gate::Report.judge(-35.0, true), ("over the gate", false));
     assert_eq!(Gate::Report.judge(-45.0, true), ("ok", false));
+}
+
+#[test]
+fn a_handovers_switch_over_the_gate_in_one_run_is_listed_and_in_two_fails_the_hard_gate() {
+    let scenario = Scenario {
+        tag: "clk-t",
+        title: "handover",
+        streams: Streams::Following,
+        lanes: &[DeviceDirection::Input],
+        switches: [false, true].map(Switch::Power).to_vec(),
+        spacing: Duration::from_secs(3),
+        gated: true,
+        note: "",
+        off: false,
+        both_devices: false,
+        before: Vec::new(),
+        budget: Some(HANDOVER_BUDGET),
+        pulse: true,
+        claims: false,
+        hook: false,
+        ranked: false,
+    };
+    let run = |worst: [f64; 2]| Run {
+        lanes: vec![Analysis {
+            floor_dbfs: -120.0,
+            floor_at_s: 1.0,
+            tone_dbfs: -18.0,
+            events: worst
+                .map(|worst_dbfs| EventResult {
+                    worst_dbfs,
+                    at_s: 0.25,
+                    dip_ms: 110.0,
+                })
+                .to_vec(),
+        }],
+        xruns: Some(0),
+        ring: [0, 0],
+        left_behind: Vec::new(),
+    };
+    let quiet = [-70.0, -70.0];
+
+    let once = [run(quiet), run([-70.0, -17.7]), run(quiet)];
+    let report_once = report(&scenario, Gate::Hard, &once, &[]);
+    assert!(
+        report_once.failures.is_empty(),
+        "the median hides it, and one is allowed: {:?}",
+        report_once.failures
+    );
+    assert!(
+        report_once
+            .text
+            .contains("1 of 6 switches over -40 dBFS, run by run: input power on in run 2"),
+        "but it is listed: {}",
+        report_once.text
+    );
+
+    let twice = [run(quiet), run([-70.0, -17.7]), run([-25.0, -70.0])];
+    assert_eq!(report(&scenario, Gate::Hard, &twice, &[]).failures.len(), 1);
+    assert!(
+        report(&scenario, Gate::Report, &twice, &[])
+            .failures
+            .is_empty()
+    );
 }
 
 #[test]

@@ -62,7 +62,7 @@
 //! stream to a route, or to anything else.
 
 use fxsound_core::MAX_ROUTES_PER_LANE;
-use fxsound_core::messages::AppRoute;
+use fxsound_core::messages::{AppRoute, RouteParams};
 
 use super::*;
 use crate::TOO_MANY_APPLICATION_PRESETS;
@@ -90,6 +90,9 @@ pub(super) struct Routes {
     idle: Duration,
     /// The missing `default` metadata object has been reported, and need not be again.
     no_metadata_told: bool,
+    /// Routes the plan took down, kept, pair and all, while they go ([`Leaving`]). No new pair is
+    /// built in a slot one of these still holds.
+    leaving: Vec<Leaving>,
 }
 
 impl Routes {
@@ -102,6 +105,7 @@ impl Routes {
             warnings: OverflowWarnings::default(),
             idle,
             no_metadata_told: false,
+            leaving: Vec::new(),
         }
     }
 
@@ -272,6 +276,22 @@ impl LiveRoute {
         }
     }
 }
+
+/// A route the plan took down, on its way out. First its streams are moved off it — silenced, and
+/// their keys deleted ([`hand_over_moves`], `fades`): a route's node that went first would have
+/// WirePlumber move them itself, unfaded. Then its chain is switched off, which fades what it
+/// still plays — a reverb's tail — out over its 20 ms glide, and the pair goes once that has been
+/// played ([`ROUTE_TAIL`]): taken down at once, the tail stopped in the middle of its wave, which
+/// clicked at −36 dBFS on the speakers.
+struct Leaving {
+    route: LiveRoute,
+    /// When its pair may go: `None` while its streams are still being moved off it.
+    goes_at: Option<Instant>,
+}
+
+/// How long a route's switched-off chain plays before its pair goes ([`Leaving`]): its 20 ms glide,
+/// and what the stream to the device has buffered.
+const ROUTE_TAIL: Duration = Duration::from_millis(80);
 
 /// Where a lane's pair is: what its routes are built on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,6 +507,7 @@ pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
         }
         hand_over_chain(route);
     }
+    drop_gone_routes(shared, now);
     if !shared.ready() {
         return;
     }
@@ -577,11 +598,14 @@ pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
         .partition(|op| matches!(op, MetadataOp::Delete { .. }));
 
     // 1. The streams leaving a route go back, and the streams going onto a route whose node is
-    //    known and stays are moved onto it — both ahead of any node a key could name going.
-    send(shared, &deletes);
-    send(shared, &writes);
+    //    known and stays are moved onto it — both ahead of any node a key could name going. Each
+    //    stream that plays is faded to silence first, and the keys are written once it is (`fades`,
+    //    [`hand_over_moves`]): noted as sent now, so that the next plan does not ask again.
+    let deletes = note(shared, deletes);
+    let writes = note(shared, writes);
 
     // 2. The routes that go; and those kept only for a stream FxSound does not move, said once.
+    //    Each one goes once its streams have been moved off it.
     for (slot, preset) in &plan.kept {
         log::info!(
             "route {} ({preset}) is kept though no rule names its preset any more: an application \
@@ -589,6 +613,7 @@ pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
             slot.node_name()
         );
     }
+    let mut leaving = Vec::new();
     for (gone, why) in &plan.teardown {
         if let Some(index) = shared
             .routes
@@ -602,10 +627,15 @@ pub(super) fn reconcile(shared: &mut Shared, now: Instant) {
                 gone.preset,
                 why.reason()
             );
-            let mut route = shared.routes.live.remove(index);
-            route.drop_pair();
+            let route = shared.routes.live.remove(index);
+            leaving.push((route.slot, route.preset.name.clone()));
+            shared.routes.leaving.push(Leaving {
+                route,
+                goes_at: None,
+            });
         }
     }
+    hand_over_moves(shared, deletes, writes, leaving);
 
     // 3. The new ones, as routes with no pair yet.
     for (slot, preset) in &plan.build {
@@ -750,6 +780,15 @@ fn build_pairs(shared: &mut Shared, attachments: &PerDirection<Option<Attachment
         if route.pair.as_ref().is_some_and(|pair| pair.on == *on) || now < route.next_attempt {
             continue;
         }
+        // Not under a name a route that is going still holds: the server never sees two nodes of
+        // one name. Built on the next pass, once that one has gone.
+        if routes
+            .leaving
+            .iter()
+            .any(|gone| gone.route.slot == route.slot)
+        {
+            continue;
+        }
         if route.pair.is_some() {
             log::info!(
                 "route {} follows its lane to {}",
@@ -789,16 +828,87 @@ fn build_pairs(shared: &mut Shared, attachments: &PerDirection<Option<Attachment
     }
 }
 
-/// Send `ops` to the `default` metadata object, and note each as sent.
-fn send(shared: &mut Shared, ops: &[MetadataOp]) {
-    if ops.is_empty() {
+/// Write `deletes` and then `writes` to the `default` metadata object once every stream they move
+/// that plays has faded to silence (`fades`), and then switch off the routes of `leaving` — each
+/// slot and preset, held in [`Routes::leaving`] meanwhile — for [`drop_gone_routes`] to take down
+/// once their tails have been played. The streams get their volume back once they are linked where
+/// the keys put them. With nothing moved and nothing leaving, nothing is asked of the handover.
+fn hand_over_moves(
+    shared: &mut Shared,
+    deletes: Vec<MetadataOp>,
+    writes: Vec<MetadataOp>,
+    leaving: Vec<(RouteSlot, String)>,
+) {
+    if deletes.is_empty() && writes.is_empty() && leaving.is_empty() {
         return;
     }
-    let Some(metadata) = shared
+    let mut streams: Vec<u32> = deletes
+        .iter()
+        .chain(&writes)
+        .map(|op| match *op {
+            MetadataOp::Write { subject, .. } | MetadataOp::Delete { subject } => subject,
+        })
+        .collect();
+    streams.sort_unstable();
+    streams.dedup();
+    fades::hand_over(
+        shared,
+        streams,
+        Box::new(move |shared: &mut Shared| {
+            write_ops(shared, &deletes);
+            write_ops(shared, &writes);
+            let goes_at = Instant::now() + ROUTE_TAIL;
+            for gone in &mut shared.routes.leaving {
+                let route = &mut gone.route;
+                if gone.goes_at.is_none()
+                    && leaving
+                        .iter()
+                        .any(|(slot, preset)| route.slot == *slot && route.preset.name == *preset)
+                {
+                    let mut params = route.preset.params;
+                    match &mut params {
+                        RouteParams::Output(params) => params.power = false,
+                        RouteParams::Input(params) => params.power = false,
+                    }
+                    route.writer.write(params);
+                    gone.goes_at = Some(goes_at);
+                }
+            }
+            !deletes.is_empty() || !writes.is_empty()
+        }),
+    );
+}
+
+/// Take down every route on its way out whose tail has been played ([`Leaving`]).
+fn drop_gone_routes(shared: &mut Shared, now: Instant) {
+    shared.routes.leaving.retain_mut(|gone| {
+        let goes = gone.goes_at.is_some_and(|at| now >= at);
+        if goes {
+            gone.route.drop_pair();
+        }
+        !goes
+    });
+}
+
+/// Send `ops` to the `default` metadata object at once, and note each as sent.
+fn send(shared: &mut Shared, ops: &[MetadataOp]) {
+    let ops = note(shared, ops.to_vec());
+    write_ops(shared, &ops);
+}
+
+/// Note `ops` as this engine's, sent — what the plan and the metadata's reports are weighed
+/// against — and hand them back for [`write_ops`] to send. None when there is no `default` metadata
+/// object to send them to, said once: they are asked for again by the next plan.
+fn note(shared: &mut Shared, ops: Vec<MetadataOp>) -> Vec<MetadataOp> {
+    if ops.is_empty() {
+        return ops;
+    }
+    if shared
         .session
         .as_ref()
         .and_then(|session| session.metadata.as_ref())
-    else {
+        .is_none()
+    {
         if !shared.routes.no_metadata_told {
             log::warn!(
                 "no `default` metadata object (a bare pipewire with no session manager?): \
@@ -806,6 +916,21 @@ fn send(shared: &mut Shared, ops: &[MetadataOp]) {
             );
             shared.routes.no_metadata_told = true;
         }
+        return Vec::new();
+    }
+    for &op in &ops {
+        shared.routes.moves.sent(op);
+    }
+    ops
+}
+
+/// Write `ops`, noted already ([`note`]), to the `default` metadata object.
+fn write_ops(shared: &Shared, ops: &[MetadataOp]) {
+    let Some(metadata) = shared
+        .session
+        .as_ref()
+        .and_then(|session| session.metadata.as_ref())
+    else {
         return;
     };
     for &op in ops {
@@ -824,7 +949,6 @@ fn send(shared: &mut Shared, ops: &[MetadataOp]) {
                 metadata.set_property(subject, app_routes::TARGET_OBJECT_KEY, None, None);
             }
         }
-        shared.routes.moves.sent(op);
     }
 }
 
@@ -983,6 +1107,7 @@ fn build_pair(
         fades_seen: volume.fades(),
         last_sound: None,
         fade_next: AtomicBool::new(false),
+        cut: CutWatch::default(),
         dsp: Some(dsp),
     };
     let first_label = first_name.clone();
@@ -1048,6 +1173,7 @@ fn build_pair(
         volume: None,
         stops_with_the_pair: passive,
         last_block: None,
+        ends_a_switch: false,
     };
     let second_label = second_name.clone();
     let second_listener = second
@@ -1236,10 +1362,15 @@ pub(super) fn move_everything_back(shared: &mut Shared) -> bool {
 /// are built again from them once the next connection knows the graph.
 pub(super) fn close(shared: &mut Shared) {
     let routes = &mut shared.routes;
-    for route in &mut routes.live {
+    for route in routes
+        .live
+        .iter_mut()
+        .chain(routes.leaving.iter_mut().map(|gone| &mut gone.route))
+    {
         route.drop_pair();
     }
     routes.live.clear();
+    routes.leaving.clear();
     routes.table.clear();
     routes.moves.forget_session();
 }

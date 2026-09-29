@@ -1035,6 +1035,57 @@ fn moving_a_level_the_speakers_share_resends_the_playback_routes_with_it() {
 }
 
 #[test]
+fn interface_and_sound_resends_the_playback_routes_on_the_windows_dsp_and_leaves_the_voices_alone()
+{
+    // «Like FxSound for Windows» = Interface and sound plays the Windows build's DSP on the
+    // output lane and on every application's output route; the voice chain has no Windows
+    // original, so a recording route's snapshot does not move.
+    use fxsound_core::{DspCompat, WindowsParity};
+    let (mut app, engine, _dir) = routed();
+    let game = |routes: &[AppRoute]| output(route_of(routes, &battlefield(), OUT));
+    let voice = |routes: &[AppRoute]| input(route_of(routes, &discord(), IN));
+    let before = app.app_routes().to_vec();
+    assert_eq!(game(&before).compat, DspCompat::Linux);
+
+    // Interface alone changes no sound: no route is sent.
+    assert_eq!(
+        app.set_windows_parity(WindowsParity::Interface, false),
+        Ok(())
+    );
+    assert!(
+        routes_sent(&engine).is_empty(),
+        "Interface plays FxSound for Linux's DSP"
+    );
+
+    assert_eq!(app.set_windows_parity(WindowsParity::Sound, false), Ok(()));
+    let windows = the_routes_sent(&engine);
+    assert_eq!(game(&windows).compat, DspCompat::Windows);
+    assert_eq!(
+        game(&windows),
+        DspParams {
+            compat: DspCompat::Windows,
+            ..game(&before)
+        },
+        "only whose DSP it is changes"
+    );
+    assert_eq!(
+        voice(&windows),
+        voice(&before),
+        "the voice route is untouched"
+    );
+
+    assert_eq!(app.set_windows_parity(WindowsParity::Off, false), Ok(()));
+    let linux = the_routes_sent(&engine);
+    assert_eq!(game(&linux).compat, DspCompat::Linux);
+    assert_eq!(game(&linux), game(&before), "back to what it was");
+    assert_eq!(
+        voice(&linux),
+        voice(&before),
+        "the voice route is untouched"
+    );
+}
+
+#[test]
 fn a_voices_own_makeup_and_the_edit_direction_move_no_route() {
     let (mut app, engine, _dir) = routed();
     app.handle(&[UiAction::SetEditDirection(IN)]);
