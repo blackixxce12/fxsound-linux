@@ -95,6 +95,18 @@ const INDIRECT_CALLS: &[(&str, &[&str])] = &[
     ("shown.hint()", &[]),
     ("shown.label()", &[]),
     ("level.label()", &[]),
+    // The line under "Smooth moves in WirePlumber" (`WirePlumberHook::line` in
+    // `dialogs/settings.rs`).
+    (
+        "hook.line()",
+        &[
+            "Fades the sound WirePlumber moves, as when the desktop picks another device. Changes \
+             WirePlumber's settings.",
+            "Needs WirePlumber 0.5 or newer.",
+            "WirePlumber takes the change when it restarts.",
+            "WirePlumber could not be restarted here. It takes the change at your next login.",
+        ],
+    ),
     // The import window's notice in `dialogs/presets.rs`, which the app files under its English
     // key (`fxsound-app/src/app.rs`, `handle_import`).
     (

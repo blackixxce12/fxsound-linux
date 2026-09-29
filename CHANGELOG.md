@@ -44,6 +44,24 @@ All notable changes to the FxSound Linux port. The format follows
   `fxsound --export-unshifted[=0|1]` sets the same: a `.fac` then keeps its first and last band
   where you tuned them, instead of moving them into the range FxSound for Windows tunes them in,
   which stays the default.
+- **Smooth moves in WirePlumber, in the Experimental tab of Settings, off by default.**
+  WirePlumber moves an application to a device picked in the desktop's sound settings before
+  FxSound hears of it, and that move clicked as in plain Linux, −19 to −28 dBFS, with FxSound on or
+  off. Ticked, FxSound installs a WirePlumber 0.5 script that fades every stream WirePlumber moves
+  while it plays, out before the move and back in after it: the desktop's pick then leaves
+  −52 dBFS or less on the speakers with FxSound on, and −59 with it off; on a recording, usually
+  −58 dBFS or less. Not always: now and then FxSound's taking a recording application back onto
+  its lane after the pick still clicks as loud as plain Linux, −18 dBFS in one switch of 24 —
+  PipeWire's own converter applies the new volume a moment before it starts the ramp to it, as
+  with the power button. With *Follow the system's default device* ticked and the power off,
+  FxSound's own lane, moving to the picked device after it, still clicks the application that has
+  just arrived there, at −23 to −32 dBFS. It changes WirePlumber's policy for every application, so
+  it is an option: it needs WirePlumber 0.5 or newer, WirePlumber reads it when it starts —
+  *Restart WirePlumber* is offered, and asks first — and unticking takes it away again.
+  WirePlumber loads it as an optional component, which it skips rather than stop over when it
+  cannot load it. An application closed in the tenth of a second the script holds it silent starts
+  again at its own volume: WirePlumber, which keeps each application's volume for its next start,
+  never keeps the script's silence.
 - **Settings keep what a later version wrote.** A key of `settings.toml` this version does not
   know is written back as it was, so going back a version and up again keeps the newer version's
   settings. 0.4.0 does not keep them: after a downgrade to 0.4.0 its next save drops the keys 0.5.0

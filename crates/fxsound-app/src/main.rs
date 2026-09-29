@@ -1067,6 +1067,9 @@ enum Confirm {
     },
     /// Settings ▸ Reset Presets (0.4.0 audit #21): every unsaved change, on both lanes.
     ResetPresets,
+    /// Settings ▸ Experimental ▸ Restart WirePlumber (roadmap 0.5.0 §7, D5): the sound of every
+    /// application stops for a moment.
+    RestartWirePlumber,
 }
 
 impl Confirm {
@@ -1077,6 +1080,7 @@ impl Confirm {
         let template = match self {
             Self::Delete { .. } => tr(DELETE_QUESTION),
             Self::ResetPresets => tr(RESET_QUESTION),
+            Self::RestartWirePlumber => tr(RESTART_WIREPLUMBER_QUESTION),
         };
         self.question_from(ctx, &template)
     }
@@ -1086,7 +1090,7 @@ impl Confirm {
     fn question_from(&self, ctx: &egui::Context, template: &str) -> String {
         match self {
             Self::Delete { name, .. } => dialogs::message::message_with_name(ctx, template, name),
-            Self::ResetPresets => template.to_owned(),
+            Self::ResetPresets | Self::RestartWirePlumber => template.to_owned(),
         }
     }
 }
@@ -1097,6 +1101,9 @@ const DELETE_QUESTION: &str = "Move the preset %s to the trash?";
 /// The question Reset Presets asks: what it does, which is less than its label says — saved
 /// presets stay.
 const RESET_QUESTION: &str = "Discard the unsaved changes of every preset? Saved presets are kept.";
+/// The question Restart WirePlumber asks: what the restart does to every application's sound.
+const RESTART_WIREPLUMBER_QUESTION: &str =
+    "Restart WirePlumber now? The sound of every application stops for a moment.";
 
 impl<'a> Shell<'a> {
     fn new(rt: &'a mut Runtime, applied_theme: ThemeMode) -> Self {
@@ -1733,6 +1740,11 @@ impl<'a> Shell<'a> {
                     self.confirm = Some(Confirm::ResetPresets);
                     continue;
                 }
+                // Asked first too: the sound stops for a moment, everyone's.
+                SettingsAction::RestartWirePlumber => {
+                    self.confirm = Some(Confirm::RestartWirePlumber);
+                    continue;
+                }
                 _ => {}
             }
             self.rt.app.handle_settings(action, state);
@@ -1778,15 +1790,18 @@ impl<'a> Shell<'a> {
                     log::info!("{name} is no longer the selected preset; not deleting it");
                 }
             }
-            Confirm::ResetPresets => {
+            Confirm::ResetPresets | Confirm::RestartWirePlumber => {
+                let action = if confirm == Confirm::ResetPresets {
+                    SettingsAction::ResetPresets
+                } else {
+                    SettingsAction::RestartWirePlumber
+                };
                 let open = self.settings.is_some();
                 let mut state = self
                     .settings
                     .take()
                     .unwrap_or_else(|| self.rt.app.settings_state());
-                self.rt
-                    .app
-                    .handle_settings(&SettingsAction::ResetPresets, &mut state);
+                self.rt.app.handle_settings(&action, &mut state);
                 self.rt.app.refresh_settings_state(&mut state);
                 if open {
                     self.settings = Some(state);
@@ -3701,17 +3716,17 @@ mod confirmation_tests {
             for language in &LANGUAGES {
                 let table = Catalogue::for_language(language);
                 let translate = |key: &str| table.get(key).unwrap_or(key).to_owned();
-                for confirm in
-                    std::iter::once(Confirm::ResetPresets).chain(names.iter().map(|name| {
-                        Confirm::Delete {
-                            lane: DeviceDirection::Output,
-                            name: name.clone(),
-                        }
+                for confirm in [Confirm::ResetPresets, Confirm::RestartWirePlumber]
+                    .into_iter()
+                    .chain(names.iter().map(|name| Confirm::Delete {
+                        lane: DeviceDirection::Output,
+                        name: name.clone(),
                     }))
                 {
                     let key = match confirm {
                         Confirm::Delete { .. } => DELETE_QUESTION,
                         Confirm::ResetPresets => RESET_QUESTION,
+                        Confirm::RestartWirePlumber => RESTART_WIREPLUMBER_QUESTION,
                     };
                     let question = confirm.question_from(ui.ctx(), &translate(key));
                     let galley =
@@ -3724,7 +3739,7 @@ mod confirmation_tests {
                         galley.size()
                     );
                     let Confirm::Delete { name, .. } = &confirm else {
-                        assert_eq!(question, translate(RESET_QUESTION), "{case}");
+                        assert_eq!(question, translate(key), "{case}");
                         continue;
                     };
                     let template = translate(DELETE_QUESTION);
@@ -3908,6 +3923,37 @@ mod confirmation_tests {
         );
         assert!(shell.settings.is_some(), "the pane stays open");
         assert!(!shell.settings.as_ref().is_some_and(|s| s.can_reset_presets));
+    }
+
+    #[test]
+    fn restart_wireplumber_asks_first_and_keeps_the_pane_open() {
+        // Roadmap 0.5.0 §7, D5: the restart stops every application's sound for a moment. A test
+        // run's app has no WirePlumber of the user's to restart (`App::start_for_tests`).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = runtime(dir.path());
+        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        shell.open_settings();
+        let mut state = shell.settings.take().expect("the pane is open");
+        let closed = shell.act_on_settings(&[SettingsAction::RestartWirePlumber], &mut state);
+        assert!(!closed);
+        shell.settings = Some(state);
+        assert_eq!(
+            shell.confirm.as_ref().map(asked).as_deref(),
+            Some("Restart WirePlumber now? The sound of every application stops for a moment.")
+        );
+        shell.answer(ConfirmChoice::No);
+        assert!(shell.confirm.is_none());
+        let mut state = shell.settings.take().expect("the pane is open");
+        shell.act_on_settings(&[SettingsAction::RestartWirePlumber], &mut state);
+        shell.settings = Some(state);
+        shell.answer(ConfirmChoice::Yes);
+        assert!(shell.confirm.is_none());
+        assert!(shell.settings.is_some(), "the pane stays open");
+        assert_eq!(
+            shell.settings.as_ref().map(|s| s.wireplumber_hook),
+            Some(fxsound_ui::dialogs::settings::WirePlumberHook::default()),
+            "nothing to restart in a test run"
+        );
     }
 }
 

@@ -175,6 +175,7 @@ mod routes;
 mod stranded;
 mod stream_handover;
 mod volume;
+pub mod wireplumber_hook;
 
 use std::thread::JoinHandle;
 use std::time::Duration;

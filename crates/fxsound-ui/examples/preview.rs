@@ -31,7 +31,9 @@
 //! `--parity=LEVEL` (the level of «Like FxSound for Windows», `off`, `interface` or `sound`:
 //! what the Experimental pane's slider stands at, and what the main window's readouts, fine
 //! steps and `--stored` sliders follow, with or without `--settings`; `full` shows as `sound`, as
-//! the app runs a `settings.toml` that says it),
+//! the app runs a `settings.toml` that says it), `--wireplumber-hook=STATE` (the Experimental
+//! pane's "Smooth moves in WirePlumber": `off`, `on`, `due`, `failed` or `old`, a WirePlumber
+//! older than 0.5; available and off otherwise),
 //! `--message[=TEXT]` (the Yes/No message box over the window: `TEXT` is translated, and its `%s`
 //! is a long preset name; the
 //! export's overwrite question otherwise), `--exit-after-paint`. Keys while it
@@ -144,6 +146,22 @@ fn main() -> eframe::Result<()> {
     }
     if let (Some(level), Some(settings)) = (parity, &mut preview.settings) {
         settings.settings.windows_parity = level;
+    }
+    if let Some(settings) = &mut preview.settings {
+        use fxsound_ui::dialogs::settings::{WirePlumberHook, WirePlumberRestart};
+        let which = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--wireplumber-hook="))
+            .unwrap_or("off");
+        settings.wireplumber_hook = WirePlumberHook {
+            available: which != "old",
+            on: matches!(which, "on" | "due" | "failed"),
+            restart: match which {
+                "due" => WirePlumberRestart::Due,
+                "failed" => WirePlumberRestart::Failed,
+                _ => WirePlumberRestart::NotNeeded,
+            },
+        };
     }
     preview.message = args.iter().find_map(|a| {
         a.strip_prefix("--message").map(|rest| {
@@ -607,6 +625,15 @@ impl Preview {
             }
             SettingsAction::SelectDeviceRow(row) => settings.selected_device = Some(*row),
             SettingsAction::SetWindowsParity(level) => settings.settings.windows_parity = *level,
+            SettingsAction::SetWirePlumberHook(on) => {
+                settings.wireplumber_hook.on = *on;
+                settings.wireplumber_hook.restart =
+                    fxsound_ui::dialogs::settings::WirePlumberRestart::Due;
+            }
+            SettingsAction::RestartWirePlumber => {
+                settings.wireplumber_hook.restart =
+                    fxsound_ui::dialogs::settings::WirePlumberRestart::NotNeeded;
+            }
             SettingsAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => {}
         }

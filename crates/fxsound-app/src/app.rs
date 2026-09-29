@@ -50,6 +50,7 @@ use fxsound_core::settings::CalibrationRecord;
 use fxsound_ui::dialogs::settings::{DevicePriority, SettingsState};
 
 mod per_app;
+mod wireplumber;
 
 pub use per_app::{
     AppRuleRefusal, ListedApp, NamedAppRule, apps_named, list_apps, unseen_description, unseen_key,
@@ -655,6 +656,9 @@ pub struct App {
     /// What the engine was last told about holding the microphone awake
     /// ([`UiToAudio::KeepInputAwake`], [`App::hold_microphone_as_needed`]).
     microphone_held: bool,
+    /// Settings ▸ Experimental's "Smooth moves in WirePlumber": FxSound's hook in the user's
+    /// WirePlumber, and the WirePlumber it goes into (roadmap 0.5.0 §7, D5).
+    wireplumber: wireplumber::WirePlumberHost,
 }
 
 impl App {
@@ -765,7 +769,15 @@ impl App {
             window_minimised: false,
             wizard_holds_microphone: false,
             microphone_held: false,
+            // The user's WirePlumber only for a run that may write the user's files.
+            wireplumber: if persist {
+                wireplumber::WirePlumberHost::of_user()
+            } else {
+                wireplumber::WirePlumberHost::none()
+            },
         };
+        // A hook an earlier FxSound installed is this build's from now on.
+        app.wireplumber.bring_up_to_date();
 
         // What the settings file asks of the audio thread before it does anything else. See
         // [`startup_messages`].
@@ -3027,6 +3039,7 @@ impl App {
             window_minimised: false,
             wizard_holds_microphone: false,
             microphone_held: false,
+            wireplumber: wireplumber::WirePlumberHost::none(),
         };
         app.start_the_stream_here();
         app
@@ -4546,6 +4559,7 @@ impl App {
         let mut state = SettingsState::new(self.settings.clone());
         state.version = env!("CARGO_PKG_VERSION").to_owned();
         state.launch_on_startup = autostart_enabled();
+        state.wireplumber_hook = self.wireplumber.state();
         state.devices = self.device_rows(DeviceDirection::Output);
         state.microphones = self.device_rows(DeviceDirection::Input);
         self.refresh_settings_state(&mut state);
@@ -5001,6 +5015,17 @@ impl App {
                 state.settings.hide_notifications = *on;
                 self.notifier.set_hidden(*on);
                 self.persist_settings();
+            }
+            A::SetWirePlumberHook(on) => {
+                if let Err(error) = self.wireplumber.set(*on) {
+                    log::warn!("FxSound's hook in WirePlumber could not be changed: {error}");
+                    self.raise_notice(tr(WIREPLUMBER_NOT_CHANGED));
+                }
+                state.wireplumber_hook = self.wireplumber.state();
+            }
+            A::RestartWirePlumber => {
+                self.wireplumber.restart();
+                state.wireplumber_hook = self.wireplumber.state();
             }
             A::SetLaunchOnStartup(on) => {
                 // The Windows build writes an HKCU\...\Run value; the XDG equivalent is a
@@ -5562,6 +5587,9 @@ impl App {
         true
     }
 }
+
+/// The notice when "Smooth moves in WirePlumber" could not install the hook or take it away.
+pub(crate) const WIREPLUMBER_NOT_CHANGED: &str = "Could not change WirePlumber's settings";
 
 /// `~/.config/autostart/fxsound.desktop` — the XDG Autostart entry that stands in for the
 /// `HKCU\…\CurrentVersion\Run` value (`FxController.cpp:2789-2812`).
@@ -15029,5 +15057,55 @@ mod tests {
         );
         assert_eq!(app.settings().windows_parity, WindowsParity::Interface);
         assert_eq!(app.windows_parity(), WindowsParity::Interface);
+    }
+
+    /// Settings ▸ Experimental ▸ "Smooth moves in WirePlumber" (roadmap 0.5.0 §7, D5): the tick
+    /// installs the hook where the host says, the pane then offers the restart WirePlumber needs,
+    /// and a run that may not touch the user's files refuses with a notice.
+    #[test]
+    fn smooth_moves_in_wireplumber_installs_the_hook_from_the_pane_and_says_a_restart_is_due() {
+        use fxsound_audio::wireplumber_hook::{Installed, Place};
+        use fxsound_ui::dialogs::settings::{SettingsAction, WirePlumberHook, WirePlumberRestart};
+
+        let mut app = App::headless_for_tests();
+        let mut state = app.settings_state();
+        assert_eq!(state.wireplumber_hook, WirePlumberHook::default());
+        app.drain_events();
+        app.handle_settings(&SettingsAction::SetWirePlumberHook(true), &mut state);
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some(WIREPLUMBER_NOT_CHANGED)
+        );
+        assert!(!state.wireplumber_hook.on);
+
+        let dir = tempfile::TempDir::new().expect("a scratch directory");
+        let place = Place::under(&dir.path().join("config"), &dir.path().join("data"));
+        app.wireplumber = wireplumber::WirePlumberHost::for_tests(
+            place.clone(),
+            || Some((0, 5, 17)),
+            |_| Some(true),
+            || Ok(()),
+        );
+        let mut state = app.settings_state();
+        assert_eq!(
+            state.wireplumber_hook,
+            WirePlumberHook {
+                available: true,
+                on: false,
+                restart: WirePlumberRestart::NotNeeded
+            }
+        );
+        app.handle_settings(&SettingsAction::SetWirePlumberHook(true), &mut state);
+        assert_eq!(place.installed(), Installed::Current);
+        assert!(state.wireplumber_hook.on);
+        assert_eq!(state.wireplumber_hook.restart, WirePlumberRestart::Due);
+        // The stand-in's WirePlumber is still the one from before the change.
+        app.handle_settings(&SettingsAction::RestartWirePlumber, &mut state);
+        assert_eq!(state.wireplumber_hook.restart, WirePlumberRestart::Failed);
+
+        app.handle_settings(&SettingsAction::SetWirePlumberHook(false), &mut state);
+        assert_eq!(place.installed(), Installed::No);
+        assert!(!state.wireplumber_hook.on);
+        assert_eq!(state.wireplumber_hook.restart, WirePlumberRestart::Due);
     }
 }

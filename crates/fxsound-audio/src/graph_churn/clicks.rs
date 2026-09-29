@@ -54,6 +54,9 @@
 //! 4. the desktop picking another default device (`wpctl set-default`) with FxSound on,
 //! 5. and with FxSound off;
 //!
+//! 4 and 5 again with FxSound's hook in WirePlumber (`crate::wireplumber_hook`, D5), which fades
+//! the moves WirePlumber makes itself;
+//!
 //! and the music equalizer and presets, the voice equalizer and presets, and «Like FxSound for
 //! Windows» moved between Off and Interface and sound, on the lane and in an application's route
 //! (roadmap 0.5.0 §1 A4). Every stream but the
@@ -109,7 +112,10 @@
 //! hears a click beside the sound it cuts. What the move leaves at the monitor of the speakers
 //! FxSound played through, read on that monitor alone — the end of the sound it cut off in
 //! FxSound's chain, faded since D4 — is gated ([`left_behind`]). With FxSound off the pick is
-//! WirePlumber's alone, and reported: it is what the other is held to.
+//! WirePlumber's alone, and reported: it is what the other is held to. With FxSound's hook in
+//! WirePlumber (D5, an option of Settings ▸ Experimental) WirePlumber fades its own moves too, and
+//! the same picks, with FxSound on and with it off, are gated, WirePlumber's move and FxSound's
+//! claim alike ([`Scenario::hook`]).
 //!
 //! # Running it
 //!
@@ -119,7 +125,7 @@
 //!
 //! `--nocapture` shows the tables; one test at a time keeps the other tests' daemons from causing
 //! the xruns that would discard runs. [`FXSOUND_CLICK_REPORT`](REPORT_FILE) names a file every
-//! table is appended to as well. The eleven measurements take about a quarter of an hour, and
+//! table is appended to as well. The thirteen measurements take about twenty minutes, and
 //! their names share the prefix `under_a_steady_tone`, by which CI's Arch Linux leg leaves them out
 //! of its test step and runs them in one of their own, in `report` mode, with the tables in the
 //! job's summary (`.github/workflows/ci.yml`). They also run in a plain `cargo test --workspace`,
@@ -141,8 +147,8 @@
 //!   [`EventResult::dip_ms`] as well ([`Scenario::budget`]). D3 also held WirePlumber's move after
 //!   the desktop's pick to plain Linux + 3 dB ([`against_bare_linux`]); D4 faded FxSound's part
 //!   of it, the tail it cut off in FxSound's chain, and gates it at the monitor of the speakers
-//!   FxSound played through, read on its own ([`left_behind`]); D5, whose hook makes the rest
-//!   fade, is to gate that in a test of its own.
+//!   FxSound played through, read on its own ([`left_behind`]); D5, whose hook in WirePlumber
+//!   makes the rest fade, gates the desktop's picks with it in tests of their own.
 //! * A phase that says a reported switch got quieter judges by the loudest run, of several passes,
 //!   not by a shift of the median: what WirePlumber's move leaves spreads over about 20 dB (below).
 //! * A phase that changes what a scenario sets up — a new node between the tone and the recorder,
@@ -192,6 +198,20 @@
 //! −41.1, and single runs of the power going off reached −11.7. So a phase that makes a move
 //! quieter does not read an improvement from a median that moved within these ranges: it runs
 //! several passes and judges by the loudest run of all of them, the `loudest run` of each table.
+//!
+//! FxSound's hook in WirePlumber, measured on 29.09.2026 at D5 in the same way: the desktop's picks
+//! with FxSound on left, over two passes, −53.8…−61.2 dBFS for WirePlumber's move (the loudest run
+//! −52.9) and −61.8…−63.8 for FxSound's claim on the speakers' lane, −58.6…−69.0 and −71.8…−76.6
+//! on the microphone's, dips 100–160 ms; with FxSound off and ranking its devices, −59.8…−60.7
+//! and −65.9…−66.7, dips 50–100 ms. The microphone's claim is not always under the gate: in one
+//! run of a pass it jumped once in 24 switches, at −34.1 in the pass above and at −17.7 in a
+//! later one (`t_other` to `t_mic2`), as loud as plain Linux — the converter's new volume played
+//! before its ramp, below, which the hook does not end — and the scenario passes within
+//! [`Budget::loud_runs`]. Without the hook WirePlumber's move is plain Linux's −19 to −28. A first
+//! version of the hook gave the volume back 20 ms after the new link whatever the stream had left:
+//! run beside the rest of the tests, FxSound's claim then met the hook's fade in on the same
+//! stream, and the converter, refusing a second ramp, jumped: −18.8 to −31.1 in two runs of three.
+//! A stream moved off FxSound's nodes is now held silent until FxSound has moved it back.
 //!
 //! «Like FxSound for Windows», measured on 29.09.2026 in the same way at W1d of 0.5.0, both scenarios
 //! at −6 dB of master gain and +4 dB of balance: on the engine before W1d the lane's move to
@@ -888,6 +908,15 @@ struct Scenario {
     /// claim (its [`AudioToUi::RememberedDefault`]), reported; FxSound's from then on, held to the
     /// gate when the scenario is `gated`.
     claims: bool,
+    /// Whether the graph's WirePlumber runs FxSound's hook ([`crate::wireplumber_hook`]), which
+    /// fades the streams it moves itself: then WirePlumber's move after a desktop pick is held to
+    /// the gate too ([`Self::rows`]).
+    hook: bool,
+    /// Whether FxSound ranks the graph's devices, the first ones of each direction above the
+    /// others ([`UiToAudio::SetDevicePriority`]), as the app has it unless *Follow the system's
+    /// default device* is ticked; otherwise the engine follows the system's default, as it does
+    /// until the app ranks its devices.
+    ranked: bool,
 }
 
 impl Scenario {
@@ -901,7 +930,7 @@ impl Scenario {
                 let label = switch.label();
                 if self.claims {
                     vec![
-                        (format!("{label}: the move"), false),
+                        (format!("{label}: the move"), self.gated && self.hook),
                         (format!("{label}: FxSound's claim"), self.gated),
                     ]
                 } else {
@@ -1013,9 +1042,14 @@ struct Bench {
 }
 
 impl Bench {
-    /// `None` when the graph could not run here (a skip, said by [`PolicyGraph::start`]).
-    fn start(tag: &str) -> Option<Self> {
-        let graph = PolicyGraph::start(tag)?;
+    /// `None` when the graph could not run here (a skip, said by [`PolicyGraph::start`]). With
+    /// FxSound's `hook` in the graph's WirePlumber, or without it.
+    fn start(tag: &str, hook: bool) -> Option<Self> {
+        let graph = if hook {
+            PolicyGraph::start_with_the_hook(tag)?
+        } else {
+            PolicyGraph::start(tag)?
+        };
         let engine =
             AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
         let mut said = Transcript::default();
@@ -1558,7 +1592,7 @@ struct Run {
 
 /// Run `scenario` once on a fresh bench. `None` when it cannot run here.
 fn run_once(scenario: &Scenario) -> Option<Run> {
-    let mut bench = Bench::start(scenario.tag)?;
+    let mut bench = Bench::start(scenario.tag, scenario.hook)?;
     for tool in ["pw-cat", "pw-record", "pw-dump", "pw-link", "pw-metadata"] {
         if !installed(tool) {
             skip(&format!(
@@ -1574,6 +1608,17 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
     // Longer than the run by far: the tone must not end inside what is read.
     let length = 15.0 + scenario.spacing.as_secs_f64() * (scenario.switches.len() + 1) as f64;
     let pinned = scenario.streams == Streams::Pinned;
+    if scenario.ranked {
+        for (lane, direction) in DeviceDirection::ALL.into_iter().enumerate() {
+            bench.engine.send(UiToAudio::SetDevicePriority {
+                direction,
+                names: [false, true]
+                    .map(|other| lane_devices(other)[lane].to_owned())
+                    .to_vec(),
+                new_devices_first: false,
+            });
+        }
+    }
     // Before any stream exists, so that a route is where the player and the recorder start.
     for switch in &scenario.before {
         bench.act(switch);
@@ -2213,6 +2258,8 @@ fn under_a_steady_tone_the_power_switch_does_not_click_in_streams_pinned_to_fxso
         budget: None,
         pulse: false,
         claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
@@ -2239,6 +2286,8 @@ fn under_a_steady_tone_the_power_switch_moves_the_streams_that_follow_the_defaul
         budget: Some(HANDOVER_BUDGET),
         pulse: false,
         claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
@@ -2266,6 +2315,8 @@ fn under_a_steady_tone_the_power_switch_moves_pulseaudio_applications_that_follo
         budget: Some(HANDOVER_BUDGET),
         pulse: true,
         claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
@@ -2301,6 +2352,8 @@ fn under_a_steady_tone_the_equalizer_and_the_music_presets_switch_without_a_clic
         budget: None,
         pulse: false,
         claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
@@ -2330,6 +2383,8 @@ fn under_a_steady_tone_moving_like_fxsound_for_windows_between_off_and_sound_doe
         budget: None,
         pulse: false,
         claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
@@ -2358,6 +2413,8 @@ fn under_a_steady_tone_moving_like_fxsound_for_windows_in_an_application_route_d
         budget: None,
         pulse: false,
         claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
@@ -2388,6 +2445,8 @@ fn under_a_steady_tone_the_voice_equalizer_and_the_voice_presets_switch_without_
         budget: None,
         pulse: false,
         claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
@@ -2413,6 +2472,8 @@ fn under_a_steady_tone_an_application_route_moves_the_streams_on_and_off_without
         budget: Some(HANDOVER_BUDGET),
         pulse: false,
         claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
@@ -2441,6 +2502,8 @@ fn under_a_steady_tone_fxsound_picks_another_device_without_a_click() {
         budget: Some(HANDOVER_BUDGET),
         pulse: false,
         claims: false,
+        hook: false,
+        ranked: false,
     });
 }
 
@@ -2473,6 +2536,42 @@ fn desktop_picks(on: bool) -> Scenario {
         budget: on.then_some(HANDOVER_BUDGET),
         pulse: false,
         claims: on,
+        hook: false,
+        ranked: false,
+    }
+}
+
+/// [`desktop_picks`] with FxSound's hook in the graph's WirePlumber (roadmap §7, D5; test 4 "with
+/// the hook"): every move WirePlumber makes itself is faded, so each pick is held to the gate,
+/// WirePlumber's move as well as FxSound's claim after it with FxSound `on`.
+///
+/// With FxSound off, FxSound ranks its devices ([`Scenario::ranked`]), as it does unless *Follow
+/// the system's default device* is ticked. Following it, FxSound's lane — out of the sound, with
+/// the power off — moves to the picked device too, about 0.2 s after the pick, and that move
+/// clicks the stream the hook has just faded in there: −23 to −32 dBFS where the pick itself was
+/// −60 (measured for D5, 3 runs × 4 picks; with the hook's fade in held back 300 ms, past it, the
+/// click went). That is FxSound's own lane moving under another application's sound, not
+/// WirePlumber's move, and not this scenario's.
+fn desktop_picks_with_the_hook(on: bool) -> Scenario {
+    Scenario {
+        tag: if on { "clk-hookon" } else { "clk-hookoff" },
+        title: if on {
+            "desktop picks the default device, FxSound on, FxSound's hook in WirePlumber"
+        } else {
+            "desktop picks the default device, FxSound off, FxSound's hook in WirePlumber"
+        },
+        gated: true,
+        note: if on {
+            "Each pick is two moves: WirePlumber's, faded by FxSound's hook in WirePlumber, and \
+             FxSound's claim of the default back; both gated (roadmap 0.5.0 §7 test 4, D5)"
+        } else {
+            "WirePlumber's move alone, faded by FxSound's hook in WirePlumber, with FxSound \
+             ranking its devices; gated (roadmap 0.5.0 §7, D5)"
+        },
+        budget: Some(HANDOVER_BUDGET),
+        hook: true,
+        ranked: !on,
+        ..desktop_picks(on)
     }
 }
 
@@ -2520,6 +2619,34 @@ fn under_a_steady_tone_a_desktop_pick_with_fxsound_on_is_taken_back_without_a_cl
         result.failures.extend(held.failures);
     }
     conclude(result);
+}
+
+/// The desktop's picks with FxSound on, with FxSound's hook in WirePlumber (roadmap §7, test 4
+/// with the hook; D5): WirePlumber fades each stream it moves off FxSound's nodes onto the picked
+/// device and back in once it is there, and FxSound takes the default back as without it. Both
+/// moves of each pick are gated, and what the move leaves at the speakers FxSound played through is
+/// held as without the hook ([`left_behind`]).
+#[test]
+fn under_a_steady_tone_a_desktop_pick_with_fxsound_on_and_its_hook_in_wireplumber_does_not_click() {
+    let gate = Gate::from_env();
+    let scenario = desktop_picks_with_the_hook(true);
+    let Some(measured) = measure(&scenario) else {
+        return;
+    };
+    let mut result = report(&scenario, gate, &measured.clean, &measured.discarded);
+    let faded = left_behind(&scenario, gate, &measured.clean);
+    result.text.push_str(&faded.text);
+    result.failures.extend(faded.failures);
+    conclude(result);
+}
+
+/// The desktop's picks with FxSound off, with FxSound's hook in WirePlumber and FxSound ranking its
+/// devices: WirePlumber alone moves the streams, and the hook fades each move. Plain Linux's
+/// click, which the option takes away with FxSound out of the sound too; gated.
+#[test]
+fn under_a_steady_tone_a_desktop_pick_with_fxsound_off_and_its_hook_in_wireplumber_does_not_click()
+{
+    check(&desktop_picks_with_the_hook(false));
 }
 
 /// The same picks with FxSound's power off (roadmap §7, test 5): FxSound is out of the sound, and
@@ -2899,6 +3026,8 @@ fn a_handovers_switch_over_the_gate_in_one_run_is_listed_and_in_two_fails_the_ha
         budget: Some(HANDOVER_BUDGET),
         pulse: true,
         claims: false,
+        hook: false,
+        ranked: false,
     };
     let run = |worst: [f64; 2]| Run {
         lanes: vec![Analysis {

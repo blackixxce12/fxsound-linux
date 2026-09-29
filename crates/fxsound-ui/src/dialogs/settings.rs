@@ -813,6 +813,38 @@ pub struct SettingsState {
     /// Whether a microphone is selected. Calibration measures one, so without it the button is
     /// disabled rather than opening a wizard with nothing to listen to (0.4.0 design §8).
     pub has_microphone: bool,
+    /// Settings ▸ Experimental's "Smooth moves in WirePlumber". Not part of [`Settings`], for the
+    /// reason [`SettingsState::launch_on_startup`] is not: it is two files in WirePlumber's own
+    /// directories, and the app layer reads them and fills this in.
+    pub wireplumber_hook: WirePlumberHook,
+}
+
+/// "Smooth moves in WirePlumber" (roadmap 0.5.0 §7, D5): FxSound's hook in the user's WirePlumber,
+/// which fades the streams WirePlumber moves itself — a device picked in the desktop's sound
+/// settings among them — as FxSound fades the ones it moves (`fxsound_audio::wireplumber_hook`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WirePlumberHook {
+    /// Whether it can be offered: WirePlumber 0.5 or later is installed. Unticked and greyed out
+    /// otherwise, with the line saying why.
+    pub available: bool,
+    /// Whether it is ticked: the hook's files are where WirePlumber reads them.
+    pub on: bool,
+    /// Whether the WirePlumber that runs has read them as they are.
+    pub restart: WirePlumberRestart,
+}
+
+/// Whether the WirePlumber that runs has what the tick box says: it reads the hook's files only
+/// when it starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WirePlumberRestart {
+    /// It has, or no WirePlumber runs to say otherwise.
+    #[default]
+    NotNeeded,
+    /// It started before the box was last ticked or unticked: "Restart WirePlumber" is offered.
+    Due,
+    /// A restart was asked for and WirePlumber is still the one from before — it was not started
+    /// by systemd, or systemd could not restart it. The next login brings the change.
+    Failed,
 }
 
 impl Default for SettingsState {
@@ -840,6 +872,7 @@ impl SettingsState {
             echo_cancel_trouble: None,
             input_processing: false,
             has_microphone: false,
+            wireplumber_hook: WirePlumberHook::default(),
         }
     }
 
@@ -997,6 +1030,12 @@ pub enum SettingsAction {
     /// its label, an arrow key, a wheel notch, a right-click (back to Off), or a drag let go —
     /// never the positions a drag passes on its way.
     SetWindowsParity(WindowsParity),
+    /// "Smooth moves in WirePlumber" ticked or unticked: install FxSound's hook in the user's
+    /// WirePlumber, or take it away. Only emitted while it is available.
+    SetWirePlumberHook(bool),
+    /// "Restart WirePlumber", so that it reads the hook's files as they are now. The window asks
+    /// first: the sound stops for a moment. Only emitted while a restart is due.
+    RestartWirePlumber,
 
     /// Close the window — the ✕ or Escape (`FxSettingsDialog.cpp:78-88`). The caller then runs
     /// the equivalent of `FxController::refreshOutputList()` (`FxMainWindow.cpp:454`).
@@ -2884,6 +2923,15 @@ pub mod experimental {
     pub const HINT_Y: f32 = 155.0;
     /// Height of the hint's one line.
     pub const HINT_HEIGHT: f32 = 20.0;
+    /// y of "Smooth moves in WirePlumber": twenty under the hint, as the General pane's first
+    /// checkbox is under the language switch.
+    pub const HOOK_Y: f32 = 195.0;
+    /// The checkbox's height, the Microphone pane's.
+    pub const HOOK_HEIGHT: f32 = 30.0;
+    /// Room for three lines of the small font: the lines under the checkbox.
+    pub const HOOK_LINE_HEIGHT: f32 = 54.0;
+    /// Above "Restart WirePlumber", as above the Microphone pane's button.
+    pub const GAP_BEFORE_RESTART: f32 = 10.0;
 }
 
 /// The heading over the slider.
@@ -2891,6 +2939,67 @@ pub const LIKE_WINDOWS_TITLE: &str = "Like FxSound for Windows";
 /// The slider's tooltip: what no level takes away. Shown unless help tips are hidden.
 pub const LIKE_WINDOWS_TIP: &str = "Always kept: the preset trash and autosave, fixed port errors, \
 click-free switching, the command line and D-Bus. No setting is deleted.";
+
+/// The checkbox of FxSound's hook in WirePlumber.
+pub const WIREPLUMBER_HOOK: &str = "Smooth moves in WirePlumber";
+/// The line under it: what it does, and whose settings it changes.
+pub const WIREPLUMBER_HOOK_HINT: &str = "Fades the sound WirePlumber moves, as when the desktop picks another device. Changes WirePlumber's settings.";
+/// The line under it where there is no WirePlumber 0.5.
+pub const WIREPLUMBER_TOO_OLD: &str = "Needs WirePlumber 0.5 or newer.";
+/// The line under it once it was ticked or unticked, until WirePlumber restarts.
+pub const WIREPLUMBER_RESTART_DUE: &str = "WirePlumber takes the change when it restarts.";
+/// The line under it when a restart was asked for and did not happen.
+pub const WIREPLUMBER_RESTART_FAILED: &str =
+    "WirePlumber could not be restarted here. It takes the change at your next login.";
+/// The button that restarts WirePlumber, after asking.
+pub const RESTART_WIREPLUMBER: &str = "Restart WirePlumber";
+
+/// "Smooth moves in WirePlumber": a checkbox the width of the row.
+#[must_use]
+pub fn wireplumber_hook_rect(pane: Rect) -> Rect {
+    let row = parity_row(pane);
+    Rect::from_min_size(
+        pos2(row.left(), pane.top() + experimental::HOOK_Y),
+        vec2(row.width(), experimental::HOOK_HEIGHT),
+    )
+}
+
+/// The lines under the checkbox, indented to its caption, as the echo canceller's status is.
+#[must_use]
+pub fn wireplumber_line_rect(pane: Rect) -> Rect {
+    let toggle = wireplumber_hook_rect(pane);
+    let indent = TICK_BOX_SIDE + TICK_BOX_GAP;
+    Rect::from_min_size(
+        pos2(toggle.left() + indent, toggle.bottom()),
+        vec2(toggle.width() - indent, experimental::HOOK_LINE_HEIGHT),
+    )
+}
+
+/// "Restart WirePlumber", sized like the reset button (see [`reset_button_size`]), under the
+/// lines at the pane's margin, as "Calibrate microphone…" is under the echo canceller's.
+#[must_use]
+pub fn restart_wireplumber_rect(pane: Rect, size: Vec2) -> Rect {
+    Rect::from_min_size(
+        pos2(
+            parity_row(pane).left(),
+            wireplumber_line_rect(pane).bottom() + experimental::GAP_BEFORE_RESTART,
+        ),
+        size,
+    )
+}
+
+impl WirePlumberHook {
+    /// The line under the checkbox, untranslated.
+    #[must_use]
+    pub const fn line(self) -> &'static str {
+        match (self.available, self.restart) {
+            (_, WirePlumberRestart::Due) => WIREPLUMBER_RESTART_DUE,
+            (_, WirePlumberRestart::Failed) => WIREPLUMBER_RESTART_FAILED,
+            (false, WirePlumberRestart::NotNeeded) => WIREPLUMBER_TOO_OLD,
+            (true, WirePlumberRestart::NotNeeded) => WIREPLUMBER_HOOK_HINT,
+        }
+    }
+}
 
 /// The row the heading, the labels and the hint share: the pane less a margin each side.
 #[must_use]
@@ -3072,6 +3181,54 @@ fn experimental_pane(
         && level != current
     {
         response.push(SettingsAction::SetWindowsParity(level));
+    }
+
+    wireplumber_hook(ui, pane, state.wireplumber_hook, palette, id, response);
+}
+
+/// "Smooth moves in WirePlumber", the line under it, and "Restart WirePlumber" while a restart is
+/// due (roadmap 0.5.0 §7, D5). Greyed out without WirePlumber 0.5 — ticked all the same if the
+/// hook is there, so that it can still be taken away.
+fn wireplumber_hook(
+    ui: &mut Ui,
+    pane: Rect,
+    hook: WirePlumberHook,
+    palette: Palette,
+    id: Id,
+    response: &mut DialogResponse<SettingsAction>,
+) {
+    if toggle(
+        ui,
+        wireplumber_hook_rect(pane),
+        &tr(WIREPLUMBER_HOOK),
+        hook.on,
+        hook.available || hook.on,
+        palette,
+        id.with("wireplumber-hook"),
+    ) {
+        response.push(SettingsAction::SetWirePlumberHook(!hook.on));
+    }
+    draw_wrapped(
+        ui.painter(),
+        &tr(hook.line()),
+        small_font(),
+        palette.color(FxColor::HintText),
+        wireplumber_line_rect(pane),
+    );
+    if hook.restart == WirePlumberRestart::Due {
+        let label = tr(RESTART_WIREPLUMBER);
+        let text_width = ui
+            .painter()
+            .layout_no_wrap(label.clone(), normal_font(), Color32::PLACEHOLDER)
+            .size()
+            .x;
+        let button = restart_wireplumber_rect(pane, reset_button_size(&label, text_width));
+        if TextButton::new(&label)
+            .show(ui, button, palette, id.with("restart-wireplumber"))
+            .clicked()
+        {
+            response.push(SettingsAction::RestartWirePlumber);
+        }
     }
 }
 
@@ -6223,6 +6380,160 @@ mod tests {
                     if used > pane_title_rect(pane).width() {
                         problems.push(format!("{tab:?} {code}: {text:?} is {used:.1}"));
                     }
+                }
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    // ---- Smooth moves in WirePlumber ------------------------------------------------------
+
+    fn with_hook(available: bool, on: bool, restart: WirePlumberRestart) -> SettingsState {
+        let mut state = experimental_state(WindowsParity::Off);
+        state.wireplumber_hook = WirePlumberHook {
+            available,
+            on,
+            restart,
+        };
+        state
+    }
+
+    /// What the pane draws for `state`, as text.
+    fn experimental_texts(state: &SettingsState) -> Vec<String> {
+        let mut window = Window::new(ThemeMode::Dark);
+        let (_, shapes) = window.frame(state, Vec::new());
+        crate::views::testing::texts(&shapes)
+            .into_iter()
+            .map(|(text, _, _)| text)
+            .collect()
+    }
+
+    #[test]
+    fn the_hooks_box_the_lines_under_it_and_its_button_sit_under_the_slider_inside_the_pane() {
+        let pane = shown_pane();
+        let hook = wireplumber_hook_rect(pane);
+        let line = wireplumber_line_rect(pane);
+        let button = restart_wireplumber_rect(pane, vec2(audio::RESET_MAX_WIDTH, 24.0));
+        assert!(parity_hint_rect(pane).bottom() < hook.top());
+        assert!(hook.bottom() <= line.top() && line.bottom() <= button.top());
+        let row = parity_row(pane);
+        for rect in [hook, line, button] {
+            assert!(
+                rect.left() >= row.left() && rect.right() <= row.right() + 1e-3,
+                "{rect:?} in {row:?}"
+            );
+        }
+        assert!(button.bottom() <= pane.bottom());
+    }
+
+    #[test]
+    fn ticking_smooth_moves_in_wireplumber_asks_for_the_hook_and_unticking_takes_it_away() {
+        let at = wireplumber_hook_rect(shown_pane()).left_center() + vec2(5.0, 0.0);
+        let off = with_hook(true, false, WirePlumberRestart::NotNeeded);
+        assert_eq!(
+            click_settings(&off, at),
+            [SettingsAction::SetWirePlumberHook(true)]
+        );
+        let on = with_hook(true, true, WirePlumberRestart::NotNeeded);
+        assert_eq!(
+            click_settings(&on, at),
+            [SettingsAction::SetWirePlumberHook(false)]
+        );
+    }
+
+    #[test]
+    fn without_wireplumber_0_5_the_box_cannot_be_ticked_but_a_hook_left_there_can_be_unticked() {
+        let at = wireplumber_hook_rect(shown_pane()).left_center() + vec2(5.0, 0.0);
+        let unavailable = with_hook(false, false, WirePlumberRestart::NotNeeded);
+        assert_eq!(click_settings(&unavailable, at), []);
+        assert!(experimental_texts(&unavailable).contains(&WIREPLUMBER_TOO_OLD.to_owned()));
+        let left_there = with_hook(false, true, WirePlumberRestart::NotNeeded);
+        assert_eq!(
+            click_settings(&left_there, at),
+            [SettingsAction::SetWirePlumberHook(false)]
+        );
+    }
+
+    #[test]
+    fn restart_wireplumber_is_offered_only_while_a_restart_is_due() {
+        let button = |state: &SettingsState| {
+            experimental_texts(state).contains(&RESTART_WIREPLUMBER.to_owned())
+        };
+        for (restart, line, offered) in [
+            (WirePlumberRestart::NotNeeded, WIREPLUMBER_HOOK_HINT, false),
+            (WirePlumberRestart::Due, WIREPLUMBER_RESTART_DUE, true),
+            (
+                WirePlumberRestart::Failed,
+                WIREPLUMBER_RESTART_FAILED,
+                false,
+            ),
+        ] {
+            let state = with_hook(true, true, restart);
+            assert_eq!(button(&state), offered, "{restart:?}");
+            let texts = experimental_texts(&state);
+            // Wrapped: each of the line's words is drawn.
+            let drawn = texts.join(" ");
+            assert!(
+                line.split_whitespace().all(|word| drawn.contains(word)),
+                "{restart:?}: {texts:?}"
+            );
+        }
+        let due = with_hook(true, false, WirePlumberRestart::Due);
+        let ctx = test_context();
+        let label = RESTART_WIREPLUMBER;
+        let mut width = 0.0;
+        frame(&ctx, |ui| {
+            width = ui
+                .painter()
+                .layout_no_wrap(label.to_owned(), normal_font(), Color32::PLACEHOLDER)
+                .size()
+                .x;
+        });
+        let at = restart_wireplumber_rect(shown_pane(), reset_button_size(label, width)).center();
+        assert_eq!(
+            click_settings(&due, at),
+            [SettingsAction::RestartWirePlumber]
+        );
+    }
+
+    #[test]
+    fn every_language_fits_the_hooks_box_its_lines_and_its_button() {
+        let ctx = test_context();
+        let pane = pane_rect(content());
+        let box_room = wireplumber_hook_rect(pane).width() - TICK_BOX_SIDE - TICK_BOX_GAP;
+        let line = wireplumber_line_rect(pane);
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            problems.extend(wider_than(ui, WIREPLUMBER_HOOK, &normal_font(), box_room));
+            for key in [
+                WIREPLUMBER_HOOK_HINT,
+                WIREPLUMBER_TOO_OLD,
+                WIREPLUMBER_RESTART_DUE,
+                WIREPLUMBER_RESTART_FAILED,
+            ] {
+                for (code, text) in every_translation(key) {
+                    let size = ui
+                        .painter()
+                        .layout(
+                            text.clone(),
+                            small_font(),
+                            Color32::PLACEHOLDER,
+                            line.width(),
+                        )
+                        .size();
+                    if size.y > line.height() || size.x > line.width() {
+                        problems.push(format!("{code}: {text:?} is {size:?} in {:?}", line.size()));
+                    }
+                }
+            }
+            for (code, text) in every_translation(RESTART_WIREPLUMBER) {
+                let used = ui
+                    .painter()
+                    .layout_no_wrap(text.clone(), normal_font(), Color32::PLACEHOLDER)
+                    .size()
+                    .x;
+                if reset_button_size(&text, used).y > audio::RESET_LINE_HEIGHT {
+                    problems.push(format!("{code}: {text:?} wraps"));
                 }
             }
         });

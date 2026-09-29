@@ -110,6 +110,9 @@ wireplumber.profiles = {
 }
 ";
 
+/// The graph's WirePlumber's log, in the graph's directory.
+const SESSION_MANAGER_LOG: &str = "wireplumber.log";
+
 /// A [`PrivateGraph`] with WirePlumber managing it. The PulseAudio server goes first when it is
 /// dropped, then the session manager, then the daemon and its directory.
 pub(crate) struct PolicyGraph {
@@ -142,7 +145,8 @@ fn skip_without_session_manager(reason: &str) {
     println!("SKIPPED: {reason}");
 }
 
-/// Whether `wireplumber --version` names a library of 0.5 or later.
+/// Whether `wireplumber --version` names a library of 0.5 or later
+/// ([`crate::wireplumber_hook::supported`]).
 fn wireplumber_05() -> bool {
     let Ok(output) = support::command("wireplumber")
         .arg("--version")
@@ -152,15 +156,8 @@ fn wireplumber_05() -> bool {
     else {
         return false;
     };
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.split_whitespace()
-        .skip_while(|word| *word != "libwireplumber")
-        .nth(1)
-        .and_then(|version| {
-            let mut parts = version.split('.').map(str::parse::<u32>);
-            Some((parts.next()?.ok()?, parts.next()?.ok()?))
-        })
-        .is_some_and(|version| version >= (0, 5))
+    crate::wireplumber_hook::parse_version(&String::from_utf8_lossy(&output.stdout))
+        .is_some_and(crate::wireplumber_hook::supported)
 }
 
 /// The environment every process of `graph`'s own runs in beside the daemon: its runtime
@@ -204,6 +201,21 @@ impl PolicyGraph {
     /// when there is no `pipewire` (a skip, as for every graph here) or no WirePlumber 0.5 (a skip
     /// that passes everywhere); a WirePlumber that is there and never comes up is a failure.
     pub(crate) fn start(tag: &str) -> Option<Self> {
+        Self::start_prepared(tag, |_| {})
+    }
+
+    /// [`Self::start`], with FxSound's hook in WirePlumber installed where the graph's WirePlumber
+    /// reads it ([`crate::wireplumber_hook`]), as Settings ▸ Experimental installs it for a user.
+    pub(crate) fn start_with_the_hook(tag: &str) -> Option<Self> {
+        Self::start_prepared(tag, |hook| hook.install().expect("the hook installs"))
+    }
+
+    /// [`Self::start`], with `prepare` given the place of FxSound's hook in the graph's
+    /// WirePlumber's directories before WirePlumber starts.
+    pub(crate) fn start_prepared(
+        tag: &str,
+        prepare: impl FnOnce(&crate::wireplumber_hook::Place),
+    ) -> Option<Self> {
         if !wireplumber_05() {
             skip_without_session_manager(&format!(
                 "WirePlumber 0.5 is not installed, so {tag} cannot run"
@@ -228,15 +240,17 @@ impl PolicyGraph {
             PROFILE,
         )
         .expect("the graph's directory is ours");
+        prepare(&Self::hook_place(&graph));
         let mut command = support::command("wireplumber");
         private_environment(&graph, &mut command);
         command
             .args(["-p", "fxsound-test"])
-            .env_remove("WIREPLUMBER_DEBUG")
+            // Warnings, and what FxSound's hook says it did ([`Self::session_manager_log`]).
+            .env("WIREPLUMBER_DEBUG", "2,s-fxsound:4")
             .env_remove("WIREPLUMBER_CONFIG_DIR")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(support::log_to(&graph.dir.join(SESSION_MANAGER_LOG)));
         let session_manager = support::spawn(command).expect("wireplumber should start");
         let graph = Self {
             pulse: None,
@@ -255,6 +269,18 @@ impl PolicyGraph {
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("the private WirePlumber never picked a default sink");
+    }
+
+    /// Where FxSound's hook goes for `graph`'s WirePlumber: the configuration and data
+    /// directories of its environment ([`private_environment`]).
+    fn hook_place(graph: &PrivateGraph) -> crate::wireplumber_hook::Place {
+        crate::wireplumber_hook::Place::under(&graph.dir.join("config"), &graph.dir.join("data"))
+    }
+
+    /// What the graph's WirePlumber has written to its log: warnings and errors, and the lines of
+    /// FxSound's hook.
+    pub(crate) fn session_manager_log(&self) -> String {
+        std::fs::read_to_string(self.graph.dir.join(SESSION_MANAGER_LOG)).unwrap_or_default()
     }
 
     /// Start `pipewire-pulse` on this graph, with the configuration it is installed with, and wait

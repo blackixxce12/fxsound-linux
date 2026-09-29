@@ -71,6 +71,7 @@ use std::time::{Duration, Instant};
 pub(crate) mod apps;
 mod clicks;
 mod handover;
+mod hook;
 mod policy;
 mod routes;
 mod sleep;
