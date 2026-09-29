@@ -351,7 +351,10 @@ page and metainfo — and never touches a running FxSound. Every package's CI jo
 FxSound publishes its own sink. Everything written there is processed and rendered to whichever real
 device you pick in the app. That is the same shape as the Windows virtual driver, implemented with
 PipeWire nodes instead of a kernel driver — which also means uninstalling is `pkill fxsound` and
-your audio comes straight back.
+your audio comes straight back. The one exception is
+[*Smooth moves in WirePlumber*](#deliberate-differences-from-the-windows-build): once ticked, it
+leaves a script for WirePlumber in your home, which no package removes — untick it before
+uninstalling.
 
 A microphone is a second lane beside it, not a switch: a capture stream from the microphone you pick
 runs [the voice chain](#the-microphone-chain) and feeds a virtual source, `FxSound (Input)`, that
@@ -754,6 +757,10 @@ Each of these is a considered decision, not an oversight:
   a WirePlumber not started by systemd takes the change at the next login. The script is loaded as
   an optional component: one that fails on a later WirePlumber is logged and skipped, and never
   stops WirePlumber. Unticking deletes both files; by hand, delete them and restart WirePlumber.
+  Untick it before uninstalling FxSound or going back to 0.4.0: the package manager does not touch
+  files in your home, and only FxSound 0.5.0 or later takes them away, so WirePlumber would go on
+  loading the script with no FxSound left to untick it. Otherwise delete the two files and run
+  `systemctl --user restart wireplumber`.
   With *Follow the system's default device* ticked and the power off, FxSound's own lane moving to
   the picked device still clicks the application that has just arrived there. An application closed
   in the tenth of a second the script holds it silent keeps its own volume: WirePlumber, which keeps

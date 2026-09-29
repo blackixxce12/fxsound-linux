@@ -11,8 +11,8 @@ All notable changes to the FxSound Linux port. The format follows
   positions — Off, Interface, Interface and sound — with a line under it that says what each
   does, and `fxsound --windows-parity=off|interface|sound` for the same. The level is saved,
   shown in `--status` (`windows_parity`), announced by `--watch` (`windows_parity`) and on D-Bus
-  (the `WindowsParity` property and `SetWindowsParity`); what each level changes arrives over the
-  rest of 0.5.0 (`docs/0.5.0-windows-parity.md`). Everything, the fourth level, comes in a later
+  (the `WindowsParity` property and `SetWindowsParity`); the entries below say what each level
+  changes (`docs/0.5.0-windows-parity.md`). Everything, the fourth level, comes in a later
   version: `full` is refused from the command line and D-Bus, `--force` or not, and a
   `settings.toml` that says `full` runs as `sound` and keeps saying `full`, so the later version
   finds Everything again. A tab caption too long for one line, as
@@ -80,7 +80,12 @@ All notable changes to the FxSound Linux port. The format follows
   *Restart WirePlumber* is offered, asks first, and restarts it without holding up the window;
   a box ticked and unticked again under the same WirePlumber asks for no restart —
   and unticking takes it away again. WirePlumber loads it as an optional component, which it skips
-  rather than stop over when it cannot load it. An application closed in the tenth of a second the
+  rather than stop over when it cannot load it. Untick it before uninstalling FxSound or going
+  back to 0.4.0: the script and its fragment live in your home
+  (`~/.local/share/wireplumber/scripts/fxsound/fade-on-move.lua`,
+  `~/.config/wireplumber/wireplumber.conf.d/90-fxsound-fade-on-move.conf`), which the package
+  manager does not touch, and only FxSound 0.5.0 or later takes them away; otherwise delete both
+  and run `systemctl --user restart wireplumber`. An application closed in the tenth of a second the
   script holds it silent starts again at its own volume: WirePlumber, which keeps each
   application's volume for its next start, never keeps the script's silence, nor a point of its
   fades that PipeWire's converter reported on the way. Since the converter may never report the
@@ -112,6 +117,35 @@ All notable changes to the FxSound Linux port. The format follows
 - **A deleted preset on another drive goes to that drive's trash**, `.Trash-UID` at its top (or
   the shared `.Trash`), where file managers list it, instead of staying beside itself as
   `NAME.fac.1.bak`, which is kept for a drive FxSound cannot write a trash to.
+- **Tested on the newest PipeWire as well as the oldest.** Besides Ubuntu 24.04 and its
+  PipeWire 1.0, CI runs the tests in an Arch Linux container with the newest PipeWire and
+  WirePlumber 0.5, where the tests of WirePlumber's own policy, which Ubuntu's 0.4 has to skip,
+  must run. The workflows moved to the Node 24 releases of their actions, run on Ubuntu 24.04
+  everywhere rather than on whatever `ubuntu-latest` becomes, and are checked by actionlint.
+- **Clicks are measured by the tests.** A steady tone plays through FxSound on a private PipeWire
+  with WirePlumber while the power button, an application's own preset, FxSound's and the
+  desktop's choice of device, the equalizer and the music and voice presets are switched, and each
+  switch's worst click is read from the recording, against the level of the sound it cuts. The
+  equalizer, the presets and the power button under sound that stays on FxSound must stay below
+  −40 dBFS. The moves FxSound makes itself — the power button, an application's own preset, a
+  device chosen in FxSound and FxSound's taking the default back after the desktop's choice — are
+  held to −40 dBFS too, with the gap they leave held to 200 ms, for `pw-cat` and for PulseAudio
+  applications alike, and every run of them counted, not only the median: one switch over
+  −40 dBFS in a pass is listed (PipeWire's own, under Fixed), a second fails it. The desktop's own
+  move, before FxSound hears of it, is held to the same choice with FxSound off, plus 3 dB. An
+  application recording from the default source has to record again within a second of each
+  switch of the power button. CI shows the measurements in the job's summary.
+- **The sound is checked bit for bit against 0.4.0.** CI renders every shipped preset at 10, 20
+  and 31 bands through this version and through v0.4.0, from a cold start and while a preset, the
+  band count and a slider are switched, and requires the same output: identical, or nowhere more
+  than −120 dBFS apart. It also renders Interface and sound against the engine before the 0.4.0
+  audit and requires the same output from a cold start, except the two presets whose Ambience is
+  stored at 51 (Classic Rock, R&B), which are held to the Windows C code instead. The offline
+  renderer (`process_wav`, with `--compat windows` for Interface and sound) and the blind A/B of
+  `scripts/voicing` now play a preset the way the application does, through the application's
+  own reading of a preset, and the drift measurement (`preset_drift`) sets Interface and sound
+  beside Off with `PRESET_DRIFT_COMPAT=windows`. Moving the level is in the click tests, on the
+  output and in an application's own preset.
 
 ### Fixed
 - **A tray that was already running is found.** FxSound took a system tray that was there before
@@ -187,40 +221,6 @@ All notable changes to the FxSound Linux port. The format follows
   Chinese no longer name the window's hotkey as the power's (打开/关闭 FxSound 窗口,
   開啟/關閉 FxSound 視窗); Italian's tray says Esci to quit, where it said Uscita, its word for the
   output, and Seleziona dispositivo di riproduzione, with the verb first.
-
-### Changed
-- **Tested on the newest PipeWire as well as the oldest.** Besides Ubuntu 24.04 and its
-  PipeWire 1.0, CI runs the tests in an Arch Linux container with the newest PipeWire and
-  WirePlumber 0.5, where the tests of WirePlumber's own policy, which Ubuntu's 0.4 has to skip,
-  must run. The workflows moved to the Node 24 releases of their actions, run on Ubuntu 24.04
-  everywhere rather than on whatever `ubuntu-latest` becomes, and are checked by actionlint.
-- **Clicks are measured by the tests.** A steady tone plays through FxSound on a private PipeWire
-  with WirePlumber while the power button, an application's own preset, FxSound's and the
-  desktop's choice of device, the equalizer and the music and voice presets are switched, and each
-  switch's worst click is read from the recording. The equalizer, the presets and the power button
-  under sound that stays on FxSound must stay below −40 dBFS. A switch that moves an application's
-  sound to another device or node is reported instead, as loud as it is today: −18 to −41 dBFS for
-  the power button, as loud as −5 dBFS for an application's own preset or a device chosen in
-  FxSound, and −19 to −28 dBFS for the desktop's choice with FxSound off. The moves FxSound makes
-  itself are held to −40 dBFS once 0.5.0 makes them quiet — the power button's and an
-  application's own preset's already, with the gap they leave held to 200 ms, for `pw-cat` and for
-  PulseAudio applications alike, and every run of them counted, not only the median: one switch
-  over −40 dBFS in a pass is listed (PipeWire's own, above), a second fails it. So are a device
-  chosen in FxSound and FxSound's taking the default back after the desktop's choice; the
-  desktop's own move before it is held to the same choice with FxSound off, plus 3 dB, each read
-  against the level of the sound it cuts. An application recording from the default source has to
-  record again within a second of each switch of the power button. CI shows the measurements in
-  the job's summary.
-- **The sound is checked bit for bit against 0.4.0.** CI renders every shipped preset at 10, 20
-  and 31 bands through this version and through v0.4.0, from a cold start and while a preset, the
-  band count and a slider are switched, and requires the same output: identical, or nowhere more
-  than −120 dBFS apart. It also renders Interface and sound against the engine before the 0.4.0
-  audit, and requires the same output wherever that level is built so far. The offline renderer
-  (`process_wav`, with `--compat windows` for Interface and sound) and the blind A/B of
-  `scripts/voicing` now play a preset the way the application does, through the application's
-  own reading of a preset, and the drift measurement (`preset_drift`) sets Interface and sound
-  beside Off with `PRESET_DRIFT_COMPAT=windows`. Moving the level is in the click tests, on the
-  output and in an application's own preset.
 
 ## [0.4.0] — 2026-09-27
 
