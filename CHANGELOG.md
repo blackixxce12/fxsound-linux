@@ -4,7 +4,7 @@ All notable changes to the FxSound Linux port. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.5.0] — 2026-09-30
 
 ### Added
 - **«Like FxSound for Windows», in a new Experimental tab of Settings.** A slider of three
@@ -20,11 +20,13 @@ All notable changes to the FxSound Linux port. The format follows
 - **«Like FxSound for Windows» = Interface brings back the Windows command line and tray.** A
   command line with an option the Windows build has raises the window again, and a start from one
   shows it unless FxSound was last quit hidden; the keybind options (`--toggle-power`,
-  `--next-preset`, `--prev-preset`, `--next-output`) and D-Bus still never raise it. Save New
-  Preset and `--save_preset` want unsaved changes, and Export Presets and Import Presets want none.
-  A `--set_band_gain` or `--set_band_freq` list sets the pairs that fit and skips the others, with
-  a note, where Off refuses the whole list. The tray cuts a playback device's name after 30
-  characters.
+  `--next-preset`, `--prev-preset`, `--next-output`) and D-Bus still never raise it. A window
+  raised this way that cannot be opened — FxSound started with no display to open it on — leaves
+  FxSound running as it was, tray or none, rather than quitting and taking the sound with it. Save
+  New Preset and `--save_preset` want unsaved changes, and Export Presets and Import Presets want
+  none. A `--set_band_gain` or `--set_band_freq` list sets the pairs that fit and skips the
+  others, with a note, where Off refuses the whole list. The tray cuts a playback device's name
+  after 30 characters.
 - **«Like FxSound for Windows» = Interface brings back the Windows window.** Master Gain and
   Balance step by 2 dB, Volume Leveling reads "dB", the light theme's power-off graphs and rules
   are the original's again, the slider fill is painted as the original paints it, a long preset

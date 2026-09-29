@@ -49,7 +49,7 @@
 # fxsound.spec: for a local rpmbuild, mock or COPR build the filename is irrelevant, but Fedora
 # dist-git wants <name>.spec, so a submission renames this to fxsound-linux.spec.
 Name:           fxsound-linux
-Version:        0.4.0
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        System-wide audio enhancement: EQ, ambience, surround, bass and dynamic boost
 
@@ -372,6 +372,9 @@ appstreamcli validate --no-net %{buildroot}%{_metainfodir}/com.fxsound.FxSound.m
 
 
 %changelog
+* Wed Sep 30 2026 FxSound Linux port contributors <blackixxce12@users.noreply.github.com> - 0.5.0-1
+- Update to 0.5.0
+
 * Sun Sep 27 2026 FxSound Linux port contributors <blackixxce12@users.noreply.github.com> - 0.4.0-1
 - Update to 0.4.0
 - Install the manual page, the D-Bus activation file, the tray's status icons and the

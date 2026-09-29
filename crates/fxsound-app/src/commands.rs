@@ -36,6 +36,10 @@ pub struct WindowRequest {
     pub hide: bool,
     pub toggle: bool,
     pub quit: bool,
+    /// `show` is only the window «Like FxSound for Windows» raises for a forwarded line that
+    /// sets something ([`run_forwarded`]): nobody asked for the window itself, so one that cannot
+    /// be opened — no display in FxSound's environment — is no reason to stop the sound.
+    pub raised_like_windows: bool,
 }
 
 impl WindowRequest {
@@ -44,11 +48,23 @@ impl WindowRequest {
         !self.show && !self.hide && !self.toggle && !self.quit
     }
 
-    fn merge(&mut self, other: Self) {
+    /// Show the window because somebody asked for it: `--show`, the tray. Whatever raise was
+    /// merged in before is then asked for too.
+    pub const fn ask_to_show(&mut self) {
+        self.show = true;
+        self.raised_like_windows = false;
+    }
+
+    /// Both requests at once. The window shown is only raised like Windows while no side asked
+    /// for it itself.
+    pub const fn merge(&mut self, other: Self) {
+        let asked =
+            (self.show && !self.raised_like_windows) || (other.show && !other.raised_like_windows);
         self.show |= other.show;
         self.hide |= other.hide;
         self.toggle |= other.toggle;
         self.quit |= other.quit;
+        self.raised_like_windows = self.show && !asked;
     }
 }
 
@@ -115,7 +131,11 @@ pub fn run(app: &mut App, commands: &[Command]) -> Outcome {
 pub fn run_forwarded(app: &mut App, commands: &[Command], raises_like_windows: bool) -> Outcome {
     let mut outcome = run(app, commands);
     if raises_like_windows && app.windows_parity().interface() && !outcome.window.quit {
-        outcome.window.show = true;
+        outcome.window.merge(WindowRequest {
+            show: true,
+            raised_like_windows: true,
+            ..WindowRequest::default()
+        });
     }
     outcome
 }

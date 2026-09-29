@@ -83,7 +83,7 @@ From the working tree you already have:
 ```bash
 cd packaging
 makepkg -f
-sudo pacman -U fxsound-linux-0.4.0-1-x86_64.pkg.tar.zst
+sudo pacman -U fxsound-linux-0.5.0-1-x86_64.pkg.tar.zst
 ```
 
 `makepkg` runs the whole test suite as part of the build; pass `--nocheck` to skip it.
@@ -100,7 +100,7 @@ tree, so copy it there first:
 ```bash
 cp -a packaging/debian debian
 dpkg-buildpackage -us -uc -b
-sudo apt install ../fxsound-linux_0.4.0-1_amd64.deb
+sudo apt install ../fxsound-linux_0.5.0-1_amd64.deb
 ```
 
 The `.deb` lands beside the source tree, not inside it. Use `apt` rather than `dpkg -i` so the
@@ -117,7 +117,7 @@ and why lowering the floor is not the fix, is at the top of
 
 ```bash
 rpmbuild -ba packaging/fedora/fxsound.spec
-sudo dnf install ~/rpmbuild/RPMS/x86_64/fxsound-linux-0.4.0-1.*.x86_64.rpm
+sudo dnf install ~/rpmbuild/RPMS/x86_64/fxsound-linux-0.5.0-1.*.x86_64.rpm
 ```
 
 The spec needs a vendored-dependency tarball beside it;
@@ -130,8 +130,8 @@ For anything else, or for anyone who would rather no package manager were involv
 
 ```bash
 packaging/build-tarball.sh
-tar xf dist/fxsound-linux-0.4.0-x86_64.tar.gz
-sudo ./fxsound-linux-0.4.0-x86_64/install.sh        # /usr/local unless you name another prefix
+tar xf dist/fxsound-linux-0.5.0-x86_64.tar.gz
+sudo ./fxsound-linux-0.5.0-x86_64/install.sh        # /usr/local unless you name another prefix
 ```
 
 `/usr/local` is searched for presets alongside `/usr`, and first by a binary installed there, so
@@ -176,7 +176,9 @@ for presets. On an older distribution than Debian 12, build from source instead.
 FxSound started by the user unit — enabled, or by a D-Bus call such as a status bar's — runs in the
 systemd user manager's environment, not the compositor's. Where the compositor does not import
 `WAYLAND_DISPLAY` into it (sway, and Hyprland without uwsm), that FxSound has no display: it runs in
-the tray, and asking for its window brings a notification that it could not be opened instead. Import
+the tray, and asking for its window brings a notification that it could not be opened instead. A
+window raised only because «Like FxSound for Windows» is on — a forwarded Windows command line —
+that cannot be opened is just logged, and FxSound keeps running, with or without a tray. Import
 it when the compositor starts, with `exec dbus-update-activation-environment --systemd
 WAYLAND_DISPLAY DISPLAY` in sway (`exec-once = ...` in Hyprland).
 
@@ -229,6 +231,8 @@ and a list scrolls between the title bar and the window's bottom edge, over its 
 is no room under it — in the Lite view, four rows of the menu and two and a half of a list show at
 a time. FxSound gives the compositor each view's size as the window's smallest and largest, so
 flipping between Pro and Lite and opening Settings resize a floating window on Hyprland too.
+COSMIC (cosmic-comp 1.9) does not take the new size and keeps the window at the Pro size, so the
+Lite view and the Settings pages are drawn scaled inside it.
 
 Global shortcuts are the one feature that cannot work the way it does on Windows. A Wayland client
 is not allowed to grab keys it does not have focus for — that is a deliberate security property of

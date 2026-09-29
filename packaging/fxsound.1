@@ -11,7 +11,7 @@
 .\"
 .\" Copyright (C) 2026 FxSound Linux port contributors
 .\" Licensed under the GNU Affero General Public License, version 3 or later.
-.TH FXSOUND 1 "2026-09-27" "fxsound 0.4.0" "User Commands"
+.TH FXSOUND 1 "2026-09-30" "fxsound 0.5.0" "User Commands"
 .SH NAME
 fxsound \- system-wide audio enhancement for PipeWire
 .SH SYNOPSIS
@@ -1510,6 +1510,9 @@ compositor does not import
 into it (sway, and Hyprland without uwsm), that FxSound has no display: it runs
 in the tray, and asking for its window brings a notification that it could not
 be opened instead; quit it and start it again once the variable is imported.
+A window raised only because \(lqLike FxSound for Windows\(rq is on (a
+forwarded Windows command line) that cannot be opened is just logged, and
+FxSound keeps running, with or without a tray.
 Import it when the compositor starts, in sway with:
 .PP
 .RS 4

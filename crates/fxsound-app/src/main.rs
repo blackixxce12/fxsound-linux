@@ -366,6 +366,7 @@ fn main() -> eframe::Result<()> {
             .then(|| Instant::now() + TRAY_WAIT),
         start_minimised: false,
         reopening: false,
+        only_raised_like_windows: false,
     };
 
     loop {
@@ -511,6 +512,10 @@ struct Runtime {
     start_minimised: bool,
     /// The window closing now is being opened again ([`WindowExit::Reopen`]): not news.
     reopening: bool,
+    /// The window being opened is only the one «Like FxSound for Windows» raises for a forwarded
+    /// line that sets something ([`commands::WindowRequest::raised_like_windows`]): if it cannot
+    /// be opened, FxSound runs on without it ([`Runtime::window_failed`]).
+    only_raised_like_windows: bool,
 }
 
 impl Runtime {
@@ -572,18 +577,18 @@ impl Runtime {
                 forwarded.commands(),
                 forwarded.raises_like_windows(),
             );
-            merge(&mut request, outcome.window);
+            request.merge(outcome.window);
             forwarded.respond_with(outcome.stdout, outcome.stderr, outcome.failed);
         }
         while let Ok(command) = self.tray_rx.try_recv() {
             match command {
                 TrayCommand::ToggleWindow => request.toggle = true,
-                TrayCommand::Open => request.show = true,
+                TrayCommand::Open => request.ask_to_show(),
                 TrayCommand::Exit => request.quit = true,
                 TrayCommand::OpenSettings => {
                     // Only a window can open the pane; make sure there is one.
                     self.settings_requested = true;
-                    request.show = true;
+                    request.ask_to_show();
                 }
                 other => self.app.handle_tray(other),
             }
@@ -662,6 +667,8 @@ impl Runtime {
         // The meters went with the window, and let go of the microphone they held.
         self.app.set_window_shown(false);
         run?;
+        // It opened: what asked for it no longer matters.
+        self.only_raised_like_windows = false;
         let tray_visible = self.tray_visible();
         Ok(self.window_closed(tray_visible))
     }
@@ -707,7 +714,24 @@ impl Runtime {
     /// launcher, opens the window. The bus's `--activated` start stays in the tray whatever the
     /// setting says (`Cli::window_command`), so this brings back no failing start. With no tray
     /// icon there is nothing to fall back to, and it quits as before.
+    ///
+    /// A window nobody asked for — the one «Like FxSound for Windows» raises for a forwarded line
+    /// that sets something, `fxsound --power=off` from a keybind — is no reason to quit, tray or
+    /// not: the line did what it said, and quitting over it would stop the sound of an instance
+    /// that has no display to open a window on at every such line. It is logged, and FxSound runs
+    /// on as it was, with no notification: the next such line would bring another.
     fn window_failed(&mut self, err: &dyn std::fmt::Display, tray_visible: bool) -> bool {
+        if std::mem::take(&mut self.only_raised_like_windows) {
+            log::warn!(
+                "the window «Like FxSound for Windows» raises for a command line could not be \
+                 opened: {err}; FxSound keeps running without it"
+            );
+            self.announce(&AppEvent::Window { visible: false });
+            self.app.remember_window_hidden(tray_visible);
+            self.start_minimised = false;
+            self.reopening = false;
+            return true;
+        }
         if !tray_visible {
             log::error!("the window could not be run: {err}");
             return false;
@@ -746,6 +770,8 @@ impl Runtime {
             // With no window, toggle means show.
             if request.show || request.toggle || self.settings_requested {
                 self.tray_wait = None;
+                self.only_raised_like_windows =
+                    request.raised_like_windows && !request.toggle && !self.settings_requested;
                 return HeadlessExit::Show;
             }
             if let Some(until) = self.tray_wait {
@@ -912,14 +938,6 @@ fn wait_for_any(channels: &[&dyn Watched], deadline: Instant) -> bool {
         }
         select.remove(index);
     }
-}
-
-/// `WindowRequest::merge` is private to the commands module; this is the same OR.
-fn merge(into: &mut WindowRequest, other: WindowRequest) {
-    into.show |= other.show;
-    into.hide |= other.hide;
-    into.toggle |= other.toggle;
-    into.quit |= other.quit;
 }
 
 /// The window eframe is asked for, sized for the current view.
@@ -2682,6 +2700,7 @@ mod runtime_tests {
             tray_wait: None,
             start_minimised: false,
             reopening: false,
+            only_raised_like_windows: false,
         }
     }
 
@@ -2974,6 +2993,84 @@ mod runtime_tests {
             "nothing to start in next time"
         );
         runtime.shutdown();
+    }
+
+    #[test]
+    fn a_window_raised_like_windows_that_cannot_be_opened_leaves_fxsound_running_with_no_tray() {
+        // The 0.5.0 live check (W5-live): at Interface and sound a forwarded `fxsound --power=off`
+        // raises the window, as the Windows build does. An instance with no display and no tray
+        // icon took the failed window for a reason to quit, and the sound went with it.
+        use fxsound_core::WindowsParity;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        runtime
+            .app
+            .set_windows_parity(WindowsParity::Sound, false)
+            .expect("Interface and sound is offered");
+        let socket = runtime.server.path().to_path_buf();
+        let line = |args: &[&str]| {
+            let socket = socket.clone();
+            let argv: Vec<String> = std::iter::once("fxsound")
+                .chain(args.iter().copied())
+                .map(str::to_owned)
+                .collect();
+            std::thread::spawn(move || {
+                ipc::forward_to(&socket, &argv, Path::new("/"), Duration::from_secs(5))
+            })
+        };
+
+        let power = line(&["--power=off"]);
+        assert_eq!(
+            runtime.run_headless(),
+            HeadlessExit::Show,
+            "raised as on Windows"
+        );
+        assert!(runtime.only_raised_like_windows);
+        let why = "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET nor DISPLAY is set.";
+        assert!(
+            runtime.window_failed(&why, false),
+            "it runs on with no tray icon, rather than quitting"
+        );
+        assert!(!runtime.only_raised_like_windows);
+        assert!(power.join().expect("client").expect("answered").ok);
+        assert!(!runtime.app.state.power, "and the line did what it said");
+
+        // A window asked for itself, on the same line or not, is not a raise: with no tray and
+        // no display that still ends FxSound, as before.
+        let show = line(&["--show", "--power=on"]);
+        assert_eq!(runtime.run_headless(), HeadlessExit::Show);
+        assert!(!runtime.only_raised_like_windows, "--show asked for it");
+        assert!(show.join().expect("client").expect("answered").ok);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn a_raise_like_windows_merged_with_a_window_asked_for_is_asked_for() {
+        let raised = WindowRequest {
+            show: true,
+            raised_like_windows: true,
+            ..WindowRequest::default()
+        };
+        let mut request = raised;
+        request.merge(WindowRequest::default());
+        assert!(request.show && request.raised_like_windows, "a raise alone");
+        request.ask_to_show();
+        assert!(
+            request.show && !request.raised_like_windows,
+            "the tray's Open"
+        );
+        let mut request = WindowRequest {
+            show: true,
+            ..WindowRequest::default()
+        };
+        request.merge(raised);
+        assert!(request.show && !request.raised_like_windows, "--show first");
+        let mut request = raised;
+        request.merge(WindowRequest {
+            toggle: true,
+            ..WindowRequest::default()
+        });
+        assert!(request.raised_like_windows && request.toggle);
     }
 
     #[test]
@@ -3348,6 +3445,7 @@ mod calibration_tests {
             tray_wait: None,
             start_minimised: false,
             reopening: false,
+            only_raised_like_windows: false,
         }
     }
 
@@ -3847,6 +3945,7 @@ mod confirmation_tests {
             tray_wait: None,
             start_minimised: false,
             reopening: false,
+            only_raised_like_windows: false,
         }
     }
 
@@ -4113,6 +4212,7 @@ mod forget_device_tests {
             tray_wait: None,
             start_minimised: false,
             reopening: false,
+            only_raised_like_windows: false,
         };
         (runtime, engine)
     }
