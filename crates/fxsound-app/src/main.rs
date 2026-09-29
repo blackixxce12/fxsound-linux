@@ -281,8 +281,10 @@ fn main() -> eframe::Result<()> {
     // no such thing as a hidden window here (see the module docs). An explicit `--show` overrides
     // the preference, as `--hide` overrides it the other way (`Cli::cold_start_commands`), and so
     // does `--toggle-window`, since the window it toggles is not up yet. A line that only sets
-    // something starts in the tray too (`cold_start_visibility`).
-    let quiet = cli.only_sets_things();
+    // something starts in the tray too (`cold_start_visibility`), except at «Как в Windows» =
+    // Interface and above one with an option the Windows build has, whose start shows its window
+    // (0.4.0 audit R11, `Cli::only_sets_things_at`) — at the level the line itself may have set.
+    let quiet = cli.only_sets_things_at(app.windows_parity());
     let mut visibility = cold_start_visibility(
         cold.window.hide,
         cold.window.show || cold.window.toggle,
@@ -364,6 +366,7 @@ fn main() -> eframe::Result<()> {
             .then(|| Instant::now() + TRAY_WAIT),
         start_minimised: false,
         reopening: false,
+        only_raised_like_windows: false,
     };
 
     loop {
@@ -509,6 +512,10 @@ struct Runtime {
     start_minimised: bool,
     /// The window closing now is being opened again ([`WindowExit::Reopen`]): not news.
     reopening: bool,
+    /// The window being opened is only the one «Like FxSound for Windows» raises for a forwarded
+    /// line that sets something ([`commands::WindowRequest::raised_like_windows`]): if it cannot
+    /// be opened, FxSound runs on without it ([`Runtime::window_failed`]).
+    only_raised_like_windows: bool,
 }
 
 impl Runtime {
@@ -550,8 +557,9 @@ impl Runtime {
                 log::info!("not running a command whose caller stopped waiting for it");
                 continue;
             }
-            // A `--forget-device` for an instance PipeWire has not listed the devices to yet: the
-            // whole line waits for the list, or until `until`, and is refused only then. A line
+            // A `--forget-device`, `--next-output` or `--next-input` for an instance PipeWire has
+            // not listed the devices to yet: the whole line waits for the list, or until `until`,
+            // and runs then. A line
             // that came after a waiting one waits behind it (0.4.0 review FA): run first, a
             // keybind's `--preset=Day` would be undone by the held `--preset=Night` before it
             // when the list came. Its own wait is never the longer one — the line ahead of it
@@ -564,19 +572,23 @@ impl Runtime {
                 self.waiting_for_devices.push((forwarded, until));
                 continue;
             }
-            let outcome = commands::run(&mut self.app, forwarded.commands());
-            merge(&mut request, outcome.window);
+            let outcome = commands::run_forwarded(
+                &mut self.app,
+                forwarded.commands(),
+                forwarded.raises_like_windows(),
+            );
+            request.merge(outcome.window);
             forwarded.respond_with(outcome.stdout, outcome.stderr, outcome.failed);
         }
         while let Ok(command) = self.tray_rx.try_recv() {
             match command {
                 TrayCommand::ToggleWindow => request.toggle = true,
-                TrayCommand::Open => request.show = true,
+                TrayCommand::Open => request.ask_to_show(),
                 TrayCommand::Exit => request.quit = true,
                 TrayCommand::OpenSettings => {
                     // Only a window can open the pane; make sure there is one.
                     self.settings_requested = true;
-                    request.show = true;
+                    request.ask_to_show();
                 }
                 other => self.app.handle_tray(other),
             }
@@ -647,7 +659,7 @@ impl Runtime {
                     .options_mut(|options| options.zoom_with_keyboard = false);
                 // From here on a producer's wake-up is a frame of this window.
                 runtime.waker.attach(&cc.egui_ctx);
-                Ok(Box::new(Shell::new(runtime, palette.mode())))
+                Ok(Box::new(Shell::new(runtime, palette)))
             }),
         );
         // Whatever arrives now is the headless pump's to wait for.
@@ -655,6 +667,8 @@ impl Runtime {
         // The meters went with the window, and let go of the microphone they held.
         self.app.set_window_shown(false);
         run?;
+        // It opened: what asked for it no longer matters.
+        self.only_raised_like_windows = false;
         let tray_visible = self.tray_visible();
         Ok(self.window_closed(tray_visible))
     }
@@ -700,7 +714,24 @@ impl Runtime {
     /// launcher, opens the window. The bus's `--activated` start stays in the tray whatever the
     /// setting says (`Cli::window_command`), so this brings back no failing start. With no tray
     /// icon there is nothing to fall back to, and it quits as before.
+    ///
+    /// A window nobody asked for — the one «Like FxSound for Windows» raises for a forwarded line
+    /// that sets something, `fxsound --power=off` from a keybind — is no reason to quit, tray or
+    /// not: the line did what it said, and quitting over it would stop the sound of an instance
+    /// that has no display to open a window on at every such line. It is logged, and FxSound runs
+    /// on as it was, with no notification: the next such line would bring another.
     fn window_failed(&mut self, err: &dyn std::fmt::Display, tray_visible: bool) -> bool {
+        if std::mem::take(&mut self.only_raised_like_windows) {
+            log::warn!(
+                "the window «Like FxSound for Windows» raises for a command line could not be \
+                 opened: {err}; FxSound keeps running without it"
+            );
+            self.announce(&AppEvent::Window { visible: false });
+            self.app.remember_window_hidden(tray_visible);
+            self.start_minimised = false;
+            self.reopening = false;
+            return true;
+        }
         if !tray_visible {
             log::error!("the window could not be run: {err}");
             return false;
@@ -739,6 +770,8 @@ impl Runtime {
             // With no window, toggle means show.
             if request.show || request.toggle || self.settings_requested {
                 self.tray_wait = None;
+                self.only_raised_like_windows =
+                    request.raised_like_windows && !request.toggle && !self.settings_requested;
                 return HeadlessExit::Show;
             }
             if let Some(until) = self.tray_wait {
@@ -907,14 +940,6 @@ fn wait_for_any(channels: &[&dyn Watched], deadline: Instant) -> bool {
     }
 }
 
-/// `WindowRequest::merge` is private to the commands module; this is the same OR.
-fn merge(into: &mut WindowRequest, other: WindowRequest) {
-    into.show |= other.show;
-    into.hide |= other.hide;
-    into.toggle |= other.toggle;
-    into.quit |= other.quit;
-}
-
 /// The window eframe is asked for, sized for the current view.
 fn native_options(view: ViewMode) -> eframe::NativeOptions {
     eframe::NativeOptions {
@@ -976,8 +1001,9 @@ struct Shell<'a> {
     scratch: ViewScratch,
     /// The size the viewport was last told to be, so a resize is sent only on a real change.
     applied_size: Option<egui::Vec2>,
-    /// The theme the fonts and visuals were installed for.
-    applied_theme: ThemeMode,
+    /// The palette the fonts and visuals were installed for: its theme and whether it is the
+    /// Windows build's ([`Palette::windows`]), whose edges the visuals' strokes carry too.
+    applied_palette: Palette,
     /// The hamburger menu.
     menu: Menu,
     /// `Some` while the Settings pane is open.
@@ -1067,6 +1093,9 @@ enum Confirm {
     },
     /// Settings ▸ Reset Presets (0.4.0 audit #21): every unsaved change, on both lanes.
     ResetPresets,
+    /// Settings ▸ Experimental ▸ Restart WirePlumber (roadmap 0.5.0 §7, D5): the sound of every
+    /// application stops for a moment.
+    RestartWirePlumber,
 }
 
 impl Confirm {
@@ -1077,6 +1106,7 @@ impl Confirm {
         let template = match self {
             Self::Delete { .. } => tr(DELETE_QUESTION),
             Self::ResetPresets => tr(RESET_QUESTION),
+            Self::RestartWirePlumber => tr(RESTART_WIREPLUMBER_QUESTION),
         };
         self.question_from(ctx, &template)
     }
@@ -1086,7 +1116,7 @@ impl Confirm {
     fn question_from(&self, ctx: &egui::Context, template: &str) -> String {
         match self {
             Self::Delete { name, .. } => dialogs::message::message_with_name(ctx, template, name),
-            Self::ResetPresets => template.to_owned(),
+            Self::ResetPresets | Self::RestartWirePlumber => template.to_owned(),
         }
     }
 }
@@ -1097,9 +1127,12 @@ const DELETE_QUESTION: &str = "Move the preset %s to the trash?";
 /// The question Reset Presets asks: what it does, which is less than its label says — saved
 /// presets stay.
 const RESET_QUESTION: &str = "Discard the unsaved changes of every preset? Saved presets are kept.";
+/// The question Restart WirePlumber asks: what the restart does to every application's sound.
+const RESTART_WIREPLUMBER_QUESTION: &str =
+    "Restart WirePlumber now? The sound of every application stops for a moment.";
 
 impl<'a> Shell<'a> {
-    fn new(rt: &'a mut Runtime, applied_theme: ThemeMode) -> Self {
+    fn new(rt: &'a mut Runtime, applied_palette: Palette) -> Self {
         let Panes {
             scratch,
             mut settings,
@@ -1125,7 +1158,7 @@ impl<'a> Shell<'a> {
             rt,
             scratch,
             applied_size: None,
-            applied_theme,
+            applied_palette,
             menu: Menu::default(),
             settings,
             settings_icons: NavIcons::new(),
@@ -1161,7 +1194,7 @@ impl<'a> Shell<'a> {
                 ShowAction::Restore => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    self.minimised = false;
+                    self.set_minimised(false);
                 }
                 ShowAction::Reopen => {
                     self.rt.exit = WindowExit::Reopen;
@@ -1187,9 +1220,16 @@ impl<'a> Shell<'a> {
             MinimiseAction::HideToTray => Self::hide(ctx),
             MinimiseAction::Minimise => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                self.minimised = true;
+                self.set_minimised(true);
             }
         }
+    }
+
+    /// The window went into the minimised state or out of it: the shell's own record for
+    /// `--show`, and the app's, which weighs the notices of changes made out of sight.
+    fn set_minimised(&mut self, minimised: bool) {
+        self.minimised = minimised;
+        self.rt.app.set_window_minimised(minimised);
     }
 
     /// Notice the window coming back from minimised by the user's own hand — the dock, the
@@ -1198,7 +1238,7 @@ impl<'a> Shell<'a> {
         let (focused, pressed) = ctx.input(|i| (i.viewport().focused, i.pointer.any_pressed()));
         if self.minimised && (pressed || (focused == Some(true) && self.was_focused == Some(false)))
         {
-            self.minimised = false;
+            self.set_minimised(false);
         }
         self.was_focused = focused;
     }
@@ -1228,14 +1268,15 @@ impl<'a> Shell<'a> {
             .is_some_and(|asked| asked.elapsed() < RESIZE_SETTLE)
     }
 
-    /// Re-install fonts and visuals after a theme change.
+    /// Re-install fonts and visuals after a change of theme or of «Like FxSound for Windows»:
+    /// the level decides the edges of every popup and tooltip too ([`Palette::windows`]).
     fn sync_theme(&mut self, ctx: &egui::Context) {
         let palette = self.rt.app.palette();
-        if palette.mode() == self.applied_theme {
+        if palette == self.applied_palette {
             return;
         }
         theme::apply(ctx, palette);
-        self.applied_theme = palette.mode();
+        self.applied_palette = palette;
     }
 
     /// Where an open menu or drop-down may hang this frame, in `screen`'s points: under the title
@@ -1337,11 +1378,8 @@ impl<'a> Shell<'a> {
                 .collect();
             // The names are this lane's, so the files written are too, whatever happens to the
             // edit direction before Export is pressed.
-            self.export = Some(ExportState {
-                lane: self.rt.app.state.direction,
-                presets,
-                ..ExportState::default()
-            });
+            let lane = self.rt.app.state.direction;
+            self.export = Some(self.rt.app.export_window(lane, presets));
         }
     }
 
@@ -1371,8 +1409,9 @@ impl<'a> Shell<'a> {
 
         // The enablement predicates of `FxMainWindow.cpp:536-543`: the preset items are the
         // controller's one rule, which the command line and D-Bus are refused by too, with the
-        // power on or off (0.4.0 audit R7); Export and Import are always offered (audit #18,
-        // [`App::preset_menu`]).
+        // power on or off (0.4.0 audit R7); Export and Import are offered whether or not the
+        // preset has unsaved changes (audit #18), except at «Как в Windows» = Interface and
+        // above, where changes grey them out as on Windows ([`App::preset_menu`]).
         let preset = app.state.preset();
         let PresetMenu {
             save_new: can_save_new,
@@ -1729,6 +1768,11 @@ impl<'a> Shell<'a> {
                     self.confirm = Some(Confirm::ResetPresets);
                     continue;
                 }
+                // Asked first too: the sound stops for a moment, everyone's.
+                SettingsAction::RestartWirePlumber => {
+                    self.confirm = Some(Confirm::RestartWirePlumber);
+                    continue;
+                }
                 _ => {}
             }
             self.rt.app.handle_settings(action, state);
@@ -1774,15 +1818,18 @@ impl<'a> Shell<'a> {
                     log::info!("{name} is no longer the selected preset; not deleting it");
                 }
             }
-            Confirm::ResetPresets => {
+            Confirm::ResetPresets | Confirm::RestartWirePlumber => {
+                let action = if confirm == Confirm::ResetPresets {
+                    SettingsAction::ResetPresets
+                } else {
+                    SettingsAction::RestartWirePlumber
+                };
                 let open = self.settings.is_some();
                 let mut state = self
                     .settings
                     .take()
                     .unwrap_or_else(|| self.rt.app.settings_state());
-                self.rt
-                    .app
-                    .handle_settings(&SettingsAction::ResetPresets, &mut state);
+                self.rt.app.handle_settings(&action, &mut state);
                 self.rt.app.refresh_settings_state(&mut state);
                 if open {
                     self.settings = Some(state);
@@ -1859,6 +1906,9 @@ impl<'a> Shell<'a> {
         let Some(mut state) = self.export.take() else {
             return;
         };
+        // «Like FxSound for Windows» and the end-band choice may have moved since the window
+        // opened (a keybind, D-Bus): shown as they are now, and exported as shown.
+        self.rt.app.refresh_export_state(&mut state);
         dim_backdrop(ui, window, "export");
         let outer =
             egui::Rect::from_center_size(window.center(), dialogs::presets::export::WINDOW_SIZE);
@@ -2650,6 +2700,7 @@ mod runtime_tests {
             tray_wait: None,
             start_minimised: false,
             reopening: false,
+            only_raised_like_windows: false,
         }
     }
 
@@ -2945,6 +2996,84 @@ mod runtime_tests {
     }
 
     #[test]
+    fn a_window_raised_like_windows_that_cannot_be_opened_leaves_fxsound_running_with_no_tray() {
+        // The 0.5.0 live check (W5-live): at Interface and sound a forwarded `fxsound --power=off`
+        // raises the window, as the Windows build does. An instance with no display and no tray
+        // icon took the failed window for a reason to quit, and the sound went with it.
+        use fxsound_core::WindowsParity;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut runtime = runtime(dir.path());
+        runtime
+            .app
+            .set_windows_parity(WindowsParity::Sound, false)
+            .expect("Interface and sound is offered");
+        let socket = runtime.server.path().to_path_buf();
+        let line = |args: &[&str]| {
+            let socket = socket.clone();
+            let argv: Vec<String> = std::iter::once("fxsound")
+                .chain(args.iter().copied())
+                .map(str::to_owned)
+                .collect();
+            std::thread::spawn(move || {
+                ipc::forward_to(&socket, &argv, Path::new("/"), Duration::from_secs(5))
+            })
+        };
+
+        let power = line(&["--power=off"]);
+        assert_eq!(
+            runtime.run_headless(),
+            HeadlessExit::Show,
+            "raised as on Windows"
+        );
+        assert!(runtime.only_raised_like_windows);
+        let why = "neither WAYLAND_DISPLAY nor WAYLAND_SOCKET nor DISPLAY is set.";
+        assert!(
+            runtime.window_failed(&why, false),
+            "it runs on with no tray icon, rather than quitting"
+        );
+        assert!(!runtime.only_raised_like_windows);
+        assert!(power.join().expect("client").expect("answered").ok);
+        assert!(!runtime.app.state.power, "and the line did what it said");
+
+        // A window asked for itself, on the same line or not, is not a raise: with no tray and
+        // no display that still ends FxSound, as before.
+        let show = line(&["--show", "--power=on"]);
+        assert_eq!(runtime.run_headless(), HeadlessExit::Show);
+        assert!(!runtime.only_raised_like_windows, "--show asked for it");
+        assert!(show.join().expect("client").expect("answered").ok);
+        runtime.shutdown();
+    }
+
+    #[test]
+    fn a_raise_like_windows_merged_with_a_window_asked_for_is_asked_for() {
+        let raised = WindowRequest {
+            show: true,
+            raised_like_windows: true,
+            ..WindowRequest::default()
+        };
+        let mut request = raised;
+        request.merge(WindowRequest::default());
+        assert!(request.show && request.raised_like_windows, "a raise alone");
+        request.ask_to_show();
+        assert!(
+            request.show && !request.raised_like_windows,
+            "the tray's Open"
+        );
+        let mut request = WindowRequest {
+            show: true,
+            ..WindowRequest::default()
+        };
+        request.merge(raised);
+        assert!(request.show && !request.raised_like_windows, "--show first");
+        let mut request = raised;
+        request.merge(WindowRequest {
+            toggle: true,
+            ..WindowRequest::default()
+        });
+        assert!(request.raised_like_windows && request.toggle);
+    }
+
+    #[test]
     fn a_window_closed_for_a_quit_leaves_the_start_up_preference_as_the_window_found_it() {
         // The window was showing when FxSound was told to quit, so the next start shows it; and a
         // quit is no hide, so no tray tip and no `window visible=false` either.
@@ -2970,7 +3099,7 @@ mod runtime_tests {
         let mut runtime = runtime(dir.path());
         with_a_window_up(&mut runtime);
         {
-            let mut shell = Shell::new(&mut runtime, ThemeMode::Dark);
+            let mut shell = Shell::new(&mut runtime, Palette::new(ThemeMode::Dark));
             let ctx = egui::Context::default();
             shell.apply_window_request(
                 &ctx,
@@ -3154,7 +3283,7 @@ mod runtime_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut runtime = runtime(dir.path());
         {
-            let mut shell = Shell::new(&mut runtime, ThemeMode::Dark);
+            let mut shell = Shell::new(&mut runtime, Palette::new(ThemeMode::Dark));
             shell.open_settings();
             shell.open_import();
             shell.scratch.column_face = shell.scratch.column_face.flipped();
@@ -3162,7 +3291,7 @@ mod runtime_tests {
             shell.menu.toggle();
         }
         let flipped = fxsound_ui::views::ColumnFace::default().flipped();
-        let shell = Shell::new(&mut runtime, ThemeMode::Dark);
+        let shell = Shell::new(&mut runtime, Palette::new(ThemeMode::Dark));
         assert!(shell.settings.is_some(), "Settings is still open");
         assert!(shell.import.is_some(), "and so is Import Presets");
         assert_eq!(shell.scratch.column_face, flipped);
@@ -3175,7 +3304,7 @@ mod runtime_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut runtime = runtime(dir.path());
         runtime.settings_requested = true;
-        let shell = Shell::new(&mut runtime, ThemeMode::Dark);
+        let shell = Shell::new(&mut runtime, Palette::new(ThemeMode::Dark));
         assert!(shell.settings.is_some());
         drop(shell);
         assert!(!runtime.settings_requested);
@@ -3316,6 +3445,7 @@ mod calibration_tests {
             tray_wait: None,
             start_minimised: false,
             reopening: false,
+            only_raised_like_windows: false,
         }
     }
 
@@ -3323,7 +3453,7 @@ mod calibration_tests {
     fn calibrate_microphone_opens_the_controllers_wizard_over_the_pane_and_grows_the_window() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path(), true);
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         shell.open_settings();
         shell.open_calibration();
 
@@ -3344,7 +3474,7 @@ mod calibration_tests {
     fn without_a_microphone_on_the_input_lane_the_wizard_does_not_open() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path(), false);
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         shell.open_settings();
         shell.open_calibration();
         assert!(shell.calibration.is_none());
@@ -3355,7 +3485,7 @@ mod calibration_tests {
     fn cancel_in_the_wizard_closes_it_in_the_controller_too() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path(), true);
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         shell.open_calibration();
         shell.rt.app.handle_calibration(CalibrationAction::Start);
         assert!(shell.rt.app.calibration_is_live(), "Start began a run");
@@ -3566,6 +3696,42 @@ mod minimise_tests {
             "--view asks for the window"
         );
     }
+
+    #[test]
+    fn at_interface_a_cold_start_from_an_option_windows_has_shows_the_window_as_there() {
+        // 0.4.0 audit R11 at «Как в Windows» = Interface: the Windows build's start shows its
+        // window whatever its line set, unless it was last quit hidden; a keybind's option, which
+        // stands in for a Windows hotkey, still starts in the tray.
+        use WindowVisibility::{Hidden, Shown};
+        use fxsound_core::WindowsParity;
+        let quiet = |args: &[&str], level: WindowsParity| {
+            Cli::try_parse_from(std::iter::once("fxsound").chain(args.iter().copied()))
+                .expect("parses")
+                .only_sets_things_at(level)
+        };
+        for level in [WindowsParity::Interface, WindowsParity::Sound] {
+            let gaming = quiet(&["--preset=Gaming"], level);
+            assert_eq!(cold_start_visibility(false, false, false, gaming), Shown);
+            assert_eq!(
+                cold_start_visibility(false, false, true, gaming),
+                Hidden,
+                "the remembered tray state still counts"
+            );
+            assert_eq!(
+                cold_start_visibility(false, false, false, quiet(&["--toggle-power"], level)),
+                Hidden
+            );
+        }
+        assert_eq!(
+            cold_start_visibility(
+                false,
+                false,
+                false,
+                quiet(&["--preset=Gaming"], WindowsParity::Off)
+            ),
+            Hidden
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3697,17 +3863,17 @@ mod confirmation_tests {
             for language in &LANGUAGES {
                 let table = Catalogue::for_language(language);
                 let translate = |key: &str| table.get(key).unwrap_or(key).to_owned();
-                for confirm in
-                    std::iter::once(Confirm::ResetPresets).chain(names.iter().map(|name| {
-                        Confirm::Delete {
-                            lane: DeviceDirection::Output,
-                            name: name.clone(),
-                        }
+                for confirm in [Confirm::ResetPresets, Confirm::RestartWirePlumber]
+                    .into_iter()
+                    .chain(names.iter().map(|name| Confirm::Delete {
+                        lane: DeviceDirection::Output,
+                        name: name.clone(),
                     }))
                 {
                     let key = match confirm {
                         Confirm::Delete { .. } => DELETE_QUESTION,
                         Confirm::ResetPresets => RESET_QUESTION,
+                        Confirm::RestartWirePlumber => RESTART_WIREPLUMBER_QUESTION,
                     };
                     let question = confirm.question_from(ui.ctx(), &translate(key));
                     let galley =
@@ -3720,7 +3886,7 @@ mod confirmation_tests {
                         galley.size()
                     );
                     let Confirm::Delete { name, .. } = &confirm else {
-                        assert_eq!(question, translate(RESET_QUESTION), "{case}");
+                        assert_eq!(question, translate(key), "{case}");
                         continue;
                     };
                     let template = translate(DELETE_QUESTION);
@@ -3779,6 +3945,7 @@ mod confirmation_tests {
             tray_wait: None,
             start_minimised: false,
             reopening: false,
+            only_raised_like_windows: false,
         }
     }
 
@@ -3798,7 +3965,7 @@ mod confirmation_tests {
         // 0.4.0 audit #16: one click on the menu used to delete the preset for good.
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path());
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         assert_eq!(listed(&shell), ["Mine", "Other"]);
 
         shell.act_on_menu(MenuChoice::Delete);
@@ -3835,7 +4002,7 @@ mod confirmation_tests {
     fn a_yes_to_a_preset_that_is_no_longer_selected_deletes_nothing() {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path());
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         shell.act_on_menu(MenuChoice::Delete);
         // A keybind moves the selection while the question is up.
         shell.rt.app.cycle_preset(true);
@@ -3852,7 +4019,7 @@ mod confirmation_tests {
         // 0.4.0 audit #21: the settings pane's button reset at once.
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = runtime(dir.path());
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         shell
             .rt
             .app
@@ -3904,6 +4071,37 @@ mod confirmation_tests {
         );
         assert!(shell.settings.is_some(), "the pane stays open");
         assert!(!shell.settings.as_ref().is_some_and(|s| s.can_reset_presets));
+    }
+
+    #[test]
+    fn restart_wireplumber_asks_first_and_keeps_the_pane_open() {
+        // Roadmap 0.5.0 §7, D5: the restart stops every application's sound for a moment. A test
+        // run's app has no WirePlumber of the user's to restart (`App::start_for_tests`).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = runtime(dir.path());
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
+        shell.open_settings();
+        let mut state = shell.settings.take().expect("the pane is open");
+        let closed = shell.act_on_settings(&[SettingsAction::RestartWirePlumber], &mut state);
+        assert!(!closed);
+        shell.settings = Some(state);
+        assert_eq!(
+            shell.confirm.as_ref().map(asked).as_deref(),
+            Some("Restart WirePlumber now? The sound of every application stops for a moment.")
+        );
+        shell.answer(ConfirmChoice::No);
+        assert!(shell.confirm.is_none());
+        let mut state = shell.settings.take().expect("the pane is open");
+        shell.act_on_settings(&[SettingsAction::RestartWirePlumber], &mut state);
+        shell.settings = Some(state);
+        shell.answer(ConfirmChoice::Yes);
+        assert!(shell.confirm.is_none());
+        assert!(shell.settings.is_some(), "the pane stays open");
+        assert_eq!(
+            shell.settings.as_ref().map(|s| s.wireplumber_hook),
+            Some(fxsound_ui::dialogs::settings::WirePlumberHook::default()),
+            "nothing to restart in a test run"
+        );
     }
 }
 
@@ -4014,6 +4212,7 @@ mod forget_device_tests {
             tray_wait: None,
             start_minimised: false,
             reopening: false,
+            only_raised_like_windows: false,
         };
         (runtime, engine)
     }
@@ -4291,7 +4490,7 @@ mod popup_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = calibration_tests::runtime(dir.path(), false);
         rt.app.state.view = ViewMode::Lite;
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         let lite = layout::lite::WINDOW_SIZE;
         let ctx = context();
 
@@ -4333,7 +4532,7 @@ mod popup_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = confirmation_tests::runtime(dir.path());
         rt.app.state.view = ViewMode::Pro;
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         let pro = layout::pro::WINDOW_SIZE;
         let ctx = context();
         sized_frame(&mut shell, &ctx, pro);
@@ -4376,7 +4575,7 @@ mod popup_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = calibration_tests::runtime(dir.path(), false);
         rt.app.state.view = ViewMode::Lite;
-        let mut shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         let ctx = context();
         let lite = layout::lite::WINDOW_SIZE;
         let (_, commands) = sized_frame(&mut shell, &ctx, lite);
@@ -4407,7 +4606,7 @@ mod popup_tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let mut rt = calibration_tests::runtime(dir.path(), false);
         rt.app.state.view = ViewMode::Lite;
-        let shell = Shell::new(&mut rt, ThemeMode::Dark);
+        let shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
         let lite = layout::lite::WINDOW_SIZE;
         let bounds = shell.popup_bounds(Rect::from_min_size(Pos2::ZERO, lite));
         assert_eq!(
@@ -4584,5 +4783,78 @@ mod popup_tests {
         })
         .drop_without_applying_deltas();
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+    use fxsound_core::WindowsParity;
+
+    /// The edge the context draws every popup and tooltip with after one frame of `shell`'s.
+    fn frame_edge(shell: &mut Shell<'_>, ctx: &egui::Context) -> egui::Stroke {
+        ctx.run_ui(egui::RawInput::default(), |ui| shell.sync_theme(ui.ctx()))
+            .drop_without_applying_deltas();
+        ctx.global_style().visuals.window_stroke
+    }
+
+    #[test]
+    fn a_level_change_in_the_light_theme_redraws_the_popups_edges_on_the_next_frame() {
+        // W2: the level decides the palette's edges as well as the theme does, and a frame that
+        // re-applied the visuals only on a new theme kept the last level's edge on every popup.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = calibration_tests::runtime(dir.path(), false);
+        rt.app.state.theme = ThemeMode::Light;
+        let mut shell = Shell::new(&mut rt, Palette::new(ThemeMode::Dark));
+        let ctx = egui::Context::default();
+        let light = Palette::new(ThemeMode::Light);
+
+        let ours = frame_edge(&mut shell, &ctx);
+        assert_eq!(ours.color, light.divider());
+
+        shell
+            .rt
+            .app
+            .set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        let windows = frame_edge(&mut shell, &ctx);
+        assert_eq!(windows.color, light.windows(true).divider());
+        assert_ne!(
+            windows.color, ours.color,
+            "the Windows edge is another colour"
+        );
+
+        shell
+            .rt
+            .app
+            .set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        assert_eq!(frame_edge(&mut shell, &ctx), ours, "and back again at Off");
+    }
+
+    #[test]
+    fn a_window_opened_at_interface_keeps_the_windows_edge_until_the_level_goes_off() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut rt = calibration_tests::runtime(dir.path(), false);
+        rt.app.state.theme = ThemeMode::Light;
+        rt.app
+            .set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        let palette = rt.app.palette();
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, palette);
+        let mut shell = Shell::new(&mut rt, palette);
+        let light = Palette::new(ThemeMode::Light);
+
+        assert_eq!(
+            frame_edge(&mut shell, &ctx).color,
+            light.windows(true).divider()
+        );
+        shell
+            .rt
+            .app
+            .set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        assert_eq!(frame_edge(&mut shell, &ctx).color, light.divider());
     }
 }

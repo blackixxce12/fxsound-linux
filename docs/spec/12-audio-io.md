@@ -1218,6 +1218,10 @@ fn on_sink_process(&mut self) {
 }
 ```
 
+*0.5.0:* a block of digital silence or an empty packet right after a block that ended loud is a
+sound cut off: before the push, the unplayed end of the ring fades out and the chain is held
+silent until the next sound (§19.7, "A sound cut off").
+
 **NODE 2 (output):**
 
 ```rust
@@ -1395,6 +1399,23 @@ next volume key would raise it.
 **A new pair fades in.** The first 30 ms a new pair processes rise linearly from silence, in both
 lanes, after the volume (`lane_dsp::FADE_IN_SECONDS`).
 
+**A sound cut off.** *0.5.0 (D4).* A stream moved off FxSound's virtual sink — the desktop picking
+another default device, a mixer moving one application — leaves it between two cycles, in the
+middle of its wave, while NODE 2 still holds the block and a half NODE 1 pushed last. Until 0.5.0
+it played that to its end and stopped there in a step as loud as the sound, followed by the
+preset's ring-out. Now NODE 1 watches for it (`engine::CutWatch`): a block whose last 8 frames
+reach −40 dBFS in any channel (`CUT_LEVEL`, `CUT_END_FRAMES`), followed by one of digital silence
+or by an empty packet (`chunk->size == 0`), is a sound cut off. The last 10 ms of it NODE 2 has
+not played yet fade to silence over half a cosine in the ring (`SampleRing::fade_tail`,
+`CUT_FADE`; fewer frames if fewer are left), and the chain is held silent from that block on —
+through the same mute as the system mute, so no ring-out — until the next sound, which fades in
+over 30 ms as a new pair's does (`cut_off`, `FADE_IN_SECONDS`). A sound that ends on its own, or a
+stream the smooth handover faded out (its last step is 1/120 of full scale), ends below the level
+and is left as it is. A sound cut off *inside* a block, padded with silence by the application,
+is not found: its step is in the block the application hands over, which plain Linux plays too.
+Measured in `graph_churn::clicks` on the desktop's picks (§21, the polite protocol, step 4): at
+the speakers FxSound had played through, −88.8 to −105.6 dBFS in 136 of 144 picks.
+
 The rule that matters most is unchanged: **nothing here writes the real device's `Props`.** Only
 FxSound's own two virtual nodes are written, and only with the volume they had or a lower one.
 
@@ -1566,11 +1587,20 @@ value:            {"name":"fxsound_sink"}
    ("1 of 1 PipeWire links failed to activate"), and nothing tries again until the default moves.
    So while FxSound holds a default, a stream that follows it (`node.autoconnect`, no target of its
    own, none in the metadata, not `node.dont-move`/`node.dont-reconnect`, no monitor recorder)
-   and has no link for 500 ms has its `target.object` set to FxSound's node and deleted again at
-   once: each change makes WirePlumber rescan and link it, and the stream still follows the
-   default. Twice at most per stream each time FxSound takes the default (`crate::stranded`;
+   and has no link for 250 ms (500 ms in 0.4.0; counted since 0.5.0 from the moment its last link
+   went, and found by the supervisor's next tick) has its `target.object` set to FxSound's node
+   and deleted again at once: each change makes WirePlumber rescan and link it, and the stream
+   still follows the default. Twice at most per stream each time FxSound takes the default
+   (`crate::stranded`;
    `graph_churn::a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_toggle`,
    with WirePlumber itself on a private graph).
+   *0.5.0:* the same happens the other way — a recorder moved at the power off from the stereo
+   `fxsound_source` onto a mono microphone, about one power off in fifteen with four recorders —
+   so for 3 s after FxSound hands a default back, such a stream is moved the same way onto the
+   device the default went to. And that test now times every switch: each recorder records again
+   where the default went — linked, the link active, its volume back from the fade (4b) — within
+   1 s of the switch, a stranded one's rescue included (measured: 330–380 ms, and up to 780 ms
+   for a rescued one; 1.1–1.2 s with the 0.4.0 wait of 500 ms from the first tick that saw it).
 4a. **A desktop pick, while following the system.** With no ranking (*Follow the system's default
    device*), a real device written to `default.configured.audio.<sink|source>` by anyone but
    FxSound — the desktop's sound settings, `wpctl set-default` — once the connection is up, is
@@ -1578,13 +1608,132 @@ value:            {"name":"fxsound_sink"}
    or takes it back at once when it already plays there. FxSound's own writes are told apart by
    their echoes, kept until the server reports them. Before 0.4.0's live check the saved device the
    app announces at every start outranked the desktop (rule 4), and the default stayed on the
-   picked device, past FxSound. A start still begins on that saved device; the desktop's next pick
-   moves it.
+   picked device, past FxSound. *0.5.0:* the engine also tells the app of the pick
+   (`AudioToUi::DesktopPick { direction, node_name }`), and the app, while the lane follows the
+   system's default device, saves it as the lane's device, as a pick in FxSound would be — so the
+   next start begins on the device the desktop picked last, not on the one last picked in FxSound.
+   Nothing is sent back to the engine, which has moved the lane already. It is sent for a pick
+   only: the engine's own fallback, when the lane's device goes and it moves to another, is the
+   rules' doing and leaves the saved device as it is; and with a priority list in force the app
+   keeps nothing.
+4b. **Moves without a click (0.5.0).** WirePlumber moves a stream by unlinking it and linking it
+   to the new target in the middle of its wave, and each move of the power button — the claim
+   (step 3) and the hand-back (step 5 at the power off, U12) — moved every stream that follows the
+   default with a click of −18.8 to −31.1 dBFS. So every move of an application's stream FxSound
+   causes goes through one handover (`crate::stream_handover`, the engine's `fades`): the claim,
+   the power-off hand-back, the claim taken back after a desktop pick (4a), and the `target.object`
+   keys of the per-application routes, written and deleted (`SetAppRoutes([])` at the power off
+   among them).
+   1. Each stream to be moved that plays (`running`), has a master volume of its own that is not
+      locked and not silent, has that volume read from its `Props` and written first to the
+      journal, `$XDG_STATE_HOME/fxsound/handover.toml`, under the key WirePlumber keeps it under
+      (`Output/Audio:application.name:…`); then its master `volume` is sent to 0 over 20 ms
+      (`volumeRampTime`, `volumeRampStepSamples = 8`), on a third connection of the engine's own
+      with a watchdog, since a `set_param` on another client's node holds the writer until the
+      owner answers. `channelVolumes`, the level a desktop's mixer shows, is not touched. Eight
+      samples a step, not one: the converter applies a ramped write's new volume at once and only
+      then builds the ramp, a `Props` object a step (`audioconvert.c`, `apply_props`), and a cycle
+      its data thread plays in between plays at the new volume before the ramp starts from the
+      old one — a whole quantum at full level before a fade in. Without FxSound, on a private
+      graph, a `parec` stream faded out and in over 50 ms: at one sample a step 21 writes in 2400
+      did it, at eight 1 in 1600. It is PipeWire's, and not gone: see the measurements below.
+   2. Once the server echoes the 0, and 70 ms more have gone (the ramp, what the stream buffers,
+      a quantum), the move is made: the key written — the default claimed or handed back, a
+      target set or deleted. The lanes' DSP does not wait for it: the power switch reaches the
+      chain at the press, through the snapshot the app writes to the audio thread, and the chain
+      switches with its own dip (10 ms out, 10 ms in; `fxsound_dsp::smooth::Dip`). At the power
+      off, a stream that follows the default hears that dip on FxSound's node, and the switch to
+      the unprocessed sound, some 90 ms before its own fade — after the move it plays to the
+      device and no longer passes FxSound's DSP. At the power on the chain is on before the
+      streams arrive, silent, on FxSound's node. Holding the snapshot until the move, as the
+      roadmap asked (§7), would put an override of the engine's in front of the app's wait-free
+      snapshot on the real-time path, and one left standing would be a power button that does
+      not bypass; for a switch that is click-free on its own it is not done.
+   3. The stream's next link to become **active** ends its move — WirePlumber's, or the rescue's
+      for a stranded stream (step 4) — and its volume goes back over 50 ms: a player's at once, a
+      recorder's 50 ms after its link is active, when what its source plays has reached it. One
+      with no new link within 1 s gets its volume back regardless; one whose move moved nothing
+      (the power switched back before the hand-back's turn) gets it back at once.
+   4. The echo of the volume given back, and the ramp's own length after it, have the volume
+      written once more, at once: the converter may have last reported a point on the way — the
+      next handover reads what the server shows as the stream's volume, and WirePlumber keeps it.
+      The server reporting that volume ends the stream's handover, and its line leaves the
+      journal; until it does, the volume is written again every 50 ms, four times at most (seen on
+      PipeWire 1.6.9: the echo of that write went missing, the server kept a point 0.10 of the way
+      up, and the next power switch gave the application that back, 20 dB down). Points a ramp
+      passes, down or up, reported on the way, are the ramp's. One handover at a time, one ramp at
+      a time per stream; a volume someone else writes meanwhile (a role's ducking, a mixer) is
+      theirs, and is not written over.
+   A line still in the journal at the next start — FxSound killed within that tenth of a second —
+   is put back on the application's stream found at 0, then or when it next appears: WirePlumber
+   keeps the 0 in its own state (`state-stream.lua`) and gives it to the application's next
+   stream, while a PulseAudio mixer shows 100 %. A PipeWire older than 0.3.68 has no ramp, and
+   there the move is made at once, as in 0.4.0. Measured on a private graph with WirePlumber
+   0.5.17 and PipeWire 1.6.9: the power switch's moves at −45.9 dBFS or quieter in the median, a
+   gap of 50–130 ms — but not in every run. The converter's race (step 1) played a quantum at full
+   level before the fade in of a PulseAudio recorder at 2 power switches in 160, −17.7 to −24.9
+   dBFS, and before a player's at 3 in 96 with one sample a step and none in 160 with eight. That
+   click is PipeWire's to end. The tests are `graph_churn::clicks` (gated at −40 in the median, the
+   gap at 200 ms, for `pw-cat` and for PulseAudio applications, with every run counted: one switch
+   over the gate in a pass is listed, a second fails it) and `graph_churn::handover`.
+4c. **Another device, the same virtual node (0.5.0).** Until 0.5.0 a lane that moved to another
+   device — picked in FxSound, `--output`, `--next-output`, `--input`, a desktop pick it follows
+   (4a), a target that came back as a new node — dropped both of its nodes and built them again
+   there, and for as long as `fxsound_sink` was gone WirePlumber moved every application on it onto
+   a device of its own, unprocessed, and back: −4.9 to −10.3 dBFS on the speakers for FxSound's own
+   pick. Now a target at the format the pair runs at (`PairFormat`: channels, rate, and the
+   microphone's native rate) keeps the virtual node — `fxsound_sink`, `fxsound_source`, and a
+   keep-awake recorder on the source — and only the stream on the device is replaced: the
+   playback stream (NODE 2) or the capture stream (NODE 1, which is also how the capture stream
+   moves onto the echo canceller's source and back). No application is moved, and the claim on
+   the default is never in question. A new format still replaces the whole pair.
+   1. The lane's chain falls silent, as a mute does over 20 ms (`StreamStatus::switch_mute`, read
+      by NODE 1 beside the sleep's mute), and with something playing through the lane the stream
+      on the device goes only once that silence has been played on the old device: the fade and
+      three of the ring's cushions, 68 ms at a 512-frame quantum (`switch_tail`). The handover's
+      clock wakes the main loop for it.
+   2. The new stream is made on the new device. A capture stream takes the lane's DSP, silent; a
+      playback stream drops what the ring holds on its first block. The lane's volume is
+      remembered for the device it left and looked up for the new one, as for a new pair (§19.7),
+      and written to the kept virtual node.
+   3. The chain is heard again, faded in from silence, once the new stream's link to the device
+      is active (followed on the handover's connection) and has settled there for 60 ms, or two
+      cushions at a larger quantum (`switch_settle`) — or after 1 s regardless. Not on the new
+      stream's first block: it is in the virtual node's link-group, so the server runs it from the
+      moment it exists, linked or not, and a chain let out then faded in into nothing and started
+      on the device at full level. Nor at the link itself: the first cycles on the new device's
+      clock can leave the ring a block short, a gap in the middle of the wave.
+   4. After a desktop pick with the lane holding no default, the move to the device is made inside
+      the claim that takes the default back (4b), once the applications WirePlumber moved there are
+      faded to silence: a stream linked to their device while they play changes the quantum under
+      them, and a player or recorder whose quantum changes can skip samples.
+   Measured on a private graph with WirePlumber 0.5.17 and PipeWire 1.6.9 (`graph_churn::clicks`,
+   three passes): FxSound's pick −59.1 to −75.6 dBFS, a gap of 100–140 ms; its claim after a
+   desktop pick −59.9 to −66.7, a gap of 110–160 ms. The desktop's own move before it stays where
+   plain Linux has it (§14 #16 of the roadmap), and is held there: its loudest run, read above the
+   tone rather than in dBFS because the chain plays the tone louder than plain Linux does (by
+   10.9 dB on the speakers, 7.2 on the microphone), may be no more than 3 dB over the loudest run
+   of the same picks with FxSound off (§7 test 4 of the roadmap; `against_bare_linux`). It was
+   −10.5 dB (−8.8 in one pass) against −6.8 on the speakers and −6.9 against −5.3 on the
+   microphone. The move cuts the application off FxSound's sink between two cycles, in the
+   middle of its wave; since 0.5.0 the end of it NODE 2 has not played yet fades out over 10 ms
+   in the ring and the chain's ring-out after it is dropped (§19.7, "A sound cut off"). At the
+   speakers FxSound had played through, the pick went from a step at the level of the move itself
+   to −88.8 to −105.6 dBFS in 136 of 144 picks (twelve passes); in the other 8 the recording skips
+   into the fade at −8.4 to −16.3. What is left of the move is the application arriving
+   unprocessed on the picked device (−18.8 to −48.0), as in plain Linux; the click test gates the
+   speakers left behind (`left_behind`: no more than a quarter of a pass's picks at −40 dBFS or
+   louder). `graph_churn::switch` checks that the sink, the source and the applications' links
+   stay.
 5. **Restore on exit**, in this order (this is the Linux `sndDevicesRestoreDefaultDevice`,
    `sndDevicesSetupDevices.cpp:545-644`):
    1. Pick the first *present* sink from `user_selected_playback` → `most_recent_playback` →
       `most_recent_default` → `prior_default` → `original_default`.
-   2. Write it into `default.configured.audio.sink`.
+   2. Write it into `default.configured.audio.sink`. *0.5.0:* before it, every stream a handover
+      (4b) holds silent gets its volume back, and the loop is turned until the server has it or
+      the wait is up; the moves not made yet are not made, and this hand-back is made at once,
+      unfaded: the way out does not wait on a fade. A volume not back in time stays in the
+      journal for the next start.
    3. **Only then** disconnect the streams / destroy the nodes.
    Doing it in that order means there is never a window in which the default points at a node that
    no longer exists. Do this on `SIGINT`/`SIGTERM` as well as on clean quit — install a handler that
@@ -1642,7 +1791,9 @@ Implementation notes:
   registry `global_remove` for that node id → re-run the §19.5 rules on the next supervisor tick →
   reconnect NODE 2 with a new `target.object`. Do not tear down NODE 1; apps stay connected to it
   and never notice. Since 0.4.0 that is so for a node that has gone for good; a node whose card is
-  still there is first waited for (*A target that blinks*, below).
+  still there is first waited for (*A target that blinks*, below). *0.5.0:* only now is NODE 1
+  really kept, when the new target takes the pair's format (§21, 4c); 0.3.0 and 0.4.0 rebuilt the
+  whole pair.
 * Watch for `PIPEWIRE_REMOTE` / `XDG_RUNTIME_DIR` being unset (e.g. under a bare TTY or a flatpak
   without the `pipewire` socket permission) and fail with a clear message rather than looping.
 
@@ -1716,8 +1867,10 @@ Since 0.4.0 each lane decides per node that goes (`engine.rs`: `Hold`, `hold_for
   Whether the lane's pair is already on what the rules choose is asked of the target's
   `node.name` **and** its `object.serial` (`is_same_node`), never the name alone: WirePlumber
   never links a handled `node.dont-reconnect` stream again (`linking/prepare-link.lua:71-76`), so
-  a pair kept because the name matched would play into nothing. The new serial rebuilds the pair, and the new pair's NODE 2 is a new stream,
-  which WirePlumber links. A server that reports no serial leaves the name to decide, as before.
+  a pair kept because the name matched would play into nothing. The new serial replaces the
+  stream on the device — since 0.5.0 that stream alone, at the same format, the virtual node kept
+  (§21, 4c) — and the new stream is one WirePlumber links. A server that reports no serial leaves
+  the name to decide, as before.
 * **What is still waited out: a card switched to `off`.** A card set to its `off` profile (in
   `pavucontrol`'s Configuration tab, or by `wpctl set-profile`) removes its nodes and adds none,
   and its `Device` object stays. Nothing ends the hold early: no node comes back under the old
@@ -2298,9 +2451,10 @@ nodes vanish.
 
 Two rebuild paths deliberately **keep** the default, because the same node is about to reappear
 under the same name and `default.configured.audio.*` survives the gap: a target change within the
-same lane, and the supervisor's format-mismatch / NODE 1- or NODE 2-error rebuilds. Since 0.4.0 a
-stream error is one of these, a rebuild of that lane alone on its own backoff (`supervise_lane`,
-§29.1), and no longer a path to `disconnect`.
+same lane, and the supervisor's format-mismatch / NODE 1- or NODE 2-error rebuilds. (Since 0.5.0 a
+target change at the same format keeps the virtual node itself, and there is no gap at all: §21,
+4c.) Since 0.4.0 a stream error is one of these, a rebuild of that lane alone on its own backoff
+(`supervise_lane`, §29.1), and no longer a path to `disconnect`.
 
 ### 28.7 What the GUI receives
 

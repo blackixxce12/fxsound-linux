@@ -13,6 +13,7 @@ pub mod engine;
 pub mod eq;
 pub mod input;
 pub mod leveller;
+pub mod preset;
 pub mod smooth;
 pub mod spectrum;
 

@@ -49,7 +49,7 @@
 # fxsound.spec: for a local rpmbuild, mock or COPR build the filename is irrelevant, but Fedora
 # dist-git wants <name>.spec, so a submission renames this to fxsound-linux.spec.
 Name:           fxsound-linux
-Version:        0.4.0
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        System-wide audio enhancement: EQ, ambience, surround, bass and dynamic boost
 
@@ -285,6 +285,12 @@ install -Dpm0644 assets/images/fxsound_large.png \
     %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/fxsound.png
 install -Dpm0644 assets/images/fxsound.png \
     %{buildroot}%{_datadir}/icons/hicolor/32x32/apps/fxsound.png
+# The same two under the application id, the icon name every notification is sent with
+# (crates/fxsound-app/src/notify.rs).
+install -Dpm0644 assets/images/fxsound_large.png \
+    %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/com.fxsound.FxSound.png
+install -Dpm0644 assets/images/fxsound.png \
+    %{buildroot}%{_datadir}/icons/hicolor/32x32/apps/com.fxsound.FxSound.png
 
 # The tray icon's three states. A StatusNotifier host resolves an icon *name* through the theme,
 # so without these under hicolor's status context the tray shows a blank where the icon should be.
@@ -354,6 +360,8 @@ appstreamcli validate --no-net %{buildroot}%{_metainfodir}/com.fxsound.FxSound.m
 %{_datadir}/fxsound/presets/Input/
 %{_datadir}/icons/hicolor/256x256/apps/fxsound.png
 %{_datadir}/icons/hicolor/32x32/apps/fxsound.png
+%{_datadir}/icons/hicolor/256x256/apps/com.fxsound.FxSound.png
+%{_datadir}/icons/hicolor/32x32/apps/com.fxsound.FxSound.png
 %{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-off.svg
 %{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-on.svg
 %{_datadir}/icons/hicolor/scalable/status/com.fxsound.FxSound-processing.svg
@@ -364,6 +372,9 @@ appstreamcli validate --no-net %{buildroot}%{_metainfodir}/com.fxsound.FxSound.m
 
 
 %changelog
+* Wed Sep 30 2026 FxSound Linux port contributors <blackixxce12@users.noreply.github.com> - 0.5.0-1
+- Update to 0.5.0
+
 * Sun Sep 27 2026 FxSound Linux port contributors <blackixxce12@users.noreply.github.com> - 0.4.0-1
 - Update to 0.4.0
 - Install the manual page, the D-Bus activation file, the tray's status icons and the

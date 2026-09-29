@@ -7,7 +7,7 @@
 # rather than fetched from a remote. Install the result with `pacman -U`.
 
 pkgname=fxsound-linux
-pkgver=0.4.0
+pkgver=0.5.0
 pkgrel=1
 pkgdesc="System-wide audio enhancement for Linux: EQ, ambience, surround, bass and dynamic boost (Rust/egui port of FxSound)"
 arch=('x86_64')
@@ -101,6 +101,13 @@ package() {
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/fxsound.png"
   install -Dm644 "assets/images/fxsound.png" \
     "${pkgdir}/usr/share/icons/hicolor/32x32/apps/fxsound.png"
+  # The same two under the application id, the icon name every notification is sent with
+  # (crates/fxsound-app/src/notify.rs): a daemon that resolves it through the theme finds nothing
+  # under fxsound alone.
+  install -Dm644 "assets/images/fxsound_large.png" \
+    "${pkgdir}/usr/share/icons/hicolor/256x256/apps/com.fxsound.FxSound.png"
+  install -Dm644 "assets/images/fxsound.png" \
+    "${pkgdir}/usr/share/icons/hicolor/32x32/apps/com.fxsound.FxSound.png"
 
   # The tray icon's three states. A StatusNotifier host resolves an icon *name* through the theme,
   # so without these under hicolor's status context the tray shows a blank where the icon should

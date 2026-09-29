@@ -881,8 +881,9 @@ schema change.
   (`crates/fxsound-app/src/cli.rs` `Command::honoured_at_cold_start`,
   `crates/fxsound-app/src/commands.rs` `answer_without_an_instance`). D-Bus `NextOutput` and
   `NextInput` cannot be refused that way: the bus starts FxSound first, and the call reaches an
-  instance with no device list yet, steps nowhere and succeeds (the man page says so; waiting
-  for the list, as `ForgetDevice` does, is left for 0.5.0).
+  instance with no device list yet. In 0.4.0 it stepped nowhere and succeeded; since 0.5.0 it
+  waits for the first list, for at most three seconds, as `ForgetDevice` does, and then steps
+  (`commands::waits_for_the_device_list`).
 
 ---
 
@@ -1314,7 +1315,8 @@ Notify(
   summary       = "FxSound",                    // matches szInfoTitle, :413
   body          = <message, with \r\n -> \n>,   // up to 3 lines, §6.2
   actions       = link.is_some() ? ["default", <link.first>] : [],
-  hints         = { "urgency": 0 /*low*/, "suppress-sound": true,
+  hints         = { "urgency": 0 /*low: an echo*/ or 1 /*normal: an alert*/,
+                    "suppress-sound": true,
                     "desktop-entry": "com.fxsound.FxSound",
                     "category": "device" },
   expire_timeout = link.is_some() ? 8000 : 7000  // §6.2
@@ -1327,8 +1329,9 @@ Mapping table:
 |---|---|
 | single message slot (`FxModel.h:170-183`) | keep **one** `replaces_id` so a new message replaces the old one in place, exactly matching the C++ semantics |
 | `NIIF_NOSOUND` (`:411`) | hint `"suppress-sound" = true` |
-| `NIIF_RESPECT_QUIET_TIME` (`:411`) | urgency `Low` — DND policies suppress Low first |
-| `SHQueryUserNotificationState != QUNS_ACCEPTS_NOTIFICATIONS` → skip (`:394-398`) | check the daemon's DND state where exposed (GNOME Shell publishes an `Inhibited` property on `org.freedesktop.Notifications`); otherwise just send with Low urgency and let the daemon decide. **Do not** reimplement full-screen detection. |
+| `NIIF_RESPECT_QUIET_TIME` (`:411`) | left to the daemon: Do Not Disturb holds back normal and low urgency alike. Urgency is per kind of message (0.5.0): `Normal` for what the user has to see (where the window went, a lost output, a refused save, a keybind's power toggle, and any echo sent while no window is up or the window is minimised), `Low` for an echo of a change the window shows — GNOME Shell never shows a banner for `Low` (`messageTray.js`, `_onNotificationRequestBanner`) |
+| one sender for all notices (0.5.0) | every `Notify` goes over **one** connection kept open while FxSound runs. GNOME Shell destroys an application's notifications when the sender that created their source leaves the bus (`notificationDaemon.js`, `_onNameVanished`), so notify-rust's connection per notification, closed at once, had GNOME remove each notice about 7 ms after showing it |
+| `SHQueryUserNotificationState != QUNS_ACCEPTS_NOTIFICATIONS` → skip (`:394-398`) | check the daemon's DND state where exposed (GNOME Shell publishes an `Inhibited` property on `org.freedesktop.Notifications`); otherwise just send and let the daemon decide. **Do not** reimplement full-screen detection. |
 | link → `FxHyperlink` inside the toast | notification **action**; on `ActionInvoked` open the URL with `xdg-open` via `std::process::Command` (never shell out through `sh -c`) |
 | 7000 / 8000 ms timers (`FxNotification.cpp:187,191`) | `expire_timeout` in ms — but note servers may clamp or ignore it |
 | fade-in 200 ms, radius 16, shadow 5 | **not portable** — the daemon owns the look. Drop, unless you take the fallback path below. |

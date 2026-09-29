@@ -11,7 +11,9 @@
 //! the same file format, layered on top of the original's table for the same language — and,
 //! for the few strings a Windows table misspells, omits or gets wrong where the port shows them
 //! (Croatian's `on`/`off` left in English, Italian's `on` as "su", eleven `"Output: "`s without
-//! the space the device name needs), a repaired copy: a layer over a file that is embedded
+//! the space the device name needs, Arabic's Bass Boost left in English, both Chinese tables
+//! naming the window's hotkey as the power's, Italian's tray quitting with its word for the output
+//! lane and putting "Select" last), a repaired copy: a layer over a file that is embedded
 //! unchanged is the one place such a repair can live.
 //!
 //! `tests/translations.rs` audits every string the interface passes to [`tr`] against every
@@ -110,6 +112,19 @@ pub static LANGUAGES: [Language; 30] = [
     language!("zh-CN", "简体中文", "zh-CN"),
     language!("zh-TW", "繁體中文", "zh-TW"),
     language!("ko", "한국어", "ko"),
+];
+
+/// The codes of [`LANGUAGES`] in the order the Windows build's language switch runs through them
+/// (`FxLanguage.cpp:25`), which «Как в Windows» = Interface and above bring back — the order only;
+/// the names stay [`LANGUAGES`]' own (0.4.0 audit #28, `fxsound_core::WindowsLook::LanguageOrder`).
+///
+/// The Windows list has Hungarian, which it never shipped a table for, and no Bulgarian, which this
+/// port has; Bulgarian goes where the Windows list, ordered by the languages' English names from
+/// Arabic on, would have put it, after Bosnian.
+pub const WINDOWS_ORDER: [&str; 30] = [
+    ENGLISH, "ar", "ba", "bg", "hr", "cs", "de", "es", "fi", "fr", "id", "it", "ja", "ko", "nl",
+    "no", "fa", "pl", "pt", "pt-br", "ro", "ru", "sl", "sv", "th", "tr", "ua", "vi", "zh-CN",
+    "zh-TW",
 ];
 
 impl Language {
@@ -364,10 +379,29 @@ pub fn current() -> String {
     CURRENT.load().code.clone()
 }
 
+/// Where a translation says a long word may be broken over two lines: `Эксперимен{-}тальное`.
+///
+/// Only the port's own tables use it, and only in a caption drawn where two lines fit and one does
+/// not — the Settings tabs' ([`tr_breakable`]). Everywhere else [`tr`] takes it out. A soft hyphen
+/// (U+00AD) would have been the standard spelling, but egui neither breaks at one nor hides it.
+pub const BREAK: &str = "{-}";
+
 /// Translate one string. The key is the English text, exactly as the C++ passes it to
-/// `TRANS`; an untranslated key comes back as itself.
+/// `TRANS`; an untranslated key comes back as itself. A [`BREAK`] in the translation is taken out.
 #[must_use]
 pub fn tr(key: &str) -> String {
+    let text = tr_breakable(key);
+    if text.contains(BREAK) {
+        text.replace(BREAK, "")
+    } else {
+        text
+    }
+}
+
+/// [`tr`], with each [`BREAK`] left where the translation put it, for a caption that may take
+/// two lines.
+#[must_use]
+pub fn tr_breakable(key: &str) -> String {
     CURRENT
         .load()
         .get(key)
@@ -477,6 +511,21 @@ mod tests {
         LANGUAGE_IN_EFFECT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn the_windows_order_holds_every_language_once_with_english_first() {
+        assert_eq!(WINDOWS_ORDER[0], ENGLISH);
+        let mut ours: Vec<&str> = LANGUAGES.iter().map(|language| language.code).collect();
+        let mut windows = WINDOWS_ORDER.to_vec();
+        ours.sort_unstable();
+        windows.sort_unstable();
+        assert_eq!(windows, ours);
+        // Russian is where the Windows switch has it, twenty-one presses on from English.
+        assert_eq!(
+            WINDOWS_ORDER.iter().position(|code| *code == "ru"),
+            Some(21)
+        );
     }
 
     #[test]
@@ -609,6 +658,65 @@ mod tests {
         };
         assert_eq!(original("it", "on").as_deref(), Some("su"));
         assert_eq!(original("de", "Output: ").as_deref(), Some("Ausgabe:"));
+    }
+
+    #[test]
+    fn the_port_repairs_the_bass_boost_the_hotkey_list_and_the_italian_tray() {
+        let get = |code: &str, key: &str| {
+            Catalogue::for_language(language(code).expect(code))
+                .get(key)
+                .map(str::to_owned)
+        };
+        let original = |code: &str, key: &str| {
+            language(code)
+                .expect(code)
+                .original_catalogue()
+                .get(key)
+                .map(str::to_owned)
+        };
+        // Arabic translated every effect but Bass Boost, which it left in English; the table's
+        // own word for bass is الجهير.
+        assert_eq!(original("ar", "Bass Boost").as_deref(), Some("Bass Boost"));
+        assert_eq!(get("ar", "Bass Boost").as_deref(), Some("تعزيز الجهير"));
+        // Both Chinese tables said "turn FxSound on/off" for the window's hotkey too.
+        for code in ["zh-CN", "zh-TW"] {
+            assert_eq!(
+                original(code, "Turn FxSound On/Off"),
+                original(code, "Open/Close FxSound"),
+                "{code}"
+            );
+            assert_ne!(
+                get(code, "Turn FxSound On/Off"),
+                get(code, "Open/Close FxSound"),
+                "{code}"
+            );
+            assert_eq!(
+                get(code, "Turn FxSound On/Off"),
+                original(code, "Turn FxSound On/Off"),
+                "{code}: the power's line keeps its words"
+            );
+        }
+        assert_eq!(
+            get("zh-CN", "Open/Close FxSound").as_deref(),
+            Some("打开/关闭 FxSound 窗口")
+        );
+        assert_eq!(
+            get("zh-TW", "Open/Close FxSound").as_deref(),
+            Some("開啟/關閉 FxSound 視窗")
+        );
+        // Italian's tray put the verb last ("Playback device Select") and quit with the word its
+        // window uses for the output lane.
+        assert_eq!(
+            original("it", "Playback Device Select").as_deref(),
+            Some("Dispositivo di riproduzione Seleziona")
+        );
+        assert_eq!(
+            get("it", "Playback Device Select").as_deref(),
+            Some("Seleziona dispositivo di riproduzione")
+        );
+        assert_eq!(original("it", "Exit").as_deref(), Some("Uscita"));
+        assert_eq!(get("it", "Exit").as_deref(), Some("Esci"));
+        assert_eq!(get("it", "Output").as_deref(), Some("Uscita"));
     }
 
     #[test]
@@ -770,6 +878,55 @@ mod tests {
         assert!(!set_language("xx"));
         assert_eq!(current(), ENGLISH);
         assert_eq!(tr("Settings"), "Settings");
+    }
+
+    #[test]
+    fn tr_takes_the_break_mark_out_and_tr_breakable_keeps_it() {
+        let _table = hold_the_table();
+        assert!(set_language("ru"));
+        assert_eq!(tr("Experimental"), "Экспериментальное");
+        assert_eq!(tr_breakable("Experimental"), "Эксперимен{-}тальное");
+        // A string without the mark is the same either way.
+        assert_eq!(tr_breakable("Settings"), tr("Settings"));
+        set_language(ENGLISH);
+        assert_eq!(tr("Experimental"), "Experimental");
+    }
+
+    #[test]
+    fn only_a_settings_tab_caption_carries_the_break_mark_in_any_table() {
+        // The captions drawn with `tr_breakable` (`SettingsTab::nav_label`); anywhere else the
+        // mark would be taken out by `tr` and never break anything.
+        let captions = [
+            "Audio",
+            "General",
+            "Help",
+            "Microphone",
+            "Applications",
+            "Experimental",
+        ];
+        for language in &LANGUAGES[1..] {
+            for catalogue in [language.original_catalogue(), language.port_catalogue()] {
+                for key in catalogue.keys() {
+                    let text = catalogue.get(key).unwrap_or_default();
+                    assert!(
+                        !text.contains(BREAK) || captions.contains(&key),
+                        "{}: {key:?} = {text:?}",
+                        language.code
+                    );
+                    // One mark at most, inside a word, never at either end.
+                    assert!(
+                        text.matches(BREAK).count() <= 1,
+                        "{}: {text:?}",
+                        language.code
+                    );
+                    assert!(
+                        !text.starts_with(BREAK) && !text.ends_with(BREAK),
+                        "{}: {text:?}",
+                        language.code
+                    );
+                }
+            }
+        }
     }
 
     #[test]

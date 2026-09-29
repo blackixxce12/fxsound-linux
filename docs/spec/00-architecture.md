@@ -779,12 +779,13 @@ Notification::new()
     .appname("FxSound").summary("FxSound").icon("com.fxsound.FxSound")
     .body(&text)                                     // \r\n → \n, at most 3 lines
     .hint(Hint::SuppressSound(true))                 // ≡ NIIF_NOSOUND
-    .urgency(Urgency::Low)                           // ≡ NIIF_RESPECT_QUIET_TIME
+    .urgency(message.weight.urgency())               // Low for an echo, Normal for an alert
     .hint(Hint::DesktopEntry("com.fxsound.FxSound".into()))
     .action("default", link_label)                   // only when a link exists
     .timeout(Timeout::Milliseconds(if has_link { 8000 } else { 7000 }))
-    .id(replaces_id)
-    .show()?;
+    .id(replaces_id);
+// sent by `notify::DesktopSink` over one connection kept open while FxSound runs, not
+// `.show()`, whose connection per notification GNOME Shell takes as the app leaving (0.5.0)
 ```
 
 `.actions(vec![..])` is deprecated — use `.action(id, label)`

@@ -17,6 +17,7 @@
 //! cargo run -p fxsound-ui --example preview -- --stored
 //! cargo run -p fxsound-ui --example preview -- --lang=de --message
 //! cargo run -p fxsound-ui --example preview -- --settings=general --light
+//! cargo run -p fxsound-ui --example preview -- --settings=experimental --parity=sound --lang=ru
 //! ```
 //!
 //! Flags: `--light`, `--input` (edit the microphone lane), `--lite`, `--notice[=TEXT]`,
@@ -26,8 +27,15 @@
 //! effects as a Windows preset stores them, between the sliders' positions), `--lang=CODE`
 //! (one of the translation tables' codes; English otherwise), `--apps[=empty]` (Settings ▸
 //! Applications over a made-up list of applications, or none), `--settings=TAB` (Settings on
-//! `audio`, `general`, `help`, `microphone` or `applications`), `--message[=TEXT]` (the Yes/No
-//! message box over the window: `TEXT` is translated, and its `%s` is a long preset name; the
+//! `audio`, `general`, `help`, `microphone`, `applications` or `experimental`),
+//! `--parity=LEVEL` (the level of «Like FxSound for Windows», `off`, `interface` or `sound`:
+//! what the Experimental pane's slider stands at, and what the main window's readouts, fine
+//! steps and `--stored` sliders follow, with or without `--settings`; `full` shows as `sound`, as
+//! the app runs a `settings.toml` that says it), `--wireplumber-hook=STATE` (the Experimental
+//! pane's "Smooth moves in WirePlumber": `off`, `on`, `due`, `failed` or `old`, a WirePlumber
+//! older than 0.5; available and off otherwise),
+//! `--message[=TEXT]` (the Yes/No message box over the window: `TEXT` is translated, and its `%s`
+//! is a long preset name; the
 //! export's overwrite question otherwise), `--exit-after-paint`. Keys while it
 //! runs: `I` switches the edit direction, `N` puts a notice up, `L` flips Pro/Lite, `T` flips the
 //! palette, `Esc` quits.
@@ -37,7 +45,7 @@
 //! routed applications.
 
 use eframe::egui;
-use fxsound_core::{AppKey, AudioDevice, DeviceDirection, ThemeMode, ViewMode};
+use fxsound_core::{AppKey, AudioDevice, DeviceDirection, ThemeMode, ViewMode, WindowsParity};
 use fxsound_ui::dialogs::settings::DevicePriority;
 use fxsound_ui::dialogs::{
     AppLane, AppRow, NavIcons, SettingsAction, SettingsDialog, SettingsState, SettingsTab, settings,
@@ -82,6 +90,21 @@ fn main() -> eframe::Result<()> {
     if flag("--power-off") {
         state.power = false;
     }
+    // The level goes to the main window too: its readouts and fine steps follow it (W1c), and
+    // `--stored` places the stored values as that level's sliders do.
+    let parity = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--parity="))
+        .and_then(|level| {
+            let parsed = WindowsParity::parse(level).map(WindowsParity::offered_or_below);
+            if parsed.is_none() {
+                eprintln!("no level {level:?}; expected off, interface or sound");
+            }
+            parsed
+        });
+    if let Some(level) = parity {
+        state.windows_parity = level;
+    }
     if flag("--stored") {
         // General's stored values: 50, 64, 20, 60 and 60 of 127, most of them between positions.
         use fxsound_core::{Effect, scale};
@@ -92,7 +115,8 @@ fn main() -> eframe::Result<()> {
             (Effect::DynamicBoost, 60),
             (Effect::Bass, 60),
         ] {
-            state.effects[effect as usize] = scale::midi_to_slider_for(effect, midi);
+            state.effects[effect as usize] =
+                scale::midi_to_slider_in(state.dsp_compat(), effect, midi);
         }
     }
     let mut preview = Preview::new(state, flag("--exit-after-paint"));
@@ -115,9 +139,29 @@ fn main() -> eframe::Result<()> {
             "help" => SettingsTab::Help,
             "microphone" => SettingsTab::Microphone,
             "applications" => SettingsTab::Applications,
+            "experimental" => SettingsTab::Experimental,
             _ => SettingsTab::Audio,
         };
         preview.settings = Some(settings);
+    }
+    if let (Some(level), Some(settings)) = (parity, &mut preview.settings) {
+        settings.settings.windows_parity = level;
+    }
+    if let Some(settings) = &mut preview.settings {
+        use fxsound_ui::dialogs::settings::{WirePlumberHook, WirePlumberRestart};
+        let which = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--wireplumber-hook="))
+            .unwrap_or("off");
+        settings.wireplumber_hook = WirePlumberHook {
+            available: which != "old",
+            on: matches!(which, "on" | "due" | "failed"),
+            restart: match which {
+                "due" => WirePlumberRestart::Due,
+                "failed" => WirePlumberRestart::Failed,
+                _ => WirePlumberRestart::NotNeeded,
+            },
+        };
     }
     preview.message = args.iter().find_map(|a| {
         a.strip_prefix("--message").map(|rest| {
@@ -146,7 +190,7 @@ fn main() -> eframe::Result<()> {
         "FxSound preview",
         options,
         Box::new(move |cc| {
-            theme::apply(&cc.egui_ctx, Palette::new(preview.state.theme));
+            theme::apply(&cc.egui_ctx, preview.palette());
             Ok(Box::new(preview))
         }),
     )
@@ -402,6 +446,12 @@ struct Preview {
 }
 
 impl Preview {
+    /// The palette the application would hand the views: the Windows theme from Interface on.
+    fn palette(&self) -> Palette {
+        Palette::new(self.state.theme)
+            .windows(self.state.windows_look(fxsound_core::WindowsLook::Palette))
+    }
+
     fn new(state: UiState, exit_after_paint: bool) -> Self {
         Self {
             state,
@@ -580,6 +630,21 @@ impl Preview {
                 settings.microphones.swap(*row, row + 1);
             }
             SettingsAction::SelectDeviceRow(row) => settings.selected_device = Some(*row),
+            SettingsAction::SetWindowsParity(level) => {
+                settings.settings.windows_parity = *level;
+                self.state.windows_parity = *level;
+                // The level decides the popups' and tooltips' edges too (`Palette::windows`).
+                theme::apply(ctx, self.palette());
+            }
+            SettingsAction::SetWirePlumberHook(on) => {
+                settings.wireplumber_hook.on = *on;
+                settings.wireplumber_hook.restart =
+                    fxsound_ui::dialogs::settings::WirePlumberRestart::Due;
+            }
+            SettingsAction::RestartWirePlumber => {
+                settings.wireplumber_hook.restart =
+                    fxsound_ui::dialogs::settings::WirePlumberRestart::NotNeeded;
+            }
             SettingsAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             _ => {}
         }
@@ -590,7 +655,7 @@ impl Preview {
             ThemeMode::Dark => ThemeMode::Light,
             ThemeMode::Light => ThemeMode::Dark,
         };
-        theme::apply(ctx, Palette::new(self.state.theme));
+        theme::apply(ctx, self.palette());
         self.assets.clear();
     }
 }
@@ -644,13 +709,7 @@ impl eframe::App for Preview {
         if let Some(settings) = &self.settings {
             let outer = egui::Rect::from_min_size(ui.max_rect().min, settings::WINDOW_SIZE);
             let actions = SettingsDialog::new(settings)
-                .show(
-                    ui,
-                    outer,
-                    Palette::new(self.state.theme),
-                    &mut self.assets,
-                    &mut self.icons,
-                )
+                .show(ui, outer, self.palette(), &mut self.assets, &mut self.icons)
                 .actions;
             for action in &actions {
                 self.handle_settings(&ctx, action);
@@ -663,11 +722,12 @@ impl eframe::App for Preview {
             return;
         }
 
+        let palette = self.palette();
         let response = views::show(
             ui,
             &self.state,
             &mut self.scratch,
-            Palette::new(self.state.theme),
+            palette,
             &mut self.assets,
         );
         for action in &response.actions {
@@ -680,12 +740,7 @@ impl eframe::App for Preview {
                 "Rock Ballad Extended Night",
             );
             if fxsound_ui::dialogs::MessageBox::new(&text)
-                .show_modal(
-                    &ctx,
-                    Palette::new(self.state.theme),
-                    &mut self.assets,
-                    "preview.message",
-                )
+                .show_modal(&ctx, self.palette(), &mut self.assets, "preview.message")
                 .is_some()
             {
                 self.message = None;

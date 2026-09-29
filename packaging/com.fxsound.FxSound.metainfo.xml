@@ -65,6 +65,17 @@
        date, and release.yml's verify job refuses a tag where the two differ, so a version bump
        dates both together. -->
   <releases>
+    <release version="0.5.0" date="2026-09-30">
+      <description>
+        <p>
+          «Like FxSound for Windows», a new Experimental setting, brings back the Windows
+          window, command line and tray, and at its last position the Windows sound. The power
+          button no longer clicks in the applications it moves, and an optional WirePlumber script
+          fades an application moved to another device instead of letting it click.
+        </p>
+      </description>
+      <url>https://github.com/blackixxce12/fxsound-linux/blob/main/CHANGELOG.md</url>
+    </release>
     <release version="0.4.0" date="2026-09-27">
       <description>
         <p>

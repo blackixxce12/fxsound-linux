@@ -68,10 +68,14 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-mod apps;
+pub(crate) mod apps;
+mod clicks;
+mod handover;
+mod hook;
 mod policy;
 mod routes;
 mod sleep;
+mod switch;
 mod volume;
 
 /// How long to wait for anything the server has to do.
@@ -105,6 +109,51 @@ pub(crate) fn skip(reason: &str) {
         "{reason}, and {REQUIRE_TOOLS}=1 says nothing here may be skipped"
     );
     println!("SKIPPED: {reason}");
+}
+
+/// Say what a test that passes left unchecked because the server under it could not show it: an
+/// older PipeWire in CI, above all. Unlike a `SKIPPED` line this is no failure under
+/// [`REQUIRE_TOOLS`], and unlike `println!` it is not kept back with the rest of a passing test's
+/// output: it is written to the process's own standard error, past the harness, and on GitHub
+/// Actions as a warning the run's summary lists. A pass that checked less must never be a silent
+/// one.
+pub(crate) fn note(what: &str) {
+    let on_github = std::env::var_os("GITHUB_ACTIONS").is_some_and(|value| value == "true");
+    let _ = emit_note(&mut std::io::stderr().lock(), what, on_github);
+}
+
+/// The line [`note`] writes: `NOTE: …`, or GitHub's `::warning` command carrying it, whose message
+/// must stay on one line, with `%`, CR and LF escaped.
+fn emit_note(out: &mut impl std::io::Write, what: &str, on_github: bool) -> std::io::Result<()> {
+    if on_github {
+        let what = what
+            .replace('%', "%25")
+            .replace('\r', "%0D")
+            .replace('\n', "%0A");
+        writeln!(
+            out,
+            "::warning title=Checked less on this server::NOTE: {what}"
+        )
+    } else {
+        writeln!(out, "NOTE: {what}")
+    }
+}
+
+#[test]
+fn a_note_is_one_plain_line_and_on_github_actions_a_warning_that_keeps_to_its_line() {
+    let mut plain = Vec::new();
+    emit_note(&mut plain, "the tail was not checked", false).expect("a Vec takes it");
+    assert_eq!(
+        String::from_utf8(plain).expect("UTF-8"),
+        "NOTE: the tail was not checked\n"
+    );
+
+    let mut github = Vec::new();
+    emit_note(&mut github, "100% dry\r\nin 3 rounds", true).expect("a Vec takes it");
+    assert_eq!(
+        String::from_utf8(github).expect("UTF-8"),
+        "::warning title=Checked less on this server::NOTE: 100%25 dry%0D%0Ain 3 rounds\n"
+    );
 }
 
 /// A PipeWire daemon of our own: one stereo sink, one 7.1 sink, one virtual microphone, and the
@@ -194,9 +243,11 @@ impl PrivateGraph {
             .arg("-c")
             .arg(&conf)
             .env("XDG_RUNTIME_DIR", &run)
-            .env("PIPEWIRE_DEBUG", "0")
+            // Errors only, and kept: they are how a tone that ran dry is told from a failure of
+            // the code under test ([`again_if_a_tone_ran_dry`]).
+            .env("PIPEWIRE_DEBUG", "1")
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(support::log_to(&dir.join(DAEMON_LOG)));
         if cards {
             daemon
                 .env(
@@ -546,6 +597,35 @@ impl PrivateGraph {
             .map(str::to_owned)
     }
 
+    /// The master volume of the node called `name` — the `volume` of its `Props` — as the server
+    /// holds it. `None` when `pw-dump` is not there to ask; `Some(None)` when the node is not in
+    /// the graph or lists no volume.
+    pub(crate) fn node_volume(&self, name: &str) -> Option<Option<f64>> {
+        let objects = self.dump()?;
+        Some(Self::node_object(&objects, name).and_then(|node| {
+            node["info"]["params"]["Props"]
+                .as_array()?
+                .iter()
+                .find_map(|props| props["volume"].as_f64())
+        }))
+    }
+
+    /// Set the master volume of the node called `name` as a mixer would, with `pw-cli`. `None`
+    /// when the node is not in the graph or the tool is not there or failed.
+    pub(crate) fn set_node_volume(&self, name: &str, volume: f32) -> Option<()> {
+        let id = self.node_id(name)?.to_string();
+        self.tool(
+            "pw-cli",
+            &[
+                "set-param",
+                &id,
+                "Props",
+                &format!("{{ volume: {volume} }}"),
+            ],
+        )
+        .map(drop)
+    }
+
     /// Wait until `name` runs (`running`) or does not. `Ok` with the state it settled in, `Err`
     /// with the last one seen when it never did.
     pub(crate) fn runs_until(&self, name: &str, running: bool) -> Result<String, Option<String>> {
@@ -687,7 +767,9 @@ impl PrivateGraph {
     /// at its own real-time pace on 1.0.5 too. Not everywhere: driving a group that stops and
     /// starts, as recording applications make it, it was seen to run out of buffers on a busy
     /// machine ([`Self::clocked_recorder`]), which a follower never does — and on 1.0.5, behind
-    /// the echo canceller, at once ([`Self::add_following_tone`]).
+    /// the echo canceller, at once ([`Self::add_following_tone`]). Nor only there: a link made
+    /// into its group while it drives was seen to do the same, on an idle machine too, one run in
+    /// twenty or so. So every test that plays one runs through [`again_if_a_tone_ran_dry`].
     pub(crate) fn add_tone(&self, name: &str) -> Option<()> {
         self.tone(name, !self.a_following_tone_is_heard())
     }
@@ -1134,6 +1216,16 @@ pub(crate) fn unless_skipped<T>(checked: Option<T>, tool: &str, what: &str) -> O
     checked
 }
 
+impl PrivateGraph {
+    /// Whether the daemon has logged, so far, that a tone which drives its group ran out of
+    /// buffers ([`Self::add_tone`]): from then on that group is silent with every node in it still
+    /// `running`, and what a recorder in it hears says nothing about the code under test.
+    pub(crate) fn tone_ran_dry(&self) -> bool {
+        std::fs::read_to_string(self.dir.join(DAEMON_LOG))
+            .is_ok_and(|log| log.contains(A_TONE_RAN_DRY))
+    }
+}
+
 impl Drop for PrivateGraph {
     /// The daemons go first, and their directory after them, with the fields.
     fn drop(&mut self) {
@@ -1143,7 +1235,87 @@ impl Drop for PrivateGraph {
             let _ = bus.kill();
             let _ = bus.wait();
         }
+        if self.tone_ran_dry() {
+            TONE_RAN_DRY.set(true);
+        }
     }
+}
+
+/// The daemon's standard error, in its graph's directory.
+const DAEMON_LOG: &str = "pipewire.log";
+
+/// What the daemon logs when a tone that drives its group runs out of buffers
+/// ([`PrivateGraph::add_tone`]).
+const A_TONE_RAN_DRY: &str = "out of buffers";
+
+/// How many times [`again_if_a_tone_ran_dry`] runs a test whose tone keeps running dry.
+const TONE_ATTEMPTS: u32 = 3;
+
+thread_local! {
+    /// Whether a graph dropped on this thread — a test's, as its test panics — logged
+    /// [`A_TONE_RAN_DRY`].
+    static TONE_RAN_DRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `test`, and run it again, up to [`TONE_ATTEMPTS`] times in all, while it fails in a graph
+/// whose tone ran out of buffers. Where a tone has to drive its group
+/// ([`PrivateGraph::add_tone`], PipeWire before [`TONE_FOLLOWS_SINCE`]), a link made or a
+/// recording started while it plays can leave it without a buffer to fill; it logs
+/// [`A_TONE_RAN_DRY`], stops its timer for good, and the whole group falls silent with every node
+/// still `running`. That is the test's instrument failing, not the code under test, and a fresh
+/// graph is a fresh instrument. Any other failure, and one that happens again every time, fails
+/// the test as it would have.
+pub(crate) fn again_if_a_tone_ran_dry(test: impl Fn()) {
+    for attempt in 1..=TONE_ATTEMPTS {
+        TONE_RAN_DRY.set(false);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(&test)) {
+            Ok(()) => return,
+            Err(_) if attempt < TONE_ATTEMPTS && TONE_RAN_DRY.get() => {
+                println!("the tone ran out of buffers (attempt {attempt}), so the test runs again");
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
+
+#[test]
+fn a_test_whose_tone_ran_dry_runs_again_and_passes_when_the_next_graph_holds() {
+    let runs = std::cell::Cell::new(0);
+    again_if_a_tone_ran_dry(|| {
+        runs.set(runs.get() + 1);
+        if runs.get() == 1 {
+            TONE_RAN_DRY.set(true);
+            panic!("silence, because the tone ran dry");
+        }
+    });
+    assert_eq!(runs.get(), 2);
+}
+
+#[test]
+fn a_test_that_fails_with_its_tone_running_is_not_run_again() {
+    let runs = std::cell::Cell::new(0);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        again_if_a_tone_ran_dry(|| {
+            runs.set(runs.get() + 1);
+            panic!("a failure of the code under test");
+        });
+    }));
+    assert!(failed.is_err());
+    assert_eq!(runs.get(), 1);
+}
+
+#[test]
+fn a_tone_that_runs_dry_every_time_fails_the_test_in_the_end() {
+    let runs = std::cell::Cell::new(0);
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        again_if_a_tone_ran_dry(|| {
+            runs.set(runs.get() + 1);
+            TONE_RAN_DRY.set(true);
+            panic!("silence, because the tone ran dry");
+        });
+    }));
+    assert!(failed.is_err());
+    assert_eq!(runs.get(), TONE_ATTEMPTS);
 }
 
 /// Everything the engine said, kept, so a test can ask afterwards what it did *not* say.
@@ -1385,7 +1557,14 @@ fn still_running_after(started: &[(u32, u64)], patience: Duration) -> Vec<u32> {
     }
 }
 
-/// The child half as the tests below see it.
+/// What every child half's directory is called: [`ChildHalf`] removes nothing else.
+const CHILD_HALF_DIR: &str = "fxsound-t-child-half-";
+
+/// The child half as the tests below see it. Dropped, it kills the test process if it still runs,
+/// waits for its daemons to go and removes their directory: a child half that was killed outright
+/// never removes it itself, and neither does one that waited on its standard input for a line
+/// that never came, because the test that started it failed first — which is how a
+/// `fxsound-t-child-half-*` directory was left in `/tmp`.
 struct ChildHalf {
     /// The test process — guarded itself, so a test here that fails cannot leave it waiting.
     process: Guarded,
@@ -1393,6 +1572,22 @@ struct ChildHalf {
     started: Vec<(u32, u64)>,
     /// Their directory.
     dir: PathBuf,
+}
+
+impl Drop for ChildHalf {
+    fn drop(&mut self) {
+        let _ = self.process.kill();
+        let _ = self.process.wait();
+        // Their parent is gone, and the kernel's signal is on its way to them.
+        still_running_after(&self.started, PATIENCE);
+        if self
+            .dir
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(CHILD_HALF_DIR))
+        {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 }
 
 /// Start the child half with [`CHILD_HALF`] set to `then`, and read what it says. `None`, after
@@ -1437,67 +1632,58 @@ fn graph_child_half(then: &str) -> Option<ChildHalf> {
             Some((ids?, PathBuf::from(dir)))
         })
         .expect("the child half said which its daemons are");
-    let started = pids
-        .into_iter()
-        .map(|pid| (pid, started_at(pid).expect("a daemon the child half runs")))
-        .collect();
+    // From here on, whatever fails, the directory goes with the child half.
+    let mut half = ChildHalf {
+        process,
+        started: Vec::new(),
+        dir,
+    };
+    for pid in pids {
+        let started = started_at(pid).expect("a daemon the child half runs");
+        half.started.push((pid, started));
+    }
     // Noted: a child half that is to panic may now.
-    let stdin = process.stdin().expect("piped");
+    let stdin = half.process.stdin().expect("piped");
     writeln!(stdin).expect("the child half reads its standard input");
     stdin.flush().expect("the line is out");
-    Some(ChildHalf {
-        process,
-        started,
-        dir,
-    })
+    Some(half)
 }
 
 #[test]
 fn a_test_that_panics_leaves_no_private_daemon_behind() {
-    let Some(ChildHalf {
-        mut process,
-        started,
-        dir,
-    }) = graph_child_half("panic")
-    else {
+    let Some(mut half) = graph_child_half("panic") else {
         return;
     };
-    let status = process.wait().expect("the child half ended");
+    let status = half.process.wait().expect("the child half ended");
     assert!(!status.success(), "its test panicked, so it failed");
     assert_eq!(
-        still_running_after(&started, Duration::ZERO),
+        still_running_after(&half.started, Duration::ZERO),
         Vec::<u32>::new()
     );
-    assert!(!dir.exists(), "{} is still there", dir.display());
+    // Asked before `half` is dropped, which would remove the directory whatever the child did.
+    assert!(!half.dir.exists(), "{} is still there", half.dir.display());
 }
 
 #[test]
 fn a_test_killed_outright_leaves_no_private_daemon_behind() {
-    let Some(ChildHalf {
-        mut process,
-        started,
-        dir,
-    }) = graph_child_half("wait")
-    else {
+    let Some(mut half) = graph_child_half("wait") else {
         return;
     };
-    process.kill().expect("SIGKILL");
-    process.wait().expect("the child half ended");
-    let left = still_running_after(&started, PATIENCE);
+    half.process.kill().expect("SIGKILL");
+    half.process.wait().expect("the child half ended");
+    let left = still_running_after(&half.started, PATIENCE);
 
     // No destructor ran in the killed process, so its directory is still there — which no later
-    // graph takes for its own — and the recording in it has stopped growing.
-    let recording = dir.join("t_rec.raw");
+    // graph takes for its own, and which `half` removes when it is dropped — and the recording in
+    // it has stopped growing.
+    let recording = half.dir.join("t_rec.raw");
     let size = || std::fs::metadata(&recording).map_or(0, |meta| meta.len());
     let before = size();
     std::thread::sleep(Duration::from_millis(300));
     let after = size();
-    if dir
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().starts_with("fxsound-t-child-half-"))
-    {
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    let dir = half.dir.clone();
+    drop(half);
+    assert!(!dir.exists(), "{} is still there", dir.display());
     assert_eq!(
         left,
         Vec::<u32>::new(),
@@ -2202,21 +2388,83 @@ fn a_saved_pick_does_not_keep_a_following_lane_from_the_sinks_the_desktop_picks(
     handle.shutdown();
 }
 
-/// How long after the power comes back on a recorder that follows the default source has to be
-/// recording FxSound again: time for WirePlumber's move, and for FxSound to find one that left the
-/// recorder linked to nothing and move it again (`crate::stranded`), with room for a slow runner.
+/// How long after a power switch a recorder that follows the default source may take to record
+/// where the default went, before it counts as never doing so: time for WirePlumber's move, and
+/// for FxSound to find one that left the recorder linked to nothing and move it again
+/// (`crate::stranded`), with room for a slow runner.
 const RELINKED_WITHIN: Duration = Duration::from_secs(4);
 
-/// Whether the recorder `recorder` is linked from FxSound's source and its recording `file` grows,
-/// within [`RELINKED_WITHIN`].
-fn records_fxsound(graph: &policy::PolicyGraph, recorder: u64, file: &std::path::Path) -> bool {
+/// How soon after a power switch a recorder that follows the default source has to record again
+/// where the default went (roadmap 0.5.0 §7, test 1): linked from it, the link active, and its
+/// volume back from the switch's handover (`crate::stream_handover`). Held to it where the click
+/// tests hold their gate hard ([`clicks::Gate`]): on a developer's machine, and not on a shared CI
+/// runner, where it is reported and [`RELINKED_WITHIN`] is what fails.
+const RECORDS_AGAIN_WITHIN: Duration = Duration::from_secs(1);
+
+/// How long after `since` each of `recorders` — `(node.name, id)` — was first seen linked from
+/// the node called `from`, the link active, at a master volume of 1: all of them read from one
+/// `pw-dump` a turn, so that one slow recorder does not delay the others' reading. `None` for one
+/// never seen so within [`RELINKED_WITHIN`]. The time is when it was seen, a turn of `pw-dump`
+/// after it happened at most.
+fn recording_again(
+    graph: &policy::PolicyGraph,
+    recorders: &[(&str, u64)],
+    from: &str,
+    since: Instant,
+) -> Vec<Option<Duration>> {
+    let mut seen: Vec<Option<Duration>> = vec![None; recorders.len()];
+    let deadline = since + RELINKED_WITHIN;
+    while seen.iter().any(Option::is_none) && Instant::now() < deadline {
+        let Some(objects) = graph.dump() else {
+            break;
+        };
+        let at = since.elapsed();
+        let source = PrivateGraph::node_object(&objects, from).and_then(|node| node["id"].as_u64());
+        for (when, (name, id)) in seen.iter_mut().zip(recorders) {
+            if when.is_some() {
+                continue;
+            }
+            let linked = objects.iter().any(|object| {
+                object["type"].as_str() == Some("PipeWire:Interface:Link")
+                    && object["info"]["output-node-id"].as_u64() == source
+                    && object["info"]["input-node-id"].as_u64() == Some(*id)
+                    && object["info"]["state"].as_str() == Some("active")
+            });
+            let heard = PrivateGraph::node_object(&objects, name)
+                .and_then(|node| node["info"]["params"]["Props"].as_array())
+                .and_then(|props| props.iter().find_map(|props| props["volume"].as_f64()))
+                .is_some_and(|volume| (volume - 1.0).abs() < 1e-3);
+            if linked && heard {
+                *when = Some(at);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    seen
+}
+
+/// Whether the recorder `recorder`, called `name`, is linked from the node called `from`, has its
+/// volume back from the power switch's handover (`crate::stream_handover`), and its recording
+/// `file` grows, within [`RELINKED_WITHIN`]. A recorder left at 0 would write a file that grows,
+/// and hear nothing.
+fn records_from(
+    graph: &policy::PolicyGraph,
+    from: &str,
+    name: &str,
+    recorder: u64,
+    file: &std::path::Path,
+) -> bool {
     let deadline = Instant::now() + RELINKED_WITHIN;
     while Instant::now() < deadline {
         let linked = graph
-            .node_id(SOURCE_NODE_NAME)
+            .node_id(from)
             .and_then(|source| graph.linked(source, recorder))
             .unwrap_or(false);
-        if linked {
+        let heard = graph
+            .node_volume(name)
+            .flatten()
+            .is_some_and(|volume| (volume - 1.0).abs() < 1e-3);
+        if linked && heard {
             let before = policy::size_of(file);
             std::thread::sleep(Duration::from_millis(300));
             if policy::size_of(file) > before {
@@ -2235,11 +2483,22 @@ fn records_fxsound(graph: &policy::PolicyGraph, recorder: u64, file: &std::path:
 /// (`crate::stranded`). The 0.4.0 live check found such a recorder recording nothing until the
 /// default changed again, on 3 to 6 of 9 quick toggles with something playing to the default sink.
 /// Here with WirePlumber itself, in an environment of the graph's own ([`policy`]): after each of
-/// eight power toggles, every one of three such recorders is linked from FxSound's source and
-/// receiving. Without FxSound's rescue of stranded streams this failed on the first toggle in
-/// every run tried, with WirePlumber 0.5.17 and PipeWire 1.6.9.
+/// eight power toggles, every one of four such recorders — three `pw-record` and a PulseAudio
+/// application — is linked from FxSound's source and receiving, at its own volume. Without
+/// FxSound's rescue of stranded streams this failed on the first toggle in every run tried, with
+/// WirePlumber 0.5.17 and PipeWire 1.6.9. And since the power switch fades what it moves (D2), the
+/// rescue's link is what ends a stranded recorder's move: a handover that gave its volume back at
+/// the link WirePlumber failed to make would have it start recording at full volume in the middle
+/// of a wave.
+///
+/// How soon each records again is timed at every switch, off and on, from the switch to the
+/// recorder linked where the default went and at its volume again, and held to
+/// [`RECORDS_AGAIN_WITHIN`] (roadmap 0.5.0 §7, test 1: «≤ 1 s»), a stranded recorder's rescue
+/// included.
 #[test]
 fn a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_toggle() {
+    use std::fmt::Write as _;
+
     let Some(mut graph) = policy::PolicyGraph::start("relink") else {
         return;
     };
@@ -2252,13 +2511,16 @@ fn a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_
         ));
         return;
     }
+    if !graph.start_pulse() {
+        return;
+    }
     // Something plays to the default sink meanwhile, and is moved at the same moment: the live
-    // check never stranded the recorder without it. And three recorders rather than one: each is
-    // moved on its own, and each move is another chance for WirePlumber to lose one.
+    // check never stranded the recorder without it. And several recorders rather than one: each
+    // is moved on its own, and each move is another chance for WirePlumber to lose one.
     let _player = graph
         .pw_cat("--playback", "t_player", "application.name = t_player", &[])
         .expect("pw-cat should play");
-    let recorders: Vec<(String, Guarded, PathBuf, u64)> = (1..=3)
+    let mut recorders: Vec<(String, Guarded, PathBuf, u64)> = (1..=3)
         .map(|n| {
             let name = format!("t_recorder{n}");
             let (child, file) = graph
@@ -2268,10 +2530,18 @@ fn a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_
             (name, child, file, id)
         })
         .collect();
-    let stranded = |graph: &policy::PolicyGraph| -> Vec<&str> {
+    let name = "t_pulse_recorder".to_owned();
+    let (child, file) = graph.pulse_recorder(&name).expect("pacat should record");
+    let id = graph.node_id(&name).expect("the recorder is there");
+    recorders.push((name, child, file, id));
+    let ids: Vec<(&str, u64)> = recorders
+        .iter()
+        .map(|(name, _, _, id)| (name.as_str(), *id))
+        .collect();
+    let silent_from = |graph: &policy::PolicyGraph, from: &str| -> Vec<&str> {
         recorders
             .iter()
-            .filter(|(_, _, file, id)| !records_fxsound(graph, *id, file))
+            .filter(|(name, _, file, id)| !records_from(graph, from, name, *id, file))
             .map(|(name, ..)| name.as_str())
             .collect()
     };
@@ -2293,33 +2563,73 @@ fn a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_
         );
     }
     assert_eq!(
-        stranded(&graph),
+        silent_from(&graph, SOURCE_NODE_NAME),
         Vec::<&str>::new(),
         "these never recorded FxSound"
     );
 
+    // Every switch's time for every recorder: (toggle, the power, the recorder, the time).
+    let mut times: Vec<(u32, bool, &str, Option<Duration>)> = Vec::new();
     for toggle in 1..=8 {
-        for want in [false, true] {
+        for (want, from) in [(false, "t_mic"), (true, SOURCE_NODE_NAME)] {
             for direction in DeviceDirection::ALL {
                 handle.send(UiToAudio::SetAsDefault { direction, want });
             }
-            if !want {
-                // Long enough for WirePlumber to have moved everything onto the devices.
-                std::thread::sleep(Duration::from_millis(1_200));
-            }
+            let since = Instant::now();
+            let again = recording_again(&graph, &ids, from, since);
+            times.extend(
+                ids.iter()
+                    .zip(again)
+                    .map(|((name, _), time)| (toggle, want, *name, time)),
+            );
+            let left = silent_from(&graph, from);
+            assert!(
+                graph.session_manager_runs(),
+                "the private WirePlumber went away"
+            );
+            assert!(
+                left.is_empty(),
+                "power toggle {toggle}, power {}: {left:?} followed the default source and were \
+                 left recording nothing from {from}",
+                if want { "on" } else { "off" }
+            );
         }
-        let left = stranded(&graph);
-        assert!(
-            graph.session_manager_runs(),
-            "the private WirePlumber went away"
-        );
-        assert!(
-            left.is_empty(),
-            "power toggle {toggle}: {left:?} followed the default source and were left linked \
-             to nothing"
-        );
     }
     handle.shutdown();
+
+    let slowest = times
+        .iter()
+        .max_by_key(|(.., time)| time.unwrap_or(Duration::MAX))
+        .copied()
+        .expect("sixteen switches were timed");
+    let mut table = String::from("how soon each recorder recorded again after each switch:\n");
+    for (toggle, want, name, time) in &times {
+        let _ = writeln!(
+            table,
+            "  toggle {toggle}, power {:<3} {name:<17} {}",
+            if *want { "on" } else { "off" },
+            time.map_or_else(
+                || "never".to_owned(),
+                |time| format!("{} ms", time.as_millis())
+            )
+        );
+    }
+    println!("{table}");
+    let (toggle, want, name, time) = slowest;
+    let time = time.expect("every recorder recorded again, as checked above");
+    if time > RECORDS_AGAIN_WITHIN {
+        let line = format!(
+            "power toggle {toggle}, power {}: {name} recorded again only after {} ms, over {} ms",
+            if want { "on" } else { "off" },
+            time.as_millis(),
+            RECORDS_AGAIN_WITHIN.as_millis()
+        );
+        assert!(
+            clicks::Gate::from_env() != clicks::Gate::Hard,
+            "{line}\n{table}"
+        );
+        note(&line);
+    }
 }
 
 /// A run that was killed rather than quit leaves both configured defaults naming nodes that died
@@ -2444,90 +2754,92 @@ fn a_claim_left_behind_by_a_killed_run_is_handed_back_to_the_seeded_devices() {
 /// hand-back is not an attachment. The output lane's claim is its own and is adopted as before.
 #[test]
 fn a_claim_left_behind_for_a_lane_that_stays_detached_is_handed_back_while_the_engine_runs() {
-    let Some(graph) = PrivateGraph::start("orphan") else {
-        return;
-    };
-    for (direction, ours) in [
-        (DeviceDirection::Output, SINK_NODE_NAME),
-        (DeviceDirection::Input, SOURCE_NODE_NAME),
-    ] {
-        let Some(()) = unless_skipped(
-            graph.write_default(devices::configured_default_key(direction), ours),
-            "pw-metadata",
-            "the hand-back of a claim no lane stands behind",
-        ) else {
+    again_if_a_tone_ran_dry(|| {
+        let Some(graph) = PrivateGraph::start("orphan") else {
             return;
         };
-        assert_eq!(graph.default_settles_on(direction, ours), Some(Ok(())));
-    }
+        for (direction, ours) in [
+            (DeviceDirection::Output, SINK_NODE_NAME),
+            (DeviceDirection::Input, SOURCE_NODE_NAME),
+        ] {
+            let Some(()) = unless_skipped(
+                graph.write_default(devices::configured_default_key(direction), ours),
+                "pw-metadata",
+                "the hand-back of a claim no lane stands behind",
+            ) else {
+                return;
+            };
+            assert_eq!(graph.default_settles_on(direction, ours), Some(Ok(())));
+        }
 
-    let handle =
-        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
-    handle.send(UiToAudio::SeedRememberedDefaults {
-        output: "t_71".to_owned(),
-        input: "t_tone".to_owned(),
-    });
-    let mut said = Transcript::default();
-    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_71")));
+        let handle =
+            AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+        handle.send(UiToAudio::SeedRememberedDefaults {
+            output: "t_71".to_owned(),
+            input: "t_tone".to_owned(),
+        });
+        let mut said = Transcript::default();
+        assert!(said.attached(&handle, DeviceDirection::Output, Some("t_71")));
 
-    // Unplugged: there is nothing to hand the default source back to yet, so it is left alone.
-    said.settle(&handle);
-    assert_eq!(
-        graph.configured_default(DeviceDirection::Input).as_deref(),
-        Some(SOURCE_NODE_NAME),
-        "the default source was released with nothing to go to"
-    );
+        // Unplugged: there is nothing to hand the default source back to yet, so it is left alone.
+        said.settle(&handle);
+        assert_eq!(
+            graph.configured_default(DeviceDirection::Input).as_deref(),
+            Some(SOURCE_NODE_NAME),
+            "the default source was released with nothing to go to"
+        );
 
-    // Plugged in.
-    if graph.add_tone("t_tone").is_none() {
-        skip(concat!(
-            "the tone never appeared (is audiotestsrc installed?), ",
-            "so the hand-back was not checked"
-        ));
-        handle.shutdown();
-        return;
-    }
-    // The app reads the list with the microphone on it, and — its lane saved as off — leaves the
-    // lane detached. That is its chance gone by; the claim goes back.
-    assert!(said.heard(&handle, "the microphone listed", |m| matches!(
-        m,
-        AudioToUi::Devices(devices) if devices.iter().any(|d| d.name == "t_tone")
-    )));
-    assert_eq!(
-        graph.default_settles_on(DeviceDirection::Input, "t_tone"),
-        Some(Ok(())),
-        "the default source named a node no lane will ever build, with the microphone right there"
-    );
-    assert_eq!(
-        graph.configured_default(DeviceDirection::Output).as_deref(),
-        Some(SINK_NODE_NAME),
-        "the output lane's claim is the output lane's"
-    );
-    said.settle(&handle);
-    assert_eq!(
-        said.attachments(DeviceDirection::Input),
-        Vec::<Option<String>>::new(),
-        "handing the claim back switched the input lane on"
-    );
-    assert!(
-        !said.0.iter().any(|m| matches!(
+        // Plugged in.
+        if graph.add_tone("t_tone").is_none() {
+            skip(concat!(
+                "the tone never appeared (is audiotestsrc installed?), ",
+                "so the hand-back was not checked"
+            ));
+            handle.shutdown();
+            return;
+        }
+        // The app reads the list with the microphone on it, and — its lane saved as off — leaves the
+        // lane detached. That is its chance gone by; the claim goes back.
+        assert!(said.heard(&handle, "the microphone listed", |m| matches!(
             m,
-            AudioToUi::RememberedDefault { node_name, .. }
-                if OUR_NODE_NAMES.contains(&node_name.as_str())
-        )),
-        "a stale claim was remembered as the default from before FxSound"
-    );
+            AudioToUi::Devices(devices) if devices.iter().any(|d| d.name == "t_tone")
+        )));
+        assert_eq!(
+            graph.default_settles_on(DeviceDirection::Input, "t_tone"),
+            Some(Ok(())),
+            "the default source named a node no lane will ever build, with the microphone right there"
+        );
+        assert_eq!(
+            graph.configured_default(DeviceDirection::Output).as_deref(),
+            Some(SINK_NODE_NAME),
+            "the output lane's claim is the output lane's"
+        );
+        said.settle(&handle);
+        assert_eq!(
+            said.attachments(DeviceDirection::Input),
+            Vec::<Option<String>>::new(),
+            "handing the claim back switched the input lane on"
+        );
+        assert!(
+            !said.0.iter().any(|m| matches!(
+                m,
+                AudioToUi::RememberedDefault { node_name, .. }
+                    if OUR_NODE_NAMES.contains(&node_name.as_str())
+            )),
+            "a stale claim was remembered as the default from before FxSound"
+        );
 
-    handle.shutdown();
-    assert_eq!(
-        graph.configured_default(DeviceDirection::Output).as_deref(),
-        Some("t_71")
-    );
-    assert_eq!(
-        graph.configured_default(DeviceDirection::Input).as_deref(),
-        Some("t_tone"),
-        "the exit took the default source back from the microphone"
-    );
+        handle.shutdown();
+        assert_eq!(
+            graph.configured_default(DeviceDirection::Output).as_deref(),
+            Some("t_71")
+        );
+        assert_eq!(
+            graph.configured_default(DeviceDirection::Input).as_deref(),
+            Some("t_tone"),
+            "the exit took the default source back from the microphone"
+        );
+    });
 }
 
 #[test]
@@ -2640,611 +2952,619 @@ fn a_restart_rebuilds_every_lane_that_was_running() {
 /// plays into the sink.
 #[test]
 fn a_tone_driven_through_each_lane_reaches_that_lane_and_no_other() {
-    let Some(graph) = PrivateGraph::start("flow") else {
-        return;
-    };
-    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link", "pw-record"]
-        .into_iter()
-        .find(|tool| !installed(tool))
-    {
-        skip(&format!(
-            "{missing} is not available, so no audio was driven through the lanes"
-        ));
-        return;
-    }
-    if graph.add_tone("t_tone").is_none() {
-        skip(concat!(
-            "the tone never appeared (is audiotestsrc installed?), ",
-            "so no audio was driven through the lanes"
-        ));
-        return;
-    }
-    let mut handle =
-        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
-    let mut said = Transcript::default();
-    said.until(
-        &handle,
-        "a device list",
-        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
-    );
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_stereo".to_owned(),
-        direction: DeviceDirection::Output,
-    });
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_tone".to_owned(),
-        direction: DeviceDirection::Input,
-    });
-    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
-    assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
-    assert_eq!(
-        graph
-            .settles_on(&LANE_NODE_NAMES)
-            .map(|settled| settled.map(drop)),
-        Some(Ok(())),
-        "both pairs should be in the graph at once"
-    );
-    for (node, direction, positions) in [
-        ("t_tone", "Output", &["MONO"][..]),
-        ("t_stereo", "Input", &["FL", "FR"][..]),
-        (CAPTURE_NODE_NAME, "Input", &["MONO"][..]),
-        (SOURCE_NODE_NAME, "Output", &["FL", "FR"][..]),
-        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
-        (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
-    ] {
-        assert!(
-            graph.configure_ports(node, direction, positions).is_some(),
-            "{node} was not given ports"
+    again_if_a_tone_ran_dry(|| {
+        let Some(graph) = PrivateGraph::start("flow") else {
+            return;
+        };
+        if let Some(missing) = ["pw-dump", "pw-cli", "pw-link", "pw-record"]
+            .into_iter()
+            .find(|tool| !installed(tool))
+        {
+            skip(&format!(
+                "{missing} is not available, so no audio was driven through the lanes"
+            ));
+            return;
+        }
+        if graph.add_tone("t_tone").is_none() {
+            skip(concat!(
+                "the tone never appeared (is audiotestsrc installed?), ",
+                "so no audio was driven through the lanes"
+            ));
+            return;
+        }
+        let mut handle =
+            AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+        let mut said = Transcript::default();
+        said.until(
+            &handle,
+            "a device list",
+            |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
         );
-    }
-
-    // The microphone alone — and something recording from FxSound (Input), which is what runs
-    // the input lane's passive capture stream (U19).
-    assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
-    let recording = graph
-        .clocked_recorder("t_recorder")
-        .expect("a recorder for FxSound (Input)");
-    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
-    let heard = meters_until(&mut handle, DeviceDirection::Input, |m| m.input_peak > 0.1);
-    assert!(
-        heard.is_some(),
-        "the tone never reached the input lane's meters"
-    );
-    said.settle(&handle);
-    let music = handle.meters(DeviceDirection::Output);
-    assert!(
-        music.peak_left < 1e-3 && music.peak_right < 1e-3,
-        "the microphone was heard in the output lane: {music:?}"
-    );
-    let woken = said.0.iter().find(|message| {
-        matches!(message, AudioToUi::Status { direction: DeviceDirection::Output, status }
-            if status.processing)
-    });
-    assert!(
-        woken.is_none(),
-        "the output lane ran because the microphone did: {woken:?}"
-    );
-
-    // Now something plays, and the speakers are connected.
-    assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
-    assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
-    let played = meters_until(&mut handle, DeviceDirection::Output, |m| {
-        m.peak_left > 0.1 && m.peak_right > 0.1
-    });
-    assert!(
-        played.is_some(),
-        "the tone never reached the output lane's meters"
-    );
-
-    // And each lane says so under its own direction, describing its own pair.
-    for direction in DeviceDirection::ALL {
-        assert!(
-            said.heard(
-                &handle,
-                &format!("the {} lane processing", direction.key()),
-                |m| matches!(m, AudioToUi::Status { direction: d, status }
-                    if *d == direction && status.processing),
-            ),
-            "the {} lane never reported processing",
-            direction.key()
-        );
-    }
-    let last_status = |direction: DeviceDirection| {
-        said.0
-            .iter()
-            .rev()
-            .find_map(|message| match message {
-                AudioToUi::Status {
-                    direction: d,
-                    status,
-                } if *d == direction => Some(*status),
-                _ => None,
-            })
-            .expect("heard a moment ago")
-    };
-    let (output, input) = (
-        last_status(DeviceDirection::Output),
-        last_status(DeviceDirection::Input),
-    );
-    assert_eq!(
-        (output.sample_rate, output.channels),
-        (48_000, 2),
-        "the output lane's status should describe the stereo sink"
-    );
-    assert_eq!(
-        input.sample_rate, 48_000,
-        "the input lane's status should describe the 48 kHz capture"
-    );
-    for (direction, status) in [
-        (DeviceDirection::Output, output),
-        (DeviceDirection::Input, input),
-    ] {
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_stereo".to_owned(),
+            direction: DeviceDirection::Output,
+        });
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_tone".to_owned(),
+            direction: DeviceDirection::Input,
+        });
+        assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+        assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
         assert_eq!(
-            status.format_mismatches,
-            0,
-            "wiring the {} lane disturbed the format its pair was built with",
-            direction.key()
+            graph
+                .settles_on(&LANE_NODE_NAMES)
+                .map(|settled| settled.map(drop)),
+            Some(Ok(())),
+            "both pairs should be in the graph at once"
         );
-    }
-    handle.shutdown();
+        for (node, direction, positions) in [
+            ("t_tone", "Output", &["MONO"][..]),
+            ("t_stereo", "Input", &["FL", "FR"][..]),
+            (CAPTURE_NODE_NAME, "Input", &["MONO"][..]),
+            (SOURCE_NODE_NAME, "Output", &["FL", "FR"][..]),
+            (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+            (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
+        ] {
+            assert!(
+                graph.configure_ports(node, direction, positions).is_some(),
+                "{node} was not given ports"
+            );
+        }
+
+        // The microphone alone — and something recording from FxSound (Input), which is what runs
+        // the input lane's passive capture stream (U19).
+        assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
+        let recording = graph
+            .clocked_recorder("t_recorder")
+            .expect("a recorder for FxSound (Input)");
+        assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
+        let heard = meters_until(&mut handle, DeviceDirection::Input, |m| m.input_peak > 0.1);
+        assert!(
+            heard.is_some(),
+            "the tone never reached the input lane's meters"
+        );
+        said.settle(&handle);
+        let music = handle.meters(DeviceDirection::Output);
+        assert!(
+            music.peak_left < 1e-3 && music.peak_right < 1e-3,
+            "the microphone was heard in the output lane: {music:?}"
+        );
+        let woken = said.0.iter().find(|message| {
+            matches!(message, AudioToUi::Status { direction: DeviceDirection::Output, status }
+            if status.processing)
+        });
+        assert!(
+            woken.is_none(),
+            "the output lane ran because the microphone did: {woken:?}"
+        );
+
+        // Now something plays, and the speakers are connected.
+        assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
+        assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
+        let played = meters_until(&mut handle, DeviceDirection::Output, |m| {
+            m.peak_left > 0.1 && m.peak_right > 0.1
+        });
+        assert!(
+            played.is_some(),
+            "the tone never reached the output lane's meters"
+        );
+
+        // And each lane says so under its own direction, describing its own pair.
+        for direction in DeviceDirection::ALL {
+            assert!(
+                said.heard(
+                    &handle,
+                    &format!("the {} lane processing", direction.key()),
+                    |m| matches!(m, AudioToUi::Status { direction: d, status }
+                    if *d == direction && status.processing),
+                ),
+                "the {} lane never reported processing",
+                direction.key()
+            );
+        }
+        let last_status = |direction: DeviceDirection| {
+            said.0
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    AudioToUi::Status {
+                        direction: d,
+                        status,
+                    } if *d == direction => Some(*status),
+                    _ => None,
+                })
+                .expect("heard a moment ago")
+        };
+        let (output, input) = (
+            last_status(DeviceDirection::Output),
+            last_status(DeviceDirection::Input),
+        );
+        assert_eq!(
+            (output.sample_rate, output.channels),
+            (48_000, 2),
+            "the output lane's status should describe the stereo sink"
+        );
+        assert_eq!(
+            input.sample_rate, 48_000,
+            "the input lane's status should describe the 48 kHz capture"
+        );
+        for (direction, status) in [
+            (DeviceDirection::Output, output),
+            (DeviceDirection::Input, input),
+        ] {
+            assert_eq!(
+                status.format_mismatches,
+                0,
+                "wiring the {} lane disturbed the format its pair was built with",
+                direction.key()
+            );
+        }
+        handle.shutdown();
+    });
 }
 
 #[test]
 fn a_mono_sink_that_appears_is_played_to_through_a_stereo_pair_its_adapter_down_mixes() {
-    // A Bluetooth headset that has just switched to its call profile, as the output lane meets
-    // it: a new output with one channel. Windows refused such a device (`sndDevices.h:32-39`), and
-    // so did this port — the moment the sink's info said "one channel", the next run of the rules
-    // tore the lane down and the music went to the speakers for the length of the call.
-    let Some(graph) = PrivateGraph::start("mono") else {
-        return;
-    };
-    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
-        .into_iter()
-        .find(|tool| !installed(tool))
-    {
-        skip(&format!(
-            "{missing} is not available, so no mono sink was played to"
-        ));
-        return;
-    }
-    if graph.add_tone("t_tone").is_none() {
-        skip(concat!(
-            "the tone never appeared (is audiotestsrc installed?), ",
-            "so no mono sink was played to"
-        ));
-        return;
-    }
-    let mut handle =
-        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
-    let mut said = Transcript::default();
-    said.until(
-        &handle,
-        "a device list",
-        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
-    );
-    // The output lane attaches by itself, to one of the graph's stereo sinks. Let it settle there,
-    // so that the rules have run over every device the graph started with.
-    assert!(
-        said.heard(&handle, "the output lane attached", |m| matches!(
-            m,
-            AudioToUi::Attached {
-                direction: DeviceDirection::Output,
-                node_name: Some(_)
-            }
-        )),
-        "the output lane never attached to anything"
-    );
-    said.settle(&handle);
-
-    // The mono sink arrives. Rule 5 takes it — it is new — whatever its channel count.
-    let arrived = said.0.len();
-    assert!(
-        graph.add_mono_sink("t_mono").is_some(),
-        "the mono sink never appeared"
-    );
-    assert!(
-        said.attached(&handle, DeviceDirection::Output, Some("t_mono")),
-        "the output lane should move to the sink that just appeared, mono as it is"
-    );
-
-    // Its info — one channel — has had time to arrive; now give the rules a reason to run again,
-    // which is where the refusal used to strike: another output goes away.
-    said.settle(&handle);
-    assert!(
-        graph.remove_node("t_71").is_some(),
-        "the 7.1 sink could not be taken out of the graph"
-    );
-    assert!(
-        said.heard_since(&handle, arrived, "a device list without t_71", |m| {
-            matches!(m, AudioToUi::Devices(d) if !d.iter().any(|d| d.name == "t_71"))
-        }),
-        "the engine never noticed the 7.1 sink go"
-    );
-    said.settle(&handle);
-    let since = &said.0[arrived..];
-    let moves: Vec<Option<&str>> = since
-        .iter()
-        .filter_map(|message| match message {
-            AudioToUi::Attached {
-                direction: DeviceDirection::Output,
-                node_name,
-            } => Some(node_name.as_deref()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        moves,
-        [Some("t_mono")],
-        "the output lane should have moved to the mono sink once and stayed there"
-    );
-    let complaints: Vec<&AudioToUi> = since
-        .iter()
-        .filter(|message| {
-            matches!(
-                message,
-                AudioToUi::Error {
-                    direction: Some(DeviceDirection::Output) | None,
-                    ..
-                }
-            )
-        })
-        .collect();
-    assert!(
-        complaints.is_empty(),
-        "a mono sink is not an error: {complaints:?}"
-    );
-    let listed = said
-        .0
-        .iter()
-        .rev()
-        .find_map(|message| match message {
-            AudioToUi::Devices(devices) => Some(devices),
-            _ => None,
-        })
-        .expect("heard a moment ago");
-    assert!(
-        listed
-            .iter()
-            .any(|d| d.name == "t_mono" && d.direction == DeviceDirection::Output),
-        "the mono sink should be offered as an output: {listed:?}"
-    );
-
-    // The pair it built: NODE 1 stays stereo, and NODE 2 declares the same stereo — the ring
-    // between them is read at the stride it is written at — aimed at the mono sink, with
-    // remixing left on for its adapter to down-mix.
-    for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME] {
-        assert_eq!(
-            graph.node_format(node).flatten(),
-            Some((48_000, 2)),
-            "{node} should run a stereo pair in front of the mono sink"
+    again_if_a_tone_ran_dry(|| {
+        // A Bluetooth headset that has just switched to its call profile, as the output lane meets
+        // it: a new output with one channel. Windows refused such a device (`sndDevices.h:32-39`), and
+        // so did this port — the moment the sink's info said "one channel", the next run of the rules
+        // tore the lane down and the music went to the speakers for the length of the call.
+        let Some(graph) = PrivateGraph::start("mono") else {
+            return;
+        };
+        if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+            .into_iter()
+            .find(|tool| !installed(tool))
+        {
+            skip(&format!(
+                "{missing} is not available, so no mono sink was played to"
+            ));
+            return;
+        }
+        if graph.add_tone("t_tone").is_none() {
+            skip(concat!(
+                "the tone never appeared (is audiotestsrc installed?), ",
+                "so no mono sink was played to"
+            ));
+            return;
+        }
+        let mut handle =
+            AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+        let mut said = Transcript::default();
+        said.until(
+            &handle,
+            "a device list",
+            |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
         );
-    }
-    assert_eq!(
-        graph.node_prop(OUTPUT_NODE_NAME, "target.object").flatten(),
-        Some("t_mono".to_owned())
-    );
-    assert_eq!(
-        graph
-            .node_prop(OUTPUT_NODE_NAME, "stream.dont-remix")
-            .flatten(),
-        Some("false".to_owned()),
-        "the playback stream must let its adapter remix, or the session manager would not \
-         set its ports up at the sink's layout"
-    );
-
-    // Now play through it. The playback stream's ports are set up at the sink's own one-channel
-    // layout, as WirePlumber sets up a stream that may be remixed, so its adapter turns the
-    // stereo pair into one channel. What comes out of the sink is heard on the other side of it:
-    // the input lane records the sink's monitor, on a microphone it was attached to only to have
-    // a capture stream to link.
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_mic".to_owned(),
-        direction: DeviceDirection::Input,
-    });
-    assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
-    assert_eq!(
-        graph
-            .settles_on(&[
-                SINK_NODE_NAME,
-                OUTPUT_NODE_NAME,
-                CAPTURE_NODE_NAME,
-                SOURCE_NODE_NAME
-            ])
-            .map(|settled| settled.map(drop)),
-        Some(Ok(())),
-        "both pairs should be in the graph"
-    );
-    for (node, direction, positions) in [
-        ("t_tone", "Output", &["MONO"][..]),
-        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
-        (OUTPUT_NODE_NAME, "Output", &["MONO"][..]),
-        (CAPTURE_NODE_NAME, "Input", &["MONO"][..]),
-    ] {
+        // The output lane attaches by itself, to one of the graph's stereo sinks. Let it settle there,
+        // so that the rules have run over every device the graph started with.
         assert!(
-            graph.configure_ports(node, direction, positions).is_some(),
-            "{node} was not given ports"
+            said.heard(&handle, "the output lane attached", |m| matches!(
+                m,
+                AudioToUi::Attached {
+                    direction: DeviceDirection::Output,
+                    node_name: Some(_)
+                }
+            )),
+            "the output lane never attached to anything"
         );
-    }
-    assert!(
-        graph
-            .configure_monitored_ports("t_mono", &["MONO"])
-            .is_some(),
-        "the mono sink was not given a port and a monitor"
-    );
-    assert_eq!(
-        graph
-            .ports(OUTPUT_NODE_NAME, "out")
-            .map(|ports| ports.len()),
-        Some(1),
-        "the stereo playback stream should come out of its adapter as one channel"
-    );
-    assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_mono"));
-    assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
-    assert_eq!(
-        graph.runs_until("t_mono", true).map(drop),
-        Ok(()),
-        "the mono sink should run while something plays into FxSound"
-    );
-    assert!(
-        meters_until(&mut handle, DeviceDirection::Output, |m| {
-            m.peak_left > 0.1 && m.peak_right > 0.1
-        })
-        .is_some(),
-        "the tone never reached the output lane's meters"
-    );
-    // The input lane's meters read its signal before its chain, so what they show is what the
-    // mono sink was handed.
-    assert!(graph.link_nodes("t_mono", CAPTURE_NODE_NAME));
-    assert!(
-        meters_until(&mut handle, DeviceDirection::Input, |m| m.input_peak > 0.1).is_some(),
-        "the tone went into the stereo pair and never came out of the mono sink"
-    );
+        said.settle(&handle);
 
-    said.settle(&handle);
-    let output = said
-        .0
-        .iter()
-        .rev()
-        .find_map(|message| match message {
-            AudioToUi::Status {
-                direction: DeviceDirection::Output,
-                status,
-            } => Some(*status),
-            _ => None,
-        })
-        .expect("a lane that played has reported its status");
-    assert_eq!(
-        (output.sample_rate, output.channels),
-        (48_000, 2),
-        "the output lane runs a stereo pair"
-    );
-    assert_eq!(
-        output.format_mismatches, 0,
-        "the two nodes of the pair disagreed about their format"
-    );
-    assert_eq!(
-        said.attachments(DeviceDirection::Output).last(),
-        Some(&Some("t_mono".to_owned())),
-        "playing moved the output lane off the mono sink"
-    );
-    handle.shutdown();
+        // The mono sink arrives. Rule 5 takes it — it is new — whatever its channel count.
+        let arrived = said.0.len();
+        assert!(
+            graph.add_mono_sink("t_mono").is_some(),
+            "the mono sink never appeared"
+        );
+        assert!(
+            said.attached(&handle, DeviceDirection::Output, Some("t_mono")),
+            "the output lane should move to the sink that just appeared, mono as it is"
+        );
+
+        // Its info — one channel — has had time to arrive; now give the rules a reason to run again,
+        // which is where the refusal used to strike: another output goes away.
+        said.settle(&handle);
+        assert!(
+            graph.remove_node("t_71").is_some(),
+            "the 7.1 sink could not be taken out of the graph"
+        );
+        assert!(
+            said.heard_since(&handle, arrived, "a device list without t_71", |m| {
+                matches!(m, AudioToUi::Devices(d) if !d.iter().any(|d| d.name == "t_71"))
+            }),
+            "the engine never noticed the 7.1 sink go"
+        );
+        said.settle(&handle);
+        let since = &said.0[arrived..];
+        let moves: Vec<Option<&str>> = since
+            .iter()
+            .filter_map(|message| match message {
+                AudioToUi::Attached {
+                    direction: DeviceDirection::Output,
+                    node_name,
+                } => Some(node_name.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            moves,
+            [Some("t_mono")],
+            "the output lane should have moved to the mono sink once and stayed there"
+        );
+        let complaints: Vec<&AudioToUi> = since
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    AudioToUi::Error {
+                        direction: Some(DeviceDirection::Output) | None,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert!(
+            complaints.is_empty(),
+            "a mono sink is not an error: {complaints:?}"
+        );
+        let listed = said
+            .0
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                AudioToUi::Devices(devices) => Some(devices),
+                _ => None,
+            })
+            .expect("heard a moment ago");
+        assert!(
+            listed
+                .iter()
+                .any(|d| d.name == "t_mono" && d.direction == DeviceDirection::Output),
+            "the mono sink should be offered as an output: {listed:?}"
+        );
+
+        // The pair it built: NODE 1 stays stereo, and NODE 2 declares the same stereo — the ring
+        // between them is read at the stride it is written at — aimed at the mono sink, with
+        // remixing left on for its adapter to down-mix.
+        for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME] {
+            assert_eq!(
+                graph.node_format(node).flatten(),
+                Some((48_000, 2)),
+                "{node} should run a stereo pair in front of the mono sink"
+            );
+        }
+        assert_eq!(
+            graph.node_prop(OUTPUT_NODE_NAME, "target.object").flatten(),
+            Some("t_mono".to_owned())
+        );
+        assert_eq!(
+            graph
+                .node_prop(OUTPUT_NODE_NAME, "stream.dont-remix")
+                .flatten(),
+            Some("false".to_owned()),
+            "the playback stream must let its adapter remix, or the session manager would not \
+         set its ports up at the sink's layout"
+        );
+
+        // Now play through it. The playback stream's ports are set up at the sink's own one-channel
+        // layout, as WirePlumber sets up a stream that may be remixed, so its adapter turns the
+        // stereo pair into one channel. What comes out of the sink is heard on the other side of it:
+        // the input lane records the sink's monitor, on a microphone it was attached to only to have
+        // a capture stream to link.
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_mic".to_owned(),
+            direction: DeviceDirection::Input,
+        });
+        assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
+        assert_eq!(
+            graph
+                .settles_on(&[
+                    SINK_NODE_NAME,
+                    OUTPUT_NODE_NAME,
+                    CAPTURE_NODE_NAME,
+                    SOURCE_NODE_NAME
+                ])
+                .map(|settled| settled.map(drop)),
+            Some(Ok(())),
+            "both pairs should be in the graph"
+        );
+        for (node, direction, positions) in [
+            ("t_tone", "Output", &["MONO"][..]),
+            (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+            (OUTPUT_NODE_NAME, "Output", &["MONO"][..]),
+            (CAPTURE_NODE_NAME, "Input", &["MONO"][..]),
+        ] {
+            assert!(
+                graph.configure_ports(node, direction, positions).is_some(),
+                "{node} was not given ports"
+            );
+        }
+        assert!(
+            graph
+                .configure_monitored_ports("t_mono", &["MONO"])
+                .is_some(),
+            "the mono sink was not given a port and a monitor"
+        );
+        assert_eq!(
+            graph
+                .ports(OUTPUT_NODE_NAME, "out")
+                .map(|ports| ports.len()),
+            Some(1),
+            "the stereo playback stream should come out of its adapter as one channel"
+        );
+        assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_mono"));
+        assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
+        assert_eq!(
+            graph.runs_until("t_mono", true).map(drop),
+            Ok(()),
+            "the mono sink should run while something plays into FxSound"
+        );
+        assert!(
+            meters_until(&mut handle, DeviceDirection::Output, |m| {
+                m.peak_left > 0.1 && m.peak_right > 0.1
+            })
+            .is_some(),
+            "the tone never reached the output lane's meters"
+        );
+        // The input lane's meters read its signal before its chain, so what they show is what the
+        // mono sink was handed.
+        assert!(graph.link_nodes("t_mono", CAPTURE_NODE_NAME));
+        assert!(
+            meters_until(&mut handle, DeviceDirection::Input, |m| m.input_peak > 0.1).is_some(),
+            "the tone went into the stereo pair and never came out of the mono sink"
+        );
+
+        said.settle(&handle);
+        let output = said
+            .0
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                AudioToUi::Status {
+                    direction: DeviceDirection::Output,
+                    status,
+                } => Some(*status),
+                _ => None,
+            })
+            .expect("a lane that played has reported its status");
+        assert_eq!(
+            (output.sample_rate, output.channels),
+            (48_000, 2),
+            "the output lane runs a stereo pair"
+        );
+        assert_eq!(
+            output.format_mismatches, 0,
+            "the two nodes of the pair disagreed about their format"
+        );
+        assert_eq!(
+            said.attachments(DeviceDirection::Output).last(),
+            Some(&Some("t_mono".to_owned())),
+            "playing moved the output lane off the mono sink"
+        );
+        handle.shutdown();
+    });
 }
 
 #[test]
 fn the_speakers_sleep_while_nothing_plays_into_the_sink_and_wake_the_moment_something_does() {
-    let Some(graph) = PrivateGraph::start("asleep") else {
-        return;
-    };
-    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
-        .into_iter()
-        .find(|tool| !installed(tool))
-    {
-        skip(&format!(
-            "{missing} is not available, so the output lane's idle was not checked"
-        ));
-        return;
-    }
-    if graph.add_tone("t_tone").is_none() {
-        skip(concat!(
-            "the tone never appeared (is audiotestsrc installed?), ",
-            "so the output lane's idle was not checked"
-        ));
-        return;
-    }
-    let mut handle =
-        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
-    let mut said = Transcript::default();
-    said.until(
-        &handle,
-        "a device list",
-        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
-    );
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_stereo".to_owned(),
-        direction: DeviceDirection::Output,
-    });
-    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
-    assert_eq!(
-        graph
-            .settles_on(&[SINK_NODE_NAME, OUTPUT_NODE_NAME])
-            .map(|settled| settled.map(drop)),
-        Some(Ok(())),
-        "the output lane's pair should be in the graph"
-    );
-    for (node, direction, positions) in [
-        ("t_tone", "Output", &["MONO"][..]),
-        ("t_stereo", "Input", &["FL", "FR"][..]),
-        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
-        (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
-    ] {
-        assert!(
-            graph.configure_ports(node, direction, positions).is_some(),
-            "{node} was not given ports"
+    again_if_a_tone_ran_dry(|| {
+        let Some(graph) = PrivateGraph::start("asleep") else {
+            return;
+        };
+        if let Some(missing) = ["pw-dump", "pw-cli", "pw-link"]
+            .into_iter()
+            .find(|tool| !installed(tool))
+        {
+            skip(&format!(
+                "{missing} is not available, so the output lane's idle was not checked"
+            ));
+            return;
+        }
+        if graph.add_tone("t_tone").is_none() {
+            skip(concat!(
+                "the tone never appeared (is audiotestsrc installed?), ",
+                "so the output lane's idle was not checked"
+            ));
+            return;
+        }
+        let mut handle =
+            AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+        let mut said = Transcript::default();
+        said.until(
+            &handle,
+            "a device list",
+            |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
         );
-    }
-
-    // The playback stream is linked to the speakers as soon as the pair is up, as WirePlumber
-    // links it, and nothing plays into the sink. In 0.3.0 that was enough to run both nodes and
-    // the speakers for as long as FxSound was open.
-    assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
-    for node in [OUTPUT_NODE_NAME, SINK_NODE_NAME, "t_stereo"] {
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_stereo".to_owned(),
+            direction: DeviceDirection::Output,
+        });
+        assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
         assert_eq!(
-            graph.runs_until(node, false).map(drop),
-            Ok(()),
-            "{node} should not run while nothing plays into the sink"
+            graph
+                .settles_on(&[SINK_NODE_NAME, OUTPUT_NODE_NAME])
+                .map(|settled| settled.map(drop)),
+            Some(Ok(())),
+            "the output lane's pair should be in the graph"
         );
-    }
-    // Not merely for a moment: for longer than a playback stream paced by hand is given to fall
-    // asleep, so that whichever way this server idles the pair, the pair has had time to wake.
-    let quiet_until = Instant::now() + engine::SLEEP_AFTER * 2;
-    while Instant::now() < quiet_until {
-        for node in [OUTPUT_NODE_NAME, "t_stereo"] {
-            assert_ne!(
-                graph.node_state(node).as_deref(),
-                Some("running"),
-                "{node} ran with nothing to play"
+        for (node, direction, positions) in [
+            ("t_tone", "Output", &["MONO"][..]),
+            ("t_stereo", "Input", &["FL", "FR"][..]),
+            (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+            (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
+        ] {
+            assert!(
+                graph.configure_ports(node, direction, positions).is_some(),
+                "{node} was not given ports"
             );
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // And a lane doing nothing has nothing to say: no status for the GUI to wake up for.
-    said.settle(&handle);
-    let idle_from = said.0.len();
-    said.settle(&handle);
-    let idle_statuses: Vec<_> = said.0[idle_from..]
-        .iter()
-        .filter(|m| {
-            matches!(
-                m,
-                AudioToUi::Status {
-                    direction: DeviceDirection::Output,
-                    ..
-                }
-            )
-        })
-        .collect();
-    assert!(
-        idle_statuses.is_empty(),
-        "an idle output lane kept reporting: {idle_statuses:?}"
-    );
 
-    // Something plays: the sink, the playback stream and the speakers all run, and the tone gets
-    // through the chain.
-    assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
-    for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME, "t_stereo"] {
-        assert_eq!(
-            graph.runs_until(node, true).map(drop),
-            Ok(()),
-            "{node} should run while something plays into the sink"
+        // The playback stream is linked to the speakers as soon as the pair is up, as WirePlumber
+        // links it, and nothing plays into the sink. In 0.3.0 that was enough to run both nodes and
+        // the speakers for as long as FxSound was open.
+        assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
+        for node in [OUTPUT_NODE_NAME, SINK_NODE_NAME, "t_stereo"] {
+            assert_eq!(
+                graph.runs_until(node, false).map(drop),
+                Ok(()),
+                "{node} should not run while nothing plays into the sink"
+            );
+        }
+        // Not merely for a moment: for longer than a playback stream paced by hand is given to fall
+        // asleep, so that whichever way this server idles the pair, the pair has had time to wake.
+        let quiet_until = Instant::now() + engine::SLEEP_AFTER * 2;
+        while Instant::now() < quiet_until {
+            for node in [OUTPUT_NODE_NAME, "t_stereo"] {
+                assert_ne!(
+                    graph.node_state(node).as_deref(),
+                    Some("running"),
+                    "{node} ran with nothing to play"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // And a lane doing nothing has nothing to say: no status for the GUI to wake up for.
+        said.settle(&handle);
+        let idle_from = said.0.len();
+        said.settle(&handle);
+        let idle_statuses: Vec<_> = said.0[idle_from..]
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    AudioToUi::Status {
+                        direction: DeviceDirection::Output,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert!(
+            idle_statuses.is_empty(),
+            "an idle output lane kept reporting: {idle_statuses:?}"
         );
-    }
-    let played = meters_until(&mut handle, DeviceDirection::Output, |m| {
-        m.peak_left > 0.1 && m.peak_right > 0.1
+
+        // Something plays: the sink, the playback stream and the speakers all run, and the tone gets
+        // through the chain.
+        assert!(graph.link_nodes("t_tone", SINK_NODE_NAME));
+        for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME, "t_stereo"] {
+            assert_eq!(
+                graph.runs_until(node, true).map(drop),
+                Ok(()),
+                "{node} should run while something plays into the sink"
+            );
+        }
+        let played = meters_until(&mut handle, DeviceDirection::Output, |m| {
+            m.peak_left > 0.1 && m.peak_right > 0.1
+        });
+        assert!(
+            played.is_some(),
+            "the tone never reached the output lane's meters"
+        );
+
+        // It stops — the application closed its stream — and so does everything it woke.
+        assert!(graph.unlink_nodes("t_tone", SINK_NODE_NAME));
+        for node in [OUTPUT_NODE_NAME, SINK_NODE_NAME, "t_stereo"] {
+            assert_eq!(
+                graph.runs_until(node, false).map(drop),
+                Ok(()),
+                "{node} should stop once nothing plays into the sink"
+            );
+        }
+        handle.shutdown();
     });
-    assert!(
-        played.is_some(),
-        "the tone never reached the output lane's meters"
-    );
-
-    // It stops — the application closed its stream — and so does everything it woke.
-    assert!(graph.unlink_nodes("t_tone", SINK_NODE_NAME));
-    for node in [OUTPUT_NODE_NAME, SINK_NODE_NAME, "t_stereo"] {
-        assert_eq!(
-            graph.runs_until(node, false).map(drop),
-            Ok(()),
-            "{node} should stop once nothing plays into the sink"
-        );
-    }
-    handle.shutdown();
 }
 
 #[test]
 fn a_microphone_being_captured_does_not_keep_the_speakers_awake() {
-    let Some(graph) = PrivateGraph::start("micawake") else {
-        return;
-    };
-    if let Some(missing) = ["pw-dump", "pw-cli", "pw-link", "pw-record"]
-        .into_iter()
-        .find(|tool| !installed(tool))
-    {
-        skip(&format!(
-            "{missing} is not available, so the two lanes' idle was not checked"
-        ));
-        return;
-    }
-    if graph.add_tone("t_tone").is_none() {
-        skip(concat!(
-            "the tone never appeared (is audiotestsrc installed?), ",
-            "so the two lanes' idle was not checked"
-        ));
-        return;
-    }
-    let handle =
-        AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
-    let mut said = Transcript::default();
-    said.until(
-        &handle,
-        "a device list",
-        |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
-    );
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_stereo".to_owned(),
-        direction: DeviceDirection::Output,
-    });
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_tone".to_owned(),
-        direction: DeviceDirection::Input,
-    });
-    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
-    assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
-    assert_eq!(
-        graph
-            .settles_on(&LANE_NODE_NAMES)
-            .map(|settled| settled.map(drop)),
-        Some(Ok(())),
-        "both pairs should be in the graph at once"
-    );
-    for (node, direction, positions) in [
-        ("t_tone", "Output", &["MONO"][..]),
-        ("t_stereo", "Input", &["FL", "FR"][..]),
-        (CAPTURE_NODE_NAME, "Input", &["MONO"][..]),
-        (SOURCE_NODE_NAME, "Output", &["FL", "FR"][..]),
-        (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
-        (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
-    ] {
-        assert!(
-            graph.configure_ports(node, direction, positions).is_some(),
-            "{node} was not given ports"
+    again_if_a_tone_ran_dry(|| {
+        let Some(graph) = PrivateGraph::start("micawake") else {
+            return;
+        };
+        if let Some(missing) = ["pw-dump", "pw-cli", "pw-link", "pw-record"]
+            .into_iter()
+            .find(|tool| !installed(tool))
+        {
+            skip(&format!(
+                "{missing} is not available, so the two lanes' idle was not checked"
+            ));
+            return;
+        }
+        if graph.add_tone("t_tone").is_none() {
+            skip(concat!(
+                "the tone never appeared (is audiotestsrc installed?), ",
+                "so the two lanes' idle was not checked"
+            ));
+            return;
+        }
+        let handle =
+            AudioEngine::start_with_remote(Some(&graph.remote())).expect("the engine should start");
+        let mut said = Transcript::default();
+        said.until(
+            &handle,
+            "a device list",
+            |m| matches!(m, AudioToUi::Devices(d) if d.iter().any(|d| d.name == "t_tone")),
         );
-    }
-    assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
-    assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
-    let recording = graph
-        .clocked_recorder("t_recorder")
-        .expect("a recorder for FxSound (Input)");
-    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
-
-    // The microphone lane runs while something records from it — that is what it is for — and
-    // the speakers' lane, with nothing playing into its sink, does not. With one link-group for
-    // all four nodes the capture stream made the other pair runnable with it, and the speakers
-    // never slept while the microphone lane was on.
-    assert_eq!(
-        graph.runs_until(CAPTURE_NODE_NAME, true).map(drop),
-        Ok(()),
-        "the capture stream should run while its microphone does"
-    );
-    let quiet_until = Instant::now() + engine::SLEEP_AFTER * 2;
-    while Instant::now() < quiet_until {
-        for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME, "t_stereo"] {
-            assert_ne!(
-                graph.node_state(node).as_deref(),
-                Some("running"),
-                "{node} ran because the microphone did"
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_stereo".to_owned(),
+            direction: DeviceDirection::Output,
+        });
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_tone".to_owned(),
+            direction: DeviceDirection::Input,
+        });
+        assert!(said.attached(&handle, DeviceDirection::Output, Some("t_stereo")));
+        assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
+        assert_eq!(
+            graph
+                .settles_on(&LANE_NODE_NAMES)
+                .map(|settled| settled.map(drop)),
+            Some(Ok(())),
+            "both pairs should be in the graph at once"
+        );
+        for (node, direction, positions) in [
+            ("t_tone", "Output", &["MONO"][..]),
+            ("t_stereo", "Input", &["FL", "FR"][..]),
+            (CAPTURE_NODE_NAME, "Input", &["MONO"][..]),
+            (SOURCE_NODE_NAME, "Output", &["FL", "FR"][..]),
+            (SINK_NODE_NAME, "Input", &["FL", "FR"][..]),
+            (OUTPUT_NODE_NAME, "Output", &["FL", "FR"][..]),
+        ] {
+            assert!(
+                graph.configure_ports(node, direction, positions).is_some(),
+                "{node} was not given ports"
             );
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    handle.shutdown();
+        assert!(graph.link_nodes(OUTPUT_NODE_NAME, "t_stereo"));
+        assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
+        let recording = graph
+            .clocked_recorder("t_recorder")
+            .expect("a recorder for FxSound (Input)");
+        assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
+
+        // The microphone lane runs while something records from it — that is what it is for — and
+        // the speakers' lane, with nothing playing into its sink, does not. With one link-group for
+        // all four nodes the capture stream made the other pair runnable with it, and the speakers
+        // never slept while the microphone lane was on.
+        assert_eq!(
+            graph.runs_until(CAPTURE_NODE_NAME, true).map(drop),
+            Ok(()),
+            "the capture stream should run while its microphone does"
+        );
+        let quiet_until = Instant::now() + engine::SLEEP_AFTER * 2;
+        while Instant::now() < quiet_until {
+            for node in [SINK_NODE_NAME, OUTPUT_NODE_NAME, "t_stereo"] {
+                assert_ne!(
+                    graph.node_state(node).as_deref(),
+                    Some("running"),
+                    "{node} ran because the microphone did"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        handle.shutdown();
+    });
 }
 
 /// Why the echo canceller cannot be tested here, if it cannot: `None` when PipeWire's module and
@@ -3623,9 +3943,9 @@ fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
         "the speakers run while the canceller listens to them"
     );
 
-    // Off. The canceller goes, the capture stream is rebuilt on the microphone, and once it is
-    // linked there — the session manager's job, done here by hand — the microphone lane runs on
-    // without keeping the speakers awake.
+    // Off. The canceller goes, the capture stream is replaced on the microphone, FxSound's source
+    // kept (roadmap 0.5.0 §7, D3), and once it is linked there — the session manager's job, done
+    // here by hand — the microphone lane runs on without keeping the speakers awake.
     let mark = said.0.len();
     handle.send(UiToAudio::SetEchoCancel(false));
     assert!(heard_echo_cancel(
@@ -3653,16 +3973,13 @@ fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
             .is_some(),
         "the rebuilt capture stream was not given ports"
     );
-    assert!(
-        graph
-            .configure_ports(SOURCE_NODE_NAME, "Output", &["FL", "FR"])
-            .is_some(),
-        "the rebuilt source was not given ports"
-    );
     assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
-    // The pair was rebuilt whole, so the recorder is linked to the new source as a session manager
-    // would link it.
-    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
+    // The source stayed, and the recorder with it, on the link it had.
+    assert_eq!(
+        graph.linked(SOURCE_NODE_NAME, &recording.name),
+        Some(true),
+        "the recorder of FxSound (Input) lost its link when the canceller went"
+    );
     assert_eq!(
         graph.runs_until(CAPTURE_NODE_NAME, true).map(drop),
         Ok(()),
@@ -3743,11 +4060,11 @@ fn echo_cancellation_holds_nothing_awake_while_nothing_records_from_fxsound_inpu
     } else {
         // Everything ran, which is what this test is about; that the tone came through as well
         // is not something this server's following `audiotestsrc` can show.
-        println!(
-            "NOTE: PipeWire {:?} is older than {TONE_FOLLOWS_SINCE:?}, whose following tone is \
-             silent, so what the recorder heard through the canceller was not checked",
+        note(&format!(
+            "PipeWire {:?} is older than {TONE_FOLLOWS_SINCE:?}, whose following tone is silent, \
+             so what the recorder heard through the canceller was not checked",
             graph.server_version()
-        );
+        ));
     }
 
     // It stops, and all of it sleeps again with echo cancellation still on.
@@ -3811,132 +4128,134 @@ fn canceller_settles_on(
 
 #[test]
 fn the_canceller_follows_the_microphone_and_the_speakers_and_goes_with_the_microphone_lane() {
-    if let Some(missing) = canceller_missing() {
-        skip(&format!(
-            "{missing}, so the canceller's reloads were not checked"
-        ));
-        return;
-    }
-    let Some(graph) = PrivateGraph::start("aecfollow") else {
-        return;
-    };
-    if !installed("pw-dump") {
-        skip("pw-dump is not available, so the canceller's reloads were not checked");
-        return;
-    }
-    if graph.add_tone("t_tone").is_none() {
-        skip(concat!(
-            "the tone never appeared (is audiotestsrc installed?), ",
-            "so the canceller's reloads were not checked"
-        ));
-        return;
-    }
-    let mut said = Transcript::default();
-    let handle = engine_with_both_lanes(&graph, aec::NULL_LIBRARY, "t_mic", &mut said);
-    let mark = said.0.len();
-    handle.send(UiToAudio::SetEchoCancel(true));
-    assert!(heard_echo_cancel(
-        &mut said,
-        &handle,
-        mark,
-        true,
-        str::is_empty
-    ));
-    assert_eq!(
-        canceller_settles_on(&graph, "t_mic", "t_stereo", None),
-        Some(true),
-        "the canceller should hear the microphone and the speakers the lanes are attached to"
-    );
-
-    // Other speakers: the canceller is reloaded to hear those, and the capture stream ends up on
-    // the new canceller's source.
-    let capture = |graph: &PrivateGraph| {
-        graph
-            .our_nodes()
-            .and_then(|nodes| serial_of(&nodes, CAPTURE_NODE_NAME))
-    };
-    let before = capture(&graph);
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_71".to_owned(),
-        direction: DeviceDirection::Output,
-    });
-    // Asked for again, echo cancellation is answered as the message is handled, and messages are
-    // handled in order: once the answer is in, the change of speakers has been handled in full.
-    let mark = said.0.len();
-    handle.send(UiToAudio::SetEchoCancel(true));
-    assert!(
-        said.heard_since(&handle, mark, "echo cancellation's answer", |m| {
-            matches!(m, AudioToUi::EchoCancel { .. })
-        })
-    );
-    assert!(said.attached(&handle, DeviceDirection::Output, Some("t_71")));
-    assert_ne!(
-        capture(&graph),
-        before,
-        "the capture stream should leave the unloaded canceller's source with it, not a tick later"
-    );
-    assert_eq!(
-        canceller_settles_on(&graph, "t_mic", "t_71", before),
-        Some(true),
-        "a change of speakers should reload the canceller to hear the new ones"
-    );
-
-    // Another microphone: the same, for the capture side.
-    let before = capture(&graph);
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_tone".to_owned(),
-        direction: DeviceDirection::Input,
-    });
-    assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
-    assert_eq!(
-        canceller_settles_on(&graph, "t_tone", "t_71", before),
-        Some(true),
-        "a change of microphone should reload the canceller to hear the new one"
-    );
-
-    // The microphone lane detached: the canceller goes with it, the speakers' pair stays.
-    let heard_before = said.0.len();
-    handle.send(UiToAudio::DetachLane(DeviceDirection::Input));
-    assert!(said.attached(&handle, DeviceDirection::Input, None));
-    assert_eq!(
-        graph
-            .settles_on(&[SINK_NODE_NAME, OUTPUT_NODE_NAME])
-            .map(|settled| settled.map(drop)),
-        Some(Ok(())),
-        "detaching the microphone lane should unload the canceller with the lane's pair"
-    );
-    assert!(
-        said.heard_since(
+    again_if_a_tone_ran_dry(|| {
+        if let Some(missing) = canceller_missing() {
+            skip(&format!(
+                "{missing}, so the canceller's reloads were not checked"
+            ));
+            return;
+        }
+        let Some(graph) = PrivateGraph::start("aecfollow") else {
+            return;
+        };
+        if !installed("pw-dump") {
+            skip("pw-dump is not available, so the canceller's reloads were not checked");
+            return;
+        }
+        if graph.add_tone("t_tone").is_none() {
+            skip(concat!(
+                "the tone never appeared (is audiotestsrc installed?), ",
+                "so the canceller's reloads were not checked"
+            ));
+            return;
+        }
+        let mut said = Transcript::default();
+        let handle = engine_with_both_lanes(&graph, aec::NULL_LIBRARY, "t_mic", &mut said);
+        let mark = said.0.len();
+        handle.send(UiToAudio::SetEchoCancel(true));
+        assert!(heard_echo_cancel(
+            &mut said,
             &handle,
-            heard_before,
-            "echo cancellation stopping",
-            |m| matches!(
-                m,
-                AudioToUi::EchoCancel { running: false, detail } if detail.is_empty()
-            )
-        ),
-        "the canceller stopping with the lane is reported"
-    );
+            mark,
+            true,
+            str::is_empty
+        ));
+        assert_eq!(
+            canceller_settles_on(&graph, "t_mic", "t_stereo", None),
+            Some(true),
+            "the canceller should hear the microphone and the speakers the lanes are attached to"
+        );
 
-    // Still on: attaching a microphone again brings it back.
-    let mark = said.0.len();
-    handle.send(UiToAudio::SelectDevice {
-        node_name: "t_mic".to_owned(),
-        direction: DeviceDirection::Input,
+        // Other speakers: the canceller is reloaded to hear those, and the capture stream ends up on
+        // the new canceller's source.
+        let capture = |graph: &PrivateGraph| {
+            graph
+                .our_nodes()
+                .and_then(|nodes| serial_of(&nodes, CAPTURE_NODE_NAME))
+        };
+        let before = capture(&graph);
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_71".to_owned(),
+            direction: DeviceDirection::Output,
+        });
+        // Asked for again, echo cancellation is answered as the message is handled, and messages are
+        // handled in order: once the answer is in, the change of speakers has been handled in full.
+        let mark = said.0.len();
+        handle.send(UiToAudio::SetEchoCancel(true));
+        assert!(
+            said.heard_since(&handle, mark, "echo cancellation's answer", |m| {
+                matches!(m, AudioToUi::EchoCancel { .. })
+            })
+        );
+        assert!(said.attached(&handle, DeviceDirection::Output, Some("t_71")));
+        assert_ne!(
+            capture(&graph),
+            before,
+            "the capture stream should leave the unloaded canceller's source with it, not a tick later"
+        );
+        assert_eq!(
+            canceller_settles_on(&graph, "t_mic", "t_71", before),
+            Some(true),
+            "a change of speakers should reload the canceller to hear the new ones"
+        );
+
+        // Another microphone: the same, for the capture side.
+        let before = capture(&graph);
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_tone".to_owned(),
+            direction: DeviceDirection::Input,
+        });
+        assert!(said.attached(&handle, DeviceDirection::Input, Some("t_tone")));
+        assert_eq!(
+            canceller_settles_on(&graph, "t_tone", "t_71", before),
+            Some(true),
+            "a change of microphone should reload the canceller to hear the new one"
+        );
+
+        // The microphone lane detached: the canceller goes with it, the speakers' pair stays.
+        let heard_before = said.0.len();
+        handle.send(UiToAudio::DetachLane(DeviceDirection::Input));
+        assert!(said.attached(&handle, DeviceDirection::Input, None));
+        assert_eq!(
+            graph
+                .settles_on(&[SINK_NODE_NAME, OUTPUT_NODE_NAME])
+                .map(|settled| settled.map(drop)),
+            Some(Ok(())),
+            "detaching the microphone lane should unload the canceller with the lane's pair"
+        );
+        assert!(
+            said.heard_since(
+                &handle,
+                heard_before,
+                "echo cancellation stopping",
+                |m| matches!(
+                    m,
+                    AudioToUi::EchoCancel { running: false, detail } if detail.is_empty()
+                )
+            ),
+            "the canceller stopping with the lane is reported"
+        );
+
+        // Still on: attaching a microphone again brings it back.
+        let mark = said.0.len();
+        handle.send(UiToAudio::SelectDevice {
+            node_name: "t_mic".to_owned(),
+            direction: DeviceDirection::Input,
+        });
+        assert!(heard_echo_cancel(
+            &mut said,
+            &handle,
+            mark,
+            true,
+            str::is_empty
+        ));
+        assert_eq!(
+            canceller_settles_on(&graph, "t_mic", "t_71", None),
+            Some(true),
+            "echo cancellation stays on across a detach, and comes back with the microphone lane"
+        );
+        handle.shutdown();
     });
-    assert!(heard_echo_cancel(
-        &mut said,
-        &handle,
-        mark,
-        true,
-        str::is_empty
-    ));
-    assert_eq!(
-        canceller_settles_on(&graph, "t_mic", "t_71", None),
-        Some(true),
-        "echo cancellation stays on across a detach, and comes back with the microphone lane"
-    );
-    handle.shutdown();
 }
 
 #[test]
@@ -4111,10 +4430,9 @@ fn a_headset_between_profiles_keeps_the_output_lane_and_its_sink_is_linked_again
         "the playback stream could not be linked to the headset"
     );
     assert_eq!(graph.linked(OUTPUT_NODE_NAME, HEADSET), Some(true));
-    let first = graph
-        .our_nodes()
-        .and_then(|nodes| serial_of(&nodes, OUTPUT_NODE_NAME))
-        .expect("the playback stream is in the graph");
+    let nodes = graph.our_nodes().expect("pw-dump answered a moment ago");
+    let first = serial_of(&nodes, OUTPUT_NODE_NAME).expect("the playback stream is in the graph");
+    let sink = serial_of(&nodes, SINK_NODE_NAME).expect("FxSound's sink is in the graph");
     let from = said.0.len();
 
     // The headset switches profile: its sink goes, and comes back under the same name a moment
@@ -4156,14 +4474,19 @@ fn a_headset_between_profiles_keeps_the_output_lane_and_its_sink_is_linked_again
          slow for this test to say anything"
     );
 
-    // The pair is rebuilt on the node that came back, because the stream WirePlumber linked
-    // once is never linked again — and the new stream is linked.
+    // The playback stream is replaced on the node that came back, because the stream WirePlumber
+    // linked once is never linked again — and the new stream is linked. FxSound's sink stays, at
+    // the same format, and with it every application on it (roadmap 0.5.0 §7, D3).
     let rebuilt = graph.nodes_until(|nodes| {
         serial_of(nodes, OUTPUT_NODE_NAME).is_some_and(|serial| serial != first)
     });
-    assert!(
-        matches!(rebuilt, Some(Ok(_))),
-        "the playback stream was never rebuilt for the sink that came back: {rebuilt:?}"
+    let Some(Ok(rebuilt)) = rebuilt else {
+        panic!("the playback stream was never rebuilt for the sink that came back: {rebuilt:?}");
+    };
+    assert_eq!(
+        serial_of(&rebuilt, SINK_NODE_NAME),
+        Some(sink),
+        "FxSound's sink went with the headset's profile switch"
     );
     said.settle(&handle);
     assert_eq!(

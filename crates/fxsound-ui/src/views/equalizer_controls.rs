@@ -71,8 +71,8 @@ use crate::widgets::equalizer::BAND_COUNTS;
 use crate::widgets::slider::{self, FxSlider, Track};
 use crate::widgets::{FxComboBox, IconButton};
 use egui::{Align2, Rect, Ui, Vec2, pos2, vec2};
-use fxsound_core::DeviceDirection;
 use fxsound_core::i18n::tr;
+use fxsound_core::{DeviceDirection, WindowsLook};
 
 /// `FxEqualizerControl::X_MARGIN`.
 pub const X_MARGIN: f32 = 8.0;
@@ -308,6 +308,22 @@ impl Level {
         }
     }
 
+    /// The range the window's slider has for the state in force: [`Level::range`], except that at
+    /// «Как в Windows» = Interface and above the speakers' Master Gain and Balance step by two
+    /// decibels, as the Windows sliders do ([`WindowsLook::LevelSteps`], 0.4.0 audit #22). The
+    /// microphone's Makeup Gain, which Windows does not have, keeps its one.
+    #[must_use]
+    pub const fn range_in(self, state: &UiState) -> LevelRange {
+        let mut range = self.range(state.direction);
+        if matches!(self, Self::MasterGain | Self::Balance)
+            && matches!(state.direction, DeviceDirection::Output)
+            && state.windows_look(WindowsLook::LevelSteps)
+        {
+            range.step = 2.0;
+        }
+        range
+    }
+
     /// The caption over the slider, translated.
     #[must_use]
     pub fn caption(self, direction: DeviceDirection) -> String {
@@ -363,6 +379,19 @@ impl Level {
             _ => number.as_str(),
         };
         format!("{number}{unit}")
+    }
+
+    /// The readout the window shows for the state in force: [`Level::readout`], except that at
+    /// «Как в Windows» = Interface and above Volume Leveling says `dB` after its amount again, as
+    /// the original's `%.1f dB` does ([`WindowsLook::LevelingUnit`], 0.4.0 audit #23).
+    #[must_use]
+    pub fn readout_in(self, value: f32, state: &UiState) -> String {
+        let text = self.readout(value);
+        if self == Self::VolumeLeveling && state.windows_look(WindowsLook::LevelingUnit) {
+            format!("{text} dB")
+        } else {
+            text
+        }
     }
 
     /// Whether the stage this slider sets is in the signal path right now.
@@ -433,13 +462,14 @@ pub fn show(
             caption_colour,
         );
 
-        let range = level.range(direction);
+        let range = level.range_in(state);
         let rect = slider_rect(column, row);
         let before = level.value(state);
         let mut value = before;
         let slider = FxSlider::new(&mut value, range.min, range.max, range.step)
             .default_value(range.default)
             .reset_on_secondary_click(true)
+            .fidelity(super::pro::slider_fidelity(state))
             .enabled(enabled)
             .lit(level.in_path(state))
             .track(if level == Level::Balance {
@@ -452,14 +482,16 @@ pub fn show(
             response.push(level.action(value));
         }
         // The original has no tooltip here, and so nothing that tells of the right-click reset
-        // (0.4.0 audit R9); "Hide help tips" hides it with the rest.
-        if !state.hide_tooltips {
+        // (0.4.0 audit R9); "Hide help tips" hides it with the rest, and «Как в Windows» =
+        // Interface and above go without it as the original does. The microphone's levels are
+        // the port's own, with no Windows original to follow, and keep theirs at every level.
+        if state.lane_tips_shown() {
             let _ = slider.on_hover_text(slider::with_reset_tip(None));
         }
 
         // A plain visible child in the original, so — unlike face A's — shown with the power off
         // too, at a disabled label's half alpha.
-        let text = level.readout(value);
+        let text = level.readout_in(value, state);
         let font = caption_font(VALUE_FONT_PX);
         let width = ui
             .painter()
@@ -527,7 +559,7 @@ mod tests {
     use crate::views::{ColumnFace, ViewScratch};
     use egui::epaint::ClippedShape;
     use egui::{Color32, Event, Modifiers, PointerButton, Pos2, Shape};
-    use fxsound_core::{AudioDevice, ThemeMode, ViewMode};
+    use fxsound_core::{AudioDevice, ThemeMode, ViewMode, WindowsParity};
 
     /// The column at the window-local place the Pro view puts it.
     fn column() -> Rect {
@@ -823,6 +855,54 @@ mod tests {
             assert_eq!(slider::step_towards(3.0, r.min, r.step, true), 4.0);
             assert_eq!(slider::step_towards(3.0, r.min, r.step, false), 2.0);
         }
+    }
+
+    #[test]
+    fn at_interface_the_master_gain_and_the_balance_step_by_two_decibels_as_on_windows() {
+        // «Как в Windows» = Interface sets 0.4.0 audit #22 back (`FxAudioControls.cpp:312`,
+        // `FxBalanceSlider.cpp:36`); Off keeps the whole decibel (the test above).
+        for level in [WindowsParity::Interface, WindowsParity::Sound] {
+            let state = UiState {
+                windows_parity: level,
+                ..UiState::default()
+            };
+            for row in [Level::MasterGain, Level::Balance] {
+                let r = row.range_in(&state);
+                assert_eq!((r.min, r.max, r.step, r.default), (-20.0, 20.0, 2.0, 0.0));
+                // A --master_gain=3 goes to 4 or 2 at an arrow, as the Windows slider snaps it.
+                assert_eq!(slider::step_towards(3.0, r.min, r.step, true), 4.0);
+                assert_eq!(slider::step_towards(4.0, r.min, r.step, true), 6.0);
+            }
+            for row in [Level::VolumeLeveling, Level::FilterQ] {
+                assert_eq!(row.range_in(&state), row.range(DeviceDirection::Output));
+            }
+            // The microphone's Makeup Gain has no Windows original and keeps its decibel.
+            let microphone = UiState {
+                direction: DeviceDirection::Input,
+                ..state
+            };
+            assert_eq!(Level::MasterGain.range_in(&microphone).step, 1.0);
+        }
+        let off = UiState::default();
+        assert_eq!(Level::MasterGain.range_in(&off).step, 1.0);
+        assert_eq!(Level::Balance.range_in(&off).step, 1.0);
+    }
+
+    #[test]
+    fn at_interface_the_volume_leveling_says_db_as_on_windows_and_off_it_does_not() {
+        // 0.4.0 audit #23 set back at Interface: the original's `%.1f dB`.
+        let windows = UiState {
+            windows_parity: WindowsParity::Interface,
+            ..UiState::default()
+        };
+        assert_eq!(Level::VolumeLeveling.readout_in(1.5, &windows), "1.5 dB");
+        assert_eq!(
+            Level::VolumeLeveling.readout_in(1.5, &UiState::default()),
+            "1.5"
+        );
+        // The other readouts are the original's already.
+        assert_eq!(Level::MasterGain.readout_in(-4.0, &windows), "-4 dB");
+        assert_eq!(Level::FilterQ.readout_in(2.0, &windows), "2.0x");
     }
 
     #[test]
@@ -1174,6 +1254,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn at_interface_no_level_slider_says_a_right_click_resets_it_and_the_right_click_still_does() {
+        // The original has no tip on these (0.4.0 audit R9 set back at «Как в Windows» =
+        // Interface); the reset itself is the original's and stays.
+        let windows = UiState {
+            windows_parity: WindowsParity::Interface,
+            ..speakers()
+        };
+        for (row, _) in Level::OUTPUT.iter().enumerate() {
+            let mut harness = turned_over(ThemeMode::Dark);
+            let shown = harness.rest(&windows, slider_rect(column(), row).center());
+            assert!(
+                !shown.iter().any(|text| text == slider::RESET_TIP),
+                "row {row}: {shown:?}"
+            );
+        }
+        let mut harness = turned_over(ThemeMode::Dark);
+        harness.settle(&windows);
+        let track = slider::track_rect(slider_rect(column(), 1));
+        let target = pos2(track.right() - 2.0, track.center().y);
+        let actions = press(&mut harness, &windows, target, PointerButton::Secondary);
+        assert_eq!(actions, vec![UiAction::SetVolumeLeveling(0.0)]);
+    }
+
+    #[test]
+    fn at_interface_every_microphone_level_slider_still_says_a_right_click_resets_it() {
+        // The input lane is the port's own: nothing in the Windows build to set it back to.
+        let windows = UiState {
+            windows_parity: WindowsParity::Interface,
+            ..microphone()
+        };
+        let hidden = UiState {
+            hide_tooltips: true,
+            ..windows.clone()
+        };
+        for (row, _) in Level::INPUT.iter().enumerate() {
+            let mut harness = turned_over(ThemeMode::Dark);
+            let shown = harness.rest(&windows, slider_rect(column(), row).center());
+            assert!(
+                shown.iter().any(|text| text == slider::RESET_TIP),
+                "row {row}: {shown:?}"
+            );
+            let mut harness = turned_over(ThemeMode::Dark);
+            let shown = harness.rest(&hidden, slider_rect(column(), row).center());
+            assert!(
+                !shown.iter().any(|text| text == slider::RESET_TIP),
+                "row {row} with help tips hidden: {shown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn at_interface_a_click_on_the_master_gains_track_lands_on_an_even_decibel() {
+        // 32 % of the way along is -7.2 dB: -7 on the whole-decibel step, -8 at Interface, the
+        // Windows slider's nearest two-decibel position (0.4.0 audit #22 set back).
+        let mut harness = turned_over(ThemeMode::Dark);
+        let state = UiState {
+            windows_parity: WindowsParity::Interface,
+            ..speakers()
+        };
+        harness.settle(&state);
+        let track = slider::track_rect(slider_rect(column(), 0));
+        let target = pos2(track.left() + track.width() * 0.32, track.center().y);
+        let actions = press(&mut harness, &state, target, PointerButton::Primary);
+        assert_eq!(actions, vec![UiAction::SetMasterGain(-8.0)]);
+        let mut harness = turned_over(ThemeMode::Dark);
+        let off = speakers();
+        harness.settle(&off);
+        let actions = press(&mut harness, &off, target, PointerButton::Primary);
+        assert_eq!(actions, vec![UiAction::SetMasterGain(-7.0)]);
+    }
+
     /// The centre of `level`'s thumb on the speakers' `row`.
     fn level_thumb(state: &UiState, row: usize, level: Level) -> Pos2 {
         let rect = slider_rect(column(), row);
@@ -1419,6 +1571,85 @@ mod tests {
         let width = fill_at(&shapes, slider::track_rect(slider_rect(column(), 1))).unwrap();
         assert!(!is_grey(makeup), "{makeup:?}");
         assert!(is_grey(width), "{width:?}");
+    }
+
+    /// The right edge of the fill painted from `track`'s start over it, if one was: the one
+    /// rectangle that starts where the track does and is not the track.
+    fn fill_right(shapes: &[ClippedShape], track: Rect) -> Option<f32> {
+        shapes.iter().find_map(|clipped| match &clipped.shape {
+            Shape::Rect(shape)
+                if (shape.rect.min - track.min).length() < 1e-3
+                    && (shape.rect.height() - track.height()).abs() < 1e-3
+                    && (shape.rect.width() - track.width()).abs() > 1e-3 =>
+            {
+                Some(shape.rect.right())
+            }
+            _ => None,
+        })
+    }
+
+    /// Where the balance bar's gradient ends, and how many vertices the bar has.
+    fn balance_end(shapes: &[ClippedShape], track: Rect) -> (f32, usize) {
+        shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                Shape::Mesh(mesh)
+                    if mesh.texture_id == egui::TextureId::default()
+                        && mesh
+                            .vertices
+                            .first()
+                            .is_some_and(|v| v.pos == track.left_top()) =>
+                {
+                    Some((mesh.vertices[1].pos.x, mesh.vertices.len()))
+                }
+                _ => None,
+            })
+            .expect("the balance bar")
+    }
+
+    #[test]
+    fn at_interface_the_level_sliders_paint_as_windows_does_and_off_they_paint_corrected() {
+        // 0.4.0 audit #41 set back: `drawLinearSlider` takes the thumb's x for the fill's width,
+        // and `FxBalanceSlider::paint` ends its gradient a track's width in from the slider's left
+        // edge and holds the end colour after it (`slider::Fidelity::Faithful`).
+        let windows = UiState {
+            windows_parity: WindowsParity::Interface,
+            ..speakers()
+        };
+        let gain = slider_rect(column(), 0);
+        let gain_track = slider::track_rect(gain);
+        let range = Level::MasterGain.range_in(&windows);
+        let t = (windows.master_gain_db - range.min) / (range.max - range.min);
+        let thumb_x = gain_track.left() + gain_track.width() * t;
+        let balance = slider_rect(column(), Level::BALANCE_ROW);
+        let balance_track = slider::track_rect(balance);
+
+        let mut harness = turned_over(ThemeMode::Dark);
+        let shapes = harness.settle(&speakers());
+        let off = fill_right(&shapes, gain_track).expect("Off: the gain's fill");
+        assert!((off - thumb_x).abs() < 1e-3, "Off: {off} against {thumb_x}");
+        assert_eq!(
+            balance_end(&shapes, balance_track),
+            (balance_track.right(), 4)
+        );
+
+        let mut harness = turned_over(ThemeMode::Dark);
+        let shapes = harness.settle(&windows);
+        let faithful = fill_right(&shapes, gain_track).expect("Interface: the gain's fill");
+        let want = gain_track.left() + (thumb_x - gain.left());
+        assert!(
+            (faithful - want).abs() < 1e-3,
+            "Interface: {faithful} against {want}"
+        );
+        assert!(
+            faithful > off,
+            "the thumb's x as a width runs past the thumb"
+        );
+        assert_eq!(
+            balance_end(&shapes, balance_track),
+            (balance.left() + balance_track.width(), 8),
+            "a track's width in from the slider's edge, and the end colour after it"
+        );
     }
 
     #[test]

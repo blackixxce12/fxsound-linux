@@ -43,6 +43,8 @@
 //!    "… Digital Stereo" both read "Family 17h/19h/1ah HD Audio...". Here a name keeps up to
 //!    [`MENU_LABEL_MAX`] characters and loses its middle beyond that, where the card's name ends
 //!    and before the profile or the port that tells two of its devices apart (0.4.0 audit #31).
+//!    At «Как в Windows» = Interface and above the playback devices are cut after 30 again, as
+//!    there ([`WINDOWS_LABEL_MAX`]).
 //! 4. **Two preset submenus.** One per lane, each listing that lane's presets — the music presets
 //!    and the voice presets — so the microphone's can be changed from the tray without the
 //!    window, and without making the microphone the lane the window edits.
@@ -68,7 +70,7 @@
 
 use crate::wake::WakingSender;
 use fxsound_core::i18n::{tr, tr_args};
-use fxsound_core::{DeviceDirection, ThemeMode};
+use fxsound_core::{DeviceDirection, ThemeMode, WindowsLook, WindowsParity};
 use ksni::blocking::{Handle, TrayMethods as _};
 use ksni::menu::{RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{Category, Icon, MenuItem, Status, ToolTip, Tray};
@@ -102,6 +104,12 @@ pub const PIXMAP_SIZES: [u32; 6] = [16, 22, 24, 32, 48, 64];
 /// (`FxSystemTrayView.cpp:353`, `:422-432`) cut the end off at 30, which is where PipeWire's
 /// descriptions start to differ.
 pub const MENU_LABEL_MAX: usize = 60;
+
+/// What the Windows build cuts a playback device's name to: its first 27 characters and `...`
+/// (`getTruncatedText(name, 30)`, `FxSystemTrayView.cpp:353`, `:422-432`). The tray does so again
+/// at «Как в Windows» = Interface and above ([`TrayState::windows_parity`]); the recording
+/// submenu, which only this port has, keeps [`MENU_LABEL_MAX`].
+pub const WINDOWS_LABEL_MAX: usize = 30;
 
 /// Which of the three icons the item is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -278,6 +286,9 @@ pub struct TrayState {
     pub devices: Vec<TrayDevice>,
     /// The UI language the labels were built in, so a switch re-sends the menu.
     pub language: String,
+    /// The level of «Как в Windows» in force: from Interface on, the playback devices' rows are
+    /// cut as the Windows build cuts them ([`WINDOWS_LABEL_MAX`], 0.4.0 audit #31).
+    pub windows_parity: WindowsParity,
 }
 
 impl Default for TrayState {
@@ -291,6 +302,7 @@ impl Default for TrayState {
             input: TrayLane::default(),
             devices: Vec::new(),
             language: String::new(),
+            windows_parity: WindowsParity::Off,
         }
     }
 }
@@ -425,6 +437,13 @@ pub struct FxTray {
     /// window hides, is there anything left on screen? On a GNOME session without the
     /// AppIndicator extension there is not — no window, no icon, and until now no message saying
     /// so, which leaves a running process the user cannot see or reach.
+    ///
+    /// ksni reports changes, not the state: a registration that succeeds calls nothing at all,
+    /// and [`Tray::watcher_online`] comes only after a [`Tray::watcher_offline`]
+    /// (`ksni-0.3.6/src/service.rs:82-100`, `:138-142`). So [`spawn`] sets it before registering
+    /// ([`FxTray::expecting_a_watcher`]) and ksni's callbacks correct it from there: a watcher
+    /// missing at the start is a `watcher_offline` inside the spawn itself, before it returns.
+    /// Starting from `false` instead, as 0.4.0 did, took a tray that was already running for none.
     watcher: Arc<AtomicBool>,
 }
 
@@ -445,6 +464,15 @@ impl FxTray {
     #[must_use]
     pub fn with_pixmaps(self, pixmaps: TrayPixmaps) -> Self {
         Self { pixmaps, ..self }
+    }
+
+    /// Count the icon as shown until ksni says otherwise: what a successful registration looks
+    /// like, since ksni calls nothing for one (see the `watcher` field). An item built by
+    /// [`FxTray::new`] alone, which nothing registers, is not shown.
+    #[must_use]
+    pub fn expecting_a_watcher(self) -> Self {
+        self.watcher.store(true, Ordering::Relaxed);
+        self
     }
 
     /// The flag the GUI thread reads to find out whether the icon is really there.
@@ -470,9 +498,18 @@ impl FxTray {
     /// The two lanes' preset submenus, `Output Presets ▸` and `Input Presets ▸` — the original's
     /// `Preset Select ▸`, once per lane. The original drops it while the power is off
     /// (`FxSystemTrayView.cpp:313-316`); here it stays, as the window's preset list and the
-    /// command line do, so a preset can be picked before switching on (0.4.0 audit R7). A lane
-    /// with no presets has no submenu.
+    /// command line do, so a preset can be picked before switching on (0.4.0 audit R7) — except
+    /// at «Как в Windows» = Interface and above, where both go with the power as there
+    /// ([`WindowsLook::PresetsNeedPower`]). A lane with no presets has no submenu.
     fn preset_menus(&self) -> Vec<MenuItem<Self>> {
+        if !self.state.power
+            && self
+                .state
+                .windows_parity
+                .windows_look(WindowsLook::PresetsNeedPower)
+        {
+            return Vec::new();
+        }
         DeviceDirection::ALL
             .into_iter()
             .filter_map(|direction| self.preset_menu(direction))
@@ -574,6 +611,22 @@ impl FxTray {
             .collect()
     }
 
+    /// A device's row: cut after [`WINDOWS_LABEL_MAX`] characters as on Windows for a playback
+    /// device at «Как в Windows» = Interface and above, in its middle past [`MENU_LABEL_MAX`]
+    /// otherwise (0.4.0 audit #31).
+    fn device_label(&self, direction: DeviceDirection, name: &str) -> String {
+        if direction == DeviceDirection::Output
+            && self
+                .state
+                .windows_parity
+                .windows_look(WindowsLook::TrayNames)
+        {
+            truncate_label_as_windows(name)
+        } else {
+            truncate_label(name)
+        }
+    }
+
     /// One lane's radio group — `Off`, then its direction's devices — or `None` when the direction
     /// has no devices.
     fn device_group(&self, direction: DeviceDirection) -> Option<MenuItem<Self>> {
@@ -593,7 +646,7 @@ impl FxTray {
             ..Default::default()
         })
         .chain(indices.iter().map(|&i| RadioItem {
-            label: truncate_label(&self.state.devices[i].name),
+            label: self.device_label(direction, &self.state.devices[i].name),
             ..Default::default()
         }))
         .collect();
@@ -791,7 +844,8 @@ impl Tray for FxTray {
         true
     }
 
-    /// A watcher appeared — a panel starting, or the session finally providing one.
+    /// A watcher appeared — a panel starting, or the session finally providing one. ksni calls it
+    /// only when the watcher's name had no owner before, which is after a `watcher_offline`.
     fn watcher_online(&self) {
         log::info!("a StatusNotifierWatcher is present; the tray icon is visible");
         self.watcher.store(true, Ordering::Relaxed);
@@ -869,6 +923,11 @@ impl crate::events::TraySink for TrayHandle {
 /// user when nothing has registered after a few seconds; with the window hidden and no tray the
 /// app is otherwise invisible (`docs/spec/07-startup-tray.md` §5.8).
 ///
+/// The icon counts as shown from the start ([`FxTray::expecting_a_watcher`]): a watcher that is
+/// already there takes the item without any callback, and one that is not is reported through
+/// `watcher_offline` before this returns, so [`TrayHandle::is_visible`] is right from the first
+/// call.
+///
 /// # Errors
 ///
 /// If the session bus is unreachable or the item cannot be registered.
@@ -876,7 +935,9 @@ pub fn spawn(
     state: TrayState,
     tx: impl Into<WakingSender<TrayCommand>>,
 ) -> Result<TrayHandle, ksni::Error> {
-    let tray = FxTray::new(state, tx).with_pixmaps(TrayPixmaps::rasterised());
+    let tray = FxTray::new(state, tx)
+        .with_pixmaps(TrayPixmaps::rasterised())
+        .expecting_a_watcher();
     let watcher = tray.watcher_flag();
     let handle = tray.assume_sni_available(true).spawn()?;
     Ok(TrayHandle { handle, watcher })
@@ -922,6 +983,21 @@ fn truncate_label(text: &str) -> String {
     let head: String = chars[..kept / 2].iter().collect();
     let tail: String = chars[chars.len() - (kept - kept / 2)..].iter().collect();
     format!("{}…{}", head.trim_end(), tail.trim_start())
+}
+
+/// A playback device's name as the Windows build's tray shows it: whole up to
+/// [`WINDOWS_LABEL_MAX`] characters, and beyond that its first `WINDOWS_LABEL_MAX - 3` and `...`
+/// (`FxSystemTrayView::getTruncatedText`, `FxSystemTrayView.cpp:422-432`).
+fn truncate_label_as_windows(text: &str) -> String {
+    const ELLIPSIS: &str = "...";
+    if text.chars().count() <= WINDOWS_LABEL_MAX {
+        return text.to_owned();
+    }
+    let head: String = text
+        .chars()
+        .take(WINDOWS_LABEL_MAX - ELLIPSIS.len())
+        .collect();
+    format!("{head}{ELLIPSIS}")
 }
 
 #[cfg(test)]
@@ -1114,6 +1190,29 @@ mod tests {
         // The same items as with the power on, but for the power item's words.
         let on = labels(&on.menu());
         assert_eq!(off.len(), on.len(), "{off:?} / {on:?}");
+    }
+
+    #[test]
+    fn at_interface_the_preset_submenus_go_with_the_power_as_on_windows() {
+        // `FxSystemTrayView.cpp:313-316`, at «Как в Windows» = Interface (R7 set back).
+        for level in [WindowsParity::Interface, WindowsParity::Sound] {
+            let (on, _rx) = with_state(TrayState {
+                windows_parity: level,
+                ..populated()
+            });
+            let (off, _rx) = with_state(TrayState {
+                power: false,
+                windows_parity: level,
+                ..populated()
+            });
+            let on = labels(&on.menu());
+            let off = labels(&off.menu());
+            assert!(on.contains(&tr("Output Presets")), "{on:?}");
+            assert!(!off.contains(&tr("Output Presets")), "{off:?}");
+            assert!(!off.contains(&tr("Input Presets")), "{off:?}");
+            assert_eq!(off[1], "Turn On", "the item says what it will do");
+            assert!(off.contains(&tr("Playback Device Select")));
+        }
     }
 
     #[test]
@@ -1692,5 +1791,259 @@ mod tests {
             truncate_label("Navi 31 HDMI/DP Audio Controller Digital Stereo (HDMI 3) Output"),
             "Navi 31 HDMI/DP Audio Control…Digital Stereo (HDMI 3) Output"
         );
+    }
+
+    #[test]
+    fn at_interface_a_playback_device_is_cut_after_thirty_characters_as_on_windows() {
+        // 0.4.0 audit #31 at «Как в Windows» = Interface: `getTruncatedText(name, 30)`
+        // (`FxSystemTrayView.cpp:422-432`) keeps the first 27 characters and "...". At Off the
+        // same name loses its middle past 60 (above).
+        assert_eq!(truncate_label_as_windows("Speakers"), "Speakers");
+        let at_the_limit = "a".repeat(WINDOWS_LABEL_MAX);
+        assert_eq!(truncate_label_as_windows(&at_the_limit), at_the_limit);
+        assert_eq!(
+            truncate_label_as_windows("Family 17h/19h/1ah HD Audio Controller Analog Stereo"),
+            "Family 17h/19h/1ah HD Audio..."
+        );
+        assert_eq!(
+            truncate_label_as_windows("Встроенное аудио Аналоговый стерео"),
+            "Встроенное аудио Аналоговый...",
+            "characters, not bytes"
+        );
+
+        let long_mic = "Family 17h/19h/1ah HD Audio Controller Analog Stereo Microphone";
+        let mut state = both_lanes();
+        state.devices[4].name = long_mic.to_owned();
+        for level in WindowsParity::ALL {
+            let (tray, _rx) = with_state(TrayState {
+                windows_parity: level,
+                ..state.clone()
+            });
+            let menu = tray.menu();
+            let outputs = options(devices_of(&menu, OUT));
+            let inputs = options(devices_of(&menu, IN));
+            let hdmi = if level.interface() {
+                "HDMI / DisplayPort 3 Output..."
+            } else {
+                "HDMI / DisplayPort 3 Output That Goes On Forever"
+            };
+            assert_eq!(
+                outputs,
+                vec![
+                    "Off",
+                    "Built-in Audio Analogue Stereo",
+                    hdmi,
+                    "Mono Headset"
+                ],
+                "{level:?}"
+            );
+            assert_eq!(
+                inputs[2],
+                truncate_label(long_mic),
+                "{level:?}: the recording submenu is the port's own and keeps its cut"
+            );
+        }
+    }
+
+    // ---- whether the icon is shown ----------------------------------------------------------
+    // ksni 0.3.6 reports changes, not the state: a registration that succeeds calls nothing,
+    // one that finds no watcher calls `watcher_offline` before `spawn` returns, and
+    // `watcher_online` follows only a watcher's name that had no owner before
+    // (`ksni-0.3.6/src/service.rs:82-100`, `:134-165`). The first three tests play that order
+    // on the item alone; the last two run the real ksni against a watcher on a private bus.
+
+    #[test]
+    fn a_registration_that_ksni_reports_nothing_about_counts_as_shown() {
+        // A tray that was running before FxSound: ksni registers and says nothing. 0.4.0 started
+        // the flag at `false` and took it for no tray at all.
+        let (tray, _rx) = with_state(TrayState::default());
+        let tray = tray.expecting_a_watcher();
+        assert!(tray.watcher_flag().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_watcher_missing_at_the_start_is_reported_offline_and_the_icon_counts_as_hidden() {
+        // GNOME without the AppIndicator extension: the registration fails with ServiceUnknown,
+        // and `assume_sni_available` turns that into `watcher_offline` inside `spawn`.
+        let (tray, _rx) = with_state(TrayState::default());
+        let tray = tray.expecting_a_watcher();
+        assert!(
+            tray.watcher_offline(ksni::OfflineReason::No),
+            "the service keeps waiting for a watcher rather than shutting down"
+        );
+        assert!(!tray.watcher_flag().load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_watcher_that_comes_after_one_went_counts_the_icon_as_shown_again() {
+        let (tray, _rx) = with_state(TrayState::default());
+        let tray = tray.expecting_a_watcher();
+        let flag = tray.watcher_flag();
+        tray.watcher_offline(ksni::OfflineReason::No);
+        tray.watcher_online();
+        assert!(flag.load(Ordering::Relaxed));
+        tray.watcher_offline(ksni::OfflineReason::No);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a panel restarting hides it again"
+        );
+    }
+
+    #[test]
+    fn an_item_nothing_registered_is_not_shown() {
+        let (tray, _rx) = with_state(TrayState::default());
+        assert!(!tray.watcher_flag().load(Ordering::Relaxed));
+    }
+
+    /// Set, to the private bus's address, in the child process the two tests below run their
+    /// body in. ksni connects to `DBUS_SESSION_BUS_ADDRESS` and to nothing else, and setting that
+    /// in this process would be unsound with other tests' threads running — and would point them
+    /// all at the private bus.
+    const TRAY_CHILD_BUS: &str = "FXSOUND_TEST_TRAY_BUS";
+
+    /// A `StatusNotifierWatcher` that takes every item and remembers which registered.
+    struct Watcher {
+        registered: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
+    impl Watcher {
+        fn register_status_notifier_item(&self, service: &str) {
+            self.registered
+                .lock()
+                .expect("not poisoned")
+                .push(service.to_owned());
+        }
+
+        #[zbus(property)]
+        fn is_status_notifier_host_registered(&self) -> bool {
+            true
+        }
+    }
+
+    /// A watcher on the bus at `address`, and what has registered with it.
+    fn watcher(
+        address: &str,
+    ) -> (
+        zbus::blocking::Connection,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let registered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let connection = zbus::blocking::connection::Builder::address(address)
+            .expect("an address")
+            .name("org.kde.StatusNotifierWatcher")
+            .expect("a well-known name")
+            .serve_at(
+                "/StatusNotifierWatcher",
+                Watcher {
+                    registered: Arc::clone(&registered),
+                },
+            )
+            .expect("a path")
+            .build()
+            .expect("the watcher is on the bus");
+        (connection, registered)
+    }
+
+    /// Wait up to ten seconds for `what` to hold.
+    fn within_ten_seconds(what: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if what() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        what()
+    }
+
+    fn tray_on_the_private_bus() -> TrayHandle {
+        let (tx, _rx) = unbounded();
+        spawn(TrayState::default(), tx).expect("the item registers on the private bus")
+    }
+
+    /// Run the test called `name` again in a child process of this binary, with a private bus of
+    /// its own as its session bus, and say whether it ran there. `None` when there is no
+    /// `dbus-daemon` to start one.
+    fn in_a_child_on_a_private_bus(name: &str) -> Option<()> {
+        let bus = crate::private_bus::PrivateBus::start()?;
+        let (_, module) = module_path!()
+            .split_once("::")
+            .expect("a module of the crate");
+        let name = format!("{module}::{name}");
+        let output =
+            fxsound_core::test_support::command(std::env::current_exe().expect("this test binary"))
+                .args([name.as_str(), "--exact", "--test-threads=1", "--nocapture"])
+                .env("DBUS_SESSION_BUS_ADDRESS", &bus.address)
+                .env(TRAY_CHILD_BUS, &bus.address)
+                .output()
+                .expect("the child ran");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the child failed: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // An `--exact` name that matched nothing passes too; the line says the body ran.
+        assert!(stdout.contains("tray child ran"), "the child ran no {name}");
+        Some(())
+    }
+
+    #[test]
+    fn a_watcher_already_running_when_the_tray_starts_counts_the_icon_as_shown_at_once() {
+        let Ok(address) = std::env::var(TRAY_CHILD_BUS) else {
+            let _ = in_a_child_on_a_private_bus(
+                "a_watcher_already_running_when_the_tray_starts_counts_the_icon_as_shown_at_once",
+            );
+            return;
+        };
+        let (connection, registered) = watcher(&address);
+        let tray = tray_on_the_private_bus();
+        assert!(
+            tray.is_visible(),
+            "a tray that was there first is taken for none"
+        );
+        assert!(within_ten_seconds(|| registered
+            .lock()
+            .expect("not poisoned")
+            .len()
+            == 1));
+
+        // The panel restarts: gone, then back.
+        connection.close().expect("the watcher leaves the bus");
+        assert!(within_ten_seconds(|| !tray.is_visible()));
+        let (_connection, registered) = watcher(&address);
+        assert!(within_ten_seconds(|| tray.is_visible()));
+        assert!(within_ten_seconds(|| registered
+            .lock()
+            .expect("not poisoned")
+            .len()
+            == 1));
+        tray.shutdown();
+        println!("tray child ran");
+    }
+
+    #[test]
+    fn a_tray_started_before_any_watcher_counts_as_hidden_until_one_comes() {
+        let Ok(address) = std::env::var(TRAY_CHILD_BUS) else {
+            let _ = in_a_child_on_a_private_bus(
+                "a_tray_started_before_any_watcher_counts_as_hidden_until_one_comes",
+            );
+            return;
+        };
+        let tray = tray_on_the_private_bus();
+        assert!(
+            !tray.is_visible(),
+            "with no watcher on the bus the icon is shown nowhere"
+        );
+        let (_connection, registered) = watcher(&address);
+        assert!(within_ten_seconds(|| tray.is_visible()));
+        assert!(within_ten_seconds(|| registered
+            .lock()
+            .expect("not poisoned")
+            .len()
+            == 1));
+        tray.shutdown();
+        println!("tray child ran");
     }
 }

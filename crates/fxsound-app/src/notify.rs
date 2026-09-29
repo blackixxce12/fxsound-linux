@@ -26,20 +26,48 @@
 //!
 //! `SHQueryUserNotificationState`, which suppresses the toast outside
 //! `QUNS_ACCEPTS_NOTIFICATIONS` (`FxSystemTrayView.cpp:394-398`), is not reimplemented either: Do
-//! Not Disturb is the daemon's job. Sending at `Urgency::Low` is what asks it to apply that policy,
-//! and it is also the analogue of `NIIF_RESPECT_QUIET_TIME` (`:411`).
+//! Not Disturb is the daemon's job, and every daemon that has one holds back normal and low
+//! urgency alike — the analogue of `NIIF_RESPECT_QUIET_TIME` (`:411`).
+//!
+//! # Urgency, per kind of message
+//!
+//! 0.4.0 sent everything at `Urgency::Low`, and GNOME Shell never shows a banner for that
+//! (`messageTray.js`, `_onNotificationRequestBanner`: `if (notification.urgency === Urgency.LOW)
+//! return;`), so on GNOME not even "FxSound is still running, but this session has no tray icon"
+//! was seen. Each message now has a [`Weight`]:
+//!
+//! | Message | Weight |
+//! |---|---|
+//! | [`Message::minimised_to_tray`], [`Message::hidden_with_no_tray`], [`Message::window_unavailable`] | [`Weight::Alert`]: where the window went, and how to get it back |
+//! | [`Message::output_disconnected`] | [`Weight::Alert`]: the sound moved without being asked to |
+//! | [`Message::preset_limit_reached`] | [`Weight::Alert`]: something asked for was refused |
+//! | [`Message::power_toggled`] | [`Weight::Alert`]: sent only for a keybind or the command line, where it is the only answer |
+//! | [`Message::preset_selected`], [`Message::output_selected`], [`Message::preset_saved`], [`Message::preset_overwritten`], [`Message::preset_deleted`], [`Message::presets_restored`] | [`Weight::Echo`], and [`Weight::Alert`] when no window is up to show the change ([`Message::raised`], [`crate::app::App`]) |
+//!
+//! # One connection, kept
+//!
+//! GNOME Shell files a notification under a source per application and watches the bus name of
+//! the sender that made the source: when that name leaves the bus, the source and every
+//! notification in it are destroyed (`notificationDaemon.js`, `FdoNotificationDaemonSource`,
+//! `_onNameVanished`, for any source whose application it knows — ours, through `desktop-entry`).
+//! `notify_rust::Notification::show()` opens a D-Bus connection per notification and closes it
+//! with the handle, which for a message with no link was at once, so GNOME removed the notice
+//! about 7 ms after showing it. [`DesktopSink`] sends every notification over one connection
+//! that stays open while FxSound runs, so a notice stays in the message list until it is
+//! dismissed or FxSound quits.
 //!
 //! # Threading
 //!
-//! `notify_rust::Notification::show()` is `zbus::block_on` over a whole connect-and-send round trip
-//! (`notify-rust-4.18.0/src/xdg/mod.rs:8,413`), so it must never be called from the egui thread.
-//! [`Notifier`] owns a worker thread and the GUI only ever hands it a [`Message`].
+//! Connecting and sending are blocking D-Bus round trips, so they must never happen on the egui
+//! thread. [`Notifier`] owns a worker thread and the GUI only ever hands it a [`Message`].
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use notify_rust::{Hint, Notification, NotificationResponse, Timeout, Urgency};
+use notify_rust::{Hint, Notification, Timeout, Urgency};
 
 use crate::tray::APP_ID;
 use fxsound_core::i18n::{tr, tr_args};
@@ -70,20 +98,66 @@ pub struct Link {
     pub url: String,
 }
 
+/// How much a message asks of the desktop: the urgency it is sent with (see the module docs for
+/// which message has which).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Weight {
+    /// Says back a change the user has just made where they can see it made. `Urgency::Low`:
+    /// GNOME files it in the message list without a banner; most other daemons show it as before.
+    Echo,
+    /// Something the user has to see. `Urgency::Normal`, so GNOME shows a banner too — unless Do
+    /// Not Disturb is on, which holds it back as it does any other application's.
+    Alert,
+}
+
+impl Weight {
+    /// The urgency hint it is sent with.
+    #[must_use]
+    pub const fn urgency(self) -> Urgency {
+        match self {
+            Self::Echo => Urgency::Low,
+            Self::Alert => Urgency::Normal,
+        }
+    }
+}
+
 /// One pushed message — the payload of `FxModel::pushMessage` (`FxModel.h:170-175`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     /// The text. `\r\n` is normalised to `\n` when the notification is built.
     pub body: String,
     pub link: Option<Link>,
+    pub weight: Weight,
 }
 
 impl Message {
+    /// A message that echoes what the user did ([`Weight::Echo`]).
     #[must_use]
     pub fn new(body: impl Into<String>) -> Self {
         Self {
             body: body.into(),
             link: None,
+            weight: Weight::Echo,
+        }
+    }
+
+    /// A message the user has to see ([`Weight::Alert`]).
+    #[must_use]
+    pub fn alert(body: impl Into<String>) -> Self {
+        Self {
+            weight: Weight::Alert,
+            ..Self::new(body)
+        }
+    }
+
+    /// The same message as a [`Weight::Alert`]: what an echo becomes when there is no window on
+    /// screen to show the change it echoes — a preset picked in the tray or by a keybind — and
+    /// the notification is all the answer there is.
+    #[must_use]
+    pub fn raised(self) -> Self {
+        Self {
+            weight: Weight::Alert,
+            ..self
         }
     }
 
@@ -99,6 +173,7 @@ impl Message {
                 label: label.into(),
                 url: url.into(),
             }),
+            weight: Weight::Alert,
         }
     }
 
@@ -128,7 +203,7 @@ impl Message {
     /// app entirely (§6.5).
     #[must_use]
     pub fn minimised_to_tray() -> Self {
-        Self::new(tr("FxSound in system tray\nClick FxSound icon to reopen"))
+        Self::alert(tr("FxSound in system tray\nClick FxSound icon to reopen"))
     }
 
     /// The same moment, on a session that has no tray to hide into.
@@ -142,7 +217,7 @@ impl Message {
     /// untranslated build reads correctly.
     #[must_use]
     pub fn hidden_with_no_tray() -> Self {
-        Self::new(tr(
+        Self::alert(tr(
             "FxSound is still running, but this session has no tray icon.\nRun 'fxsound --show' \
              to bring the window back.",
         ))
@@ -157,7 +232,7 @@ impl Message {
     /// desktop. A port addition.
     #[must_use]
     pub fn window_unavailable() -> Self {
-        Self::new(tr(
+        Self::alert(tr(
             "FxSound could not open its window and keeps running in the system tray.\nQuit it \
              from the tray and start FxSound again to open the window.",
         ))
@@ -186,7 +261,7 @@ impl Message {
     /// The selected output vanished (`FxController.cpp:1170`).
     #[must_use]
     pub fn output_disconnected() -> Self {
-        Self::new(tr("Output Disconnected"))
+        Self::alert(tr("Output Disconnected"))
     }
 
     /// An existing user preset was overwritten (`FxController.cpp:1221`).
@@ -205,7 +280,7 @@ impl Message {
     /// to `[10, 120]` at `:194-199`).
     #[must_use]
     pub fn preset_limit_reached() -> Self {
-        Self::new(tr("Reached the limit on new presets."))
+        Self::alert(tr("Reached the limit on new presets."))
     }
 
     /// A user preset was deleted (`FxController.cpp:1313`).
@@ -227,7 +302,7 @@ impl Message {
     /// `fxsound --toggle-power`.
     #[must_use]
     pub fn power_toggled(on: bool) -> Self {
-        Self::new(tr_args(
+        Self::alert(tr_args(
             "FxSound is %s.",
             &[&tr(if on { "on" } else { "off" })],
         ))
@@ -238,9 +313,9 @@ impl Message {
 ///
 /// Pure, so it can be checked without a daemon on the bus. The hint set is
 /// `docs/spec/07-startup-tray.md` §6.5's, and each hint has a Windows ancestor:
-/// `suppress-sound` is `NIIF_NOSOUND` (`FxSystemTrayView.cpp:411`), the low urgency is
-/// `NIIF_RESPECT_QUIET_TIME` (same line), and `desktop-entry` is what lets a shell attribute the
-/// notification to our window.
+/// `suppress-sound` is `NIIF_NOSOUND` (`FxSystemTrayView.cpp:411`), and `desktop-entry` is what
+/// lets a shell attribute the notification to our window. The urgency is the message's
+/// [`Weight`].
 #[must_use]
 pub fn build(message: &Message, replaces: Option<u32>) -> Notification {
     let mut notification = Notification::new();
@@ -249,7 +324,7 @@ pub fn build(message: &Message, replaces: Option<u32>) -> Notification {
         .summary(APP_NAME)
         .body(&message.body.replace("\r\n", "\n"))
         .icon(APP_ID)
-        .urgency(Urgency::Low)
+        .urgency(message.weight.urgency())
         .hint(Hint::SuppressSound(true))
         .hint(Hint::Category("device".to_owned()))
         .hint(Hint::DesktopEntry(APP_ID.to_owned()))
@@ -274,45 +349,206 @@ pub trait Sink: Send + 'static {
     fn deliver(&mut self, message: &Message, replaces: Option<u32>) -> Option<u32>;
 }
 
-/// Delivery over `org.freedesktop.Notifications`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DesktopSink;
+const NOTIFICATIONS: &str = "org.freedesktop.Notifications";
+const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
+
+/// Delivery over `org.freedesktop.Notifications`, on one connection kept open from the first
+/// message to the last (see "One connection, kept" in the module docs).
+pub struct DesktopSink {
+    /// The bus to connect to: the session's when `None`.
+    address: Option<String>,
+    connection: Option<zbus::blocking::Connection>,
+    /// The notification whose link a click follows, and the link: the last one delivered, if it
+    /// had a link. Shared with the thread that listens for the click.
+    link: Arc<Mutex<Option<(u32, String)>>>,
+    /// What following a link does: [`open_url`], or a test's recorder.
+    open: Opener,
+}
+
+/// Follows a link a notification was clicked for.
+type Opener = Arc<dyn Fn(&str) + Send + Sync>;
+
+impl Default for DesktopSink {
+    fn default() -> Self {
+        Self {
+            address: None,
+            connection: None,
+            link: Arc::default(),
+            open: Arc::new(open_url),
+        }
+    }
+}
+
+impl std::fmt::Debug for DesktopSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DesktopSink")
+            .field("address", &self.address)
+            .field("connected", &self.connection.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DesktopSink {
+    /// Delivery to the session bus's notification daemon.
+    #[must_use]
+    pub fn session() -> Self {
+        Self::default()
+    }
+
+    /// Delivery to the daemon on the bus at `address` — a test's private bus.
+    #[must_use]
+    pub fn at_address(address: impl Into<String>) -> Self {
+        let mut sink = Self::default();
+        sink.address = Some(address.into());
+        sink
+    }
+
+    /// The kept connection, made on the first call. A new one also starts the thread that follows
+    /// links; it ends with the connection.
+    fn connection(&mut self) -> zbus::Result<zbus::blocking::Connection> {
+        if let Some(connection) = &self.connection {
+            return Ok(connection.clone());
+        }
+        let builder = match &self.address {
+            Some(address) => zbus::blocking::connection::Builder::address(address.as_str())?,
+            None => zbus::blocking::connection::Builder::session()?,
+        };
+        let connection = builder.build()?;
+        follow_links(&connection, Arc::clone(&self.link), Arc::clone(&self.open));
+        self.connection = Some(connection.clone());
+        Ok(connection)
+    }
+
+    /// Close the kept connection, which also ends the thread that follows links on it: its
+    /// signal stream holds a clone, so dropping ours alone would leave both behind.
+    fn disconnect(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = connection.close();
+        }
+    }
+
+    fn send(&mut self, notification: &Notification, replaces: Option<u32>) -> zbus::Result<u32> {
+        let connection = self.connection()?;
+        let hints: HashMap<&str, zbus::zvariant::Value<'_>> =
+            notification.hints.iter().map(Into::into).collect();
+        connection
+            .call_method(
+                Some(NOTIFICATIONS),
+                NOTIFICATIONS_PATH,
+                Some(NOTIFICATIONS),
+                "Notify",
+                &(
+                    &notification.appname,
+                    replaces.unwrap_or(0),
+                    &notification.icon,
+                    &notification.summary,
+                    &notification.body,
+                    &notification.actions,
+                    hints,
+                    i32::from(notification.timeout),
+                ),
+            )?
+            .body()
+            .deserialize()
+    }
+}
 
 impl Sink for DesktopSink {
     fn deliver(&mut self, message: &Message, replaces: Option<u32>) -> Option<u32> {
-        match build(message, replaces).show() {
-            Ok(handle) => {
-                let id = handle.id();
-                match message.link.clone() {
-                    // The handle keeps the D-Bus connection alive, and dropping it can stop the
-                    // action from ever firing (`notify-rust-4.18.0/src/xdg/mod.rs:64-70`), so it
-                    // moves to a thread of its own that outlives this call.
-                    Some(link) => {
-                        thread::spawn(move || {
-                            let _ =
-                                handle.wait_for_response(move |response: &NotificationResponse| {
-                                    match response {
-                                        NotificationResponse::Default
-                                        | NotificationResponse::Action(_) => open_url(&link.url),
-                                        // `Reply` is macOS-only and never arrives here
-                                        // (`notify-rust-4.18.0/src/response.rs:75-78`).
-                                        NotificationResponse::Reply(_)
-                                        | NotificationResponse::Closed(_) => {}
-                                    }
-                                });
-                        });
-                    }
-                    None => drop(handle),
-                }
+        let notification = build(message, replaces);
+        let kept = self.connection.is_some();
+        let mut sent = self.send(&notification, replaces);
+        if sent.is_err() && kept {
+            // The kept connection may be the one that failed — the bus restarted under it — so
+            // one more try, on a new one.
+            self.disconnect();
+            sent = self.send(&notification, replaces);
+        }
+        match sent {
+            Ok(id) => {
+                let link = message.link.as_ref().map(|link| (id, link.url.clone()));
+                *self
+                    .link
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = link;
                 Some(id)
             }
             Err(e) => {
                 // A session with no notification daemon is normal on a bare compositor; it is not
                 // worth more than a line in the log.
                 log::warn!("could not show a notification: {e}");
+                self.disconnect();
                 None
             }
         }
+    }
+}
+
+/// The notifications go with the connection, on GNOME, when FxSound quits: they would otherwise
+/// offer to open an application that is not running.
+impl Drop for DesktopSink {
+    fn drop(&mut self) {
+        self.disconnect();
+    }
+}
+
+/// Listen on `connection` for a click on the notification in `link`, and follow its link. The
+/// thread ends when the connection does.
+fn follow_links(
+    connection: &zbus::blocking::Connection,
+    link: Arc<Mutex<Option<(u32, String)>>>,
+    open: Opener,
+) {
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .interface(NOTIFICATIONS)
+        .and_then(|rule| rule.path(NOTIFICATIONS_PATH))
+        .map(zbus::match_rule::Builder::build);
+    let signals = rule.and_then(|rule| {
+        zbus::blocking::MessageIterator::for_match_rule(rule, connection, Some(16))
+    });
+    let signals = match signals {
+        Ok(signals) => signals,
+        Err(e) => {
+            log::warn!("notification links will not open: {e}");
+            return;
+        }
+    };
+    let spawned = thread::Builder::new()
+        .name("fxsound-notify-links".to_owned())
+        .spawn(move || {
+            for signal in signals {
+                let Ok(signal) = signal else { break };
+                let header = signal.header();
+                let member = header.member().map(zbus::names::MemberName::as_str);
+                let mut link = link
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match member {
+                    Some("ActionInvoked") => {
+                        let Ok((id, _action)) = signal.body().deserialize::<(u32, String)>() else {
+                            continue;
+                        };
+                        if link.as_ref().is_some_and(|(shown, _)| *shown == id)
+                            && let Some((_, url)) = link.take()
+                        {
+                            open(&url);
+                        }
+                    }
+                    Some("NotificationClosed") => {
+                        let Ok((id, _reason)) = signal.body().deserialize::<(u32, u32)>() else {
+                            continue;
+                        };
+                        if link.as_ref().is_some_and(|(shown, _)| *shown == id) {
+                            *link = None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("notification links will not open: {e}");
     }
 }
 
@@ -332,7 +568,7 @@ impl Notifier {
     /// A notifier that talks to the session's notification daemon.
     #[must_use]
     pub fn new(hide_notifications: bool) -> Self {
-        Self::with_sink(hide_notifications, DesktopSink)
+        Self::with_sink(hide_notifications, DesktopSink::session())
     }
 
     /// A notifier that delivers through `sink`.
@@ -456,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_message_becomes_a_low_urgency_silent_notification() {
+    fn a_plain_message_becomes_a_silent_notification_at_its_weight_s_urgency() {
         let notification = build(&Message::preset_selected("Bass Booster"), None);
 
         assert_eq!(notification.appname, APP_NAME);
@@ -467,7 +703,7 @@ mod tests {
         assert_eq!(notification.body, "Preset: Bass Booster");
         assert_eq!(notification.icon, APP_ID);
         assert_eq!(notification.timeout, Timeout::Milliseconds(TIMEOUT_MS));
-        assert!(hint(&notification, &Hint::Urgency(Urgency::Low)));
+        assert!(hint(&notification, &Hint::Urgency(Urgency::Low)), "an echo");
         assert!(hint(&notification, &Hint::SuppressSound(true)));
         assert!(hint(&notification, &Hint::Category("device".to_owned())));
         assert!(hint(&notification, &Hint::DesktopEntry(APP_ID.to_owned())));
@@ -633,5 +869,262 @@ mod tests {
         // absence of a spawn, so this only pins that the guard exists and does not panic.
         open_url("file:///etc/passwd");
         open_url("x-scheme-handler/evil");
+    }
+
+    #[test]
+    fn what_the_user_has_to_see_is_an_alert_and_the_rest_an_echo() {
+        // GNOME Shell shows no banner for low urgency, so an alert is what a user sees there.
+        for message in [
+            Message::minimised_to_tray(),
+            Message::hidden_with_no_tray(),
+            Message::window_unavailable(),
+            Message::output_disconnected(),
+            Message::preset_limit_reached(),
+            Message::power_toggled(true),
+            Message::power_toggled(false),
+        ] {
+            assert_eq!(message.weight, Weight::Alert, "{message:?}");
+            assert!(
+                hint(&build(&message, None), &Hint::Urgency(Urgency::Normal)),
+                "{message:?}"
+            );
+        }
+        for message in [
+            Message::preset_selected("Rock"),
+            Message::output_selected("Speakers", Some("Rock")),
+            Message::preset_overwritten("Rock"),
+            Message::preset_saved("Rock"),
+            Message::preset_deleted("Rock"),
+            Message::presets_restored(),
+        ] {
+            assert_eq!(message.weight, Weight::Echo, "{message:?}");
+            assert!(
+                hint(&build(&message, None), &Hint::Urgency(Urgency::Low)),
+                "{message:?}"
+            );
+            let raised = message.clone().raised();
+            assert_eq!(raised.weight, Weight::Alert);
+            assert_eq!(
+                raised.body, message.body,
+                "raising changes the urgency alone"
+            );
+        }
+    }
+
+    /// What the notification daemon on a test's private bus was sent: the sender's unique name,
+    /// the id to replace, and the urgency byte.
+    type Received = (String, u32, u8);
+
+    /// A notification daemon that records each call and answers with a new id, or the one it was
+    /// asked to replace.
+    struct Daemon {
+        tx: Sender<Received>,
+        next_id: std::sync::atomic::AtomicU32,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.Notifications")]
+    impl Daemon {
+        #[allow(clippy::too_many_arguments)]
+        fn notify(
+            &self,
+            #[zbus(header)] header: zbus::message::Header<'_>,
+            _app_name: String,
+            replaces_id: u32,
+            _app_icon: String,
+            _summary: String,
+            _body: String,
+            _actions: Vec<String>,
+            hints: HashMap<String, zbus::zvariant::OwnedValue>,
+            _expire_timeout: i32,
+        ) -> u32 {
+            let sender = header.sender().map(ToString::to_string).unwrap_or_default();
+            let urgency = hints
+                .get("urgency")
+                .and_then(|value| u8::try_from(value).ok())
+                .unwrap_or(u8::MAX);
+            let _ = self.tx.send((sender, replaces_id, urgency));
+            if replaces_id == 0 {
+                self.next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1
+            } else {
+                replaces_id
+            }
+        }
+    }
+
+    #[test]
+    fn every_notification_comes_from_one_connection_that_stays_until_the_notifier_goes() {
+        // GNOME Shell destroys an application's notifications when the sender that made their
+        // source leaves the bus; 0.4.0 opened a connection per notification and closed it at
+        // once, and GNOME took the notice down about 7 ms after showing it.
+        let Some(bus) = crate::private_bus::PrivateBus::start() else {
+            return;
+        };
+        let (tx, rx) = unbounded();
+        let _daemon = daemon_on(&bus, tx);
+        let client = bus.client();
+
+        let notifier = Notifier::with_sink(false, DesktopSink::at_address(bus.address.clone()));
+        let received = |rx: &Receiver<Received>| {
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("the daemon was called")
+        };
+        assert!(notifier.notify(Message::hidden_with_no_tray()));
+        let (first, replaces, urgency) = received(&rx);
+        assert_eq!(replaces, 0);
+        assert_eq!(urgency, 1, "an alert is sent at normal urgency");
+        assert!(notifier.notify(Message::preset_selected("Rock")));
+        let (second, replaces, urgency) = received(&rx);
+        assert_eq!(second, first, "a second connection for the second notice");
+        assert_eq!(replaces, 1, "it takes the first one's slot");
+        assert_eq!(urgency, 0, "an echo is sent at low urgency");
+
+        // Long after the last notice, its sender is still there to keep it in the list.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            bus.has_owner(&client, &first),
+            "the sender left the bus after sending"
+        );
+
+        drop(notifier);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while bus.has_owner(&client, &first) {
+            assert!(
+                Instant::now() < deadline,
+                "the connection outlived the notifier"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn with_no_daemon_on_the_bus_a_notice_is_lost_and_the_next_one_still_goes() {
+        let Some(bus) = crate::private_bus::PrivateBus::start() else {
+            return;
+        };
+        let mut sink = DesktopSink::at_address(bus.address.clone());
+        assert_eq!(sink.deliver(&Message::output_disconnected(), None), None);
+
+        let (tx, rx) = unbounded();
+        let _daemon = daemon_on(&bus, tx);
+        assert_eq!(sink.deliver(&Message::output_disconnected(), None), Some(1));
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// The daemon of [`Daemon`] on `bus`, as a connection the test can signal from.
+    fn daemon_on(
+        bus: &crate::private_bus::PrivateBus,
+        tx: Sender<Received>,
+    ) -> zbus::blocking::Connection {
+        zbus::blocking::connection::Builder::address(bus.address.as_str())
+            .expect("an address")
+            .name("org.freedesktop.Notifications")
+            .expect("a well-known name")
+            .serve_at(
+                "/org/freedesktop/Notifications",
+                Daemon {
+                    tx,
+                    next_id: std::sync::atomic::AtomicU32::new(0),
+                },
+            )
+            .expect("a path")
+            .build()
+            .expect("the daemon is on the bus")
+    }
+
+    #[test]
+    fn a_click_follows_the_link_of_the_notice_shown_and_of_no_notice_before_it() {
+        let Some(bus) = crate::private_bus::PrivateBus::start() else {
+            return;
+        };
+        let (tx, rx) = unbounded();
+        let daemon = daemon_on(&bus, tx);
+        let (opened_tx, opened) = unbounded::<String>();
+        let mut sink = DesktopSink::at_address(bus.address.clone());
+        sink.open = Arc::new(move |url: &str| {
+            let _ = opened_tx.send(url.to_owned());
+        });
+        let emit = |member: &str, body: &(u32, &str)| {
+            daemon
+                .emit_signal(
+                    None::<&str>,
+                    NOTIFICATIONS_PATH,
+                    NOTIFICATIONS,
+                    member,
+                    body,
+                )
+                .expect("the signal is sent");
+        };
+        let click = |id: u32| emit("ActionInvoked", &(id, "default"));
+        let closed = |id: u32| {
+            daemon
+                .emit_signal(
+                    None::<&str>,
+                    NOTIFICATIONS_PATH,
+                    NOTIFICATIONS,
+                    "NotificationClosed",
+                    &(id, 2_u32),
+                )
+                .expect("the signal is sent");
+        };
+        let next_opened = || {
+            opened
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a link was followed")
+        };
+        let link = |url: &str| Message::with_link("Read it.", "Open", url);
+        // The signals are handled on the listener's thread, and the daemon hands out the same id
+        // for every notice in the slot, so a click still queued when the next notice takes the
+        // slot would follow the next notice's link. A fence waits until the listener has handled
+        // every signal sent so far: a notice with an id of its own is clicked, and signals are
+        // handled in order, so a link opened by an earlier click would come before the fence's.
+        let fence = |sink: &mut DesktopSink, slot: u32| {
+            let id = sink
+                .deliver(&link("https://example.org/fence"), None)
+                .expect("delivered");
+            assert_ne!(id, slot, "a notice of its own has an id of its own");
+            click(id);
+            assert_eq!(next_opened(), "https://example.org/fence");
+        };
+
+        let id = sink
+            .deliver(&link("https://example.org/one"), None)
+            .expect("delivered");
+        click(id);
+        assert_eq!(next_opened(), "https://example.org/one");
+
+        // A notice without a link took the slot: a click on it follows nothing.
+        let id = sink
+            .deliver(&Message::presets_restored(), Some(id))
+            .expect("delivered");
+        click(id);
+        fence(&mut sink, id);
+
+        // A notice closed before the click follows nothing either. The fence's own notice must
+        // wait until the listener has seen the close, or a late close would pass for the fence's.
+        let id = sink
+            .deliver(&link("https://example.org/two"), Some(id))
+            .expect("delivered");
+        closed(id);
+        click(id);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sink
+            .link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            assert!(Instant::now() < deadline, "the close was not seen");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        fence(&mut sink, id);
+
+        let id = sink
+            .deliver(&link("https://example.org/three"), Some(id))
+            .expect("delivered");
+        click(id);
+        assert_eq!(next_opened(), "https://example.org/three");
+        assert_eq!(rx.len(), 6, "six notices, six calls");
     }
 }

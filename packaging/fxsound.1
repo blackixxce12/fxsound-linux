@@ -11,7 +11,7 @@
 .\"
 .\" Copyright (C) 2026 FxSound Linux port contributors
 .\" Licensed under the GNU Affero General Public License, version 3 or later.
-.TH FXSOUND 1 "2026-09-27" "fxsound 0.4.0" "User Commands"
+.TH FXSOUND 1 "2026-09-30" "fxsound 0.5.0" "User Commands"
 .SH NAME
 fxsound \- system-wide audio enhancement for PipeWire
 .SH SYNOPSIS
@@ -59,8 +59,13 @@ or chosen by the priority list when it is plugged in, or, with Settings \(->
 Audio's
 .I Follow the system's default device
 on, picked in the desktop's sound settings, which FxSound then follows even
-after a device was picked in FxSound \(en the device brings its
-preset back; a device used for the first time leaves the preset alone.
+after a device was picked in FxSound, and starts on the next time \(en the
+device brings its preset back; a device used for the first time leaves the
+preset alone.
+A lane that moves to a device of the same channel count and rate keeps
+FxSound's own output or input, and replaces only its stream on the device, so
+an application playing or recording through FxSound is never moved: it hears
+a gap of about a tenth of a second instead of a click.
 Settings \(-> Audio sets the preset of each playback device, and Settings \(->
 Microphone the voice preset of each microphone, in the device's row of its
 priority list; set on the device a lane is on, it takes over at once. A renamed
@@ -105,7 +110,14 @@ is not left running with nothing on screen. At a start,
 sets the layout and the window follows the remembered tray state, unless
 .B \-\-show
 is given too. The Windows build raises its window for every option but
-.BR \-\-status .
+.BR \-\-status ,
+and so does this one at \(lqLike FxSound for Windows\(rq = interface and
+above
+.RB ( \-\-windows\-parity )
+for the options the Windows build has, and a start from one of them shows the
+window unless FxSound was last quit hidden. The keybinding options
+.RB ( \-\-toggle\-power ", " \-\-next\-preset ", " \-\-prev\-preset ", " \-\-next\-output ),
+the options only this port has and D-Bus never raise it.
 .BR \-\-status ", " \-\-watch " and " \-\-list\-apps
 print and exit without touching the window, and
 .B \-\-self\-test
@@ -127,7 +139,11 @@ process per query can use the D-Bus interface instead; see
 Turn audio processing on or off, for both lanes. Off also hands the session's
 default output and input back to the real devices, so applications play and
 record past FxSound until it is turned on again, which takes them back; an
-application with a preset of its own is moved back onto it then.
+application with a preset of its own is moved back onto it then. Each
+application that is moved is faded out first and back in once it plays or
+records where it went: a gap of about a tenth of a second instead of a click.
+Now and then PipeWire itself plays a moment at full volume before the fade,
+and that one still clicks.
 Any non-zero integer means on;
 .B toggle
 inverts the current state.
@@ -179,7 +195,9 @@ on standard error, as
 does on ten bands. A
 .B \-\-num_bands
 on the same command line sets the count first. The Windows build drops such a
-list, or sets what it can of it, without a word.
+list, or sets what it can of it, without a word. At \(lqLike FxSound for
+Windows\(rq = interface and above, either list sets the pairs that fit and
+skips the others, naming them in a note on standard error, and succeeds.
 .TP
 .BI \-\-filter_q= Q
 Equalizer filter Q,
@@ -246,7 +264,10 @@ Save the current settings as a new user preset: its unsaved changes, or a copy
 of it when it has none. Refused with a name a preset already has (in any
 case), and at the user-preset limit
 .RB ( max_user_presets
-in the settings file, 10 to 1000).
+in the settings file, 10 to 1000). At \(lqLike FxSound for Windows\(rq =
+interface and above a preset with no unsaved changes is refused, as on
+Windows, and the menu's Save New Preset waits for changes too, while Export
+Presets and Import Presets wait for none.
 .TP
 .B \-\-overwrite_preset
 Overwrite the selected user preset with its unsaved changes. A factory preset
@@ -266,10 +287,15 @@ is a rename.
 .TP
 .B \-\-delete_preset
 Delete the selected user preset: its file goes to the desktop's trash
-.RI ( $XDG_DATA_HOME/Trash ),
-where a file manager can restore it, or stays beside itself as
+.RI ( $XDG_DATA_HOME/Trash ,
+or for a preset on another filesystem that filesystem's own,
+.I .Trash/UID
+or
+.I .Trash\-UID
+at the top of it), where a file manager can restore it, or stays beside
+itself as
 .I NAME.fac.1.bak
-(or the next free number) when the trash is on another filesystem. Its
+(or the next free number) when no trash can take it. Its
 unsaved changes go the same way from
 .IR AutoSave/ ;
 restore both and the preset is back with them. A factory preset is refused.
@@ -385,6 +411,70 @@ and so is a locale such as
 .BR ru_RU.UTF\-8 .
 A language FxSound has no translation for is an error, not a setting that
 quietly shows another language.
+.TP
+.BI \-\-windows\-parity= off|interface|sound
+\(lqLike FxSound for Windows\(rq, the slider in Settings \(-> Experimental,
+saved like it:
+.B off
+(the default) is FxSound for Linux as it is;
+.B interface
+brings the window and its controls back to the Windows build's \(em the 2 dB
+steps of Master Gain and Balance, its readouts, tooltips and light theme, the
+equalizer's straight-line curve and one-way end wheels, the language order,
+and with the power off no preset picked from the window, its menu or the tray
+(the command line and D-Bus still pick them) \(em without changing the sound;
+.B sound
+adds the Windows build's sound, so that a preset sounds as it does there.
+Each level includes the ones before it, none of them changes or deletes
+another setting, and
+.B off
+brings everything back as it was.
+.B sound
+plays Volume Leveling, Dynamic Boost, Ambience, the equalizer, the master gain
+and the balance as the Windows build does, and reads a preset as it does \(en a
+curve of another band count by position, twenty bands on the Windows build's
+ladder; switching to it and back while something plays glides over 20 ms,
+without a click.
+The level is saved and reported
+.RB ( windows_parity
+in
+.BR \-\-status ).
+The fourth level,
+.B full
+.RB ( everything ),
+which hides and stops what the Windows build does not have, comes in a later
+version: this one refuses it with exit status 1, with or without
+.BR \-\-force ,
+and runs a
+.I settings.toml
+that says
+.B full
+as
+.BR sound ,
+keeping
+.B full
+in the file for the version that offers it.
+.TP
+.BR \-\-export\-unshifted [ =0|1 ]
+Where an exported preset puts its first and last equalizer band, as the tick box
+\(lqKeep the end bands where they are\(rq of the Export Presets window says;
+saved.
+.B 1
+(or no value) keeps them where they are, limited only to 10\ Hz\(en21\ kHz;
+.BR 0 ,
+the default, moves them back into the range FxSound for Windows tunes them in,
+as 0.4.0 does. Followed from
+.B \-\-windows\-parity=sound
+on, where the window offers the tick box; below it every export moves them and
+the choice waits.
+.TP
+.B \-\-force
+With
+.BR \-\-windows\-parity=full ,
+in the version that offers it: switch even when that takes something in use
+away. Refused along with
+.B full
+in this one.
 .TP
 .BR \-\-run_minimized ", " \-\-hide
 Start without showing the window, or hide the window of a running instance.
@@ -515,14 +605,20 @@ it never crosses into the microphones. With no FxSound running there is no
 device to step from: the command line is refused (exit status 1) and nothing
 on it is done or started;
 .BI \-\-output= NAME
-starts FxSound on a device.
+starts FxSound on a device. An FxSound that has only just started (the bus
+may have started it for
+.BR NextOutput )
+holds the command for up to three seconds until PipeWire has listed the
+devices, and steps then.
 .TP
 .B \-\-next\-input
 Cycle the microphone lane to the next usable capture device, wrapping, in the
 order of the microphones' priority list (Settings \(-> Microphone). Capture
 devices only. With no FxSound running it is refused as
 .B \-\-next\-output
-is.
+is, and an FxSound that has only just started waits for the device list as
+.B \-\-next\-output
+does.
 .SS Control
 .TP
 .B \-\-status
@@ -534,14 +630,18 @@ line per item: the version, whether processing is on, then
 .BR noise_suppression ", " echo_cancel
 and the voice chain's telemetry as
 .B input_
-lines. Every other option on the same command line is ignored.
+lines, with
+.B windows_parity
+after
+.BR theme .
+Every other option on the same command line is ignored.
 .TP
 .B \-\-json
 Print the
 .BR \-\-status ", " \-\-watch ", " \-\-self\-test " or " \-\-list\-apps
 report as JSON instead of as lines: one object for
 .B \-\-status
-(schema 2, described under
+(schema 3, described under
 .BR "STATUS DOCUMENT" ),
 for
 .B \-\-self\-test
@@ -572,8 +672,11 @@ until it succeeds keeps it running. The first event is
 document); after that
 .BR power ", " preset_changed ", " device_changed ", " devices_changed ", "
 .BR audio_state ", " direction ", " notice ", " echo_cancel ", " calibrated ", "
-.BR app_routed ", " window " and " quit
+.BR app_routed ", " windows_parity ", " window " and " quit
 as they happen;
+.B windows_parity
+carries the new
+.BR level ;
 .B app_routed
 says where an application's streams went
 .RB ( app ", " binary ", " flatpak ", " direction ", " preset ,
@@ -644,8 +747,10 @@ every check that ran passed.
 .B 1
 The command failed and standard error or the report says why: the running
 instance refused it (an unknown preset or device name, a factory preset to
-overwrite, a band the equalizer does not have, or a device to forget that is
-connected, for example) or could
+overwrite, a band the equalizer does not have, a device to forget that is
+connected, or
+.BR \-\-windows\-parity=full ,
+which comes in a later version, for example) or could
 not be reached, there is no running instance for
 .BR \-\-status " or " \-\-watch
 to ask or for
@@ -686,8 +791,12 @@ and every key the Windows build's
 writes (marked
 .IR upstream ),
 with that build's meaning and JSON type, so a client written for either reads
-it. Keys are only ever added; a key that changed its meaning would change
-.BR schema .
+it. Keys are only ever added; a key removed, renamed or given another meaning
+would change
+.B schema
+(see
+.B Compatibility
+below).
 The equalizer and
 .BR preset ", " presets " and " selected_preset
 are the edit direction's: the lane the window shows. The effects,
@@ -695,7 +804,10 @@ are the edit direction's: the lane the window shows. The effects,
 exist on the output lane only and are always the output lane's.
 .TP
 .B schema
-2. The 0.3.0 document had no number and is schema 1.
+3, the compatibility number described under
+.BR Compatibility .
+The 0.3.0 document had no number and is schema 1; 0.4.0's is 2, and 3 keeps
+every key of 2.
 .TP
 .BR version ", " power
 .RI ( upstream )
@@ -738,7 +850,10 @@ and
 .BR active ;
 .B input
 adds
-.BR noise_suppression " and " denoise_level .
+.BR noise_suppression ", " denoise_level " and " hidden ,
+whether \(lqLike FxSound for Windows\(rq at
+.B full
+hides the microphone lane (never in this version).
 A detached lane has
 .B null
 for its device.
@@ -836,6 +951,53 @@ the preset FxSound has moved its streams onto in each lane, or
 .B null
 while they run through the lane's own chain \(en it follows the lane, it is
 not playing or recording there, or its preset could not be run.
+.TP
+.BR windows_parity ", " apps_hidden
+The level of \(lqLike FxSound for Windows\(rq
+.RB ( off ", " interface " or " sound ;
+.B full
+from the later version that offers it),
+and whether it hides the applications' presets, so that a status bar can grey
+its microphone and application parts instead of failing; always
+.B false
+in this version.
+.SS Compatibility
+The JSON FxSound prints \(en this document and D-Bus
+.BR GetStatus ,
+the
+.BR ListPresets ", " ListDevices " and " ListApps
+answers and
+.B \-\-list\-apps \-\-json
+(which carry this document's
+.BR schema ),
+and the events of
+.B \-\-watch \-\-json
+(which carry
+.BR \(dqv\(dq )
+\(en follows one rule.
+.B schema
+and
+.B v
+are compatibility numbers, not versions. Adding a key or an event never
+changes them, so a later FxSound may print keys this page does not list, and a
+client ignores what it does not know. Removing or
+renaming a key, or changing its meaning or its JSON type, raises the number by
+one; where a meaning has to change, the new meaning gets a key of its own and
+the old key keeps the old one, as
+.B edit_direction
+did beside
+.BR direction .
+A client written for schema 3 reads any document that says 3, and one that
+needs a key added later looks for the key rather than at the number.
+.B schema
+went from 1 to 2 and to 3 with keys that 0.4.0 and 0.5.0 added, before the
+rule was written; it stays 3 while keys are only added.
+.B \-\-self\-test \-\-json
+carries no number and follows the same rule: its
+.BR version ", " checks " (" name ", " status ", " detail ") and " ok
+keep their meaning, new checks may appear, and
+.B detail
+is words for a person, not for parsing.
 .SH D\-BUS
 A running instance also serves an interface on the session bus, for status
 bars, compositor scripts and anything else that would rather hold a connection
@@ -872,6 +1034,7 @@ Apply(as argv) \(-> (b ok, s stdout, s stderr)
 ListPresets() \(-> s          ListDevices() \(-> s
 SetAppPreset(s app, s direction, s preset)
 ListApps() \(-> s             ForgetDevice(s)
+SetWindowsParity(s level, b force)
 .EE
 .RE
 .PP
@@ -900,6 +1063,17 @@ takes
 .B ForgetDevice
 is
 .BR \-\-forget\-device .
+.B SetWindowsParity
+is
+.BR \-\-windows\-parity ,
+and
+.I force
+is
+.BR \-\-force ;
+.B full
+is refused with
+.B org.fxsound.FxSound.Error.Refused
+in this version.
 .B SetAppPreset
 is
 .BR \-\-app\-preset " and " \-\-app\-input\-preset :
@@ -953,7 +1127,7 @@ of the status document.
 .PP
 Properties:
 .BR Version " (s, constant), " Power " (b), " Preset " (s), "
-.BR Output " (s), " Input " (s) and " Direction " (s)."
+.BR Output " (s), " Input " (s), " Direction " (s) and " WindowsParity " (s)."
 .B Preset
 is the edit direction's preset, without the
 .B *
@@ -963,7 +1137,11 @@ and
 .B Input
 are the lanes' devices by description, empty while a lane is detached;
 .B Direction
-is the edit direction.
+is the edit direction;
+.B WindowsParity
+is the level of \(lqLike FxSound for Windows\(rq, as
+.B SetWindowsParity
+takes it.
 .PP
 Signals:
 .BR PowerChanged (b),
@@ -998,10 +1176,10 @@ and hands the start to the systemd user unit,
 or runs
 .B fxsound \-\-activated
 itself where the bus has no systemd. A
-.BR NextOutput " or " NextInput
-call that starts FxSound this way steps nowhere, since the new instance has no
-device list yet to step through, and it still succeeds; with no FxSound
-running,
+.BR NextOutput ", " NextInput " or " ForgetDevice
+call that starts FxSound this way waits, up to three seconds, for PipeWire to
+list the devices, and then steps or forgets as it would in an instance that
+had been running; with no FxSound running,
 .BR \-\-next\-output " and " \-\-next\-input
 are refused instead. A started FxSound takes over the
 session's default devices, so anything that only reads or polls \(en a status
@@ -1108,6 +1286,13 @@ first, or to
 and so on, never over an earlier one. The Windows keys FxSound does not use
 \(en the hotkey chords, the window position, always-on-top and the update
 check \(en are read from an older file without complaint and not written back.
+Keys this version does not know, such as those a later version wrote, are kept
+and written back as they were, at the top of the file and inside a device's entry
+or the calibration record; 0.4.0 drops them on its next save.
+.B windows_parity
+and
+.B export_unshifted
+are written only when they are not the default.
 This file,
 .I apps.toml
 and a preset may be symbolic links, as a dotfile manager leaves them: a save
@@ -1130,6 +1315,41 @@ than 500 of those. One that does not load is moved aside to
 .I apps.toml.2.bad
 and so on, never over an earlier one) when FxSound starts, and the list starts
 empty.
+.TP
+.I ~/.local/state/fxsound/handover.toml
+The volume of each application FxSound is fading out to move it, from before
+the fade, while the move lasts. It is there only for a tenth of a second or so;
+one left behind by a FxSound that was killed then is read at the next start,
+which gives each application found silent its volume back. Under
+.I $XDG_STATE_HOME/fxsound/
+when that is set.
+.TP
+.I ~/.local/share/wireplumber/scripts/fxsound/fade-on-move.lua
+.TQ
+.I ~/.config/wireplumber/wireplumber.conf.d/90-fxsound-fade-on-move.conf
+FxSound's hook in WirePlumber, there only while \(lqSmooth moves in
+WirePlumber\(rq in Settings \(-> Experimental is ticked: a WirePlumber 0.5
+script that fades each playing stream WirePlumber moves, and the fragment that
+makes it an optional component, which WirePlumber skips, logging why, when it
+cannot load it. The silence the script holds a stream in, and a point of its
+fades reported on the way, never reach the volume WirePlumber keeps for the
+application's next start; while it holds a stream, the script says so in the
+.B default
+metadata, under the stream's id, as
+.BR fxsound.held ,
+and FxSound's own fade leaves the stream to it. A stream whose new link failed
+gets its volume back only once it has a link again. WirePlumber reads
+them when it starts. Unticking deletes both;
+FxSound brings them up to its own version when it starts, and deletes them
+under a WirePlumber older than 0.5. Under
+.I $XDG_DATA_HOME
+and
+.I $XDG_CONFIG_HOME
+when those are set.
+No package removes them, since the package manager does not touch files in
+your home, and FxSound 0.4.0 does not know them: untick the box before
+uninstalling FxSound or going back to 0.4.0, or else delete both files and run
+.BR "systemctl \-\-user restart wireplumber" .
 .TP
 .I $XDG_RUNTIME_DIR/fxsound/instance.lock
 Holds the running instance's pid under an exclusive
@@ -1154,6 +1374,12 @@ not running. See
 The tray icon's three states, looked up by name by the StatusNotifier host.
 The binary carries the same three and offers them as pixmaps too, for a host
 that does not look icons up in the theme.
+.TP
+.I /usr/share/icons/hicolor/{256x256,32x32}/apps/com.fxsound.FxSound.png
+The application icon under the application id, the icon name FxSound's
+notifications carry; the same icon is also installed as
+.IR fxsound.png ,
+the name the desktop entry uses.
 .SH EXAMPLES
 Bind the shortcut targets in the compositor, here on Super+Alt, which few
 desktops and no applications use \(en in Hyprland:
@@ -1261,7 +1487,9 @@ devices under
 and the microphones under
 .BR "Recording Device Select" ,
 a long name shortened in its middle so that the part that tells two devices of
-one card apart stays.
+one card apart stays; at \(lqLike FxSound for Windows\(rq = interface and
+above a playback device's name is cut after 30 characters, as the Windows build
+cuts it, and with the power off the preset submenus are left out, as there.
 .PP
 The systemd user unit is installed but deliberately not enabled. The desktop
 entry already starts FxSound when you launch it, and an enabled user unit on
@@ -1282,6 +1510,9 @@ compositor does not import
 into it (sway, and Hyprland without uwsm), that FxSound has no display: it runs
 in the tray, and asking for its window brings a notification that it could not
 be opened instead; quit it and start it again once the variable is imported.
+A window raised only because \(lqLike FxSound for Windows\(rq is on (a
+forwarded Windows command line) that cannot be opened is just logged, and
+FxSound keeps running, with or without a tray.
 Import it when the compositor starts, in sway with:
 .PP
 .RS 4

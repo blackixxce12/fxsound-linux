@@ -715,8 +715,10 @@ command line and D-Bus all go by — decides:
 * **Rename** to the preset's own name in other letter case is allowed, and moves the file and its
   autosave instead of saving a copy and deleting the old file (#19).
 * **Delete** is asked about first (`"Move the preset %s to the trash?"`) and moves the file and its
-  autosave to the desktop's trash, or sets them aside as `<name>.fac.1.bak` when the trash is on
-  another filesystem — never the permanent `SHFileOperation` delete (#16).
+  autosave to the desktop's trash — for a preset on another filesystem, that filesystem's own
+  (`$topdir/.Trash/$uid` or `$topdir/.Trash-$uid`) — and keeps them beside themselves as
+  `<name>.fac.1.bak` (or the next free number) only when no trash can take them; never the
+  permanent `SHFileOperation` delete (#16).
 * **Reset** (Settings ▸ Reset presets) is offered only while some preset of either lane has
   unsaved changes, asks first (`"Discard the unsaved changes of every preset? Saved presets are
   kept."`), drops every autosave in both lanes' stores and loads each lane's preset — the one its

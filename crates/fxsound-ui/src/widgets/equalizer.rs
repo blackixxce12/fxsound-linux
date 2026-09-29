@@ -60,8 +60,9 @@
 //! * **A press on a thumb holds its value** until the pointer has moved two points, as on every
 //!   slider (0.4.0 audit #14); JUCE jumps to the pointer there too, which moved a band a decibel
 //!   for a press half a thumb off centre and snapped a gain between two steps.
-//! * **A press outlives its curve.** A preset, a band count or a lane that comes from outside
-//!   with the button down on a band or a wheel — or the application ending the solo — ends the
+//! * **A press outlives its curve.** A preset (the one shown, read again, included), a band count
+//!   or a lane that comes from outside with the button down on a band or a wheel — or the
+//!   application ending the solo — ends the
 //!   gesture: nothing follows the pointer until the button is let go, where egui would hand the
 //!   press on to the same band of the new curve.
 //! * **The end bands turn both ways** (0.4.0 audit R6): see [`band_frequency_range`].
@@ -82,8 +83,8 @@ use crate::widgets::slider;
 use egui::{
     Align2, Color32, CornerRadius, Id, Mesh, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2,
 };
-use fxsound_core::ThemeMode;
 use fxsound_core::i18n::tr;
+use fxsound_core::{ThemeMode, WindowsLook};
 
 // ---------------------------------------------------------------------------------------------
 // Constants, all from FxEqualizer.h:96-105 and FxTheme.h:44-45
@@ -377,19 +378,6 @@ pub fn snap_gain(gain_db: f32) -> f32 {
 // Band frequencies
 // ---------------------------------------------------------------------------------------------
 
-/// The spectrum edges a band count implies (`GraphicEqSet.cpp:430-486`).
-///
-/// The five counts the UI offers each overwrite `min_band_freq` / `max_band_freq` with their own
-/// pair ([`fxsound_core::eq::ladder_edges_hz`]); anything else keeps whatever the engine had, which
-/// is taken here as the full 20 Hz … 20 kHz span.
-#[must_use]
-pub fn band_span_hz(num_bands: usize) -> (f32, f32) {
-    fxsound_core::eq::ladder_edges_hz(num_bands).unwrap_or((
-        fxsound_core::eq::TUNING_FLOOR_HZ,
-        fxsound_core::eq::TUNING_CEILING_HZ,
-    ))
-}
-
 /// How far band `band`'s wheel tunes it, in Hz: [`fxsound_core::eq::band_frequency_range`].
 ///
 /// The Windows ranges (`GraphicEqGet.cpp:105-168`) sit at the *geometric midpoints* of the generic
@@ -437,10 +425,35 @@ pub fn default_band_frequency(band: usize, num_bands: usize) -> f32 {
     }
 }
 
+/// How far band `band`'s wheel turns, standing at `center_hz`: [`band_frequency_range`], or at
+/// «Как в Windows» = Interface and above (`windows`) the Windows build's range
+/// ([`fxsound_core::eq::windows_band_frequency_range`], [`WindowsLook::EndBandWheels`], R6 set
+/// back), in which the five- and ten-band equalizer's end bands turn one way only. A band a
+/// preset or the command line has already put past that range stays where it is, and the range
+/// reaches out to it: it can be turned back inwards, and no further out than it was.
+#[must_use]
+pub fn wheel_range(band: usize, num_bands: usize, center_hz: f32, windows: bool) -> (f32, f32) {
+    if !windows {
+        return band_frequency_range(band, num_bands);
+    }
+    let (low, high) = fxsound_core::eq::windows_band_frequency_range(band, num_bands);
+    if center_hz.is_finite() {
+        (low.min(center_hz), high.max(center_hz))
+    } else {
+        (low, high)
+    }
+}
+
 /// Clamp a frequency into a band's range and snap it to the wheel's hundredth.
 #[must_use]
 pub fn snap_frequency(freq_hz: f32, band: usize, num_bands: usize) -> f32 {
-    let (min_hz, max_hz) = band_frequency_range(band, num_bands);
+    snap_frequency_within(freq_hz, band_frequency_range(band, num_bands))
+}
+
+/// Clamp a frequency into `(min_hz, max_hz)` and snap it to a hundredth of that range, as a wheel
+/// does.
+#[must_use]
+pub fn snap_frequency_within(freq_hz: f32, (min_hz, max_hz): (f32, f32)) -> f32 {
     let step = (max_hz - min_hz) / 100.0;
     if step <= 0.0 {
         return min_hz;
@@ -610,6 +623,28 @@ pub fn response_curve(
         db: db_at(axis[last]),
     });
     points
+}
+
+/// The curve as the Windows build draws it: straight segments from one fader's gain to the
+/// next, one point a band, the filter width and the bands adding up left out
+/// (`FxEqualizer.cpp:350-370`). What «Как в Windows» = Interface and above draw
+/// ([`WindowsLook::CurveThroughBands`], 0.4.0 audit R8 set back).
+#[must_use]
+pub fn band_polyline(
+    layout: &EqLayout,
+    centres_hz: &[f32],
+    gains_db: &[f32],
+) -> Vec<ResponsePoint> {
+    gains_db
+        .iter()
+        .take(layout.num_bands)
+        .enumerate()
+        .map(|(band, &db)| ResponsePoint {
+            x: layout.center_x(band),
+            hz: centres_hz.get(band).copied().unwrap_or(0.0),
+            db,
+        })
+        .collect()
 }
 
 /// The response curve, worked out only when what it is drawn from changes.
@@ -786,15 +821,17 @@ struct Still {
 /// the sliders' two points ([`slider`]).
 pub const HOLD_DISTANCE: f32 = 2.0;
 
-/// Which curve a gesture is on: its band count, its lane and its preset. Any of them changing
-/// under a press comes from outside the window — a preset from the tray or a device, a band count
-/// from the command line, a lane from D-Bus — since the pointer that would pick one here is busy
-/// holding a band.
+/// Which curve a gesture is on: its band count, its lane, its preset, and which reading of a
+/// preset ([`UiState::eq_curve_generation`]). Any of them changing under a press comes from
+/// outside the window — a preset from the tray or a device, the same preset read again by an
+/// undo from the command line, a band count from the command line, a lane from D-Bus — since the
+/// pointer that would pick one here is busy holding a band.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CurveKey {
     bands: usize,
     lane: fxsound_core::DeviceDirection,
     preset: Option<String>,
+    generation: u64,
 }
 
 impl CurveKey {
@@ -803,6 +840,7 @@ impl CurveKey {
             bands: state.eq_bands.len(),
             lane: state.direction,
             preset: state.preset().map(|p| p.name.clone()),
+            generation: state.eq_curve_generation,
         }
     }
 
@@ -810,6 +848,7 @@ impl CurveKey {
         self.bands == state.eq_bands.len()
             && self.lane == state.direction
             && self.preset.as_deref() == state.preset().map(|p| p.name.as_str())
+            && self.generation == state.eq_curve_generation
     }
 }
 
@@ -1126,9 +1165,17 @@ impl<'a> EqualizerWidget<'a> {
 
             // `FxEqualizer::paint` re-applies the per-band tooltips every frame, and only ever at
             // ten bands (`FxEqualizer.cpp:326-343`). Under them, and alone at the other counts,
-            // the right-click reset nothing else mentions (0.4.0 audit R9) and the solo.
+            // the right-click reset nothing else mentions (0.4.0 audit R9) and the solo — except
+            // at «Как в Windows» = Interface and above, which keep the original's alone
+            // ([`WindowsLook::WindowsTooltips`]) on the playback lane; the microphone's is the
+            // port's own and keeps them ([`UiState::lane_tips_shown`]).
             if !state.hide_tooltips
-                && let Some(tip) = band_tooltip(band, layout.num_bands, powered, can_solo)
+                && let Some(tip) = band_tooltip(
+                    band,
+                    layout.num_bands,
+                    powered && state.lane_tips_shown(),
+                    can_solo,
+                )
             {
                 let _ = band_response.on_hover_text(tip);
             }
@@ -1147,16 +1194,22 @@ impl<'a> EqualizerWidget<'a> {
         };
 
         let centres: Vec<f32> = state.eq_bands.iter().map(|band| band.center_hz).collect();
-        let curve = curve_points(
-            &layout,
-            interaction.response.curve(
+        // At «Как в Windows» = Interface and above the original's straight line through the
+        // bands, not the response that plays ([`WindowsLook::CurveThroughBands`], R8).
+        let curve = if state.windows_look(WindowsLook::CurveThroughBands) {
+            curve_points(&layout, &band_polyline(&layout, &centres, &gains))
+        } else {
+            curve_points(
                 &layout,
-                &centres,
-                &gains,
-                state.filter_q,
-                state.sample_rate,
-            ),
-        );
+                interaction.response.curve(
+                    &layout,
+                    &centres,
+                    &gains,
+                    state.filter_q,
+                    state.sample_rate,
+                ),
+            )
+        };
 
         if db_scale {
             paint_db_scale(&painter, &ctx, &layout);
@@ -1626,7 +1679,12 @@ fn wheel(
         return;
     };
     let rect = translate(local_rect, ctx.origin);
-    let (min_hz, max_hz) = band_frequency_range(band, layout.num_bands);
+    let (min_hz, max_hz) = wheel_range(
+        band,
+        layout.num_bands,
+        eq_band.center_hz,
+        state.windows_look(WindowsLook::EndBandWheels),
+    );
     let span = (max_hz - min_hz).max(f32::EPSILON);
     let mut proportion = ((eq_band.center_hz - min_hz) / span).clamp(0.0, 1.0);
 
@@ -1665,7 +1723,7 @@ fn wheel(
                 && let Some(total) = wheel_response.total_drag_delta()
             {
                 proportion = wheel_drag_proportion(drag.start_proportion, total);
-                new_hz = snap_frequency(min_hz + proportion * span, band, layout.num_bands);
+                new_hz = snap_frequency_within(min_hz + proportion * span, (min_hz, max_hz));
             }
             if wheel_response.drag_stopped() && interaction.dragged_wheel() == Some(band) {
                 interaction.wheel_drag = None;
@@ -1673,13 +1731,13 @@ fn wheel(
         }
 
         if wheel_response.has_focus() {
-            let step = frequency_step(band, layout.num_bands);
+            let step = (max_hz - min_hz) / 100.0;
             ui.input(|input| {
                 if input.key_pressed(egui::Key::ArrowUp) {
-                    new_hz = snap_frequency(new_hz + step, band, layout.num_bands);
+                    new_hz = snap_frequency_within(new_hz + step, (min_hz, max_hz));
                 }
                 if input.key_pressed(egui::Key::ArrowDown) {
-                    new_hz = snap_frequency(new_hz - step, band, layout.num_bands);
+                    new_hz = snap_frequency_within(new_hz - step, (min_hz, max_hz));
                 }
             });
         }
@@ -1692,7 +1750,10 @@ fn wheel(
     }
 
     if !state.hide_tooltips {
-        let _ = wheel_response.on_hover_text(wheel_tooltip(interactive));
+        // The right-click under the original's tip, but not on the playback lane at «Как в
+        // Windows» = Interface and above ([`WindowsLook::WindowsTooltips`]); the microphone's
+        // wheels are the port's own and keep it ([`UiState::lane_tips_shown`]).
+        let _ = wheel_response.on_hover_text(wheel_tooltip(interactive && state.lane_tips_shown()));
     }
 
     // `reduced(2)` then `radius - lineW * 0.5` (`FxTheme.cpp:348-352`).
@@ -2028,6 +2089,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn at_interface_the_end_wheels_have_the_windows_range_and_reach_out_only_to_where_a_band_is() {
+        // 0.4.0 audit R6 set back: the first band of ten tunes up from 62.5 Hz only, the last
+        // down from 16 kHz only; the inner bands' ranges are the Windows ones at either level.
+        for count in [5, 10] {
+            for band in 0..count {
+                let windows = fxsound_core::eq::windows_band_frequency_range(band, count);
+                let centre = default_band_frequency(band, count);
+                assert_eq!(
+                    wheel_range(band, count, centre, true),
+                    windows,
+                    "{count}/{band}"
+                );
+                assert_eq!(
+                    wheel_range(band, count, centre, false),
+                    band_frequency_range(band, count),
+                    "{count}/{band}"
+                );
+            }
+        }
+        assert_eq!(wheel_range(0, 10, 62.5, true).0, 62.5);
+        assert_eq!(wheel_range(9, 10, 16_000.0, true).1, 16_000.0);
+        // A first band a preset put at 50 Hz keeps it, and can go back up but no lower.
+        assert_eq!(
+            wheel_range(0, 10, 50.0, true),
+            (50.0, wheel_range(0, 10, 62.5, true).1)
+        );
+        assert_eq!(
+            snap_frequency_within(40.0, wheel_range(0, 10, 50.0, true)),
+            50.0
+        );
+    }
+
+    #[test]
+    fn the_windows_curve_has_one_point_a_band_at_its_gain() {
+        let layout = EqLayout::new(10);
+        let gains = [1.0, 2.0, 3.0, 4.0, 5.0, -1.0, -2.0, -3.0, -4.0, -5.0];
+        let line = band_polyline(&layout, &centres(10), &gains);
+        assert_eq!(line.len(), 10);
+        for (band, point) in line.iter().enumerate() {
+            assert_eq!(point.x, layout.center_x(band));
+            assert_eq!(point.db, gains[band]);
+            assert_eq!(point.hz, centres(10)[band]);
+        }
+    }
+
     /// §A4's step column: a hundred positions across the range.
     #[test]
     fn the_wheel_steps_a_hundredth_of_the_band_range() {
@@ -2319,6 +2426,38 @@ mod tests {
                     (measured - point.db).abs() < 0.1,
                     "{count} bands, Q x{filter_q}, {rate} Hz: at {} Hz the curve says {} dB, \
                      the equalizer does {measured} dB",
+                    point.hz,
+                    point.db
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_band_count_the_window_does_not_offer_is_drawn_as_the_engine_plays_it_after_any_other() {
+        // Twelve bands, from a hand-made microphone preset or a `num_bands` edited in
+        // settings.toml (a `.fac` is fitted onto the window's count): the curve is worked out on
+        // a fresh equalizer, the sound on one that played another count before it. Until 0.5.0 the engine kept the last
+        // table's edges for such a count, and so another Q than the one drawn.
+        let count = 12;
+        let layout = EqLayout::new(count);
+        let ladder: Vec<f32> = (0..count)
+            .map(|band| 30.0 * 600.0_f32.powf(band as f32 / (count - 1) as f32))
+            .collect();
+        let gains: Vec<f32> = (0..count)
+            .map(|band| if band % 3 == 0 { 9.0 } else { -3.0 })
+            .collect();
+        let response = response_curve(&layout, &ladder, &gains, 1.0, 48_000);
+        assert!(!response.is_empty());
+        for before in [5, 10, 15, 20, 31] {
+            let mut eq = fxsound_dsp::eq::GraphicEq::new();
+            eq.set_bands(&centres(before), &vec![0.0; before]);
+            eq.set_bands(&ladder, &gains);
+            for point in &response {
+                let played = eq.response_db(point.hz);
+                assert!(
+                    (played - point.db).abs() < 0.01,
+                    "after {before} bands, at {} Hz: drawn {} dB, played {played} dB",
                     point.hz,
                     point.db
                 );
@@ -3041,10 +3180,14 @@ mod tests {
 
         #[test]
         fn a_drag_writes_nothing_once_a_preset_a_band_count_or_a_lane_comes_from_outside() {
-            // FA: an ordinary drag, no solo, so no generation to move: the curve itself says it
-            // is another one.
+            // FA: an ordinary drag, no solo, so no solo generation to move: the curve itself says
+            // it is another one. Undo from the command line reads the preset shown again, under
+            // the same name, count and lane; only the curve's own generation tells.
             type Change = fn(&mut UiState);
-            let changes: [(&str, Change); 3] = [
+            let changes: [(&str, Change); 4] = [
+                ("the same preset read again", |state| {
+                    state.eq_curve_generation += 1;
+                }),
                 ("a preset", |state| state.selected_preset = Some(1)),
                 ("a band count", |state| {
                     state.eq_bands = centres(15)
@@ -3395,6 +3538,140 @@ mod tests {
                 .collect();
             let lowest = tuned.iter().copied().fold(f32::MAX, f32::min);
             assert!((46.0..62.5).contains(&lowest), "tuned to {tuned:?}");
+        }
+
+        #[test]
+        fn at_interface_the_first_wheel_of_ten_bands_turns_only_up_as_on_windows() {
+            // 0.4.0 audit R6 set back: band 1's wheel starts at its minimum, 62.5 Hz, and the
+            // same drag the port lets below it tunes nothing.
+            let state = UiState {
+                windows_parity: fxsound_core::WindowsParity::Interface,
+                ..UiState::default()
+            };
+            let layout = EqLayout::new(10);
+            let wheel = layout
+                .wheel_rect(0)
+                .expect("ten bands have wheels")
+                .center()
+                + panel();
+            let mut harness = Harness::new(ThemeMode::Dark);
+            harness.settle(&state);
+            let none = Modifiers::default();
+            let mut actions = Vec::new();
+            for events in [
+                vec![Event::PointerMoved(wheel)],
+                vec![Event::PointerMoved(wheel), button(wheel, true, none)],
+                vec![Event::PointerMoved(wheel - vec2(10.0, 0.0))],
+                vec![Event::PointerMoved(wheel - vec2(100.0, 0.0))],
+                vec![button(wheel - vec2(100.0, 0.0), false, none)],
+            ] {
+                actions.extend(harness.frame(&state, events).0);
+            }
+            assert!(
+                !actions.iter().any(
+                    |action| matches!(action, UiAction::SetBandFrequency(0, hz) if *hz < 62.5)
+                ),
+                "{actions:?}"
+            );
+        }
+
+        #[test]
+        fn at_interface_the_drawn_curve_is_the_line_through_the_bands_as_on_windows() {
+            // 0.4.0 audit R8 set back: one vertex a band, at its gain, in the same colour and
+            // weight as the response Off draws.
+            let mut state = UiState {
+                windows_parity: fxsound_core::WindowsParity::Interface,
+                ..UiState::default()
+            };
+            state.eq_bands[4].boost_db = 9.0;
+            let mut harness = Harness::new(ThemeMode::Dark);
+            let shapes = harness.settle(&state);
+            let layout = EqLayout::new(10);
+            let gains = [0.0, 0.0, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let expected = curve_points(&layout, &band_polyline(&layout, &centres(10), &gains));
+            assert_eq!(expected.len(), 10);
+            let drawn: Vec<&egui::epaint::PathShape> = shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    Shape::Path(path)
+                        if path.points.len() == expected.len() && path.stroke.width == 1.5 =>
+                    {
+                        Some(path)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(drawn.len(), 1, "one path for the curve");
+            for (drawn, want) in drawn[0].points.iter().zip(&expected) {
+                assert_eq!(*drawn, *want + panel());
+            }
+            // Nothing was designed for it.
+            assert_eq!(harness.scratch.eq.response().computations(), 0);
+        }
+
+        /// What the window shows with the pointer at rest over the first of ten bands' wheel.
+        fn over_wheel(state: &UiState) -> Vec<String> {
+            let wheel = EqLayout::new(10).wheel_rect(0).expect("a wheel").center() + panel();
+            let mut harness = Harness::new(ThemeMode::Dark);
+            harness.settle(state);
+            harness.rest(state, wheel)
+        }
+
+        /// What the window shows with the pointer at rest over the first band's gain slider.
+        fn over_band(state: &UiState) -> Vec<String> {
+            let mut harness = Harness::new(ThemeMode::Dark);
+            harness.settle(state);
+            harness.rest(state, thumb(state, 0) + vec2(0.0, 20.0))
+        }
+
+        #[test]
+        fn at_interface_a_wheels_tip_is_the_originals_alone_and_off_it_names_the_right_click() {
+            // `FxEqualizer.cpp:326-343` gives the wheel its description and nothing under it; the
+            // right-click line is the port's (0.4.0 audit R9), set back at Interface.
+            let off = over_wheel(&UiState::default());
+            assert!(off.contains(&wheel_tooltip(true)), "{off:?}");
+            assert!(wheel_tooltip(true).ends_with(slider::RESET_TIP));
+
+            let windows = UiState {
+                windows_parity: fxsound_core::WindowsParity::Interface,
+                ..UiState::default()
+            };
+            let shown = over_wheel(&windows);
+            assert!(shown.contains(&tr(WHEEL_TOOLTIP)), "{shown:?}");
+            assert!(
+                !shown.iter().any(|tip| tip.contains(slider::RESET_TIP)),
+                "{shown:?}"
+            );
+        }
+
+        #[test]
+        fn at_interface_the_microphones_bands_and_wheels_still_name_the_right_click_and_the_solo() {
+            // The microphone lane is the port's own: nothing in the Windows build to set it back
+            // to, as with its level sliders.
+            let windows = UiState {
+                windows_parity: fxsound_core::WindowsParity::Interface,
+                direction: fxsound_core::DeviceDirection::Input,
+                ..UiState::default()
+            };
+            let band = over_band(&windows);
+            let full = band_tooltip(0, 10, true, true).expect("a tip");
+            assert!(full.ends_with(SOLO_TIP), "{full:?}");
+            assert!(band.contains(&full), "{band:?}");
+            let wheel = over_wheel(&windows);
+            assert!(wheel.contains(&wheel_tooltip(true)), "{wheel:?}");
+
+            // "Hide help tips" still hides them there.
+            let hidden = UiState {
+                hide_tooltips: true,
+                ..windows
+            };
+            let shown = [over_band(&hidden), over_wheel(&hidden)].concat();
+            assert!(
+                !shown
+                    .iter()
+                    .any(|tip| tip.contains(slider::RESET_TIP) || tip.contains(SOLO_TIP)),
+                "{shown:?}"
+            );
         }
     }
 }

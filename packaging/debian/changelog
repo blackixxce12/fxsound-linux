@@ -1,3 +1,15 @@
+fxsound-linux (0.5.0-1) unstable; urgency=medium
+
+  * New upstream release. «Like FxSound for Windows», a new Experimental
+    tab of Settings, brings back the Windows window, command line and tray
+    and, at its last position, the Windows sound; the power button no
+    longer clicks in the applications it moves; and an optional WirePlumber
+    script fades an application moved to another device instead of letting
+    it click. See the upstream changelog in
+    /usr/share/doc/fxsound-linux/changelog.gz.
+
+ -- FxSound Linux port contributors <blackixxce12@users.noreply.github.com>  Wed, 30 Sep 2026 01:52:23 +0400
+
 fxsound-linux (0.4.0-1) unstable; urgency=medium
 
   * New upstream release. The microphone runs in a lane of its own beside

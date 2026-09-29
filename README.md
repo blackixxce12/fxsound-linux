@@ -9,7 +9,15 @@ virtual audio driver through WASAPI and COM, none of which exists here. Every la
 re-implemented, but the DSP is ported from the original C rather than reinvented. Since 0.4.0 it
 also fixes defects that came across with it, so a preset voiced on Windows sounds close to, but not
 exactly, the same here; [the deliberate differences](#deliberate-differences-from-the-windows-build)
-say what changed, and a mode that restores the original behaviour is planned.
+say what changed. A mode that restores the original behaviour, «Like FxSound for Windows» in
+Settings ▸ Experimental (`--windows-parity=off|interface|sound`), comes with 0.5.0: `interface`
+brings back the Windows build's window, command line and tray without changing the sound, and
+`sound` also plays Volume Leveling, Dynamic Boost, Ambience, the equalizer, the master gain and the
+balance as the Windows build does and reads a preset as it does; moving between the levels while
+something plays does not click
+([`docs/0.5.0-windows-parity.md`](docs/0.5.0-windows-parity.md)). Its fourth level, Everything,
+comes in a later version; 0.5.0 refuses `full`, and runs a `settings.toml` that says `full` as
+`sound` while keeping `full` in the file for that version.
 
 It processes what the machine plays and, at the same time, a microphone: each has a lane of its
 own, with its own device and preset, and an application can have a preset of its own on either.
@@ -75,7 +83,7 @@ From the working tree you already have:
 ```bash
 cd packaging
 makepkg -f
-sudo pacman -U fxsound-linux-0.4.0-1-x86_64.pkg.tar.zst
+sudo pacman -U fxsound-linux-0.5.0-1-x86_64.pkg.tar.zst
 ```
 
 `makepkg` runs the whole test suite as part of the build; pass `--nocheck` to skip it.
@@ -92,7 +100,7 @@ tree, so copy it there first:
 ```bash
 cp -a packaging/debian debian
 dpkg-buildpackage -us -uc -b
-sudo apt install ../fxsound-linux_0.4.0-1_amd64.deb
+sudo apt install ../fxsound-linux_0.5.0-1_amd64.deb
 ```
 
 The `.deb` lands beside the source tree, not inside it. Use `apt` rather than `dpkg -i` so the
@@ -109,7 +117,7 @@ and why lowering the floor is not the fix, is at the top of
 
 ```bash
 rpmbuild -ba packaging/fedora/fxsound.spec
-sudo dnf install ~/rpmbuild/RPMS/x86_64/fxsound-linux-0.4.0-1.*.x86_64.rpm
+sudo dnf install ~/rpmbuild/RPMS/x86_64/fxsound-linux-0.5.0-1.*.x86_64.rpm
 ```
 
 The spec needs a vendored-dependency tarball beside it;
@@ -122,8 +130,8 @@ For anything else, or for anyone who would rather no package manager were involv
 
 ```bash
 packaging/build-tarball.sh
-tar xf dist/fxsound-linux-0.4.0-x86_64.tar.gz
-sudo ./fxsound-linux-0.4.0-x86_64/install.sh        # /usr/local unless you name another prefix
+tar xf dist/fxsound-linux-0.5.0-x86_64.tar.gz
+sudo ./fxsound-linux-0.5.0-x86_64/install.sh        # /usr/local unless you name another prefix
 ```
 
 `/usr/local` is searched for presets alongside `/usr`, and first by a binary installed there, so
@@ -158,6 +166,7 @@ for presets. On an older distribution than Debian 12, build from source instead.
 | `/usr/lib/systemd/user/fxsound.service` | `systemctl --user enable --now fxsound` |
 | `/usr/share/dbus-1/services/org.fxsound.FxSound.service` | starts FxSound, through that unit, for a D-Bus call |
 | `/usr/share/icons/hicolor/*/apps/fxsound.png` | the icon |
+| `/usr/share/icons/hicolor/*/apps/com.fxsound.FxSound.png` | the same icon under the application id, the name the notifications carry |
 | `/usr/share/icons/hicolor/scalable/status/` | the tray's three status icons |
 | `/usr/share/man/man1/fxsound.1` | the manual page: every option, the status document and the D-Bus interface |
 | `/usr/share/metainfo/com.fxsound.FxSound.metainfo.xml` | what GNOME Software and Discover show |
@@ -167,7 +176,9 @@ for presets. On an older distribution than Debian 12, build from source instead.
 FxSound started by the user unit — enabled, or by a D-Bus call such as a status bar's — runs in the
 systemd user manager's environment, not the compositor's. Where the compositor does not import
 `WAYLAND_DISPLAY` into it (sway, and Hyprland without uwsm), that FxSound has no display: it runs in
-the tray, and asking for its window brings a notification that it could not be opened instead. Import
+the tray, and asking for its window brings a notification that it could not be opened instead. A
+window raised only because «Like FxSound for Windows» is on — a forwarded Windows command line —
+that cannot be opened is just logged, and FxSound keeps running, with or without a tray. Import
 it when the compositor starts, with `exec dbus-update-activation-environment --systemd
 WAYLAND_DISPLAY DISPLAY` in sway (`exec-once = ...` in Hyprland).
 
@@ -220,6 +231,8 @@ and a list scrolls between the title bar and the window's bottom edge, over its 
 is no room under it — in the Lite view, four rows of the menu and two and a half of a list show at
 a time. FxSound gives the compositor each view's size as the window's smallest and largest, so
 flipping between Pro and Lite and opening Settings resize a floating window on Hyprland too.
+COSMIC (cosmic-comp 1.9) does not take the new size and keeps the window at the Pro size, so the
+Lite view and the Settings pages are drawn scaled inside it.
 
 Global shortcuts are the one feature that cannot work the way it does on Windows. A Wayland client
 is not allowed to grab keys it does not have focus for — that is a deliberate security property of
@@ -287,6 +300,11 @@ fxsound --watch --json | jq --unbuffered -c -n '
 The module hides while FxSound is not running, and `restart-interval` picks the stream up again
 once it is. `--meters` adds the microphone's readouts, at most four times a second.
 
+The JSON is meant to be built on. Its `schema` (3), and `v` in each event, are compatibility
+numbers: a new key never changes them, so read the keys you know and ignore the rest; a key
+removed, renamed or given another meaning or type would raise them, and FxSound gives a changed
+meaning a key of its own instead. `man fxsound` has the rule under *STATUS DOCUMENT*.
+
 The same commands are a D-Bus interface, `org.fxsound.FxSound` at `/org/fxsound/FxSound` on the
 session bus, for anything that would rather hold a connection than start a process:
 
@@ -337,7 +355,10 @@ page and metainfo — and never touches a running FxSound. Every package's CI jo
 FxSound publishes its own sink. Everything written there is processed and rendered to whichever real
 device you pick in the app. That is the same shape as the Windows virtual driver, implemented with
 PipeWire nodes instead of a kernel driver — which also means uninstalling is `pkill fxsound` and
-your audio comes straight back.
+your audio comes straight back. The one exception is
+[*Smooth moves in WirePlumber*](#deliberate-differences-from-the-windows-build): once ticked, it
+leaves a script for WirePlumber in your home, which no package removes — untick it before
+uninstalling.
 
 A microphone is a second lane beside it, not a switch: a capture stream from the microphone you pick
 runs [the voice chain](#the-microphone-chain) and feeds a virtual source, `FxSound (Input)`, that
@@ -532,13 +553,14 @@ The equalizer's curve is the response the equalizer really has, filter width and
 Windows build joins the band values with straight lines: bands boosted side by side add up, and a
 narrower filter width draws a narrower peak. The first and last band's wheels on five and ten bands
 turn both ways, reaching half a band past the ladder (on ten bands 46 Hz and 20 kHz); a preset
-exported for Windows has such a band put back at 62.5 Hz or 16 kHz, where its wheels stop.
-**Ctrl+Alt**+drag on a band solos it, as Alt+drag does on Windows: every other band sinks to
-−10 dB while you listen and comes back when you let go, or when a preset, the band count or the
-lane changes under it, and the preset is not marked as changed. The solo is offered while the
-equalizer plays, not while it is switched off. A press on a band's knob moves nothing until the
-pointer does, as on the sliders, and a band held when a preset, the band count or the lane arrives
-from elsewhere stays where the new curve puts it until you let go.
+exported for Windows has such a band put back at 62.5 Hz or 16 kHz, where its wheels stop, unless,
+at «Like FxSound for Windows» = Interface and sound, "Keep the end bands where they are" is ticked
+in the Export window (`--export-unshifted`). **Ctrl+Alt**+drag on a band solos it, as Alt+drag does
+on Windows: every other band sinks to −10 dB while you listen and comes back when you let go, or
+when a preset, the band count or the lane changes under it, and the preset is not marked as changed.
+The solo is offered while the equalizer plays, not while it is switched off. A press on a band's
+knob moves nothing until the pointer does, as on the sliders, and a band held when a preset, the
+band count or the lane arrives from elsewhere stays where the new curve puts it until you let go.
 
 A preset lands on your band count, as in the original since 1.2.11: pick a ten-band preset while on
 31 bands and its curve is fitted onto the 31, and changing the band count carries the curve over
@@ -552,7 +574,9 @@ Unsaved edits are kept in `AutoSave/` a minute after the first one and whenever 
 or quit, so a crash loses at most a minute. **Delete Preset** asks first and moves the file to the
 desktop's trash, where a file manager can restore it, and its unsaved edits with it: restore both
 and the preset is back with its `*`. **Save New Preset** also copies a preset with
-no unsaved changes. A new preset's name is cut to the 126 bytes a Windows FxSound reads a name in
+no unsaved changes, and **Export Presets** and **Import Presets** work with unsaved changes; at
+«Like FxSound for Windows» = Interface, as on Windows, the first waits for changes and the other two
+for none. A new preset's name is cut to the 126 bytes a Windows FxSound reads a name in
 (63 Cyrillic letters), and a line break or a tab in it becomes a space. Saving over one of your
 presets writes the file it was listed from, whatever that file is called, so a preset 0.3.0 saved
 as `Rock:Live.fac` keeps its file, and the unsaved edits 0.3.0 left in `AutoSave/` come back with
@@ -563,11 +587,14 @@ The settings file keeps the original's key names so it can be diffed against the
 `FxSound.settings`. Settings and presets are written durably — temporary file, fsync, rename — so an
 interrupted save cannot truncate what was there. A settings file that does not load (a typo, a
 comment saved in a legacy encoding, permissions) is moved aside to `settings.toml.bad`, or
-`settings.toml.2.bad` and so on, never over an earlier one, before the defaults are saved. A
-settings file or preset that is a symbolic link, as GNU Stow or chezmoi leave them, stays one: the
-file it points to is the one replaced. A link to a read-only file, or to one in a directory you may
-not write, is never saved through, so every save of that file fails. home-manager's default links
-into the Nix store are such links; link the file with `mkOutOfStoreSymlink` to let FxSound save it.
+`settings.toml.2.bad` and so on, never over an earlier one, before the defaults are saved. Keys this
+version does not know, such as those a later version wrote, are kept and written back as they
+were, at the top of the file and inside a device's entry or the calibration record; 0.4.0 drops
+them on its next save. A settings file or preset that is a symbolic link, as GNU
+Stow or chezmoi leave them, stays one: the file it points to is the one replaced. A link to a
+read-only file, or to one in a directory you may not write, is never saved through, so every save of
+that file fails. home-manager's default links into the Nix store are such links; link the file with
+`mkOutOfStoreSymlink` to let FxSound save it.
 
 ## A preset per application
 
@@ -642,20 +669,24 @@ Each of these is a considered decision, not an oversight:
   refused exactly where the hamburger menu greys the item out — an overwrite or rename of a
   factory preset, a rename with unsaved changes, a name already taken, the user-preset limit —
   with the reason on stderr, exit status 1, and `org.fxsound.FxSound.Error.Refused` on D-Bus.
+  «Like FxSound for Windows» = Interface greys the window's list and menu items and drops the tray's
+  preset menu with the power again; the command line and D-Bus still work.
 - **Global hotkeys live in the compositor.** See above.
 - **Window position is not restored.** Wayland gives a client no way to place its own toplevel, so
   the compositor places the window.
 - **The command line raises the window only when asked to.** On Windows every option but `--status`
   shows and raises the window; here only `--show`, `--view` and `fxsound` with no options do, so a
   keybind or a script sets a preset, the power or an effect without the window jumping in front —
-  and a line of such options that starts FxSound starts it in the tray.
+  and a line of such options that starts FxSound starts it in the tray. «Like FxSound for Windows»
+  = Interface raises it again for the options Windows has; the keybind options and D-Bus never do.
 - **The command line says what it will not do.** Two preset options on one line (`--save_preset=A
   --preset=B`, which Windows reads as `--preset=B` alone), a new preset name that is nothing once the
   characters a `.fac` name cannot hold are gone, and a `--language` FxSound has no translation for
   are parse errors; a band list naming a band the equalizer does not have (`--set_band_gain=12:2` on
-  ten bands), or a `--set_band_freq` outside the band's range, is refused whole with the band named.
-  Windows ignores all of them without a word. `--language` also takes the ISO codes Windows spells
-  its own way (`uk`, `bs`, `nb`) and locales.
+  ten bands), or a `--set_band_freq` outside the band's range, is refused whole with the band named
+  (at «Like FxSound for Windows» = Interface the pairs that fit are set and the rest skipped, with a
+  note). Windows ignores all of them without a word. `--language` also takes the ISO codes Windows
+  spells its own way (`uk`, `bs`, `nb`) and locales.
 - **Every option works when it starts FxSound.** Windows drops the band lists, `--set_effect` and
   the preset commands (`--next-preset` from a keybind included) when there is no FxSound running
   for them; here the start carries them out on the preset it selects. `--next-output` and
@@ -664,7 +695,7 @@ Each of these is a considered decision, not an oversight:
 - **Two device menus in the tray.** The playback devices are under *Playback Device Select* and the
   microphones under *Recording Device Select*, and a long device name is shortened in its middle,
   where Windows cut every name after 30 characters and PipeWire's names of one card's outputs all
-  looked alike.
+  looked alike. «Like FxSound for Windows» = Interface cuts the playback devices after 30 again.
 - **No Donate button, no update check, no bonus-preset download, no Help center.** The heart in
   the title bar and the Donate items in the menu and the tray are gone: this fork is not the
   upstream developers' product and must not solicit money for them. "Check for updates" and the
@@ -680,11 +711,16 @@ Each of these is a considered decision, not an oversight:
   unless one is picked in Settings ▸ General or with `--language <code>` (`--language system`
   returns to following the desktop). The switch lists English and then every language by its own
   name, in alphabetical order, where Windows used an order of its own and called three of them by
-  the wrong word (Turkish "Türk", Thai "แบบไทย", Czech "Česky"). Strings this port added are in
+  the wrong word (Turkish "Türk", Thai "แบบไทย", Czech "Česky"). «Like FxSound for Windows» = Interface
+  brings back the Windows order, not the wrong words. Strings this port added are in
   `assets/translations/port/`. Right-to-left scripts render left-to-right — egui has no bidi.
 - **Desktop notifications** for preset, output and power changes, the way the original's tray
   balloons announce them, through `org.freedesktop.Notifications`; *Hide notifications* in Settings
-  silences them.
+  silences them. What has to be seen — where the window went, a lost output, a refused save, the
+  power toggled from a keybind, a change made while the window is hidden or minimised — is sent at
+  normal urgency; a preset or an output picked in the window is sent at low urgency, which GNOME
+  files in the message list without a banner. Every notice stays in GNOME's list until it is
+  dismissed or FxSound quits.
 - **FxSound takes the session default automatically — politely.** Picking an output device makes
   `FxSound (Output)` the default sink so every application plays through it without any manual
   routing; the previous default is remembered first and handed back on exit or when a lane is
@@ -700,14 +736,74 @@ Each of these is a considered decision, not an oversight:
   takes them onto their presets again (a stream that holds on to its preset's node by itself stays
   there, unprocessed). While it is off, the device lists show the system's
   default device, which is where the sound goes; a device picked then is the one FxSound takes
-  over when the power comes back on.
+  over when the power comes back on. Moving an application in the middle of its sound used to
+  click; FxSound now fades each application it is about to have moved to silence, and back in once
+  it plays or records where it went — a short dip of about a tenth of a second instead of a click,
+  for the power button and for an application's own preset switched on or off. Now and then —
+  for a recording application, about one power switch in a hundred — PipeWire itself still plays a
+  moment at full volume before the fade (it applies a new volume just before it starts the ramp
+  to it), and that one clicks as before. The desktop's own device switcher still moves
+  applications as plain Linux does, click and all — unless *Smooth moves in WirePlumber* is ticked
+  (below).
+- **Smooth moves in WirePlumber (Settings ▸ Experimental, off by default).** A device picked in the
+  desktop's sound settings is moved by WirePlumber itself, before FxSound hears of it, so only
+  WirePlumber can fade that move. Ticked, FxSound puts a small WirePlumber 0.5 script,
+  `~/.local/share/wireplumber/scripts/fxsound/fade-on-move.lua`, and the fragment that loads it,
+  `~/.config/wireplumber/wireplumber.conf.d/90-fxsound-fade-on-move.conf`, where WirePlumber reads
+  them: every stream WirePlumber moves while it plays — with FxSound or without, on or off — is
+  faded out before the move and back in after it, a dip of about a tenth of a second instead of the
+  click (measured below −52 dBFS where it was −19 to −28). It changes WirePlumber's own policy for
+  every application, needs WirePlumber 0.5 or newer (Ubuntu 24.04 ships 0.4, and the box is greyed
+  out there), and WirePlumber reads it only when it starts: the pane then offers *Restart
+  WirePlumber* (not after ticking and unticking again under the same WirePlumber), which asks first,
+  since every application's sound stops for a moment, and restarts it with
+  `systemctl --user try-restart wireplumber`, in the background, so the window never waits for it —
+  a WirePlumber not started by systemd takes the change at the next login. The script is loaded as
+  an optional component: one that fails on a later WirePlumber is logged and skipped, and never
+  stops WirePlumber. Unticking deletes both files; by hand, delete them and restart WirePlumber.
+  Untick it before uninstalling FxSound or going back to 0.4.0: the package manager does not touch
+  files in your home, and only FxSound 0.5.0 or later takes them away, so WirePlumber would go on
+  loading the script with no FxSound left to untick it. Otherwise delete the two files and run
+  `systemctl --user restart wireplumber`.
+  With *Follow the system's default device* ticked and the power off, FxSound's own lane moving to
+  the picked device still clicks the application that has just arrived there. An application closed
+  in the tenth of a second the script holds it silent keeps its own volume: WirePlumber, which keeps
+  each application's volume for its next start, never sees the script's silence, nor a point of its
+  fades PipeWire reports on the way, and the script says the volume once more once its fade back is
+  over, until PipeWire shows it. While it holds an application it says so in the `default` metadata
+  (`fxsound.held`), and FxSound's own fade leaves that application to it. An application whose own
+  libpipewire is older than 0.3.68 has no ramp to fade with, and is moved as it is. An application
+  whose new link fails — a recorder WirePlumber strands between a mono microphone and FxSound's
+  stereo source — gets its volume back only once FxSound has linked it again, and one WirePlumber
+  has not moved yet when FxSound takes the default back is left to the script rather than faded by
+  FxSound too. Should an application ever start silent while the desktop's mixer shows 100 % all the
+  same, `pw-cli set-param <id> Props '{ volume: 1.0 }'` on its node while it plays gives it its
+  volume back for good (`wpctl status` lists the ids).
+- **Changing the device keeps `FxSound (Output)` and `FxSound (Input)`.** A lane moved to another
+  device — picked in FxSound, `--output`, `--next-output`, `--input`, or followed from the
+  desktop's sound settings — replaces only its own stream on the device when the new one takes the
+  same channel count and rate, so nothing playing or recording through FxSound is moved: the sound
+  dips for about a tenth of a second instead of clicking twice as WirePlumber moved it away and
+  back. After a pick in the desktop's sound settings, WirePlumber's own move to the picked device
+  still clicks as plain Linux does where the application arrives, unprocessed; on the speakers
+  FxSound was playing through, the part of the sound it had not played yet fades out over 10 ms,
+  as it does whenever an application is taken off FxSound in the middle of its sound (the preset's
+  ring-out after it is dropped, and the next sound fades in over 30 ms), and FxSound's taking the
+  default back is faded. A device with another channel count or rate still has both
+  nodes built anew, as before.
+- **An application silenced in the middle of a move gets its volume back.** For that tenth of a
+  second FxSound keeps each faded application's volume in `~/.local/state/fxsound/handover.toml`.
+  Should FxSound be killed right then, the application is left silent — WirePlumber even keeps the
+  silence for its next start, while the desktop's mixer shows 100 % — and the next start of
+  FxSound gives it its volume back. Without FxSound, `pw-cli set-param <id> Props '{ volume: 1.0 }'`
+  on the application's node while it plays does the same (`wpctl status` lists the ids).
 - **The device priority list can be told to step aside.** Settings ▸ Audio's list (and Settings ▸
   Microphone's list of microphones, a port addition) picks the device as the Windows build's does:
   every device seen joins it, at the bottom or, with *Prioritize new output devices*, at the top.
   *Follow the system's default device*, which the Windows build does not have (its issue #629),
   hands that choice back to the desktop's sound settings and keeps the list for later: a device
   picked there moves the lane and FxSound stays the default, even after a device was picked in
-  FxSound. A device that
+  FxSound, and the next start begins on the device picked there last. A device that
   is not connected has a ✕ beside it that forgets it and the preset it remembers, and
   `fxsound --forget-device=NAME` (D-Bus `ForgetDevice`) does the same from a script. With no
   FxSound running it forgets the name from the settings file and exits, without starting FxSound.
@@ -742,10 +838,25 @@ Each of these is a considered decision, not an oversight:
 The original's painting slips are fixed rather than reproduced: the slider fill no longer overshoots
 its track by 8 px, the balance gradient no longer ends 8 px early, and the lit slider thumb is drawn
 at its 16 points instead of a quarter of that (`widgets::slider::Fidelity::Faithful` keeps the first
-two for comparison). In the light theme the power-off spectrum and a bypassed equalizer go a grey
-that can be seen instead of white, the Settings rule and the menu's edge get a colour that shows on
-the light background, and Settings' tab captions are set smaller where a translation would run
-past the rule.
+two, and «Like FxSound for Windows» = Interface paints them). In the light theme the power-off
+spectrum and a bypassed equalizer go a grey that can be seen instead of white, the Settings rule and
+the menu's edge get a colour that shows on the light background, and Settings' tab captions are set
+smaller where a translation would run past the rule.
+
+«Like FxSound for Windows» = Interface puts the window back the way the Windows build draws and
+works it, and changes nothing you hear or have saved: the master gain and the balance step by 2 dB,
+the volume leveling reads "dB", the light theme's power-off graphs turn white and its rules nearly
+vanish again, the slider fill overshoots as it did, a long preset name loses its ` *` with the
+cut, the equalizer's curve joins the band values with straight lines, the first and last wheels on
+five and ten bands turn one way from 62.5 Hz and 16 kHz (a band a preset already put further out
+stays there and can only come back in), a right-click on an effect slider moves it as a click does
+instead of switching the effect off, the tooltips are the Windows build's own and no more (none on
+the title bar, the flip button or the level sliders, none of the right-click and solo lines), the
+Audio, General and Help captions are set in the normal font and cut where their button ends, the
+language switch runs in the Windows order (with the right names), and with the power off the preset
+list, the menu's preset items and the tray's preset menu go grey or away — the command line and
+D-Bus still pick presets. The port's own features, the microphone lane, the applications' presets
+and the other Settings tabs among them, stay as they are.
 
 ## Implementation status
 
@@ -803,6 +914,19 @@ against a Mesa driver before calling it an upstream bug.
 packaging/fxsound.1` to read it there) is the reference for using it: every option and its exit
 status, the `--status --json` document key by key, the `--watch` events, the D-Bus methods,
 properties and signals, and the files FxSound reads and writes.
+
+[`docs/0.5.0-windows-parity.md`](docs/0.5.0-windows-parity.md) is the contract of «Like FxSound
+for Windows»: its levels (three in 0.5.0; Everything, which hides the port's own features, comes
+later), which of the port's changes and features each one reverts or hides and which none ever
+does, and the setting, option, D-Bus members and status keys that carry it.
+[`docs/0.5.0-dsp-inventory.md`](docs/0.5.0-dsp-inventory.md) lists every change to the output
+lane's sound since the engine before the 0.4.0 audit, with the level each one belongs to, and
+`scripts/windows-parity-bitexact.sh <commit>` holds the output lane to another build of itself bit
+for bit — every shipped preset as the application plays it, on 10, 20 and 31 bands; CI holds it to
+`v0.4.0`, and with `--compat=windows` holds Interface and sound to the engine before the 0.4.0
+audit from a cold start. Where the Windows C code is the reference instead (Ambience, the balance
+on surround), `scripts/windows-vectors/build.sh` compiles it into the golden vectors the unit
+tests hold.
 
 `docs/0.4.0-design.md`, `docs/0.4.0-upstream.md` and `docs/0.4.0-apps.md` record how 0.4.0 was
 built: the two lanes, the voice chain's new stages, D-Bus and the event stream; what was taken from

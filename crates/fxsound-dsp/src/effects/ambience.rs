@@ -27,6 +27,7 @@
 use super::{Effect, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE};
 use crate::biquad::Real;
 use crate::smooth::{Ramp, glide_frames};
+use fxsound_core::DspCompat;
 use std::fmt;
 
 // ---------------------------------------------------------------------------------------------
@@ -392,12 +393,43 @@ pub struct Ambience {
     active: bool,
     /// Which channels the single stereo instance runs over; `None` means the first two.
     front_pair: Option<(usize, usize)>,
+    /// Whose mapping from the amount to the tank and the mix runs ([`Ambience::set_compat`]).
+    compat: DspCompat,
 }
 
 impl Ambience {
     /// Which channels are the front pair. `None` falls back to the first two.
     pub fn set_front_pair(&mut self, pair: Option<(usize, usize)>) {
         self.front_pair = pair;
+    }
+
+    /// Map the amount as FxSound for Linux does, or as the Windows build does («Like FxSound for
+    /// Windows» = Interface and sound; audit report #39, whose reference is the Windows C code,
+    /// `dfxp_CommunicateAmbience`).
+    ///
+    /// The two differ in the wet/dry pair and nowhere else: the bypass test is on the stored
+    /// value either way, as the original's is, and the decay and the diffusers' coefficient come
+    /// from the same quantiser. For the stored values 13 to 38 the Windows build lets the warp run
+    /// off the end of its range — wet −0.078 and dry 1.029 at 13, a tail in opposite phase, and
+    /// none at 38 — where FxSound for Linux ramps from the bypass to the warp's pair at 39
+    /// ([`FIRST_WARPED_ABOVE_THRESHOLD_MIDI`]). Above that the Windows arithmetic is taken as the
+    /// C writes it: its constants are `double` products, where this port's are `f32`, and at 23
+    /// stored values from 6 to 97 the two pairs are a unit in the last place apart.
+    ///
+    /// Switching glides the pair to its new value as a new amount does; the tank carries on.
+    pub fn set_compat(&mut self, compat: DspCompat) {
+        if compat == self.compat {
+            return;
+        }
+        self.compat = compat;
+        let amount = self.amount;
+        self.set_amount(amount);
+    }
+
+    /// Whose mapping runs ([`Ambience::set_compat`]).
+    #[must_use]
+    pub const fn compat(&self) -> DspCompat {
+        self.compat
     }
 
     /// Build the reverb, sized for the worst case the original supports.
@@ -434,6 +466,7 @@ impl Ambience {
             amount: 0.0,
             active: false,
             front_pair: None,
+            compat: DspCompat::Linux,
         };
         effect.design();
         effect.set_amount(0.0);
@@ -724,6 +757,21 @@ fn warped_wet_dry(warped: i32) -> (Real, Real) {
     (wet, dry)
 }
 
+/// The wet/dry pair of the Windows build for a warped value, as `dfxpComm.cpp:619-632` computes
+/// it, the `double` constants included: the fixed pair above 40, and below it the warp for every
+/// warped value, off the end of its range too (the stage is bypassed at stored 12 and below, so
+/// that end is only reached from stored 13 to 38).
+fn windows_wet_dry(warped: i32) -> (Real, Real) {
+    if warped > 40 {
+        ((0.21_f64 * 1.3) as Real, (0.69_f64 * 1.3) as Real)
+    } else {
+        let wet = (f64::from(warped - 12) * (1.0 / (40.0 - 12.0)) * (0.21 * 1.3)) as Real;
+        let dry = 0.897_f32
+            + (f64::from(40 - warped) * (1.0 / (40.0 - 12.0))) as Real * (1.0_f64 - 0.897) as Real;
+        (wet, dry)
+    }
+}
+
 /// `DAW_MIN_SAMPLING_FREQ`…`DAW_MAX_SAMPLING_FREQ` (`u_dfxp.h:44-45`), with non-finite input
 /// pinned to the bottom of the range so the layout can never be asked for a nonsense length.
 fn clamp_rate(sample_rate: Real) -> Real {
@@ -784,7 +832,9 @@ impl Effect for Ambience {
         self.decay = f64::from(decay).powf(f64::from(ROOM_SIZE)) as Real;
         self.lat6_coeff = (self.decay + 0.15).clamp(0.25, 0.5);
 
-        if warped > 40 {
+        if self.compat.windows() {
+            (self.wet_gain, self.dry_gain) = windows_wet_dry(warped);
+        } else if warped > 40 {
             self.wet_gain = WET_MAX;
             self.dry_gain = DRY_MIN;
         } else if warped > MIN_EFFECTIVE_MIDI {
@@ -1773,5 +1823,990 @@ mod tests {
         let mut last = tone(1);
         stage.process(&mut last, 2);
         assert!(!stage.is_active(), "the fade did not end after 20 ms");
+    }
+
+    /// The Windows build's Ambience parameters for every stored value 0 to 127 — `(runs, decay,
+    /// lat6 coefficient, wet, dry)` — made as `docs/spec/09-dsp-eq.md` §13's vectors are:
+    /// `dfxp_CommunicateAmbience` and `dfxp_CommAmbienceBypass` (`dfxpComm.cpp:571-679`,
+    /// `:1662-1691`) with the two quantisers they read (`Qntitor.cpp`, `dfxpQnt.cpp:144-184`),
+    /// transcribed statement for statement with `realtype = float` and compiled as C with glibc's
+    /// libm on x86-64 (`scripts/windows-vectors/build.sh`). A2 of «Like FxSound for Windows».
+    #[allow(clippy::unreadable_literal, clippy::excessive_precision)]
+    const WINDOWS_PARAMETERS: [(bool, Real, Real, Real, Real); 128] = [
+        (
+            false,
+            9.412367642e-02,
+            2.500000000e-01,
+            -1.169999987e-01,
+            1.044142842e+00,
+        ),
+        (
+            false,
+            9.412367642e-02,
+            2.500000000e-01,
+            -1.169999987e-01,
+            1.044142842e+00,
+        ),
+        (
+            false,
+            9.412367642e-02,
+            2.500000000e-01,
+            -1.169999987e-01,
+            1.044142842e+00,
+        ),
+        (
+            false,
+            9.585261345e-02,
+            2.500000000e-01,
+            -1.072499976e-01,
+            1.040464282e+00,
+        ),
+        (
+            false,
+            9.585261345e-02,
+            2.500000000e-01,
+            -1.072499976e-01,
+            1.040464282e+00,
+        ),
+        (
+            false,
+            9.585261345e-02,
+            2.500000000e-01,
+            -1.072499976e-01,
+            1.040464282e+00,
+        ),
+        (
+            false,
+            9.761329740e-02,
+            2.500000000e-01,
+            -9.749999642e-02,
+            1.036785722e+00,
+        ),
+        (
+            false,
+            9.761329740e-02,
+            2.500000000e-01,
+            -9.749999642e-02,
+            1.036785722e+00,
+        ),
+        (
+            false,
+            9.761329740e-02,
+            2.500000000e-01,
+            -9.749999642e-02,
+            1.036785722e+00,
+        ),
+        (
+            false,
+            9.940632433e-02,
+            2.500000000e-01,
+            -8.775000274e-02,
+            1.033107162e+00,
+        ),
+        (
+            false,
+            9.940632433e-02,
+            2.500000000e-01,
+            -8.775000274e-02,
+            1.033107162e+00,
+        ),
+        (
+            false,
+            9.940632433e-02,
+            2.500000000e-01,
+            -8.775000274e-02,
+            1.033107162e+00,
+        ),
+        (
+            false,
+            1.012322903e-01,
+            2.512322962e-01,
+            -7.800000161e-02,
+            1.029428601e+00,
+        ),
+        (
+            true,
+            1.012322903e-01,
+            2.512322962e-01,
+            -7.800000161e-02,
+            1.029428601e+00,
+        ),
+        (
+            true,
+            1.012322903e-01,
+            2.512322962e-01,
+            -7.800000161e-02,
+            1.029428601e+00,
+        ),
+        (
+            true,
+            1.030917987e-01,
+            2.530918121e-01,
+            -6.825000048e-02,
+            1.025750041e+00,
+        ),
+        (
+            true,
+            1.030917987e-01,
+            2.530918121e-01,
+            -6.825000048e-02,
+            1.025750041e+00,
+        ),
+        (
+            true,
+            1.030917987e-01,
+            2.530918121e-01,
+            -6.825000048e-02,
+            1.025750041e+00,
+        ),
+        (
+            true,
+            1.049854606e-01,
+            2.549854517e-01,
+            -5.849999934e-02,
+            1.022071481e+00,
+        ),
+        (
+            true,
+            1.049854606e-01,
+            2.549854517e-01,
+            -5.849999934e-02,
+            1.022071481e+00,
+        ),
+        (
+            true,
+            1.049854606e-01,
+            2.549854517e-01,
+            -5.849999934e-02,
+            1.022071481e+00,
+        ),
+        (
+            true,
+            1.069139019e-01,
+            2.569139004e-01,
+            -4.874999821e-02,
+            1.018392920e+00,
+        ),
+        (
+            true,
+            1.069139019e-01,
+            2.569139004e-01,
+            -4.874999821e-02,
+            1.018392920e+00,
+        ),
+        (
+            true,
+            1.069139019e-01,
+            2.569139004e-01,
+            -4.874999821e-02,
+            1.018392920e+00,
+        ),
+        (
+            true,
+            1.088777781e-01,
+            2.588777840e-01,
+            -3.900000080e-02,
+            1.014714360e+00,
+        ),
+        (
+            true,
+            1.088777781e-01,
+            2.588777840e-01,
+            -3.900000080e-02,
+            1.014714360e+00,
+        ),
+        (
+            true,
+            1.088777781e-01,
+            2.588777840e-01,
+            -3.900000080e-02,
+            1.014714360e+00,
+        ),
+        (
+            true,
+            1.108777225e-01,
+            2.608777285e-01,
+            -2.924999967e-02,
+            1.011035681e+00,
+        ),
+        (
+            true,
+            1.108777225e-01,
+            2.608777285e-01,
+            -2.924999967e-02,
+            1.011035681e+00,
+        ),
+        (
+            true,
+            1.108777225e-01,
+            2.608777285e-01,
+            -2.924999967e-02,
+            1.011035681e+00,
+        ),
+        (
+            true,
+            1.129143983e-01,
+            2.629144192e-01,
+            -1.950000040e-02,
+            1.007357121e+00,
+        ),
+        (
+            true,
+            1.129143983e-01,
+            2.629144192e-01,
+            -1.950000040e-02,
+            1.007357121e+00,
+        ),
+        (
+            true,
+            1.129143983e-01,
+            2.629144192e-01,
+            -1.950000040e-02,
+            1.007357121e+00,
+        ),
+        (
+            true,
+            1.149884909e-01,
+            2.649884820e-01,
+            -9.750000201e-03,
+            1.003678560e+00,
+        ),
+        (
+            true,
+            1.149884909e-01,
+            2.649884820e-01,
+            -9.750000201e-03,
+            1.003678560e+00,
+        ),
+        (
+            true,
+            1.149884909e-01,
+            2.649884820e-01,
+            -9.750000201e-03,
+            1.003678560e+00,
+        ),
+        (
+            true,
+            1.171006784e-01,
+            2.671006918e-01,
+            0.000000000e+00,
+            1.000000000e+00,
+        ),
+        (
+            true,
+            1.171006784e-01,
+            2.671006918e-01,
+            0.000000000e+00,
+            1.000000000e+00,
+        ),
+        (
+            true,
+            1.171006784e-01,
+            2.671006918e-01,
+            0.000000000e+00,
+            1.000000000e+00,
+        ),
+        (
+            true,
+            1.192516685e-01,
+            2.692516744e-01,
+            9.750000201e-03,
+            9.963214397e-01,
+        ),
+        (
+            true,
+            1.192516685e-01,
+            2.692516744e-01,
+            9.750000201e-03,
+            9.963214397e-01,
+        ),
+        (
+            true,
+            1.192516685e-01,
+            2.692516744e-01,
+            9.750000201e-03,
+            9.963214397e-01,
+        ),
+        (
+            true,
+            1.214421615e-01,
+            2.714421749e-01,
+            1.950000040e-02,
+            9.926428795e-01,
+        ),
+        (
+            true,
+            1.214421615e-01,
+            2.714421749e-01,
+            1.950000040e-02,
+            9.926428795e-01,
+        ),
+        (
+            true,
+            1.214421615e-01,
+            2.714421749e-01,
+            1.950000040e-02,
+            9.926428795e-01,
+        ),
+        (
+            true,
+            1.236728951e-01,
+            2.736729085e-01,
+            2.924999967e-02,
+            9.889643192e-01,
+        ),
+        (
+            true,
+            1.236728951e-01,
+            2.736729085e-01,
+            2.924999967e-02,
+            9.889643192e-01,
+        ),
+        (
+            true,
+            1.236728951e-01,
+            2.736729085e-01,
+            2.924999967e-02,
+            9.889643192e-01,
+        ),
+        (
+            true,
+            1.259446144e-01,
+            2.759446204e-01,
+            3.900000080e-02,
+            9.852857590e-01,
+        ),
+        (
+            true,
+            1.259446144e-01,
+            2.759446204e-01,
+            3.900000080e-02,
+            9.852857590e-01,
+        ),
+        (
+            true,
+            1.282580346e-01,
+            2.782580256e-01,
+            4.874999821e-02,
+            9.816071391e-01,
+        ),
+        (
+            true,
+            1.282580346e-01,
+            2.782580256e-01,
+            4.874999821e-02,
+            9.816071391e-01,
+        ),
+        (
+            true,
+            1.282580346e-01,
+            2.782580256e-01,
+            4.874999821e-02,
+            9.816071391e-01,
+        ),
+        (
+            true,
+            1.306139827e-01,
+            2.806139886e-01,
+            5.849999934e-02,
+            9.779285789e-01,
+        ),
+        (
+            true,
+            1.306139827e-01,
+            2.806139886e-01,
+            5.849999934e-02,
+            9.779285789e-01,
+        ),
+        (
+            true,
+            1.306139827e-01,
+            2.806139886e-01,
+            5.849999934e-02,
+            9.779285789e-01,
+        ),
+        (
+            true,
+            1.330131739e-01,
+            2.830131650e-01,
+            6.825000048e-02,
+            9.742500186e-01,
+        ),
+        (
+            true,
+            1.330131739e-01,
+            2.830131650e-01,
+            6.825000048e-02,
+            9.742500186e-01,
+        ),
+        (
+            true,
+            1.330131739e-01,
+            2.830131650e-01,
+            6.825000048e-02,
+            9.742500186e-01,
+        ),
+        (
+            true,
+            1.354564577e-01,
+            2.854564786e-01,
+            7.800000161e-02,
+            9.705714583e-01,
+        ),
+        (
+            true,
+            1.354564577e-01,
+            2.854564786e-01,
+            7.800000161e-02,
+            9.705714583e-01,
+        ),
+        (
+            true,
+            1.354564577e-01,
+            2.854564786e-01,
+            7.800000161e-02,
+            9.705714583e-01,
+        ),
+        (
+            true,
+            1.379446238e-01,
+            2.879446149e-01,
+            8.775000274e-02,
+            9.668928385e-01,
+        ),
+        (
+            true,
+            1.379446238e-01,
+            2.879446149e-01,
+            8.775000274e-02,
+            9.668928385e-01,
+        ),
+        (
+            true,
+            1.379446238e-01,
+            2.879446149e-01,
+            8.775000274e-02,
+            9.668928385e-01,
+        ),
+        (
+            true,
+            1.404784918e-01,
+            2.904784977e-01,
+            9.749999642e-02,
+            9.632142782e-01,
+        ),
+        (
+            true,
+            1.404784918e-01,
+            2.904784977e-01,
+            9.749999642e-02,
+            9.632142782e-01,
+        ),
+        (
+            true,
+            1.404784918e-01,
+            2.904784977e-01,
+            9.749999642e-02,
+            9.632142782e-01,
+        ),
+        (
+            true,
+            1.430589110e-01,
+            2.930589318e-01,
+            1.072499976e-01,
+            9.595357180e-01,
+        ),
+        (
+            true,
+            1.430589110e-01,
+            2.930589318e-01,
+            1.072499976e-01,
+            9.595357180e-01,
+        ),
+        (
+            true,
+            1.430589110e-01,
+            2.930589318e-01,
+            1.072499976e-01,
+            9.595357180e-01,
+        ),
+        (
+            true,
+            1.456867158e-01,
+            2.956867218e-01,
+            1.169999987e-01,
+            9.558571577e-01,
+        ),
+        (
+            true,
+            1.456867158e-01,
+            2.956867218e-01,
+            1.169999987e-01,
+            9.558571577e-01,
+        ),
+        (
+            true,
+            1.456867158e-01,
+            2.956867218e-01,
+            1.169999987e-01,
+            9.558571577e-01,
+        ),
+        (
+            true,
+            1.483627856e-01,
+            2.983627915e-01,
+            1.267500073e-01,
+            9.521785975e-01,
+        ),
+        (
+            true,
+            1.483627856e-01,
+            2.983627915e-01,
+            1.267500073e-01,
+            9.521785975e-01,
+        ),
+        (
+            true,
+            1.483627856e-01,
+            2.983627915e-01,
+            1.267500073e-01,
+            9.521785975e-01,
+        ),
+        (
+            true,
+            1.510880291e-01,
+            3.010880351e-01,
+            1.365000010e-01,
+            9.485000372e-01,
+        ),
+        (
+            true,
+            1.510880291e-01,
+            3.010880351e-01,
+            1.365000010e-01,
+            9.485000372e-01,
+        ),
+        (
+            true,
+            1.510880291e-01,
+            3.010880351e-01,
+            1.365000010e-01,
+            9.485000372e-01,
+        ),
+        (
+            true,
+            1.538633108e-01,
+            3.038633168e-01,
+            1.462499946e-01,
+            9.448214173e-01,
+        ),
+        (
+            true,
+            1.538633108e-01,
+            3.038633168e-01,
+            1.462499946e-01,
+            9.448214173e-01,
+        ),
+        (
+            true,
+            1.538633108e-01,
+            3.038633168e-01,
+            1.462499946e-01,
+            9.448214173e-01,
+        ),
+        (
+            true,
+            1.566895843e-01,
+            3.066895902e-01,
+            1.560000032e-01,
+            9.411428571e-01,
+        ),
+        (
+            true,
+            1.566895843e-01,
+            3.066895902e-01,
+            1.560000032e-01,
+            9.411428571e-01,
+        ),
+        (
+            true,
+            1.566895843e-01,
+            3.066895902e-01,
+            1.560000032e-01,
+            9.411428571e-01,
+        ),
+        (
+            true,
+            1.595677584e-01,
+            3.095677495e-01,
+            1.657499969e-01,
+            9.374642968e-01,
+        ),
+        (
+            true,
+            1.595677584e-01,
+            3.095677495e-01,
+            1.657499969e-01,
+            9.374642968e-01,
+        ),
+        (
+            true,
+            1.595677584e-01,
+            3.095677495e-01,
+            1.657499969e-01,
+            9.374642968e-01,
+        ),
+        (
+            true,
+            1.624988168e-01,
+            3.124988079e-01,
+            1.755000055e-01,
+            9.337857366e-01,
+        ),
+        (
+            true,
+            1.624988168e-01,
+            3.124988079e-01,
+            1.755000055e-01,
+            9.337857366e-01,
+        ),
+        (
+            true,
+            1.624988168e-01,
+            3.124988079e-01,
+            1.755000055e-01,
+            9.337857366e-01,
+        ),
+        (
+            true,
+            1.654836982e-01,
+            3.154836893e-01,
+            1.852499992e-01,
+            9.301071763e-01,
+        ),
+        (
+            true,
+            1.654836982e-01,
+            3.154836893e-01,
+            1.852499992e-01,
+            9.301071763e-01,
+        ),
+        (
+            true,
+            1.654836982e-01,
+            3.154836893e-01,
+            1.852499992e-01,
+            9.301071763e-01,
+        ),
+        (
+            true,
+            1.685234159e-01,
+            3.185234070e-01,
+            1.949999928e-01,
+            9.264286160e-01,
+        ),
+        (
+            true,
+            1.685234159e-01,
+            3.185234070e-01,
+            1.949999928e-01,
+            9.264286160e-01,
+        ),
+        (
+            true,
+            1.685234159e-01,
+            3.185234070e-01,
+            1.949999928e-01,
+            9.264286160e-01,
+        ),
+        (
+            true,
+            1.716189682e-01,
+            3.216189742e-01,
+            2.047500014e-01,
+            9.227499962e-01,
+        ),
+        (
+            true,
+            1.716189682e-01,
+            3.216189742e-01,
+            2.047500014e-01,
+            9.227499962e-01,
+        ),
+        (
+            true,
+            1.747713834e-01,
+            3.247714043e-01,
+            2.144999951e-01,
+            9.190714359e-01,
+        ),
+        (
+            true,
+            1.747713834e-01,
+            3.247714043e-01,
+            2.144999951e-01,
+            9.190714359e-01,
+        ),
+        (
+            true,
+            1.747713834e-01,
+            3.247714043e-01,
+            2.144999951e-01,
+            9.190714359e-01,
+        ),
+        (
+            true,
+            1.779817045e-01,
+            3.279817104e-01,
+            2.242500037e-01,
+            9.153928757e-01,
+        ),
+        (
+            true,
+            1.779817045e-01,
+            3.279817104e-01,
+            2.242500037e-01,
+            9.153928757e-01,
+        ),
+        (
+            true,
+            1.779817045e-01,
+            3.279817104e-01,
+            2.242500037e-01,
+            9.153928757e-01,
+        ),
+        (
+            true,
+            1.812509894e-01,
+            3.312509954e-01,
+            2.339999974e-01,
+            9.117143154e-01,
+        ),
+        (
+            true,
+            1.812509894e-01,
+            3.312509954e-01,
+            2.339999974e-01,
+            9.117143154e-01,
+        ),
+        (
+            true,
+            1.812509894e-01,
+            3.312509954e-01,
+            2.339999974e-01,
+            9.117143154e-01,
+        ),
+        (
+            true,
+            1.845803261e-01,
+            3.345803320e-01,
+            2.437500060e-01,
+            9.080357552e-01,
+        ),
+        (
+            true,
+            1.845803261e-01,
+            3.345803320e-01,
+            2.437500060e-01,
+            9.080357552e-01,
+        ),
+        (
+            true,
+            1.845803261e-01,
+            3.345803320e-01,
+            2.437500060e-01,
+            9.080357552e-01,
+        ),
+        (
+            true,
+            1.879708320e-01,
+            3.379708529e-01,
+            2.535000145e-01,
+            9.043571353e-01,
+        ),
+        (
+            true,
+            1.879708320e-01,
+            3.379708529e-01,
+            2.535000145e-01,
+            9.043571353e-01,
+        ),
+        (
+            true,
+            1.879708320e-01,
+            3.379708529e-01,
+            2.535000145e-01,
+            9.043571353e-01,
+        ),
+        (
+            true,
+            1.914236099e-01,
+            3.414236307e-01,
+            2.632499933e-01,
+            9.006785750e-01,
+        ),
+        (
+            true,
+            1.914236099e-01,
+            3.414236307e-01,
+            2.632499933e-01,
+            9.006785750e-01,
+        ),
+        (
+            true,
+            1.914236099e-01,
+            3.414236307e-01,
+            2.632499933e-01,
+            9.006785750e-01,
+        ),
+        (
+            true,
+            1.949398071e-01,
+            3.449398279e-01,
+            2.730000019e-01,
+            8.970000148e-01,
+        ),
+        (
+            true,
+            1.949398071e-01,
+            3.449398279e-01,
+            2.730000019e-01,
+            8.970000148e-01,
+        ),
+        (
+            true,
+            1.949398071e-01,
+            3.449398279e-01,
+            2.730000019e-01,
+            8.970000148e-01,
+        ),
+        (
+            true,
+            1.985206008e-01,
+            3.485206068e-01,
+            2.730000019e-01,
+            8.970000148e-01,
+        ),
+        (
+            true,
+            1.985206008e-01,
+            3.485206068e-01,
+            2.730000019e-01,
+            8.970000148e-01,
+        ),
+        (
+            true,
+            1.985206008e-01,
+            3.485206068e-01,
+            2.730000019e-01,
+            8.970000148e-01,
+        ),
+        (
+            true,
+            2.021671683e-01,
+            3.521671891e-01,
+            2.730000019e-01,
+            8.970000148e-01,
+        ),
+        (
+            true,
+            2.021671683e-01,
+            3.521671891e-01,
+            2.730000019e-01,
+            8.970000148e-01,
+        ),
+        (
+            true,
+            2.021671683e-01,
+            3.521671891e-01,
+            2.730000019e-01,
+            8.970000148e-01,
+        ),
+        (
+            true,
+            2.058807164e-01,
+            3.558807373e-01,
+            2.730000019e-01,
+            8.970000148e-01,
+        ),
+    ];
+
+    #[test]
+    fn at_interface_and_sound_every_stored_value_gets_the_windows_builds_parameters() {
+        // Audit report #39, reference the Windows C code: the bypass, the decay, the diffusers'
+        // coefficient and the wet/dry pair, bit for bit, for all 128 stored values — 1 to 12
+        // bypassed, 13 to 38 with the warp run off the end of its range.
+        let mut reverb = Ambience::new(48_000.0);
+        reverb.set_compat(DspCompat::Windows);
+        for (midi, &(runs, decay, lat6, wet, dry)) in (0_u8..).zip(WINDOWS_PARAMETERS.iter()) {
+            reverb.set_amount(fxsound_core::scale::midi_to_value(midi));
+            assert_eq!(reverb.active, runs, "stored {midi}");
+            assert_eq!(
+                (
+                    reverb.decay,
+                    reverb.lat6_coeff,
+                    reverb.wet_gain,
+                    reverb.dry_gain
+                ),
+                (decay, lat6, wet, dry),
+                "stored {midi}"
+            );
+        }
+    }
+
+    #[test]
+    fn fxsound_for_linux_differs_from_the_windows_build_below_39_and_by_rounding_above() {
+        let mut linux = Ambience::new(48_000.0);
+        let mut windows = Ambience::new(48_000.0);
+        windows.set_compat(DspCompat::Windows);
+        for midi in 0..=127_u8 {
+            let value = fxsound_core::scale::midi_to_value(midi);
+            linux.set_amount(value);
+            windows.set_amount(value);
+            assert_eq!(linux.active, windows.active, "the same bypass at {midi}");
+            assert_eq!(
+                (linux.decay, linux.lat6_coeff),
+                (windows.decay, windows.lat6_coeff),
+                "the same tank at {midi}"
+            );
+            if midi >= 39 {
+                // A unit in the last place at most: `f32` constants against the C's `double`.
+                let ulp = |a: Real, b: Real| (a - b).abs() <= a.abs() * Real::EPSILON;
+                assert!(ulp(linux.wet_gain, windows.wet_gain), "{midi}");
+                assert!(ulp(linux.dry_gain, windows.dry_gain), "{midi}");
+            } else if midi > 12 {
+                assert!(linux.wet_gain >= 0.0 && linux.dry_gain <= 1.0, "{midi}");
+            }
+        }
+        // Stored 13: a tail in opposite phase on Windows, none to speak of here.
+        windows.set_amount(fxsound_core::scale::midi_to_value(13));
+        assert!(windows.wet_gain < -0.07 && windows.dry_gain > 1.02);
+    }
+
+    #[test]
+    fn switching_to_the_windows_mapping_glides_the_mix_and_keeps_the_tank() {
+        let mut stage = Ambience::new(48_000.0);
+        stage.set_amount(fxsound_core::scale::midi_to_value(25));
+        stage.settle();
+        let tone = |start: usize| -> Vec<Real> {
+            (start..start + 480)
+                .flat_map(|n| {
+                    let s = (n as Real * 0.03).sin() * 0.3;
+                    [s, s]
+                })
+                .collect()
+        };
+        let mut before = tone(0);
+        stage.process(&mut before, 2);
+        stage.set_compat(DspCompat::Windows);
+        assert_eq!(stage.compat(), DspCompat::Windows);
+        assert!(stage.glide.is_gliding(), "the pair should glide");
+        assert!(!stage.clear_pending, "the tank carries on");
+        let mut after = tone(480);
+        stage.process(&mut after, 2);
+        let step = (after[0] - before[before.len() - 2]).abs();
+        assert!(step < 0.02, "a step of {step} at the switch");
+        stage.set_compat(DspCompat::Windows);
+        assert_eq!(stage.compat(), DspCompat::Windows);
     }
 }

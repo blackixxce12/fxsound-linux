@@ -1,0 +1,1377 @@
+//! The engine's side of the smooth handover (`crate::stream_handover`): the connection it reads and
+//! writes application streams' volume through, what it learns there, the clock that wakes it for
+//! a handover's next step, and the journal on disk.
+//!
+//! [`hand_over`] is the primitive, and every move of an application stream FxSound makes goes
+//! through it:
+//!
+//! - **the power button**: a default claimed or handed back ([`claim_default`],
+//!   [`release_default_smoothly`]) moves every stream that follows it ([`following`]) — and so does
+//!   a claim taken back after the desktop picked a device while the lane follows the system's
+//!   default device, which moves them off that device and onto FxSound again;
+//! - **the applications' routes**: the `target.object` keys written and deleted for them, the
+//!   `SetAppRoutes([])` of the power going off among them, and a route that goes only once its
+//!   streams are off it (`route_pairs::reconcile`);
+//! - **the recorder's rescue**: a recorder WirePlumber linked to a port that went (`stranded`) is
+//!   still held at 0 when FxSound links it again, and the rescue's link is what ends its move —
+//!   only a link that becomes active counts ([`link_announced`]).
+//!
+//! Everything around it runs whether or not anything moves: the connection, the streams' volumes
+//! read, and the journal put right, so a volume a handover left behind is found by the first run
+//! that can find it. The handover is the same at every level of «Like FxSound for Windows»: a
+//! click is no part of the Windows build's sound.
+//!
+//! # A third connection
+//!
+//! Writing a parameter to a node another client owns makes the server stop reading the writer
+//! until the owner has answered (`node_set_param` in `src/pipewire/impl-node.c`,
+//! `pw_impl_client_set_busy`) — which is why a lane's own volume already goes through a second
+//! connection ([`Session::_volume_core`]). An application's node is the application's, and an
+//! application can stop answering. Written on the session's connection, one that did would stop
+//! the engine hearing the graph; written on the volume connection, it would stop the lanes
+//! telling desktops their volume. So application streams get a connection of their own
+//! ([`FadeLine`]), with a `sync` behind every write: one not answered within [`LINE_WATCHDOG`]
+//! means somebody is holding it, and the connection is made again ([`watch_line`]). What was held
+//! is then whatever it is; the handover goes on without its echo ([`stream_handover::ECHO_WAIT`]).
+//!
+//! What the handover reads about a stream — whether it plays, the key WirePlumber keeps it under,
+//! its `Props` — it reads on the same connection, from a proxy it binds to every application
+//! stream there ([`StreamProbe`]). Reading holds nobody: the server answers from what the owner
+//! last published. But a stream can go between its announcement and the request that subscribes
+//! to its `Props`, and a request to an object the server no longer has is answered with an error
+//! on the connection's core — which on the session's connection restarts everything
+//! (`a_stream_and_a_client_gone_before_the_main_loop_bound_them_leave_the_connection_alone`), and
+//! here is a line in the log.
+//!
+//! # A clock
+//!
+//! The handover's steps are tens of milliseconds apart, and the supervisor ticks every 200. So a
+//! handover in progress has a thread of its own sleep until its next step and wake the main loop
+//! for it ([`attach_clock`]); with none in progress, the thread sleeps until asked, and the engine
+//! costs nothing more at rest. The tests, which turn the loop by hand, call [`drive`] instead.
+//!
+//! # Moves are never lost
+//!
+//! A handover's move is the caller's: a default written, a target set, a chain switched. Only its
+//! fade is the handover's. So a move asked for while another handover is in progress waits its
+//! turn, and one the connection went down in the middle of is made there and then, without its
+//! fade ([`session_closed`]) — the engine's own state is what the move changes, and it outlives the
+//! connection. Only on the way out is a move not made: the exit hands everything back itself
+//! ([`restore_before_exit`]).
+
+use std::collections::{HashMap, VecDeque};
+
+use super::*;
+use crate::stream_handover::{self, Handover, Journal, Repair, Step, Watched};
+
+/// A handover's move, made once every stream it fades is silent ([`hand_over`]). It says whether it
+/// moved anything: one that finds nothing left to do — the power switched back before its turn
+/// came, a claim somebody else made meanwhile — has the faded streams given their volume back at
+/// once, rather than after [`stream_handover::LINK_WAIT`] of waiting for a new link that is not
+/// coming.
+pub(super) type Move = Box<dyn FnOnce(&mut Shared) -> bool>;
+
+/// How long a write on the [`FadeLine`] may go unanswered before the connection is taken for held
+/// by an application that has stopped answering, and made again.
+pub(super) const LINE_WATCHDOG: Duration = Duration::from_millis(500);
+
+/// How long the way out waits for the streams a handover left silent to get their volume back: the
+/// longest a stream can take — a fade whose echo has not come ([`stream_handover::ECHO_WAIT`]), the
+/// ramp after it ([`stream_handover::RAMP_DONE`]), and the echo of the volume written back — and a
+/// margin for a machine under load. The power button, the handover's first user, makes one on the
+/// way out whenever it was pressed a moment before the quit, and a stream left at 0 is what the
+/// journal is for, not what the way out is to leave.
+pub(super) const EXIT_WAIT: Duration = Duration::from_secs(1);
+
+/// The third connection: application streams' volume is read and written through it and nothing
+/// else (module docs). Every proxy on it is declared before the core, and so dropped first, and
+/// each listener before what it listens to.
+pub(super) struct FadeLine {
+    /// Every application stream, bound on this connection, by registry id.
+    streams: HashMap<u32, StreamProbe>,
+    /// The links of the streams a handover holds, bound on this connection, by registry id: a
+    /// moved stream's move is over once one of them is active ([`link_announced`]).
+    links: HashMap<u32, LinkProbe>,
+    _registry_listener: pw::registry::Listener,
+    _listener: pw::core::Listener,
+    registry: pw::registry::RegistryRc,
+    core: pw::core::CoreRc,
+}
+
+/// One application stream, bound on the [`FadeLine`]: its state, its properties and its `Props`
+/// arrive on the listener, and its volume is written through the proxy.
+struct StreamProbe {
+    _listener: Option<pw::node::NodeListener>,
+    node: pw::node::Node,
+}
+
+/// A link of a stream a handover holds, bound on the [`FadeLine`] for its state.
+struct LinkProbe {
+    _listener: pw::link::LinkListener,
+    _link: pw::link::Link,
+}
+
+/// Everything the handover keeps between two events. Kept across connections, like the journal it
+/// holds; what belongs to one connection is emptied when it closes ([`session_closed`]).
+pub(super) struct Fades {
+    handover: Handover,
+    /// What is known about each application stream's volume, by registry id.
+    watched: HashMap<u32, Watched>,
+    /// The move of the handover in progress, until it is made.
+    then: Option<Move>,
+    /// Handovers asked for while one was in progress, in order: their streams and their moves.
+    queued: VecDeque<(Vec<u32>, Move)>,
+    journal: Journal,
+    /// Where the journal is kept; `None` to keep it in memory only, as the tests do unless they
+    /// say otherwise.
+    journal_path: Option<std::path::PathBuf>,
+    /// Streams the journal said were left at 0, whose volume has been written back, until they are
+    /// heard at a volume again ([`Repaired`]).
+    repairs: HashMap<u32, Repaired>,
+    /// The latest `sync` sent on the [`FadeLine`], and when the oldest one not answered yet was
+    /// sent: the connection is busy until it comes back.
+    pending: Option<(AsyncSeq, Instant)>,
+    /// Asks the clock's thread to wake the main loop at an instant ([`attach_clock`]); `None` in
+    /// the tests, which call [`drive`] themselves.
+    clock: Option<crossbeam_channel::Sender<Instant>>,
+    /// The instant the clock was last asked for.
+    armed: Option<Instant>,
+    /// How many times [`watch_line`] has made the [`FadeLine`] again.
+    lines_remade: u32,
+    /// The connection is closing, and the moves not made yet are being made without their fades
+    /// ([`session_closed`]): a move that is only worth making on a live connection — a default
+    /// claimed or handed back, which the reconnect settles for itself — says it moved nothing.
+    closing: bool,
+    /// Whether each client's libpipewire ramps a volume, by registry id: the converter of every
+    /// stream on that connection is of it (`crate::stream_handover`, "A stream without the
+    /// ramp"). `None` for a client that says no version this can read.
+    clients: HashMap<u32, Option<bool>>,
+    /// The registry id of the `default` metadata object whose [`crate::wireplumber_hook::HELD_KEY`]
+    /// keys say which streams the hook in WirePlumber holds ([`Watched::hook_held`]).
+    hook_metadata: Option<u32>,
+    /// Every volume written to an application stream, in order: its id, the level and the ramp.
+    #[cfg(test)]
+    writes: Vec<(u32, f32, i32)>,
+}
+
+/// A stream at 0 whose volume [`repair`] has written back from the journal.
+struct Repaired {
+    /// The application's key: its line in the journal.
+    key: String,
+    /// Whether the line comes out once the stream is heard at a volume. Not when a handover was
+    /// holding another stream of the same application at 0 as the volume was written: the line is
+    /// that stream's too, and only the handover's own [`Step::Forget`] takes it out.
+    forget: bool,
+    /// The volume written back.
+    level: f32,
+    /// When the ramp back has surely been played, and the volume is to be written once more, at
+    /// once, where it has taken the stream ([`stream_handover::RAMP_IN_DONE`]): the converter may
+    /// last have reported a point on the way, and WirePlumber keeps what it reports. `None` once
+    /// written, or when the volume went back in one step.
+    settle_at: Option<Instant>,
+    /// Once the volume has been said once more: when, and how many times, until the server
+    /// reports it ([`stream_handover::CONFIRM_WAIT`]). `None` once it has, or the tries are spent.
+    confirm: Option<(Instant, u8)>,
+    /// The stream has been heard at a volume since.
+    heard: bool,
+}
+
+impl Fades {
+    /// No handover, nothing watched, and the journal at `journal_path`, read now.
+    pub(super) fn new(journal_path: Option<std::path::PathBuf>) -> Self {
+        let journal = journal_path
+            .as_deref()
+            .map(Journal::load)
+            .unwrap_or_default();
+        if !journal.is_empty()
+            && let Some(path) = &journal_path
+        {
+            log::info!(
+                "{} lists streams a handover left silent; they get their volume back when they \
+                 are met",
+                path.display()
+            );
+        }
+        Self {
+            handover: Handover::default(),
+            watched: HashMap::new(),
+            then: None,
+            queued: VecDeque::new(),
+            journal,
+            journal_path,
+            repairs: HashMap::new(),
+            pending: None,
+            clock: None,
+            armed: None,
+            lines_remade: 0,
+            closing: false,
+            clients: HashMap::new(),
+            hook_metadata: None,
+            #[cfg(test)]
+            writes: Vec::new(),
+        }
+    }
+
+    /// How many times [`watch_line`] has made the [`FadeLine`] again.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) const fn lines_remade(&self) -> u32 {
+        self.lines_remade
+    }
+
+    /// Every volume written to an application stream, in order: its id, the level and the ramp in
+    /// milliseconds.
+    #[cfg(test)]
+    pub(super) fn writes(&self) -> &[(u32, f32, i32)] {
+        &self.writes
+    }
+
+    /// Whether the connection is closing, and the move being made is one of those it leaves
+    /// behind ([`Fades::closing`]).
+    pub(super) const fn closing(&self) -> bool {
+        self.closing
+    }
+
+    /// Whether a handover is in progress.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) const fn busy(&self) -> bool {
+        self.handover.busy()
+    }
+
+    /// What is known about the stream under `id`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn watched(&self, id: u32) -> Option<&Watched> {
+        self.watched.get(&id)
+    }
+
+    /// Every master volume known, in no order.
+    #[cfg(test)]
+    pub(super) fn levels(&self) -> impl Iterator<Item = f32> + '_ {
+        self.watched.values().filter_map(|watched| watched.level)
+    }
+
+    /// Whether the journal is empty.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn journal_is_empty(&self) -> bool {
+        self.journal.is_empty()
+    }
+
+    fn save_journal(&self) {
+        let Some(path) = &self.journal_path else {
+            return;
+        };
+        if let Err(error) = self.journal.save(path) {
+            log::warn!("could not write {}: {error}", path.display());
+        }
+    }
+
+    /// Ask the clock for the handover's next step, if it has one and it is not asked for already.
+    fn arm(&mut self) {
+        let next = self.handover.next_deadline();
+        if next == self.armed {
+            return;
+        }
+        self.armed = next;
+        if let (Some(next), Some(clock)) = (next, &self.clock) {
+            let _ = clock.send(next);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The connection
+// ---------------------------------------------------------------------------------------------
+
+/// Make the [`FadeLine`]: a connection to the same server, with a registry to bind streams on and a
+/// listener for the `done` of its `sync`s.
+///
+/// Whether the server ramps a volume is set in `volume_ramps` ([`Shared::volume_ramps`]) from this
+/// connection's own core info too. The session's says the same, but on another socket, in no set
+/// order with this one; this one's comes ahead of its registry, and so ahead of every stream a
+/// repair ([`repair`]) may have to ramp.
+pub(super) fn fade_line(
+    shared: &Rc<RefCell<Shared>>,
+    context: &pw::context::ContextRc,
+    remote: Option<String>,
+    volume_ramps: Rc<Cell<bool>>,
+) -> Result<FadeLine, pw::Error> {
+    let props = remote.map(|name| {
+        properties! {
+            *pw::keys::REMOTE_NAME => name,
+        }
+    });
+    let core = context.connect_rc(props)?;
+    let listener = core
+        .add_listener_local()
+        .info(move |info| volume_ramps.set(ramps_volume(info.version())))
+        .done({
+            let shared = Rc::clone(shared);
+            move |id, seq| {
+                if id != pw::core::PW_ID_CORE {
+                    return;
+                }
+                if let Ok(mut guard) = shared.try_borrow_mut()
+                    && guard
+                        .fades
+                        .pending
+                        .is_some_and(|(pending, _)| pending == seq)
+                {
+                    guard.fades.pending = None;
+                }
+            }
+        })
+        .error(|id, _seq, res, message| {
+            // A stream that went before its proxy did, most likely: nothing to do about it.
+            log::debug!("the handover's connection: error on object {id}: {message} ({res})");
+        })
+        .register();
+    let registry = core.get_registry_rc()?;
+    let registry_listener = registry
+        .add_listener_local()
+        .global({
+            let shared = Rc::clone(shared);
+            let registry = registry.clone();
+            move |global| {
+                if global.type_ == pw::types::ObjectType::Link {
+                    link_announced(&shared, &registry, global);
+                    return;
+                }
+                if global.type_ != pw::types::ObjectType::Node {
+                    return;
+                }
+                let Some(props) = global.props else {
+                    return;
+                };
+                if StreamNode::from_props(global.id, &|key: &str| props.get(key)).is_none() {
+                    return;
+                }
+                let probe = probe_stream(&shared, &registry, global);
+                if let Ok(mut guard) = shared.try_borrow_mut()
+                    && let Some(probe) = probe
+                    && let Some(line) = guard
+                        .session
+                        .as_mut()
+                        .and_then(|session| session.fade_line.as_mut())
+                {
+                    line.streams.insert(global.id, probe);
+                    // Watched from now, before anything of it is in: until its properties and
+                    // volume are, it may be the stream a handover left at 0, and a line in the
+                    // journal waits for it ([`Journal::outlived`]).
+                    guard.fades.watched.entry(global.id).or_default();
+                }
+            }
+        })
+        .global_remove({
+            let shared = Rc::clone(shared);
+            move |id| {
+                // The session's registry says the same, and ends a handover's part in the stream
+                // ([`stream_removed`]); this one lets go of the proxy, and of what its listener
+                // learned — which may have come in after the session's registry let go of it.
+                if let Ok(mut guard) = shared.try_borrow_mut()
+                    && let Some(line) = guard
+                        .session
+                        .as_mut()
+                        .and_then(|session| session.fade_line.as_mut())
+                {
+                    line.streams.remove(&id);
+                    line.links.remove(&id);
+                    if guard.fades.watched.remove(&id).is_some() {
+                        drop_outlived(&mut guard);
+                    }
+                }
+            }
+        })
+        .register();
+    Ok(FadeLine {
+        streams: HashMap::new(),
+        links: HashMap::new(),
+        _registry_listener: registry_listener,
+        _listener: listener,
+        registry,
+        core,
+    })
+}
+
+/// A link was announced on the [`FadeLine`]. One from or into a stream a handover holds is bound,
+/// and its state listened to ([`link_active`]) — and so is one from or into the stream a lane put
+/// on its new device in a move that kept its virtual node (`super::switch_linked`); every other is
+/// none of the handover's business.
+///
+/// The link's announcement is not the end of a move. WirePlumber creates the link, and the server
+/// negotiates its format and buffers before anything flows through it — a recorder moved between a
+/// mono microphone and FxSound's stereo source has its ports replaced meanwhile. A volume given back
+/// as the link appears is ramped over what the stream processes before the sound arrives, and the
+/// sound then starts at full volume in the middle of a wave: measured, a recorder moved by the power
+/// switch clicked at −21 to −25 dBFS so. And a link WirePlumber makes to a port that is about to go
+/// (`crate::stranded`) never becomes active at all: the stream's move ends with the link FxSound's
+/// rescue has made instead.
+fn link_announced(
+    shared: &Rc<RefCell<Shared>>,
+    registry: &pw::registry::RegistryRc,
+    global: &pw::registry::GlobalObject<&libspa::utils::dict::DictRef>,
+) {
+    let Some(props) = global.props else {
+        return;
+    };
+    let node = |key: &str| props.get(key).and_then(|value| value.parse::<u32>().ok());
+    let ends = [node("link.output.node"), node("link.input.node")];
+    let held = {
+        let Ok(guard) = shared.try_borrow() else {
+            return;
+        };
+        ends.into_iter()
+            .flatten()
+            .any(|end| guard.fades.handover.holds(end) || super::is_switching_stream(&guard, end))
+    };
+    if !held {
+        return;
+    }
+    let id = global.id;
+    let Ok(link) = registry
+        .bind::<pw::link::Link, _>(global)
+        .inspect_err(|error| log::debug!("could not bind link {id} to follow it: {error}"))
+    else {
+        return;
+    };
+    let listener = link
+        .add_listener_local()
+        .info({
+            let shared = Rc::clone(shared);
+            move |info| {
+                if matches!(info.state(), pw::link::LinkState::Active)
+                    && let Ok(mut guard) = shared.try_borrow_mut()
+                {
+                    link_active(&mut guard, info.output_node_id(), info.input_node_id());
+                    // A lane's new stream on its device, linked there: its chain is heard again.
+                    super::switch_linked(&mut guard, info.output_node_id(), info.input_node_id());
+                }
+            }
+        })
+        .register();
+    if let Ok(mut guard) = shared.try_borrow_mut()
+        && let Some(line) = guard
+            .session
+            .as_mut()
+            .and_then(|session| session.fade_line.as_mut())
+    {
+        line.links.insert(
+            id,
+            LinkProbe {
+                _listener: listener,
+                _link: link,
+            },
+        );
+    }
+}
+
+/// Bind an application stream on the [`FadeLine`] and listen for what the handover reads of it:
+/// whether it plays, its properties, and its `Props`, subscribed to.
+fn probe_stream(
+    shared: &Rc<RefCell<Shared>>,
+    registry: &pw::registry::RegistryRc,
+    global: &pw::registry::GlobalObject<&libspa::utils::dict::DictRef>,
+) -> Option<StreamProbe> {
+    let id = global.id;
+    let node = registry
+        .bind::<pw::node::Node, _>(global)
+        .inspect_err(|error| log::debug!("could not bind stream {id} to fade it: {error}"))
+        .ok()?;
+    let listener = node
+        .add_listener_local()
+        .info({
+            let shared = Rc::clone(shared);
+            move |info| {
+                let Ok(mut guard) = shared.try_borrow_mut() else {
+                    return;
+                };
+                if info.change_mask().contains(pw::node::NodeChangeMask::STATE) {
+                    let running = matches!(info.state(), pw::node::NodeState::Running);
+                    stream_state(&mut guard, id, running);
+                }
+                if info.change_mask().contains(pw::node::NodeChangeMask::PROPS)
+                    && let Some(props) = info.props()
+                {
+                    stream_props(&mut guard, id, &|key: &str| props.get(key));
+                }
+            }
+        })
+        .param({
+            let shared = Rc::clone(shared);
+            move |_seq, param_type, _index, _next, param| {
+                if param_type != libspa::param::ParamType::Props {
+                    return;
+                }
+                let Some(update) = param.and_then(PropsUpdate::from_pod) else {
+                    return;
+                };
+                if let Ok(mut guard) = shared.try_borrow_mut() {
+                    stream_volume(
+                        &mut guard,
+                        id,
+                        update.volume,
+                        update.locked.unwrap_or(false),
+                    );
+                }
+            }
+        })
+        .register();
+    node.subscribe_params(&[libspa::param::ParamType::Props]);
+    Some(StreamProbe {
+        _listener: Some(listener),
+        node,
+    })
+}
+
+/// Write `level` to the master volume of the application stream under `id`, over `ramp_ms` (at
+/// once for 0), through the [`FadeLine`], and put a `sync` behind it. Whether the write was sent.
+fn write_volume(shared: &mut Shared, id: u32, level: f32, ramp_ms: i32) -> bool {
+    let Some(line) = shared
+        .session
+        .as_mut()
+        .and_then(|session| session.fade_line.as_mut())
+    else {
+        return false;
+    };
+    let probe = match line.streams.entry(id) {
+        std::collections::hash_map::Entry::Occupied(bound) => bound.into_mut(),
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            // Not announced on this connection yet — made again a moment ago by [`watch_line`] —
+            // so bound by id: the server finds the object whether or not this connection's
+            // registry has announced it, and the session's registry has.
+            let global = pw::registry::GlobalObject::<&libspa::utils::dict::DictRef> {
+                id,
+                permissions: pw::permissions::PermissionFlags::empty(),
+                type_: pw::types::ObjectType::Node,
+                version: 0,
+                props: None,
+            };
+            match line.registry.bind::<pw::node::Node, _>(&global) {
+                Ok(node) => slot.insert(StreamProbe {
+                    _listener: None,
+                    node,
+                }),
+                Err(error) => {
+                    log::warn!("could not reach stream {id} to fade it: {error}");
+                    return false;
+                }
+            }
+        }
+    };
+    let node = &probe.node;
+    let bytes = volume::master_volume_pod(level, ramp_ms);
+    let Some(pod) = Pod::from_bytes(&bytes) else {
+        log::warn!("could not build a Props pod for a master volume of {level}");
+        return false;
+    };
+    node.set_param(libspa::param::ParamType::Props, 0, pod);
+    #[cfg(test)]
+    shared.fades.writes.push((id, level, ramp_ms));
+    match line.core.sync(0) {
+        Ok(seq) => {
+            let since = shared
+                .fades
+                .pending
+                .map_or_else(Instant::now, |(_, since)| since);
+            shared.fades.pending = Some((seq, since));
+        }
+        Err(error) => log::debug!("could not follow the handover's write with a sync: {error}"),
+    }
+    true
+}
+
+/// The supervisor's check on the [`FadeLine`]: one whose writes have gone unanswered for
+/// [`LINE_WATCHDOG`] is held by an application that stopped answering, and is made again.
+pub(super) fn watch_line(
+    shared: &mut Shared,
+    handle: &Rc<RefCell<Shared>>,
+    context: &pw::context::ContextRc,
+    now: Instant,
+) {
+    let Some((_, since)) = shared.fades.pending else {
+        return;
+    };
+    if now < since + LINE_WATCHDOG || shared.session.is_none() {
+        return;
+    }
+    log::warn!(
+        "an application has not answered a volume the handover wrote to it for {LINE_WATCHDOG:?}; \
+         connecting again for the next"
+    );
+    shared.fades.pending = None;
+    shared.fades.lines_remade += 1;
+    let line = fade_line(
+        handle,
+        context,
+        shared.remote.clone(),
+        Rc::clone(&shared.volume_ramps),
+    )
+    .inspect_err(|error| log::warn!("could not connect again for the handover: {error}"))
+    .ok();
+    if let Some(session) = shared.session.as_mut() {
+        session.fade_line = line;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// What the engine hears
+// ---------------------------------------------------------------------------------------------
+
+/// An application stream's properties arrived: the key WirePlumber keeps its volume under, and its
+/// serial.
+fn stream_props<'a>(shared: &mut Shared, id: u32, get: &impl Fn(&str) -> Option<&'a str>) {
+    let watched = shared.fades.watched.entry(id).or_default();
+    watched.key = stream_handover::state_key(get);
+    watched.records = get("media.class") == Some("Stream/Input/Audio");
+    watched.serial = get("object.serial").and_then(|serial| serial.parse().ok());
+    watched.client = get("client.id").and_then(|client| client.parse().ok());
+    watched.known = true;
+    repair(shared, id);
+    // Until now the stream could have been the one another application's line waits for.
+    drop_outlived(shared);
+}
+
+/// An application stream's state changed: whether it is `running`.
+fn stream_state(shared: &mut Shared, id: u32, running: bool) {
+    shared.fades.watched.entry(id).or_default().running = running;
+}
+
+/// A client's properties arrived, with `version`, its libpipewire's (`core.version`): whether the
+/// converters of its streams ramp a volume ([`converter_ramps`]).
+pub(super) fn client_info(shared: &mut Shared, id: u32, version: Option<&str>) {
+    let ramps = version.and_then(super::client_ramps_volume);
+    shared.fades.clients.insert(id, ramps);
+}
+
+/// A client left the graph.
+pub(super) fn client_removed(shared: &mut Shared, id: u32) {
+    shared.fades.clients.remove(&id);
+}
+
+/// FxSound's hook in WirePlumber says it holds the stream `id` silent for a move of WirePlumber's
+/// own, or no longer ([`crate::wireplumber_hook::HELD_KEY`] in the `default` metadata): a handover
+/// leaves the stream alone meanwhile ([`Watched::hook_held`]). Only for a stream already watched:
+/// an entry made here for anything else would be one [`Journal::outlived`] waits for.
+pub(super) fn hook_holds(shared: &mut Shared, id: u32, held: bool) {
+    if let Some(watched) = shared.fades.watched.get_mut(&id) {
+        watched.hook_held = held;
+    }
+}
+
+/// A `default` metadata object was bound, under the registry id `id`: WirePlumber started, or
+/// started again. Its keys are all there are now; a stream the hook in WirePlumber held under the
+/// object before is held no longer — a WirePlumber that restarted or died in the middle of a move
+/// never cleared its key, and the stream would be moved without a fade of FxSound's for the rest of
+/// its life ([`Watched::hook_held`]). A stream the new one holds says so in its own keys, which
+/// arrive after this.
+pub(super) fn default_metadata_bound(shared: &mut Shared, id: u32) {
+    shared.fades.hook_metadata = Some(id);
+    let_go_of_what_the_hook_held(shared);
+}
+
+/// A global left the graph: when it is the `default` metadata object ([`default_metadata_bound`]),
+/// the hook's word on every stream goes with it. Whether it was.
+pub(super) fn metadata_removed(shared: &mut Shared, id: u32) -> bool {
+    if shared.fades.hook_metadata != Some(id) {
+        return false;
+    }
+    shared.fades.hook_metadata = None;
+    let_go_of_what_the_hook_held(shared);
+    true
+}
+
+/// No stream is held by the hook in WirePlumber any more.
+fn let_go_of_what_the_hook_held(shared: &mut Shared) {
+    for watched in shared.fades.watched.values_mut() {
+        watched.hook_held = false;
+    }
+}
+
+/// Whether the audio converter of `watched` ramps a volume: as its client's libpipewire says, and
+/// as the server's does for a stream whose client is not known or says nothing
+/// (`crate::stream_handover`, "A stream without the ramp").
+fn converter_ramps(shared: &Shared, watched: &Watched) -> bool {
+    watched
+        .client
+        .and_then(|client| shared.fades.clients.get(&client).copied().flatten())
+        .unwrap_or_else(|| shared.volume_ramps.get())
+}
+
+/// An application stream's `Props` arrived — its master volume, and whether its converter locks
+/// it — on subscription, and again on every change: a write of ours echoed, or anybody's.
+fn stream_volume(shared: &mut Shared, id: u32, level: Option<f32>, locked: bool) {
+    let now = Instant::now();
+    let watched = shared.fades.watched.entry(id).or_default();
+    watched.level = level;
+    watched.locked = locked;
+    if shared.fades.handover.holds(id) {
+        let steps = shared.fades.handover.volume(id, level, now);
+        apply(shared, steps);
+        return;
+    }
+    if let Some(repaired) = shared.fades.repairs.get_mut(&id) {
+        if repaired.settle_at.is_none()
+            && level.is_some_and(|level| stream_handover::same(level, repaired.level))
+        {
+            repaired.confirm = None;
+        }
+        if level.is_some_and(|level| !stream_handover::silent(level)) && !repaired.heard {
+            repaired.heard = true;
+            let (key, forget) = (repaired.key.clone(), repaired.forget);
+            log::info!("{key} plays again at its volume from before the handover");
+            // Not while another stream of the application may still be at 0: one a handover since
+            // holds there, one repaired a moment ago whose echo is still on its way, one not known
+            // yet.
+            if forget {
+                drop_if_outlived(shared, &key);
+            }
+        }
+        settle_repairs(shared, now);
+        return;
+    }
+    repair(shared, id);
+}
+
+/// A link from the node `output` to the node `input` became active ([`link_announced`]): a new link
+/// of a stream a handover has moved ends its move.
+fn link_active(shared: &mut Shared, output: u32, input: u32) {
+    let now = Instant::now();
+    for id in [output, input] {
+        if shared.fades.handover.holds(id) {
+            let steps = shared.fades.handover.linked(id, now);
+            apply(shared, steps);
+        }
+    }
+}
+
+/// An application stream left the graph.
+pub(super) fn stream_removed(shared: &mut Shared, id: u32) {
+    if shared.fades.watched.remove(&id).is_some() {
+        // Gone, it is no longer a stream a line may be waiting for.
+        drop_outlived(shared);
+    }
+    shared.fades.repairs.remove(&id);
+    if let Some(line) = shared
+        .session
+        .as_mut()
+        .and_then(|session| session.fade_line.as_mut())
+    {
+        line.streams.remove(&id);
+    }
+    if shared.fades.handover.holds(id) {
+        let steps = shared.fades.handover.removed(id, Instant::now());
+        apply(shared, steps);
+    }
+}
+
+/// What the journal says about the stream under `id`, now that more is known of it: a volume a
+/// handover left at 0 goes back — over the ramp if the stream is playing, at once if not — and a
+/// line that has outlived its stream goes ([`drop_if_outlived`]).
+///
+/// A stream met at a volume of its own takes the line out only once no stream of the application
+/// can still be the one left at 0. A handover fades only the streams that play: a browser's paused
+/// tab, at its own volume, says nothing of the tab faded beside it — which a run started after a
+/// killed one may meet a moment later, in no set order with the paused one.
+///
+/// While a handover holds a stream of the same application at 0, the line is that stream's: the
+/// stream met here is another one of the application — a second tab, one WirePlumber restored —
+/// and what it plays at says nothing of the faded one. Found at 0 (WirePlumber gave it the 0 it
+/// kept for the faded one), it still gets the volume back; the line stays for the handover to take
+/// out ([`Repaired::forget`]).
+fn repair(shared: &mut Shared, id: u32) {
+    if shared.fades.handover.holds(id) || shared.fades.repairs.contains_key(&id) {
+        return;
+    }
+    let Some(watched) = shared.fades.watched.get(&id) else {
+        return;
+    };
+    let Some(key) = watched.key.clone() else {
+        return;
+    };
+    let held = shared.fades.handover.holds_key(&key);
+    match shared.fades.journal.repair(&key, watched.level) {
+        Repair::Nothing => {}
+        Repair::Obsolete => drop_if_outlived(shared, &key),
+        Repair::Restore(level) => {
+            // Not the handover's word on the ramp: that is learned when a handover begins, and a
+            // repair comes before any — on the very first connection of a run after a killed one.
+            // A write with no line to go through is not sent at all ([`write_volume`]).
+            let ramp = if converter_ramps(shared, watched) && watched.running {
+                stream_handover::RAMP_IN_MS
+            } else {
+                0
+            };
+            let serial = shared.fades.journal.serial(&key);
+            if write_volume(shared, id, level, ramp) {
+                log::info!(
+                    "{key} is at 0, where a handover left {}; putting {level} back",
+                    serial.map_or_else(
+                        || "one of its streams".to_owned(),
+                        |serial| format!("stream {serial}")
+                    )
+                );
+                let settle_at = (ramp > 0).then(|| Instant::now() + stream_handover::RAMP_IN_DONE);
+                shared.fades.repairs.insert(
+                    id,
+                    Repaired {
+                        key,
+                        forget: !held,
+                        level,
+                        settle_at,
+                        confirm: None,
+                        heard: false,
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Take the line for `key` out of the journal if it has outlived the stream it was written for
+/// ([`Journal::outlived`]). Never while a handover holds a stream of the application at 0: the line
+/// is that stream's, and the handover takes it out itself.
+fn drop_if_outlived(shared: &mut Shared, key: &str) {
+    if shared.fades.handover.holds_key(key)
+        || !shared
+            .fades
+            .journal
+            .outlived(key, shared.fades.watched.values())
+    {
+        return;
+    }
+    log::info!("{key} plays at a volume of its own; its handover line is dropped");
+    shared.fades.journal.forget(key);
+    shared.fades.save_journal();
+}
+
+/// [`drop_if_outlived`] for every line in the journal: a stream that went, or became known, may
+/// have been the last one a line waited for.
+fn drop_outlived(shared: &mut Shared) {
+    if shared.fades.journal.is_empty() {
+        return;
+    }
+    let keys: Vec<String> = shared.fades.journal.keys().map(str::to_owned).collect();
+    for key in keys {
+        drop_if_outlived(shared, &key);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The handover
+// ---------------------------------------------------------------------------------------------
+
+/// The application streams a move of `direction`'s default takes along: every one that follows the
+/// default ([`AppStreams::followers`]) and has no target of its own in the `default` metadata — a
+/// stream on a per-application route, or one a mixer moved, stays where it is.
+pub(super) fn following(shared: &Shared, direction: DeviceDirection) -> Vec<u32> {
+    shared
+        .apps
+        .followers(direction)
+        .into_iter()
+        .filter(|&id| !route_pairs::has_target(shared, id))
+        .collect()
+}
+
+/// Hand the application streams under `streams` over: fade each one that plays to silence, make
+/// `then` once they are all silent, and give each its volume back once it has its new link
+/// (`crate::stream_handover`). With nothing to fade — no stream plays, the server has no ramp, no
+/// connection to write through — `then` is made before this returns. While another handover is in
+/// progress this one waits for it to finish.
+pub(super) fn hand_over(shared: &mut Shared, streams: Vec<u32>, then: Move) {
+    if shared.fades.handover.busy() {
+        shared.fades.queued.push_back((streams, then));
+        return;
+    }
+    begin(shared, &streams, then);
+}
+
+fn begin(shared: &mut Shared, streams: &[u32], then: Move) {
+    let now = Instant::now();
+    let writable = shared
+        .session
+        .as_ref()
+        .is_some_and(|session| session.fade_line.is_some());
+    shared
+        .fades
+        .handover
+        .set_ramps(writable && shared.volume_ramps.get());
+    // Each stream's converter decides whether it is faded, not the server
+    // (`crate::stream_handover`, "A stream without the ramp").
+    let candidates: Vec<(u32, Watched)> = streams
+        .iter()
+        .filter_map(|&id| {
+            let watched = shared.fades.watched.get(&id)?;
+            let ramps = writable && converter_ramps(shared, watched);
+            Some((
+                id,
+                Watched {
+                    converter_ramps: Some(ramps),
+                    ..watched.clone()
+                },
+            ))
+        })
+        .collect();
+    let candidates: Vec<(u32, &Watched)> = candidates
+        .iter()
+        .map(|(id, watched)| (*id, watched))
+        .collect();
+    shared.fades.then = Some(then);
+    let steps = shared.fades.handover.begin(&candidates, now);
+    apply(shared, steps);
+}
+
+/// Do what the handover says, in order, and ask the clock for its next step.
+fn apply(shared: &mut Shared, steps: Vec<Step>) {
+    for step in steps {
+        match step {
+            Step::Volume { id, level, ramp_ms } => {
+                write_volume(shared, id, level, ramp_ms);
+            }
+            Step::Remember { key, serial, level } => {
+                if shared.fades.journal.remember(&key, serial, level) {
+                    shared.fades.save_journal();
+                }
+            }
+            Step::Forget { key } => {
+                if shared.fades.journal.forget(&key) {
+                    shared.fades.save_journal();
+                }
+            }
+            Step::Move => {
+                if let Some(then) = shared.fades.then.take()
+                    && !then(shared)
+                {
+                    // Nothing moved: nothing is linked anew, and every stream gets its volume
+                    // back as soon as a ramp may be written to it.
+                    let steps = shared.fades.handover.restore_all(Instant::now());
+                    apply(shared, steps);
+                }
+            }
+            Step::Finished => {
+                // Left only by a handover the engine is leaving: the exit hands back instead.
+                shared.fades.then = None;
+                if let Some((streams, then)) = shared.fades.queued.pop_front() {
+                    begin(shared, &streams, then);
+                }
+            }
+        }
+    }
+    shared.fades.arm();
+}
+
+/// What time has made due in the handover: the clock's wake-up, the supervisor's tick, and the
+/// tests' turns of the loop.
+pub(super) fn drive(shared: &mut Shared) {
+    let now = Instant::now();
+    let steps = shared.fades.handover.tick(now);
+    apply(shared, steps);
+    settle_repairs(shared, now);
+}
+
+/// Write each repaired volume once more, at once, once its ramp back has been played
+/// ([`Repaired::settle_at`]), and again until the server reports it, as a handover does
+/// ([`stream_handover::CONFIRM_WAIT`]); and let go of each repair that is settled, reported and
+/// heard.
+fn settle_repairs(shared: &mut Shared, now: Instant) {
+    let due: Vec<(u32, f32, u8)> = shared
+        .fades
+        .repairs
+        .iter()
+        .filter_map(
+            |(&id, repaired)| match (repaired.settle_at, repaired.confirm) {
+                (Some(at), _) if now >= at => Some((id, repaired.level, 1)),
+                (None, Some((sent, tries)))
+                    if now >= sent + stream_handover::CONFIRM_WAIT
+                        && tries < stream_handover::CONFIRM_TRIES =>
+                {
+                    Some((id, repaired.level, tries + 1))
+                }
+                _ => None,
+            },
+        )
+        .collect();
+    for (id, level, tries) in due {
+        write_volume(shared, id, level, 0);
+        if let Some(repaired) = shared.fades.repairs.get_mut(&id) {
+            repaired.settle_at = None;
+            repaired.confirm = Some((now, tries));
+        }
+    }
+    for repaired in shared.fades.repairs.values_mut() {
+        if repaired.confirm.is_some_and(|(sent, tries)| {
+            tries >= stream_handover::CONFIRM_TRIES && now >= sent + stream_handover::CONFIRM_WAIT
+        }) {
+            repaired.confirm = None;
+        }
+    }
+    shared.fades.repairs.retain(|_, repaired| {
+        repaired.settle_at.is_some() || repaired.confirm.is_some() || !repaired.heard
+    });
+}
+
+/// Start the clock's thread (module docs, "A clock"), and have what it sends wake the main loop and
+/// [`drive`] the handover. The thread ends when `shared` lets go of its end of the channel.
+pub(super) fn attach_clock<'l>(
+    loop_: &'l pw::loop_::Loop,
+    shared: &Rc<RefCell<Shared>>,
+) -> pw::channel::AttachedReceiver<'l, ()> {
+    let (wake, woken) = pw::channel::channel::<()>();
+    let attached = woken.attach(loop_, {
+        let shared = Rc::clone(shared);
+        move |()| {
+            if let Ok(mut guard) = shared.try_borrow_mut() {
+                guard.fades.armed = None;
+                drive(&mut guard);
+                // A lane's move to another device waits on the same clock ([`wake_at`]).
+                super::switch_devices_due(&mut guard);
+            }
+        }
+    });
+    let (ask, asked) = crossbeam_channel::unbounded::<Instant>();
+    let spawned = std::thread::Builder::new()
+        .name("fxsound-fades".to_owned())
+        .spawn(move || tick_at(&asked, || wake.send(()).is_ok()));
+    match spawned {
+        Ok(_) => shared.borrow_mut().fades.clock = Some(ask),
+        Err(error) => log::warn!(
+            "could not start the handover's clock ({error}); its steps wait for the supervisor"
+        ),
+    }
+    attached
+}
+
+/// The clock's thread: sleep until the earliest instant asked for, then `wake` the main loop; and
+/// until asked, when nothing is. An instant asked for while another is due replaces it if it is
+/// sooner; a later one is left for the step woken for to ask again ([`Fades::arm`]). Returns when
+/// nobody can ask any more, or `wake` says nobody is woken any more.
+fn tick_at(asked: &crossbeam_channel::Receiver<Instant>, wake: impl Fn() -> bool) {
+    let mut due: Option<Instant> = None;
+    loop {
+        let Some(at) = due else {
+            match asked.recv() {
+                Ok(at) => due = Some(at),
+                Err(_) => return,
+            }
+            continue;
+        };
+        match asked.recv_timeout(at.saturating_duration_since(Instant::now())) {
+            Ok(sooner) => due = Some(sooner.min(at)),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                due = None;
+                if !wake() {
+                    return;
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// Ask the clock to wake the main loop at `at`, for a step that is not the handover's: a lane's
+/// move to another device, once its chain has been heard silent on the old one
+/// (`super::switch_ready`). A step that is woken for asks again if it is still early; one asked
+/// for while a sooner wake-up is due is asked again by that wake-up ([`tick_at`]). Without a clock
+/// — the tests, which turn the loop by hand — the supervisor's tick makes the step.
+pub(super) fn wake_at(shared: &Shared, at: Instant) {
+    if let Some(clock) = &shared.fades.clock {
+        let _ = clock.send(at);
+    }
+}
+
+/// Stop the clock's thread: the engine is done with it.
+pub(super) fn stop_clock(shared: &mut Shared) {
+    shared.fades.clock = None;
+}
+
+/// The connection is closing: its streams and its handover go with it. The moves not made yet are
+/// made now, without their fades (module docs, "Moves are never lost"); the journal keeps its lines
+/// for the next connection to find.
+pub(super) fn session_closed(shared: &mut Shared) {
+    // A move may ask for another handover; on this connection that one is abandoned too, and its
+    // move made in the next round.
+    shared.fades.closing = true;
+    loop {
+        shared.fades.handover.abandon();
+        let mut moves: Vec<Move> = shared.fades.then.take().into_iter().collect();
+        moves.extend(shared.fades.queued.drain(..).map(|(_, then)| then));
+        if moves.is_empty() {
+            break;
+        }
+        for then in moves {
+            let _ = then(shared);
+        }
+    }
+    shared.fades.closing = false;
+    shared.fades.watched.clear();
+    shared.fades.hook_metadata = None;
+    shared.fades.repairs.clear();
+    shared.fades.pending = None;
+    shared.fades.armed = None;
+}
+
+/// The way out: every stream a handover left silent gets its volume back, and the loop is turned
+/// until the server has it or [`EXIT_WAIT`] is up — before the defaults are handed back and the
+/// connection goes. The moves not made yet are not made: the exit hands everything back itself.
+///
+/// Called like [`release_defaults_before_exit`]: after `run()`, with nothing else attached.
+pub(super) fn restore_before_exit(shared: &Rc<RefCell<Shared>>, loop_: &pw::loop_::Loop) {
+    {
+        let mut guard = shared.borrow_mut();
+        stop_clock(&mut guard);
+        guard.fades.queued.clear();
+        if !guard.fades.handover.busy() {
+            return;
+        }
+        let steps = guard.fades.handover.restore_all(Instant::now());
+        apply(&mut guard, steps);
+    }
+    let deadline = Instant::now() + EXIT_WAIT;
+    loop {
+        {
+            let mut guard = shared.borrow_mut();
+            drive(&mut guard);
+            if !guard.fades.handover.busy() && guard.fades.pending.is_none() {
+                log::debug!("every stream the handover left silent has its volume back");
+                break;
+            }
+        }
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            log::warn!(
+                "a stream the handover left silent did not get its volume back within \
+                 {EXIT_WAIT:?}; the journal keeps it for the next start"
+            );
+            break;
+        };
+        loop_.iterate(pw::loop_::Timeout::Finite(
+            remaining.min(Duration::from_millis(10)),
+        ));
+    }
+    let mut guard = shared.borrow_mut();
+    guard.fades.then = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wireplumber_hook::HELD_KEY;
+
+    /// How long a test waits for a wake-up that should come: far past any instant asked for here.
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    /// An engine's state before it has connected: no session, nothing held.
+    fn shared_for_tests() -> Shared {
+        let (notify, _) = crossbeam_channel::unbounded();
+        Shared::new(
+            notify,
+            None,
+            None,
+            PerDirection::default(),
+            ChainHandover::new().0,
+        )
+    }
+
+    #[test]
+    fn a_stream_the_hook_in_wireplumber_says_it_holds_is_left_out_of_a_handover_until_it_lets_go() {
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        {
+            let mut guard = shared.borrow_mut();
+            stream_state(&mut guard, 42, true);
+            // A point of the hook's fade, last reported before its end.
+            stream_volume(&mut guard, 42, Some(0.2), false);
+            assert!(guard.fades.watched(42).is_some_and(Watched::fades));
+        }
+        let fades = |shared: &Rc<RefCell<Shared>>| {
+            shared
+                .borrow()
+                .fades
+                .watched(42)
+                .map(|watched| (watched.hook_held, watched.fades()))
+        };
+        super::super::on_metadata_event(&shared, true, 42, Some(HELD_KEY), Some("1.0"));
+        assert_eq!(fades(&shared), Some((true, false)));
+        // Another metadata object's key of the same name is not the hook's.
+        super::super::on_metadata_event(&shared, false, 42, Some(HELD_KEY), None);
+        assert_eq!(fades(&shared), Some((true, false)));
+        super::super::on_metadata_event(&shared, true, 42, Some(HELD_KEY), None);
+        assert_eq!(fades(&shared), Some((false, true)));
+        // Every key of the stream cleared at once lets go of it too.
+        super::super::on_metadata_event(&shared, true, 42, Some(HELD_KEY), Some("1.0"));
+        super::super::on_metadata_event(&shared, true, 42, None, None);
+        assert_eq!(fades(&shared), Some((false, true)));
+        // A subject the handover does not watch gets no entry, which the journal would wait for.
+        super::super::on_metadata_event(&shared, true, 77, Some(HELD_KEY), Some("1.0"));
+        assert!(shared.borrow().fades.watched(77).is_none());
+    }
+
+    #[test]
+    fn a_new_default_metadata_lets_go_of_every_stream_the_hook_held() {
+        let shared = Rc::new(RefCell::new(shared_for_tests()));
+        let held = |shared: &Rc<RefCell<Shared>>, id: u32| {
+            shared
+                .borrow()
+                .fades
+                .watched(id)
+                .map(|watched| (watched.hook_held, watched.fades()))
+        };
+        {
+            let mut guard = shared.borrow_mut();
+            default_metadata_bound(&mut guard, 30);
+            for id in [42, 43] {
+                stream_state(&mut guard, id, true);
+                stream_volume(&mut guard, id, Some(0.2), false);
+            }
+        }
+        for id in [42, 43] {
+            super::super::on_metadata_event(&shared, true, id, Some(HELD_KEY), Some("1.0"));
+            assert_eq!(held(&shared, id), Some((true, false)));
+        }
+        // WirePlumber restarted in the middle of the move: its new object never heard of the key.
+        default_metadata_bound(&mut shared.borrow_mut(), 31);
+        for id in [42, 43] {
+            assert_eq!(held(&shared, id), Some((false, true)), "{id}");
+        }
+        // And one that died: its object goes, and nothing holds the stream any more.
+        super::super::on_metadata_event(&shared, true, 42, Some(HELD_KEY), Some("1.0"));
+        assert!(
+            !metadata_removed(&mut shared.borrow_mut(), 30),
+            "not the object of now"
+        );
+        assert_eq!(held(&shared, 42), Some((true, false)));
+        assert!(metadata_removed(&mut shared.borrow_mut(), 31));
+        assert_eq!(held(&shared, 42), Some((false, true)));
+        assert!(!metadata_removed(&mut shared.borrow_mut(), 31), "said once");
+    }
+
+    #[test]
+    fn a_stream_is_faded_as_its_own_client_s_libpipewire_ramps_and_not_as_the_server_does() {
+        let mut shared = shared_for_tests();
+        let on = |client: Option<u32>| Watched {
+            client,
+            ..Watched::default()
+        };
+        shared.volume_ramps.set(true);
+        client_info(&mut shared, 5, Some("0.3.65"));
+        client_info(&mut shared, 6, Some("1.6.9"));
+        client_info(&mut shared, 7, None);
+        client_info(&mut shared, 8, Some("pipewire"));
+        // An application with an older libpipewire of its own, on a server that ramps.
+        assert!(!converter_ramps(&shared, &on(Some(5))));
+        assert!(converter_ramps(&shared, &on(Some(6))));
+        // A client that says no version, or none that reads, one not known, and no client at
+        // all: the server's word.
+        for client in [Some(7), Some(8), Some(9), None] {
+            assert!(converter_ramps(&shared, &on(client)), "{client:?}");
+        }
+        shared.volume_ramps.set(false);
+        assert!(converter_ramps(&shared, &on(Some(6))));
+        for client in [Some(5), Some(7), Some(9), None] {
+            assert!(!converter_ramps(&shared, &on(client)), "{client:?}");
+        }
+        // A client gone is not known any more.
+        shared.volume_ramps.set(true);
+        client_removed(&mut shared, 5);
+        assert!(converter_ramps(&shared, &on(Some(5))));
+    }
+
+    /// The clock's thread, started on channels of the test's own: what is asked of it, the instant
+    /// of each wake-up it gives, and the thread.
+    fn clock() -> (
+        crossbeam_channel::Sender<Instant>,
+        crossbeam_channel::Receiver<Instant>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (ask, asked) = crossbeam_channel::unbounded::<Instant>();
+        let (woke, wakes) = crossbeam_channel::unbounded::<Instant>();
+        let thread =
+            std::thread::spawn(move || tick_at(&asked, || woke.send(Instant::now()).is_ok()));
+        (ask, wakes, thread)
+    }
+
+    /// Wait for `thread` to end, for at most [`PATIENCE`]. Whether it did.
+    fn ends(thread: &std::thread::JoinHandle<()>) -> bool {
+        let deadline = Instant::now() + PATIENCE;
+        while !thread.is_finished() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
+
+    #[test]
+    fn the_clock_wakes_the_loop_once_at_the_instant_asked_for_and_not_before() {
+        let (ask, wakes, thread) = clock();
+        let at = Instant::now() + Duration::from_millis(40);
+        ask.send(at).expect("the clock listens");
+        let woke = wakes
+            .recv_timeout(PATIENCE)
+            .expect("the clock never woke the loop");
+        assert!(woke >= at, "woken {:?} early", at - woke);
+        assert!(
+            wakes.recv_timeout(Duration::from_millis(100)).is_err(),
+            "woken twice for one instant"
+        );
+        drop(ask);
+        assert!(ends(&thread));
+    }
+
+    #[test]
+    fn a_sooner_instant_asked_for_replaces_a_later_one_and_a_later_one_does_not_put_off_a_sooner() {
+        let (ask, wakes, thread) = clock();
+        let start = Instant::now();
+        let later = start + Duration::from_secs(3);
+        let sooner = start + Duration::from_millis(40);
+        ask.send(later).expect("the clock listens");
+        ask.send(sooner).expect("the clock listens");
+        let woke = wakes
+            .recv_timeout(PATIENCE)
+            .expect("the clock never woke the loop");
+        assert!(woke >= sooner, "woken {:?} early", sooner - woke);
+        assert!(woke < later, "the sooner instant waited for the later one");
+
+        let sooner = Instant::now() + Duration::from_millis(40);
+        ask.send(sooner).expect("the clock listens");
+        ask.send(sooner + Duration::from_secs(3))
+            .expect("the clock listens");
+        let woke = wakes
+            .recv_timeout(PATIENCE)
+            .expect("the clock never woke the loop");
+        assert!(woke >= sooner, "woken {:?} early", sooner - woke);
+        assert!(
+            woke < sooner + Duration::from_secs(1),
+            "a later instant put off the sooner one"
+        );
+        drop(ask);
+        assert!(ends(&thread));
+    }
+
+    #[test]
+    fn the_clock_ends_when_nobody_can_ask_it_any_more_even_with_an_instant_due() {
+        let (ask, _wakes, thread) = clock();
+        drop(ask);
+        assert!(
+            ends(&thread),
+            "the clock outlived an engine that asked nothing"
+        );
+
+        let (ask, _wakes, thread) = clock();
+        ask.send(Instant::now() + Duration::from_secs(60))
+            .expect("the clock listens");
+        std::thread::sleep(Duration::from_millis(20));
+        drop(ask);
+        assert!(
+            ends(&thread),
+            "the clock waited out an instant nobody needed"
+        );
+    }
+
+    #[test]
+    fn the_clock_ends_when_the_loop_it_wakes_is_gone() {
+        let (ask, asked) = crossbeam_channel::unbounded::<Instant>();
+        let thread = std::thread::spawn(move || tick_at(&asked, || false));
+        ask.send(Instant::now()).expect("the clock listens");
+        assert!(
+            ends(&thread),
+            "the clock kept going for a loop that is gone"
+        );
+    }
+}

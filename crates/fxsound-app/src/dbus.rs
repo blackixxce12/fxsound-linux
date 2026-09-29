@@ -15,8 +15,10 @@
 //!            SetNoiseSuppression(s), SetEditDirection(s), GetStatus() → s, Show(), Hide(),
 //!            ToggleWindow(), Quit(), Apply(as argv) → (b ok, s stdout, s stderr),
 //!            ListPresets() → s, ListDevices() → s,
-//!            SetAppPreset(s app, s direction, s preset), ListApps() → s, ForgetDevice(s)
-//! properties Version (s, const), Power (b), Preset (s), Output (s), Input (s), Direction (s)
+//!            SetAppPreset(s app, s direction, s preset), ListApps() → s, ForgetDevice(s),
+//!            SetWindowsParity(s level, b force)
+//! properties Version (s, const), Power (b), Preset (s), Output (s), Input (s), Direction (s),
+//!            WindowsParity (s)
 //! signals    PowerChanged(b), PresetChanged(s direction, s name),
 //!            DeviceChanged(s direction, s node_name, s description), AudioStateChanged(s json),
 //!            Notice(s message), AppRouted(s app, s direction, s preset)
@@ -42,8 +44,9 @@
 //! D-Bus additions, the prerequisites of an MCP server). `SetAppPreset` and `ListApps` are
 //! `--app-preset` / `--app-input-preset` and `--list-apps --json` (per-application presets,
 //! `docs/0.4.0-apps.md`), and `AppRouted` is the `app_routed` event. `ForgetDevice` is
-//! `--forget-device` (0.4.0 audit #34); an instance the call has just started holds it until
-//! PipeWire has listed the devices (`commands::waits_for_the_device_list`). The bus starts FxSound for
+//! `--forget-device` (0.4.0 audit #34); an instance the call has just started holds it, and
+//! `NextOutput` and `NextInput`, until PipeWire has listed the devices
+//! (`commands::waits_for_the_device_list`). The bus starts FxSound for
 //! a call when it is not running — any call, a property read included, unless the caller sets
 //! `NO_AUTO_START` (`busctl --auto-start=no call`; `get-property` ignores the flag), which the
 //! manual tells pollers to:
@@ -93,7 +96,7 @@ use std::task::Poll;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use fxsound_core::DeviceDirection;
+use fxsound_core::{DeviceDirection, ParityClass, WindowsParity};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
@@ -164,6 +167,12 @@ pub enum Call {
     ListApps,
     /// A device to drop from its lane's priority list, by `node.name` or description.
     ForgetDevice(String),
+    /// The level of «Как в Windows», as it came, and whether a move to Everything that takes
+    /// something in use away goes ahead.
+    SetWindowsParity {
+        level: String,
+        force: bool,
+    },
 }
 
 impl Call {
@@ -194,6 +203,7 @@ impl Call {
             Self::SetAppPreset { .. } => "SetAppPreset",
             Self::ListApps => "ListApps",
             Self::ForgetDevice(_) => "ForgetDevice",
+            Self::SetWindowsParity { .. } => "SetWindowsParity",
         }
     }
 
@@ -269,7 +279,52 @@ impl Call {
                 }
                 vec![Command::ForgetDevice(device.clone())]
             }
+            Self::SetWindowsParity { level, force } => vec![Command::WindowsParity {
+                level: cli::parse_windows_parity(level)?,
+                force: *force,
+            }],
         })
+    }
+
+    /// The level of «Как в Windows» at which this call stops doing what it does in FxSound for
+    /// Linux (`docs/0.5.0-windows-parity.md`, "Classification").
+    ///
+    /// Exhaustive on purpose, with no `_` arm: a new method does not compile until someone has
+    /// decided its level. D-Bus itself is Linux plumbing and never goes away; a method is
+    /// [`ParityClass::Full`] when what it acts on — the microphone lane, the applications'
+    /// presets — is hidden at Everything, where it is refused, except `ListApps`, which answers
+    /// with the applications hidden, as `--list-apps` does. None raises the window at any level,
+    /// so the window behaviour that makes the matching options [`ParityClass::Interface`] does
+    /// not apply here.
+    #[must_use]
+    pub const fn parity_class(&self) -> ParityClass {
+        match self {
+            Self::SetInput(_)
+            | Self::NextInput
+            | Self::SetNoiseSuppression(_)
+            | Self::SetEditDirection(_)
+            | Self::SetAppPreset { .. }
+            | Self::ListApps => ParityClass::Full,
+            Self::TogglePower
+            | Self::SetPower(_)
+            | Self::NextPreset
+            | Self::PrevPreset
+            | Self::SetPreset(_)
+            | Self::GetPreset
+            | Self::SetOutput(_)
+            | Self::NextOutput
+            | Self::GetStatus
+            | Self::Show
+            | Self::Hide
+            | Self::ToggleWindow
+            | Self::Quit
+            | Self::ListPresets
+            | Self::ListDevices
+            | Self::ForgetDevice(_)
+            | Self::SetWindowsParity { .. } => ParityClass::Never,
+            // The line's own commands decide, each by its own class.
+            Self::Apply(_) => ParityClass::Never,
+        }
     }
 }
 
@@ -469,6 +524,8 @@ pub struct Properties {
     pub presets: [Option<String>; 2],
     /// Per lane: the device's `node.name` and description, `None` while the lane is detached.
     pub devices: [Option<(String, String)>; 2],
+    /// The level of «Как в Windows».
+    pub windows_parity: WindowsParity,
 }
 
 /// One of the properties that can change. `Version` cannot.
@@ -479,6 +536,7 @@ pub enum Property {
     Output,
     Input,
     Direction,
+    WindowsParity,
 }
 
 impl Property {
@@ -491,6 +549,7 @@ impl Property {
             Self::Output => "Output",
             Self::Input => "Input",
             Self::Direction => "Direction",
+            Self::WindowsParity => "WindowsParity",
         }
     }
 
@@ -577,6 +636,7 @@ impl Properties {
         let mut properties = Self {
             power: state.power,
             direction: state.direction,
+            windows_parity: app.windows_parity(),
             ..Self::default()
         };
         for direction in DeviceDirection::ALL {
@@ -680,6 +740,16 @@ impl Properties {
                 Update {
                     signal: None,
                     changed,
+                }
+            }
+            AppEvent::WindowsParity { level } => {
+                if self.windows_parity == *level {
+                    return Update::default();
+                }
+                self.windows_parity = *level;
+                Update {
+                    signal: None,
+                    changed: vec![Property::WindowsParity],
                 }
             }
             AppEvent::AudioState { .. } => Update {
@@ -912,6 +982,18 @@ impl Service {
         self.run(Call::ListApps).await
     }
 
+    /// Set «Как в Windows» / "Like FxSound for Windows" — `off`, `interface` or `sound` — as
+    /// `--windows-parity` does. `full` (`everything`) is refused: Everything arrives in a later
+    /// version, and `force` is for it, to go ahead with a move that would switch off something
+    /// in use, as `--force` says.
+    async fn set_windows_parity(&self, level: &str, force: bool) -> Result<(), MethodError> {
+        self.run_quietly(Call::SetWindowsParity {
+            level: level.to_owned(),
+            force,
+        })
+        .await
+    }
+
     /// The version `--status` reports.
     #[zbus(property(emits_changed_signal = "const"))]
     fn version(&self) -> String {
@@ -946,6 +1028,13 @@ impl Service {
     #[zbus(property)]
     fn direction(&self) -> String {
         self.read(|properties| properties.direction.key().to_owned())
+    }
+
+    /// The level of «Как в Windows»: `off`, `interface` or `sound`, and `full` from the version
+    /// that offers Everything.
+    #[zbus(property)]
+    fn windows_parity(&self) -> String {
+        self.read(|properties| properties.windows_parity.key().to_owned())
     }
 
     /// Processing was turned on or off.
@@ -1071,6 +1160,7 @@ async fn emit(iface: &InterfaceRef<Service>, update: Update) -> zbus::Result<()>
                 Property::Output => service.output_changed(emitter).await?,
                 Property::Input => service.input_changed(emitter).await?,
                 Property::Direction => service.direction_changed(emitter).await?,
+                Property::WindowsParity => service.windows_parity_changed(emitter).await?,
             }
         }
     }
@@ -1694,6 +1784,10 @@ mod tests {
             set_app_preset("bf6.exe", "output", "Gaming"),
             Call::ListApps,
             Call::ForgetDevice("Old Dock".to_owned()),
+            Call::SetWindowsParity {
+                level: "sound".to_owned(),
+                force: false,
+            },
         ]
     }
 
@@ -1719,7 +1813,7 @@ mod tests {
         let mut members: Vec<_> = every_call().iter().map(Call::member).collect();
         members.sort_unstable();
         members.dedup();
-        assert_eq!(members.len(), 23);
+        assert_eq!(members.len(), 24);
     }
 
     fn argv(args: &[&str]) -> Vec<String> {
@@ -2115,6 +2209,7 @@ mod tests {
                 Some(("alsa_output.pci".to_owned(), "Speakers".to_owned())),
                 None,
             ],
+            windows_parity: WindowsParity::Off,
         }
     }
 
@@ -2493,7 +2588,7 @@ mod tests {
     #[test]
     fn every_method_is_served_with_its_documented_signature() {
         let xml = introspection();
-        let signatures: [(&str, &[&str]); 23] = [
+        let signatures: [(&str, &[&str]); 24] = [
             ("TogglePower", &[r#"type="b" direction="out""#]),
             ("SetPower", &[r#"type="b" direction="in""#]),
             ("NextPreset", &[]),
@@ -2532,6 +2627,13 @@ mod tests {
             ),
             ("ListApps", &[r#"type="s" direction="out""#]),
             ("ForgetDevice", &[r#"type="s" direction="in""#]),
+            (
+                "SetWindowsParity",
+                &[
+                    r#"name="level" type="s" direction="in""#,
+                    r#"name="force" type="b" direction="in""#,
+                ],
+            ),
         ];
         for (member, args) in signatures {
             let method = element(&xml, "method", member);
@@ -2544,7 +2646,7 @@ mod tests {
                 assert!(method.contains(arg), "{member} has no {arg}: {method}");
             }
         }
-        assert_eq!(xml.matches("<method ").count(), 23, "{xml}");
+        assert_eq!(xml.matches("<method ").count(), 24, "{xml}");
         for call in every_call() {
             element(&xml, "method", call.member());
         }
@@ -2560,6 +2662,7 @@ mod tests {
             ("Output", "s"),
             ("Input", "s"),
             ("Direction", "s"),
+            ("WindowsParity", "s"),
         ] {
             let property = element(&xml, "property", name);
             assert!(
@@ -3089,6 +3192,45 @@ mod tests {
         assert_eq!(status["input"]["noise_suppression"], "strong");
         assert_eq!(status["version"], VERSION);
 
+        // «Как в Windows»: a level taken and announced, Everything refused even when forced.
+        let properties = zbus::blocking::Proxy::new(
+            &client,
+            BUS_NAME,
+            OBJECT_PATH,
+            "org.freedesktop.DBus.Properties",
+        )
+        .expect("a properties proxy");
+        let property_signals = signals(&properties, "PropertiesChanged");
+        let () = proxy
+            .call("SetWindowsParity", &("sound", false))
+            .expect("SetWindowsParity");
+        eventually(&proxy, "WindowsParity", &"sound".to_owned());
+        let announced = loop {
+            let signal = property_signals
+                .recv_timeout(Duration::from_secs(5))
+                .expect("PropertiesChanged with WindowsParity");
+            let (interface, mut changed, _): (
+                String,
+                std::collections::HashMap<String, zvariant_owned::OwnedValue>,
+                Vec<String>,
+            ) = signal
+                .body()
+                .deserialize()
+                .expect("a PropertiesChanged body");
+            assert_eq!(interface, INTERFACE);
+            if let Some(level) = changed.remove("WindowsParity") {
+                break String::try_from(level).expect("a string");
+            }
+        };
+        assert_eq!(announced, "sound");
+        let (name, detail) = method_error(proxy.call("SetWindowsParity", &("full", true)));
+        assert_eq!(name, REFUSED);
+        assert_eq!(detail, fxsound_core::parity::FULL_NOT_YET);
+        eventually(&proxy, "WindowsParity", &"sound".to_owned());
+        let status: String = proxy.call("GetStatus", &()).expect("GetStatus");
+        let status: Value = serde_json::from_str(&status).expect("the --status --json document");
+        assert_eq!(status["windows_parity"], "sound");
+
         // The window is the pump's business; the calls only have to be taken.
         for member in ["Show", "Hide", "ToggleWindow"] {
             let () = proxy
@@ -3379,5 +3521,158 @@ mod tests {
         eventually(&proxy, "Input", &"Headset".to_owned());
         dbus.shutdown();
         drop(server);
+    }
+
+    // ---- «Как в Windows» (A9) ---------------------------------------------------------------
+
+    #[test]
+    fn set_windows_parity_takes_what_the_option_takes_and_force_as_force_says() {
+        for (level, parsed) in [
+            ("off", WindowsParity::Off),
+            ("Interface", WindowsParity::Interface),
+            ("sound", WindowsParity::Sound),
+            ("Everything", WindowsParity::Full),
+        ] {
+            for force in [false, true] {
+                assert_eq!(
+                    commands(Call::SetWindowsParity {
+                        level: level.to_owned(),
+                        force,
+                    }),
+                    [Command::WindowsParity {
+                        level: parsed,
+                        force
+                    }]
+                );
+            }
+        }
+        assert_eq!(
+            commands(Call::SetWindowsParity {
+                level: "full".to_owned(),
+                force: true,
+            }),
+            cli(&["--windows-parity=full", "--force"])
+        );
+        let why = Call::SetWindowsParity {
+            level: "windows".to_owned(),
+            force: false,
+        }
+        .commands()
+        .expect_err("an invalid argument");
+        assert!(why.contains("off, interface or sound"), "{why}");
+    }
+
+    #[test]
+    fn everything_is_refused_on_the_bus_as_on_the_line_in_this_version() {
+        let mut app = App::headless_for_tests();
+        for force in [false, true] {
+            let refused = crate::commands::run(
+                &mut app,
+                &commands(Call::SetWindowsParity {
+                    level: "full".to_owned(),
+                    force,
+                }),
+            );
+            assert!(refused.failed);
+            assert_eq!(refused.stderr, fxsound_core::parity::FULL_NOT_YET);
+            assert_eq!(
+                refused_text(answer(Response::failed(refused.stderr.clone()))),
+                fxsound_core::parity::FULL_NOT_YET
+            );
+            assert_eq!(Properties::of(&app).windows_parity, WindowsParity::Off);
+        }
+    }
+
+    #[test]
+    #[ignore = "Everything is offered from 0.6.0 (W4)"]
+    fn a_move_to_everything_that_takes_something_away_is_refused_on_the_bus_as_on_the_line() {
+        let mut app = App::headless_for_tests();
+        app.state.devices = vec![fxsound_core::AudioDevice {
+            id: 58,
+            name: "alsa_input.pci".into(),
+            description: "Microphone".into(),
+            is_default: false,
+            direction: DeviceDirection::Input,
+            form_factor: "microphone".into(),
+        }];
+        app.mark_devices_seen_for_tests();
+        let outcome =
+            crate::commands::run(&mut app, &commands(Call::SetInput("Microphone".into())));
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert!(app.parity_would_take_away());
+
+        let refused = crate::commands::run(
+            &mut app,
+            &commands(Call::SetWindowsParity {
+                level: "full".to_owned(),
+                force: false,
+            }),
+        );
+        assert!(refused.failed);
+        assert_eq!(refused.stderr, fxsound_core::parity::FULL_REFUSAL);
+        assert_eq!(
+            refused_text(answer(Response::failed(refused.stderr.clone()))),
+            fxsound_core::parity::FULL_REFUSAL
+        );
+        assert_eq!(Properties::of(&app).windows_parity, WindowsParity::Off);
+
+        let forced = crate::commands::run(
+            &mut app,
+            &commands(Call::SetWindowsParity {
+                level: "full".to_owned(),
+                force: true,
+            }),
+        );
+        assert!(!forced.failed, "{}", forced.stderr);
+        assert_eq!(Properties::of(&app).windows_parity, WindowsParity::Full);
+    }
+
+    #[test]
+    fn a_new_level_changes_windows_parity_on_the_bus_and_the_same_level_nothing() {
+        let mut properties = properties();
+        let update = properties.fold(
+            &AppEvent::WindowsParity {
+                level: WindowsParity::Sound,
+            },
+            0,
+        );
+        assert_eq!(
+            update,
+            Update {
+                signal: None,
+                changed: vec![Property::WindowsParity],
+            }
+        );
+        assert_eq!(properties.windows_parity, WindowsParity::Sound);
+        assert!(
+            properties
+                .fold(
+                    &AppEvent::WindowsParity {
+                        level: WindowsParity::Sound
+                    },
+                    0
+                )
+                .is_empty()
+        );
+        assert_eq!(Property::WindowsParity.name(), "WindowsParity");
+    }
+
+    #[test]
+    fn every_call_declares_the_level_that_changes_it() {
+        // Exhaustive in the code; the decisions pinned here. The bus never goes away, and a
+        // method is refused at Everything only where what it acts on is hidden there; ListApps
+        // answers instead, with the applications hidden.
+        for call in every_call() {
+            let expected = match call.member() {
+                "SetInput"
+                | "NextInput"
+                | "SetNoiseSuppression"
+                | "SetEditDirection"
+                | "SetAppPreset"
+                | "ListApps" => ParityClass::Full,
+                _ => ParityClass::Never,
+            };
+            assert_eq!(call.parity_class(), expected, "{}", call.member());
+        }
     }
 }

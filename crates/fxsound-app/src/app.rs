@@ -15,11 +15,17 @@
 
 use fxsound_audio::EngineHandle;
 use fxsound_core::{
-    AudioDevice, DeviceDirection, Effect, EqBand, Preset, Settings, ThemeMode, ViewMode,
+    AudioDevice, DeviceDirection, DspCompat, Effect, EqBand, Preset, Settings, ThemeMode, ViewMode,
+    WindowsParity,
     messages::{AudioToUi, DspEvent, DspParams, InputDspParams, Meters, UiToAudio},
     scale,
 };
-use fxsound_preset::{InputPresetStore, PresetFile, PresetStore, Store, input::InputPreset};
+use fxsound_dsp::preset::{
+    MusicControls, MusicLevels, bands_of, ladder_in, music_controls, write_music_params,
+};
+use fxsound_preset::{
+    EndBands, InputPresetStore, PresetFile, PresetStore, Store, input::InputPreset,
+};
 use fxsound_ui::{
     AssetCache, Palette, UiAction, UiState,
     dialogs::{
@@ -44,6 +50,7 @@ use fxsound_core::settings::CalibrationRecord;
 use fxsound_ui::dialogs::settings::{DevicePriority, SettingsState};
 
 mod per_app;
+mod wireplumber;
 
 pub use per_app::{
     AppRuleRefusal, ListedApp, NamedAppRule, apps_named, list_apps, unseen_description, unseen_key,
@@ -128,6 +135,11 @@ pub enum Refusal {
     NothingToSave {
         preset: String,
     },
+    /// Save New Preset of a preset with no unsaved changes at «Как в Windows» = Interface and
+    /// above, where it is offered only with changes, as on Windows (0.4.0 audit #17).
+    NothingToSaveAsNew {
+        preset: String,
+    },
     /// Undo with no unsaved changes.
     NothingToUndo {
         preset: String,
@@ -193,6 +205,12 @@ impl std::fmt::Display for Refusal {
             Self::NothingToSave { preset } => {
                 write!(f, "{preset:?} has no unsaved changes to save")
             }
+            Self::NothingToSaveAsNew { preset } => write!(
+                f,
+                "{preset:?} has no unsaved changes: with \"Like FxSound for Windows\" on, a new \
+                 preset is saved from unsaved changes only, as on Windows; --windows-parity=off \
+                 saves a copy"
+            ),
             Self::NothingToUndo { preset } => {
                 write!(f, "{preset:?} has no unsaved changes to undo")
             }
@@ -232,8 +250,10 @@ const fn lane_noun(lane: DeviceDirection) -> &'static str {
 
 /// Which of the hamburger menu's preset items are offered: each is
 /// [`App::preset_command_allowed`] for its command (`FxMainWindow.cpp:536-543`), with the power on
-/// or off (0.4.0 audit R7). Export and Import are not preset commands; they are always offered,
-/// whether or not the preset has unsaved changes (0.4.0 audit #18).
+/// or off (0.4.0 audit R7). Export and Import are not preset commands; they are offered whether or
+/// not the preset has unsaved changes (0.4.0 audit #18), except at «Как в Windows» = Interface and
+/// above, where unsaved changes grey them out as on Windows, and the power off greys out all
+/// seven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PresetMenu {
     pub save_new: bool,
@@ -435,7 +455,7 @@ trait LaneStore {
     /// copying and deleting them ([`Store::rename`], 0.4.0 audit #19).
     fn rename(&mut self, old: &str, new: &str) -> Result<(), String>;
     fn import(&mut self, source: &Path) -> Result<String, String>;
-    fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, String>;
+    fn export(&self, name: &str, dir: &Path, end_bands: EndBands) -> Result<PathBuf, String>;
 }
 
 impl<F: PresetFile> LaneStore for Store<F> {
@@ -480,8 +500,8 @@ impl<F: PresetFile> LaneStore for Store<F> {
         Store::import(self, source).map_err(|err| err.to_string())
     }
 
-    fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, String> {
-        Store::export(self, name, dir).map_err(|err| err.to_string())
+    fn export(&self, name: &str, dir: &Path, end_bands: EndBands) -> Result<PathBuf, String> {
+        Store::export_with(self, name, dir, end_bands).map_err(|err| err.to_string())
     }
 }
 
@@ -641,11 +661,17 @@ pub struct App {
     apps: per_app::AppPresets,
     /// The window is up ([`App::set_window_shown`]): its microphone meters can be looking.
     window_shown: bool,
+    /// The window is up but minimised, with no tray to hide in ([`App::set_window_minimised`]):
+    /// a change made now is out of sight, like one made with no window at all.
+    window_minimised: bool,
     /// The calibration wizard's hold on the microphone, as it last asked (U9, U19).
     wizard_holds_microphone: bool,
     /// What the engine was last told about holding the microphone awake
     /// ([`UiToAudio::KeepInputAwake`], [`App::hold_microphone_as_needed`]).
     microphone_held: bool,
+    /// Settings ▸ Experimental's "Smooth moves in WirePlumber": FxSound's hook in the user's
+    /// WirePlumber, and the WirePlumber it goes into (roadmap 0.5.0 §7, D5).
+    wireplumber: wireplumber::WirePlumberHost,
 }
 
 impl App {
@@ -696,6 +722,7 @@ impl App {
                 balance_db: settings.balance,
                 volume_leveling: settings.volume_leveling,
                 hide_tooltips: settings.hide_help_tooltips,
+                windows_parity: settings.windows_parity.offered_or_below(),
                 ..UiState::default()
             },
             params: DspParams::default(),
@@ -752,9 +779,18 @@ impl App {
                 per_app::AppPresets::default()
             },
             window_shown: false,
+            window_minimised: false,
             wizard_holds_microphone: false,
             microphone_held: false,
+            // The user's WirePlumber only for a run that may write the user's files.
+            wireplumber: if persist {
+                wireplumber::WirePlumberHost::of_user()
+            } else {
+                wireplumber::WirePlumberHost::none()
+            },
         };
+        // A hook an earlier FxSound installed is this build's from now on.
+        app.wireplumber.bring_up_to_date();
 
         // What the settings file asks of the audio thread before it does anything else. See
         // [`startup_messages`].
@@ -817,10 +853,14 @@ impl App {
         self.set_edit_direction(edit);
     }
 
-    /// The palette the views should use.
+    /// The palette the views should use: the theme chosen, and from «Как в Windows» = Interface on
+    /// the Windows build's own ([`Palette::windows`]).
     #[must_use]
     pub fn palette(&self) -> Palette {
-        Palette::new(self.state.theme)
+        Palette::new(self.state.theme).windows(
+            self.windows_parity()
+                .windows_look(fxsound_core::WindowsLook::Palette),
+        )
     }
 
     /// `true` when the audio engine is running.
@@ -1061,6 +1101,27 @@ impl App {
                 // naming a node that is gone.
                 if self.settings.remembered_default(direction) != node_name {
                     self.settings.set_remembered_default(direction, &node_name);
+                    self.settings_dirty = true;
+                }
+            }
+            // A device the desktop picked as the system's default while the lane follows it: the
+            // lane's device from now on, as a pick in FxSound would be, so the next start begins
+            // there (0.4.0 began on the device last picked in FxSound). Nothing goes back to the
+            // engine, which has moved the lane already; and with the priority list in force
+            // meanwhile, a pick on its way is the list's to decide, and not kept.
+            AudioToUi::DesktopPick {
+                direction,
+                node_name,
+            } => {
+                if self.settings.follow_system_default
+                    && self.settings.device_name(direction) != node_name
+                {
+                    log::info!(
+                        "the desktop picked {node_name} for the {} lane, which follows the \
+                         system's default device: kept for the next start",
+                        direction.key()
+                    );
+                    self.settings.set_device_name(direction, &node_name);
                     self.settings_dirty = true;
                 }
             }
@@ -1586,6 +1647,7 @@ impl App {
         let (centres, boosts) = params.bands();
         self.state.eq_on = params.eq_on;
         self.state.eq_bands = bands_of(centres, boosts);
+        self.new_curve_in_the_window();
         self.state.filter_q = params.filter_q;
         self.state.master_gain_db = params.makeup_db;
         self.state.denoise_on = params.rnnoise;
@@ -1764,23 +1826,37 @@ impl App {
             effects,
             eq_on,
             eq_bands,
-        } = music_controls(preset, &self.music_ladder());
+        } = music_controls(preset, &self.music_ladder(), self.music_compat());
         self.state.effects = effects;
         self.state.eq_on = eq_on;
         self.state.eq_bands = eq_bands;
+        self.new_curve_in_the_window();
         self.sync_params_from_state();
+    }
+
+    /// Tell the window the curve it shows is a preset's, read now: a band it still holds under
+    /// the old one lets go ([`UiState::eq_curve_generation`]), also when the preset is the same.
+    fn new_curve_in_the_window(&mut self) {
+        self.state.eq_curve_generation = self.state.eq_curve_generation.wrapping_add(1);
     }
 
     /// The music lane's live band ladder: the user's band count (`settings.num_bands`), at the
     /// centres the window holds when it holds that many bands, else at the engine's own ladder
-    /// for the count. Asked while the window shows the music lane.
+    /// for the count in the DSP the level plays ([`ladder_in`]). Asked while the window shows the
+    /// music lane.
     fn music_ladder(&self) -> Vec<f32> {
         let count = (self.settings.num_bands as usize).clamp(1, fxsound_core::eq::MAX_BANDS);
         if self.state.eq_bands.len() == count {
             self.state.eq_bands.iter().map(|b| b.center_hz).collect()
         } else {
-            ladder(count)
+            ladder_in(count, self.music_compat())
         }
+    }
+
+    /// Whose DSP the music chains play and whose reading of a preset the window takes: the Windows
+    /// build's from «Like FxSound for Windows» = Interface and sound on ([`DspCompat::for_level`]).
+    fn music_compat(&self) -> DspCompat {
+        DspCompat::for_level(self.windows_parity())
     }
 
     /// The edit direction's controls as that lane's kind of preset, under the selected preset's
@@ -1846,10 +1922,11 @@ impl App {
     ) -> Preset {
         let mut preset = self.loaded_preset.clone().unwrap_or_default();
         preset.name = name;
+        let compat = self.music_compat();
         for effect in Effect::ALL {
             preset.set_effect(
                 effect,
-                scale::slider_to_value_for(effect, effects[effect as usize]),
+                scale::slider_to_value_in(compat, effect, effects[effect as usize]),
             );
         }
         preset.eq_bands = eq_bands.to_vec();
@@ -2087,8 +2164,14 @@ impl App {
             return;
         }
         self.drop_solo_on(self.state.direction);
-        let new_ladder = ladder(count);
         let lane = self.state.direction;
+        // The music lane reads a curve as the level's DSP does (at Interface and sound by
+        // position, onto the Windows twenty-band ladder); the voice chain has one reading.
+        let compat = match lane {
+            DeviceDirection::Output => self.music_compat(),
+            DeviceDirection::Input => DspCompat::Linux,
+        };
+        let new_ladder = ladder_in(count, compat);
         // Only the preset the list shows, unedited, and the one last read are the same curve: with
         // nothing selected — the last preset deleted from a list with no factory presets — the
         // last one read may be gone, and the curve on screen is the user's alone.
@@ -2100,13 +2183,15 @@ impl App {
             .filter(|(shown, read)| shown.name == read.name)
             .map(|(_, read)| read);
         self.state.eq_bands = match (unedited, lane) {
-            (Some(preset), DeviceDirection::Output) => music_controls(preset, &new_ladder).eq_bands,
+            (Some(preset), DeviceDirection::Output) => {
+                music_controls(preset, &new_ladder, compat).eq_bands
+            }
             _ => {
                 let centres: Vec<f32> = self.state.eq_bands.iter().map(|b| b.center_hz).collect();
                 let gains: Vec<f32> = self.state.eq_bands.iter().map(|b| b.boost_db).collect();
                 bands_of(
                     &new_ladder,
-                    &fxsound_dsp::eq::fit_preset_gains(&centres, &gains, &new_ladder),
+                    &fxsound_dsp::eq::fit_preset_gains_in(&centres, &gains, &new_ladder, compat),
                 )
             }
         };
@@ -2267,6 +2352,10 @@ impl App {
     fn sync_params_from_state(&mut self) {
         self.params.power = self.state.power;
         self.input_params.power = self.state.power;
+        // Whose DSP the music chain plays is the level's, whichever lane the window edits: the
+        // Windows build's from «Like FxSound for Windows» = Interface and sound on. The voice
+        // chain has no Windows original.
+        self.params.compat = DspCompat::for_level(self.windows_parity());
         // No `mute` for a system asleep: the engine silences both lanes and every route itself
         // (U13, [`App::system_sleeping`]), and gives up on a sleep whose end never came.
         match self.state.direction {
@@ -2292,6 +2381,7 @@ impl App {
 
     /// The window's controls, mapped onto the music chain ([`write_music_params`]).
     fn sync_output_params_from_state(&mut self) {
+        let compat = DspCompat::for_level(self.windows_parity());
         let state = &self.state;
         write_music_params(
             &mut self.params,
@@ -2303,6 +2393,7 @@ impl App {
                 master_gain_db: state.master_gain_db,
                 balance_db: state.balance_db,
                 volume_leveling: state.volume_leveling,
+                compat,
             },
         );
     }
@@ -2523,6 +2614,10 @@ impl App {
     /// Presets in Settings, where the lane off screen must change in the engine now rather than
     /// the next time it is looked at. The edit direction is not touched, and nothing `act` says
     /// about the lane off screen reaches the desktop.
+    ///
+    /// Nor does a preset `act` reads into the lane off screen reach the window's curve: the lane
+    /// on screen comes back as it was parked, so [`UiState::eq_curve_generation`] comes back too,
+    /// and a band held on it goes on following the pointer.
     fn in_lane(&mut self, lane: DeviceDirection, act: impl FnOnce(&mut Self)) {
         let edit = self.state.direction;
         if lane == edit {
@@ -2530,9 +2625,11 @@ impl App {
             return;
         }
         let armed = std::mem::replace(&mut self.notifications_armed, false);
+        let generation = self.state.eq_curve_generation;
         self.show_lane(lane);
         act(self);
         self.show_lane(edit);
+        self.state.eq_curve_generation = generation;
         self.notifications_armed = armed;
     }
 
@@ -2573,13 +2670,14 @@ impl App {
         // shows its own numbers rather than the other lane's.
         match direction {
             DeviceDirection::Output => {
+                let compat = self.music_compat();
                 self.state.filter_q = self.settings.filter_q;
                 self.state.master_gain_db = self.settings.master_gain;
                 self.state.balance_db = self.settings.balance;
                 self.state.volume_leveling = self.settings.volume_leveling;
                 for effect in Effect::ALL {
                     self.state.effects[effect as usize] =
-                        scale::value_to_slider_for(effect, self.params.effect(effect));
+                        scale::value_to_slider_in(compat, effect, self.params.effect(effect));
                 }
                 self.state.eq_on = self.params.eq_on;
                 let (centres, boosts) = self.params.bands();
@@ -2588,8 +2686,10 @@ impl App {
                 // on ten bands whatever the settings file says.
                 let ladder = self.music_ladder();
                 if ladder.len() != self.state.eq_bands.len() {
-                    // By frequency, from the centres the snapshot holds (audit #13).
-                    let gains = fxsound_dsp::eq::fit_preset_gains(centres, boosts, &ladder);
+                    // By frequency, from the centres the snapshot holds (audit #13); by position
+                    // at Interface and sound, as the Windows build reads it.
+                    let gains =
+                        fxsound_dsp::eq::fit_preset_gains_in(centres, boosts, &ladder, compat);
                     self.state.eq_bands = bands_of(&ladder, &gains);
                 }
             }
@@ -2967,8 +3067,10 @@ impl App {
             meters_moved: false,
             apps: per_app::AppPresets::default(),
             window_shown: false,
+            window_minimised: false,
             wizard_holds_microphone: false,
             microphone_held: false,
+            wireplumber: wireplumber::WirePlumberHost::none(),
         };
         app.start_the_stream_here();
         app
@@ -3186,6 +3288,10 @@ impl App {
         });
     }
 
+    fn note_windows_parity(&mut self) {
+        self.note(|published, app| published.windows_parity(app.windows_parity()));
+    }
+
     fn note_echo_cancel(&mut self) {
         self.note(|published, app| {
             published.echo_cancel(
@@ -3352,6 +3458,7 @@ impl App {
                 })
                 .collect(),
             language: i18n::current(),
+            windows_parity: self.windows_parity(),
         }
     }
 
@@ -3488,10 +3595,17 @@ impl App {
                 })
             }
             // A clean preset is saved as a copy (0.4.0 audit #17): the original offers Save New
-            // Preset only with unsaved changes (`FxMainWindow.cpp:535`), so copying a factory
-            // preset meant moving a slider and moving it back first.
+            // Preset only with unsaved changes (`FxMainWindow.cpp:535`,
+            // `FxController.cpp:405-411`), so copying a factory preset meant moving a slider and
+            // moving it back first. At «Как в Windows» = Interface and above it is the original's
+            // again.
             PresetCommand::SaveAs(name) => {
-                selected()?;
+                let preset = selected()?;
+                if !preset.modified && self.windows_parity().interface() {
+                    return Err(Refusal::NothingToSaveAsNew {
+                        preset: preset.name.clone(),
+                    });
+                }
                 let max = self.max_user_presets();
                 if self.user_preset_count() >= max {
                     return Err(Refusal::LimitReached { max });
@@ -3584,31 +3698,42 @@ impl App {
     /// though its command line and this one's D-Bus run them; the port offers them either way, so
     /// a preset can be picked, saved or tidied before switching on (0.4.0 audit R7).
     ///
-    /// Export Presets and Import Presets are always offered. The original greys both out while
+    /// Export Presets and Import Presets are offered either way. The original greys both out while
     /// the preset has unsaved changes (`FxMainWindow.cpp:540-541`), which protects nothing here:
     /// the export writes the presets as saved, and the import skips a name already taken, the
-    /// modified preset's included (0.4.0 audit #18).
+    /// modified preset's included (0.4.0 audit #18). At «Как в Windows» = Interface and above
+    /// they are greyed out as there, and so is every preset item while the power is off
+    /// ([`fxsound_core::WindowsLook::PresetsNeedPower`], R7 set back).
     #[must_use]
     pub fn preset_menu(&self) -> PresetMenu {
+        let powered = self.state.power
+            || !self
+                .windows_parity()
+                .windows_look(fxsound_core::WindowsLook::PresetsNeedPower);
         let offered = |command: PresetCommand| {
-            self.preset_command_allowed(&command)
-                .or_else(|refusal| {
-                    if refusal.is_about_the_name() {
-                        Ok(())
-                    } else {
-                        Err(refusal)
-                    }
-                })
-                .is_ok()
+            powered
+                && self
+                    .preset_command_allowed(&command)
+                    .or_else(|refusal| {
+                        if refusal.is_about_the_name() {
+                            Ok(())
+                        } else {
+                            Err(refusal)
+                        }
+                    })
+                    .is_ok()
         };
+        let transfer = powered
+            && !(self.windows_parity().interface()
+                && self.state.preset().is_some_and(|p| p.modified));
         PresetMenu {
             save_new: offered(PresetCommand::SaveAs(String::new())),
             overwrite: offered(PresetCommand::Overwrite),
             undo: offered(PresetCommand::Undo),
             rename: offered(PresetCommand::Rename(String::new())),
             delete: offered(PresetCommand::Delete),
-            export: true,
-            import: true,
+            export: transfer,
+            import: transfer,
         }
     }
 
@@ -3850,6 +3975,7 @@ impl App {
             | PresetsAction::Export
             | PresetsAction::Overwrite(_)
             | PresetsAction::RevealExportFolder
+            | PresetsAction::ToggleEndBands
             | PresetsAction::CloseExport => false,
         }
     }
@@ -3887,7 +4013,8 @@ impl App {
                     .collect();
                 let collisions = self.export_collisions(state.lane, &names);
                 if collisions.is_empty() {
-                    let written = self.export_presets(state.lane, &names);
+                    let written =
+                        self.export_presets(state.lane, &names, Self::export_end_bands(state));
                     state.finished = Some(written > 0);
                 } else {
                     state.collisions = collisions;
@@ -3909,7 +4036,7 @@ impl App {
                 let written = if names.is_empty() {
                     0
                 } else {
-                    self.export_presets(state.lane, &names)
+                    self.export_presets(state.lane, &names, Self::export_end_bands(state))
                 };
                 state.finished = Some(written > 0);
                 false
@@ -3924,12 +4051,74 @@ impl App {
                 }
                 false
             }
+            PresetsAction::ToggleEndBands => {
+                if state.end_bands_offered && !state.exporting {
+                    self.set_export_unshifted(!state.end_bands_as_they_are);
+                    state.end_bands_as_they_are = self.settings.export_unshifted;
+                }
+                false
+            }
             PresetsAction::CloseExport => true,
             PresetsAction::ChooseImportFolder
             | PresetsAction::Import
             | PresetsAction::DismissNotice
             | PresetsAction::CloseImport => false,
         }
+    }
+
+    /// The Export window for `lane`'s presets, `presets` listed: with the choice of where the end
+    /// bands go on the speakers' presets from «Like FxSound for Windows» = Interface and sound on
+    /// ([`App::export_end_bands`]), ticked as the setting says.
+    #[must_use]
+    pub fn export_window(&self, lane: DeviceDirection, presets: Vec<String>) -> ExportState {
+        let mut state = ExportState {
+            lane,
+            presets,
+            ..ExportState::default()
+        };
+        self.refresh_export_state(&mut state);
+        state
+    }
+
+    /// Bring an open Export window up to date with what may have moved since it opened: whether
+    /// «Like FxSound for Windows» still offers the end-band choice (`--windows-parity`, D-Bus
+    /// `SetWindowsParity`), and the choice itself (`--export-unshifted`). The host calls it
+    /// every frame the window is drawn, so what the window shows is what an export does
+    /// ([`App::handle_export`] exports as the window says, not as the level says).
+    pub fn refresh_export_state(&self, state: &mut ExportState) {
+        state.end_bands_offered = self.end_bands_offered(state.lane);
+        state.end_bands_as_they_are = self.settings.export_unshifted;
+    }
+
+    /// Whether `lane`'s export offers to keep the end bands where they are: the speakers' `.fac`,
+    /// from «Like FxSound for Windows» = Interface and sound on (roadmap 0.5.0 §14 #56). A voice
+    /// preset has no Windows reader to shift them for.
+    fn end_bands_offered(&self, lane: DeviceDirection) -> bool {
+        lane == DeviceDirection::Output && self.windows_parity().sound()
+    }
+
+    /// Where an export from the Export window `state` puts the end bands: where they are when the
+    /// window offers that and shows it chosen (`export_unshifted`, the tick box,
+    /// `--export-unshifted`), back inside the Windows build's range otherwise, as 0.4.0 does
+    /// (0.4.0 audit R6). The window's own record, kept current by
+    /// [`App::refresh_export_state`], so the export never does what the window does not show.
+    fn export_end_bands(state: &ExportState) -> EndBands {
+        if state.end_bands_offered && state.end_bands_as_they_are {
+            EndBands::AsTheyAre
+        } else {
+            EndBands::Shifted
+        }
+    }
+
+    /// Choose whether an export keeps the end bands where they are (the Export window's tick box,
+    /// `--export-unshifted`), and save it. It is followed from «Like FxSound for Windows» =
+    /// Interface and sound on; below it the choice is kept for then.
+    pub fn set_export_unshifted(&mut self, as_they_are: bool) {
+        if self.settings.export_unshifted == as_they_are {
+            return;
+        }
+        self.settings.export_unshifted = as_they_are;
+        self.persist_settings();
     }
 
     /// The presets among `names` whose file already exists in the export directory — the file
@@ -3949,10 +4138,15 @@ impl App {
             .collect()
     }
 
-    /// Write `names`, from `lane`'s store, into the export directory — each as last saved.
-    /// Returns how many files were written, which is what `FxController::exportPresets()` reduces
-    /// to a `bool`.
-    fn export_presets(&mut self, lane: DeviceDirection, names: &[String]) -> usize {
+    /// Write `names`, from `lane`'s store, into the export directory — each as last saved, with
+    /// the end bands put as `end_bands` says. Returns how many files were written, which is what
+    /// `FxController::exportPresets()` reduces to a `bool`.
+    fn export_presets(
+        &mut self,
+        lane: DeviceDirection,
+        names: &[String],
+        end_bands: EndBands,
+    ) -> usize {
         if let Err(err) = std::fs::create_dir_all(&self.export_dir) {
             log::warn!("could not create {}: {err}", self.export_dir.display());
             self.raise_notice(tr("Could not create the export folder"));
@@ -3960,7 +4154,7 @@ impl App {
         }
         let mut written = 0;
         for name in names {
-            match self.store(lane).export(name, &self.export_dir) {
+            match self.store(lane).export(name, &self.export_dir, end_bands) {
                 Ok(_) => written += 1,
                 Err(err) => {
                     log::warn!("could not export {name}: {err}");
@@ -4155,76 +4349,6 @@ pub(crate) const fn detach(lane: DeviceDirection) -> UiAction {
     }
 }
 
-/// The engine's band ladder for `count` bands: the original's hard-coded table where it has
-/// one, else the geometric ladder `GraphicEq` builds.
-fn ladder(count: usize) -> Vec<f32> {
-    fxsound_dsp::eq::band_table(count).map_or_else(
-        || {
-            let mut eq = fxsound_dsp::GraphicEq::new();
-            eq.set_num_bands(count);
-            eq.center_frequencies().to_vec()
-        },
-        |(table, _, _)| table.to_vec(),
-    )
-}
-
-/// An equalizer as the window holds it, from a snapshot's two parallel arrays.
-fn bands_of(centres: &[f32], boosts: &[f32]) -> Vec<EqBand> {
-    centres
-        .iter()
-        .zip(boosts)
-        .map(|(&center_hz, &boost_db)| EqBand {
-            center_hz,
-            boost_db,
-        })
-        .collect()
-}
-
-/// What a music preset puts in the window: the five effects at their slider positions, and the
-/// equalizer's switch and bands.
-#[derive(Debug, Clone, PartialEq)]
-struct MusicControls {
-    effects: [f32; Effect::COUNT],
-    eq_on: bool,
-    eq_bands: Vec<EqBand>,
-}
-
-/// A music preset read into the window's controls on `ladder`, the live band ladder — the one
-/// reading of a `.fac` there is: the lane's own ([`App::apply_preset`]) and an application's
-/// route ([`per_app`]) both go through it, so a preset sounds the same on either.
-///
-/// The effects land where the slider shows them, which is where they sound: a Dynamic Boost past
-/// the slider's dead top is read as the top ([`scale::value_to_slider_for`]). The curve is the
-/// preset's own when it has as many bands as the ladder, fitted onto the ladder by frequency when
-/// it has another count ([`fxsound_dsp::eq::fit_preset_gains`], audit #13), and flat with the
-/// equalizer on when it has none, the original's "old preset".
-///
-/// A twenty-band curve on the Windows ladder — a Windows preset, or one saved before 0.4.0 — is
-/// read on the half-octave ladder that replaced it, band for band (0.4.0 audit R4,
-/// [`fxsound_core::eq::move_off_the_windows_twenty_band_ladder`]), so it plays without the
-/// paired ladder's ripple and is saved on the new one the next time it is saved.
-fn music_controls(preset: &Preset, ladder: &[f32]) -> MusicControls {
-    let effects =
-        Effect::ALL.map(|effect| scale::value_to_slider_for(effect, preset.effect(effect)));
-    let mut preset_bands = preset.eq_bands.clone();
-    fxsound_core::eq::move_off_the_windows_twenty_band_ladder(&mut preset_bands);
-    let (eq_on, eq_bands) = if preset_bands.is_empty() {
-        (true, bands_of(ladder, &vec![0.0; ladder.len()]))
-    } else if preset_bands.len() == ladder.len() {
-        (preset.eq_on, preset_bands)
-    } else {
-        let centres: Vec<f32> = preset_bands.iter().map(|b| b.center_hz).collect();
-        let gains: Vec<f32> = preset_bands.iter().map(|b| b.boost_db).collect();
-        let fitted = fxsound_dsp::eq::fit_preset_gains(&centres, &gains, ladder);
-        (preset.eq_on, bands_of(ladder, &fitted))
-    };
-    MusicControls {
-        effects,
-        eq_on,
-        eq_bands,
-    }
-}
-
 /// A voice preset's own parameters — the one reading of a voice preset there is: the lane's own
 /// ([`App::apply_input_preset`]) and a recording route's ([`per_app`]) both go through it.
 ///
@@ -4239,52 +4363,6 @@ fn voice_params(preset: &InputPreset) -> InputDspParams {
         params.set_bands(&bands);
     }
     params
-}
-
-/// The levels every music chain shares: settings over every `.fac`, as the original's.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct MusicLevels {
-    filter_q: f32,
-    master_gain_db: f32,
-    balance_db: f32,
-    volume_leveling: f32,
-}
-
-impl MusicLevels {
-    /// The levels the settings file holds, which are the speakers' whichever lane the window
-    /// edits.
-    const fn of(settings: &Settings) -> Self {
-        Self {
-            filter_q: settings.filter_q,
-            master_gain_db: settings.master_gain,
-            balance_db: settings.balance,
-            volume_leveling: settings.volume_leveling,
-        }
-    }
-}
-
-/// Map a music chain's controls onto its snapshot: the effects from their slider positions, the
-/// equalizer, and the shared levels. Everything else in `params` is left as it is — the power and
-/// the mute are the whole application's.
-fn write_music_params(
-    params: &mut DspParams,
-    effects: &[f32; Effect::COUNT],
-    eq_on: bool,
-    eq_bands: &[EqBand],
-    levels: MusicLevels,
-) {
-    for effect in Effect::ALL {
-        params.set_effect(
-            effect,
-            scale::slider_to_value_for(effect, effects[effect as usize]),
-        );
-    }
-    params.eq_on = eq_on;
-    params.set_bands(eq_bands);
-    params.filter_q = levels.filter_q;
-    params.master_gain_db = levels.master_gain_db;
-    params.balance = levels.balance_db;
-    params.volume_leveling_db = levels.volume_leveling;
 }
 
 /// Copy what the engine's lanes measured into what the window draws.
@@ -4548,6 +4626,7 @@ impl App {
         let mut state = SettingsState::new(self.settings.clone());
         state.version = env!("CARGO_PKG_VERSION").to_owned();
         state.launch_on_startup = autostart_enabled();
+        state.wireplumber_hook = self.wireplumber.state();
         state.devices = self.device_rows(DeviceDirection::Output);
         state.microphones = self.device_rows(DeviceDirection::Input);
         self.refresh_settings_state(&mut state);
@@ -4713,9 +4792,189 @@ impl App {
         self.persist_settings();
     }
 
+    /// Set «Как в Windows» / "Like FxSound for Windows" (`--windows-parity`, D-Bus
+    /// `SetWindowsParity`, the slider in Settings ▸ Experimental), save it and say so on the
+    /// stream.
+    ///
+    /// Everything is refused with [`fxsound_core::parity::FULL_NOT_YET`] on every path: 0.5.0 does
+    /// not offer it ([`WindowsParity::offered`]), and 0.6.0 (W4) brings it.
+    ///
+    /// Once it is offered, a move to Everything that would switch off something in use now
+    /// ([`App::parity_would_take_away`]) is refused unless `force` says to go ahead: the window
+    /// asks first, and the command line and D-Bus cannot ask, so they refuse with the words the
+    /// question would have used ([`fxsound_core::parity::FULL_REFUSAL`]).
+    ///
+    /// The level is recorded, reported and saved, and from Interface and sound on the output lane
+    /// and the applications' output routes play the Windows build's DSP ([`DspCompat`]); what else
+    /// each level changes arrives with the phases that build it (`docs/0.5.0-windows-parity.md`).
+    ///
+    /// # Errors
+    ///
+    /// The refusal's text, with nothing changed.
+    pub fn set_windows_parity(&mut self, level: WindowsParity, force: bool) -> Result<(), String> {
+        if !level.offered() {
+            return Err(fxsound_core::parity::FULL_NOT_YET.to_owned());
+        }
+        // The level in force, not the one stored: a file a later version wrote may say `full`,
+        // which runs as Interface and sound, so choosing Interface and sound then changes nothing
+        // and the file keeps its Everything for when that version is back.
+        let current = self.windows_parity();
+        if level == current {
+            return Ok(());
+        }
+        if level.full() && !current.full() && !force && self.parity_would_take_away() {
+            return Err(fxsound_core::parity::FULL_REFUSAL.to_owned());
+        }
+        self.settings.windows_parity = level;
+        // What the window draws from Interface on (W2) follows at the next frame.
+        self.state.windows_parity = self.windows_parity();
+        self.persist_settings();
+        // Interface and sound brings the Windows build's DSP to the output lane and the
+        // applications' output routes, and its reading of a preset to the window; the other
+        // levels play FxSound for Linux's.
+        let (from, to) = (DspCompat::for_level(current), DspCompat::for_level(level));
+        if to != from {
+            self.read_music_controls_in(from, to);
+            self.sync_params_from_state();
+        }
+        self.note_windows_parity();
+        // The tray's device rows are cut as Windows cuts them from Interface on (0.4.0 audit #31).
+        self.tray_stale = true;
+        Ok(())
+    }
+
+    /// Read the music lane's controls again in the other DSP's reading of a preset, when the level
+    /// of «Like FxSound for Windows» moves across Interface and sound: nothing is edited, marked or
+    /// saved.
+    ///
+    /// A preset with no unsaved changes is read again from its own file, as picking it would read
+    /// it at the new level ([`music_controls`]), as a band count change reads it (audit #45): a
+    /// curve of another band count by position at Interface and sound and by frequency below it,
+    /// Ambience's slider on the level's line. Controls with unsaved changes, or with no preset
+    /// read, are carried over instead: every effect keeps the value it plays and moves to the
+    /// position that value shows at in the new reading (audit #39), and a twenty-band curve on
+    /// one DSP's ladder moves to the other's band for band, its gains where they were (R4). Either
+    /// way a twenty-band preset taken to Interface and sound and back is the preset it was, bit
+    /// for bit (A12), and what is saved at either level reads back at the other as it was saved.
+    ///
+    /// The window's controls when it edits the speakers; otherwise the speakers' controls it keeps
+    /// aside ([`App::lane_controls`]), and the music chain's snapshot, which only the window's
+    /// controls rebuild, is written from them.
+    fn read_music_controls_in(&mut self, from: DspCompat, to: DspCompat) {
+        fn carry(
+            controls: (&mut [f32; Effect::COUNT], &mut bool, &mut Vec<EqBand>),
+            fresh: Option<&MusicControls>,
+            from: DspCompat,
+            to: DspCompat,
+        ) {
+            let (effects, eq_on, bands) = controls;
+            if let Some(fresh) = fresh {
+                effects.clone_from(&fresh.effects);
+                *eq_on = fresh.eq_on;
+                bands.clone_from(&fresh.eq_bands);
+                return;
+            }
+            for effect in Effect::ALL {
+                let slider = &mut effects[effect as usize];
+                *slider = scale::value_to_slider_in(
+                    to,
+                    effect,
+                    scale::slider_to_value_in(from, effect, *slider),
+                );
+            }
+            fxsound_core::eq::move_to_the_twenty_band_ladder_of(bands, to);
+        }
+        let count = (self.settings.num_bands as usize).clamp(1, fxsound_core::eq::MAX_BANDS);
+        let fresh = self
+            .unedited_music_preset()
+            .map(|preset| music_controls(preset, &ladder_in(count, to), to));
+        match self.state.direction {
+            DeviceDirection::Output => {
+                let state = &mut self.state;
+                carry(
+                    (&mut state.effects, &mut state.eq_on, &mut state.eq_bands),
+                    fresh.as_ref(),
+                    from,
+                    to,
+                );
+            }
+            DeviceDirection::Input => {
+                if let Some(music) = &mut self.lane_controls[lane_index(DeviceDirection::Output)] {
+                    carry(
+                        (&mut music.effects, &mut music.eq_on, &mut music.eq_bands),
+                        fresh.as_ref(),
+                        from,
+                        to,
+                    );
+                    write_music_params(
+                        &mut self.params,
+                        &music.effects,
+                        music.eq_on,
+                        &music.eq_bands,
+                        MusicLevels {
+                            filter_q: music.filter_q,
+                            master_gain_db: music.master_gain_db,
+                            balance_db: music.balance_db,
+                            volume_leveling: music.volume_leveling,
+                            compat: to,
+                        },
+                    );
+                }
+                self.mirror_music_controls();
+            }
+        }
+    }
+
+    /// The speakers' preset as it was read, while the speakers' controls are still that preset
+    /// unedited: the one their list shows, with no unsaved changes, and the one last read. The
+    /// same test a band count change makes ([`App::set_band_count`]).
+    fn unedited_music_preset(&self) -> Option<&Preset> {
+        let shown = match self.state.direction {
+            DeviceDirection::Output => self.state.preset(),
+            DeviceDirection::Input => {
+                let music = self.lane_controls[lane_index(DeviceDirection::Output)].as_ref()?;
+                music.selected_preset.and_then(|i| music.presets.get(i))
+            }
+        }?;
+        self.loaded_preset
+            .as_ref()
+            .filter(|read| !shown.modified && shown.name == read.name)
+    }
+
+    /// Whether a move to Everything would switch off something in use now: the microphone lane
+    /// attached to a device, an application on a route of a preset of its own, or a calibration
+    /// in progress. What the confirmation in the window and the refusal on the command line and
+    /// D-Bus are about.
+    #[must_use]
+    pub fn parity_would_take_away(&self) -> bool {
+        self.state.device_for(DeviceDirection::Input).is_some()
+            || self
+                .app_streams()
+                .iter()
+                .any(|stream| stream.route.is_some())
+            || self.calibration.is_some()
+    }
+
+    /// The level of «Как в Windows» in force: the one in the settings, except that Everything,
+    /// which a later version's `settings.toml` may hold and this one does not offer, runs as
+    /// Interface and sound ([`WindowsParity::offered_or_below`]). The settings keep what the file
+    /// said, so the next save writes it back unchanged. What `--status`, `--watch`, D-Bus and
+    /// every behaviour of a level go by.
+    #[must_use]
+    pub const fn windows_parity(&self) -> WindowsParity {
+        self.settings.windows_parity.offered_or_below()
+    }
+
     /// Hand a toast to the desktop, unless notifications are hidden or start-up is still going.
+    /// With no window up — none there, or one minimised — an echo of a change is all the answer a
+    /// tray pick or a keybind gets, so it goes out as an alert ([`Message::raised`]).
     fn notify(&self, message: Message) {
         if self.notifications_armed {
+            let message = if self.window_shown && !self.window_minimised {
+                message
+            } else {
+                message.raised()
+            };
             let _ = self.notifier.notify(message);
         }
     }
@@ -4807,6 +5066,13 @@ impl App {
                 state.settings.language_follows_system = self.settings.language_follows_system;
                 self.persist_settings();
             }
+            // From the window, which asks before a move to Everything that takes something
+            // away, so the move is refused here only while Everything is not offered; the
+            // slider does not offer it then either.
+            A::SetWindowsParity(level) => {
+                let _ = self.set_windows_parity(*level, true);
+                state.settings.windows_parity = self.settings.windows_parity;
+            }
             A::SetHideHelpTips(on) => {
                 self.settings.hide_help_tooltips = *on;
                 state.settings.hide_help_tooltips = *on;
@@ -4818,6 +5084,20 @@ impl App {
                 state.settings.hide_notifications = *on;
                 self.notifier.set_hidden(*on);
                 self.persist_settings();
+            }
+            A::SetWirePlumberHook(on) => {
+                if let Err(error) = self.wireplumber.set(*on) {
+                    log::warn!("FxSound's hook in WirePlumber could not be changed: {error}");
+                    self.raise_notice(tr(WIREPLUMBER_NOT_CHANGED));
+                }
+                state.wireplumber_hook = self.wireplumber.state();
+            }
+            // On a thread of its own: systemd may take up to its stop timeout to restart a
+            // WirePlumber stuck on a device, and the window is not to hang meanwhile. The pane
+            // learns how it went in [`App::refresh_settings_state`].
+            A::RestartWirePlumber => {
+                self.wireplumber.restart();
+                state.wireplumber_hook = self.wireplumber.state();
             }
             A::SetLaunchOnStartup(on) => {
                 // The Windows build writes an HKCU\...\Run value; the XDG equivalent is a
@@ -5081,10 +5361,16 @@ impl App {
             state.apps = apps;
         }
         state.can_reset_presets = self.can_reset_presets();
+        // A restart of WirePlumber asked for from the pane, over.
+        if let Some(hook) = self.wireplumber.restart_settled() {
+            state.wireplumber_hook = hook;
+        }
         self.refresh_device_rows(state);
         state.echo_cancel_running = self.state.echo_cancel_running;
         // The one microphone setting the command line and D-Bus can change under an open pane.
         state.settings.noise_suppression = self.settings.noise_suppression;
+        // And the Experimental pane's slider, which `--windows-parity` and D-Bus move too.
+        state.settings.windows_parity = self.settings.windows_parity;
         state.echo_cancel_trouble = self.state.echo_cancel_trouble;
         state.input_processing = self.state.input_active;
         state.has_microphone = self.microphone_description().is_some();
@@ -5253,7 +5539,17 @@ impl App {
     /// microphone awake ([`App::hold_microphone_as_needed`]).
     pub fn set_window_shown(&mut self, shown: bool) {
         self.window_shown = shown;
+        // Each window comes up out of the minimised state, and one gone is not minimised.
+        self.window_minimised = false;
         self.hold_microphone_as_needed();
+    }
+
+    /// The window went into the minimised state (`true`) — the minimise button with no tray
+    /// there, or a start in the tray that found none — or came back out of it (`false`). A
+    /// change made while it is minimised is not on screen, so its notice is an alert
+    /// ([`App::notify`]).
+    pub fn set_window_minimised(&mut self, minimised: bool) {
+        self.window_minimised = minimised;
     }
 
     /// Whether the microphone meters are in sight: the window is up in the Pro view, editing a
@@ -5355,6 +5651,7 @@ impl App {
                 .map_or(0, |since| since.as_secs()),
             preset: name.clone(),
             device: calibration.microphone.node_name.clone(),
+            extra: toml::Table::new(),
         });
         let message = if overwrite {
             Message::preset_overwritten(&name)
@@ -5367,6 +5664,9 @@ impl App {
         true
     }
 }
+
+/// The notice when "Smooth moves in WirePlumber" could not install the hook or take it away.
+pub(crate) const WIREPLUMBER_NOT_CHANGED: &str = "Could not change WirePlumber's settings";
 
 /// `~/.config/autostart/fxsound.desktop` — the XDG Autostart entry that stands in for the
 /// `HKCU\…\CurrentVersion\Run` value (`FxController.cpp:2789-2812`).
@@ -5429,6 +5729,7 @@ fn set_autostart(enabled: bool) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use fxsound_core::test_support::ScratchDir;
+    use fxsound_dsp::preset::ladder;
 
     fn headless() -> App {
         App::headless_for_tests()
@@ -6049,6 +6350,80 @@ mod tests {
         assert!(app.tray_tip_shown);
         app.notify_hidden_to_tray(true);
         assert!(app.tray_tip_shown, "the second call must be a no-op");
+    }
+
+    /// A sink that hands each delivered message to the test instead of a daemon.
+    struct Delivered(crossbeam_channel::Sender<Message>);
+
+    impl crate::notify::Sink for Delivered {
+        fn deliver(&mut self, message: &Message, _replaces: Option<u32>) -> Option<u32> {
+            let _ = self.0.send(message.clone());
+            Some(1)
+        }
+    }
+
+    #[test]
+    fn a_change_the_window_shows_is_echoed_quietly_and_one_made_without_a_window_is_an_alert() {
+        // GNOME files a low-urgency notification without a banner. A preset picked in the window
+        // is on screen already; one picked from the tray or a keybind with the window hidden has
+        // nothing else to say so.
+        use crate::notify::Weight;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = app_with_two_presets("notice-weight");
+        app.notifier = Notifier::with_sink(false, Delivered(tx));
+        let next = || {
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a notification was sent")
+        };
+
+        app.set_window_shown(true);
+        app.handle(&[UiAction::SelectPreset(1)]);
+        let echoed = next();
+        assert_eq!(echoed.body, "Preset: Beta");
+        assert_eq!(echoed.weight, Weight::Echo);
+
+        app.set_window_shown(false);
+        app.handle(&[UiAction::SelectPreset(0)]);
+        let alerted = next();
+        assert_eq!(alerted.body, "Preset: Alpha");
+        assert_eq!(alerted.weight, Weight::Alert);
+
+        // Where the window went is never an echo, with a tray or without.
+        app.notify_hidden_to_tray(false);
+        assert_eq!(next().weight, Weight::Alert);
+    }
+
+    #[test]
+    fn a_change_made_with_the_window_minimised_is_an_alert() {
+        // GNOME without AppIndicator: the minimise button minimises, the window stays up, and a
+        // preset a keybind or `fxsound --next-preset` picks then is on no screen either.
+        use crate::notify::Weight;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let mut app = app_with_two_presets("notice-weight-minimised");
+        app.notifier = Notifier::with_sink(false, Delivered(tx));
+        let next = || {
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a notification was sent")
+        };
+
+        app.set_window_shown(true);
+        app.set_window_minimised(true);
+        app.handle(&[UiAction::SelectPreset(1)]);
+        let alerted = next();
+        assert_eq!(alerted.body, "Preset: Beta");
+        assert_eq!(alerted.weight, Weight::Alert);
+
+        // Back out of the minimised state, the window shows the change again.
+        app.set_window_minimised(false);
+        app.handle(&[UiAction::SelectPreset(0)]);
+        assert_eq!(next().weight, Weight::Echo);
+
+        // A fresh window is never minimised, whatever the last one was.
+        app.set_window_minimised(true);
+        app.set_window_shown(false);
+        app.set_window_shown(true);
+        app.handle(&[UiAction::SelectPreset(1)]);
+        assert_eq!(next().weight, Weight::Echo);
     }
 
     #[test]
@@ -7673,6 +8048,147 @@ mod tests {
         app.state.presets.iter().map(|p| p.name.as_str()).collect()
     }
 
+    /// Export `name` through the Export window as `app` opens it for the speakers, and read the
+    /// file back.
+    fn export_through_the_window(app: &mut App, dir: &tempfile::TempDir, name: &str) -> Preset {
+        let names: Vec<String> = app.state.presets.iter().map(|p| p.name.clone()).collect();
+        let state = app.export_window(DeviceDirection::Output, names);
+        export_from_the_open_window(app, dir, &state, name)
+    }
+
+    /// Export `name` through the Export window `state`, already open, and read the file back.
+    fn export_from_the_open_window(
+        app: &mut App,
+        dir: &tempfile::TempDir,
+        state: &ExportState,
+        name: &str,
+    ) -> Preset {
+        let mut state = state.clone();
+        let at = state
+            .presets
+            .iter()
+            .position(|n| n == name)
+            .expect("listed");
+        app.handle_export(&PresetsAction::ToggleExport(at), &mut state);
+        app.handle_export(&PresetsAction::Export, &mut state);
+        if !state.collisions.is_empty() {
+            app.handle_export(
+                &PresetsAction::Overwrite(OverwriteChoice::OverwriteAll),
+                &mut state,
+            );
+        }
+        fxsound_preset::load(&dir.path().join("export").join(format!("{name}.fac")))
+            .expect("the export")
+    }
+
+    #[test]
+    fn at_interface_and_sound_the_export_window_keeps_the_end_bands_where_they_are_when_asked() {
+        // Roadmap 0.5.0 §14 #56: from Interface and sound on, the Export window offers to leave
+        // the end bands where they are; unticked it shifts them as 0.4.0 does, and below that
+        // level it never offers and always shifts, whatever the setting says.
+        let (mut app, dir) = with_store();
+        let mut wide = Preset {
+            name: "Wide".into(),
+            ..Preset::default()
+        };
+        wide.eq_bands[0].center_hz = 46.0;
+        wide.eq_bands[9].center_hz = 20_000.0;
+        app.presets.save_as(&wide, "Wide").expect("saved");
+        app.refresh_preset_list();
+
+        let state = app.export_window(DeviceDirection::Output, vec!["Wide".into()]);
+        assert!(!state.end_bands_offered, "not offered at Off");
+        assert_eq!(
+            export_through_the_window(&mut app, &dir, "Wide").eq_bands[0].center_hz,
+            62.5
+        );
+
+        app.set_windows_parity(WindowsParity::Sound, false)
+            .expect("offered");
+        let mut state = app.export_window(DeviceDirection::Output, vec!["Wide".into()]);
+        assert!(state.end_bands_offered && !state.end_bands_as_they_are);
+        assert!(
+            !app.export_window(DeviceDirection::Input, Vec::new())
+                .end_bands_offered,
+            "a voice preset has no Windows reader"
+        );
+        assert_eq!(
+            export_through_the_window(&mut app, &dir, "Wide").eq_bands[0].center_hz,
+            62.5
+        );
+
+        app.handle_export(&PresetsAction::ToggleEndBands, &mut state);
+        assert!(state.end_bands_as_they_are);
+        assert!(app.settings.export_unshifted, "the choice is kept");
+        let exported = export_through_the_window(&mut app, &dir, "Wide");
+        assert_eq!(
+            exported.eq_bands, wide.eq_bands,
+            "the end bands where they were tuned"
+        );
+
+        // Back at Off the choice waits, and 0.4.0's export comes back.
+        app.set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        assert!(app.settings.export_unshifted);
+        assert_eq!(
+            export_through_the_window(&mut app, &dir, "Wide").eq_bands[0].center_hz,
+            62.5
+        );
+        let state = app.export_window(DeviceDirection::Output, vec!["Wide".into()]);
+        assert!(!state.end_bands_offered);
+    }
+
+    #[test]
+    fn an_open_export_window_follows_the_level_and_exports_as_it_shows() {
+        let (mut app, dir) = with_store();
+        let mut wide = Preset {
+            name: "Wide".into(),
+            ..Preset::default()
+        };
+        wide.eq_bands[0].center_hz = 46.0;
+        app.presets.save_as(&wide, "Wide").expect("saved");
+        app.refresh_preset_list();
+        app.set_export_unshifted(true);
+
+        // (a) Opened at Interface and sound, ticked; a keybind takes the level to Off.
+        app.set_windows_parity(WindowsParity::Sound, false)
+            .expect("offered");
+        let mut state = app.export_window(DeviceDirection::Output, vec!["Wide".into()]);
+        assert!(state.end_bands_offered && state.end_bands_as_they_are);
+        app.set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        // Not drawn since: the export does what the window still shows.
+        assert_eq!(
+            export_from_the_open_window(&mut app, &dir, &state, "Wide").eq_bands[0].center_hz,
+            46.0
+        );
+        // Drawn again: the choice is gone from it, and from the export.
+        app.refresh_export_state(&mut state);
+        assert!(!state.end_bands_offered);
+        assert_eq!(
+            export_from_the_open_window(&mut app, &dir, &state, "Wide").eq_bands[0].center_hz,
+            62.5
+        );
+
+        // (b) Opened at Off with the choice saved earlier; the level goes to Interface and sound.
+        let mut state = app.export_window(DeviceDirection::Output, vec!["Wide".into()]);
+        assert!(!state.end_bands_offered);
+        app.set_windows_parity(WindowsParity::Sound, false)
+            .expect("offered");
+        // The window never offered the choice, so the export shifts as 0.4.0 does.
+        assert_eq!(
+            export_from_the_open_window(&mut app, &dir, &state, "Wide").eq_bands[0].center_hz,
+            62.5
+        );
+        // Drawn again it offers it, ticked as saved, and exports as it shows.
+        app.refresh_export_state(&mut state);
+        assert!(state.end_bands_offered && state.end_bands_as_they_are);
+        assert_eq!(
+            export_from_the_open_window(&mut app, &dir, &state, "Wide").eq_bands[0].center_hz,
+            46.0
+        );
+    }
+
     #[test]
     fn renaming_a_user_preset_moves_the_file_and_keeps_it_selected() {
         let (mut app, dir) = with_store();
@@ -8974,6 +9490,62 @@ mod tests {
     }
 
     #[test]
+    fn every_preset_read_into_the_window_moves_the_curve_generation_and_an_edit_does_not() {
+        // 0.4.0 left it: an undo from outside reads the preset shown again, same name, count and
+        // lane, and a band dragged in the window went on over the curve read back.
+        let (mut app, _engine, _dir) = started_with(saved_settings(OUT));
+        app.handle(&[UiAction::SelectPreset(0)]);
+        let at_start = app.state.eq_curve_generation;
+        app.handle(&[UiAction::SetBandGain(3, 6.0), UiAction::SetBandGain(3, 7.0)]);
+        assert_eq!(
+            app.state.eq_curve_generation, at_start,
+            "the window's own drag is the same curve"
+        );
+        assert!(app.state.preset().is_some_and(|p| p.modified));
+        let name = app.state.preset().map(|p| p.name.clone());
+        app.handle(&[UiAction::UndoPresetChanges]);
+        assert_eq!(
+            app.state.preset().map(|p| p.name.clone()),
+            name,
+            "the same preset"
+        );
+        assert_ne!(
+            app.state.eq_curve_generation, at_start,
+            "read again, it is a new curve"
+        );
+        let after_undo = app.state.eq_curve_generation;
+        app.handle(&[UiAction::SelectPreset(1)]);
+        assert_ne!(app.state.eq_curve_generation, after_undo, "another preset");
+    }
+
+    #[test]
+    fn a_voice_preset_read_into_the_lane_off_screen_leaves_the_curve_generation_alone() {
+        // A microphone that brings back its own voice preset while the music lane is on screen
+        // changes nothing the window shows: a band held there goes on following the pointer.
+        let (mut app, _engine, _dir) = started_with(saved_settings(OUT));
+        app.settings
+            .remember_device_preset(MIC, "Microphone", "Quiet", "", IN);
+        let curve = app.state.eq_bands.clone();
+        let at_start = app.state.eq_curve_generation;
+
+        app.bring_back_device_preset(IN, MIC);
+
+        assert_eq!(
+            app.settings.input_preset, "Quiet",
+            "the voice preset was read"
+        );
+        assert_eq!(
+            app.state.direction, OUT,
+            "the music lane is still on screen"
+        );
+        assert_eq!(app.state.eq_bands, curve, "with its own curve");
+        assert_eq!(
+            app.state.eq_curve_generation, at_start,
+            "the curve on screen is the same curve"
+        );
+    }
+
+    #[test]
     fn the_application_tells_the_window_each_time_it_ends_a_solo_and_only_then() {
         let (mut app, _engine, _dir) = started_with(saved_settings(OUT));
         let at_start = app.state.eq_solo_generation;
@@ -9054,6 +9626,7 @@ mod tests {
             port: String::new(),
             channel_volumes: vec![0.5, 0.5],
             mute: false,
+            extra: toml::Table::new(),
         };
         settings.device_volumes = vec![volume.clone()];
 
@@ -9379,6 +9952,55 @@ mod tests {
             select_devices(&engine.take_sent()),
             [&select(HEADPHONES, OUT)]
         );
+    }
+
+    #[test]
+    fn while_the_system_decides_the_device_the_desktop_picked_last_is_where_the_next_start_begins()
+    {
+        // roadmap 0.5.0 §3.2 (deferred from 0.4.0): a start in this mode began on the device last
+        // picked in FxSound, not on the one the desktop picked last before the quit.
+        let mut settings = saved_settings(OUT);
+        settings.follow_system_default = true;
+        let (mut app, engine, _dir) = started_with(settings);
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        engine.feed(attached(OUT, Some(HEADPHONES)));
+        app.poll_audio();
+        let _ = engine.take_sent();
+
+        engine.feed(AudioToUi::DesktopPick {
+            direction: OUT,
+            node_name: SPEAKERS.to_owned(),
+        });
+        engine.feed(attached(OUT, Some(SPEAKERS)));
+        app.poll_audio();
+        assert_eq!(app.settings.device_name(OUT), SPEAKERS);
+        assert_eq!(
+            select_devices(&engine.take_sent()),
+            [] as [&UiToAudio; 0],
+            "the engine moved the lane already, and is asked for nothing"
+        );
+
+        // The next start announces the desktop's pick as the lane's device.
+        let (mut next, engine, _dir) = started_with(app.settings.clone());
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        next.poll_audio();
+        assert_eq!(
+            select_devices(&engine.take_sent()),
+            [&select(SPEAKERS, OUT), &select(MIC, IN)]
+        );
+    }
+
+    #[test]
+    fn a_device_the_desktop_picks_is_not_kept_while_the_priority_list_decides() {
+        let (mut app, engine, _dir) = started_with(saved_settings(OUT));
+        engine.feed(AudioToUi::Devices(two_lane_devices()));
+        app.poll_audio();
+        engine.feed(AudioToUi::DesktopPick {
+            direction: OUT,
+            node_name: SPEAKERS.to_owned(),
+        });
+        app.poll_audio();
+        assert_eq!(app.settings.device_name(OUT), HEADPHONES);
     }
 
     #[test]
@@ -9721,6 +10343,7 @@ mod tests {
             port: String::new(),
             channel_volumes: vec![level, level],
             mute: false,
+            extra: toml::Table::new(),
         };
 
         engine.feed(AudioToUi::TargetVolume(volume(0.4)));
@@ -9777,6 +10400,7 @@ mod tests {
             port: String::new(),
             channel_volumes: vec![0.3, 0.3],
             mute: false,
+            extra: toml::Table::new(),
         };
         engine.feed(AudioToUi::TargetVolume(volume.clone()));
         app.poll_audio();
@@ -11516,6 +12140,293 @@ mod tests {
     }
 
     #[test]
+    fn interface_and_sound_sends_the_windows_dsp_to_the_output_lane_and_the_other_levels_do_not() {
+        // «Like FxSound for Windows» = Interface and sound plays the Windows build's DSP on the
+        // output lane (and on the applications' output routes, which read the settings' levels,
+        // `MusicLevels::of`): the snapshot says so the moment the level moves, and says so again
+        // the moment it moves back. The other levels leave the sound alone.
+        use WindowsParity::{Interface, Off, Sound};
+        let (mut app, engine, _dir) = started_on(10, &[preset_with("Alpha", &[])]);
+        assert_eq!(engine.params().map(|p| p.compat), Some(DspCompat::Linux));
+        for (level, compat) in [
+            (Interface, DspCompat::Linux),
+            (Sound, DspCompat::Windows),
+            (Off, DspCompat::Linux),
+            (Sound, DspCompat::Windows),
+            (Interface, DspCompat::Linux),
+        ] {
+            assert_eq!(app.set_windows_parity(level, false), Ok(()));
+            assert_eq!(engine.params().map(|p| p.compat), Some(compat), "{level:?}");
+            assert_eq!(app.played_params().compat, compat, "{level:?}");
+            assert_eq!(MusicLevels::of(&app.settings).compat, compat, "{level:?}");
+            assert_eq!(
+                app.played_params(),
+                DspParams {
+                    compat,
+                    ..fxsound_dsp::preset::preset_params(
+                        &preset_with("Alpha", &[]),
+                        &ladder(10),
+                        MusicLevels::of(&app.settings),
+                    )
+                },
+                "{level:?}: the rest of the snapshot is the preset's"
+            );
+        }
+
+        // A start with the level saved plays it from the first snapshot on.
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let mut settings = Settings::default();
+        settings.windows_parity = Sound;
+        let engine = FakeEngine::new();
+        let music = PresetStore::with_dirs(vec![], dir.path().join("user"));
+        let app = App::start_for_tests(settings, music, voices(&dir), &engine);
+        assert_eq!(engine.params().map(|p| p.compat), Some(DspCompat::Windows));
+        assert_eq!(app.played_params().compat, DspCompat::Windows);
+    }
+
+    /// A twenty-band curve on the half-octave ladder, every band a different gain.
+    fn half_octave_twenty() -> Vec<(f32, f32)> {
+        fxsound_core::eq::TWENTY_BAND_CENTRES_HZ
+            .iter()
+            .enumerate()
+            .map(|(i, &hz)| (hz, (i as f32 * 0.6).sin() * 8.0))
+            .collect()
+    }
+
+    #[test]
+    fn a_twenty_band_preset_taken_to_interface_and_sound_and_back_is_the_preset_it_was() {
+        // A12 of «Like FxSound for Windows»: at Interface and sound twenty bands are the Windows
+        // ladder, and the curve moves there band for band (audit report R4 taken back); back at
+        // Off it is the curve it was, bit for bit, and nothing was edited on the way.
+        use WindowsParity::{Off, Sound};
+        let (mut app, engine, dir) =
+            started_on(20, &[preset_with("Twenty", &half_octave_twenty())]);
+        let twenty = fxsound_preset::load(&dir.path().join("factory").join("Twenty.fac"))
+            .expect("the preset as written");
+        let (at_off, gains_at_off) = (centres(&app), gains(&app));
+        assert_eq!(at_off, fxsound_core::eq::TWENTY_BAND_CENTRES_HZ);
+        let played_at_off = app.played_params();
+
+        app.set_windows_parity(Sound, false).expect("offered");
+        assert_eq!(
+            centres(&app),
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(gains(&app), gains_at_off, "every gain on its band");
+        let sent = engine.params().expect("published");
+        assert_eq!(
+            sent.bands().0,
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(
+            app.lane_preset(DeviceDirection::Output),
+            Some(("Twenty", false))
+        );
+        // As a fresh read of the preset at that level would have it.
+        assert_eq!(
+            app.played_params(),
+            fxsound_dsp::preset::preset_params(
+                &twenty,
+                &MusicLevels::of(&app.settings).ladder(20),
+                MusicLevels::of(&app.settings),
+            )
+        );
+
+        app.set_windows_parity(Off, false).expect("offered");
+        assert_eq!(centres(&app), at_off);
+        assert_eq!(gains(&app), gains_at_off);
+        assert_eq!(app.played_params(), played_at_off, "bit for bit");
+        assert_eq!(
+            app.lane_preset(DeviceDirection::Output),
+            Some(("Twenty", false))
+        );
+    }
+
+    #[test]
+    fn a_level_change_reads_an_unedited_preset_again_as_a_pick_at_that_level_would() {
+        // A ten-band preset on twenty bands: fitted by frequency at Off, by position onto the
+        // Windows ladder at Interface and sound, and back — each time what a pick would play.
+        use WindowsParity::{Off, Sound};
+        let ten: Vec<(f32, f32)> = fxsound_core::eq::DEFAULT_CENTERS_HZ
+            .iter()
+            .enumerate()
+            .map(|(i, &hz)| (hz, i as f32 - 4.5))
+            .collect();
+        let (mut app, _engine, dir) = started_on(20, &[preset_with("Ten", &ten)]);
+        let file = fxsound_preset::load(&dir.path().join("factory").join("Ten.fac"))
+            .expect("the preset as written");
+        let at_off = app.played_params();
+        for (level, then) in [(Sound, None), (Off, Some(at_off))] {
+            app.set_windows_parity(level, false).expect("offered");
+            let levels = MusicLevels::of(&app.settings);
+            let picked = fxsound_dsp::preset::preset_params(&file, &levels.ladder(20), levels);
+            assert_eq!(app.played_params(), picked, "{level:?}");
+            if let Some(then) = then {
+                assert_eq!(app.played_params(), then, "back at {level:?}");
+            }
+            assert_eq!(
+                app.lane_preset(DeviceDirection::Output),
+                Some(("Ten", false))
+            );
+        }
+    }
+
+    #[test]
+    fn a_level_change_reaches_the_speakers_while_the_window_edits_the_microphone() {
+        // The speakers' controls are kept aside while the microphone is edited; the music chain
+        // plays the new reading all the same, and the window finds it on coming back.
+        use WindowsParity::{Off, Sound};
+        let (mut app, engine, _dir) =
+            started_on(20, &[preset_with("Twenty", &half_octave_twenty())]);
+        let at_off = app.played_params();
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
+        app.set_windows_parity(Sound, false).expect("offered");
+        let sent = engine.params().expect("published");
+        assert_eq!(sent.compat, DspCompat::Windows);
+        assert_eq!(
+            sent.bands().0,
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Output)]);
+        assert_eq!(
+            centres(&app),
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Input)]);
+        app.set_windows_parity(Off, false).expect("offered");
+        app.handle(&[UiAction::SetEditDirection(DeviceDirection::Output)]);
+        assert_eq!(app.played_params(), at_off);
+    }
+
+    #[test]
+    fn a_level_change_carries_unsaved_changes_over_band_for_band() {
+        // An edited curve is the user's, not the file's: it moves between the twenty-band ladders
+        // band for band and stays edited.
+        use WindowsParity::{Off, Sound};
+        let (mut app, _engine, _dir) =
+            started_on(20, &[preset_with("Twenty", &half_octave_twenty())]);
+        app.handle(&[UiAction::SetBandGain(3, 7.5)]);
+        let edited = gains(&app);
+        app.set_windows_parity(Sound, false).expect("offered");
+        assert_eq!(
+            centres(&app),
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(gains(&app), edited);
+        assert_eq!(
+            app.lane_preset(DeviceDirection::Output),
+            Some(("Twenty", true))
+        );
+        app.set_windows_parity(Off, false).expect("offered");
+        assert_eq!(centres(&app), fxsound_core::eq::TWENTY_BAND_CENTRES_HZ);
+        assert_eq!(gains(&app), edited);
+    }
+
+    #[test]
+    fn a_twenty_band_preset_saved_at_interface_and_sound_reads_back_at_off_as_it_was_saved() {
+        // A12, the other half: saved at Interface and sound the file is on the Windows ladder, as
+        // the Windows build writes twenty bands, and read at Off it is on the half-octave ladder
+        // with every gain where it was saved.
+        use WindowsParity::{Off, Sound};
+        let (mut app, _engine, dir) =
+            started_on(20, &[preset_with("Twenty", &half_octave_twenty())]);
+        app.set_windows_parity(Sound, false).expect("offered");
+        app.handle(&[
+            UiAction::SetBandGain(4, 5.5),
+            UiAction::SavePresetAs("Mine".into()),
+        ]);
+        let saved_gains = gains(&app);
+        let file = fxsound_preset::load(&dir.path().join("user").join("Mine.fac"))
+            .expect("the saved preset");
+        let file_centres: Vec<f32> = file.eq_bands.iter().map(|b| b.center_hz).collect();
+        assert_eq!(
+            file_centres,
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+
+        app.set_windows_parity(Off, false).expect("offered");
+        pick(&mut app, "Twenty");
+        pick(&mut app, "Mine");
+        assert_eq!(centres(&app), fxsound_core::eq::TWENTY_BAND_CENTRES_HZ);
+        assert_eq!(gains(&app), saved_gains);
+        app.set_windows_parity(Sound, false).expect("offered");
+        assert_eq!(
+            centres(&app),
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(gains(&app), saved_gains);
+    }
+
+    #[test]
+    fn at_interface_and_sound_the_band_count_changes_and_a_preset_of_another_count_go_by_position()
+    {
+        // Audit report #13 taken back: the Windows build reads a curve onto another band count by
+        // position, on the window's band count change and on a pick alike.
+        let ten: Vec<(f32, f32)> = fxsound_core::eq::DEFAULT_CENTERS_HZ
+            .iter()
+            .enumerate()
+            .map(|(i, &hz)| (hz, if i == 0 { 6.0 } else { 0.0 }))
+            .collect();
+        let (mut app, _engine, _dir) = started_on(10, &[preset_with("Bass", &ten)]);
+        app.set_windows_parity(WindowsParity::Sound, false)
+            .expect("offered");
+        app.handle(&[UiAction::SetBandCount(31)]);
+        let ten_gains: Vec<f32> = ten.iter().map(|&(_, gain)| gain).collect();
+        assert_eq!(
+            gains(&app),
+            fxsound_dsp::eq::remap_band_gains_by_position(&ten_gains, 31)
+        );
+        assert_eq!(
+            gains(&app)[0],
+            6.0,
+            "the 20 Hz band takes the 62.5 Hz boost"
+        );
+        app.handle(&[UiAction::SetBandCount(20)]);
+        assert_eq!(
+            centres(&app),
+            fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ
+        );
+        assert_eq!(
+            gains(&app),
+            fxsound_dsp::eq::remap_band_gains_by_position(&ten_gains, 20)
+        );
+    }
+
+    #[test]
+    fn at_interface_and_sound_ambiences_slider_stores_the_windows_builds_values() {
+        // Audit report #39 taken back with the stage: position 1 saves 13, as the Windows build's
+        // slider does; a value the preset stores keeps playing across the level change.
+        let mut stored = preset_with("Room", &[]);
+        stored.set_effect(Effect::Ambience, scale::midi_to_value(64));
+        let (mut app, _engine, _dir) = started_on(10, &[stored]);
+        let played = app.played_params().effect(Effect::Ambience);
+        app.set_windows_parity(WindowsParity::Sound, false)
+            .expect("offered");
+        assert_eq!(
+            scale::value_to_midi(app.played_params().effect(Effect::Ambience)),
+            scale::value_to_midi(played),
+            "the stored value plays on"
+        );
+        let shown = app.state.effects[Effect::Ambience as usize];
+        assert!(
+            (shown - 5.039).abs() < 0.001,
+            "64 shows at {shown} on Windows"
+        );
+        app.handle(&[UiAction::SetEffect(Effect::Ambience, 1.0)]);
+        assert_eq!(
+            scale::value_to_midi(app.played_params().effect(Effect::Ambience)),
+            13
+        );
+        app.set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        assert_eq!(
+            scale::value_to_midi(app.played_params().effect(Effect::Ambience)),
+            13,
+            "the value set at Interface and sound plays at Off too"
+        );
+    }
+
+    #[test]
     fn a_preset_with_no_equalizer_turns_it_on_and_flat_on_the_users_ladder() {
         // The original's "old preset" (`DfxDspEq.cpp:144-158`).
         let (mut app, _engine, _dir) = started_on(15, &[preset_with("Alpha", &[])]);
@@ -11528,6 +12439,61 @@ mod tests {
         assert_eq!(app.state.eq_bands.len(), 15);
         assert!(gains(&app).iter().all(|&g| g == 0.0), "{:?}", gains(&app));
         assert_eq!(centres(&app), ladder(15));
+    }
+
+    #[test]
+    fn the_music_lane_plays_every_shipped_preset_as_the_shared_reading_does() {
+        // `fxsound_dsp::preset::preset_params` is what the bit-exactness harness of «Like FxSound
+        // for Windows», `preset_drift` and `process_wav` render a `.fac` with. They measure what
+        // the application plays only while the lane plays exactly that, on each band count the
+        // harness renders at, with the speakers' levels wherever they are.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/presets");
+        let mut files: Vec<PathBuf> = ["Factsoft", "BonusPresets"]
+            .iter()
+            .flat_map(|dir| std::fs::read_dir(root.join(dir)).expect("shipped presets"))
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|file| file.extension().is_some_and(|e| e == "fac"))
+            .collect();
+        files.sort();
+        assert!(files.len() >= 30, "only {} shipped presets", files.len());
+        for (level, compat) in [
+            (WindowsParity::Off, DspCompat::Linux),
+            (WindowsParity::Sound, DspCompat::Windows),
+        ] {
+            let levels = MusicLevels {
+                filter_q: 1.5,
+                master_gain_db: -3.0,
+                balance_db: 2.0,
+                volume_leveling: 1.0,
+                compat,
+            };
+            for count in [10, 20, 31] {
+                for file in &files {
+                    let preset = fxsound_preset::load(file).expect("a shipped preset loads");
+                    let (mut app, _engine, _dir) = started_on(count, &[preset_with("Alpha", &[])]);
+                    app.set_windows_parity(level, false).expect("offered");
+                    app.handle(&[
+                        UiAction::SetFilterQ(levels.filter_q),
+                        UiAction::SetMasterGain(levels.master_gain_db),
+                        UiAction::SetBalance(levels.balance_db),
+                        UiAction::SetVolumeLeveling(levels.volume_leveling),
+                    ]);
+                    assert_eq!(MusicLevels::of(&app.settings), levels);
+                    app.apply_preset(&preset);
+                    let expected = fxsound_dsp::preset::preset_params(
+                        &preset,
+                        &levels.ladder(count as usize),
+                        levels,
+                    );
+                    assert_eq!(
+                        app.played_params(),
+                        expected,
+                        "{} on {count} bands at {level:?}",
+                        file.display()
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -12040,6 +13006,112 @@ mod tests {
     }
 
     #[test]
+    fn at_interface_save_new_export_and_import_are_offered_as_on_windows() {
+        // 0.4.0 audit #17 and #18 at «Как в Windows» = Interface: Save New Preset only with
+        // unsaved changes (`FxMainWindow.cpp:535`, `FxController.cpp:405-411`), Export Presets
+        // and Import Presets only without (`FxMainWindow.cpp:540-541`). At Off (above) a clean
+        // preset is copied and both are always offered; the other items are the same at both.
+        for level in [WindowsParity::Interface, WindowsParity::Sound] {
+            for factory in [true, false] {
+                for modified in [false, true] {
+                    let mut app = choosing(factory, modified);
+                    app.settings.windows_parity = level;
+                    let menu = app.preset_menu();
+                    let case = format!("{level:?}, factory {factory}, modified {modified}");
+                    assert_eq!(menu.save_new, modified, "{case}");
+                    assert_eq!(menu.export, !modified, "{case}");
+                    assert_eq!(menu.import, !modified, "{case}");
+                    assert_eq!(menu.overwrite, modified && !factory, "{case}");
+                    assert_eq!(menu.undo, modified, "{case}");
+                    assert_eq!(menu.rename, !modified && !factory, "{case}");
+                    assert_eq!(menu.delete, !factory, "{case}");
+
+                    let copy = app.preset_command_allowed(&P::SaveAs("Copy".into()));
+                    if modified {
+                        assert_eq!(copy, Ok(()), "{case}");
+                    } else {
+                        let preset = if factory { "Jazz" } else { "Mine" }.to_owned();
+                        let refusal = copy.unwrap_err();
+                        assert_eq!(refusal, Refusal::NothingToSaveAsNew { preset }, "{case}");
+                        assert!(
+                            refusal.to_string().contains("--windows-parity=off"),
+                            "the refusal says how to copy: {refusal}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn at_interface_every_preset_item_goes_grey_with_the_power_as_on_windows() {
+        // `FxMainWindow.cpp:535-541` ands every preset item with the power (0.4.0 audit R7 set
+        // back at «Как в Windows» = Interface). Off offers them either way (above).
+        for factory in [true, false] {
+            for modified in [false, true] {
+                let mut app = choosing(factory, modified);
+                app.set_windows_parity(WindowsParity::Interface, false)
+                    .expect("offered");
+                app.state.power = false;
+                let menu = app.preset_menu();
+                let case = format!("factory {factory}, modified {modified}");
+                assert_eq!(
+                    menu,
+                    PresetMenu {
+                        save_new: false,
+                        overwrite: false,
+                        undo: false,
+                        rename: false,
+                        delete: false,
+                        export: false,
+                        import: false,
+                    },
+                    "{case}"
+                );
+                // The command line and D-Bus still pick and manage presets with the power off.
+                assert!(
+                    app.preset_command_allowed(&P::Delete).is_ok() || factory,
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_level_reaches_the_window_and_its_palette_at_once() {
+        // W2: what the window draws from Interface on follows the level set from anywhere.
+        let mut app = headless();
+        app.state.theme = ThemeMode::Light;
+        assert_eq!(app.state.windows_parity, WindowsParity::Off);
+        assert!(!app.palette().is_windows());
+        app.set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        assert_eq!(app.state.windows_parity, WindowsParity::Interface);
+        assert!(app.palette().is_windows());
+        assert_eq!(app.palette().mode(), ThemeMode::Light);
+        app.set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        assert_eq!(app.state.windows_parity, WindowsParity::Off);
+        assert!(!app.palette().is_windows());
+    }
+
+    #[test]
+    fn a_new_level_redraws_the_tray_with_it() {
+        // The tray cuts its playback devices as Windows does from Interface on (0.4.0 audit #31),
+        // so a level set from the command line, D-Bus or the slider reaches it at once.
+        let mut app = headless();
+        let _ = app.take_tray_refresh();
+        assert_eq!(app.tray_state().windows_parity, WindowsParity::Off);
+        app.set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        assert!(app.take_tray_refresh());
+        assert_eq!(app.tray_state().windows_parity, WindowsParity::Interface);
+        app.set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        assert!(!app.take_tray_refresh(), "the same level again is no news");
+    }
+
+    #[test]
     fn moving_a_slider_leaves_export_and_import_presets_offered() {
         // The report's scenario (0.4.0 audit #18): a slider moved, and Export Presets and Import
         // Presets went grey without a word, although neither touches the unsaved changes.
@@ -12346,6 +13418,7 @@ mod tests {
             port: "analog-output-headphones".to_owned(),
             channel_volumes: vec![0.3, 0.3],
             mute: false,
+            extra: toml::Table::new(),
         };
         settings.device_volumes = vec![volume.clone()];
 
@@ -14229,5 +15302,132 @@ mod tests {
         app.handle(&[UiAction::SetEffect(Effect::Bass, 5.0), UiAction::SavePreset]);
         assert_eq!(names(&app), [long.as_str()]);
         assert!(dir.path().join(format!("user/{long}.fac")).is_file());
+    }
+
+    #[test]
+    fn the_windows_slider_is_refused_everything_in_this_version_and_the_pane_keeps_the_level() {
+        let mut app = App::headless_for_tests();
+        let mut pane = app.settings_state();
+        app.handle_settings(
+            &SettingsAction::SetWindowsParity(WindowsParity::Sound),
+            &mut pane,
+        );
+        assert_eq!(app.windows_parity(), WindowsParity::Sound);
+        assert_eq!(pane.settings.windows_parity, WindowsParity::Sound);
+        app.handle_settings(
+            &SettingsAction::SetWindowsParity(WindowsParity::Full),
+            &mut pane,
+        );
+        assert_eq!(app.windows_parity(), WindowsParity::Sound);
+        assert_eq!(pane.settings.windows_parity, WindowsParity::Sound);
+        assert_eq!(
+            app.set_windows_parity(WindowsParity::Full, true),
+            Err(fxsound_core::parity::FULL_NOT_YET.to_owned())
+        );
+    }
+
+    #[test]
+    fn a_later_versions_everything_runs_as_sound_everywhere_and_stays_everything_in_the_settings() {
+        // A settings.toml 0.6.0 wrote says `full`; this version runs Interface and sound and
+        // keeps `full` for the next save, so going back up finds Everything again.
+        let mut app = App::headless_for_tests();
+        app.settings.windows_parity = WindowsParity::Full;
+        let _ = app.drain_events();
+
+        assert_eq!(app.windows_parity(), WindowsParity::Sound);
+        assert_eq!(
+            crate::commands::status_document(&app).windows_parity,
+            "sound"
+        );
+        assert_eq!(
+            crate::dbus::Properties::of(&app).windows_parity,
+            WindowsParity::Sound
+        );
+        let mut pane = app.settings_state();
+        assert_eq!(
+            pane.settings.windows_parity.offered_or_below(),
+            WindowsParity::Sound,
+            "the slider shows it at Interface and sound"
+        );
+
+        // Choosing the level in force changes nothing and says nothing.
+        assert_eq!(app.set_windows_parity(WindowsParity::Sound, false), Ok(()));
+        app.handle_settings(
+            &SettingsAction::SetWindowsParity(WindowsParity::Sound),
+            &mut pane,
+        );
+        assert_eq!(app.settings().windows_parity, WindowsParity::Full);
+        assert_eq!(app.drain_events(), []);
+
+        // Choosing another one is the user's new level, and replaces it.
+        assert_eq!(
+            app.set_windows_parity(WindowsParity::Interface, false),
+            Ok(())
+        );
+        assert_eq!(app.settings().windows_parity, WindowsParity::Interface);
+        assert_eq!(app.windows_parity(), WindowsParity::Interface);
+    }
+
+    /// Settings ▸ Experimental ▸ "Smooth moves in WirePlumber" (roadmap 0.5.0 §7, D5): the tick
+    /// installs the hook where the host says, the pane then offers the restart WirePlumber needs,
+    /// and a run that may not touch the user's files refuses with a notice.
+    #[test]
+    fn smooth_moves_in_wireplumber_installs_the_hook_from_the_pane_and_says_a_restart_is_due() {
+        use fxsound_audio::wireplumber_hook::{Installed, Place};
+        use fxsound_ui::dialogs::settings::{SettingsAction, WirePlumberHook, WirePlumberRestart};
+
+        let mut app = App::headless_for_tests();
+        let mut state = app.settings_state();
+        assert_eq!(state.wireplumber_hook, WirePlumberHook::default());
+        app.drain_events();
+        app.handle_settings(&SettingsAction::SetWirePlumberHook(true), &mut state);
+        assert_eq!(
+            app.state.notification.as_deref(),
+            Some(WIREPLUMBER_NOT_CHANGED)
+        );
+        assert!(!state.wireplumber_hook.on);
+
+        let dir = tempfile::TempDir::new().expect("a scratch directory");
+        let place = Place::under(&dir.path().join("config"), &dir.path().join("data"));
+        app.wireplumber = wireplumber::WirePlumberHost::for_tests(
+            place.clone(),
+            || Some((0, 5, 17)),
+            |_| Some(true),
+            || Ok(()),
+        );
+        let mut state = app.settings_state();
+        assert_eq!(
+            state.wireplumber_hook,
+            WirePlumberHook {
+                available: true,
+                on: false,
+                restart: WirePlumberRestart::NotNeeded
+            }
+        );
+        app.handle_settings(&SettingsAction::SetWirePlumberHook(true), &mut state);
+        assert_eq!(place.installed(), Installed::Current);
+        assert!(state.wireplumber_hook.on);
+        assert_eq!(state.wireplumber_hook.restart, WirePlumberRestart::Due);
+        // The stand-in's WirePlumber is still the one from before the change.
+        app.handle_settings(&SettingsAction::RestartWirePlumber, &mut state);
+        // Made on a thread of its own; the pane, drawn again, learns how it went.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.wireplumber_hook.restart == WirePlumberRestart::Due
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.refresh_settings_state(&mut state);
+        }
+        assert_eq!(state.wireplumber_hook.restart, WirePlumberRestart::Failed);
+
+        // Unticked again: the files are back to what the WirePlumber from before read, and there
+        // is nothing to restart it for.
+        app.handle_settings(&SettingsAction::SetWirePlumberHook(false), &mut state);
+        assert_eq!(place.installed(), Installed::No);
+        assert!(!state.wireplumber_hook.on);
+        assert_eq!(
+            state.wireplumber_hook.restart,
+            WirePlumberRestart::NotNeeded
+        );
     }
 }

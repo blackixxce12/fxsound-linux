@@ -192,6 +192,23 @@ impl Chain {
         self.dynamic_boost.set_channel_sides(Some(sides));
     }
 
+    /// Play the port's arithmetic or the Windows build's where the 0.4.0 audit changed it
+    /// («Like FxSound for Windows» = Interface and sound): Dynamic Boost and its limiter
+    /// ([`DynamicBoost::set_compat`]) and Ambience's mapping ([`Ambience::set_compat`], audit
+    /// report #39). Fidelity, Surround and Bass have one. What glides lands at once until the
+    /// chain has been heard, as a new amount does.
+    pub fn set_compat(&mut self, compat: fxsound_core::DspCompat) {
+        if compat == self.dynamic_boost.compat() && compat == self.ambience.compat() {
+            return;
+        }
+        self.dynamic_boost.set_compat(compat);
+        self.ambience.set_compat(compat);
+        if !self.heard {
+            self.dynamic_boost.settle();
+            self.ambience.settle();
+        }
+    }
+
     pub fn set_sample_rate(&mut self, sample_rate: Real) {
         let sample_rate = sample_rate.clamp(MIN_SAMPLE_RATE, MAX_SAMPLE_RATE);
         if sample_rate == self.sample_rate {
@@ -236,6 +253,7 @@ impl Chain {
     /// Apply a whole parameter snapshot.
     pub fn apply(&mut self, params: &DspParams) {
         self.set_power(params.power);
+        self.set_compat(params.compat);
         for id in EffectId::ALL {
             self.set_effect(id, params.effect(id));
         }

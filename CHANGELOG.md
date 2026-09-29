@@ -4,6 +4,226 @@ All notable changes to the FxSound Linux port. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-09-30
+
+### Added
+- **«Like FxSound for Windows», in a new Experimental tab of Settings.** A slider of three
+  positions — Off, Interface, Interface and sound — with a line under it that says what each
+  does, and `fxsound --windows-parity=off|interface|sound` for the same. The level is saved,
+  shown in `--status` (`windows_parity`), announced by `--watch` (`windows_parity`) and on D-Bus
+  (the `WindowsParity` property and `SetWindowsParity`); the entries below say what each level
+  changes (`docs/0.5.0-windows-parity.md`). Everything, the fourth level, comes in a later
+  version: `full` is refused from the command line and D-Bus, `--force` or not, and a
+  `settings.toml` that says `full` runs as `sound` and keeps saying `full`, so the later version
+  finds Everything again. A tab caption too long for one line, as
+  «Экспериментальное» is, takes two, broken where its translation marks the word.
+- **«Like FxSound for Windows» = Interface brings back the Windows command line and tray.** A
+  command line with an option the Windows build has raises the window again, and a start from one
+  shows it unless FxSound was last quit hidden; the keybind options (`--toggle-power`,
+  `--next-preset`, `--prev-preset`, `--next-output`) and D-Bus still never raise it. A window
+  raised this way that cannot be opened — FxSound started with no display to open it on — leaves
+  FxSound running as it was, tray or none, rather than quitting and taking the sound with it. Save
+  New Preset and `--save_preset` want unsaved changes, and Export Presets and Import Presets want
+  none. A `--set_band_gain` or `--set_band_freq` list sets the pairs that fit and skips the
+  others, with a note, where Off refuses the whole list. The tray cuts a playback device's name
+  after 30 characters.
+- **«Like FxSound for Windows» = Interface brings back the Windows window.** Master Gain and
+  Balance step by 2 dB, Volume Leveling reads "dB", the light theme's power-off graphs and rules
+  are the original's again, the slider fill is painted as the original paints it, a long preset
+  name is cut together with its ` *`, the equalizer's curve is the straight line through the
+  bands, the end bands' wheels on five and ten bands turn one way from 62.5 Hz and 16 kHz, a
+  right-click on an effect slider no longer switches the effect off, only the Windows build's
+  tooltips are shown, Audio, General and Help are captioned in the normal font, the language
+  switch runs in the Windows order, and with the power off the preset list, the menu's preset
+  items and the tray's preset menu are not offered. Nothing you hear or have saved changes, the
+  command line and D-Bus still pick presets with the power off, and the microphone lane, which
+  Windows does not have, keeps its tooltips.
+- **At «Like FxSound for Windows» = Interface and sound, Volume Leveling and Dynamic Boost play
+  as on Windows.** The levelling steps once a buffer, reads its peak from the bass-light side
+  chain, leaves the subwoofer alone and pulls the gain down at the top of a buffer, and Dynamic
+  Boost lifts loud material by half a decibel at 0, hears the left channel alone and limits each
+  channel on its own, with no hold: the Windows build's arithmetic, sample for sample, on the
+  output and on the applications' output routes. The transitions stay FxSound for Linux's.
+- **At «Like FxSound for Windows» = Interface and sound, Ambience, the equalizer, the master gain
+  and the balance play as on Windows, and a preset is read as there.** Ambience's slider stores
+  13, 25 and 38 at its first three positions again, and the reverb plays them as the Windows build
+  does; a band below 20 Hz is the flat gain it is there; the master gain and the balance sit
+  between the equalizer and the levelling, go off with the equalizer's switch, and with FxSound
+  off the master gain alone plays, while the equalizer is on; the balance plays on stereo only. A
+  preset of another band count is read onto yours by position, and twenty bands are the Windows
+  build's ladder: a twenty-band preset moves to it and back band for band, and nothing is saved
+  on the way.
+- **«Like FxSound for Windows» moves between Off and Interface and sound without a click, while
+  it plays.** What the level changes goes from one sound to the other over 20 ms instead of
+  between two samples: the master gain and the balance move to their Windows place and back, the
+  subwoofer under Volume Leveling fades between levelled and not, and Dynamic Boost hands its
+  limiting over from one design to the other. At −6 dB of master gain and +4 dB of balance the
+  switch clicked at −6 to −20 dBFS; it now leaves about −52 dBFS at most, and the same for an
+  application with a preset of its own.
+- **The Export window can keep the end bands where they are.** From «Like FxSound for Windows» =
+  Interface and sound on it has a tick box, "Keep the end bands where they are", and
+  `fxsound --export-unshifted[=0|1]` sets the same: a `.fac` then keeps its first and last band
+  where you tuned them, instead of moving them into the range FxSound for Windows tunes them in,
+  which stays the default. An Export window left open follows the level as it changes, and exports
+  as it shows.
+- **Smooth moves in WirePlumber, in the Experimental tab of Settings, off by default.**
+  WirePlumber moves an application to a device picked in the desktop's sound settings before
+  FxSound hears of it, and that move clicked as in plain Linux, −19 to −28 dBFS, with FxSound on or
+  off. Ticked, FxSound installs a WirePlumber 0.5 script that fades every stream WirePlumber moves
+  while it plays, out before the move and back in after it: the desktop's pick then leaves
+  −52 dBFS or less on the speakers with FxSound on, and −59 with it off; on a recording, usually
+  −58 dBFS or less. Not always: now and then FxSound's taking a recording application back onto
+  its lane after the pick still clicks as loud as plain Linux, −18 dBFS in one switch of 24 —
+  PipeWire's own converter applies the new volume a moment before it starts the ramp to it, as
+  with the power button. With *Follow the system's default device* ticked and the power off,
+  FxSound's own lane, moving to the picked device after it, still clicks the application that has
+  just arrived there, at −23 to −32 dBFS. It changes WirePlumber's policy for every application, so
+  it is an option: it needs WirePlumber 0.5 or newer, WirePlumber reads it when it starts —
+  *Restart WirePlumber* is offered, asks first, and restarts it without holding up the window;
+  a box ticked and unticked again under the same WirePlumber asks for no restart —
+  and unticking takes it away again. WirePlumber loads it as an optional component, which it skips
+  rather than stop over when it cannot load it. Untick it before uninstalling FxSound or going
+  back to 0.4.0: the script and its fragment live in your home
+  (`~/.local/share/wireplumber/scripts/fxsound/fade-on-move.lua`,
+  `~/.config/wireplumber/wireplumber.conf.d/90-fxsound-fade-on-move.conf`), which the package
+  manager does not touch, and only FxSound 0.5.0 or later takes them away; otherwise delete both
+  and run `systemctl --user restart wireplumber`. An application closed in the tenth of a second the
+  script holds it silent starts again at its own volume: WirePlumber, which keeps each
+  application's volume for its next start, never keeps the script's silence, nor a point of its
+  fades that PipeWire's converter reported on the way. Since the converter may never report the
+  end of a fade, the script says the volume once more when its fade back is over, until PipeWire
+  shows it; otherwise an application could stay silent, or 20 dB down, while every mixer said
+  100 %. While the script holds an application it says so in PipeWire's `default` metadata
+  (`fxsound.held`), and FxSound's own fade leaves that application to it. An application with a
+  libpipewire of its own older than 0.3.68 — from an older Flatpak runtime, say — is moved without
+  a fade, by the script and by FxSound alike: its converter has no ramp, and would jump to silence
+  and back, two clicks for one. FxSound, taking the default back after the desktop's pick, leaves
+  out of its own fade an application WirePlumber has not moved yet, which the script fades if
+  WirePlumber still moves it; and the script gives an application whose new link failed its volume
+  back only once it is linked again. Before, either clicked at −18 to −38 dBFS on about one claim
+  in twenty in the click test.
+- **Settings keep what a later version wrote.** A key of `settings.toml` this version does not
+  know is written back as it was — at the top of the file, or inside an entry of
+  `[[device_configs]]` or `[[device_volumes]]` or inside `[calibration]` — so going back a version
+  and up again keeps the newer version's settings. An entry this version drops takes its unknown
+  keys with it: a device forgotten in Settings, a volume or a calibration record that is not a
+  number. 0.4.0 does not keep them: after a downgrade to 0.4.0 its next save drops the keys 0.5.0
+  added, `windows_parity` among them.
+
+### Changed
+- **`--status --json` is schema 3.** Every key of schema 2 is kept; `windows_parity`,
+  `apps_hidden` and `input.hidden` are new. `--status` prints a `windows_parity:` line.
+- **The JSON's compatibility rule is written down** (`man fxsound`, STATUS DOCUMENT). `schema` and
+  the events' `v` are compatibility numbers: a new key never changes them; a key removed, renamed
+  or given another meaning or type raises them. `schema` stays 3 while keys are only added.
+- **A deleted preset on another drive goes to that drive's trash**, `.Trash-UID` at its top (or
+  the shared `.Trash`), where file managers list it, instead of staying beside itself as
+  `NAME.fac.1.bak`, which is kept for a drive FxSound cannot write a trash to.
+- **Tested on the newest PipeWire as well as the oldest.** Besides Ubuntu 24.04 and its
+  PipeWire 1.0, CI runs the tests in an Arch Linux container with the newest PipeWire and
+  WirePlumber 0.5, where the tests of WirePlumber's own policy, which Ubuntu's 0.4 has to skip,
+  must run. The workflows moved to the Node 24 releases of their actions, run on Ubuntu 24.04
+  everywhere rather than on whatever `ubuntu-latest` becomes, and are checked by actionlint.
+- **Clicks are measured by the tests.** A steady tone plays through FxSound on a private PipeWire
+  with WirePlumber while the power button, an application's own preset, FxSound's and the
+  desktop's choice of device, the equalizer and the music and voice presets are switched, and each
+  switch's worst click is read from the recording, against the level of the sound it cuts. The
+  equalizer, the presets and the power button under sound that stays on FxSound must stay below
+  −40 dBFS. The moves FxSound makes itself — the power button, an application's own preset, a
+  device chosen in FxSound and FxSound's taking the default back after the desktop's choice — are
+  held to −40 dBFS too, with the gap they leave held to 200 ms, for `pw-cat` and for PulseAudio
+  applications alike, and every run of them counted, not only the median: one switch over
+  −40 dBFS in a pass is listed (PipeWire's own, under Fixed), a second fails it. The desktop's own
+  move, before FxSound hears of it, is held to the same choice with FxSound off, plus 3 dB. An
+  application recording from the default source has to record again within a second of each
+  switch of the power button. CI shows the measurements in the job's summary.
+- **The sound is checked bit for bit against 0.4.0.** CI renders every shipped preset at 10, 20
+  and 31 bands through this version and through v0.4.0, from a cold start and while a preset, the
+  band count and a slider are switched, and requires the same output: identical, or nowhere more
+  than −120 dBFS apart. It also renders Interface and sound against the engine before the 0.4.0
+  audit and requires the same output from a cold start, except the two presets whose Ambience is
+  stored at 51 (Classic Rock, R&B), which are held to the Windows C code instead. The offline
+  renderer (`process_wav`, with `--compat windows` for Interface and sound) and the blind A/B of
+  `scripts/voicing` now play a preset the way the application does, through the application's
+  own reading of a preset, and the drift measurement (`preset_drift`) sets Interface and sound
+  beside Off with `PRESET_DRIFT_COMPAT=windows`. Moving the level is in the click tests, on the
+  output and in an application's own preset.
+
+### Fixed
+- **A tray that was already running is found.** FxSound took a system tray that was there before
+  it started — KDE's, Waybar's, a Quickshell shell's, Noctalia's, GNOME's with the AppIndicator
+  extension — for none, until the tray restarted: minimise went to the taskbar, closing into the
+  tray was not remembered, and a start with the tray remembered brought the window up minimised.
+- **Notifications show on GNOME.** GNOME never shows a banner for low urgency and removed every
+  FxSound notification a few milliseconds after it arrived. What you have to see — where the
+  window went and how to get it back, a lost output, a refused save, the power toggled from a
+  keybind, and any change made while the window is hidden or minimised — now pops up, a preset or
+  an output picked in the window goes quietly to the message list, and every notice stays in the
+  list until it is dismissed or FxSound quits.
+- **The power button no longer clicks in the applications it moves.** Power off hands the
+  defaults back to your devices and power on takes them again, and WirePlumber moved every
+  application that follows the default in the middle of its sound: −18 to −41 dBFS on the
+  speakers and in a recording. FxSound now fades each application it is about to have moved to
+  silence over 20 ms, and back in over 50 ms once it plays or records where it went: a gap of
+  about a tenth of a second, which usually leaves −46 dBFS or less. Not always: PipeWire's own
+  converter applies a new volume a moment before it starts the ramp to it, and now and then plays
+  one cycle at the new volume first, a click as loud as the sound itself — measured for a
+  recording application at about one power switch in a hundred. FxSound makes it rarer, and
+  cannot end it. An application given a preset of its own, or losing it, is moved the same way,
+  where it clicked as loud as −5 dBFS, and the preset's own reverb tail fades out rather than
+  stopping. PipeWire older than 0.3.68 has no such fade, and moves them as before — the server's,
+  or an application's own libpipewire, whose converter does the fade. Should FxSound
+  be killed within that tenth of a second, its next start gives the application its volume back
+  (`~/.local/state/fxsound/handover.toml`).
+- **Changing the device no longer clicks.** A lane moved to another device took FxSound's own
+  output or input down and built it again there, and meanwhile WirePlumber moved every application
+  on it onto a device of its own, unprocessed, and back: two clicks, as loud as −5 dBFS on the
+  speakers. When the new device takes the same channel count and rate, FxSound (Output) and
+  FxSound (Input) now stay, and only FxSound's own stream on the device is replaced, its sound
+  faded out before and in again once the new device plays it: a gap of about a tenth of a second,
+  −59 dBFS or less. That goes for a device picked in the window or the tray, `--output`,
+  `--next-output` and `--input`, and for echo cancellation switched on or off. After a pick in the
+  desktop's sound settings FxSound takes the default back without a click too; WirePlumber's own
+  move to the picked device, before FxSound hears of it, still clicks, as in plain Linux and no
+  louder for the sound it cuts.
+- **A sound cut off in the middle no longer ends in a click on FxSound's side.** When an
+  application is taken off FxSound in the middle of its sound — the desktop's sound settings
+  picking another device, a mixer moving it — the part FxSound had not played yet stopped in a
+  step, as loud as the sound, followed by the ring-out of the preset. It now fades out over 10 ms;
+  the preset's ring-out after such a cut, its reverb's and filters', is dropped with it, and the
+  next sound fades in over 30 ms. On the speakers FxSound was playing through, the desktop's pick
+  went from that step to −89 dBFS or less in 136 picks of 144; what is left of the move is the
+  application arriving on the picked device, as in plain Linux. A sound an application itself
+  ends in a step, partway through the last of its sound it hands over, still ends as it was given.
+- **Following the system's default device, FxSound starts where the desktop last put it.** With
+  *Follow the system's default device* on, a device picked in the desktop's sound settings moved
+  the lane but was forgotten at the next start, which began on the device last picked in FxSound.
+- **A recording application is not left recording nothing when the power goes off.** WirePlumber
+  now and then linked an application that records from the default source to nothing when the
+  power button handed the microphone back — about one power off in fifteen, with four such
+  applications — and it then recorded silence until the default changed again. For three seconds
+  after it hands a default back, FxSound now moves such an application onto the device, as it
+  already did onto FxSound when the power comes back on; and it finds one sooner, a quarter of a
+  second after it lost its link, so that it records again within a second of the switch.
+- **The notifications have their icon.** The packages install the application icon under the
+  name the notifications ask for, `com.fxsound.FxSound`, as well as `fxsound`.
+- **`NextOutput` and `NextInput` over D-Bus step when they start FxSound.** A call that started
+  FxSound through the bus reached it before PipeWire had listed the devices, went nowhere and still
+  succeeded; it now waits for the list, up to three seconds, as `ForgetDevice` does, and so does a
+  `--next-output` or `--next-input` sent to an FxSound that has only just started.
+- **A band count the window does not offer sounds as it is drawn.** Twelve bands, say, from a
+  microphone preset made by hand or a `num_bands` edited in `settings.toml`, were played with the
+  band width of whichever count came before them, and drawn with another; they now play and are
+  drawn with the ten-band equalizer's edges, whatever came before. (A `.fac` of such a count is
+  still fitted onto the window's count, as before.)
+- **A band dragged while the same preset is read back stops following the pointer.** An undo
+  from the command line, the tray or D-Bus with the button down on a band let the drag go on over
+  the curve read back, writing the pointer's gain into it.
+- **Translations.** Arabic's Bass Boost is no longer left in English; Simplified and Traditional
+  Chinese no longer name the window's hotkey as the power's (打开/关闭 FxSound 窗口,
+  開啟/關閉 FxSound 視窗); Italian's tray says Esci to quit, where it said Uscita, its word for the
+  output, and Seleziona dispositivo di riproduzione, with the verb first.
+
 ## [0.4.0] — 2026-09-27
 
 ### Added

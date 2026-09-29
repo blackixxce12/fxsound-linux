@@ -17,7 +17,7 @@ in the tree, as `crates/fxsound-rnnoise`.)
 produce it once per release, then build:
 
 ```bash
-VER=0.4.0
+VER=0.5.0
 mkdir -p ~/rpmbuild/SOURCES ~/rpmbuild/SPECS
 
 # Source0: the release tarball

@@ -7,9 +7,10 @@
 //! so changing the band count, the sample rate or a preset never allocates on the audio thread.
 
 use crate::biquad::{
-    BiquadCoeffs, MAX_BOOST_OR_CUT_DB, Real, SOS_MAX_SECTIONS, calc_parametric, magnitude,
+    BiquadCoeffs, MAX_BOOST_OR_CUT_DB, Real, SOS_MAX_SECTIONS, calc_parametric_in, magnitude,
 };
 use crate::smooth::{FadingSection, Ramp, glide_frames};
+use fxsound_core::DspCompat;
 
 /// `GraphicEqInit.cpp:49` — the Q multiplier before the user touches the filter-width knob.
 pub const DEFAULT_Q_MULTIPLIER: Real = 1.0;
@@ -95,6 +96,23 @@ pub fn band_table(num_bands: usize) -> Option<(&'static [Real], Real, Real)> {
     }
 }
 
+/// [`band_table`] in the DSP `compat` plays: at «Like FxSound for Windows» = Interface and sound
+/// ([`DspCompat::Windows`]) twenty bands are the Windows build's ladder again,
+/// [`WINDOWS_TWENTY_BAND_CENTRES_HZ`] (audit report R4), with the same edges and so the same Q.
+/// Every other count has one ladder.
+///
+/// A curve moves between the two twenty-band ladders band for band, its gains where they were
+/// (`fxsound_core::eq::move_onto_the_windows_twenty_band_ladder` and
+/// `move_off_the_windows_twenty_band_ladder`), so a twenty-band preset taken to Interface and
+/// sound and back is the preset it was (A12).
+#[must_use]
+pub fn band_table_in(num_bands: usize, compat: DspCompat) -> Option<(&'static [Real], Real, Real)> {
+    match (num_bands, compat) {
+        (20, DspCompat::Windows) => Some((&WINDOWS_TWENTY_BAND_CENTRES_HZ, 20.0, 16000.0)),
+        _ => band_table(num_bands),
+    }
+}
+
 /// The generic geometric ladder used for band counts with no table
 /// (`GraphicEqSet.cpp:495-508`). Computed in `f64`, stored as `f32`, like the original.
 fn geometric_ladder(num_bands: usize, min_hz: f64, max_hz: f64, out: &mut [Real]) {
@@ -144,15 +162,15 @@ pub fn band_frequency_range(
 }
 
 /// The ladder a band count gets when nothing else supplies one: the table for the counts that have
-/// one, and otherwise the geometric ladder a fresh equalizer spreads between the ten-band edges —
-/// the ladder [`GraphicEq::set_num_bands`] builds from a new equalizer, and the one the window
-/// takes for the count.
+/// one, and otherwise the geometric ladder between the ten-band edges
+/// ([`fxsound_core::eq::band_edges_hz`]) — the ladder [`GraphicEq::set_num_bands`] builds, whatever
+/// count the equalizer had before, and the one the window takes for the count.
 #[must_use]
 pub fn standard_centres(count: usize) -> Vec<Real> {
     if let Some((table, _, _)) = band_table(count) {
         return table.to_vec();
     }
-    let (min_hz, max_hz) = band_table(10).map_or((62.5, 16_000.0), |(_, lo, hi)| (lo, hi));
+    let (min_hz, max_hz) = fxsound_core::eq::band_edges_hz(count);
     let mut centres = vec![0.0; count];
     if count > 0 {
         geometric_ladder(count, f64::from(min_hz), f64::from(max_hz), &mut centres);
@@ -303,6 +321,82 @@ pub fn fit_preset_gains(
         &preset_gains[..preset_bands],
         live_centres,
     )
+}
+
+/// [`fit_preset_gains`] in the DSP `compat` plays.
+///
+/// At «Like FxSound for Windows» = Interface and sound ([`DspCompat::Windows`]) a curve of
+/// another count is read **by position**, as the Windows build reads it (audit report #13 taken
+/// back, [`remap_band_gains_by_position`]): its centres are not looked at, and live band *i*
+/// takes the preset's band `i·(old−1)/(new−1)`. An equal count copies the gains and no
+/// equalizer is a flat curve, at either level.
+#[must_use]
+pub fn fit_preset_gains_in(
+    preset_centres: &[Real],
+    preset_gains: &[Real],
+    live_centres: &[Real],
+    compat: DspCompat,
+) -> Vec<Real> {
+    if compat.windows() {
+        let preset_bands = preset_centres.len().min(preset_gains.len());
+        remap_band_gains_by_position(&preset_gains[..preset_bands], live_centres.len())
+    } else {
+        fit_preset_gains(preset_centres, preset_gains, live_centres)
+    }
+}
+
+/// Carry a curve to another band count **by position**, as the Windows build does
+/// (`GraphicEqSet.cpp:200-245`, upstream 182a329): the remap this port used before audit report
+/// #13, taken from `0f05ba5` as it was, for «Like FxSound for Windows» = Interface and sound
+/// ([`fit_preset_gains_in`]).
+///
+/// Band *i* of `new_count` (counted from 1) reads position `1 + (i−1)·(old−1)/(new−1)` of the old
+/// curve: onto fewer bands the nearest old band, rounded half up; onto more, the straight line
+/// between the two old bands either side. Where each band sits in frequency plays no part, so a
+/// ten-band +6 dB at 62.5 Hz lands on thirty-one bands at 20 Hz — the Windows build's reading,
+/// which #13 changed for FxSound for Linux. An equal count copies, no old bands is a flat
+/// curve, one old band is a flat curve at its gain, and a curve taken to one band is its first.
+#[must_use]
+pub fn remap_band_gains_by_position(old: &[Real], new_count: usize) -> Vec<Real> {
+    let old_num_bands = old.len();
+    if old_num_bands == 0 {
+        return vec![0.0; new_count];
+    }
+    if old_num_bands == new_count {
+        return old.to_vec();
+    }
+
+    let num_bands = new_count;
+    let last = old_num_bands - 1;
+    (1..=num_bands)
+        .map(|i| {
+            if old_num_bands == 1 || num_bands == 1 {
+                // One old band is a flat curve; one new band is undefined in the original, which
+                // `0f05ba5` read as the first.
+                old[0]
+            } else if num_bands < old_num_bands {
+                // Fewer bands: pick the nearest old band (equidistant selection).
+                let source_index = 1
+                    + ((i as f64 - 1.0) * (old_num_bands as f64 - 1.0) / (num_bands as f64 - 1.0)
+                        + 0.5) as usize;
+                old[(source_index - 1).min(last)]
+            } else {
+                // More bands: linear interpolation between old bands.
+                let source_index = (1.0
+                    + f64::from((i - 1) as Real) * (old_num_bands as f64 - 1.0)
+                        / (num_bands as f64 - 1.0)) as Real;
+                let lower_index = (source_index as usize).clamp(1, old_num_bands);
+                let upper_index = lower_index + 1;
+                let fraction = source_index - lower_index as Real;
+
+                if upper_index <= old_num_bands {
+                    old[lower_index - 1] + (old[upper_index - 1] - old[lower_index - 1]) * fraction
+                } else {
+                    old[lower_index - 1]
+                }
+            }
+        })
+        .collect()
 }
 
 /// A centre as the equalizer would install it, on the natural-log axis the curve is read along.
@@ -634,6 +728,8 @@ pub struct GraphicEq {
     q: Real,
     sample_rate: Real,
     enabled: bool,
+    /// Whose design the bands get ([`GraphicEq::set_compat`]).
+    compat: DspCompat,
 }
 
 impl GraphicEq {
@@ -657,6 +753,7 @@ impl GraphicEq {
             q: 1.0,
             sample_rate: 48_000.0,
             enabled: true,
+            compat: DspCompat::Linux,
         };
         eq.set_num_bands(10);
         eq
@@ -773,9 +870,19 @@ impl GraphicEq {
             self.max_band_hz = max_hz;
             self.center_hz[..num_bands].copy_from_slice(table);
         } else {
-            // Keep whatever edges are current and spread the bands geometrically between them.
-            let (min_hz, max_hz) = (f64::from(self.min_band_hz), f64::from(self.max_band_hz));
-            geometric_ladder(num_bands, min_hz, max_hz, &mut self.center_hz);
+            // The original keeps whatever edges the last table count left and spreads the bands
+            // geometrically between them, so the same curve's Q depended on the preset played
+            // before it; here a count with no table has edges of its own
+            // (`fxsound_core::eq::band_edges_hz`), the ones the window draws it with.
+            let (min_hz, max_hz) = fxsound_core::eq::band_edges_hz(num_bands);
+            self.min_band_hz = min_hz;
+            self.max_band_hz = max_hz;
+            geometric_ladder(
+                num_bands,
+                f64::from(min_hz),
+                f64::from(max_hz),
+                &mut self.center_hz,
+            );
         }
 
         self.recompute_q();
@@ -836,6 +943,30 @@ impl GraphicEq {
         self.redesign_all();
     }
 
+    /// Design the bands as FxSound for Linux does, or as the Windows build does («Like FxSound
+    /// for Windows» = Interface and sound). The two differ below 20 Hz only, where the Windows
+    /// design's Q goes negative (audit report #12, [`calc_parametric_in`]); a band there is
+    /// redesigned and crossfades to its new design as a moved band does.
+    pub fn set_compat(&mut self, compat: DspCompat) {
+        if compat == self.compat {
+            return;
+        }
+        self.compat = compat;
+        for band in 0..self.num_bands {
+            if self.center_hz[band] < 20.0 {
+                self.installed_boost_db[band] = Real::NAN;
+                let boost = self.requested_boost_db[band];
+                self.set_band_boost(band, boost);
+            }
+        }
+    }
+
+    /// Whose design the bands get ([`GraphicEq::set_compat`]).
+    #[must_use]
+    pub const fn compat(&self) -> DspCompat {
+        self.compat
+    }
+
     /// Move one band's centre frequency, clamped the way `GraphicEqSetBandFreq` clamps it.
     pub fn set_band_frequency(&mut self, band: usize, freq_hz: Real) {
         if band >= self.num_bands {
@@ -873,7 +1004,10 @@ impl GraphicEq {
         if clamped == self.installed_boost_db[band] {
             return;
         }
-        self.install(band, calc_parametric(self.sample_rate, f0, clamped, self.q));
+        self.install(
+            band,
+            calc_parametric_in(self.sample_rate, f0, clamped, self.q, self.compat),
+        );
         self.installed_boost_db[band] = clamped;
     }
 
@@ -1147,6 +1281,32 @@ mod tests {
         let first = f[1] / f[0];
         let last = f[6] / f[5];
         assert!((first - last).abs() < 1e-3, "{first} vs {last}");
+    }
+
+    #[test]
+    fn a_band_count_with_no_table_gets_the_same_ladder_and_q_whatever_count_came_before() {
+        let mut fresh = GraphicEq::new();
+        fresh.set_num_bands(12);
+        let (low, high) = fxsound_core::eq::band_edges_hz(12);
+        assert_eq!((low, high), (62.5, 16_000.0), "a new equalizer's");
+        assert!((fresh.center_frequencies()[0] - low).abs() < 1e-3);
+        assert!((fresh.center_frequencies()[11] - high).abs() < 1.0);
+        for before in [1, 5, 10, 15, 20, 31, 7] {
+            let mut eq = GraphicEq::new();
+            eq.set_num_bands(before);
+            eq.set_num_bands(12);
+            assert_eq!(eq.q(), fresh.q(), "after {before} bands");
+            assert_eq!(
+                eq.center_frequencies(),
+                fresh.center_frequencies(),
+                "after {before} bands"
+            );
+            assert_eq!(
+                eq.band_range(0),
+                fresh.band_range(0),
+                "after {before} bands"
+            );
+        }
     }
 
     #[test]
@@ -2205,6 +2365,7 @@ mod tests {
                 eq.center_frequencies(),
                 "{count} bands"
             );
+            assert_eq!(standard_centres(count)[0], 62.5, "{count} bands");
         }
         assert!(standard_centres(0).is_empty());
     }
@@ -2591,5 +2752,94 @@ mod tests {
         eq.sit_out();
         assert_eq!(eq.outgoing_bands, 0);
         assert!(!eq.ladder_fade.is_gliding());
+    }
+
+    // «Like FxSound for Windows» = Interface and sound (W1c of 0.5.0).
+
+    #[test]
+    fn at_interface_and_sound_twenty_bands_are_the_windows_ladder_with_the_same_edges() {
+        // Audit report R4 taken back; the edges, and so the Q, are the half-octave ladder's.
+        let (windows, low, high) = band_table_in(20, DspCompat::Windows).expect("20 bands");
+        assert_eq!(windows, WINDOWS_TWENTY_BAND_CENTRES_HZ.as_slice());
+        let (linux, linux_low, linux_high) = band_table(20).expect("20 bands");
+        assert_eq!((low, high), (linux_low, linux_high));
+        assert_ne!(windows, linux);
+        for count in [1, 5, 10, 12, 15, 31] {
+            assert_eq!(
+                band_table_in(count, DspCompat::Windows),
+                band_table(count),
+                "{count}"
+            );
+            assert_eq!(band_table_in(count, DspCompat::Linux), band_table(count));
+        }
+        assert_eq!(band_table_in(20, DspCompat::Linux), band_table(20));
+    }
+
+    #[test]
+    fn at_interface_and_sound_a_curve_of_another_count_is_read_by_position_as_on_windows() {
+        // Audit report #13 taken back: a ten-band +6 dB at 62.5 Hz lands on thirty-one bands at
+        // 20 Hz, where the Windows build puts it, and on its own band count it is copied.
+        let ten = ladder(10);
+        let mut bass = vec![0.0; 10];
+        bass[0] = 6.0;
+        let thirty_one = ladder(31);
+        let windows = fit_preset_gains_in(&ten, &bass, &thirty_one, DspCompat::Windows);
+        assert_eq!(windows, remap_band_gains_by_position(&bass, 31));
+        assert_eq!(windows[0], 6.0, "the first band takes the first band");
+        assert!(windows[3] < 1.0, "{windows:?}");
+        assert_eq!(
+            fit_preset_gains_in(&ten, &bass, &thirty_one, DspCompat::Linux),
+            fit_preset_gains(&ten, &bass, &thirty_one)
+        );
+        assert_eq!(
+            fit_preset_gains_in(&ten, &bass, &ten, DspCompat::Windows),
+            bass
+        );
+        assert_eq!(
+            fit_preset_gains_in(&[], &[], &ten, DspCompat::Windows),
+            vec![0.0; 10]
+        );
+    }
+
+    #[test]
+    fn the_windows_remap_by_position_is_0f05ba5s() {
+        // `0f05ba5`'s `remap_band_gains`, whose values these are (upstream 182a329).
+        let five = [1.0, 2.0, 3.0, 4.0, 5.0];
+        assert_eq!(
+            remap_band_gains_by_position(&five, 9),
+            [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0]
+        );
+        assert_eq!(remap_band_gains_by_position(&five, 3), [1.0, 3.0, 5.0]);
+        assert_eq!(remap_band_gains_by_position(&five, 1), [1.0]);
+        assert_eq!(remap_band_gains_by_position(&[4.0], 3), [4.0, 4.0, 4.0]);
+        assert_eq!(remap_band_gains_by_position(&[], 2), [0.0, 0.0]);
+        assert_eq!(remap_band_gains_by_position(&five, 5), five);
+        // Ten through thirty-one and back keeps roughly every third band: a ramp comes home a
+        // tenth of a decibel off in places, which is what #13 set out to stop.
+        let ten: Vec<Real> = (0..10).map(|i| i as Real).collect();
+        let back = remap_band_gains_by_position(&remap_band_gains_by_position(&ten, 31), 10);
+        assert_ne!(back, ten);
+        assert_all_close(&back, &ten, 0.11, "ten through thirty-one and back");
+    }
+
+    #[test]
+    fn at_interface_and_sound_a_band_below_20hz_is_the_windows_builds_flat_gain() {
+        // Audit report #12 taken back: a +6 dB band at 15 Hz lifts 1 kHz by the full 6 dB, as
+        // the Windows build's does; FxSound for Linux keeps it in the sub-bass. Switching the
+        // design redesigns that band and no other.
+        let mut centres = ladder(31);
+        centres[0] = 15.0;
+        let mut gains = vec![0.0; 31];
+        gains[0] = 6.0;
+        gains[10] = 3.0;
+        let mut eq = equalizer(&centres, &gains);
+        assert!(eq.response_db(1_000.0).abs() < 0.05);
+        let mut untouched = eq.sections[10];
+        eq.set_compat(DspCompat::Windows);
+        assert_eq!(eq.compat(), DspCompat::Windows);
+        assert!((eq.response_db(1_000.0) - 6.0).abs() < 0.1);
+        assert_eq!(eq.sections[10].steady().coeffs, untouched.steady().coeffs);
+        eq.set_compat(DspCompat::Linux);
+        assert!(eq.response_db(1_000.0).abs() < 0.05);
     }
 }

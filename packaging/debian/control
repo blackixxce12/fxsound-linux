@@ -19,7 +19,7 @@
 #
 #   2. Cargo.toml says rust-version = "1.98.1". Cargo enforces that one itself,
 #      with any rustc, and refuses the build outright: "package `fxsound-app
-#      v0.4.0` cannot be built because it requires rustc 1.98.1 or newer".
+#      v0.5.0` cannot be built because it requires rustc 1.98.1 or newer".
 #      Exporting RUSTUP_TOOLCHAIN does nothing about it. Neither does removing
 #      rust-toolchain.toml.
 #

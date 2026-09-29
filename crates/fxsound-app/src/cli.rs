@@ -35,7 +35,10 @@
 //!    the tray ([`Cli::only_sets_things`]); `--show`, `--view` and a line with no options at all
 //!    raise the window, `--toggle-window` toggles it and `--hide` hides it
 //!    ([`Cli::window_command`]). At a start `--view` sets the layout and the window follows the
-//!    remembered tray state, unless `--show` is given too ([`Cli::cold_start_commands`]).
+//!    remembered tray state, unless `--show` is given too ([`Cli::cold_start_commands`]). At «Как
+//!    в Windows» = Interface and above a line with an option the Windows build has raises the
+//!    window again, as there ([`Cli::raises_like_windows`]); the keybind options and D-Bus never
+//!    do.
 //! 5. **One preset option per line** (audit #30). Windows takes the first of `--preset`,
 //!    `--save_preset`, `--overwrite_preset`, `--undo_preset`, `--rename_preset` and
 //!    `--delete_preset` and silently drops the rest (`FxController.cpp:393-448`); here a second one
@@ -46,7 +49,8 @@
 //!    #51): Windows drops such a list without a word when it has more pairs than bands, and sets
 //!    whatever it can otherwise; here nothing of it is set, and the command fails naming the bands
 //!    that are not there (`crate::commands`). So is a `--set_band_freq` list with a frequency
-//!    outside its band's range, a pair Windows drops alone and without a word.
+//!    outside its band's range, a pair Windows drops alone and without a word. At «Как в Windows»
+//!    = Interface and above the pairs that fit are set and the others skipped, with a note.
 //! 7. **An unknown `--language` is an error** (audit #28): Windows saves any code and shows the
 //!    language whose name it starts with, or English. The table's own codes are taken in any case,
 //!    and so are the ISO codes it spells otherwise (`uk`, `bs`, `nb`, `nn`) and locales
@@ -65,7 +69,10 @@
 //! the value the DSP will see.
 
 use clap::Parser;
-use fxsound_core::{DeviceDirection, Effect, NoiseSuppressionOverride, ViewMode, eq, i18n};
+use fxsound_core::{
+    DeviceDirection, Effect, NoiseSuppressionOverride, ParityClass, ViewMode, WindowsParity, eq,
+    i18n,
+};
 
 /// The reserved-character set, the length cap and the sanitiser a preset name goes through
 /// before it is used (`FxController::sanitizePresetName`, `fxsound/Source/GUI/FxController.cpp:378`).
@@ -251,6 +258,44 @@ pub struct Cli {
     /// language with no table is an error (0.4.0 audit #28).
     #[arg(long = "language", value_name = "CODE|system", value_parser = parse_language)]
     pub language: Option<String>,
+
+    /// «Как в Windows» / "Like FxSound for Windows": `off`, `interface` or `sound`, saved like
+    /// the slider in Settings ▸ Experimental.
+    ///
+    /// Linux addition (`docs/0.5.0-windows-parity.md`). `full` (`everything`) is read, and
+    /// refused: Everything arrives in a later version. Once it is offered, a move to `full` that
+    /// would switch off something in use — the microphone lane, an application's own preset, a
+    /// calibration — is refused unless `--force` is given too: the window asks first, and a
+    /// command line cannot.
+    #[arg(
+        long = "windows-parity",
+        alias = "windows_parity",
+        value_name = "off|interface|sound",
+        value_parser = parse_windows_parity
+    )]
+    pub windows_parity: Option<WindowsParity>,
+
+    /// With `--windows-parity=full`, from the version that offers it: switch even when it takes
+    /// something in use away. Refused with the rest of `full` until then.
+    #[arg(long = "force", requires = "windows_parity")]
+    pub force: bool,
+
+    /// Export a `.fac` with its first and last band where they are (1, or no value), or back
+    /// inside the range FxSound for Windows tunes them in (0), as the Export window's tick box
+    /// says; saved.
+    ///
+    /// Linux addition (`docs/0.5.0-windows-parity.md` §2, roadmap 0.5.0 §14 #56). Followed from
+    /// «Like FxSound for Windows» = Interface and sound on; below it every export shifts them, as
+    /// 0.4.0 does, and the choice waits.
+    #[arg(
+        long = "export-unshifted",
+        alias = "export_unshifted",
+        value_name = "0|1",
+        num_args = 0..=1,
+        default_missing_value = "1",
+        value_parser = parse_zero_or_one
+    )]
+    pub export_unshifted: Option<bool>,
 
     /// Number of equalizer bands: 5, 10, 15, 20 or 31.
     ///
@@ -617,6 +662,16 @@ pub enum Command {
     MasterGain(f32),
     View(ViewMode),
     Language(String),
+    /// «Как в Windows» / "Like FxSound for Windows" (`--windows-parity`). `force` goes ahead with
+    /// a move to Everything that would take something in use away, which is refused without it,
+    /// from the version that offers Everything; this one refuses Everything either way.
+    WindowsParity {
+        level: WindowsParity,
+        force: bool,
+    },
+    /// Whether an export keeps the end bands where they are (`--export-unshifted`), followed
+    /// from «Like FxSound for Windows» = Interface and sound on.
+    ExportUnshifted(bool),
     Window(WindowCommand),
     /// `(band index, Hz)` pairs. The caller refuses the whole list, naming the bands, when one of
     /// them is past the live band count (0.4.0 audit #51) — that count is not knowable here.
@@ -751,6 +806,13 @@ impl Cli {
     /// devices, the preset, the levels, the view and the language, in [`Cli::commands`]' order.
     fn commands_before_the_window(&self) -> Vec<Command> {
         let mut commands = Vec::new();
+        // First, so that everything after it on the line is done at the level it asks for.
+        if let Some(level) = self.windows_parity {
+            commands.push(Command::WindowsParity {
+                level,
+                force: self.force,
+            });
+        }
         if let Some(power) = self.power_command() {
             commands.push(Command::Power(power));
         }
@@ -802,6 +864,9 @@ impl Cli {
         }
         if let Some(language) = &self.language {
             commands.push(Command::Language(language.clone()));
+        }
+        if let Some(as_they_are) = self.export_unshifted {
+            commands.push(Command::ExportUnshifted(as_they_are));
         }
         commands
     }
@@ -869,6 +934,34 @@ impl Cli {
     #[must_use]
     pub fn only_sets_things(&self) -> bool {
         !self.is_query() && self.window_command().is_none()
+    }
+
+    /// `true` for a line the Windows build would raise its window for and this one does not: one
+    /// that says nothing about the window, is no question, and carries an option the Windows
+    /// build has ([`Command::parity_class`] is [`ParityClass::Interface`]). At «Как в Windows» =
+    /// Interface and above a running instance raises its window for such a line, as step 11 of
+    /// `applyConfig` does (`FxController.cpp:523-531`, 0.4.0 audit R11), and a cold start from one
+    /// starts as a bare `fxsound` does ([`Cli::only_sets_things_at`]).
+    ///
+    /// The options only this port has — the keybind options that stand in for the Windows
+    /// hotkeys, which never raised anything there, `--output=off`, the microphone's and the
+    /// applications' — raise nothing at any level, and a line of them alone stays quiet.
+    #[must_use]
+    pub fn raises_like_windows(&self) -> bool {
+        self.only_sets_things()
+            && self
+                .commands()
+                .iter()
+                .any(|command| command.parity_class() == ParityClass::Interface)
+    }
+
+    /// [`Cli::only_sets_things`] at `level` of «Как в Windows»: from Interface on, a line the
+    /// Windows build raises its window for ([`Cli::raises_like_windows`]) is not one, so a cold
+    /// start from `fxsound --preset=Gaming` shows the window unless FxSound was last quit hidden,
+    /// as the Windows build's start does.
+    #[must_use]
+    pub fn only_sets_things_at(&self, level: WindowsParity) -> bool {
+        self.only_sets_things() && !(level.interface() && self.raises_like_windows())
     }
 
     /// `true` when this invocation only asks for state and must not disturb the window.
@@ -992,6 +1085,9 @@ impl Command {
             | Self::MasterGain(_)
             | Self::View(_)
             | Self::Language(_) => true,
+            // Saved like `--language`; at a start nothing is in use yet for a move to Everything
+            // to take away.
+            Self::WindowsParity { .. } | Self::ExportUnshifted(_) => true,
             // Past §4.3: the presets are read by step 4, so the band lists, the effects and every
             // preset command work on the preset the start has selected, as they would a moment
             // later on the running instance — where `initConfig` drops them without a word.
@@ -1021,6 +1117,72 @@ impl Command {
             | Self::SelfTest { .. }
             | Self::ListApps { .. }
             | Self::Quit => false,
+        }
+    }
+}
+
+impl Command {
+    /// The level of «Как в Windows» at which this command stops doing what it does in FxSound for
+    /// Linux (`docs/0.5.0-windows-parity.md`, "Classification").
+    ///
+    /// Exhaustive on purpose, with no `_` arm: a new command does not compile until someone has
+    /// decided its level.
+    ///
+    /// - [`ParityClass::Interface`]: the options the Windows build has
+    ///   (`docs/COMMAND_LINE_OPTIONS.md`), whose window behaviour (0.4.0 audit R11) and band lists
+    ///   (#51) go back to Windows there, and the preset commands whose availability does (#17,
+    ///   #18).
+    /// - [`ParityClass::Full`]: what only this port has and Everything hides — the microphone
+    ///   lane, the applications' presets.
+    /// - [`ParityClass::Never`]: the questions, the keybind options that stand in for the Windows
+    ///   hotkeys, the window, forgetting a device, quitting, and this option itself, which is the
+    ///   way back.
+    #[must_use]
+    pub const fn parity_class(&self) -> ParityClass {
+        match self {
+            Self::Status { .. } | Self::Watch { .. } | Self::SelfTest { .. } => ParityClass::Never,
+            // Answers with the applications hidden at Everything rather than refusing, as D-Bus's
+            // `ListApps` does.
+            Self::ListApps { .. } => ParityClass::Full,
+            Self::Power(power) => match power {
+                PowerCommand::On | PowerCommand::Off => ParityClass::Interface,
+                // `--toggle-power` is the stand-in for the Windows hotkey, which never raised
+                // the window.
+                PowerCommand::Toggle => ParityClass::Never,
+            },
+            Self::Preset(preset) => match preset {
+                PresetCommand::Select(_)
+                | PresetCommand::SaveAs(_)
+                | PresetCommand::Overwrite
+                | PresetCommand::Undo
+                | PresetCommand::Rename(_)
+                | PresetCommand::Delete => ParityClass::Interface,
+                PresetCommand::Next | PresetCommand::Previous => ParityClass::Never,
+            },
+            Self::Output(device) => match device {
+                DeviceCommand::Select(_) => ParityClass::Interface,
+                // `--next-output` is a hotkey's stand-in; `--output=off` is the port's own.
+                DeviceCommand::Next | DeviceCommand::Detach => ParityClass::Never,
+            },
+            Self::Input(_)
+            | Self::EditDirection(_)
+            | Self::NoiseSuppression(_)
+            | Self::AppPreset { .. } => ParityClass::Full,
+            Self::ForgetDevice(_) => ParityClass::Never,
+            Self::NumBands(_)
+            | Self::VolumeLeveling(_)
+            | Self::Balance(_)
+            | Self::FilterQ(_)
+            | Self::MasterGain(_)
+            | Self::View(_)
+            | Self::Language(_)
+            | Self::BandFrequencies(_)
+            | Self::BandGains(_)
+            | Self::Effects(_) => ParityClass::Interface,
+            Self::WindowsParity { .. } | Self::Window(_) | Self::Quit => ParityClass::Never,
+            // A choice of the port's own, followed from Interface and sound on and hidden by no
+            // level: the Windows build has no such option to set it back to.
+            Self::ExportUnshifted(_) => ParityClass::Never,
         }
     }
 }
@@ -1108,6 +1270,16 @@ fn parse_device_name(value: &str) -> Result<String, String> {
     }
 }
 
+/// `--windows-parity`'s value: `off`, `interface`, `sound` or `full` in any case, and `everything`
+/// for `full`. D-Bus's `SetWindowsParity` reads its argument with it too.
+///
+/// `full` is read, so that [`crate::app::App::set_windows_parity`] refuses it with the one text
+/// every path shares ([`fxsound_core::parity::FULL_NOT_YET`]) rather than as an unknown word.
+pub(crate) fn parse_windows_parity(value: &str) -> Result<WindowsParity, String> {
+    WindowsParity::parse(value)
+        .ok_or_else(|| format!("expected off, interface or sound, got `{value}`"))
+}
+
 /// `--language`'s value: `system` (also `default`) to follow the desktop session, or a language
 /// FxSound has a table for, as [`i18n::canonical_code`] reads one — its code in any case, the ISO
 /// code where the Windows build spells it otherwise (`uk`, `bs`, `nb`, `nn`), or a locale such as
@@ -1150,6 +1322,15 @@ fn parse_power(value: &str) -> Result<PowerArg, String> {
             Ok(_) => Ok(PowerArg::On),
             Err(_) => Err(format!("expected 0, 1 or toggle, got `{value}`")),
         },
+    }
+}
+
+/// `--export-unshifted`'s value: `0` or `1`, or `off` / `on`.
+fn parse_zero_or_one(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" => Ok(true),
+        "0" | "off" => Ok(false),
+        _ => Err(format!("expected 0 or 1, got `{value}`")),
     }
 }
 
@@ -1844,6 +2025,77 @@ mod tests {
                 !parse(about_the_window).only_sets_things(),
                 "{about_the_window:?}"
             );
+        }
+    }
+
+    #[test]
+    fn at_interface_a_line_with_an_option_windows_has_raises_the_window_as_there() {
+        // 0.4.0 audit R11 at «Как в Windows» = Interface: step 11 of applyConfig raises the
+        // window for every forwarded line (`FxController.cpp:523-531`), and a start from one
+        // shows it unless FxSound was last quit hidden. At Off the same lines stay quiet (above).
+        for windows in [
+            &["--preset=Gaming"][..],
+            &["--power=1"][..],
+            &["--save_preset=Mine"][..],
+            &["--overwrite_preset"][..],
+            &["--undo_preset"][..],
+            &["--rename_preset=Other"][..],
+            &["--delete_preset"][..],
+            &["--output=Speakers"][..],
+            &["--num_bands=31"][..],
+            &["--volume_leveling=2"][..],
+            &["--balance=3"][..],
+            &["--filter_q=2"][..],
+            &["--master_gain=-6"][..],
+            &["--language=fr"][..],
+            &["--set_band_freq=0:60"][..],
+            &["--set_band_gain=0:3"][..],
+            &["--set_effect=bass:7"][..],
+            // An option Windows has beside the port's own still raises it, as there.
+            &["--toggle-power", "--preset=Rock"][..],
+            &["--edit=output", "--set_effect=bass:7"][..],
+            &["--windows-parity=interface", "--preset=Rock"][..],
+        ] {
+            let cli = parse(windows);
+            assert!(cli.raises_like_windows(), "{windows:?}");
+            assert!(cli.only_sets_things_at(WindowsParity::Off), "{windows:?}");
+            for level in [WindowsParity::Interface, WindowsParity::Sound] {
+                assert!(!cli.only_sets_things_at(level), "{windows:?} at {level:?}");
+            }
+        }
+        for linux in [
+            // The keybind options stand in for the Windows hotkeys, which raise nothing there.
+            &["--toggle-power"][..],
+            &["--power=toggle"][..],
+            &["--next-preset"][..],
+            &["--prev-preset"][..],
+            &["--next-output"][..],
+            // The port's own options, and the way back.
+            &["--output=off"][..],
+            &["--input=Mic"][..],
+            &["--edit=input"][..],
+            &["--noise-suppression=strong"][..],
+            &["--app-preset=bf6.exe=Gaming"][..],
+            &["--forget-device=Old Dock"][..],
+            &["--windows-parity=interface"][..],
+            // Questions, and lines that say what the window does already.
+            &["--status"][..],
+            &["--list-apps"][..],
+            &["--show", "--preset=Rock"][..],
+            &["--hide", "--preset=Rock"][..],
+            &["--run_minimized", "--preset=Rock"][..],
+            &["--toggle-window", "--preset=Rock"][..],
+            &["--view=1", "--preset=Rock"][..],
+        ] {
+            let cli = parse(linux);
+            assert!(!cli.raises_like_windows(), "{linux:?}");
+            for level in WindowsParity::ALL {
+                assert_eq!(
+                    cli.only_sets_things_at(level),
+                    cli.only_sets_things(),
+                    "{linux:?} at {level:?}"
+                );
+            }
         }
     }
 
@@ -2543,6 +2795,162 @@ mod tests {
             parse(&["--list-apps", "--json"])
                 .cold_start_commands()
                 .is_empty()
+        );
+    }
+
+    // ---- «Как в Windows» (A9) ---------------------------------------------------------------
+
+    #[test]
+    fn windows_parity_reads_its_four_levels_in_any_case_and_everything_for_full() {
+        // Read, all four: `full` is refused by the application, with the text every path
+        // shares, not by the parser as an unknown word.
+        for (value, level) in [
+            ("off", WindowsParity::Off),
+            ("Interface", WindowsParity::Interface),
+            ("SOUND", WindowsParity::Sound),
+            ("full", WindowsParity::Full),
+            ("everything", WindowsParity::Full),
+        ] {
+            assert_eq!(
+                parse(&[&format!("--windows-parity={value}")]).windows_parity,
+                Some(level)
+            );
+            // A space works as well as an `=`, and so does the underscored spelling.
+            assert_eq!(
+                parse(&["--windows_parity", value]).windows_parity,
+                Some(level)
+            );
+        }
+        assert_eq!(
+            parse(&["--windows-parity=full", "--force"]).commands(),
+            [Command::WindowsParity {
+                level: WindowsParity::Full,
+                force: true
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unknown_level_is_refused_naming_the_three_offered() {
+        let message = error(&["--windows-parity=windows"]);
+        assert!(message.contains("off, interface or sound"), "{message}");
+    }
+
+    #[test]
+    fn force_without_windows_parity_is_refused() {
+        let message = error(&["--force"]);
+        assert!(message.contains("--windows-parity"), "{message}");
+    }
+
+    #[test]
+    fn windows_parity_sets_the_level_silently_as_every_set_option_does() {
+        let cli = parse(&["--windows-parity=sound"]);
+        assert!(cli.only_sets_things());
+        assert_eq!(cli.window_command(), None);
+        assert!(
+            Command::WindowsParity {
+                level: WindowsParity::Sound,
+                force: false
+            }
+            .honoured_at_cold_start()
+        );
+    }
+
+    #[test]
+    fn export_unshifted_reads_one_zero_or_nothing_and_sets_it_silently() {
+        // Roadmap 0.5.0 §14 #56: the Export window's choice from the command line.
+        for (args, want) in [
+            (vec!["--export-unshifted"], true),
+            (vec!["--export-unshifted=1"], true),
+            (vec!["--export-unshifted=0"], false),
+            (vec!["--export_unshifted", "off"], false),
+            (vec!["--export-unshifted=ON"], true),
+        ] {
+            let cli = parse(&args);
+            assert_eq!(cli.export_unshifted, Some(want), "{args:?}");
+            assert_eq!(cli.commands(), [Command::ExportUnshifted(want)], "{args:?}");
+            assert!(cli.only_sets_things(), "{args:?}");
+        }
+        assert!(error(&["--export-unshifted=2"]).contains("expected 0 or 1"));
+        assert!(Command::ExportUnshifted(true).honoured_at_cold_start());
+        assert_eq!(parse(&["--preset=Jazz"]).export_unshifted, None);
+    }
+
+    #[test]
+    fn every_command_declares_the_level_that_changes_it() {
+        // The classification is an exhaustive match, so a new command cannot compile without a
+        // level; this pins the decisions of the contract (`docs/0.5.0-windows-parity.md`).
+        use ParityClass::{Full, Interface, Never};
+        let cases: Vec<(Command, ParityClass)> = vec![
+            (Command::Status { json: true }, Never),
+            (
+                Command::Watch {
+                    json: true,
+                    meters: false,
+                },
+                Never,
+            ),
+            (Command::SelfTest { json: false }, Never),
+            (Command::ListApps { json: true }, Full),
+            (Command::Power(PowerCommand::On), Interface),
+            (Command::Power(PowerCommand::Toggle), Never),
+            (
+                Command::Preset(PresetCommand::Select("Rock".into())),
+                Interface,
+            ),
+            (
+                Command::Preset(PresetCommand::SaveAs("Mine".into())),
+                Interface,
+            ),
+            (Command::Preset(PresetCommand::Next), Never),
+            (
+                Command::Output(DeviceCommand::Select("Speakers".into())),
+                Interface,
+            ),
+            (Command::Output(DeviceCommand::Next), Never),
+            (Command::Output(DeviceCommand::Detach), Never),
+            (Command::Input(DeviceCommand::Select("Mic".into())), Full),
+            (Command::Input(DeviceCommand::Next), Full),
+            (Command::EditDirection(DeviceDirection::Input), Full),
+            (
+                Command::NoiseSuppression(NoiseSuppressionOverride::Strong),
+                Full,
+            ),
+            (
+                Command::AppPreset {
+                    direction: DeviceDirection::Output,
+                    app: "firefox".into(),
+                    preset: AppPresetChoice::Follow,
+                },
+                Full,
+            ),
+            (Command::ForgetDevice("Old".into()), Never),
+            (Command::NumBands(31), Interface),
+            (Command::Language("fr".into()), Interface),
+            (Command::View(ViewMode::Lite), Interface),
+            (Command::BandGains(vec![(0, 3.0)]), Interface),
+            (Command::Effects(vec![(Effect::Bass, 5.0)]), Interface),
+            (
+                Command::WindowsParity {
+                    level: WindowsParity::Full,
+                    force: false,
+                },
+                Never,
+            ),
+            (Command::ExportUnshifted(true), Never),
+            (Command::Window(WindowCommand::Show), Never),
+            (Command::Quit, Never),
+        ];
+        for (command, class) in cases {
+            assert_eq!(command.parity_class(), class, "{command:?}");
+        }
+        // Nothing on the command line is a sound thing: the sound levels change what a preset
+        // sounds like, not what an option does.
+        assert!(
+            parse(&["--preset=Rock", "--set_effect=bass:5", "--balance=2"])
+                .commands()
+                .iter()
+                .all(|command| command.parity_class() != ParityClass::Sound)
         );
     }
 }

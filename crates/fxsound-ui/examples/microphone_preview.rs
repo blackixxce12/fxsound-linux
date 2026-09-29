@@ -106,6 +106,7 @@ fn demo_state() -> SettingsState {
         unix_time: 1_790_121_600,
         preset: format!("Calibrated — {DEVICE}"),
         device: "alsa_input.usb-fifine".to_owned(),
+        extra: Default::default(),
     });
     let row = |id: &str, name: &str, preset, connected, present| DevicePriority {
         id: id.to_owned(),

@@ -23,6 +23,16 @@
 //! default. At most [`NUDGES`] times for each stream each time FxSound takes the default, so a
 //! stream WirePlumber will not link for reasons of its own is not moved for ever.
 //!
+//! The same happens the other way, when the power goes off and FxSound hands the default back: a
+//! recorder moved from FxSound's stereo source onto a mono microphone has its two ports replaced
+//! with one, and WirePlumber 0.5.17 left one of four such recorders linked to nothing on about one
+//! power off in fifteen, found by 0.5.0's test of how soon they record again
+//! (`graph_churn::a_recorder_that_follows_the_default_source_records_fxsound_after_every_power_toggle`)
+//! — and before 0.5.0's fades as well. So for [`AFTER_HAND_BACK`] after a hand-back, a stream that
+//! follows the default and has no link for [`STRANDED_AFTER`] is moved onto the device the default
+//! went to, the same way. After that the default is the desktop's, and its moves are
+//! WirePlumber's own business.
+//!
 //! What this module keeps is plain data the main loop feeds from the registry: every link, and the
 //! registry id and serial of FxSound's own sink and source.
 
@@ -35,11 +45,22 @@ use crate::per_direction::PerDirection;
 
 /// How long a stream that follows the default may have no link while FxSound holds it before it
 /// is taken for stranded. A move WirePlumber makes unlinks the stream and links it again within a
-/// few milliseconds; a stranded one stays unlinked until the default changes again.
-pub(crate) const STRANDED_AFTER: Duration = Duration::from_millis(500);
+/// few milliseconds — within 3 to 12, measured with WirePlumber 0.5.17 on a private graph; a
+/// stranded one stays unlinked until the default changes again. A quarter of a second, and not
+/// the half of 0.4.0: a recorder moved by the power switch is silent from its fade until it is
+/// linked again (`crate::stream_handover`), and one WirePlumber stranded has to record again within
+/// a second of the switch (roadmap 0.5.0 §7, test 1). The wait starts when the stream's last link
+/// goes ([`Stranded::removed`]), and the supervisor's tick, every 200 ms, finds it due.
+pub(crate) const STRANDED_AFTER: Duration = Duration::from_millis(250);
 
-/// How many times a stranded stream is moved onto FxSound each time FxSound takes the default.
+/// How many times a stranded stream is moved onto FxSound each time FxSound takes the default, or
+/// onto the device each time FxSound hands it back.
 pub(crate) const NUDGES: u8 = 2;
+
+/// How long after FxSound handed a default back it still moves a stream the hand-back left linked
+/// to nothing onto the device the default went to: the fade, the move, [`STRANDED_AFTER`], a
+/// second nudge after as long again, and room for a slow server.
+pub(crate) const AFTER_HAND_BACK: Duration = Duration::from_secs(3);
 
 /// One link of the graph: which node it takes from and which it feeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,8 +94,11 @@ impl Stranded {
     }
 
     /// Something left the registry: a link, a stream, one of FxSound's nodes, or none of them.
-    pub(crate) fn removed(&mut self, id: u32) {
-        self.links.remove(&id);
+    /// Whether it was a link: the engine then looks for streams it left with none at once
+    /// ([`Self::due`]), so that a stream's wait starts when it lost its last link, not at the
+    /// supervisor's next tick.
+    pub(crate) fn removed(&mut self, id: u32) -> bool {
+        let link = self.links.remove(&id).is_some();
         self.since.remove(&id);
         self.nudged.remove(&id);
         for direction in DeviceDirection::ALL {
@@ -83,6 +107,7 @@ impl Stranded {
                 *ours = None;
             }
         }
+        link
     }
 
     /// The `object.serial` of FxSound's node of `direction`, while it is in the graph.
@@ -90,7 +115,8 @@ impl Stranded {
         (*self.ours.get(direction)).map(|(_, serial)| serial)
     }
 
-    /// FxSound has just taken a default: every stream may be moved onto it [`NUDGES`] times again.
+    /// FxSound has just taken a default, or handed it back: every stream may be moved where it went
+    /// [`NUDGES`] times again.
     pub(crate) fn claimed(&mut self) {
         self.nudged.clear();
     }
@@ -101,6 +127,18 @@ impl Stranded {
         self.links.values().any(|link| match direction {
             DeviceDirection::Output => link.output == id,
             DeviceDirection::Input => link.input == id,
+        })
+    }
+
+    /// Whether the stream `id`, of `direction`, is linked to FxSound's own node of that direction:
+    /// a player into FxSound's sink, a recorder out of FxSound's source.
+    pub(crate) fn linked_to_ours(&self, id: u32, direction: DeviceDirection) -> bool {
+        let Some((own, _)) = *self.ours.get(direction) else {
+            return false;
+        };
+        self.links.values().any(|link| match direction {
+            DeviceDirection::Output => link.output == id && link.input == own,
+            DeviceDirection::Input => link.output == own && link.input == id,
         })
     }
 
@@ -147,7 +185,7 @@ mod tests {
     const OUT: DeviceDirection = DeviceDirection::Output;
 
     #[test]
-    fn a_follower_is_stranded_only_after_half_a_second_with_no_link_at_all() {
+    fn a_follower_is_stranded_only_after_a_quarter_of_a_second_with_no_link_at_all() {
         let mut stranded = Stranded::default();
         let start = Instant::now();
         let at = |ms| start + Duration::from_millis(ms);
@@ -155,15 +193,26 @@ mod tests {
         stranded.link_appeared(100, 63, 78);
         assert!(stranded.due(&[(78, IN)], at(0)).is_empty());
         // Moved: its link goes, and the next one comes a moment later.
-        stranded.removed(100);
+        assert!(stranded.removed(100));
         assert!(stranded.due(&[(78, IN)], at(10)).is_empty());
         stranded.link_appeared(101, 30, 78);
         assert!(stranded.due(&[(78, IN)], at(600)).is_empty());
-        // Moved onto nothing: stranded once half a second has gone by.
-        stranded.removed(101);
+        // Moved onto nothing: stranded once a quarter of a second has gone by.
+        assert!(stranded.removed(101));
         assert!(stranded.due(&[(78, IN)], at(700)).is_empty());
-        assert!(stranded.due(&[(78, IN)], at(1_100)).is_empty());
-        assert_eq!(stranded.due(&[(78, IN)], at(1_200)), [(78, IN)]);
+        assert!(stranded.due(&[(78, IN)], at(900)).is_empty());
+        assert_eq!(stranded.due(&[(78, IN)], at(950)), [(78, IN)]);
+    }
+
+    #[test]
+    fn only_a_link_leaving_asks_for_a_look_at_once() {
+        let mut stranded = Stranded::default();
+        stranded.link_appeared(100, 63, 78);
+        stranded.own_node_appeared(IN, 63, 1_055);
+        assert!(!stranded.removed(78), "a stream is no link");
+        assert!(!stranded.removed(63), "nor FxSound's own node");
+        assert!(stranded.removed(100));
+        assert!(!stranded.removed(100), "and a link goes once");
     }
 
     #[test]
@@ -177,6 +226,29 @@ mod tests {
         let followers = [(77, OUT), (78, IN)];
         assert!(stranded.due(&followers, start).is_empty());
         assert_eq!(stranded.due(&followers, later), [(78, IN)]);
+    }
+
+    #[test]
+    fn a_player_is_on_fxsound_linked_into_its_sink_and_a_recorder_linked_out_of_its_source() {
+        let mut stranded = Stranded::default();
+        stranded.own_node_appeared(OUT, 60, 1_050);
+        stranded.own_node_appeared(IN, 63, 1_055);
+        // The player 77 plays into FxSound's sink, the player 79 into a device; the recorder 78
+        // records FxSound's source, the recorder 80 a microphone.
+        stranded.link_appeared(1, 77, 60);
+        stranded.link_appeared(2, 79, 90);
+        stranded.link_appeared(3, 63, 78);
+        stranded.link_appeared(4, 91, 80);
+        assert!(stranded.linked_to_ours(77, OUT));
+        assert!(!stranded.linked_to_ours(79, OUT));
+        assert!(stranded.linked_to_ours(78, IN));
+        assert!(!stranded.linked_to_ours(80, IN));
+        // Each in its own direction only, and not once the link, or FxSound's node, has gone.
+        assert!(!stranded.linked_to_ours(78, OUT));
+        assert!(stranded.removed(1));
+        assert!(!stranded.linked_to_ours(77, OUT));
+        assert!(!stranded.removed(63));
+        assert!(!stranded.linked_to_ours(78, IN));
     }
 
     #[test]
@@ -214,7 +286,7 @@ mod tests {
         stranded.own_node_appeared(IN, 63, 1_055);
         stranded.own_node_appeared(OUT, 60, 1_050);
         assert_eq!(stranded.our_serial(IN), Some(1_055));
-        stranded.removed(63);
+        assert!(!stranded.removed(63));
         assert_eq!(stranded.our_serial(IN), None);
         assert_eq!(stranded.our_serial(OUT), Some(1_050));
         stranded.forget_session();

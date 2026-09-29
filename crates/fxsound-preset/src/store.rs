@@ -71,11 +71,26 @@ pub trait PresetFile: Clone {
     fn shared_file(name: &str, existing: &str, file: &str) -> Self::Error;
     /// The preset as it is written for someone else to open: an export. The same preset unless
     /// the format has a reader elsewhere that expects something of it — the `.fac` a Windows
-    /// FxSound reads puts a twenty-band curve back on the Windows ladder (0.4.0 audit R4).
+    /// FxSound reads puts a twenty-band curve back on the Windows ladder (0.4.0 audit R4), and its
+    /// end bands as `end_bands` says.
     #[must_use]
-    fn exported(&self) -> Self {
+    fn exported(&self, _end_bands: EndBands) -> Self {
         self.clone()
     }
+}
+
+/// Where an exported `.fac` puts its first and last band (0.4.0 audit R6).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EndBands {
+    /// Back inside the range the Windows build tunes them in, as 0.4.0 exports them: the default,
+    /// and the only choice below «Like FxSound for Windows» = Interface and sound
+    /// ([`fxsound_core::eq::move_end_bands_back_inside_the_ladder`]).
+    #[default]
+    Shifted,
+    /// Where they are, limited only to the equalizer's 10 Hz–21 kHz
+    /// ([`fxsound_core::eq::keep_centres_inside_the_equalizer`]): the export window's choice from
+    /// Interface and sound on, so the file plays on Windows as the curve plays here.
+    AsTheyAre,
 }
 
 impl PresetFile for Preset {
@@ -122,14 +137,23 @@ impl PresetFile for Preset {
     /// band, which is what the Windows build tunes twenty bands to; this port moves it back when
     /// it reads it ([`fxsound_core::eq::move_off_the_windows_twenty_band_ladder`]).
     ///
-    /// Then the first and last band go back inside the ladder's edges (0.4.0 audit R6): here they
-    /// can be tuned half a band past them, where the Windows build's wheels cannot follow, so a
-    /// first band at 46 Hz is exported at 62.5 Hz. Nothing else moves, so a preset Windows made
-    /// goes back out as it came. Importing takes a file as it is, wider centres and all.
-    fn exported(&self) -> Self {
+    /// Then, [`EndBands::Shifted`], the first and last band go back inside the ladder's edges
+    /// (0.4.0 audit R6): here they can be tuned half a band past them, where the Windows build's
+    /// wheels cannot follow, so a first band at 46 Hz is exported at 62.5 Hz. Nothing else moves,
+    /// so a preset Windows made goes back out as it came. [`EndBands::AsTheyAre`] leaves them where
+    /// they are, inside the equalizer's own 10 Hz–21 kHz. Importing takes a file as it is, wider
+    /// centres and all.
+    fn exported(&self, end_bands: EndBands) -> Self {
         let mut preset = self.clone();
         fxsound_core::eq::move_onto_the_windows_twenty_band_ladder(&mut preset.eq_bands);
-        fxsound_core::eq::move_end_bands_back_inside_the_ladder(&mut preset.eq_bands);
+        match end_bands {
+            EndBands::Shifted => {
+                fxsound_core::eq::move_end_bands_back_inside_the_ladder(&mut preset.eq_bands);
+            }
+            EndBands::AsTheyAre => {
+                fxsound_core::eq::keep_centres_inside_the_equalizer(&mut preset.eq_bands);
+            }
+        }
         preset
     }
 }
@@ -418,8 +442,9 @@ impl<F: PresetFile> Store<F> {
         Ok(path)
     }
 
-    /// Delete a user preset: its file goes to the desktop's trash, where a file manager can
-    /// restore it, or when the trash cannot take it, is set aside beside itself as
+    /// Delete a user preset: its file goes to the desktop's trash — the home trash, or the trash
+    /// of its own filesystem when that is another one — where a file manager can restore it, or
+    /// when no trash can take it, is set aside beside itself as
     /// `<file>.1.bak` or the next free number ([`trash::set_aside`]) (0.4.0 audit #16; the
     /// original deletes it for good). Factory presets are refused, as in the original.
     ///
@@ -610,7 +635,20 @@ impl<F: PresetFile> Store<F> {
     /// # Errors
     /// The name is unknown, leaves nothing to file it under, or the file cannot be written.
     pub fn export(&self, name: &str, dir: &Path) -> Result<PathBuf, F::Error> {
-        let preset = self.load_saved(name)?.exported();
+        self.export_with(name, dir, EndBands::Shifted)
+    }
+
+    /// [`Store::export`] with the end bands put as `end_bands` says ([`EndBands`]).
+    ///
+    /// # Errors
+    /// As [`Store::export`].
+    pub fn export_with(
+        &self,
+        name: &str,
+        dir: &Path,
+        end_bands: EndBands,
+    ) -> Result<PathBuf, F::Error> {
+        let preset = self.load_saved(name)?.exported(end_bands);
         let path = dir.join(Self::file_name(name)?);
         preset.save(&path)?;
         Ok(path)
@@ -1957,6 +1995,79 @@ mod tests {
             wide.eq_bands[1..9],
             "the rest as it is"
         );
+    }
+
+    #[test]
+    fn end_bands_exported_as_they_are_keep_where_they_were_tuned() {
+        // «Like FxSound for Windows» = Interface and sound, the export window's choice (roadmap
+        // §14 #56): the end bands stay where they are, and only the equalizer's own window
+        // limits a centre.
+        let tmp = tempdir("export-as-they-are");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let mut wide = Preset {
+            name: "Wide".into(),
+            ..Preset::default()
+        };
+        wide.eq_bands[0] = fxsound_core::EqBand::new(46.0, 6.0);
+        wide.eq_bands[9] = fxsound_core::EqBand::new(20000.0, -3.0);
+        store.save_as(&wide, "Wide").expect("save");
+        let path = store
+            .export_with("Wide", &tmp.join("out"), EndBands::AsTheyAre)
+            .expect("export");
+        assert_eq!(crate::load(&path).expect("parse").eq_bands, wide.eq_bands);
+
+        // A centre the equalizer would not design at goes where it is played.
+        wide.eq_bands[0].center_hz = 5.0;
+        wide.eq_bands[9].center_hz = 30_000.0;
+        store.save_as(&wide, "Wide").expect("save");
+        let path = store
+            .export_with("Wide", &tmp.join("out"), EndBands::AsTheyAre)
+            .expect("export");
+        let exported = crate::load(&path).expect("parse");
+        assert_eq!(
+            exported.eq_bands[0].center_hz,
+            fxsound_core::eq::BAND_FLOOR_HZ
+        );
+        assert_eq!(
+            exported.eq_bands[9].center_hz,
+            fxsound_core::eq::BAND_CEILING_HZ
+        );
+        assert_eq!(exported.eq_bands[1..9], wide.eq_bands[1..9]);
+
+        // Shifted is what `export` does, 0.4.0's.
+        let shifted = store.export("Wide", &tmp.join("shifted")).expect("export");
+        assert_eq!(
+            crate::load(&shifted).expect("parse").eq_bands[0].center_hz,
+            62.5
+        );
+        assert_eq!(EndBands::default(), EndBands::Shifted);
+    }
+
+    #[test]
+    fn a_twenty_band_curve_exported_as_it_is_still_goes_onto_the_windows_ladder() {
+        // The end bands are the choice; the twenty-band ladder is what the Windows build tunes
+        // twenty bands to either way (audit report R4).
+        let tmp = tempdir("export-twenty-as-they-are");
+        let mut store = PresetStore::with_dirs(Vec::new(), tmp.join("user"));
+        let twenty = Preset {
+            name: "Twenty".into(),
+            eq_bands: fxsound_core::eq::TWENTY_BAND_CENTRES_HZ
+                .iter()
+                .map(|&hz| fxsound_core::EqBand::new(hz, 2.0))
+                .collect(),
+            ..Preset::default()
+        };
+        store.save_as(&twenty, "Twenty").expect("save");
+        let path = store
+            .export_with("Twenty", &tmp.join("out"), EndBands::AsTheyAre)
+            .expect("export");
+        let centres: Vec<f32> = crate::load(&path)
+            .expect("parse")
+            .eq_bands
+            .iter()
+            .map(|b| b.center_hz)
+            .collect();
+        assert_eq!(centres, fxsound_core::eq::WINDOWS_TWENTY_BAND_CENTRES_HZ);
     }
 
     #[test]

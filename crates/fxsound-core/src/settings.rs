@@ -24,6 +24,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::messages::TargetVolume;
+use crate::parity::WindowsParity;
 use crate::{
     DeEsserMode, DenoiseChannelsOverride, DereverbLevel, DeviceDirection, NoiseSuppressionOverride,
 };
@@ -58,7 +59,7 @@ pub enum ThemeMode {
 /// Every field defaults, for the same reason the file as a whole does: an entry written by an
 /// older version, or one a hand edit left short, must cost that entry's missing field and not
 /// the whole settings file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct DeviceConfig {
     /// On Windows an endpoint id; here the PipeWire `node.name`, which is stable across restarts.
@@ -80,6 +81,12 @@ pub struct DeviceConfig {
     /// preset from it yet — that would change which preset a user hears when they plug something
     /// in, which is a decision worth making deliberately rather than inheriting from a comment.
     pub device_form_factor: String,
+    /// Every key of the entry this version does not know, kept and written back with the entry,
+    /// as [`Settings::extra`] keeps the file's: a per-device key a later version adds survives a
+    /// save here. An entry this version creates starts with none; one it forgets goes with its
+    /// keys.
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
 
 /// What the microphone calibration wizard last measured and what it did about it.
@@ -104,6 +111,11 @@ pub struct CalibrationRecord {
     pub preset: String,
     /// `node.name` of the microphone it was run on.
     pub device: String,
+    /// Every key of the record this version does not know, kept and written back with it, as
+    /// [`Settings::extra`] keeps the file's. They describe the same run as the rest of the record,
+    /// so they go with it: when the wizard runs again, and when the record is dropped as corrupt.
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
 
 impl CalibrationRecord {
@@ -247,7 +259,53 @@ pub struct Settings {
     pub hide_notifications: bool,
     /// How many presets the user may save, from 10 to 1000 ([`USER_PRESET_LIMITS`]).
     pub max_user_presets: u32,
+
+    // ---- like FxSound for Windows ----------------------------------------------------------
+    /// «Как в Windows» / "Like FxSound for Windows" (`docs/0.5.0-windows-parity.md`). Written only
+    /// when it is not `off`, and read without ever failing: a value it cannot understand is Off
+    /// ([`WindowsParity::from_toml`]), never a reason to move the file aside. Everything (`full`),
+    /// which 0.5.0 does not offer, is kept here as it was read and written back by every save, so
+    /// going back up to 0.6.0 finds it; what runs is [`WindowsParity::offered_or_below`] of it,
+    /// Interface and sound (`App::windows_parity`).
+    #[serde(skip_serializing_if = "WindowsParity::is_off")]
+    pub windows_parity: WindowsParity,
+    /// Export a `.fac` with its end bands where they are, limited only to the equalizer's
+    /// 10 Hz–21 kHz, instead of back inside the range the Windows build tunes them in (0.4.0
+    /// audit R6): the export window's choice and `--export-unshifted`. Offered, and followed, from
+    /// «Like FxSound for Windows» = Interface and sound on; below it every export shifts them, as
+    /// 0.4.0 does. Written only when set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub export_unshifted: bool,
+
+    /// Every key of the file this version does not know, kept and written back as it was read.
+    /// This is the file's top level; a key inside an entry of `device_configs` or
+    /// `device_volumes`, or inside `[calibration]`, is kept by that entry's own `extra`.
+    ///
+    /// A key written by a later version — this one's `windows_parity` read by 0.4.0, a
+    /// customisation key read by this one after a downgrade — survives a save here, so going back
+    /// up a version finds it again. 0.4.0 has no such table and drops what it does not know on its
+    /// next save. The retired Windows keys are the one exception ([`RETIRED_WINDOWS_KEYS`]).
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
+
+/// The Windows keys nothing here reads (0.4.0 audit #35): every file 0.3.0 wrote carries them, and
+/// a hand edit of any of them did nothing. They load, and the next save leaves them out, rather
+/// than being kept in [`Settings::extra`] with the keys of later versions.
+pub const RETIRED_WINDOWS_KEYS: [&str; 12] = [
+    "device_configs_version",
+    "window_x",
+    "window_y",
+    "always_on_top",
+    "hotkeys",
+    "cmd_on_off",
+    "cmd_open_close",
+    "cmd_next_preset",
+    "cmd_previous_preset",
+    "cmd_change_output",
+    "automatic_updates",
+    "last_update_time",
+];
 
 impl Default for Settings {
     fn default() -> Self {
@@ -292,6 +350,10 @@ impl Default for Settings {
             hide_help_tooltips: false,
             hide_notifications: false,
             max_user_presets: 120,
+
+            windows_parity: WindowsParity::Off,
+            export_unshifted: false,
+            extra: toml::Table::new(),
         }
     }
 }
@@ -457,6 +519,11 @@ impl Settings {
 
         let default = Self::default();
 
+        // 0.4.0 audit #35: the Windows keys nothing reads are left out of the next save.
+        for key in RETIRED_WINDOWS_KEYS {
+            self.extra.remove(key);
+        }
+
         // A 0.2.0 file's single preset is this version's *output* preset. It is taken only when
         // the new key is absent — which, with `#[serde(default)]` filling it in, reads as "still
         // the default". A file carrying both a stale `preset` line and a real `output_preset` is
@@ -551,9 +618,10 @@ impl Settings {
     /// caller saves only when there is something to save — a mixer drag reports on every step.
     ///
     /// An entry the loader would drop is not stored: the file never records a value it would
-    /// have to discard again.
+    /// have to discard again. The engine reports no keys of a later version, so an entry it
+    /// replaces keeps the ones it had ([`TargetVolume::extra`]).
     pub fn remember_target_volume(&mut self, volume: TargetVolume) -> bool {
-        let Some(volume) = volume.sanitised() else {
+        let Some(mut volume) = volume.sanitised() else {
             return false;
         };
         match self
@@ -561,8 +629,11 @@ impl Settings {
             .iter_mut()
             .find(|entry| entry.same_place(&volume))
         {
-            Some(entry) if *entry == volume => false,
             Some(entry) => {
+                volume.extra.clone_from(&entry.extra);
+                if *entry == volume {
+                    return false;
+                }
                 *entry = volume;
                 true
             }
@@ -740,6 +811,7 @@ impl Settings {
                 device_name: description.to_owned(),
                 preset: preset.to_owned(),
                 device_form_factor: form_factor.to_owned(),
+                extra: toml::Table::new(),
             });
         }
     }
@@ -1438,6 +1510,7 @@ input_preset = \"Headset\"
                 unix_time: 1_760_000_000,
                 preset: "Calibrated — Fifine K669".to_owned(),
                 device: "alsa_input.usb-fifine".to_owned(),
+                extra: toml::Table::new(),
             }),
             device_configs: vec![DeviceConfig {
                 device_id: "alsa_input.usb-fifine".to_owned(),
@@ -1445,6 +1518,7 @@ input_preset = \"Headset\"
                 device_name: "Fifine K669".to_owned(),
                 preset: "Calibrated — Fifine K669".to_owned(),
                 device_form_factor: "microphone".to_owned(),
+                extra: toml::Table::new(),
             }],
             ..Settings::default()
         };
@@ -1571,6 +1645,7 @@ device = \"mic\"
             port: String::new(),
             channel_volumes: volumes.to_vec(),
             mute: false,
+            extra: toml::Table::new(),
         }
     }
 
@@ -1881,5 +1956,357 @@ mute = true
         assert_eq!(s.volume_leveling, 4.0);
         assert_eq!(s.filter_q, 1.0);
         assert_eq!(s.num_bands, 1);
+    }
+
+    #[test]
+    fn the_windows_parity_level_is_written_only_when_it_is_not_off() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        Settings::default().save_to(&path).expect("save");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(!written.contains("windows_parity"), "{written}");
+
+        for level in [
+            WindowsParity::Interface,
+            WindowsParity::Sound,
+            WindowsParity::Full,
+        ] {
+            let settings = Settings {
+                windows_parity: level,
+                ..Settings::default()
+            };
+            settings.save_to(&path).expect("save");
+            let written = std::fs::read_to_string(&path).expect("read back");
+            assert!(
+                written.contains(&format!("windows_parity = \"{}\"", level.key())),
+                "{written}"
+            );
+            assert_eq!(Settings::load_from(&path).windows_parity, level);
+        }
+    }
+
+    #[test]
+    fn the_unshifted_export_is_written_only_when_it_is_chosen() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        Settings::default().save_to(&path).expect("save");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(!written.contains("export_unshifted"), "{written}");
+        assert!(!Settings::load_from(&path).export_unshifted);
+
+        Settings {
+            export_unshifted: true,
+            ..Settings::default()
+        }
+        .save_to(&path)
+        .expect("save");
+        let written = std::fs::read_to_string(&path).expect("read back");
+        assert!(written.contains("export_unshifted = true"), "{written}");
+        assert!(Settings::load_from(&path).export_unshifted);
+    }
+
+    #[test]
+    fn a_file_that_says_full_survives_a_load_and_a_save_byte_for_byte_while_it_runs_as_sound() {
+        // 0.6.0 writes Everything; 0.5.0 runs it as Interface and sound and writes it back as it
+        // was, so 0.6.0 -> 0.5.0 -> 0.6.0 finds Everything again.
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        Settings {
+            windows_parity: WindowsParity::Full,
+            output_preset: "Rock".into(),
+            ..Settings::default()
+        }
+        .save_to(&path)
+        .expect("save");
+        let written = std::fs::read(&path).expect("read back");
+        assert!(
+            String::from_utf8_lossy(&written).contains("windows_parity = \"full\""),
+            "{}",
+            String::from_utf8_lossy(&written)
+        );
+
+        let loaded = Settings::load_from(&path);
+        assert_eq!(loaded.windows_parity, WindowsParity::Full);
+        assert_eq!(
+            loaded.windows_parity.offered_or_below(),
+            WindowsParity::Sound
+        );
+        loaded.save_to(&path).expect("save again");
+        assert_eq!(std::fs::read(&path).expect("read again"), written);
+    }
+
+    #[test]
+    fn a_windows_parity_value_that_cannot_be_read_costs_that_key_and_never_the_file() {
+        // A10: a boolean, an unknown word, a number, a table and an array are all read as a level,
+        // and the rest of the file is believed; nothing is moved aside.
+        for (value, level) in [
+            ("true", WindowsParity::Sound),
+            ("false", WindowsParity::Off),
+            ("\"EVERYTHING\"", WindowsParity::Full),
+            ("\"full\"", WindowsParity::Full),
+            ("\"Interface\"", WindowsParity::Interface),
+            ("\"like windows\"", WindowsParity::Off),
+            ("3", WindowsParity::Off),
+            ("-0.5", WindowsParity::Off),
+            ("{ level = \"full\" }", WindowsParity::Off),
+            ("[\"sound\"]", WindowsParity::Off),
+        ] {
+            let dir = tempfile::tempdir().expect("a scratch directory");
+            let path = dir.path().join("settings.toml");
+            std::fs::write(
+                &path,
+                format!("power = false\nwindows_parity = {value}\noutput_preset = \"Rock\"\n"),
+            )
+            .expect("write");
+            let loaded = Settings::load_from(&path);
+            assert!(
+                !Settings::bad_path(&path).exists(),
+                "{value} moved the file"
+            );
+            assert_eq!(loaded.windows_parity, level, "{value}");
+            assert!(!loaded.power, "{value}");
+            assert_eq!(loaded.output_preset, "Rock", "{value}");
+            assert!(loaded.extra.is_empty(), "{value}: {:?}", loaded.extra);
+        }
+        // A table header of that name, rather than an inline table, too.
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            "power = false\n\n[windows_parity]\nlevel = \"full\"\n",
+        )
+        .expect("write");
+        let loaded = Settings::load_from(&path);
+        assert!(!Settings::bad_path(&path).exists());
+        assert_eq!(loaded.windows_parity, WindowsParity::Off);
+        assert!(!loaded.power);
+    }
+
+    /// A settings file as a later version might write it: this version's keys, and some it has
+    /// never heard of — a plain value, an array, a table and an array of tables at the top, and a
+    /// key inside an entry of each array of tables this version writes and inside `[calibration]`.
+    fn with_later_keys() -> Settings {
+        let nested = |text: &str| -> toml::Table { toml::from_str(text).expect("a later key") };
+        let later: toml::Table = toml::from_str(
+            "\
+theme = \"studio-light\"
+glass = \"system\"
+visualizer_fps = 60
+visualizer_modes = [\"spectrum\", \"wave\"]
+
+[rainbow]
+speed = 0.5
+saturation = 0.8
+
+[[correction]]
+device = \"alsa_output.usb-headphones\"
+gains = [1.5, -2.0, 0.0]
+",
+        )
+        .expect("a later version's keys");
+        Settings {
+            power: false,
+            output_preset: "Rock".to_owned(),
+            windows_parity: WindowsParity::Sound,
+            device_configs: vec![
+                DeviceConfig {
+                    device_id: "alsa_output.usb-headphones".to_owned(),
+                    preset: "Rock".to_owned(),
+                    device_form_factor: "headphone".to_owned(),
+                    extra: nested("preset_by_type = true\n[eq_trim]\nbass = -1.5\n"),
+                    ..DeviceConfig::default()
+                },
+                DeviceConfig {
+                    device_id: "alsa_output.pci-speakers".to_owned(),
+                    preset: "General".to_owned(),
+                    ..DeviceConfig::default()
+                },
+            ],
+            device_volumes: vec![TargetVolume {
+                target: "alsa_output.usb-headphones".to_owned(),
+                channel_volumes: vec![0.5, 0.5],
+                extra: nested("balance_curve = \"equal-power\"\n"),
+                ..TargetVolume::default()
+            }],
+            calibration: Some(CalibrationRecord {
+                noise_floor_db: -48.0,
+                preset: "Calibrated".to_owned(),
+                extra: nested("hum_hz = 50\nbands = [120.0, 4000.0]\n"),
+                ..CalibrationRecord::default()
+            }),
+            extra: later,
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn keys_of_a_later_version_survive_a_load_and_a_save_byte_for_byte() {
+        // A10: going back a version and up again must not cost the later version's keys.
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        with_later_keys().save_to(&path).expect("save");
+        let first = std::fs::read(&path).expect("read back");
+
+        let loaded = Settings::load_from(&path);
+        assert!(!Settings::bad_path(&path).exists());
+        assert_eq!(loaded, {
+            let mut expected = with_later_keys();
+            expected.sanitise();
+            expected
+        });
+        loaded.save_to(&path).expect("save again");
+        let second = std::fs::read(&path).expect("read back");
+        assert_eq!(
+            String::from_utf8_lossy(&first),
+            String::from_utf8_lossy(&second)
+        );
+        assert_eq!(first, second);
+
+        // And the nested keys are where the later version put them, not hoisted to the top.
+        let text = String::from_utf8_lossy(&second);
+        for line in [
+            "preset_by_type = true",
+            "[device_configs.eq_trim]",
+            "balance_curve = \"equal-power\"",
+            "hum_hz = 50",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in:\n{text}");
+        }
+        let top: toml::Table = toml::from_str(&text).expect("parse");
+        for key in [
+            "preset_by_type",
+            "eq_trim",
+            "balance_curve",
+            "hum_hz",
+            "bands",
+        ] {
+            assert!(!top.contains_key(key), "{key} moved to the top of:\n{text}");
+        }
+    }
+
+    #[test]
+    fn keys_this_version_does_not_know_are_kept_wherever_a_hand_put_them() {
+        // Written by hand, in no order a save would choose: the unknown keys come back with the
+        // same values, whatever order the next save puts them in.
+        let text = "\
+future_first = \"kept\"
+power = false
+nested_future = { a = 1, b = [true, false] }
+output_preset = \"Jazz\"
+windows_parity = \"interface\"
+future_last = 2.5
+
+[future_table]
+name = \"x\"
+
+[[device_configs]]
+device_id = \"alsa_output.usb-headphones\"
+future_nested = \"x\"
+preset = \"Rock\"
+
+[[device_volumes]]
+future_volume = { curve = \"db\" }
+target = \"alsa_output.usb-headphones\"
+channel_volumes = [0.5]
+
+[calibration]
+future_cal = 3
+noise_floor_db = -48.0
+";
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let path = dir.path().join("settings.toml");
+        std::fs::write(&path, text).expect("write");
+        let loaded = Settings::load_from(&path);
+        assert!(!Settings::bad_path(&path).exists());
+        assert_eq!(loaded.output_preset, "Jazz");
+        assert_eq!(loaded.windows_parity, WindowsParity::Interface);
+        let keys: Vec<&str> = loaded.extra.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "future_first",
+                "future_last",
+                "future_table",
+                "nested_future"
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        loaded.save_to(&path).expect("save");
+        let saved: toml::Table =
+            toml::from_str(&std::fs::read_to_string(&path).expect("read back")).expect("parse");
+        let original: toml::Table = toml::from_str(text).expect("parse");
+        for key in keys {
+            assert_eq!(saved.get(key), original.get(key), "{key}");
+        }
+        let entry = |table: &toml::Table, array: &str, key: &str| {
+            table[array].as_array().expect("an array of tables")[0]
+                .get(key)
+                .cloned()
+        };
+        assert_eq!(
+            entry(&saved, "device_configs", "future_nested"),
+            Some(toml::Value::from("x"))
+        );
+        assert_eq!(
+            entry(&saved, "device_volumes", "future_volume"),
+            entry(&original, "device_volumes", "future_volume")
+        );
+        assert_eq!(
+            saved["calibration"].get("future_cal"),
+            Some(&toml::Value::from(3))
+        );
+        assert_eq!(Settings::load_from(&path), loaded);
+    }
+
+    #[test]
+    fn a_device_the_app_updates_keeps_the_keys_a_later_version_wrote_into_its_entry() {
+        let mut settings: Settings = toml::from_str(
+            "[[device_configs]]\ndevice_id = \"hdmi\"\npreset = \"Rock\"\nfuture = 1\n\n\
+             [[device_volumes]]\ntarget = \"hdmi\"\nchannel_volumes = [0.5]\nfuture = 2\n",
+        )
+        .expect("parse");
+        settings.sanitise();
+
+        settings.remember_device_preset("hdmi", "TV", "Jazz", "tv", DeviceDirection::Output);
+        assert_eq!(settings.device_configs[0].preset, "Jazz");
+        assert_eq!(
+            settings.device_configs[0].extra.get("future"),
+            Some(&toml::Value::from(1))
+        );
+
+        let reported = |level: f32| TargetVolume {
+            target: "hdmi".to_owned(),
+            channel_volumes: vec![level],
+            ..TargetVolume::default()
+        };
+        assert!(
+            !settings.remember_target_volume(reported(0.5)),
+            "the engine reports no later keys, and their absence is no change"
+        );
+        assert!(settings.remember_target_volume(reported(0.25)));
+        assert_eq!(settings.device_volumes[0].channel_volumes, [0.25]);
+        assert_eq!(
+            settings.device_volumes[0].extra.get("future"),
+            Some(&toml::Value::from(2)),
+            "a new level for the device is not a reason to forget the rest of its entry"
+        );
+    }
+
+    #[test]
+    fn a_calibration_record_dropped_as_corrupt_goes_with_the_later_keys_inside_it() {
+        // The keys inside `[calibration]` describe the same run as the rest of the record.
+        let mut corrupt: Settings =
+            toml::from_str("[calibration]\nnoise_floor_db = nan\nfuture_cal = 3\n").expect("parse");
+        assert_eq!(corrupt.calibration.as_ref().map(|r| r.extra.len()), Some(1));
+        corrupt.sanitise();
+        assert_eq!(corrupt.calibration, None);
+        assert!(
+            corrupt.extra.is_empty(),
+            "not hoisted to the top of the file"
+        );
     }
 }

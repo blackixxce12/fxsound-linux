@@ -19,7 +19,9 @@ use crate::cli::{
     AppPresetChoice, Command, DeviceCommand, PowerCommand, PresetCommand, WindowCommand,
 };
 use fxsound_core::messages::AppStream;
-use fxsound_core::{AppRules, AudioDevice, DeviceDirection, Effect, ThemeMode, ViewMode, eq};
+use fxsound_core::{
+    AppRules, AudioDevice, DeviceDirection, Effect, ParityClass, ThemeMode, ViewMode, eq,
+};
 use fxsound_ui::{UiAction, state::UiState};
 use serde::Serialize;
 use serde_json::Value;
@@ -34,6 +36,10 @@ pub struct WindowRequest {
     pub hide: bool,
     pub toggle: bool,
     pub quit: bool,
+    /// `show` is only the window «Like FxSound for Windows» raises for a forwarded line that
+    /// sets something ([`run_forwarded`]): nobody asked for the window itself, so one that cannot
+    /// be opened — no display in FxSound's environment — is no reason to stop the sound.
+    pub raised_like_windows: bool,
 }
 
 impl WindowRequest {
@@ -42,11 +48,23 @@ impl WindowRequest {
         !self.show && !self.hide && !self.toggle && !self.quit
     }
 
-    fn merge(&mut self, other: Self) {
+    /// Show the window because somebody asked for it: `--show`, the tray. Whatever raise was
+    /// merged in before is then asked for too.
+    pub const fn ask_to_show(&mut self) {
+        self.show = true;
+        self.raised_like_windows = false;
+    }
+
+    /// Both requests at once. The window shown is only raised like Windows while no side asked
+    /// for it itself.
+    pub const fn merge(&mut self, other: Self) {
+        let asked =
+            (self.show && !self.raised_like_windows) || (other.show && !other.raised_like_windows);
         self.show |= other.show;
         self.hide |= other.hide;
         self.toggle |= other.toggle;
         self.quit |= other.quit;
+        self.raised_like_windows = self.show && !asked;
     }
 }
 
@@ -98,6 +116,26 @@ pub fn run(app: &mut App, commands: &[Command]) -> Outcome {
             outcome.stdout.push_str(&one.stdout);
         }
         outcome.window.merge(one.window);
+    }
+    outcome
+}
+
+/// Execute a command line a second `fxsound` forwarded over the control socket, or D-Bus handed
+/// over: [`run`], and then the window the Windows build raises for it.
+///
+/// `raises_like_windows` is [`crate::cli::Cli::raises_like_windows`] for a line from the socket
+/// and `false` for D-Bus, whose calls come from keybinds and status bars. At «Как в Windows» =
+/// Interface and above such a line raises the window, as step 11 of `applyConfig` does for every
+/// forwarded line (`FxController.cpp:523-531`, 0.4.0 audit R11) — at the level the line leaves
+/// in force, since `--windows-parity` runs first on its line. `--quit` on the same line wins.
+pub fn run_forwarded(app: &mut App, commands: &[Command], raises_like_windows: bool) -> Outcome {
+    let mut outcome = run(app, commands);
+    if raises_like_windows && app.windows_parity().interface() && !outcome.window.quit {
+        outcome.window.merge(WindowRequest {
+            show: true,
+            raised_like_windows: true,
+            ..WindowRequest::default()
+        });
     }
     outcome
 }
@@ -196,6 +234,13 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
         }
 
         Command::Language(code) => app.set_language(code),
+        Command::ExportUnshifted(as_they_are) => app.set_export_unshifted(*as_they_are),
+
+        Command::WindowsParity { level, force } => {
+            if let Err(refusal) = app.set_windows_parity(*level, *force) {
+                return Outcome::refused(refusal);
+            }
+        }
 
         Command::Window(window) => {
             outcome.window = match window {
@@ -220,6 +265,16 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
         // (`FxController.cpp:536-572`): a list with more pairs than bands was dropped without a
         // word, and one with fewer set what it could and passed the rest to a setter that ignores
         // them, also without a word.
+        //
+        // At «Как в Windows» = Interface and above the pairs that fit are set and the rest skipped
+        // (the approved contract, `docs/0.5.0-windows-parity.md` §2), with a note rather than a
+        // failure ([`set_the_pairs_that_fit`]).
+        Command::BandFrequencies(pairs) if app.windows_parity().interface() => {
+            return set_the_pairs_that_fit(app, "--set_band_freq", pairs);
+        }
+        Command::BandGains(pairs) if app.windows_parity().interface() => {
+            return set_the_pairs_that_fit(app, "--set_band_gain", pairs);
+        }
         Command::BandFrequencies(pairs) => {
             if let Err(refusal) = bands_exist(app, "--set_band_freq", pairs)
                 .and_then(|()| frequencies_in_range(app, pairs))
@@ -256,6 +311,44 @@ fn run_one(app: &mut App, command: &Command) -> Outcome {
     }
 
     outcome
+}
+
+/// `--set_band_freq` or `--set_band_gain` (`option`) at «Как в Windows» = Interface and above:
+/// every pair whose band the edit direction's equalizer has — and, for a frequency, whose centre
+/// lies in that band's tuning range — is set, and the others are skipped (0.4.0 audit #51, the
+/// Windows side of it). The Windows build says nothing about a pair it drops; the skipped pairs
+/// are named on stderr here, and the command still succeeds.
+fn set_the_pairs_that_fit(app: &mut App, option: &str, pairs: &[(usize, f32)]) -> Outcome {
+    let frequencies = option == "--set_band_freq";
+    let count = app.state.eq_bands.len();
+    let mut skipped = Vec::new();
+    let mut actions = Vec::new();
+    for &(band, value) in pairs {
+        if band >= count {
+            skipped.push(format!("band {band}"));
+        } else if frequencies {
+            let (low, high) = fxsound_core::eq::band_frequency_range(band, count);
+            if (low..=high).contains(&value) {
+                actions.push(UiAction::SetBandFrequency(band, value));
+            } else {
+                skipped.push(format!("band {band} at {} Hz", exact(value)));
+            }
+        } else {
+            actions.push(UiAction::SetBandGain(band, value));
+        }
+    }
+    app.handle(&actions);
+    Outcome {
+        stderr: if skipped.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "note: {option}: on {count} bands, {} skipped and the rest set",
+                skipped.join(", ")
+            )
+        },
+        ..Outcome::default()
+    }
 }
 
 /// `Ok` when every band `pairs` names is one the edit direction's equalizer has now; otherwise the
@@ -837,31 +930,47 @@ pub fn forget_in_the_settings_file(commands: &[Command], path: &Path) -> Outcome
     }
 }
 
-/// How long a running FxSound holds a forwarded line with a `--forget-device` in it for
-/// PipeWire's first device list ([`waits_for_the_device_list`]): long enough for a PipeWire that
-/// answers at all, and a second short of [`crate::ipc::HANDLER_TIMEOUT`], so the caller still
-/// hears the refusal rather than its own timeout when none comes.
+/// How long a running FxSound holds a forwarded line with a `--forget-device`, a `--next-output`
+/// or a `--next-input` in it for PipeWire's first device list ([`waits_for_the_device_list`]):
+/// long enough for a PipeWire that answers at all, and a second short of
+/// [`crate::ipc::HANDLER_TIMEOUT`], so the caller still hears back rather than its own timeout
+/// when none comes.
 pub const DEVICE_LIST_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Whether `commands` should wait for the device list before `app` runs them: a
-/// `--forget-device` (or D-Bus `ForgetDevice`) that reaches an instance so young that PipeWire has
-/// not listed the devices yet — a call that started FxSound through the bus
-/// (`--activated`), or a script that runs `fxsound --forget-device` right after `fxsound &`.
-/// [`App::forget_device`] can only refuse it then; held until the list is in, for at most
-/// [`DEVICE_LIST_WAIT`], it does what it says. Without an engine no list will come, and the line
-/// runs, and is refused, at once.
+/// `--forget-device`, `--next-output` or `--next-input` (or D-Bus `ForgetDevice`, `NextOutput`,
+/// `NextInput`) that reaches an instance so young that PipeWire has not listed the devices yet — a
+/// call that started FxSound through the bus (`--activated`), or a script that runs
+/// `fxsound --next-output` right after `fxsound &`. [`App::forget_device`] can only refuse then,
+/// and a step has no list to step through, so it went nowhere and still succeeded (0.4.0); held
+/// until the list is in, for at most [`DEVICE_LIST_WAIT`], each does what it says. Without an
+/// engine no list will come, and the line runs at once.
 #[must_use]
 pub fn waits_for_the_device_list(app: &App, commands: &[Command]) -> bool {
     !app.has_seen_devices()
         && app.has_audio()
-        && commands
-            .iter()
-            .any(|command| matches!(command, Command::ForgetDevice(_)))
+        && commands.iter().any(|command| {
+            matches!(
+                command,
+                Command::ForgetDevice(_)
+                    | Command::Output(DeviceCommand::Next)
+                    | Command::Input(DeviceCommand::Next)
+            )
+        })
 }
 
-/// The shape of [`StatusDocument`], as its `schema` key says it. 0.3.0's document had no number
-/// and is schema 1; 2 is 0.4.0's, every key of 1 kept and upstream's `printStatus` keys added.
-pub const STATUS_SCHEMA: u32 = 2;
+/// The compatibility number of [`StatusDocument`], its `schema` key, which the listings
+/// (`--list-apps --json`, D-Bus `ListPresets`, `ListDevices`, `ListApps`) carry too.
+///
+/// The rule, as the man page's STATUS DOCUMENT writes it for clients: adding a key never changes
+/// the number; removing or renaming a key, or changing its meaning or its JSON type, raises it by
+/// one — and a meaning that has to change gets a new key beside the old one instead, as
+/// `edit_direction` beside `direction`. 0.3.0's document had no number and is schema 1; 2 is
+/// 0.4.0's, every key of 1 kept and upstream's `printStatus` keys added; 3 is 0.5.0's, every key
+/// of 2 kept and «Как в Windows» added (`windows_parity`, `apps_hidden`, `input.hidden`). Those
+/// two raises came with additions, before the rule was written down; from 3 on, keys are added
+/// under 3.
+pub const STATUS_SCHEMA: u32 = 3;
 
 /// Everything `--status` reports, in the shape `--status --json` prints it.
 ///
@@ -936,6 +1045,11 @@ pub struct StatusDocument {
     /// Every application FxSound remembers, the ones playing or recording now first, with the
     /// presets of their own and what they run through now (`docs/0.4.0-apps.md`).
     pub apps: Vec<AppStatus>,
+    /// «Как в Windows» / "Like FxSound for Windows": `off`, `interface`, `sound` or `full`.
+    pub windows_parity: &'static str,
+    /// Whether the applications' own presets are hidden by «Как в Windows» = Everything, so a
+    /// panel widget can grey its part for them rather than fail.
+    pub apps_hidden: bool,
 }
 
 /// A value on a control's own scale, as the document prints it: exactly, and a whole number
@@ -1104,6 +1218,8 @@ pub struct InputLaneStatus {
     pub noise_suppression: &'static str,
     /// The level the denoiser runs at once the override is applied.
     pub denoise_level: &'static str,
+    /// Whether the microphone lane is hidden by «Как в Windows» = Everything.
+    pub hidden: bool,
 }
 
 /// The microphone's telemetry, as the readout strip shows it. Reductions are positive dB.
@@ -1156,6 +1272,7 @@ pub fn status_document(app: &App) -> StatusDocument {
     let presets = |lane: DeviceDirection| preset_lists(&app.lane_preset_list(lane));
     let output_device_list = device_list(app, DeviceDirection::Output);
     let input_device_list = device_list(app, DeviceDirection::Input);
+    let parity = app.windows_parity();
 
     StatusDocument {
         schema: STATUS_SCHEMA,
@@ -1213,6 +1330,7 @@ pub fn status_document(app: &App) -> StatusDocument {
             lane: lane(DeviceDirection::Input),
             noise_suppression: app.settings().noise_suppression.key(),
             denoise_level: state.denoise_level.key(),
+            hidden: parity.changes(ParityClass::Full),
         },
         input_meters: input_meters(state),
         echo_cancel: EchoCancelStatus {
@@ -1235,6 +1353,8 @@ pub fn status_document(app: &App) -> StatusDocument {
             .map(|d| d.description.clone()),
         equalizer: equalizer(state),
         apps: app_statuses(app.app_rules(), app.app_streams()),
+        windows_parity: parity.key(),
+        apps_hidden: parity.changes(ParityClass::Full),
     }
 }
 
@@ -1393,6 +1513,7 @@ fn status_report(app: &App) -> String {
     let _ = writeln!(out, "direction: {}", doc.direction);
     let _ = writeln!(out, "view: {}", doc.view);
     let _ = writeln!(out, "theme: {}", doc.theme);
+    let _ = writeln!(out, "windows_parity: {}", doc.windows_parity);
 
     let effects = doc.effects;
     for (key, value) in [
@@ -1730,6 +1851,53 @@ mod tests {
     }
 
     #[test]
+    fn a_next_output_or_next_input_waits_for_the_first_device_list_and_then_steps() {
+        // 0.4.0: a D-Bus `NextOutput` that started FxSound through the bus reached an instance
+        // with no list to step through, went nowhere, and still succeeded.
+        let next_output = [Command::Output(OutputCommand::Next)];
+        let next_input = [Command::Input(InputCommand::Next)];
+        assert!(
+            !waits_for_the_device_list(&app(), &next_output),
+            "no engine, no list to wait for"
+        );
+        let dir = tempfile::tempdir().expect("scratch directory");
+        let engine = crate::audio_link::FakeEngine::new();
+        let mut a = App::start_for_tests(
+            fxsound_core::Settings::default(),
+            fxsound_preset::PresetStore::with_dirs(Vec::new(), dir.path().join("presets")),
+            fxsound_preset::InputPresetStore::with_dirs(Vec::new(), dir.path().join("input")),
+            &engine,
+        );
+        assert!(waits_for_the_device_list(&a, &next_output));
+        assert!(waits_for_the_device_list(&a, &next_input));
+        assert!(
+            !waits_for_the_device_list(&a, &[Command::Output(OutputCommand::Detach)]),
+            "a line that names no step does not wait"
+        );
+
+        engine.feed(fxsound_core::messages::AudioToUi::Devices(mixed_devices()));
+        a.poll_audio();
+        assert!(
+            !waits_for_the_device_list(&a, &next_output),
+            "the list is in"
+        );
+        for (line, lane) in [
+            (&next_output, fxsound_core::DeviceDirection::Output),
+            (&next_input, fxsound_core::DeviceDirection::Input),
+        ] {
+            let before = a.state.selection(lane);
+            let outcome = run(&mut a, line);
+            assert!(!outcome.failed, "{:?}", outcome.stderr);
+            let after = a.state.selection(lane);
+            assert!(
+                after.is_some() && after != before,
+                "{lane:?}: {before:?} → {after:?}"
+            );
+            assert_eq!(a.state.devices[after.unwrap()].direction, lane);
+        }
+    }
+
+    #[test]
     fn forget_device_fails_the_line_with_the_reason_when_it_forgets_nothing() {
         // Before the first device list nothing is known to be unplugged (0.4.0 audit #34).
         let mut a = app();
@@ -1816,6 +1984,165 @@ mod tests {
         let json = status(&mut a);
         assert!(json.is_object(), "{json}");
         assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Every key of schema 3 as 0.5.0 prints it, nested ones by their path (`[]` for an element
+    /// of an array), for a window with presets and devices. The applications' own keys are
+    /// checked where the applications are (`dbus.rs` and this file's `apps` tests).
+    const SCHEMA_THREE_KEYS: &[&str] = &[
+        "apps",
+        "apps_hidden",
+        "audio",
+        "balance_db",
+        "device",
+        "direction",
+        "echo_cancel",
+        "echo_cancel.on",
+        "echo_cancel.running",
+        "edit_direction",
+        "effects",
+        "effects.ambience",
+        "effects.bass",
+        "effects.clarity",
+        "effects.dynamic_boost",
+        "effects.dynamicboost",
+        "effects.fidelity",
+        "effects.surround",
+        "eq",
+        "eq.bands",
+        "eq.enabled",
+        "eq.max_bands",
+        "equalizer",
+        "equalizer.balance",
+        "equalizer.bands",
+        "equalizer.bands[].frequency",
+        "equalizer.bands[].gain",
+        "equalizer.bands[].index",
+        "equalizer.bands[].max_frequency",
+        "equalizer.bands[].min_frequency",
+        "equalizer.filter_q",
+        "equalizer.master_gain",
+        "equalizer.num_bands",
+        "equalizer.volume_leveling",
+        "filter_q",
+        "format",
+        "format.channels",
+        "format.sample_rate",
+        "input",
+        "input.active",
+        "input.denoise_level",
+        "input.device",
+        "input.enabled",
+        "input.hidden",
+        "input.modified",
+        "input.node_name",
+        "input.noise_suppression",
+        "input.preset",
+        "input_device_list",
+        "input_device_list[].description",
+        "input_device_list[].node_name",
+        "input_device_list[].present",
+        "input_devices",
+        "input_meters",
+        "input_meters.compressor_reduction_db",
+        "input_meters.deesser_reduction_db",
+        "input_meters.deesser_running",
+        "input_meters.denoise_reduction_db",
+        "input_meters.denoise_running",
+        "input_meters.gate_reduction_db",
+        "input_meters.noise_floor_db",
+        "input_meters.voice_probability",
+        "input_presets",
+        "input_presets.built_in",
+        "input_presets.built_in[].modified",
+        "input_presets.built_in[].name",
+        "input_presets.user_defined",
+        "master_gain_db",
+        "output",
+        "output.active",
+        "output.device",
+        "output.enabled",
+        "output.modified",
+        "output.node_name",
+        "output.preset",
+        "output_device_list",
+        "output_device_list[].description",
+        "output_device_list[].node_name",
+        "output_device_list[].present",
+        "output_devices",
+        "output_presets",
+        "output_presets.built_in",
+        "output_presets.built_in[].modified",
+        "output_presets.built_in[].name",
+        "output_presets.user_defined",
+        "power",
+        "preset",
+        "presets",
+        "presets.built_in",
+        "presets.built_in[].modified",
+        "presets.built_in[].name",
+        "presets.user_defined",
+        "ring",
+        "ring.dropped_frames",
+        "ring.format_mismatches",
+        "ring.resyncs",
+        "ring.underrun_frames",
+        "schema",
+        "selected_input",
+        "selected_output",
+        "selected_preset",
+        "theme",
+        "version",
+        "view",
+        "volume_leveling",
+        "windows_parity",
+    ];
+
+    /// Every key in `value`, by its path.
+    fn key_paths(value: &Value, path: &str, out: &mut std::collections::BTreeSet<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    let path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    key_paths(value, &path, out);
+                    out.insert(path);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    key_paths(item, &format!("{path}[]"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn every_key_schema_three_printed_is_still_printed_while_the_schema_is_three() {
+        // The compatibility rule (the man page's STATUS DOCUMENT): `schema` is a compatibility
+        // number. Keys are only added, which leaves it alone; a key removed or renamed raises it,
+        // and this list goes with the old number.
+        let mut a = app_with_presets("schema-three");
+        a.receive(fxsound_core::messages::AudioToUi::Devices(mixed_devices()));
+        let json = status(&mut a);
+        assert_eq!(
+            STATUS_SCHEMA, 3,
+            "a new number takes a new list of what it keeps"
+        );
+        let mut printed = std::collections::BTreeSet::new();
+        key_paths(&json, "", &mut printed);
+        let gone: Vec<&&str> = SCHEMA_THREE_KEYS
+            .iter()
+            .filter(|key| !printed.contains(**key))
+            .collect();
+        assert!(
+            gone.is_empty(),
+            "schema 3 printed these and this document does not: {gone:?}"
+        );
     }
 
     #[test]
@@ -1936,7 +2263,7 @@ mod tests {
         a.receive(fxsound_core::messages::AudioToUi::Devices(mixed_devices()));
         let json = status(&mut a);
         assert_eq!(json["schema"].as_u64(), Some(u64::from(STATUS_SCHEMA)));
-        assert_eq!(STATUS_SCHEMA, 2);
+        assert_eq!(STATUS_SCHEMA, 3);
         assert_upstream_shape(&json);
         assert_eq!(
             json["output_devices"].as_array().map(Vec::len),
@@ -4679,5 +5006,324 @@ mod tests {
         assert!(preset.modified, "the band and the effect are edits to it");
         assert_eq!(a.state.eq_bands[0].boost_db, 3.0);
         assert_eq!(a.state.effect(Effect::Bass), 5.0);
+    }
+
+    // ---- «Как в Windows» (A9) ---------------------------------------------------------------
+
+    use fxsound_core::WindowsParity;
+    use fxsound_core::parity::{FULL_NOT_YET, FULL_REFUSAL};
+
+    // Everything's own tests are ignored until W4 (0.6.0) offers it; until then every path
+    // refuses it with `FULL_NOT_YET`.
+
+    #[test]
+    fn everything_is_refused_in_this_version_whatever_is_in_use_and_with_force_too() {
+        let mut a = app();
+        for level in ["interface", "sound"] {
+            let _ = a.drain_events();
+            for line in [
+                vec!["--windows-parity=full"],
+                vec!["--windows-parity=Everything"],
+                vec!["--windows-parity=full", "--force"],
+            ] {
+                let outcome = run_line(&mut a, &line);
+                assert!(outcome.failed, "{line:?}");
+                assert_eq!(outcome.stderr, FULL_NOT_YET, "{line:?}");
+                assert_eq!(a.drain_events(), [], "{line:?}: nothing happened");
+            }
+            assert!(!run_line(&mut a, &[&format!("--windows-parity={level}")]).failed);
+            let outcome = run_line(&mut a, &["--windows-parity=full", "--force"]);
+            assert!(outcome.failed);
+            assert_eq!(a.windows_parity().key(), level, "unchanged");
+            assert_eq!(status(&mut a)["windows_parity"], level);
+        }
+        assert!(FULL_NOT_YET.contains("later version"), "{FULL_NOT_YET}");
+    }
+
+    #[test]
+    fn windows_parity_is_saved_reported_and_said_on_the_stream() {
+        let mut a = app();
+        let _ = a.drain_events();
+        for (option, level) in [
+            ("interface", WindowsParity::Interface),
+            ("SOUND", WindowsParity::Sound),
+            ("off", WindowsParity::Off),
+        ] {
+            let outcome = run_line(&mut a, &[&format!("--windows-parity={option}")]);
+            assert!(!outcome.failed, "{option}: {}", outcome.stderr);
+            assert!(
+                outcome.window.is_empty(),
+                "a set option leaves the window alone"
+            );
+            assert_eq!(a.settings().windows_parity, level);
+            assert_eq!(a.windows_parity(), level);
+            let json = status(&mut a);
+            assert_eq!(json["windows_parity"], level.key(), "{option}");
+            assert_eq!(json["apps_hidden"], level.full(), "{option}");
+            assert_eq!(json["input"]["hidden"], level.full(), "{option}");
+            assert_eq!(line(&status_lines(&mut a), "windows_parity"), level.key());
+            assert_eq!(
+                a.drain_events(),
+                [crate::events::AppEvent::WindowsParity { level }],
+                "{option}"
+            );
+            assert_eq!(a.unsaid_changes(), [], "{option}");
+        }
+        // The same level again says nothing.
+        let outcome = run_line(&mut a, &["--windows-parity=off"]);
+        assert!(!outcome.failed);
+        assert_eq!(a.drain_events(), []);
+    }
+
+    #[test]
+    fn the_status_document_is_schema_3_and_keeps_every_key_of_2() {
+        let mut a = app();
+        let json = status(&mut a);
+        assert_eq!(json["schema"], 3);
+        assert_eq!(json["windows_parity"], "off");
+        assert_eq!(json["apps_hidden"], false);
+        assert_eq!(json["input"]["hidden"], false);
+        // A few of 2's keys, each still there with its kind.
+        assert!(json["power"].is_boolean());
+        assert!(json["input"]["noise_suppression"].is_string());
+        assert!(json["apps"].is_array());
+        assert!(json["output_device_list"].is_array());
+    }
+
+    #[test]
+    #[ignore = "Everything is offered from 0.6.0 (W4)"]
+    fn a_move_to_everything_that_would_take_the_microphone_away_is_refused_without_force() {
+        let mut a = app();
+        devices_arrive(&mut a);
+        run(
+            &mut a,
+            &[Command::Input(InputCommand::Select(
+                "alsa_input.pci".into(),
+            ))],
+        );
+        assert!(a.parity_would_take_away());
+        let _ = a.drain_events();
+
+        let outcome = run_line(&mut a, &["--windows-parity=full"]);
+        assert!(outcome.failed);
+        assert_eq!(outcome.stderr, FULL_REFUSAL);
+        assert_eq!(a.settings().windows_parity, WindowsParity::Off, "unchanged");
+        assert_eq!(a.drain_events(), [], "nothing happened, so nothing is said");
+
+        // Every other level is no such move.
+        for level in ["interface", "sound"] {
+            let outcome = run_line(&mut a, &[&format!("--windows-parity={level}")]);
+            assert!(!outcome.failed, "{level}: {}", outcome.stderr);
+        }
+        let outcome = run_line(&mut a, &["--windows-parity=everything", "--force"]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(a.settings().windows_parity, WindowsParity::Full);
+        // Already there: nothing to refuse. And back down never is.
+        assert!(!run_line(&mut a, &["--windows-parity=full"]).failed);
+        assert!(!run_line(&mut a, &["--windows-parity=off"]).failed);
+        assert_eq!(a.settings().windows_parity, WindowsParity::Off);
+    }
+
+    #[test]
+    #[ignore = "Everything is offered from 0.6.0 (W4)"]
+    fn a_move_to_everything_with_nothing_in_use_goes_ahead_without_force() {
+        let mut a = app();
+        assert!(!a.parity_would_take_away());
+        let outcome = run_line(&mut a, &["--windows-parity=full"]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(a.settings().windows_parity, WindowsParity::Full);
+    }
+
+    #[test]
+    fn a_line_that_is_refused_the_move_to_everything_still_does_the_rest() {
+        // As every refusal on a line: the command is refused, the others are carried out, and
+        // the line fails. Refused for what is in use once Everything is offered; for not being
+        // offered yet until then.
+        let mut a = app();
+        devices_arrive(&mut a);
+        run(
+            &mut a,
+            &[Command::Input(InputCommand::Select(
+                "alsa_input.pci".into(),
+            ))],
+        );
+        let outcome = run_line(&mut a, &["--windows-parity=full", "--balance=3"]);
+        assert!(outcome.failed);
+        assert_eq!(a.settings().windows_parity, WindowsParity::Off);
+        assert_eq!(a.state.balance_db, 3.0);
+    }
+
+    #[test]
+    fn a_line_with_windows_parity_sets_it_before_anything_else_on_it() {
+        let cli = crate::cli::Cli::try_parse_from([
+            "fxsound",
+            "--power=1",
+            "--language=fr",
+            "--windows-parity=sound",
+        ])
+        .expect("parses");
+        assert_eq!(
+            cli.commands().first(),
+            Some(&Command::WindowsParity {
+                level: WindowsParity::Sound,
+                force: false
+            })
+        );
+        assert!(cli.only_sets_things());
+        assert!(
+            cli.cold_start_commands().contains(&Command::WindowsParity {
+                level: WindowsParity::Sound,
+                force: false
+            }),
+            "a start saves it too"
+        );
+    }
+
+    #[test]
+    #[ignore = "Everything is offered from 0.6.0 (W4)"]
+    fn a_move_to_everything_that_would_take_an_applications_preset_away_is_refused_without_force() {
+        let (mut a, engine, _dir) = with_apps();
+        assert!(a.state.device_for(IN).is_none());
+        assert!(!a.parity_would_take_away());
+        play(
+            &mut a,
+            &engine,
+            vec![on_route(
+                7,
+                DeviceDirection::Output,
+                &battlefield(),
+                "Gaming",
+            )],
+        );
+        assert!(a.parity_would_take_away());
+        let outcome = run_line(&mut a, &["--windows-parity=full"]);
+        assert!(outcome.failed);
+        assert_eq!(outcome.stderr, FULL_REFUSAL);
+        assert_eq!(a.windows_parity(), WindowsParity::Off);
+        let outcome = run_line(&mut a, &["--windows-parity=full", "--force"]);
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(a.windows_parity(), WindowsParity::Full);
+    }
+    // ---- «Как в Windows» = Interface: the command line (W3) ------------------------------------
+
+    /// [`run_forwarded`] for `args` as the control socket hands them over from a second `fxsound`.
+    fn forward_line(a: &mut App, args: &[&str]) -> Outcome {
+        let cli =
+            crate::cli::Cli::try_parse_from(std::iter::once("fxsound").chain(args.iter().copied()))
+                .expect("parses");
+        run_forwarded(a, &cli.commands(), cli.raises_like_windows())
+    }
+
+    #[test]
+    fn at_interface_a_forwarded_line_with_an_option_windows_has_raises_the_window() {
+        // 0.4.0 audit R11 at «Как в Windows» = Interface: step 11 of applyConfig raises the
+        // window for every forwarded line (`FxController.cpp:523-531`). At Off it stays down.
+        let mut a = app();
+        assert!(
+            forward_line(&mut a, &["--balance=3"]).window.is_empty(),
+            "Off"
+        );
+        let outcome = forward_line(&mut a, &["--windows-parity=interface", "--balance=3"]);
+        assert!(outcome.window.show, "at the level the line itself sets");
+        for (line, raises) in [
+            (&["--balance=2"][..], true),
+            (&["--set_effect=bass:7"][..], true),
+            (&["--master_gain=-3", "--toggle-power"][..], true),
+            // The keybind options stand in for hotkeys, which raise nothing on Windows either.
+            (&["--toggle-power"][..], false),
+            (&["--next-output"][..], false),
+            (&["--output=off"][..], false),
+            (&["--status"][..], false),
+            (&["--balance=2", "--quit"][..], false),
+        ] {
+            let outcome = forward_line(&mut a, line);
+            assert_eq!(
+                outcome.window.show, raises,
+                "{line:?}: {:?}",
+                outcome.window
+            );
+        }
+        assert!(
+            forward_line(&mut a, &["--hide", "--balance=2"]).window.hide
+                && !forward_line(&mut a, &["--hide", "--balance=2"]).window.show,
+            "a line that says what the window does is taken at its word"
+        );
+        // D-Bus never raises it: its calls come from keybinds and status bars.
+        let commands = crate::dbus::apply_commands(&["--balance=2".to_owned()]).expect("parses");
+        assert!(run_forwarded(&mut a, &commands, false).window.is_empty());
+        let outcome = forward_line(&mut a, &["--windows-parity=off", "--balance=2"]);
+        assert!(outcome.window.is_empty(), "back at Off, quiet again");
+    }
+
+    #[test]
+    fn at_interface_a_band_list_sets_the_pairs_that_fit_and_skips_the_rest() {
+        // 0.4.0 audit #51 at «Как в Windows» = Interface, as the approved contract words it:
+        // apply the valid pairs, skip the rest. At Off the whole list is refused (above).
+        let mut a = app();
+        a.set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        assert_eq!(a.state.eq_bands.len(), 10);
+        let outcome = run(
+            &mut a,
+            &[Command::BandGains(vec![(3, 4.0), (12, 2.0), (30, 6.0)])],
+        );
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(a.state.eq_bands[3].boost_db, 4.0);
+        assert_eq!(
+            outcome.stderr,
+            "note: --set_band_gain: on 10 bands, band 12, band 30 skipped and the rest set"
+        );
+
+        let centre = a.state.eq_bands[0].center_hz;
+        let outcome = run(
+            &mut a,
+            &[Command::BandFrequencies(vec![
+                (9, 20_000.0),
+                (0, 10_000.0),
+                (10, 900.0),
+            ])],
+        );
+        assert!(!outcome.failed, "{}", outcome.stderr);
+        assert_eq!(a.state.eq_bands[9].center_hz, 20_000.0);
+        assert_eq!(a.state.eq_bands[0].center_hz, centre, "out of its range");
+        assert_eq!(
+            outcome.stderr,
+            "note: --set_band_freq: on 10 bands, band 0 at 10000 Hz, band 10 skipped and the rest \
+             set"
+        );
+
+        let outcome = run(&mut a, &[Command::BandGains(vec![(9, -2.0)])]);
+        assert!(
+            !outcome.failed && outcome.stderr.is_empty(),
+            "a list that fits says nothing: {}",
+            outcome.stderr
+        );
+        assert_eq!(a.state.eq_bands[9].boost_db, -2.0);
+    }
+
+    #[test]
+    fn at_interface_save_preset_on_a_preset_with_no_unsaved_changes_is_refused_as_on_windows() {
+        // 0.4.0 audit #17 at «Как в Windows» = Interface: `--save_preset` saves only unsaved
+        // changes (`FxController.cpp:405-411`). At Off it saves a copy (above).
+        let tag = "save-no-copy-at-interface";
+        let mut a = app_with_presets(tag);
+        let user = a.user_dir();
+        run(&mut a, &[preset(PresetCommand::Select("Alpha".into()))]);
+        a.set_windows_parity(WindowsParity::Interface, false)
+            .expect("offered");
+        let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("Copy".into()))]);
+        assert!(outcome.failed, "a script has to be able to tell");
+        assert!(
+            outcome.stderr.contains("no unsaved changes")
+                && outcome.stderr.contains("--windows-parity=off"),
+            "{}",
+            outcome.stderr
+        );
+        assert!(!user.join("Copy.fac").exists(), "nothing was written");
+
+        run(&mut a, &[Command::BandGains(vec![(0, 3.0)])]);
+        let outcome = run(&mut a, &[preset(PresetCommand::SaveAs("Copy".into()))]);
+        assert!(!outcome.failed, "with changes it saves: {}", outcome.stderr);
+        assert!(user.join("Copy.fac").is_file());
     }
 }

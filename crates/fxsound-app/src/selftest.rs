@@ -583,11 +583,16 @@ fn status_icons() -> Vec<String> {
     .collect()
 }
 
-/// The application icon `Icon=fxsound` names, at the two sizes every package installs.
+/// The application icon at the two sizes every package installs, under both of its names: the
+/// `fxsound` that `Icon=` names, and the application id every notification is sent with.
 fn app_icons() -> Vec<String> {
-    ["256x256", "32x32"]
+    ["fxsound", crate::tray::APP_ID]
         .iter()
-        .map(|size| format!("share/icons/hicolor/{size}/apps/fxsound.png"))
+        .flat_map(|name| {
+            ["256x256", "32x32"]
+                .iter()
+                .map(move |size| format!("share/icons/hicolor/{size}/apps/{name}.png"))
+        })
         .collect()
 }
 
@@ -1166,6 +1171,24 @@ pub(crate) mod tests {
             icons.detail
         );
         assert_eq!(check(&report, "app_icons").status, Status::Ok);
+    }
+
+    #[test]
+    fn an_application_icon_missing_under_the_application_id_is_named() {
+        let (tmp, env) = installed();
+        let by_id = app_icons()
+            .into_iter()
+            .find(|icon| icon.contains("32x32/apps/com.fxsound.FxSound.png"))
+            .expect("the 32x32 icon under the application id is checked");
+        fs::remove_file(tmp.path().join(&by_id)).expect("remove");
+        let report = run(&env);
+        let icons = check(&report, "app_icons");
+        assert_eq!(icons.status, Status::Fail);
+        assert!(
+            icons.detail.contains("com.fxsound.FxSound.png"),
+            "{}",
+            icons.detail
+        );
     }
 
     #[test]

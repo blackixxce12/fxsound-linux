@@ -15,12 +15,16 @@ pub mod apps;
 pub mod atomic;
 pub mod i18n;
 pub mod messages;
+pub mod parity;
 pub mod settings;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
 pub use apps::{AppKey, AppPreset, AppRule, AppRules, MAX_ROUTES_PER_LANE};
-pub use messages::{AppRoute, AppStream, AudioToUi, RouteParams, TargetVolume, UiToAudio};
+pub use messages::{
+    AppRoute, AppStream, AudioToUi, DspCompat, RouteParams, TargetVolume, UiToAudio,
+};
+pub use parity::{LaterFeature, ParityClass, WindowsLook, WindowsParity};
 pub use settings::{Settings, ThemeMode, ViewMode};
 
 /// The five user-facing effects, in the order the GUI lays them out.
@@ -199,27 +203,45 @@ pub mod scale {
     /// positions 1, 2 and 3 (stored 13, 25, 38) played at −73, −51 and −45 dBFS against −31 at
     /// position 4. So the slider's first position is 39 and its ten positions are spread from
     /// there to 127, as Dynamic Boost's are spread below its dead top.
+    ///
+    /// FxSound for Linux's mapping. At «Like FxSound for Windows» = Interface and sound the
+    /// Windows build's straight line comes back with the Windows stage ([`slider_to_value_in`]).
     pub const AMBIENCE_FIRST_AUDIBLE_MIDI: u8 = 39;
 
-    /// Slider position to engine value, for one effect.
+    /// Slider position to engine value, for one effect, as FxSound for Linux maps it:
+    /// [`slider_to_value_in`] with [`DspCompat::Linux`](crate::DspCompat::Linux).
+    #[inline]
+    #[must_use]
+    pub fn slider_to_value_for(effect: crate::Effect, slider: f32) -> f32 {
+        slider_to_value_in(crate::DspCompat::Linux, effect, slider)
+    }
+
+    /// Slider position to engine value, for one effect, in the DSP `compat` plays.
     ///
     /// Identical to [`slider_to_value`] for three of the five. The other two spread their eleven
     /// positions over the stored values that sound different, so that every position is a
     /// different sound rather than several of them being the same one:
     ///
-    /// - **Dynamic Boost** over `0..=DYNAMIC_BOOST_MAX_MIDI`, below its dead top.
-    /// - **Ambience** (audit report #39): position 0 is off, positions 1 to 10 run from
-    ///   [`AMBIENCE_FIRST_AUDIBLE_MIDI`] to 127, and a position between 0 and 1 — which only a
-    ///   stored value can give — reads straight from 0 to 39, so a Windows preset storing 13..38,
-    ///   all but silent, shows below position 1 where it sounds.
+    /// - **Dynamic Boost** over `0..=DYNAMIC_BOOST_MAX_MIDI`, below its dead top, whatever
+    ///   `compat` says: the Windows build's slider walks into the dead top, and nothing but the
+    ///   position a value shows at changes by keeping it out.
+    /// - **Ambience** (audit report #39), in FxSound for Linux: position 0 is off, positions 1 to
+    ///   10 run from [`AMBIENCE_FIRST_AUDIBLE_MIDI`] to 127, and a position between 0 and 1 — which
+    ///   only a stored value can give — reads straight from 0 to 39, so a Windows preset storing
+    ///   13..38, all but silent, shows below position 1 where it sounds. At «Like FxSound for
+    ///   Windows» = Interface and sound ([`DspCompat::Windows`](crate::DspCompat::Windows)) the
+    ///   Windows build's straight line comes back with its stage (`FxAudioControls.cpp:113`
+    ///   sets every effect slider to `0..10` in whole steps, and the path to MIDI is linear):
+    ///   positions 1, 2 and 3 store 13, 25 and 38 again, which that stage plays as the Windows
+    ///   build does.
     ///
-    /// **This changes no preset and no sound.** The mapping from a *stored* value to a gain is
-    /// untouched, so every `.fac` — this port's, and any imported from Windows — produces exactly
-    /// the sound it always did. What changes is only which value the application writes when a
-    /// user moves one of these sliders, and the positions it shows a stored value at.
+    /// **The mapping changes no preset.** The mapping from a *stored* value to a gain is the
+    /// stage's, so every `.fac` — this port's, and any imported from Windows — is read as it
+    /// is. What changes is only which value the application writes when a user moves one of
+    /// these sliders, and the positions it shows a stored value at.
     #[inline]
     #[must_use]
-    pub fn slider_to_value_for(effect: crate::Effect, slider: f32) -> f32 {
+    pub fn slider_to_value_in(compat: crate::DspCompat, effect: crate::Effect, slider: f32) -> f32 {
         let slider = if slider.is_nan() {
             0.0
         } else {
@@ -230,7 +252,7 @@ pub mod scale {
                 let top = f32::from(DYNAMIC_BOOST_MAX_MIDI) / f32::from(MIDI_MAX);
                 slider / SLIDER_MAX * top
             }
-            crate::Effect::Ambience => {
+            crate::Effect::Ambience if !compat.windows() => {
                 let first = f32::from(AMBIENCE_FIRST_AUDIBLE_MIDI);
                 let midi = if slider <= 1.0 {
                     slider * first
@@ -248,6 +270,13 @@ pub mod scale {
     #[inline]
     #[must_use]
     pub fn value_to_slider_for(effect: crate::Effect, value: f32) -> f32 {
+        value_to_slider_in(crate::DspCompat::Linux, effect, value)
+    }
+
+    /// The inverse of [`slider_to_value_in`].
+    #[inline]
+    #[must_use]
+    pub fn value_to_slider_in(compat: crate::DspCompat, effect: crate::Effect, value: f32) -> f32 {
         let value = if value.is_nan() {
             0.0
         } else {
@@ -258,7 +287,7 @@ pub mod scale {
                 let top = f32::from(DYNAMIC_BOOST_MAX_MIDI) / f32::from(MIDI_MAX);
                 (value / top * SLIDER_MAX).min(SLIDER_MAX)
             }
-            crate::Effect::Ambience => {
+            crate::Effect::Ambience if !compat.windows() => {
                 let first = f32::from(AMBIENCE_FIRST_AUDIBLE_MIDI);
                 let midi = value * f32::from(MIDI_MAX);
                 let slider = if midi <= first {
@@ -276,14 +305,28 @@ pub mod scale {
     #[inline]
     #[must_use]
     pub fn slider_to_midi_for(effect: crate::Effect, slider: f32) -> u8 {
-        value_to_midi(slider_to_value_for(effect, slider))
+        slider_to_midi_in(crate::DspCompat::Linux, effect, slider)
+    }
+
+    /// [`slider_to_midi_for`] in the DSP `compat` plays ([`slider_to_value_in`]).
+    #[inline]
+    #[must_use]
+    pub fn slider_to_midi_in(compat: crate::DspCompat, effect: crate::Effect, slider: f32) -> u8 {
+        value_to_midi(slider_to_value_in(compat, effect, slider))
     }
 
     /// The slider position a stored value of `effect` shows at.
     #[inline]
     #[must_use]
     pub fn midi_to_slider_for(effect: crate::Effect, midi: u8) -> f32 {
-        value_to_slider_for(effect, midi_to_value(midi))
+        midi_to_slider_in(crate::DspCompat::Linux, effect, midi)
+    }
+
+    /// [`midi_to_slider_for`] in the DSP `compat` plays ([`value_to_slider_in`]).
+    #[inline]
+    #[must_use]
+    pub fn midi_to_slider_in(compat: crate::DspCompat, effect: crate::Effect, midi: u8) -> f32 {
+        value_to_slider_in(compat, effect, midi_to_value(midi))
     }
 
     /// The whole position `slider` saves as the same value as, if there is one: what the slider
@@ -296,8 +339,19 @@ pub mod scale {
     /// a position (2) that would save as something else (25).
     #[must_use]
     pub fn whole_position_for(effect: crate::Effect, slider: f32) -> Option<f32> {
+        whole_position_in(crate::DspCompat::Linux, effect, slider)
+    }
+
+    /// [`whole_position_for`] in the DSP `compat` plays.
+    #[must_use]
+    pub fn whole_position_in(
+        compat: crate::DspCompat,
+        effect: crate::Effect,
+        slider: f32,
+    ) -> Option<f32> {
         let whole = slider.round().clamp(0.0, SLIDER_MAX);
-        (slider_to_midi_for(effect, whole) == slider_to_midi_for(effect, slider)).then_some(whole)
+        (slider_to_midi_in(compat, effect, whole) == slider_to_midi_in(compat, effect, slider))
+            .then_some(whole)
     }
 
     /// The slider position of the stored value one step from `slider`, up or down: the fine step
@@ -306,15 +360,26 @@ pub mod scale {
     /// position stays where it is.
     #[must_use]
     pub fn stored_step_for(effect: crate::Effect, slider: f32, up: bool) -> f32 {
-        let here = midi_to_slider_for(effect, slider_to_midi_for(effect, slider));
-        let mut midi = slider_to_midi_for(effect, slider);
+        stored_step_in(crate::DspCompat::Linux, effect, slider, up)
+    }
+
+    /// [`stored_step_for`] in the DSP `compat` plays.
+    #[must_use]
+    pub fn stored_step_in(
+        compat: crate::DspCompat,
+        effect: crate::Effect,
+        slider: f32,
+        up: bool,
+    ) -> f32 {
+        let here = midi_to_slider_in(compat, effect, slider_to_midi_in(compat, effect, slider));
+        let mut midi = slider_to_midi_in(compat, effect, slider);
         loop {
             midi = match (up, midi) {
                 (true, MIDI_MAX) | (false, MIDI_MIN) => return here,
                 (true, m) => m + 1,
                 (false, m) => m - 1,
             };
-            let there = midi_to_slider_for(effect, midi);
+            let there = midi_to_slider_in(compat, effect, midi);
             if (up && there > here) || (!up && there < here) {
                 return there;
             }
@@ -326,7 +391,18 @@ pub mod scale {
     #[inline]
     #[must_use]
     pub fn nearest_stored_position_for(effect: crate::Effect, slider: f32) -> f32 {
-        midi_to_slider_for(effect, slider_to_midi_for(effect, slider))
+        nearest_stored_position_in(crate::DspCompat::Linux, effect, slider)
+    }
+
+    /// [`nearest_stored_position_for`] in the DSP `compat` plays.
+    #[inline]
+    #[must_use]
+    pub fn nearest_stored_position_in(
+        compat: crate::DspCompat,
+        effect: crate::Effect,
+        slider: f32,
+    ) -> f32 {
+        midi_to_slider_in(compat, effect, slider_to_midi_in(compat, effect, slider))
     }
 
     /// The effect slider's readout: a whole number at a whole position, and one decimal
@@ -334,7 +410,13 @@ pub mod scale {
     /// (audit report #14).
     #[must_use]
     pub fn slider_label_for(effect: crate::Effect, slider: f32) -> String {
-        match whole_position_for(effect, slider) {
+        slider_label_in(crate::DspCompat::Linux, effect, slider)
+    }
+
+    /// [`slider_label_for`] in the DSP `compat` plays.
+    #[must_use]
+    pub fn slider_label_in(compat: crate::DspCompat, effect: crate::Effect, slider: f32) -> String {
+        match whole_position_in(compat, effect, slider) {
             Some(whole) => format!("{whole:.0}"),
             None => format!("{slider:.1}"),
         }
@@ -561,6 +643,23 @@ pub mod eq {
         }
     }
 
+    /// Move a twenty-band curve onto the twenty-band ladder of the DSP `compat` plays, band for
+    /// band, and say whether it moved: off the Windows ladder for FxSound for Linux
+    /// ([`move_off_the_windows_twenty_band_ladder`]), onto it at «Like FxSound for Windows» =
+    /// Interface and sound ([`move_onto_the_windows_twenty_band_ladder`], audit report R4 taken
+    /// back). The gains stay on their bands, so a curve taken to one ladder and back is the curve
+    /// it was, bit for bit; a curve on neither ladder, or of another count, is left alone.
+    pub fn move_to_the_twenty_band_ladder_of(
+        bands: &mut [EqBand],
+        compat: crate::DspCompat,
+    ) -> bool {
+        if compat.windows() {
+            move_onto_the_windows_twenty_band_ladder(bands)
+        } else {
+            move_off_the_windows_twenty_band_ladder(bands)
+        }
+    }
+
     /// The lowest centre a band can be tuned to: the command line's floor, and where the design
     /// stops narrowing a low band's Q (`fxsound_dsp::biquad::calc_parametric`, rule A).
     pub const TUNING_FLOOR_HZ: f32 = 20.0;
@@ -579,6 +678,27 @@ pub mod eq {
             20 => Some((20.0, 16_000.0)),
             31 => Some((20.0, 20_000.0)),
             _ => None,
+        }
+    }
+
+    /// The edges every band count is laid out and designed between: its table's
+    /// ([`ladder_edges_hz`]), or for a count with no table — only a microphone preset made by hand
+    /// or a `num_bands` edited in `settings.toml` has one, since a `.fac` is fitted onto the
+    /// window's count — the ten-band table's, which a new equalizer starts with.
+    ///
+    /// The Windows engine keeps whatever edges the last table count left for such a count
+    /// (`GraphicEqSet.cpp:495-508`), so the same preset got another Q after a 31-band preset than
+    /// after a ten-band one, and the window, which works out its curve on a new equalizer, drew
+    /// only the second. One pair for the engine's ladder and Q (`fxsound_dsp::eq::GraphicEq`) and
+    /// the curve drawn from it, so what is drawn is what plays, whatever came before. The ten-band
+    /// edges sit inside every table's, so a curve carried to or from such a count by frequency
+    /// never reads past a table's ends. The wheels still tune such a count across the whole span
+    /// ([`band_frequency_range`]).
+    #[must_use]
+    pub const fn band_edges_hz(num_bands: usize) -> (f32, f32) {
+        match ladder_edges_hz(num_bands) {
+            Some(edges) => edges,
+            None => (62.5, 16_000.0),
         }
     }
 
@@ -698,6 +818,30 @@ pub mod eq {
         {
             last.center_hz = max_hz;
             moved = true;
+        }
+        moved
+    }
+
+    /// The lowest centre the equalizer designs a band at (`GraphicEqSet.cpp:555-559`,
+    /// `fxsound_dsp::eq::MIN_BAND_FREQ_HZ`): a band below it is played there.
+    pub const BAND_FLOOR_HZ: f32 = 10.0;
+    /// The highest (`fxsound_dsp::eq::MAX_BAND_FREQ_HZ`).
+    pub const BAND_CEILING_HZ: f32 = 21_000.0;
+
+    /// Keep every centre of a curve inside the equalizer's own window, [`BAND_FLOOR_HZ`] to
+    /// [`BAND_CEILING_HZ`], and say whether any moved: the one limit a `.fac` exported with its
+    /// end bands as they are is held to («Like FxSound for Windows» = Interface and sound, the
+    /// export window's choice against [`move_end_bands_back_inside_the_ladder`]). A centre inside
+    /// it stays as it is, a band at a centre the equalizer would not design is written where it is
+    /// played, and a centre that is not a number is left alone.
+    pub fn keep_centres_inside_the_equalizer(bands: &mut [EqBand]) -> bool {
+        let mut moved = false;
+        for band in bands {
+            let inside = band.center_hz.clamp(BAND_FLOOR_HZ, BAND_CEILING_HZ);
+            if inside != band.center_hz && !band.center_hz.is_nan() {
+                band.center_hz = inside;
+                moved = true;
+            }
         }
         moved
     }
@@ -1484,6 +1628,68 @@ mod tests {
         assert_eq!(scale::midi_to_slider_for(Effect::Ambience, 39), 1.0);
         let at_64 = scale::midi_to_slider_for(Effect::Ambience, 64);
         assert!((at_64 - 3.557).abs() < 0.01, "{at_64}");
+    }
+
+    #[test]
+    fn at_interface_and_sound_ambiences_positions_are_the_windows_builds_straight_line() {
+        // Audit report #39 at «Like FxSound for Windows» = Interface and sound: the slider's
+        // mapping comes back with the stage, so positions 1-3 store 13, 25 and 38 again, as
+        // `FxAudioControls.cpp:113`'s 0..10 slider does.
+        let windows = DspCompat::Windows;
+        let saved: Vec<u8> = (0..=10)
+            .map(|p| scale::slider_to_midi_in(windows, Effect::Ambience, p as f32))
+            .collect();
+        assert_eq!(saved, [0, 13, 25, 38, 51, 64, 76, 89, 102, 114, 127]);
+        let at_39 = scale::midi_to_slider_in(windows, Effect::Ambience, 39);
+        assert!((at_39 - 3.071).abs() < 0.001, "{at_39}");
+        assert_eq!(scale::slider_label_in(windows, Effect::Ambience, 1.0), "1");
+        // FxSound for Linux's is untouched, and so is every other effect's.
+        for effect in Effect::ALL {
+            for tenth in 0..=100 {
+                let slider = tenth as f32 / 10.0;
+                assert_eq!(
+                    scale::slider_to_value_in(DspCompat::Linux, effect, slider),
+                    scale::slider_to_value_for(effect, slider),
+                    "{effect:?} at {slider}"
+                );
+                if effect != Effect::Ambience {
+                    assert_eq!(
+                        scale::slider_to_value_in(windows, effect, slider),
+                        scale::slider_to_value_for(effect, slider),
+                        "{effect:?} at {slider}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn at_interface_and_sound_every_stored_value_comes_back_and_is_one_fine_step_from_the_next() {
+        let windows = DspCompat::Windows;
+        for effect in Effect::ALL {
+            let top = if effect == Effect::DynamicBoost {
+                scale::DYNAMIC_BOOST_MAX_MIDI
+            } else {
+                scale::MIDI_MAX
+            };
+            for midi in 0..=top {
+                let shown = scale::midi_to_slider_in(windows, effect, midi);
+                assert_eq!(
+                    scale::slider_to_midi_in(windows, effect, shown),
+                    midi,
+                    "{effect:?}: {midi} shows at {shown}"
+                );
+            }
+            let mut slider = 0.0;
+            for midi in 1..=top {
+                slider = scale::stored_step_in(windows, effect, slider, true);
+                assert_eq!(scale::slider_to_midi_in(windows, effect, slider), midi);
+                assert_eq!(
+                    scale::nearest_stored_position_in(windows, effect, slider),
+                    slider
+                );
+            }
+        }
     }
 
     #[test]

@@ -8,7 +8,11 @@ good, and is it better than doing nothing at all.**
 
 Nothing here touches Rust. It is four shell scripts around
 `crates/fxsound-dsp/examples/process_wav.rs`, which already renders a WAV through
-the real `Engine` with a `.fac` preset and needs no new flags for this.
+the real `Engine` with a `.fac` preset and needs no new flags for this. It plays
+the preset as the application does (`fxsound_dsp::preset::preset_params`): the
+effects through the sliders, the curve on ten bands unless `--bands` says
+otherwise, the settings' default levels. So what is judged here is what the
+application plays, not the raw values of the file.
 
 ## The question it asks
 
@@ -197,20 +201,21 @@ so it is inaudible on a switch and the dry anchor is left bit-exact. Set
 The same three-way test answers a different question when "old" and "new" are the
 same preset rendered by two builds of the engine — "did this engine change make
 the preset worse?" rather than "did this revoicing". Build `process_wav` from the
-older commit into a directory of its own, point `FXSV_OLD_PROCESS_WAV` at it, and
+older commit, in a checkout `scripts/reference-checkout.sh --with-process-wav`
+prepares — it gives a commit older than 0.5.0 this checkout's `process_wav` and
+that commit's own application's reading of a preset, so both sides play a preset
+as their application did — point `FXSV_OLD_PROCESS_WAV` at it, and
 give both sides the same `.fac`: a file already in `presets-old/` wins over git,
 so copying the current presets there makes "old" and "new" differ only in the
 engine. `FXSV_WORK` keeps the run apart from a revoicing session's votes.
 
 ```sh
-# from the repository root
-git worktree add --detach /tmp/fxsound-before <commit>
-(cd /tmp/fxsound-before && cargo build --release -p fxsound-dsp --example process_wav \
-    --target-dir /tmp/fxsound-before-bin)
-git worktree remove /tmp/fxsound-before
+# from the repository root; keep the checkout off /tmp, a release build does not fit a tmpfs
+scripts/reference-checkout.sh --with-process-wav <commit> ../fxsound-before
+(cd ../fxsound-before && cargo build --release -p fxsound-dsp --example process_wav)
 
 export FXSV_WORK="$PWD/target/voicing-engine"
-export FXSV_OLD_PROCESS_WAV=/tmp/fxsound-before-bin/release/examples/process_wav
+export FXSV_OLD_PROCESS_WAV="$(cd ../fxsound-before && pwd)/target/release/examples/process_wav"
 export FXSV_NEW_PRESETS="$FXSV_WORK/presets-new"
 mkdir -p "$FXSV_WORK/presets-old" "$FXSV_NEW_PRESETS" "$FXSV_WORK/material"
 cp assets/presets/BonusPresets/*.fac "$FXSV_NEW_PRESETS/"
@@ -228,6 +233,27 @@ scripts/voicing/vote.sh --genre Movies
 In the tally, `old` is the older engine and `new` the current one; `dry` still
 means the untouched excerpt beat both. `crates/fxsound-dsp/tests/preset_drift.rs`
 is the measuring half of the same question.
+
+The same set-up compares «Like FxSound for Windows» = Interface and sound with Off
+in one build: `process_wav --compat windows` plays a preset through the Windows
+build's DSP and reads it as the Windows build does (a curve of another band
+count by position, twenty bands on the Windows ladder), as that level does.
+Point `FXSV_OLD_PROCESS_WAV` at a wrapper that adds it, and `old` is the Windows
+sound:
+
+```sh
+cat > "$FXSV_WORK/windows-dsp" <<SH
+#!/bin/sh
+exec "$PWD/target/release/examples/process_wav" "\$@" --compat windows
+SH
+chmod +x "$FXSV_WORK/windows-dsp"
+export FXSV_OLD_PROCESS_WAV="$FXSV_WORK/windows-dsp"
+```
+
+The measuring half takes the same choice: `PRESET_DRIFT_COMPAT=windows` renders
+every shipped preset through the Windows build's DSP, and set beside a run at Off
+(`PRESET_DRIFT_BEFORE`) prints what the level changes, preset by preset
+(`crates/fxsound-dsp/tests/preset_drift.rs`).
 
 ## Files
 

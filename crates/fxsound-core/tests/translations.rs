@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use fxsound_core::i18n::{Catalogue, LANGUAGES};
 use fxsound_core::{
     DeEsserMode, DenoiseChannelMode, DenoiseChannelsOverride, DenoiseLevel, DereverbLevel,
-    DeviceDirection, Effect, NoiseSuppressionOverride,
+    DeviceDirection, Effect, NoiseSuppressionOverride, WindowsParity,
 };
 
 /// The crates that draw text, relative to this one. Everything else passes strings *to* them.
@@ -46,7 +46,14 @@ const INDIRECT_CALLS: &[(&str, &[&str])] = &[
     // `SettingsTab::nav_label` and `pane_title` in `dialogs/settings.rs`.
     (
         "tab.nav_label()",
-        &["Audio", "General", "Help", "Microphone", "Applications"],
+        &[
+            "Audio",
+            "General",
+            "Help",
+            "Microphone",
+            "Applications",
+            "Experimental",
+        ],
     ),
     (
         "self.state.tab.pane_title()",
@@ -56,6 +63,7 @@ const INDIRECT_CALLS: &[(&str, &[&str])] = &[
             "Help",
             "Microphone",
             "Applications",
+            "Experimental",
         ],
     ),
     // `HotkeyCommand::label` in `dialogs/settings.rs`.
@@ -83,6 +91,22 @@ const INDIRECT_CALLS: &[(&str, &[&str])] = &[
     ("self.denoise.label()", &[]),
     ("effect.label()", &[]),
     ("effect.tooltip()", &[]),
+    // The Experimental pane's positions and hint (`WindowsParity::label` and `hint`).
+    ("shown.hint()", &[]),
+    ("shown.label()", &[]),
+    ("level.label()", &[]),
+    // The line under "Smooth moves in WirePlumber" (`WirePlumberHook::line` in
+    // `dialogs/settings.rs`).
+    (
+        "hook.line()",
+        &[
+            "Fades the sound WirePlumber moves, as when the desktop picks another device. Changes \
+             WirePlumber's settings.",
+            "Needs WirePlumber 0.5 or newer.",
+            "WirePlumber takes the change when it restarts.",
+            "WirePlumber could not be restarted here. It takes the change at your next login.",
+        ],
+    ),
     // The import window's notice in `dialogs/presets.rs`, which the app files under its English
     // key (`fxsound-app/src/app.rs`, `handle_import`).
     (
@@ -410,7 +434,7 @@ fn calls_to_tr(
     anywhere: &BTreeMap<String, Vec<String>>,
 ) -> Vec<Argument> {
     let mut found = Vec::new();
-    for call in ["tr(", "tr_args("] {
+    for call in ["tr(", "tr_args(", "tr_breakable("] {
         let mut from = 0;
         while let Some(at) = src[from..].find(call) {
             let start = from + at;
@@ -561,6 +585,8 @@ fn core_labels() -> BTreeSet<&'static str> {
     keys.extend(DeviceDirection::ALL.iter().map(|v| v.label()));
     keys.extend(Effect::ALL.iter().map(|e| e.label()));
     keys.extend(Effect::ALL.iter().map(|e| e.tooltip()));
+    keys.extend(WindowsParity::ALL.iter().map(|level| level.label()));
+    keys.extend(WindowsParity::ALL.iter().map(|level| level.hint()));
     keys
 }
 
@@ -855,9 +881,10 @@ fn a_string_that_ends_in_a_space_keeps_the_space_in_every_language() {
 
 /// Strings some language writes exactly as English does: audio terms its engineers borrow
 /// (`Gate`, `De-esser`, `Mono`), words the two languages share (Dutch `Help`, Spanish `No`,
-/// Romanian `General`, the German, French and Spanish `Balance`), and the effect names the Polish
-/// original keeps as FxSound's own. Any other string a table translates as itself is a string
-/// nobody translated.
+/// Romanian `General`, the German, French and Spanish `Balance`, the Spanish, Portuguese and
+/// Romanian `Experimental`, the French, Dutch and Portuguese `Interface`), and the effect names
+/// the Polish original keeps as FxSound's own. Any other string a table translates as itself is a
+/// string nobody translated.
 const SPELLED_AS_IN_ENGLISH: &[&str] = &[
     "Ambience",
     "Applications",
@@ -870,6 +897,7 @@ const SPELLED_AS_IN_ENGLISH: &[&str] = &[
     "De-esser",
     "Dynamic Boost",
     "Echo",
+    "Experimental",
     "Export",
     "Filter Q",
     "FxSound is %s.",
@@ -879,6 +907,7 @@ const SPELLED_AS_IN_ENGLISH: &[&str] = &[
     "Help",
     "Import",
     "Independent",
+    "Interface",
     "Menu",
     "Microphone",
     "Mono",
@@ -938,6 +967,63 @@ fn the_level_labels_do_not_borrow_the_theme_switchs_word() {
     // The socket and D-Bus spelling is untouched by the label.
     assert_eq!(DenoiseLevel::Light.key(), "light");
     assert_eq!(DenoiseLevel::from_key("light"), Some(DenoiseLevel::Light));
+}
+
+/// Strings the interface shows side by side, or that name two different things, and so must not
+/// read alike in any language. Each group is checked pair by pair.
+const TOLD_APART: &[(&str, &[&str])] = &[
+    // Settings ▸ General's hotkey list, one line per command.
+    (
+        "the hotkey list",
+        &[
+            "Turn FxSound On/Off",
+            "Open/Close FxSound",
+            "Use Next Preset",
+            "Use Previous Preset",
+            "Change Playback Device",
+        ],
+    ),
+    // The tray menu (`tray.rs`), top level.
+    (
+        "the tray menu",
+        &[
+            "Open",
+            "Turn Off",
+            "Turn On",
+            "Output Presets",
+            "Input Presets",
+            "Playback Device Select",
+            "Recording Device Select",
+            "Settings",
+            "Theme",
+            "Exit",
+        ],
+    ),
+];
+
+#[test]
+fn no_table_gives_two_strings_shown_side_by_side_the_same_words() {
+    // Simplified and Traditional Chinese wrote 开启/关闭 FxSound for both the power and the window
+    // in the hotkey list; the port's layer repairs both, and this keeps any table from doing it
+    // again.
+    let tables = tables();
+    let mut alike = Vec::new();
+    for (what, keys) in TOLD_APART {
+        for table in &tables {
+            for (i, a) in keys.iter().enumerate() {
+                for b in &keys[i + 1..] {
+                    let (ta, tb) = (table.get(a).unwrap_or(a), table.get(b).unwrap_or(b));
+                    if ta.trim() == tb.trim() {
+                        alike.push(format!(
+                            "{}: {what}: {a:?} and {b:?} both read {ta:?}",
+                            table.code()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(alike.is_empty(), "{}", alike.join("\n"));
 }
 
 #[test]

@@ -428,6 +428,7 @@ fn status_from_application(tx: WakingSender<Forwarded>, closing: Closing) -> Sta
             &closing,
             vec![Command::Status { json: true }],
             "/".into(),
+            false,
         );
         if !response.ok {
             return None;
@@ -468,8 +469,16 @@ fn hand_over(
     closing: &Closing,
     commands: Vec<Command>,
     cwd: PathBuf,
+    raises_like_windows: bool,
 ) -> Response {
-    hand_over_within(tx, closing, commands, cwd, HANDLER_TIMEOUT)
+    hand_over_within(
+        tx,
+        closing,
+        commands,
+        cwd,
+        raises_like_windows,
+        HANDLER_TIMEOUT,
+    )
 }
 
 /// [`hand_over`], waiting `timeout` for the answer.
@@ -478,6 +487,7 @@ fn hand_over_within(
     closing: &Closing,
     commands: Vec<Command>,
     cwd: PathBuf,
+    raises_like_windows: bool,
     timeout: Duration,
 ) -> Response {
     if closing.is_set() {
@@ -487,7 +497,8 @@ fn hand_over_within(
     let forwarded = Forwarded::new(commands, cwd, move |response| {
         let _ = reply_tx.send(response);
     })
-    .closing_with(closing.clone());
+    .closing_with(closing.clone())
+    .raising_like_windows(raises_like_windows);
     let abandoned = Arc::clone(&forwarded.abandoned);
     if tx.try_send(forwarded).is_err() {
         return Response::failed(SHUTTING_DOWN);
@@ -662,6 +673,10 @@ pub struct Forwarded {
     abandoned: Arc<AtomicBool>,
     /// The server's [`Closing`], for a command handed over through it.
     closing: Option<Closing>,
+    /// Whether the line is one the Windows build raises its window for
+    /// ([`crate::cli::Cli::raises_like_windows`]): a second `fxsound` on the socket says, D-Bus
+    /// never does.
+    raises_like_windows: bool,
 }
 
 /// Where a [`Forwarded`]'s answer goes: a channel back to a connection thread, or a D-Bus call's
@@ -687,7 +702,24 @@ impl Forwarded {
             reply: Some(Box::new(reply)),
             abandoned: Arc::new(AtomicBool::new(false)),
             closing: None,
+            raises_like_windows: false,
         }
+    }
+
+    /// Mark the line as one the Windows build raises its window for, as
+    /// [`crate::cli::Cli::raises_like_windows`] says: at «Как в Windows» = Interface and above the
+    /// GUI thread raises the window for it (`crate::commands::run_forwarded`).
+    #[must_use]
+    pub const fn raising_like_windows(mut self, raises: bool) -> Self {
+        self.raises_like_windows = raises;
+        self
+    }
+
+    /// Whether the line is one the Windows build raises its window for
+    /// ([`Forwarded::raising_like_windows`]); never for a D-Bus call.
+    #[must_use]
+    pub const fn raises_like_windows(&self) -> bool {
+        self.raises_like_windows
     }
 
     /// Answer [`SHUTTING_DOWN`] instead of `ok` when dropped unanswered after `closing` is set:
@@ -1374,7 +1406,13 @@ fn dispatch(request: Request, tx: &WakingSender<Forwarded>, closing: &Closing) -
         Ok(cli) => cli,
         Err(e) => return Response::failed(e.render().to_string()),
     };
-    hand_over(tx, closing, cli.commands(), PathBuf::from(request.cwd))
+    hand_over(
+        tx,
+        closing,
+        cli.commands(),
+        PathBuf::from(request.cwd),
+        cli.raises_like_windows(),
+    )
 }
 
 // =============================================================================================
@@ -1656,6 +1694,10 @@ mod tests {
             ],
             "state-setting options raise nothing (0.4.0 audit R11)"
         );
+        assert!(
+            forwarded.raises_like_windows(),
+            "but Windows raises its window for them, which «Как в Windows» = Interface does again"
+        );
         assert_eq!(forwarded.cwd(), Path::new("/tmp"));
         drop(forwarded); // the implicit acknowledgement
 
@@ -1747,6 +1789,10 @@ mod tests {
         });
         let forwarded = wait_for(&server);
         assert_eq!(forwarded.commands(), [Command::Preset(PresetCommand::Next)]);
+        assert!(
+            !forwarded.raises_like_windows(),
+            "a keybind's option raises nothing at any level"
+        );
         drop(forwarded);
         assert!(sender.join().expect("client thread").ok);
     }
@@ -2849,6 +2895,7 @@ mod tests {
             &closing,
             vec![Command::Status { json: true }],
             PathBuf::from("/"),
+            false,
             Duration::from_millis(20),
         );
         assert!(response.is_unanswered());
@@ -2865,6 +2912,7 @@ mod tests {
             &closing,
             vec![Command::Status { json: true }],
             PathBuf::from("/"),
+            false,
             REPLY_TIMEOUT,
         );
         gui.join().expect("the GUI thread");

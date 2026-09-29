@@ -1,10 +1,10 @@
-//! The Settings window: a side nav and five panes.
+//! The Settings window: a side nav and six panes.
 //!
 //! Port of `FxSettingsDialog` (`GUI/FxSettingsDialog.{h,cpp}`) and of the device-priority list it
-//! owns (`GUI/FxOutputPreference.{h,cpp}`). 610 × 597 outside, 600 × 510 of content, five tab
+//! owns (`GUI/FxOutputPreference.{h,cpp}`). 610 × 597 outside, 600 × 510 of content, six tab
 //! buttons down the left and one pane to the right of a vertical rule
-//! (`docs/spec/06-dialogs.md` §1). The original has three; the other two are this port's, each in
-//! the row the next button would have had in the original's own grid:
+//! (`docs/spec/06-dialogs.md` §1). The original has three; the other three are this port's, each
+//! in the row the next button would have had in the original's own grid:
 //!
 //! - **Microphone** (0.4.0 design §1.4, §8): the global overrides over every voice preset, echo
 //!   cancellation and the calibration wizard's entry point, built from the same checkbox, stepper
@@ -13,6 +13,10 @@
 //! - **Applications** (`docs/0.4.0-apps.md`, "Interface"): every application that has played or
 //!   recorded through FxSound, each with a preset of its own per direction or FxSound's, in a list
 //!   built from the device priority list's box, combo, ✕ and rules.
+//! - **Experimental** (`docs/0.5.0-windows-parity.md`): «Как в Windows» / "Like FxSound for
+//!   Windows", one slider of three positions (four from 0.6.0) with a line under it that says what
+//!   the position does.
+//!   Always the last tab, and never hidden: it is the way back from every level.
 //!
 //! ## Pure view
 //!
@@ -60,14 +64,15 @@ use crate::assets::{AssetCache, FxImage, rasterise};
 use crate::state::EchoCancelTrouble;
 use crate::theme::{FxColor, Palette};
 use crate::widgets::FxComboBox;
-use crate::widgets::icon_button::IconButton;
+use crate::widgets::icon_button::{self, IconButton};
+use crate::widgets::slider::{self, FxSlider};
 use egui::{
     Align2, Color32, Context, CornerRadius, CursorIcon, Id, Key, Rect, Sense, Stroke, StrokeKind,
     TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2,
 };
 use fxsound_core::{
     AppKey, DeEsserMode, DenoiseChannelsOverride, DereverbLevel, DeviceDirection,
-    NoiseSuppressionOverride, Settings,
+    NoiseSuppressionOverride, ParityClass, Settings, WindowsLook, WindowsParity,
 };
 use std::collections::HashMap;
 
@@ -139,9 +144,9 @@ pub fn divider_x(content: Rect) -> f32 {
     pane_rect(content).left() - 1.0
 }
 
-/// One of the five tab buttons: `(20, 50, 150, 40)`, `(20, 110, …)`, `(20, 170, …)`
-/// (`FxSettingsDialog.cpp:121-123`), and the port's Microphone at `(20, 230, …)` and Applications
-/// at `(20, 290, …)` — the next rows of the same grid.
+/// One of the six tab buttons: `(20, 50, 150, 40)`, `(20, 110, …)`, `(20, 170, …)`
+/// (`FxSettingsDialog.cpp:121-123`), and the port's Microphone at `(20, 230, …)`, Applications
+/// at `(20, 290, …)` and Experimental at `(20, 350, …)` — the next rows of the same grid.
 #[must_use]
 pub fn nav_button_rect(content: Rect, index: usize) -> Rect {
     Rect::from_min_size(
@@ -170,6 +175,22 @@ pub fn nav_label_rect(button: Rect) -> Rect {
     Rect::from_min_max(
         pos2(left, button.top()),
         pos2(rule - NAV_LABEL_CLEARANCE, button.bottom()),
+    )
+}
+
+/// Where the Windows build sets a tab's caption: `height + 5` points in and `width - height + 5`
+/// wide, 115 points, past the rule (`FxSettingsDialog.cpp:73-75`). The button, 150 points wide,
+/// clips what runs further. What «Как в Windows» = Interface and above caption the original's three
+/// tabs in ([`WindowsLook::NavCaptions`], 0.4.0 audit #29 set back).
+#[must_use]
+pub fn windows_nav_label_rect(button: Rect) -> Rect {
+    let left = button.left() + button.height() + NAV_LABEL_GAP;
+    Rect::from_min_size(
+        pos2(left, button.top()),
+        vec2(
+            button.width() - button.height() + NAV_LABEL_GAP,
+            button.height(),
+        ),
     )
 }
 
@@ -207,6 +228,125 @@ pub fn nav_caption_font(ctx: &Context, text: &str, room: f32) -> egui::FontId {
     crate::theme::semibold(size)
 }
 
+/// How a tab's caption is set: one line where it fits one, as [`nav_caption_font`] sets it, and
+/// otherwise two, broken where the translation marks a long word ([`i18n::BREAK`], drawn as a
+/// hyphen at the end of the first line) or at a space — whichever lets the two lines be set
+/// largest.
+///
+/// Two lines are what the port's own long captions need: «Экспериментальное» is 117.6 points
+/// even at 12 points, in a box of 81, and an ellipsis would not say which pane the button opens.
+/// They are set in the `nav_caption` role ([`crate::theme::nav_caption`]), whose line pitch is
+/// explicit so that the two lines stay inside the 40-point button whichever face comes first in
+/// the chain.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NavCaption {
+    /// One line, or two.
+    pub lines: Vec<String>,
+    /// The size they are set in.
+    pub size: f32,
+}
+
+impl NavCaption {
+    /// The caption as it is laid out: one line in the tab's font, or two in the `nav_caption`
+    /// role, one under the other.
+    #[must_use]
+    pub fn layout(&self, ctx: &Context, colour: Color32) -> std::sync::Arc<egui::Galley> {
+        let mut job = egui::text::LayoutJob::default();
+        if let [line] = self.lines.as_slice() {
+            job.append(
+                line,
+                0.0,
+                egui::TextFormat::simple(crate::theme::semibold(self.size), colour),
+            );
+        } else {
+            job.append(
+                &self.lines.join("\n"),
+                0.0,
+                crate::theme::nav_caption(self.size, colour),
+            );
+        }
+        ctx.fonts_mut(|fonts| fonts.layout_job(job))
+    }
+}
+
+/// [`NavCaption`] for `text` in `room` points: `text` as [`i18n::tr_breakable`] gives it, with the
+/// translation's break marks in it.
+#[must_use]
+pub fn nav_caption(ctx: &Context, text: &str, room: f32) -> NavCaption {
+    let whole = text.replace(i18n::BREAK, "");
+    let width = |text: &str, size: f32| {
+        ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(
+                    text.to_owned(),
+                    crate::theme::semibold(size),
+                    Color32::PLACEHOLDER,
+                )
+                .size()
+                .x
+        })
+    };
+    let font = nav_caption_font(ctx, &whole, room);
+    if width(&whole, font.size) <= room {
+        return NavCaption {
+            lines: vec![whole],
+            size: font.size,
+        };
+    }
+    // Every place the caption may break: at a mark, with a hyphen, and at a space.
+    let mut breaks: Vec<(String, String)> = Vec::new();
+    for (at, _) in text.match_indices(i18n::BREAK) {
+        let first = text[..at].replace(i18n::BREAK, "");
+        let second = text[at + i18n::BREAK.len()..].replace(i18n::BREAK, "");
+        breaks.push((
+            format!("{}-", first.trim_end()),
+            second.trim_start().to_owned(),
+        ));
+    }
+    for (at, space) in text.char_indices().filter(|(_, c)| c.is_whitespace()) {
+        let first = text[..at].replace(i18n::BREAK, "");
+        let second = text[at + space.len_utf8()..].replace(i18n::BREAK, "");
+        if !first.trim().is_empty() && !second.trim().is_empty() {
+            breaks.push((first.trim().to_owned(), second.trim().to_owned()));
+        }
+    }
+    // For each, the largest size in half points both lines fit at; the largest of those wins, and
+    // of two at one size the better balanced.
+    let mut best: Option<(f32, f32, (String, String))> = None;
+    for (first, second) in breaks {
+        let mut size = super::NORMAL_FONT;
+        let fits = loop {
+            let widest = width(&first, size).max(width(&second, size));
+            if widest <= room {
+                break Some(widest);
+            }
+            if size <= MIN_NAV_FONT {
+                break None;
+            }
+            size = (size - 0.5).max(MIN_NAV_FONT);
+        };
+        if let Some(widest) = fits {
+            let better = best.as_ref().is_none_or(|(best_size, best_widest, _)| {
+                size > *best_size || (size == *best_size && widest < *best_widest)
+            });
+            if better {
+                best = Some((size, widest, (first, second)));
+            }
+        }
+    }
+    match best {
+        Some((size, _, (first, second))) => NavCaption {
+            lines: vec![first, second],
+            size,
+        },
+        // Nowhere to break, or no break that fits: one line at the smallest size, elided.
+        None => NavCaption {
+            lines: vec![whole],
+            size: font.size,
+        },
+    }
+}
+
 /// A pane's title: `(20, 5, paneWidth - 20, 24)` (`FxSettingsDialog.cpp:168-172`).
 #[must_use]
 pub fn pane_title_rect(pane: Rect) -> Rect {
@@ -232,16 +372,20 @@ pub enum SettingsTab {
     Microphone,
     /// The port's fifth: a preset of its own for each application (`docs/0.4.0-apps.md`).
     Applications,
+    /// The port's sixth, and always the last: «Как в Windows» / "Like FxSound for Windows"
+    /// (`docs/0.5.0-windows-parity.md`).
+    Experimental,
 }
 
 impl SettingsTab {
     /// In nav order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Audio,
         Self::General,
         Self::Help,
         Self::Microphone,
         Self::Applications,
+        Self::Experimental,
     ];
 
     /// The tab button's caption — also the component's name, which is what `TRANS` is given
@@ -254,6 +398,7 @@ impl SettingsTab {
             Self::Help => "Help",
             Self::Microphone => "Microphone",
             Self::Applications => "Applications",
+            Self::Experimental => "Experimental",
         }
     }
 
@@ -267,6 +412,7 @@ impl SettingsTab {
             Self::Help => "Help",
             Self::Microphone => "Microphone",
             Self::Applications => "Applications",
+            Self::Experimental => "Experimental",
         }
     }
 
@@ -279,6 +425,7 @@ impl SettingsTab {
             Self::Help => NavIcon::Question,
             Self::Microphone => NavIcon::Microphone,
             Self::Applications => NavIcon::Applications,
+            Self::Experimental => NavIcon::Experimental,
         }
     }
 
@@ -290,21 +437,44 @@ impl SettingsTab {
             Self::Help => 2,
             Self::Microphone => 3,
             Self::Applications => 4,
+            Self::Experimental => 5,
+        }
+    }
+
+    /// Whether the Windows build has this tab: Audio, General and Help.
+    #[must_use]
+    pub const fn windows_has(self) -> bool {
+        matches!(self, Self::Audio | Self::General | Self::Help)
+    }
+
+    /// The level of «Как в Windows» at which this tab stops being what it is in FxSound for
+    /// Linux (`docs/0.5.0-windows-parity.md`, "Classification"). Exhaustive on purpose: a new tab
+    /// does not compile until its level is decided.
+    ///
+    /// The original's three keep their place at every level — what changes inside them is
+    /// classified with the things themselves. The port's Microphone and Applications panes are
+    /// hidden at Everything. Experimental never is: it is the way back.
+    #[must_use]
+    pub const fn parity_class(self) -> ParityClass {
+        match self {
+            Self::Audio | Self::General | Self::Help | Self::Experimental => ParityClass::Never,
+            Self::Microphone | Self::Applications => ParityClass::Full,
         }
     }
 }
 
 // =============================================================================================
-// The five nav icons
+// The six nav icons
 // =============================================================================================
 
 /// The side-nav artwork.
 ///
 /// The original's three are the only images in the app that `FxTheme`'s table does not hold: the
 /// dialog loads them straight from `BinaryData` (`FxSettingsDialog.cpp:92-105`), and they have no
-/// per-theme variant — they are drawn in the same neutral grey in both palettes. The fourth and
-/// fifth, `microphone.svg` and `applications.svg`, are the port's own, drawn to match: a 24-point
-/// grid, one `#7E7E7E` fill and 1.5-point strokes, like `speaker.svg`.
+/// per-theme variant — they are drawn in the same neutral grey in both palettes. The fourth,
+/// fifth and sixth, `microphone.svg`, `applications.svg` and `experimental.svg`, are the port's
+/// own, drawn to match: a 24-point grid, one `#7E7E7E` fill and 1.5-point strokes, like
+/// `speaker.svg`.
 /// [`crate::AssetCache`] is keyed by [`FxImage`] and has nowhere to put them, so [`NavIcons`] is
 /// the same rasterise-once-and-keep-the-texture cache with its own key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -319,14 +489,17 @@ pub enum NavIcon {
     Microphone,
     /// `applications.svg`: a window with its title bar.
     Applications,
+    /// `experimental.svg`: a flask.
+    Experimental,
 }
 
-const NAV_SVGS: [&[u8]; 5] = [
+const NAV_SVGS: [&[u8]; 6] = [
     include_bytes!("../../../../assets/images/speaker.svg"),
     include_bytes!("../../../../assets/images/settings.svg"),
     include_bytes!("../../../../assets/images/question.svg"),
     include_bytes!("../../../../assets/images/microphone.svg"),
     include_bytes!("../../../../assets/images/applications.svg"),
+    include_bytes!("../../../../assets/images/experimental.svg"),
 ];
 
 impl NavIcon {
@@ -337,7 +510,7 @@ impl NavIcon {
     }
 }
 
-/// Textures for the five nav icons, one per physical size.
+/// Textures for the six nav icons, one per physical size.
 ///
 /// Held by the application next to its [`crate::AssetCache`]; `load_texture` must never run per
 /// frame.
@@ -484,12 +657,24 @@ impl LanguageChoice {
     /// Every position, in order.
     #[must_use]
     pub fn all() -> Vec<Self> {
+        Self::all_at(WindowsParity::Off)
+    }
+
+    /// Every position at a level of «Как в Windows»: [`LanguageChoice::all`], or from Interface on
+    /// the system entry and then the Windows build's order ([`i18n::WINDOWS_ORDER`],
+    /// [`WindowsLook::LanguageOrder`]) — the order only; every language keeps its own name.
+    #[must_use]
+    pub fn all_at(level: WindowsParity) -> Vec<Self> {
+        let codes: Vec<&'static str> = if level.windows_look(WindowsLook::LanguageOrder) {
+            i18n::WINDOWS_ORDER.to_vec()
+        } else {
+            i18n::LANGUAGES
+                .iter()
+                .map(|language| language.code)
+                .collect()
+        };
         std::iter::once(Self::System)
-            .chain(
-                i18n::LANGUAGES
-                    .iter()
-                    .map(|language| Self::Code(language.code)),
-            )
+            .chain(codes.into_iter().map(Self::Code))
             .collect()
     }
 
@@ -521,7 +706,13 @@ impl LanguageChoice {
     /// The position `steps` away, wrapping in both directions (`FxLanguage.cpp:80-111`).
     #[must_use]
     pub fn step(self, steps: isize) -> Self {
-        let all = Self::all();
+        self.step_at(steps, WindowsParity::Off)
+    }
+
+    /// [`LanguageChoice::step`] through the order of [`LanguageChoice::all_at`] `level`.
+    #[must_use]
+    pub fn step_at(self, steps: isize, level: WindowsParity) -> Self {
+        let all = Self::all_at(level);
         let count = all.len() as isize;
         let current = all.iter().position(|choice| *choice == self).unwrap_or(0) as isize;
         all[(current + steps).rem_euclid(count) as usize]
@@ -662,6 +853,38 @@ pub struct SettingsState {
     /// Whether a microphone is selected. Calibration measures one, so without it the button is
     /// disabled rather than opening a wizard with nothing to listen to (0.4.0 design §8).
     pub has_microphone: bool,
+    /// Settings ▸ Experimental's "Smooth moves in WirePlumber". Not part of [`Settings`], for the
+    /// reason [`SettingsState::launch_on_startup`] is not: it is two files in WirePlumber's own
+    /// directories, and the app layer reads them and fills this in.
+    pub wireplumber_hook: WirePlumberHook,
+}
+
+/// "Smooth moves in WirePlumber" (roadmap 0.5.0 §7, D5): FxSound's hook in the user's WirePlumber,
+/// which fades the streams WirePlumber moves itself — a device picked in the desktop's sound
+/// settings among them — as FxSound fades the ones it moves (`fxsound_audio::wireplumber_hook`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WirePlumberHook {
+    /// Whether it can be offered: WirePlumber 0.5 or later is installed. Unticked and greyed out
+    /// otherwise, with the line saying why.
+    pub available: bool,
+    /// Whether it is ticked: the hook's files are where WirePlumber reads them.
+    pub on: bool,
+    /// Whether the WirePlumber that runs has read them as they are.
+    pub restart: WirePlumberRestart,
+}
+
+/// Whether the WirePlumber that runs has what the tick box says: it reads the hook's files only
+/// when it starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WirePlumberRestart {
+    /// It has, or no WirePlumber runs to say otherwise.
+    #[default]
+    NotNeeded,
+    /// It started before the box was last ticked or unticked: "Restart WirePlumber" is offered.
+    Due,
+    /// A restart was asked for and WirePlumber is still the one from before — it was not started
+    /// by systemd, or systemd could not restart it. The next login brings the change.
+    Failed,
 }
 
 impl Default for SettingsState {
@@ -689,6 +912,7 @@ impl SettingsState {
             echo_cancel_trouble: None,
             input_processing: false,
             has_microphone: false,
+            wireplumber_hook: WirePlumberHook::default(),
         }
     }
 
@@ -841,6 +1065,18 @@ pub enum SettingsAction {
     /// Forget an application: its presets, and its row unless it is running (the ✕).
     ForgetApp(AppKey),
 
+    // ---- experimental pane --------------------------------------------------------------------
+    /// «Как в Windows» / "Like FxSound for Windows" moved to this level: a click on a position or
+    /// its label, an arrow key, a wheel notch, a right-click (back to Off), or a drag let go —
+    /// never the positions a drag passes on its way.
+    SetWindowsParity(WindowsParity),
+    /// "Smooth moves in WirePlumber" ticked or unticked: install FxSound's hook in the user's
+    /// WirePlumber, or take it away. Only emitted while it is available.
+    SetWirePlumberHook(bool),
+    /// "Restart WirePlumber", so that it reads the hook's files as they are now. The window asks
+    /// first: the sound stops for a moment. Only emitted while a restart is due.
+    RestartWirePlumber,
+
     /// Close the window — the ✕ or Escape (`FxSettingsDialog.cpp:78-88`). The caller then runs
     /// the equivalent of `FxController::refreshOutputList()` (`FxMainWindow.cpp:454`).
     Close,
@@ -897,9 +1133,24 @@ impl<'a> SettingsDialog<'a> {
             Stroke::new(1.0, palette.divider()),
         );
 
+        let windows_captions = self
+            .state
+            .settings
+            .windows_parity
+            .offered_or_below()
+            .windows_look(WindowsLook::NavCaptions);
         for tab in SettingsTab::ALL {
             let rect = nav_button_rect(content, tab.index());
-            if nav_button(ui, rect, tab, self.state.tab == tab, palette, icons) {
+            let windows_caption = windows_captions && tab.windows_has();
+            if nav_button(
+                ui,
+                rect,
+                tab,
+                self.state.tab == tab,
+                windows_caption,
+                palette,
+                icons,
+            ) {
                 response.push(SettingsAction::SelectTab(tab));
             }
         }
@@ -928,17 +1179,30 @@ impl<'a> SettingsDialog<'a> {
             SettingsTab::Applications => {
                 applications_pane(ui, pane, self.state, palette, assets, id, &mut response);
             }
+            SettingsTab::Experimental => {
+                experimental_pane(ui, pane, self.state, palette, assets, id, &mut response);
+            }
+        }
+        // A drag cut short by closing the pane chose nothing: its preview goes with the pane,
+        // so the next time the pane is drawn it is not taken for a drag let go.
+        if response.actions.contains(&SettingsAction::Close) {
+            ui.data_mut(|d| d.remove::<ParityDrag>(parity_drag_id(id)));
         }
         response
     }
 }
 
 /// One tab button (`FxSettingsDialog.cpp:46-76`). Returns whether it was clicked.
+///
+/// `windows_caption` sets the caption as the Windows build does: the normal font on one line in
+/// [`windows_nav_label_rect`], cut with an ellipsis there and clipped by the button, so a long
+/// translation runs into the rule as it does on Windows ([`WindowsLook::NavCaptions`]).
 fn nav_button(
     ui: &mut Ui,
     rect: Rect,
     tab: SettingsTab,
     selected: bool,
+    windows_caption: bool,
     palette: Palette,
     icons: &mut NavIcons,
 ) -> bool {
@@ -972,17 +1236,40 @@ fn nav_button(
     } else {
         palette.color(FxColor::DefaultText)
     };
+    if windows_caption {
+        draw_truncated(
+            &ui.painter().with_clip_rect(rect),
+            &tr(tab.nav_label()),
+            normal_font(),
+            colour,
+            windows_nav_label_rect(rect),
+            Align2::LEFT_CENTER,
+        );
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        return response.clicked();
+    }
     let label = nav_label_rect(rect);
-    let caption = tr(tab.nav_label());
-    let font = nav_caption_font(ui.ctx(), &caption, label.width());
-    draw_truncated(
-        ui.painter(),
-        &caption,
-        font,
-        colour,
-        label,
-        Align2::LEFT_CENTER,
+    let caption = nav_caption(
+        ui.ctx(),
+        &i18n::tr_breakable(tab.nav_label()),
+        label.width(),
     );
+    if let [line] = caption.lines.as_slice() {
+        draw_truncated(
+            ui.painter(),
+            line,
+            crate::theme::semibold(caption.size),
+            colour,
+            label,
+            Align2::LEFT_CENTER,
+        );
+    } else {
+        let galley = caption.layout(ui.ctx(), colour);
+        let placed = Align2::LEFT_CENTER.align_size_within_rect(galley.size(), label);
+        ui.painter().galley(placed.min, galley, colour);
+    }
 
     if response.hovered() {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -1734,6 +2021,7 @@ fn general_pane(
         ui,
         language_rect(pane),
         choice,
+        state.settings.windows_parity.offered_or_below(),
         palette,
         assets,
         id.with("language"),
@@ -1873,12 +2161,14 @@ fn language_switch(
     ui: &mut Ui,
     rect: Rect,
     choice: LanguageChoice,
+    level: WindowsParity,
     palette: Palette,
     assets: &mut AssetCache,
     id: Id,
 ) -> Option<LanguageChoice> {
     // Both directions wrap, so neither arrow is ever disabled (`FxLanguage.cpp:80-111`).
-    stepper(ui, rect, &choice.label(), palette, assets, id).map(|steps| choice.step(steps))
+    stepper(ui, rect, &choice.label(), palette, assets, id)
+        .map(|steps| choice.step_at(steps, level))
 }
 
 /// The language switch's box, for any short list: ‹ and › either side of the current value.
@@ -2693,6 +2983,408 @@ fn app_row(
 }
 
 // =============================================================================================
+// Experimental pane (`docs/0.5.0-windows-parity.md`)
+// =============================================================================================
+
+/// Experimental-pane geometry, on the General pane's grid: the heading where the language switch
+/// is, the slider under it, the positions' labels under their detents, and the hint.
+pub mod experimental {
+    /// y of the heading.
+    pub const HEADING_Y: f32 = 50.0;
+    /// Height of the heading.
+    pub const HEADING_HEIGHT: f32 = 24.0;
+    /// y of the slider.
+    pub const SLIDER_Y: f32 = 85.0;
+    /// The slider's height, every FxSound slider's.
+    pub const SLIDER_HEIGHT: f32 = 18.0;
+    /// y of the positions' labels.
+    pub const LABELS_Y: f32 = 110.0;
+    /// Room for two lines of a label in the small font.
+    pub const LABELS_HEIGHT: f32 = 36.0;
+    /// y of the hint.
+    pub const HINT_Y: f32 = 155.0;
+    /// Height of the hint's one line.
+    pub const HINT_HEIGHT: f32 = 20.0;
+    /// y of "Smooth moves in WirePlumber": twenty under the hint, as the General pane's first
+    /// checkbox is under the language switch.
+    pub const HOOK_Y: f32 = 195.0;
+    /// The checkbox's height, the Microphone pane's.
+    pub const HOOK_HEIGHT: f32 = 30.0;
+    /// Room for three lines of the small font: the lines under the checkbox.
+    pub const HOOK_LINE_HEIGHT: f32 = 54.0;
+    /// Above "Restart WirePlumber", as above the Microphone pane's button.
+    pub const GAP_BEFORE_RESTART: f32 = 10.0;
+}
+
+/// The heading over the slider.
+pub const LIKE_WINDOWS_TITLE: &str = "Like FxSound for Windows";
+/// The slider's tooltip: what no level takes away. Shown unless help tips are hidden.
+pub const LIKE_WINDOWS_TIP: &str = "Always kept: the preset trash and autosave, fixed port errors, \
+click-free switching, the command line and D-Bus. No setting is deleted.";
+
+/// The checkbox of FxSound's hook in WirePlumber.
+pub const WIREPLUMBER_HOOK: &str = "Smooth moves in WirePlumber";
+/// The line under it: what it does, and whose settings it changes.
+pub const WIREPLUMBER_HOOK_HINT: &str = "Fades the sound WirePlumber moves, as when the desktop picks another device. Changes WirePlumber's settings.";
+/// The line under it where there is no WirePlumber 0.5.
+pub const WIREPLUMBER_TOO_OLD: &str = "Needs WirePlumber 0.5 or newer.";
+/// The line under it once it was ticked or unticked, until WirePlumber restarts.
+pub const WIREPLUMBER_RESTART_DUE: &str = "WirePlumber takes the change when it restarts.";
+/// The line under it when a restart was asked for and did not happen.
+pub const WIREPLUMBER_RESTART_FAILED: &str =
+    "WirePlumber could not be restarted here. It takes the change at your next login.";
+/// The button that restarts WirePlumber, after asking.
+pub const RESTART_WIREPLUMBER: &str = "Restart WirePlumber";
+
+/// "Smooth moves in WirePlumber": a checkbox the width of the row.
+#[must_use]
+pub fn wireplumber_hook_rect(pane: Rect) -> Rect {
+    let row = parity_row(pane);
+    Rect::from_min_size(
+        pos2(row.left(), pane.top() + experimental::HOOK_Y),
+        vec2(row.width(), experimental::HOOK_HEIGHT),
+    )
+}
+
+/// The lines under the checkbox, indented to its caption, as the echo canceller's status is.
+#[must_use]
+pub fn wireplumber_line_rect(pane: Rect) -> Rect {
+    let toggle = wireplumber_hook_rect(pane);
+    let indent = TICK_BOX_SIDE + TICK_BOX_GAP;
+    Rect::from_min_size(
+        pos2(toggle.left() + indent, toggle.bottom()),
+        vec2(toggle.width() - indent, experimental::HOOK_LINE_HEIGHT),
+    )
+}
+
+/// "Restart WirePlumber", sized like the reset button (see [`reset_button_size`]), under the
+/// lines at the pane's margin, as "Calibrate microphone…" is under the echo canceller's.
+#[must_use]
+pub fn restart_wireplumber_rect(pane: Rect, size: Vec2) -> Rect {
+    Rect::from_min_size(
+        pos2(
+            parity_row(pane).left(),
+            wireplumber_line_rect(pane).bottom() + experimental::GAP_BEFORE_RESTART,
+        ),
+        size,
+    )
+}
+
+impl WirePlumberHook {
+    /// The line under the checkbox, untranslated.
+    #[must_use]
+    pub const fn line(self) -> &'static str {
+        match (self.available, self.restart) {
+            (_, WirePlumberRestart::Due) => WIREPLUMBER_RESTART_DUE,
+            (_, WirePlumberRestart::Failed) => WIREPLUMBER_RESTART_FAILED,
+            (false, WirePlumberRestart::NotNeeded) => WIREPLUMBER_TOO_OLD,
+            (true, WirePlumberRestart::NotNeeded) => WIREPLUMBER_HOOK_HINT,
+        }
+    }
+}
+
+/// The row the heading, the labels and the hint share: the pane less a margin each side.
+#[must_use]
+pub fn parity_row(pane: Rect) -> Rect {
+    Rect::from_min_max(
+        pos2(pane.left() + X_MARGIN, pane.top()),
+        pos2(pane.right() - X_MARGIN, pane.bottom()),
+    )
+}
+
+/// The heading, "Like FxSound for Windows".
+#[must_use]
+pub fn parity_heading_rect(pane: Rect) -> Rect {
+    let row = parity_row(pane);
+    Rect::from_min_size(
+        pos2(row.left(), pane.top() + experimental::HEADING_Y),
+        vec2(row.width(), experimental::HEADING_HEIGHT),
+    )
+}
+
+/// The label of position `index`: the row in equal columns, one per position offered
+/// ([`WindowsParity::SLIDER_LEVELS`]: three in 0.5.0; Everything is a fourth from 0.6.0).
+#[must_use]
+pub fn parity_label_rect(pane: Rect, index: usize) -> Rect {
+    let row = parity_row(pane);
+    let column = row.width() / WindowsParity::SLIDER_LEVELS.len() as f32;
+    Rect::from_min_size(
+        pos2(
+            row.left() + index as f32 * column,
+            pane.top() + experimental::LABELS_Y,
+        ),
+        vec2(column, experimental::LABELS_HEIGHT),
+    )
+}
+
+/// The slider: sized so that its track runs from the first label's centre to the last's, and
+/// each of its positions sits over its own label.
+#[must_use]
+pub fn parity_slider_rect(pane: Rect) -> Rect {
+    let first = parity_label_rect(pane, 0).center().x;
+    let last = parity_label_rect(pane, WindowsParity::SLIDER_LEVELS.len() - 1)
+        .center()
+        .x;
+    // `slider::track_rect` starts the track one thumb radius in and ends it five short.
+    Rect::from_min_size(
+        pos2(
+            first - slider::THUMB_RADIUS,
+            pane.top() + experimental::SLIDER_Y,
+        ),
+        vec2(
+            last - first + slider::THUMB_RADIUS * 6.0,
+            experimental::SLIDER_HEIGHT,
+        ),
+    )
+}
+
+/// The one line under the labels that says what the position does.
+#[must_use]
+pub fn parity_hint_rect(pane: Rect) -> Rect {
+    let row = parity_row(pane);
+    Rect::from_min_size(
+        pos2(row.left(), pane.top() + experimental::HINT_Y),
+        vec2(row.width(), experimental::HINT_HEIGHT),
+    )
+}
+
+/// Where a drag of the «Like FxSound for Windows» thumb is, while the button is held, and the
+/// frame that last saw it held on the slider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParityDrag {
+    level: WindowsParity,
+    /// [`egui::Context::cumulative_frame_nr`] of the last frame the pane was drawn with the
+    /// button held on the slider. A let-go counts only on the frame straight after it: a preview
+    /// any older belongs to a drag the pane stopped seeing (Settings closed, another tab, the
+    /// window hidden) and is dropped unapplied.
+    seen: u64,
+}
+
+/// Where [`experimental_pane`] keeps its [`ParityDrag`] between frames.
+fn parity_drag_id(id: Id) -> Id {
+    id.with("parity-drag")
+}
+
+/// «Как в Windows» / "Like FxSound for Windows": the positions offered, Off to Interface and
+/// sound in 0.5.0 ([`WindowsParity::SLIDER_LEVELS`]; Everything arrives in 0.6.0).
+///
+/// Nothing is applied while a drag is on its way: the pane remembers where the thumb is until the
+/// pointer lets go, and shows that position's label and hint meanwhile, so a drag from Off to
+/// Interface and sound never passes Interface on to the application, and one cut short — Escape
+/// with the button held, the pane closed or not drawn before the let-go — passes nothing on at
+/// all ([`ParityDrag`]). A click on a
+/// position or on its label, an arrow key, a wheel notch and a right-click (back to Off, as every
+/// slider resets) apply at once.
+#[allow(clippy::too_many_arguments)]
+fn experimental_pane(
+    ui: &mut Ui,
+    pane: Rect,
+    state: &SettingsState,
+    palette: Palette,
+    assets: &mut AssetCache,
+    id: Id,
+    response: &mut DialogResponse<SettingsAction>,
+) {
+    let current = state.settings.windows_parity;
+    let heading = tr(LIKE_WINDOWS_TITLE);
+    draw_truncated(
+        ui.painter(),
+        &heading,
+        normal_font(),
+        palette.color(FxColor::HighlightedText),
+        parity_heading_rect(pane),
+        Align2::LEFT_CENTER,
+    );
+
+    let preview_id = parity_drag_id(id);
+    let frame = ui.ctx().cumulative_frame_nr();
+    let preview = match ui.data(|d| d.get_temp::<ParityDrag>(preview_id)) {
+        Some(drag) if drag.seen + 1 >= frame => Some(drag.level),
+        Some(_) => {
+            // A drag the pane lost sight of before it let go: nothing was chosen.
+            ui.data_mut(|d| d.remove::<ParityDrag>(preview_id));
+            None
+        }
+        None => None,
+    };
+    // A level past the last position offered — Everything, which a later version's
+    // settings.toml may hold and this one runs as Interface and sound — shows at the last.
+    let shown = preview.unwrap_or(current).offered_or_below();
+    let mut position = shown.index() as f32;
+    let last = (WindowsParity::SLIDER_LEVELS.len() - 1) as f32;
+    let mut slider = FxSlider::new(&mut position, 0.0, last, 1.0)
+        .default_value(0.0)
+        .reset_on_secondary_click(true)
+        .show(
+            ui,
+            parity_slider_rect(pane),
+            palette,
+            assets,
+            id.with("parity"),
+        );
+    let moved = WindowsParity::from_index(position.round().max(0.0) as usize);
+    let mut chosen = None;
+    if slider.is_pointer_button_down_on() {
+        if moved != shown || preview.is_some() {
+            let drag = ParityDrag {
+                level: moved,
+                seen: frame,
+            };
+            ui.data_mut(|d| d.insert_temp(preview_id, drag));
+        }
+    } else if preview.is_some() {
+        ui.data_mut(|d| d.remove::<ParityDrag>(preview_id));
+        // The drag let go: this is the position it chose. With the button still held it was
+        // Escape that ended it (egui aborts a drag on Escape), and a drag cancelled chooses
+        // nothing.
+        if !ui.input(|i| i.pointer.primary_down()) {
+            chosen = Some(moved);
+        }
+    } else if slider.changed() {
+        chosen = Some(moved);
+    }
+    let shown = if chosen.is_some() || slider.is_pointer_button_down_on() {
+        moved
+    } else {
+        shown
+    };
+
+    let hint = tr(shown.hint());
+    let label = tr(shown.label());
+    slider.widget_info(|| {
+        let mut info = egui::WidgetInfo::slider(true, shown.index() as f64, &heading);
+        info.current_text_value = Some(label.clone());
+        info.hint_text = Some(hint.clone());
+        info
+    });
+    if !state.settings.hide_help_tooltips {
+        slider = slider.on_hover_text(icon_button::tooltip_text(
+            &slider::with_reset_tip(Some(&tr(LIKE_WINDOWS_TIP))),
+            palette,
+        ));
+    }
+    let _ = slider;
+
+    for level in WindowsParity::SLIDER_LEVELS {
+        let rect = parity_label_rect(pane, level.index());
+        let colour = if level == shown {
+            palette.color(FxColor::HighlightedText)
+        } else {
+            palette.color(FxColor::DefaultText)
+        };
+        draw_centred_wrapped(ui.painter(), &tr(level.label()), small_font(), colour, rect);
+        let click = ui.interact(
+            rect,
+            id.with(("parity-label", level.index())),
+            Sense::click(),
+        );
+        if click.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if click.clicked() {
+            chosen = Some(level);
+        }
+    }
+
+    super::draw_fitted(
+        ui.painter(),
+        &hint,
+        small_font(),
+        palette.color(FxColor::DefaultText),
+        parity_hint_rect(pane),
+        Align2::LEFT_CENTER,
+    );
+
+    if let Some(level) = chosen
+        && level != current
+    {
+        response.push(SettingsAction::SetWindowsParity(level));
+    }
+
+    wireplumber_hook(ui, pane, state.wireplumber_hook, palette, id, response);
+}
+
+/// "Smooth moves in WirePlumber", the line under it, and "Restart WirePlumber" while a restart is
+/// due (roadmap 0.5.0 §7, D5). Greyed out without WirePlumber 0.5 — ticked all the same if the
+/// hook is there, so that it can still be taken away.
+fn wireplumber_hook(
+    ui: &mut Ui,
+    pane: Rect,
+    hook: WirePlumberHook,
+    palette: Palette,
+    id: Id,
+    response: &mut DialogResponse<SettingsAction>,
+) {
+    if toggle(
+        ui,
+        wireplumber_hook_rect(pane),
+        &tr(WIREPLUMBER_HOOK),
+        hook.on,
+        hook.available || hook.on,
+        palette,
+        id.with("wireplumber-hook"),
+    ) {
+        response.push(SettingsAction::SetWirePlumberHook(!hook.on));
+    }
+    draw_wrapped(
+        ui.painter(),
+        &tr(hook.line()),
+        small_font(),
+        palette.color(FxColor::HintText),
+        wireplumber_line_rect(pane),
+    );
+    if hook.restart == WirePlumberRestart::Due {
+        let label = tr(RESTART_WIREPLUMBER);
+        let text_width = ui
+            .painter()
+            .layout_no_wrap(label.clone(), normal_font(), Color32::PLACEHOLDER)
+            .size()
+            .x;
+        let button = restart_wireplumber_rect(pane, reset_button_size(&label, text_width));
+        if TextButton::new(&label)
+            .show(ui, button, palette, id.with("restart-wireplumber"))
+            .clicked()
+        {
+            response.push(SettingsAction::RestartWirePlumber);
+        }
+    }
+}
+
+/// `text` wrapped to `rect`'s width with each line centred in it, from its top, clipped to it.
+/// Returns the size the text came out at.
+fn draw_centred_wrapped(
+    painter: &egui::Painter,
+    text: &str,
+    font: egui::FontId,
+    colour: Color32,
+    rect: Rect,
+) -> Vec2 {
+    let galley = centred_wrapped(painter.ctx(), text, font, colour, rect.width());
+    let size = galley.size();
+    painter
+        .with_clip_rect(rect)
+        .galley(pos2(rect.center().x, rect.top()), galley, colour);
+    size
+}
+
+/// The galley [`draw_centred_wrapped`] draws: `text` wrapped at `width`, its lines centred on x 0.
+fn centred_wrapped(
+    ctx: &Context,
+    text: &str,
+    font: egui::FontId,
+    colour: Color32,
+    width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat::simple(font, colour),
+    );
+    job.wrap.max_width = width.max(0.0);
+    job.halign = egui::Align::Center;
+    ctx.fonts_mut(|fonts| fonts.layout_job(job))
+}
+
+// =============================================================================================
 // Help pane (`docs/spec/06-dialogs.md` §1.9)
 // =============================================================================================
 
@@ -2916,18 +3608,25 @@ mod tests {
     }
 
     #[test]
-    fn the_original_three_tab_buttons_keep_their_rows_and_the_ports_two_take_the_next() {
-        // FxSettingsDialog.cpp:121-123, in content-local coordinates, and the port's fourth and
-        // fifth on the same sixty-point pitch: Applications at (20, 290, 150, 40).
+    fn the_original_three_tab_buttons_keep_their_rows_and_the_ports_three_take_the_next() {
+        // FxSettingsDialog.cpp:121-123, in content-local coordinates, and the port's fourth to
+        // sixth on the same sixty-point pitch: Experimental at (20, 350, 150, 40).
         let content = content();
-        for (index, top) in [(0, 50.0), (1, 110.0), (2, 170.0), (3, 230.0), (4, 290.0)] {
+        for (index, top) in [
+            (0, 50.0),
+            (1, 110.0),
+            (2, 170.0),
+            (3, 230.0),
+            (4, 290.0),
+            (5, 350.0),
+        ] {
             let button = local(content, nav_button_rect(content, index));
             assert!((button.min - pos2(20.0, top)).length() < 1e-4, "{button:?}");
             assert!((button.size() - vec2(150.0, 40.0)).length() < 1e-4);
         }
         assert_eq!(
             SettingsTab::ALL.map(SettingsTab::index),
-            [0, 1, 2, 3, 4],
+            [0, 1, 2, 3, 4, 5],
             "the nav order is the index order"
         );
         assert_eq!(SettingsTab::ALL[3], SettingsTab::Microphone);
@@ -2936,8 +3635,14 @@ mod tests {
         assert_eq!(SettingsTab::Applications.icon(), NavIcon::Applications);
         assert_eq!(SettingsTab::Applications.nav_label(), "Applications");
         assert_eq!(SettingsTab::Applications.pane_title(), "Applications");
-        // The fifth button ends well above the content's bottom, in the same column.
-        let last = nav_button_rect(content, 4);
+        assert_eq!(SettingsTab::ALL[5], SettingsTab::Experimental);
+        assert_eq!(SettingsTab::Experimental.icon(), NavIcon::Experimental);
+        assert_eq!(SettingsTab::Experimental.nav_label(), "Experimental");
+        assert_eq!(SettingsTab::Experimental.pane_title(), "Experimental");
+        // The sixth button ends above the content's bottom with a row to spare, in the same
+        // column: a seventh, Customization, fits at (20, 410, 150, 40) and ends at 450 of 510.
+        let last = nav_button_rect(content, 5);
+        assert!(nav_button_rect(content, 6).bottom() < content.bottom());
         assert!(last.bottom() < content.bottom());
         assert!((last.left() - nav_button_rect(content, 0).left()).abs() < 1e-4);
     }
@@ -3317,6 +4022,46 @@ mod tests {
     }
 
     #[test]
+    fn at_interface_the_language_switch_runs_in_the_windows_order_with_the_same_names() {
+        // 0.4.0 audit #28 set back at «Как в Windows» = Interface (`FxLanguage.cpp:25`): the order
+        // only; Türkçe, ไทย and Čeština keep their real names.
+        let level = WindowsParity::Interface;
+        let all = LanguageChoice::all_at(level);
+        assert_eq!(all.len(), LanguageChoice::all().len());
+        assert_eq!(
+            all[..6],
+            [
+                LanguageChoice::System,
+                LanguageChoice::Code("en"),
+                LanguageChoice::Code("ar"),
+                LanguageChoice::Code("ba"),
+                LanguageChoice::Code("bg"),
+                LanguageChoice::Code("hr"),
+            ]
+        );
+        assert_eq!(all[all.len() - 1], LanguageChoice::Code("zh-TW"));
+        // Russian is twenty-one presses on from English again, as on Windows.
+        assert_eq!(
+            LanguageChoice::Code("en").step_at(21, level),
+            LanguageChoice::Code("ru")
+        );
+        assert_eq!(
+            LanguageChoice::System.step_at(-1, level),
+            LanguageChoice::Code("zh-TW")
+        );
+        assert_eq!(LanguageChoice::Code("tr").label(), "Türkçe");
+        // Off keeps the order of the names.
+        assert_eq!(
+            LanguageChoice::all_at(WindowsParity::Off),
+            LanguageChoice::all()
+        );
+        assert_eq!(
+            LanguageChoice::Code("en").step_at(1, WindowsParity::Off),
+            LanguageChoice::Code("id")
+        );
+    }
+
+    #[test]
     fn the_current_choice_follows_the_settings_and_falls_back_to_the_system() {
         let mut settings = Settings::default();
         assert_eq!(LanguageChoice::current(&settings), LanguageChoice::System);
@@ -3431,12 +4176,12 @@ mod tests {
                 });
             }
         }
-        // The five nav icons were rasterised exactly once each per size.
+        // The six nav icons were rasterised exactly once each per size.
         assert!(!icons.is_empty());
         let cached = icons.len();
         icons.clear();
         assert!(icons.is_empty());
-        assert_eq!(cached, 5);
+        assert_eq!(cached, 6);
     }
 
     #[test]
@@ -4163,6 +4908,7 @@ mod tests {
             unix_time: 1_790_121_600,
             preset: "Calibrated — fifine".to_owned(),
             device: "alsa_input.usb-fifine".to_owned(),
+            extra: Default::default(),
         });
         assert_eq!(
             state.calibration_text(),
@@ -4213,8 +4959,13 @@ mod tests {
 
     /// The pane as `SettingsDialog::show` lays it out in a window at the origin.
     fn shown_pane() -> Rect {
+        pane_rect(shown_content())
+    }
+
+    /// The content rectangle of the window [`Window`] draws.
+    fn shown_content() -> Rect {
         let outer = Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE);
-        pane_rect(super::super::content_rect(outer))
+        super::super::content_rect(outer)
     }
 
     #[test]
@@ -4362,17 +5113,28 @@ mod tests {
 
     /// Every translation of every tab's caption, with the font [`nav_caption_font`] sets it in and
     /// the width it comes to.
-    fn fitted_captions(ui: &Ui, room: f32) -> Vec<(SettingsTab, String, f32, f32)> {
+    /// Every tab's caption in every language, as [`nav_caption`] sets it in `room`, with the
+    /// width of its widest line.
+    fn fitted_captions(ui: &Ui, room: f32) -> Vec<(SettingsTab, String, NavCaption, f32)> {
         let mut all = Vec::new();
         for tab in SettingsTab::ALL {
             for (code, text) in every_translation(tab.nav_label()) {
-                let font = nav_caption_font(ui.ctx(), &text, room);
-                let width = ui
-                    .painter()
-                    .layout_no_wrap(text.clone(), font.clone(), Color32::PLACEHOLDER)
-                    .size()
-                    .x;
-                all.push((tab, format!("{code}: {text}"), font.size, width));
+                let caption = nav_caption(ui.ctx(), &text, room);
+                let widest = caption
+                    .lines
+                    .iter()
+                    .map(|line| {
+                        ui.painter()
+                            .layout_no_wrap(
+                                line.clone(),
+                                crate::theme::semibold(caption.size),
+                                Color32::PLACEHOLDER,
+                            )
+                            .size()
+                            .x
+                    })
+                    .fold(0.0, f32::max);
+                all.push((tab, format!("{code}: {text}"), caption, widest));
             }
         }
         all
@@ -4397,38 +5159,161 @@ mod tests {
 
     #[test]
     fn every_languages_tab_captions_fit_whole_short_of_the_rule() {
-        // Set smaller where they must, but never elided: every caption of the thirty languages
-        // fits at or above the smallest size.
+        // Set smaller where they must, or in two lines, but never elided: every caption of the
+        // thirty languages fits at or above the smallest size, and two lines fit the button.
         let ctx = test_context();
         let content = content();
         let room = nav_label_rect(nav_button_rect(content, 0)).width();
         frame(&ctx, |ui| {
-            let problems: Vec<String> = fitted_captions(ui, room)
-                .into_iter()
-                .filter(|(_, _, size, width)| *width > room || *size < MIN_NAV_FONT)
-                .map(|(tab, text, size, width)| format!("{tab:?} {text}: {width:.1} at {size}"))
-                .collect();
+            let mut problems = Vec::new();
+            for (tab, text, caption, widest) in fitted_captions(ui, room) {
+                let height = caption.layout(ui.ctx(), Color32::WHITE).size().y;
+                if widest > room || caption.size < MIN_NAV_FONT || height > BUTTON_SIZE.y {
+                    problems.push(format!(
+                        "{tab:?} {text}: {:?} {widest:.1} × {height:.1} at {}",
+                        caption.lines, caption.size
+                    ));
+                }
+                if caption.lines.iter().any(|line| line.contains('{')) {
+                    problems.push(format!("{tab:?} {text}: the break mark shows"));
+                }
+            }
             assert!(problems.is_empty(), "{}", problems.join("\n"));
         });
     }
 
     #[test]
+    fn the_windows_caption_box_is_the_originals_and_runs_past_the_rule() {
+        // `FxSettingsDialog.cpp:73-75`: from `height + 5` in, `width - height + 5` wide.
+        let content = content();
+        for tab in SettingsTab::ALL {
+            let button = nav_button_rect(content, tab.index());
+            let label = windows_nav_label_rect(button);
+            assert!((label.left() - (button.left() + 45.0)).abs() < 1e-4);
+            assert!((label.width() - 115.0).abs() < 1e-4, "{label:?}");
+            assert!(label.right() > divider_x(content));
+            assert_eq!(label.y_range(), button.y_range());
+        }
+        assert!(SettingsTab::Audio.windows_has() && SettingsTab::Help.windows_has());
+        assert!(!SettingsTab::Microphone.windows_has());
+        assert!(!SettingsTab::Experimental.windows_has());
+    }
+
+    #[test]
+    fn at_interface_the_three_windows_tabs_caption_in_the_normal_font_clipped_by_their_button() {
+        // 0.4.0 audit #29 set back at «Как в Windows» = Interface; the port's own tabs keep the
+        // fitted caption.
+        let caption = |level: WindowsParity, wanted: &str| {
+            let mut window = Window::new(ThemeMode::Dark);
+            let mut state = experimental_state(level);
+            state.tab = SettingsTab::Audio;
+            window.frame(&state, Vec::new());
+            let (_, shapes) = window.frame(&state, Vec::new());
+            shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(text) if text.galley.text() == wanted => Some((
+                        clipped.clip_rect,
+                        text.galley.job.sections[0].format.font_id.size,
+                        clipped.shape.visual_bounding_rect(),
+                    )),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no {wanted:?} at {level:?}"))
+        };
+        for level in [WindowsParity::Interface, WindowsParity::Sound] {
+            for tab in [SettingsTab::Audio, SettingsTab::General, SettingsTab::Help] {
+                let (clip, size, _) = caption(level, tab.nav_label());
+                let button = nav_button_rect(shown_content(), tab.index());
+                assert_eq!(clip, button, "{tab:?}");
+                assert_eq!(size, super::super::NORMAL_FONT, "{tab:?}");
+            }
+            let (clip, size, bounds) = caption(level, "Microphone");
+            assert!(size < super::super::NORMAL_FONT, "fitted: {size}");
+            assert!(
+                bounds.right() <= divider_x(shown_content()),
+                "{bounds:?} {clip:?}"
+            );
+        }
+        // Off: every caption stops short of the rule.
+        let (clip, _, bounds) = caption(WindowsParity::Off, "Audio");
+        assert_ne!(clip, nav_button_rect(shown_content(), 0));
+        assert!(bounds.right() <= divider_x(shown_content()));
+    }
+
+    #[test]
     fn a_caption_that_fits_keeps_the_normal_font_and_only_a_long_one_is_set_smaller() {
-        // In English the original's three captions keep getNormalFont(); the port's Microphone
-        // and Applications, about 93 and 98 points in it, come down to fit 81.
+        // In English the original's three captions keep getNormalFont(); the port's Microphone,
+        // Applications and Experimental, about 93, 98 and 90 points in it, come down to fit 81.
         let ctx = test_context();
         let content = content();
         let room = nav_label_rect(nav_button_rect(content, 0)).width();
         frame(&ctx, |ui| {
-            for (tab, text, size, width) in fitted_captions(ui, room) {
+            for (tab, text, caption, widest) in fitted_captions(ui, room) {
                 if !text.starts_with("en: ") {
                     continue;
                 }
-                let long = matches!(tab, SettingsTab::Microphone | SettingsTab::Applications);
-                assert_eq!(size < super::super::NORMAL_FONT, long, "{text} at {size}");
+                assert_eq!(caption.lines.len(), 1, "{text}");
+                let long = matches!(
+                    tab,
+                    SettingsTab::Microphone | SettingsTab::Applications | SettingsTab::Experimental
+                );
+                assert_eq!(
+                    caption.size < super::super::NORMAL_FONT,
+                    long,
+                    "{text} at {}",
+                    caption.size
+                );
                 if long {
                     // As large as fits, to the half point.
-                    assert!(width > room - 5.0, "{text}: {width} in {room}");
+                    assert!(widest > room - 5.0, "{text}: {widest} in {room}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_long_word_breaks_where_the_translation_marks_it_and_shows_a_hyphen_there() {
+        // «Экспериментальное» is 117.6 points even at the smallest size, in 81.
+        let ctx = test_context();
+        frame(&ctx, |ui| {
+            let caption = nav_caption(ui.ctx(), "Эксперимен{-}тальное", 81.0);
+            assert_eq!(caption.lines, ["Эксперимен-", "тальное"]);
+            assert!(caption.size >= MIN_NAV_FONT);
+            // A caption that fits one line keeps it, and the mark does not show.
+            let short = nav_caption(ui.ctx(), "Ау{-}дио", 81.0);
+            assert_eq!(short.lines, ["Аудио"]);
+            assert_eq!(short.size, super::super::NORMAL_FONT);
+        });
+    }
+
+    #[test]
+    fn a_caption_of_two_words_breaks_at_the_space_that_sets_it_largest() {
+        let ctx = test_context();
+        frame(&ctx, |ui| {
+            // About 115 points at the smallest size, and each word well inside 81 at a larger one.
+            let caption = nav_caption(ui.ctx(), "Postavke aplikacija", 81.0);
+            assert_eq!(caption.lines, ["Postavke", "aplikacija"]);
+            assert!(caption.size > MIN_NAV_FONT, "{caption:?}");
+        });
+    }
+
+    #[test]
+    fn two_lines_of_the_nav_caption_role_fit_the_button_whatever_face_draws_them() {
+        // The role's pitch is explicit: an Arabic face first in the chain would otherwise make
+        // each line 2.112 em tall, and two lines of 12 points 50.7.
+        let ctx = test_context();
+        frame(&ctx, |ui| {
+            for text in [["Eksperimen-", "talno"], ["تجريبية", "الإعدادات"]] {
+                let mut size = MIN_NAV_FONT;
+                while size <= super::super::NORMAL_FONT {
+                    let caption = NavCaption {
+                        lines: text.iter().map(|line| (*line).to_owned()).collect(),
+                        size,
+                    };
+                    let height = caption.layout(ui.ctx(), Color32::WHITE).size().y;
+                    assert!(height <= BUTTON_SIZE.y, "{text:?} at {size}: {height}");
+                    size += 0.5;
                 }
             }
         });
@@ -4647,6 +5532,18 @@ mod tests {
             let shapes = std::mem::take(&mut output.shapes);
             output.drop_without_applying_deltas();
             (actions, shapes)
+        }
+
+        /// A frame of the main window with the Settings pane closed: `events` reach no pane.
+        fn closed_frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE)),
+                events,
+                ..Default::default()
+            };
+            self.ctx
+                .run_ui(input, |_| {})
+                .drop_without_applying_deltas();
         }
 
         fn click(&mut self, state: &SettingsState, at: egui::Pos2) -> Vec<SettingsAction> {
@@ -5363,9 +6260,10 @@ mod tests {
         for tab in SettingsTab::ALL {
             let row = nav_button_rect(content, tab.index()).center().y;
             assert!(app_list_rect(pane).y_range().contains(row), "{tab:?}");
+            // The Audio pane's list starts below the first row and ends above the sixth.
             assert_eq!(
                 output_list_rect(pane).y_range().contains(row),
-                tab != SettingsTab::Audio,
+                !matches!(tab, SettingsTab::Audio | SettingsTab::Experimental),
                 "{tab:?}"
             );
         }
@@ -5406,5 +6304,570 @@ mod tests {
             }
         });
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    // ---- the Experimental pane ---------------------------------------------------------------
+
+    fn experimental_state(level: WindowsParity) -> SettingsState {
+        let mut state = SettingsState {
+            tab: SettingsTab::Experimental,
+            ..SettingsState::default()
+        };
+        state.settings.windows_parity = level;
+        state
+    }
+
+    /// Where the slider's position for `level` is, in a window at the origin.
+    fn detent(level: WindowsParity) -> egui::Pos2 {
+        let track = slider::track_rect(parity_slider_rect(shown_pane()));
+        let last = (WindowsParity::SLIDER_LEVELS.len() - 1) as f32;
+        pos2(
+            track.left() + track.width() * level.index() as f32 / last,
+            track.center().y,
+        )
+    }
+
+    fn pointer(at: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: at,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    #[test]
+    fn the_experimental_tab_button_selects_the_experimental_pane() {
+        let outer = Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE);
+        let content = super::super::content_rect(outer);
+        let actions = click_settings(&populated(), nav_button_rect(content, 5).center());
+        assert_eq!(
+            actions,
+            [SettingsAction::SelectTab(SettingsTab::Experimental)]
+        );
+    }
+
+    #[test]
+    fn every_tab_declares_the_level_that_hides_it() {
+        // Exhaustive in the code; the decisions of the contract pinned here
+        // (`docs/0.5.0-windows-parity.md` §3).
+        for tab in SettingsTab::ALL {
+            let expected = match tab {
+                SettingsTab::Audio
+                | SettingsTab::General
+                | SettingsTab::Help
+                | SettingsTab::Experimental => ParityClass::Never,
+                SettingsTab::Microphone | SettingsTab::Applications => ParityClass::Full,
+            };
+            assert_eq!(tab.parity_class(), expected, "{tab:?}");
+        }
+        // The way back is never hidden, whatever the level.
+        for level in WindowsParity::ALL {
+            assert!(!level.changes(SettingsTab::Experimental.parity_class()));
+        }
+    }
+
+    #[test]
+    fn each_position_of_the_slider_sits_over_its_own_label() {
+        let pane = shown_pane();
+        for level in WindowsParity::SLIDER_LEVELS {
+            let label = parity_label_rect(pane, level.index());
+            assert!(
+                (detent(level).x - label.center().x).abs() < 1e-3,
+                "{level:?}: {:?} over {label:?}",
+                detent(level)
+            );
+        }
+        // Heading, slider, labels and hint, top to bottom, inside the pane's margins.
+        let slider = parity_slider_rect(pane);
+        assert!(parity_heading_rect(pane).bottom() <= slider.top());
+        assert!(slider.bottom() <= parity_label_rect(pane, 0).top());
+        assert!(parity_label_rect(pane, 0).bottom() <= parity_hint_rect(pane).top());
+        let row = parity_row(pane);
+        assert!(slider.left() >= row.left() && slider.right() <= row.right());
+        assert!(parity_label_rect(pane, 2).right() <= row.right() + 1e-3);
+    }
+
+    #[test]
+    fn the_slider_offers_off_interface_and_interface_and_sound_and_not_everything_yet() {
+        let state = experimental_state(WindowsParity::Off);
+        let (_, shapes) = Window::new(ThemeMode::Dark).frame(&state, Vec::new());
+        let texts: Vec<String> = crate::views::testing::texts(&shapes)
+            .into_iter()
+            .map(|(text, _, _)| text)
+            .collect();
+        for level in WindowsParity::SLIDER_LEVELS {
+            assert!(texts.iter().any(|text| text == level.label()), "{texts:?}");
+        }
+        assert!(
+            !texts.iter().any(|text| text == WindowsParity::Full.label()),
+            "{texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_click_on_a_position_or_on_its_label_applies_it_and_the_one_chosen_asks_for_nothing() {
+        let state = experimental_state(WindowsParity::Off);
+        let mut window = Window::new(ThemeMode::Dark);
+        assert_eq!(
+            window.click(&state, detent(WindowsParity::Interface)),
+            [SettingsAction::SetWindowsParity(WindowsParity::Interface)]
+        );
+        let mut window = Window::new(ThemeMode::Dark);
+        let label = parity_label_rect(shown_pane(), WindowsParity::Sound.index());
+        assert_eq!(
+            window.click(&state, label.center()),
+            [SettingsAction::SetWindowsParity(WindowsParity::Sound)]
+        );
+        let mut window = Window::new(ThemeMode::Dark);
+        assert_eq!(window.click(&state, detent(WindowsParity::Off)), []);
+    }
+
+    #[test]
+    fn a_drag_applies_the_position_it_is_let_go_at_and_none_it_passes() {
+        // From Off to Interface and sound: Interface is passed and never applied.
+        let state = experimental_state(WindowsParity::Off);
+        let mut window = Window::new(ThemeMode::Dark);
+        let primary = egui::PointerButton::Primary;
+        let from = detent(WindowsParity::Off);
+        let to = detent(WindowsParity::Sound);
+        let mut actions = Vec::new();
+        actions.extend(
+            window
+                .frame(&state, vec![egui::Event::PointerMoved(from)])
+                .0,
+        );
+        actions.extend(
+            window
+                .frame(
+                    &state,
+                    vec![
+                        egui::Event::PointerMoved(from),
+                        pointer(from, primary, true),
+                    ],
+                )
+                .0,
+        );
+        for step in 1..=12 {
+            let at = from + (to - from) * (step as f32 / 12.0);
+            actions.extend(window.frame(&state, vec![egui::Event::PointerMoved(at)]).0);
+        }
+        assert_eq!(actions, [], "nothing is applied while the drag is on");
+        actions.extend(window.frame(&state, vec![pointer(to, primary, false)]).0);
+        actions.extend(window.frame(&state, Vec::new()).0);
+        assert_eq!(
+            actions,
+            [SettingsAction::SetWindowsParity(WindowsParity::Sound)]
+        );
+    }
+
+    /// Press the thumb at Off and drag it to Interface and sound without letting go.
+    fn drag_to_sound_and_hold(window: &mut Window, state: &SettingsState) -> Vec<SettingsAction> {
+        let primary = egui::PointerButton::Primary;
+        let from = detent(WindowsParity::Off);
+        let to = detent(WindowsParity::Sound);
+        let mut actions = window.frame(state, vec![egui::Event::PointerMoved(from)]).0;
+        actions.extend(
+            window
+                .frame(
+                    state,
+                    vec![
+                        egui::Event::PointerMoved(from),
+                        pointer(from, primary, true),
+                    ],
+                )
+                .0,
+        );
+        for step in 1..=12 {
+            let at = from + (to - from) * (step as f32 / 12.0);
+            actions.extend(window.frame(state, vec![egui::Event::PointerMoved(at)]).0);
+        }
+        actions
+    }
+
+    #[test]
+    fn a_drag_cut_short_by_escape_applies_nothing_when_the_pane_opens_again() {
+        let state = experimental_state(WindowsParity::Off);
+        let mut window = Window::new(ThemeMode::Dark);
+        let mut actions = drag_to_sound_and_hold(&mut window, &state);
+        // Escape with the button still held: the pane closes, and the level stays Off.
+        actions.extend(
+            window
+                .frame(
+                    &state,
+                    vec![
+                        key_event(egui::Key::Escape, true),
+                        key_event(egui::Key::Escape, false),
+                    ],
+                )
+                .0,
+        );
+        assert_eq!(actions, [SettingsAction::Close]);
+        // The button is let go with the pane closed, and time passes.
+        let to = detent(WindowsParity::Sound);
+        window.closed_frame(vec![pointer(to, egui::PointerButton::Primary, false)]);
+        for _ in 0..5 {
+            window.closed_frame(Vec::new());
+        }
+        // Opened again on Experimental: nothing is asked for, and the thumb is back at Off.
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            actions.extend(window.frame(&state, Vec::new()).0);
+        }
+        assert_eq!(actions, []);
+    }
+
+    #[test]
+    fn a_drag_the_pane_stopped_seeing_before_it_let_go_applies_nothing() {
+        // Not closed through the pane (hidden, or another tab drawn): the preview is still in
+        // memory, but no frame of the pane saw the let-go.
+        let state = experimental_state(WindowsParity::Off);
+        let mut window = Window::new(ThemeMode::Dark);
+        let mut actions = drag_to_sound_and_hold(&mut window, &state);
+        let to = detent(WindowsParity::Sound);
+        window.closed_frame(vec![pointer(to, egui::PointerButton::Primary, false)]);
+        window.closed_frame(Vec::new());
+        for _ in 0..3 {
+            actions.extend(window.frame(&state, Vec::new()).0);
+        }
+        assert_eq!(actions, []);
+    }
+
+    fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    #[test]
+    fn an_arrow_key_on_the_focused_slider_moves_it_one_position_and_applies_it_at_once() {
+        let state = experimental_state(WindowsParity::Off);
+        let mut window = Window::new(ThemeMode::Dark);
+        // Focused as Tab focuses it, by the slider's own id.
+        let mut actions = window.frame(&state, Vec::new()).0;
+        window.ctx.memory_mut(|m| {
+            m.request_focus(
+                Id::new("fx_slider").with(Id::new("fx_settings_dialog").with("parity")),
+            );
+        });
+        actions.extend(window.frame(&state, Vec::new()).0);
+        assert_eq!(actions, []);
+        for events in [
+            vec![key_event(egui::Key::ArrowRight, true)],
+            vec![key_event(egui::Key::ArrowRight, false)],
+            Vec::new(),
+        ] {
+            actions.extend(window.frame(&state, events).0);
+        }
+        assert_eq!(
+            actions,
+            [SettingsAction::SetWindowsParity(WindowsParity::Interface)]
+        );
+    }
+
+    #[test]
+    fn a_wheel_notch_over_the_slider_moves_it_one_position_and_applies_it_at_once() {
+        let state = experimental_state(WindowsParity::Off);
+        let mut window = Window::new(ThemeMode::Dark);
+        let over = detent(WindowsParity::Interface);
+        let mut actions = Vec::new();
+        for events in [
+            vec![egui::Event::PointerMoved(over)],
+            vec![
+                egui::Event::PointerMoved(over),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            Vec::new(),
+            Vec::new(),
+        ] {
+            actions.extend(window.frame(&state, events).0);
+        }
+        assert_eq!(
+            actions,
+            [SettingsAction::SetWindowsParity(WindowsParity::Interface)]
+        );
+    }
+
+    #[test]
+    fn a_right_click_on_the_slider_goes_back_to_off() {
+        let state = experimental_state(WindowsParity::Sound);
+        let mut window = Window::new(ThemeMode::Dark);
+        let at = detent(WindowsParity::Interface);
+        let secondary = egui::PointerButton::Secondary;
+        let mut actions = Vec::new();
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![egui::Event::PointerMoved(at), pointer(at, secondary, true)],
+            vec![pointer(at, secondary, false)],
+            Vec::new(),
+        ] {
+            actions.extend(window.frame(&state, events).0);
+        }
+        assert_eq!(
+            actions,
+            [SettingsAction::SetWindowsParity(WindowsParity::Off)]
+        );
+    }
+
+    #[test]
+    fn every_languages_positions_fit_two_lines_under_their_own_detent() {
+        let ctx = test_context();
+        let pane = pane_rect(content());
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            for level in WindowsParity::SLIDER_LEVELS {
+                let rect = parity_label_rect(pane, level.index());
+                for (code, text) in every_translation(level.label()) {
+                    let galley = centred_wrapped(
+                        ui.ctx(),
+                        &text,
+                        small_font(),
+                        Color32::PLACEHOLDER,
+                        rect.width(),
+                    );
+                    let rows = galley.rows.len();
+                    let size = galley.size();
+                    if rows > 2 || size.x > rect.width() + 0.01 || size.y > rect.height() {
+                        problems.push(format!(
+                            "{code}: {text:?} is {size:?} in {} rows, room {:?}",
+                            rows,
+                            rect.size()
+                        ));
+                    }
+                }
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn every_languages_hints_fit_one_line_of_the_pane_at_the_small_font() {
+        // The pane's one line, at the small font itself: no language's hint is set smaller.
+        let ctx = test_context();
+        let room = parity_hint_rect(pane_rect(content())).width();
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            for level in WindowsParity::ALL {
+                problems.extend(wider_than(ui, level.hint(), &small_font(), room));
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn every_languages_heading_and_pane_title_fit_their_rows() {
+        let ctx = test_context();
+        let pane = pane_rect(content());
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            problems.extend(wider_than(
+                ui,
+                LIKE_WINDOWS_TITLE,
+                &normal_font(),
+                parity_heading_rect(pane).width(),
+            ));
+            // A pane title is never broken: the break mark is taken out of it.
+            for tab in SettingsTab::ALL {
+                for (code, text) in every_translation(tab.pane_title()) {
+                    let text = text.replace(fxsound_core::i18n::BREAK, "");
+                    let used = ui
+                        .painter()
+                        .layout_no_wrap(text.clone(), title_font(), Color32::PLACEHOLDER)
+                        .size()
+                        .x;
+                    if used > pane_title_rect(pane).width() {
+                        problems.push(format!("{tab:?} {code}: {text:?} is {used:.1}"));
+                    }
+                }
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    // ---- Smooth moves in WirePlumber ------------------------------------------------------
+
+    fn with_hook(available: bool, on: bool, restart: WirePlumberRestart) -> SettingsState {
+        let mut state = experimental_state(WindowsParity::Off);
+        state.wireplumber_hook = WirePlumberHook {
+            available,
+            on,
+            restart,
+        };
+        state
+    }
+
+    /// What the pane draws for `state`, as text.
+    fn experimental_texts(state: &SettingsState) -> Vec<String> {
+        let mut window = Window::new(ThemeMode::Dark);
+        let (_, shapes) = window.frame(state, Vec::new());
+        crate::views::testing::texts(&shapes)
+            .into_iter()
+            .map(|(text, _, _)| text)
+            .collect()
+    }
+
+    #[test]
+    fn the_hooks_box_the_lines_under_it_and_its_button_sit_under_the_slider_inside_the_pane() {
+        let pane = shown_pane();
+        let hook = wireplumber_hook_rect(pane);
+        let line = wireplumber_line_rect(pane);
+        let button = restart_wireplumber_rect(pane, vec2(audio::RESET_MAX_WIDTH, 24.0));
+        assert!(parity_hint_rect(pane).bottom() < hook.top());
+        assert!(hook.bottom() <= line.top() && line.bottom() <= button.top());
+        let row = parity_row(pane);
+        for rect in [hook, line, button] {
+            assert!(
+                rect.left() >= row.left() && rect.right() <= row.right() + 1e-3,
+                "{rect:?} in {row:?}"
+            );
+        }
+        assert!(button.bottom() <= pane.bottom());
+    }
+
+    #[test]
+    fn ticking_smooth_moves_in_wireplumber_asks_for_the_hook_and_unticking_takes_it_away() {
+        let at = wireplumber_hook_rect(shown_pane()).left_center() + vec2(5.0, 0.0);
+        let off = with_hook(true, false, WirePlumberRestart::NotNeeded);
+        assert_eq!(
+            click_settings(&off, at),
+            [SettingsAction::SetWirePlumberHook(true)]
+        );
+        let on = with_hook(true, true, WirePlumberRestart::NotNeeded);
+        assert_eq!(
+            click_settings(&on, at),
+            [SettingsAction::SetWirePlumberHook(false)]
+        );
+    }
+
+    #[test]
+    fn without_wireplumber_0_5_the_box_cannot_be_ticked_but_a_hook_left_there_can_be_unticked() {
+        let at = wireplumber_hook_rect(shown_pane()).left_center() + vec2(5.0, 0.0);
+        let unavailable = with_hook(false, false, WirePlumberRestart::NotNeeded);
+        assert_eq!(click_settings(&unavailable, at), []);
+        assert!(experimental_texts(&unavailable).contains(&WIREPLUMBER_TOO_OLD.to_owned()));
+        let left_there = with_hook(false, true, WirePlumberRestart::NotNeeded);
+        assert_eq!(
+            click_settings(&left_there, at),
+            [SettingsAction::SetWirePlumberHook(false)]
+        );
+    }
+
+    #[test]
+    fn restart_wireplumber_is_offered_only_while_a_restart_is_due() {
+        let button = |state: &SettingsState| {
+            experimental_texts(state).contains(&RESTART_WIREPLUMBER.to_owned())
+        };
+        for (restart, line, offered) in [
+            (WirePlumberRestart::NotNeeded, WIREPLUMBER_HOOK_HINT, false),
+            (WirePlumberRestart::Due, WIREPLUMBER_RESTART_DUE, true),
+            (
+                WirePlumberRestart::Failed,
+                WIREPLUMBER_RESTART_FAILED,
+                false,
+            ),
+        ] {
+            let state = with_hook(true, true, restart);
+            assert_eq!(button(&state), offered, "{restart:?}");
+            let texts = experimental_texts(&state);
+            // Wrapped: each of the line's words is drawn.
+            let drawn = texts.join(" ");
+            assert!(
+                line.split_whitespace().all(|word| drawn.contains(word)),
+                "{restart:?}: {texts:?}"
+            );
+        }
+        let due = with_hook(true, false, WirePlumberRestart::Due);
+        let ctx = test_context();
+        let label = RESTART_WIREPLUMBER;
+        let mut width = 0.0;
+        frame(&ctx, |ui| {
+            width = ui
+                .painter()
+                .layout_no_wrap(label.to_owned(), normal_font(), Color32::PLACEHOLDER)
+                .size()
+                .x;
+        });
+        let at = restart_wireplumber_rect(shown_pane(), reset_button_size(label, width)).center();
+        assert_eq!(
+            click_settings(&due, at),
+            [SettingsAction::RestartWirePlumber]
+        );
+    }
+
+    #[test]
+    fn every_language_fits_the_hooks_box_its_lines_and_its_button() {
+        let ctx = test_context();
+        let pane = pane_rect(content());
+        let box_room = wireplumber_hook_rect(pane).width() - TICK_BOX_SIDE - TICK_BOX_GAP;
+        let line = wireplumber_line_rect(pane);
+        let mut problems = Vec::new();
+        frame(&ctx, |ui| {
+            problems.extend(wider_than(ui, WIREPLUMBER_HOOK, &normal_font(), box_room));
+            for key in [
+                WIREPLUMBER_HOOK_HINT,
+                WIREPLUMBER_TOO_OLD,
+                WIREPLUMBER_RESTART_DUE,
+                WIREPLUMBER_RESTART_FAILED,
+            ] {
+                for (code, text) in every_translation(key) {
+                    let size = ui
+                        .painter()
+                        .layout(
+                            text.clone(),
+                            small_font(),
+                            Color32::PLACEHOLDER,
+                            line.width(),
+                        )
+                        .size();
+                    if size.y > line.height() || size.x > line.width() {
+                        problems.push(format!("{code}: {text:?} is {size:?} in {:?}", line.size()));
+                    }
+                }
+            }
+            for (code, text) in every_translation(RESTART_WIREPLUMBER) {
+                let used = ui
+                    .painter()
+                    .layout_no_wrap(text.clone(), normal_font(), Color32::PLACEHOLDER)
+                    .size()
+                    .x;
+                if reset_button_size(&text, used).y > audio::RESET_LINE_HEIGHT {
+                    problems.push(format!("{code}: {text:?} wraps"));
+                }
+            }
+        });
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn the_pane_shows_the_chosen_positions_hint_and_draws_in_both_palettes() {
+        for level in WindowsParity::SLIDER_LEVELS {
+            let state = experimental_state(level);
+            for mode in [ThemeMode::Dark, ThemeMode::Light] {
+                let mut window = Window::new(mode);
+                let (actions, shapes) = window.frame(&state, Vec::new());
+                assert_eq!(actions, [], "{level:?}");
+                let texts: Vec<String> = crate::views::testing::texts(&shapes)
+                    .into_iter()
+                    .map(|(text, _, _)| text)
+                    .collect();
+                assert!(
+                    texts.iter().any(|text| text == level.hint()),
+                    "{level:?}: {texts:?}"
+                );
+                assert!(
+                    texts.iter().any(|text| text == LIKE_WINDOWS_TITLE),
+                    "{texts:?}"
+                );
+            }
+        }
     }
 }

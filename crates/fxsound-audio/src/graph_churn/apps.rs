@@ -14,7 +14,14 @@ use fxsound_core::{AppKey, AppStream};
 /// process is killed, and its stream goes with its connection.
 pub(crate) struct App {
     /// Kept for its drop, which kills the process.
-    _child: Guarded,
+    child: Guarded,
+}
+
+impl App {
+    /// The process id of its `pw-cat`: `setpriv`, when it is there, execs it in its own place.
+    pub(crate) fn pid(&self) -> u32 {
+        self.child.id()
+    }
 }
 
 impl PrivateGraph {
@@ -77,7 +84,7 @@ impl PrivateGraph {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        Some(App { _child: child })
+        Some(App { child })
     }
 }
 

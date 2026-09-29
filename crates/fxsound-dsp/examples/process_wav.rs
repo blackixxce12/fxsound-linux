@@ -15,10 +15,25 @@
 //!     --input "assets/presets/Input/Laptop Mic.toml" [--chain podcast] [--source-rate 16000]
 //! ```
 //!
+//! A `.fac` is played as the application plays it ([`fxsound_dsp::preset::preset_params`]): its
+//! effects read at their slider positions, its curve on `--bands` bands (ten unless said, fitted
+//! by frequency when the preset has another count), a Windows twenty-band curve moved onto the
+//! half-octave ladder, and the levels — `--master-gain`, `--balance`, `--volume-leveling`,
+//! `--filter-q` — the settings' rather than the preset's. So the blind comparisons of
+//! `scripts/voicing/` hear what the application plays, not the raw values of the file. The
+//! effect flags and `--no-eq` are set over the preset, whatever order they come in.
+//! `--compat windows` (or `--windows-dsp`) plays it as «Like FxSound for Windows» = Interface and
+//! sound does, through the Windows build's DSP ([`fxsound_core::DspCompat`]) and the Windows
+//! build's reading of it — a curve of another count by position, twenty bands on the Windows
+//! ladder, Ambience's slider on its straight line; `--compat linux`, the default, is Off's, and
+//! `preset_drift.rs` takes the same choice (`PRESET_DRIFT_COMPAT`). A build that has one DSP only
+//! plays that.
+//!
 //! Only 16-bit PCM WAV is handled, which is what `.wav` almost always means and what the original
 //! engine's `processAudio` took.
 
-use fxsound_core::{Effect, messages::DspParams};
+use fxsound_core::{Effect, Preset, messages::DspParams};
+use fxsound_dsp::preset::{MusicLevels, bands_of, preset_params, write_music_params};
 use fxsound_dsp::{ChainSpec, Engine, InputEngine};
 use std::path::Path;
 
@@ -26,9 +41,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let (Some(input), Some(output)) = (args.next(), args.next()) else {
         eprintln!(
-            "usage: process_wav <in.wav> <out.wav> [--preset FILE] \
+            "usage: process_wav <in.wav> <out.wav> [--preset FILE] [--bands N] \
              [--fidelity N] [--ambience N] [--surround N] [--dynamic-boost N] [--bass N] \
-             [--master-gain DB] [--balance DB] [--no-eq]\n       \
+             [--master-gain DB] [--balance DB] [--volume-leveling N] [--filter-q N] [--no-eq] \
+             [--compat linux|windows]\n       \
              process_wav <mic.wav> <out.wav> --input <voice preset .toml> [--chain NAME] \
              [--source-rate HZ]"
         );
@@ -40,7 +56,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return process_input(&input, &output, &rest);
     }
 
-    let mut params = DspParams::default();
+    // The effects, the switch and the levels as flags set them, applied over the preset — as
+    // the application plays it ([`fxsound_dsp::preset::preset_params`]) — whatever order they
+    // come in.
+    let mut preset: Option<Preset> = None;
+    let mut bands = fxsound_core::eq::DEFAULT_BANDS;
+    let mut levels = MusicLevels::default();
+    let mut effects: Vec<(Effect, f32)> = Vec::new();
+    let mut no_eq = false;
     let mut i = 0;
     while i < rest.len() {
         let flag = rest[i].as_str();
@@ -53,23 +76,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         match flag {
             // The command line takes the GUI's 0..10 scale, like the original's --fidelity.
-            "--fidelity" => params.set_effect(Effect::Fidelity, value()? / 10.0),
-            "--ambience" => params.set_effect(Effect::Ambience, value()? / 10.0),
-            "--surround" => params.set_effect(Effect::Surround, value()? / 10.0),
-            "--dynamic-boost" => params.set_effect(Effect::DynamicBoost, value()? / 10.0),
-            "--bass" => params.set_effect(Effect::Bass, value()? / 10.0),
-            "--master-gain" => params.master_gain_db = value()?,
-            "--balance" => params.balance = value()?,
-            "--no-eq" => params.eq_on = false,
+            "--fidelity" => effects.push((Effect::Fidelity, value()? / 10.0)),
+            "--ambience" => effects.push((Effect::Ambience, value()? / 10.0)),
+            "--surround" => effects.push((Effect::Surround, value()? / 10.0)),
+            "--dynamic-boost" => effects.push((Effect::DynamicBoost, value()? / 10.0)),
+            "--bass" => effects.push((Effect::Bass, value()? / 10.0)),
+            "--master-gain" => levels.master_gain_db = value()?,
+            "--balance" => levels.balance_db = value()?,
+            "--volume-leveling" => levels.volume_leveling = value()?,
+            "--filter-q" => levels.filter_q = value()?,
+            "--bands" => {
+                let count = value()?;
+                if !(1.0..=fxsound_core::eq::MAX_BANDS as f32).contains(&count)
+                    || count.fract() != 0.0
+                {
+                    return Err(format!(
+                        "--bands takes a whole number from 1 to {}",
+                        fxsound_core::eq::MAX_BANDS
+                    )
+                    .into());
+                }
+                bands = count as usize;
+            }
+            "--no-eq" => no_eq = true,
+            "--windows-dsp" => levels = levels.with_windows_dsp(true),
+            "--compat" => {
+                i += 1;
+                levels = levels.with_windows_dsp(match rest.get(i).map(String::as_str) {
+                    Some("windows") => true,
+                    Some("linux") => false,
+                    _ => return Err("--compat takes linux or windows".into()),
+                });
+            }
             "--preset" => {
                 i += 1;
                 let path = rest.get(i).ok_or("--preset needs a path")?;
-                apply_preset(&mut params, Path::new(path))?;
+                preset = Some(read_preset(Path::new(path))?);
             }
             other => return Err(format!("unknown option {other}").into()),
         }
         i += 1;
     }
+    let mut params = match &preset {
+        Some(preset) => preset_params(preset, &levels.ladder(bands), levels),
+        None => {
+            let mut params = DspParams::default();
+            write_music_params(
+                &mut params,
+                &[0.0; Effect::COUNT],
+                true,
+                &bands_of(&levels.ladder(bands), &vec![0.0; bands]),
+                levels,
+            );
+            params
+        }
+    };
+    for (effect, value) in effects {
+        params.set_effect(effect, value);
+    }
+    if no_eq {
+        params.eq_on = false;
+    }
+    params.sanitise();
 
     let wav = Wav::read(Path::new(&input))?;
     println!(
@@ -249,16 +317,12 @@ fn process_input(
     Ok(())
 }
 
-fn apply_preset(params: &mut DspParams, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// A `.fac` from disk, as the application reads one.
+fn read_preset(path: &Path) -> Result<Preset, Box<dyn std::error::Error>> {
     let bytes = std::fs::read(path)?;
     let preset = fxsound_preset::parse(&bytes)?;
     println!("preset: {}", preset.name);
-    for effect in Effect::ALL {
-        params.set_effect(effect, preset.effect(effect));
-    }
-    params.set_bands(&preset.eq_bands);
-    params.eq_on = preset.eq_on;
-    Ok(())
+    Ok(preset)
 }
 
 /// The smallest WAV reader/writer that covers 16-bit PCM.
