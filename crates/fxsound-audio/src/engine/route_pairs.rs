@@ -1107,6 +1107,7 @@ fn build_pair(
         fades_seen: volume.fades(),
         last_sound: None,
         fade_next: AtomicBool::new(false),
+        cut: CutWatch::default(),
         dsp: Some(dsp),
     };
     let first_label = first_name.clone();

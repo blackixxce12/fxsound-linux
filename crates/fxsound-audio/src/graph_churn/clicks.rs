@@ -106,8 +106,10 @@
 //! plus [`BARE_MARGIN_DB`] (§7, test 4; [`against_bare_linux`]): its loudest run of all against
 //! plain Linux's, each read above the tone ([`above_the_tone`]) rather than in dBFS, since
 //! FxSound's chain plays the tone louder than plain Linux and every cut of it with it — a user
-//! hears a click beside the sound it cuts. With FxSound off the pick is WirePlumber's alone, and
-//! reported: it is what the other is held to.
+//! hears a click beside the sound it cuts. What the move leaves at the monitor of the speakers
+//! FxSound played through, read on that monitor alone — the end of the sound it cut off in
+//! FxSound's chain, faded since D4 — is gated ([`left_behind`]). With FxSound off the pick is
+//! WirePlumber's alone, and reported: it is what the other is held to.
 //!
 //! # Running it
 //!
@@ -137,8 +139,10 @@
 //!   power switch with following streams and for the route, D3 for FxSound's own pick of a device
 //!   and for its claim after the desktop's, and each holds the dip to its budget with
 //!   [`EventResult::dip_ms`] as well ([`Scenario::budget`]). D3 also held WirePlumber's move after
-//!   the desktop's pick to plain Linux + 3 dB ([`against_bare_linux`]); D5, whose hook makes it
-//!   fade, is to gate it in a test of its own.
+//!   the desktop's pick to plain Linux + 3 dB ([`against_bare_linux`]); D4 faded FxSound's part
+//!   of it, the tail it cut off in FxSound's chain, and gates it at the monitor of the speakers
+//!   FxSound played through, read on its own ([`left_behind`]); D5, whose hook makes the rest
+//!   fade, is to gate that in a test of its own.
 //! * A phase that says a reported switch got quieter judges by the loudest run, of several passes,
 //!   not by a shift of the median: what WirePlumber's move leaves spreads over about 20 dB (below).
 //! * A phase that changes what a scenario sets up — a new node between the tone and the recorder,
@@ -260,6 +264,23 @@
 //! pass made with [`against_bare_linux`], and −8.8 and −6.9 in a fifth, the gate's, with every
 //! measurement at once. FxSound's chain makes it no louder, and that holds it there. Floors as
 //! before.
+//!
+//! The tail de-click, measured on 29.09.2026 at D4 of 0.5.0 (`crate::engine`, "A sound cut off"):
+//! WirePlumber's move after the desktop's pick with FxSound on, over twelve passes of the test
+//! above, each speakers' monitor also read on its own. On the speakers FxSound had played through,
+//! the move left −88.8 to −105.6 dBFS in 136 picks of 144, where it had left a step of the chain's
+//! tone; in the other 8, six of them the third pick, the recording skipped a few milliseconds of
+//! the fade downstream of FxSound, whose own blocks were played whole (traced), and jumped into it
+//! at −8.4 to −16.3. On the picked speakers the application arrived unprocessed at −18.8 to −48.0,
+//! as in plain Linux. The move's median, switch by switch, went from −11.6…−26.2 dBFS to
+//! −18.8…−31.6 (plain Linux −18.8…−25.9); its loudest run above the tone to −17.7 dB in the five
+//! passes with no skip, −7.3 to −15.1 in the others (−8.8 to −10.5 at D3), and −17.7 in a
+//! thirteenth, the gate's, with every measurement at once. The microphone's lane, whose device
+//! never goes silent, and FxSound's own switches, as at D3. The monitor of the speakers FxSound had
+//! played through is read on its own in the test since, each pick in its own row, and gated
+//! ([`left_behind`]): −89.2 to −97.1 dBFS in a fourteenth pass, the loudest run −89.2, and −89.0
+//! to −97.0 in the gate's; with the fade taken out of the engine, 10 of a pass's 12 picks at −11.6
+//! to −26.2, and it fails.
 //!
 //! E6a measured the same switches with the app's release build, where this runs the engine
 //! unoptimised, and in another order. The switches FxSound makes itself agree within a few dB,
@@ -1528,6 +1549,11 @@ struct Run {
     /// The frames each lane's ring came up short or overflowed by, and its resyncs, in
     /// [`DeviceDirection::ALL`]'s order.
     ring: [u64; 2],
+    /// A scenario of the desktop's picks with FxSound on ([`Scenario::claims`]), heard on both
+    /// speakers: each pick's WirePlumber's move read at the monitor of the speakers FxSound had
+    /// played through before it alone, the loudest high-passed sample in dBFS
+    /// ([`left_behind`]). Empty for any other scenario.
+    left_behind: Vec<f64>,
 }
 
 /// Run `scenario` once on a fresh bench. `None` when it cannot run here.
@@ -1678,6 +1704,7 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
         "the private WirePlumber went away"
     );
     drop(streams);
+    let mut left_behind = Vec::new();
     let lanes = lanes
         .iter()
         .zip(ends)
@@ -1696,6 +1723,9 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
                     .flat_map(|(&at, &then)| Window::split(at, then))
                     .collect();
                 let clear: Vec<usize> = frames[1..].iter().chain(&lane.claims).copied().collect();
+                if lane.direction == DeviceDirection::Output && scenario.both_devices {
+                    left_behind = speakers_left_behind(scenario, &recording, &frames, &windows);
+                }
                 analyse_windows(&recording, frames[0], &windows, &clear)
             } else {
                 analyse(&recording, frames[0], &frames[1..])
@@ -1703,7 +1733,51 @@ fn run_once(scenario: &Scenario) -> Option<Run> {
         })
         .collect();
     bench.engine.shutdown();
-    Some(Run { lanes, xruns, ring })
+    Some(Run {
+        lanes,
+        xruns,
+        ring,
+        left_behind,
+    })
+}
+
+/// Each desktop pick's WirePlumber's move — the first of its two rows ([`Window::split`]) — read
+/// at the monitor of the speakers FxSound had played through before it alone, out of a speakers'
+/// lane `recording` [`joined`] from both monitors, each one's two channels in the order of
+/// [`lane_devices`]: the loudest high-passed sample in dBFS, pick by pick. What is heard there is
+/// the end of the sound FxSound's chain played, cut off by the move ([`left_behind`]).
+fn speakers_left_behind(
+    scenario: &Scenario,
+    recording: &Channels,
+    frames: &[usize],
+    windows: &[Window],
+) -> Vec<f64> {
+    let speakers = [lane_devices(false)[0], lane_devices(true)[0]];
+    let monitors: Vec<Analysis> = (0..speakers.len())
+        .map(|monitor| {
+            let channels = recording
+                .iter()
+                .skip(monitor * Tap::CHANNELS)
+                .take(Tap::CHANNELS)
+                .cloned()
+                .collect();
+            analyse_windows(&channels, frames[0], windows, &frames[1..])
+        })
+        .collect();
+    scenario
+        .switches
+        .iter()
+        .enumerate()
+        .filter_map(|(n, switch)| {
+            let Switch::Desktop(other) = switch else {
+                return None;
+            };
+            // Before the pick of the `other` devices, FxSound played through the first ones.
+            let before = lane_devices(!other)[0];
+            let monitor = speakers.iter().position(|sink| *sink == before)?;
+            Some(monitors.get(monitor)?.events.get(2 * n)?.worst_dbfs)
+        })
+        .collect()
 }
 
 /// A scenario's result: the median of its clean runs.
@@ -1995,6 +2069,89 @@ fn against_bare_linux(
                 failures.push(line);
             }
         }
+    }
+    Report { text, failures }
+}
+
+/// How many of a pass's picks may leave [`HARD_GATE_DBFS`] or more at the speakers FxSound played
+/// through, of all the clean runs, before [`left_behind`] fails it: a quarter. Now and then the
+/// monitor's recorder skips a few milliseconds of the fade downstream of FxSound, whose own blocks
+/// were played whole, and jumps into it — 8 picks in 144 over twelve passes at D4, six of them the
+/// third, at −8.4 to −16.3 dBFS — which its recording cannot tell from a sound FxSound left cut
+/// off. Without the fade every pick is one (roadmap 0.5.0 §7, D4).
+const SKIPPED_FADES: f64 = 0.25;
+
+/// Hold what WirePlumber's move after each desktop pick with FxSound on leaves on the speakers
+/// FxSound had played through ([`Run::left_behind`]) to the gate, run by run: since D4 the end of
+/// the sound the move cut off in FxSound's chain fades there (`crate::engine`, "A sound cut off"),
+/// and what is left of the move is the application arriving on the picked speakers, unprocessed,
+/// as in plain Linux ([`against_bare_linux`]). Every pick over the gate is listed; more than
+/// [`SKIPPED_FADES`] of them fail the pass. The text for the table, and what the gate fails.
+fn left_behind(scenario: &Scenario, gate: Gate, clean: &[Run]) -> Report {
+    let mut text = String::new();
+    let mut failures = Vec::new();
+    let picks: Vec<(usize, usize, f64)> = clean
+        .iter()
+        .enumerate()
+        .flat_map(|(run, measured)| {
+            measured
+                .left_behind
+                .iter()
+                .enumerate()
+                .map(move |(pick, &worst)| (run, pick, worst))
+        })
+        .collect();
+    let labels: Vec<String> = scenario.switches.iter().map(Switch::label).collect();
+    if picks.is_empty() {
+        let line = format!(
+            "{}: no clean run read the speakers FxSound played through",
+            scenario.title
+        );
+        let _ = writeln!(text, "WARNING: {line}");
+        if gate == Gate::Hard {
+            failures.push(line);
+        }
+        return Report { text, failures };
+    }
+    let _ = writeln!(
+        text,
+        "## output: WirePlumber's move at the monitor of the speakers FxSound played through"
+    );
+    for (n, label) in labels.iter().enumerate() {
+        let mut values: Vec<f64> = picks
+            .iter()
+            .filter(|(_, pick, _)| *pick == n)
+            .map(|(.., worst)| *worst)
+            .collect();
+        let loudest = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let worst = median(&mut values).unwrap_or(f64::NAN);
+        let _ = writeln!(
+            text,
+            "  {label:<32} worst {worst:6.1} dBFS (loudest run {loudest:6.1})"
+        );
+    }
+    let loud: Vec<String> = picks
+        .iter()
+        .filter(|(.., worst)| *worst >= HARD_GATE_DBFS)
+        .map(|&(run, pick, worst)| {
+            let label = labels.get(pick).map_or("?", String::as_str);
+            format!("{label} in run {} at {worst:.1} dBFS", run + 1)
+        })
+        .collect();
+    if loud.is_empty() {
+        return Report { text, failures };
+    }
+    let line = format!(
+        "{}: at the speakers FxSound played through, {} of {} picks over {HARD_GATE_DBFS} dBFS, \
+         run by run: {}",
+        scenario.title,
+        loud.len(),
+        picks.len(),
+        loud.join("; ")
+    );
+    let _ = writeln!(text, "WARNING: {line}");
+    if gate == Gate::Hard && loud.len() as f64 > picks.len() as f64 * SKIPPED_FADES {
+        failures.push(line);
     }
     Report { text, failures }
 }
@@ -2337,7 +2494,9 @@ fn bare_desktop_picks() -> Option<&'static Measured> {
 /// held to [`HANDOVER_BUDGET`]; and WirePlumber's move, which roadmap §14 #16 leaves where plain
 /// Linux has it, held to the same picks with FxSound off + 3 dB ([`against_bare_linux`]): heard in
 /// FxSound's chain, above the tone and not in dBFS, since the chain plays the tone louder than
-/// plain Linux does. The tail it cuts off in FxSound's chain is D4's.
+/// plain Linux does. The tail it cuts off in FxSound's chain fades since D4 (`crate::engine`, "A
+/// sound cut off"), held to the gate at the monitor of the speakers FxSound played through
+/// ([`left_behind`]), and what is left is the application's arrival on the picked device.
 #[test]
 fn under_a_steady_tone_a_desktop_pick_with_fxsound_on_is_taken_back_without_a_click() {
     let gate = Gate::from_env();
@@ -2346,6 +2505,9 @@ fn under_a_steady_tone_a_desktop_pick_with_fxsound_on_is_taken_back_without_a_cl
         return;
     };
     let mut result = report(&scenario, gate, &measured.clean, &measured.discarded);
+    let faded = left_behind(&scenario, gate, &measured.clean);
+    result.text.push_str(&faded.text);
+    result.failures.extend(faded.failures);
     if let Some(bare) = bare_desktop_picks() {
         let held = against_bare_linux(
             &scenario,
@@ -2512,6 +2674,7 @@ fn wireplumbers_move_with_fxsound_on_is_held_to_plain_linux_plus_3_db_above_the_
         lanes: vec![analysis(tone, worst), analysis(tone, worst)],
         xruns: Some(0),
         ring: [0, 0],
+        left_behind: Vec::new(),
     };
     // Plain Linux: the tone at −12 dBFS, its loudest move at −19, 7 dB below it.
     let bare_runs = [
@@ -2547,6 +2710,72 @@ fn wireplumbers_move_with_fxsound_on_is_held_to_plain_linux_plus_3_db_above_the_
     // Nothing to hold it to is no pass.
     let held = against_bare_linux(&on, Gate::Hard, &quiet, &bare, &[]);
     assert_eq!(held.failures.len(), 2, "{:?}", held.failures);
+}
+
+#[test]
+fn a_desktop_pick_that_leaves_the_speakers_fxsound_played_through_loud_in_more_than_a_quarter_of_runs_fails()
+ {
+    let scenario = desktop_picks(true);
+    let run = |left_behind: [f64; 4]| Run {
+        lanes: Vec::new(),
+        xruns: Some(0),
+        ring: [0, 0],
+        left_behind: left_behind.to_vec(),
+    };
+    let faded = [-95.0, -101.2, -88.8, -99.0];
+    let quiet = [run(faded), run(faded), run(faded)];
+    let held = left_behind(&scenario, Gate::Hard, &quiet);
+    assert!(held.failures.is_empty(), "{:?}", held.failures);
+    assert!(
+        held.text
+            .contains("  desktop picks t_other, t_mic2    worst  -88.8 dBFS (loudest run  -88.8)"),
+        "{}",
+        held.text
+    );
+    assert!(!held.text.contains("WARNING"), "{}", held.text);
+
+    // The recorder skipped into the fade at the third pick of one run: listed, not failed.
+    let skipped = [run(faded), run([-95.0, -101.2, -12.4, -99.0]), run(faded)];
+    let held = left_behind(&scenario, Gate::Hard, &skipped);
+    assert!(held.failures.is_empty(), "{:?}", held.failures);
+    assert!(
+        held.text.contains(
+            "at the speakers FxSound played through, 1 of 12 picks over -40 dBFS, run by run: \
+             desktop picks t_other, t_mic2 in run 2 at -12.4 dBFS"
+        ),
+        "{}",
+        held.text
+    );
+
+    // Four picks of twelve: more than a quarter. Every pick, as before D4: the tail cut off.
+    let four = [
+        run([-12.0, -101.2, -12.4, -99.0]),
+        run([-95.0, -14.0, -88.8, -9.0]),
+        run(faded),
+    ];
+    assert_eq!(left_behind(&scenario, Gate::Hard, &four).failures.len(), 1);
+    let cut = [-11.6, -14.0, -12.4, -9.0];
+    let unfaded = [run(cut), run(cut), run(cut)];
+    assert_eq!(
+        left_behind(&scenario, Gate::Hard, &unfaded).failures.len(),
+        1
+    );
+    assert!(
+        left_behind(&scenario, Gate::Report, &unfaded)
+            .failures
+            .is_empty()
+    );
+
+    // Nothing read is no pass.
+    assert_eq!(left_behind(&scenario, Gate::Hard, &[]).failures.len(), 1);
+    let unread = [run(faded)].map(|mut run| {
+        run.left_behind.clear();
+        run
+    });
+    assert_eq!(
+        left_behind(&scenario, Gate::Hard, &unread).failures.len(),
+        1
+    );
 }
 
 #[test]
@@ -2686,6 +2915,7 @@ fn a_handovers_switch_over_the_gate_in_one_run_is_listed_and_in_two_fails_the_ha
         }],
         xruns: Some(0),
         ring: [0, 0],
+        left_behind: Vec::new(),
     };
     let quiet = [-70.0, -70.0];
 

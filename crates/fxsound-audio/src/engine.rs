@@ -257,6 +257,50 @@
 //! desktop's own move stays as plain Linux has it (roadmap 0.5.0 §14 #16). A per-application route
 //! still follows its lane by being built again on the new device (`route_pairs`), and the streams
 //! on it with it.
+//!
+//! # A sound cut off
+//!
+//! A stream that WirePlumber moves off FxSound's virtual node by itself — the desktop picking
+//! another default device, a mixer moving one application — leaves it between two cycles, in the
+//! middle of its wave, and so does any stream that stops at the end of a cycle's block. NODE 1
+//! goes on running on the silence the node mixes, and NODE 2 still has the last block NODE 1 pushed to play: until
+//! 0.5.0 it played it to its end and stopped there in a step, followed by what the chain made of the
+//! silence, the ring-out of its filters and reverb: on the speakers FxSound had played through,
+//! a step as loud as the chain plays the sound. It is half of the click of WirePlumber's move after
+//! the desktop's pick with FxSound on, the other half being the application arriving unprocessed on
+//! the picked device, as it does without FxSound (roadmap 0.5.0 §7, D4; §14 #15, #16).
+//!
+//! So NODE 1 watches for it ([`CutWatch`]): a block that ends at −40 dBFS or louder in its last
+//! frames ([`CUT_LEVEL`]) followed by one of digital silence, or by PipeWire's empty packet, is a
+//! sound cut off. The end of it that NODE 2 has not played yet fades to silence in the ring over
+//! [`CUT_FADE`] ([`SampleRing::fade_tail`]), and the chain is held silent from that block on, until
+//! the next sound, which fades in from silence as a new pair's first sound does. What is lost is
+//! the last 10 ms of a sound that was cut off anyway, and the ring-out after it. A sound that ends
+//! on its own, or a stream FxSound's own handover fades out, ends quieter than [`CUT_LEVEL`] and is
+//! left as it is.
+//!
+//! Only a cut between two blocks is found: a sound cut off inside a block — a player whose last
+//! buffer ends partway through a cycle and is padded with silence — is left as it is, although
+//! roadmap 0.5.0 §7 names it. Its step is in the block the application hands over, which the
+//! chain plays as it plays every block, not in what the ring holds from before; plain Linux plays
+//! the same step, and FxSound adds none of its own, its chain playing on into its ring-out. Fading
+//! it would mean rewriting the application's block in front of the chain, at a point found by
+//! looking for exact zeros after loud samples, which a sound may hold on its own; the ring's fade
+//! cannot reach it.
+//!
+//! Measured in the click test (`graph_churn::clicks`) on the desktop's picks, the speakers' monitors
+//! read one by one over twelve passes, 144 picks: the speakers FxSound had played through went from
+//! a step at the level of the move itself to −88.8 to −105.6 dBFS in 136 of them, and the picked
+//! speakers, where the application arrives unprocessed, stayed at −18.8 to −48.0. In the other 8,
+//! six of them the third pick of the test, the recording skips a few milliseconds of the fade
+//! downstream of FxSound — NODE 2 had played the block before whole and the faded one whole — and
+//! jumps into it at −8.4 to −16.3. So the move's median, switch by switch, went from −11.6…−26.2
+//! dBFS to −18.8…−31.6, plain Linux's −18.8…−25.9; its loudest run, read above the tone, to −17.7 dB
+//! in the five passes with no skip, and stayed at −7.3 to −15.1 in the others (−8.8 to −10.5 before).
+//! The click test gates it since (`left_behind` there): at the speakers FxSound had played through,
+//! more than a quarter of a pass's picks at −40 dBFS or louder fail it — without the fade, 10 of
+//! 12. `take_block` and `take_empty_packet` are NODE 1's blocks without the stream around them,
+//! and their tests hold the chain from the cut to the next sound.
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -811,6 +855,42 @@ impl SampleRing {
         self.primed.store(false, Ordering::Relaxed);
     }
 
+    /// NODE 1 found the sound it pushes cut off between two blocks ([`CutWatch`]): fade the last
+    /// `frames` of it the consumer has not taken yet down to silence, over half a cosine whose last
+    /// frame is silence, so the device hears the sound end over a few milliseconds rather than in a
+    /// step. Fewer than `frames` left unplayed are faded over what is left. **Producer only**: of
+    /// the two cursors it only reads, and the slots it writes are ones only the producer ever
+    /// writes.
+    ///
+    /// The consumer may be taking the same samples in the same moment when the two nodes run on
+    /// different data loops, which PipeWire does not rule out (see the type's docs). Each slot is
+    /// an atomic of its own, so what it takes is then a sample as pushed or as faded, never a torn
+    /// one: at worst the first frames of the fade are played unfaded. Where the two nodes run on
+    /// one loop, as a pair does whose NODE 2 is passive, the consumer has run for the cycle before
+    /// this producer runs, and what is unplayed is exactly the cushion.
+    pub(crate) fn fade_tail(&self, frames: usize) {
+        let channels = self.channels.load(Ordering::Relaxed).max(1);
+        let write = self.write.load(Ordering::Relaxed);
+        let read = self.read.load(Ordering::Acquire);
+        let unplayed = write.wrapping_sub(read).min(self.slots.len()) / channels;
+        let length = frames.min(unplayed);
+        if length == 0 {
+            return;
+        }
+        let start = write.wrapping_sub(length * channels);
+        let step = std::f32::consts::PI / length as f32;
+        for frame in 0..length {
+            let gain = 0.5 * (1.0 + (step * (frame + 1) as f32).cos());
+            for channel in 0..channels {
+                let index = start.wrapping_add(frame * channels + channel) & self.mask;
+                if let Some(slot) = self.slots.get(index) {
+                    let faded = f32::from_bits(slot.load(Ordering::Relaxed)) * gain;
+                    slot.store(faded.to_bits(), Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     /// The fill the consumer primes to, in frames: a block and a half of the largest block it has
     /// taken since the ring was last reconfigured.
     pub(crate) fn target_fill_frames(&self) -> usize {
@@ -1220,6 +1300,9 @@ pub(crate) struct SinkData {
     /// This pair's next block fades in from silence ([`first_node_went_idle`]). This pair's own,
     /// not the lane volume's fade count, which the lane's per-application routes share with it.
     fade_next: AtomicBool,
+    /// Whether the last block ended loud, and whether the chain is held silent since a sound was
+    /// cut off after it (module docs, "A sound cut off").
+    cut: CutWatch,
 }
 
 impl SinkData {
@@ -1246,6 +1329,7 @@ impl SinkData {
             fades_seen: lane.volume.fades(),
             last_sound: None,
             fade_next: AtomicBool::new(false),
+            cut: CutWatch::default(),
             dsp: Some(dsp),
         }
     }
@@ -7490,6 +7574,97 @@ fn woke_after_standing_still(gap: Duration, frames: usize, rate: u32) -> bool {
     gap > STOOD_STILL.max(Duration::from_nanos(block_nanos.saturating_mul(4)))
 }
 
+/// How long the end of a sound cut off between two blocks fades over, in the ring (module docs,
+/// "A sound cut off"): about the block and a half NODE 2 has not played yet at the quantum FxSound
+/// asks for, and half the 20 ms every gain FxSound moves itself glides over.
+const CUT_FADE: Duration = Duration::from_millis(10);
+
+/// How loud the end of a block has to be for the digital silence after it to be a sound cut off:
+/// −40 dBFS, the gate the click test holds FxSound's own switches to. A step from anything quieter
+/// is a click under it. A sound that ends on its own ends below it, and so does a stream the
+/// smooth handover fades out — its last step, 8 samples of 20 ms, is 1/120 of full scale
+/// (`crate::stream_handover`).
+const CUT_LEVEL: f32 = 0.01;
+
+/// How many frames at the end of a block say whether it ended loud ([`CUT_LEVEL`]): one step of
+/// the handover's fade, and short enough that a wave cut off anywhere but right at its crossing
+/// of zero is still loud there.
+const CUT_END_FRAMES: usize = 8;
+
+/// What a block NODE 1 is about to process says about the sound before it (module docs, "A sound
+/// cut off").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    /// Nothing to do: the sound goes on, or the silence does, or a sound ended quietly.
+    Nothing,
+    /// The last block ended loud and this one is digital silence: the sound was cut off.
+    Now,
+    /// Sound again, after a cut: the chain is heard again, faded in from silence.
+    Resumed,
+}
+
+/// NODE 1's watch for a sound cut off between two blocks. Plain data on the data thread: two
+/// flags in the node's user data.
+#[derive(Debug, Default)]
+pub(crate) struct CutWatch {
+    /// The last block had sound and ended at [`CUT_LEVEL`] or louder.
+    ended_loud: bool,
+    /// A sound was cut off and nothing has been heard since: the chain is held silent.
+    silenced: bool,
+}
+
+impl CutWatch {
+    /// Take the next block: whether it `has_sound` at all ([`holds_sound`]) and whether it
+    /// `ends_loud` ([`ends_loud`]).
+    fn block(&mut self, has_sound: bool, ends_loud: bool) -> Cut {
+        let was_loud = std::mem::replace(&mut self.ended_loud, has_sound && ends_loud);
+        if has_sound {
+            if std::mem::take(&mut self.silenced) {
+                Cut::Resumed
+            } else {
+                Cut::Nothing
+            }
+        } else if was_loud {
+            self.silenced = true;
+            Cut::Now
+        } else {
+            Cut::Nothing
+        }
+    }
+
+    /// Whether the chain is held silent since a sound was cut off.
+    const fn silenced(&self) -> bool {
+        self.silenced
+    }
+}
+
+/// Whether a block of interleaved `f32` samples, as the stream hands them over, ends at
+/// [`CUT_LEVEL`] or louder in any channel of its last [`CUT_END_FRAMES`] frames.
+fn ends_loud(bytes: &[u8], channels: usize) -> bool {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .rev()
+        .take(CUT_END_FRAMES * channels.max(1))
+        .any(|sample| f32::from_le_bytes(*sample).abs() >= CUT_LEVEL)
+}
+
+/// NODE 1 found the sound it had been pushing cut off ([`Cut::Now`]): fade the end of it the
+/// device has not played yet over [`CUT_FADE`], and hold the chain silent from the first sample of
+/// this block, rather than fading it out from here as a mute does — what the chain goes on making
+/// of the silence is the rest of a sound whose end is now faded ([`LaneDsp::fade_in`] starts a
+/// fade from silence, which takes the mute as the next block finds it).
+fn cut_off(data: &mut SinkData) {
+    let rate = u128::from(data.format.rate());
+    let frames = rate * CUT_FADE.as_micros() / 1_000_000;
+    data.ring
+        .fade_tail(usize::try_from(frames).unwrap_or(usize::MAX));
+    if let Some(dsp) = data.dsp.as_mut() {
+        dsp.fade_in();
+    }
+}
+
 /// Whether a block of `f32` samples, as the stream hands them over, holds anything but digital
 /// silence: a sample other than `+0.0` or `-0.0`. A quantum's block is a few kilobytes to look at.
 fn holds_sound(bytes: &[u8]) -> bool {
@@ -7527,23 +7702,50 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
         .contains(libspa::buffer::ChunkFlags::CORRUPTED);
 
     let channels = data.channels;
-    if channels == 0 || size == 0 || corrupted {
-        // A zero-sized chunk is PipeWire's silent packet, the analogue of
-        // `AUDCLNT_BUFFERFLAGS_SILENT` (`sndDevicesDoCapture.cpp:186-191`). Pushing nothing lets
-        // the ring drain and NODE 2 emit silence, which is the same outcome with less work. No
-        // channels is no format yet, or one the ring was not built for ([`adopt_sink_format`]).
+    if channels == 0 || corrupted {
+        // No channels is no format yet, or one the ring was not built for
+        // ([`adopt_sink_format`]).
         return;
     }
-    let has_sound = chunk_data
+    if size == 0 {
+        take_empty_packet(data);
+        return;
+    }
+    let valid = chunk_data
         .data()
-        .and_then(|bytes| bytes.get(offset..offset.saturating_add(size)))
-        .is_some_and(holds_sound);
-    if has_sound {
+        .and_then(|bytes| bytes.get(offset..offset.saturating_add(size)));
+    take_block(data, valid);
+}
+
+/// PipeWire's silent packet, a zero-sized chunk: the analogue of `AUDCLNT_BUFFERFLAGS_SILENT`
+/// (`sndDevicesDoCapture.cpp:186-191`). Pushing nothing lets the ring drain and NODE 2 emit
+/// silence, which is the same outcome with less work — and after a block that ended loud, it is a
+/// sound cut off, whose end still in the ring fades (module docs, "A sound cut off").
+fn take_empty_packet(data: &mut SinkData) {
+    if data.cut.block(false, false) == Cut::Now {
+        cut_off(data);
+    }
+}
+
+/// NODE 1's block, `valid` as the stream hands it over — `None` when its bytes are not there —
+/// run through the lane's chain and pushed to the ring. The part of [`on_sink_process`] after the
+/// buffer is taken, and every rule of it.
+fn take_block(data: &mut SinkData, valid: Option<&[u8]>) {
+    let channels = data.channels;
+    let (has_sound, loud_end) = valid.map_or((false, false), |valid| {
+        let has_sound = holds_sound(valid);
+        (has_sound, has_sound && ends_loud(valid, channels))
+    });
+    let cut = data.cut.block(has_sound, loud_end);
+    if cut == Cut::Now {
+        cut_off(data);
+    }
+    if has_sound && let Some(valid) = valid {
         let now = Instant::now();
         if let Some(last) = data.last_sound.replace(now)
             && woke_after_standing_still(
                 now.saturating_duration_since(last),
-                size / (channels * size_of::<f32>()),
+                valid.len() / (channels.max(1) * size_of::<f32>()),
                 data.format.rate(),
             )
         {
@@ -7563,9 +7765,16 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
     let fades = data.volume.fades();
     dsp.set_volume(&data.volume.gains());
     // Silent too while the lane moves to another device, its virtual node kept: one more load.
+    // And after a sound cut off, until the next one (module docs, "A sound cut off").
     dsp.set_system_mute(
-        data.system_mute.load(Ordering::Relaxed) || data.status.switch_mute.load(Ordering::Acquire),
+        data.system_mute.load(Ordering::Relaxed)
+            || data.status.switch_mute.load(Ordering::Acquire)
+            || data.cut.silenced(),
     );
+    // The first sound after a cut: the chain comes back from silence.
+    if cut == Cut::Resumed {
+        dsp.fade_in();
+    }
     // The target's port changed under the pair and the volume with it (`follow_port`): the new
     // level fades in from silence, as a new pair's does.
     if fades != data.fades_seen {
@@ -7584,10 +7793,7 @@ fn on_sink_process(stream: &pw::stream::Stream, data: &mut SinkData) {
         dsp.fade_in();
     }
 
-    let Some(bytes) = chunk_data.data() else {
-        return;
-    };
-    let Some(valid) = bytes.get(offset..offset.saturating_add(size)) else {
+    let Some(valid) = valid else {
         return;
     };
 
@@ -14549,6 +14755,308 @@ mod tests {
                 "{port}"
             );
         }
+    }
+
+    /// A sound cut off between two blocks (module docs, "A sound cut off"): the end of it NODE 2
+    /// has not played yet fades to silence over half a cosine, and what it had played is left.
+    #[test]
+    fn the_unplayed_end_of_a_sound_cut_off_fades_to_silence_in_the_ring() {
+        let ring = ring_for(2, 4); // target fill = 6 frames
+        ring.push(&[0.5; 24]); // 12 frames
+        let mut played = [0.0_f32; 8]; // 4 frames per cycle
+        assert_eq!(ring.pop(&mut played), 8);
+        assert_eq!(
+            played, [0.5; 8],
+            "what was played before the cut is as it was"
+        );
+
+        ring.fade_tail(6);
+        let mut rest = [0.0_f32; 16];
+        assert_eq!(ring.pop(&mut rest), 16);
+        let frames: Vec<[f32; 2]> = rest.as_chunks::<2>().0.to_vec();
+        assert_eq!(
+            frames[..2],
+            [[0.5, 0.5]; 2],
+            "only the last six frames fade"
+        );
+        for pair in frames[2..].windows(2) {
+            assert!(pair[1][0] < pair[0][0], "{frames:?}");
+        }
+        for frame in &frames {
+            assert!(
+                (frame[0] - frame[1]).abs() < f32::EPSILON,
+                "both channels alike"
+            );
+        }
+        assert!(
+            frames[2][0] > 0.45,
+            "the fade starts from the sound: {frames:?}"
+        );
+        assert!(
+            frames[7][0].abs() < 1.0e-6,
+            "and ends in silence: {frames:?}"
+        );
+    }
+
+    /// Fewer frames left unplayed than the fade asks for: the fade is over what is left, from the
+    /// sound to silence all the same, and what NODE 2 took is not reached back into.
+    #[test]
+    fn a_cut_with_less_left_unplayed_than_the_fade_fades_over_what_is_left() {
+        let ring = ring_for(1, 4); // target fill = 6 frames
+        ring.push(&[1.0; 9]);
+        let mut played = [0.0_f32; 6];
+        assert_eq!(ring.pop(&mut played), 6);
+        ring.fade_tail(480);
+        let mut rest = [0.0_f32; 3];
+        assert_eq!(ring.pop(&mut rest), 3);
+        assert_eq!(played, [1.0; 6]);
+        assert!(rest[0] > 0.7 && rest[0] < 1.0, "{rest:?}");
+        assert!(rest[1] < rest[0], "{rest:?}");
+        assert!(rest[2].abs() < 1.0e-6, "{rest:?}");
+
+        let empty = ring_for(2, 4);
+        empty.fade_tail(480);
+        assert_eq!(empty.fill_frames(), 0, "an empty ring has nothing to fade");
+    }
+
+    #[test]
+    fn a_block_ends_loud_when_its_last_frames_reach_minus_40_dbfs_in_any_channel() {
+        let bytes =
+            |samples: &[f32]| -> Vec<u8> { samples.iter().flat_map(|s| s.to_le_bytes()).collect() };
+        let mut block = vec![0.0_f32; 64];
+        assert!(!ends_loud(&bytes(&block), 2), "silence");
+        block[62] = 0.02; // the last frame's left channel
+        assert!(ends_loud(&bytes(&block), 2));
+        block[62] = 0.009;
+        assert!(!ends_loud(&bytes(&block), 2), "under −40 dBFS");
+        block[62] = 0.0;
+        block[64 - 2 * CUT_END_FRAMES] = -0.5; // the first of the last eight frames
+        assert!(ends_loud(&bytes(&block), 2));
+        block[64 - 2 * CUT_END_FRAMES] = 0.0;
+        block[64 - 2 * CUT_END_FRAMES - 1] = -0.5; // just before them
+        assert!(
+            !ends_loud(&bytes(&block), 2),
+            "a sound that ended before the block did"
+        );
+        assert!(!ends_loud(&[], 2));
+        assert!(
+            !ends_loud(&bytes(&[f32::NAN; 16]), 2),
+            "what is not a number is not loud"
+        );
+    }
+
+    /// The smooth handover fades a stream out in steps of eight samples over 20 ms at 48 kHz
+    /// (`crate::stream_handover`): its last step is 1/120 of the sound, under [`CUT_LEVEL`] even
+    /// at full scale, so a stream FxSound faded out is never taken for one cut off.
+    #[test]
+    fn a_stream_the_handover_faded_out_does_not_end_loud() {
+        let steps = u32::try_from(48_000 * crate::stream_handover::RAMP_MS / 1000)
+            .expect("a positive ramp")
+            / u32::try_from(crate::stream_handover::RAMP_STEP_SAMPLES).expect("a positive step");
+        let last_step = 1.0 / steps as f32;
+        let block: Vec<u8> = std::iter::repeat_n(last_step, 16)
+            .chain(std::iter::repeat_n(0.0, 48))
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert!(!ends_loud(&block, 2));
+        let end: Vec<u8> = std::iter::repeat_n(last_step, 64)
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        assert!(!ends_loud(&end, 2), "{last_step}");
+    }
+
+    #[test]
+    fn a_loud_block_followed_by_silence_is_a_cut_and_the_next_sound_ends_it() {
+        let mut watch = CutWatch::default();
+        assert_eq!(watch.block(true, true), Cut::Nothing, "a sound goes on");
+        assert_eq!(watch.block(true, true), Cut::Nothing);
+        assert!(!watch.silenced());
+        assert_eq!(watch.block(false, false), Cut::Now);
+        assert!(watch.silenced(), "the chain is held silent after the cut");
+        assert_eq!(watch.block(false, false), Cut::Nothing, "one cut, one fade");
+        assert!(watch.silenced());
+        assert_eq!(watch.block(true, false), Cut::Resumed);
+        assert!(!watch.silenced(), "the next sound is heard, faded in");
+        assert_eq!(
+            watch.block(false, false),
+            Cut::Nothing,
+            "a sound that ended quietly is no cut"
+        );
+        assert!(!watch.silenced());
+        assert_eq!(watch.block(true, true), Cut::Nothing);
+        assert_eq!(watch.block(true, false), Cut::Nothing, "sound going quiet");
+        assert_eq!(watch.block(false, false), Cut::Nothing);
+    }
+
+    /// NODE 2's block in the tests of a sound cut off, in frames.
+    const CUT_BLOCK: usize = 256;
+
+    /// The output lane's NODE 1 as a running pair has it: stereo at 48 kHz, its ring sized for
+    /// [`CUT_BLOCK`]-frame blocks.
+    fn node_one_at_48_khz(shared: &mut Shared) -> SinkData {
+        let mut data = node_one_for_tests(shared);
+        adopt_sink_format(&mut data, FORMAT, Pod::from_bytes(&negotiated(2)));
+        data.ring.reconfigure(2, CUT_BLOCK);
+        data
+    }
+
+    /// A block of a 1 kHz sine at half of full scale in both channels, as an application hands it
+    /// over, from frame `from` of the tone on.
+    fn tone_block(from: usize) -> Vec<u8> {
+        (from..from + CUT_BLOCK)
+            .flat_map(|frame| {
+                let sample = 0.5 * (std::f32::consts::TAU * frame as f32 / 48.0).sin();
+                [sample, sample]
+            })
+            .flat_map(f32::to_le_bytes)
+            .collect()
+    }
+
+    /// NODE 2's cycle: a block of [`CUT_BLOCK`] frames from the ring, the left channel of what it
+    /// took of the sound — not the silence it plays while the ring primes — added to `played`.
+    fn node_two_plays(ring: &SampleRing, played: &mut Vec<f32>) {
+        let mut block = [0.0_f32; 2 * CUT_BLOCK];
+        let taken = ring.pop(&mut block);
+        played.extend(block.iter().take(taken).step_by(2));
+    }
+
+    fn peak(samples: &[f32]) -> f32 {
+        samples
+            .iter()
+            .fold(0.0, |max, sample| max.max(sample.abs()))
+    }
+
+    /// What NODE 2 played around a sound cut off, frame by frame of what NODE 1 pushed, and where
+    /// in it the fade was, and where the next sound began.
+    struct AroundACut {
+        played: Vec<f32>,
+        /// The frames NODE 2 had not played yet when the sound was cut off, the sound's last ones.
+        unplayed: std::ops::Range<usize>,
+        next: usize,
+    }
+
+    /// A sound NODE 1 takes eight blocks of, `cut` off, then two blocks of digital silence and
+    /// PipeWire's empty packet between them, and the sound again for eight blocks, NODE 2 taking a
+    /// block after each as a pair does — all through `take_block` and `take_empty_packet`, as
+    /// `on_sink_process` hands them the stream's blocks.
+    fn played_around_a_cut(cut: fn(&mut SinkData)) -> AroundACut {
+        let mut shared = shared_with_dsp_for_tests();
+        let mut data = node_one_at_48_khz(&mut shared);
+        let ring = Arc::clone(&data.ring);
+        let pushed = |data: &SinkData| {
+            usize::try_from(data.counters.frames_processed.load(Ordering::Relaxed))
+                .expect("a test's frames")
+        };
+        let silence = vec![0_u8; 2 * CUT_BLOCK * size_of::<f32>()];
+        let mut played = Vec::new();
+        for block in 0..8 {
+            take_block(&mut data, Some(&tone_block(block * CUT_BLOCK)));
+            node_two_plays(&ring, &mut played);
+        }
+        let sound_end = pushed(&data);
+        let unplayed = sound_end - ring.fill_frames()..sound_end;
+
+        cut(&mut data);
+        node_two_plays(&ring, &mut played);
+        take_block(&mut data, Some(&silence));
+        node_two_plays(&ring, &mut played);
+        take_empty_packet(&mut data);
+        node_two_plays(&ring, &mut played);
+        take_block(&mut data, Some(&silence));
+        node_two_plays(&ring, &mut played);
+
+        let next = pushed(&data);
+        for block in 0..8 {
+            take_block(&mut data, Some(&tone_block((8 + block) * CUT_BLOCK)));
+            node_two_plays(&ring, &mut played);
+        }
+        for _ in 0..4 {
+            node_two_plays(&ring, &mut played);
+        }
+        assert_eq!(
+            played.len(),
+            pushed(&data),
+            "NODE 2 played all of it, in order"
+        );
+        drop(data);
+        drain_recycled_dsp(&mut shared);
+        AroundACut {
+            played,
+            unplayed,
+            next,
+        }
+    }
+
+    /// What NODE 2 plays after the cut: what it had not played yet faded to silence over
+    /// [`CUT_FADE`] or what there is of it, and then nothing — no ring-out of the chain — until
+    /// the next sound, which fades in from silence over the 30 ms of a new pair
+    /// ([`crate::lane_dsp::FADE_IN_SECONDS`]), not the 20 of a mute's fade back.
+    fn assert_faded_out_held_silent_and_faded_in(around: &AroundACut) {
+        let AroundACut {
+            played,
+            unplayed,
+            next,
+        } = around;
+        let (from, to) = (unplayed.start, unplayed.end);
+        assert!(to - from >= CUT_BLOCK, "a block's cushion: {unplayed:?}");
+        let before = peak(&played[from - 96..from]);
+        assert!(before > 0.25, "the chain plays the sound: {before}");
+        assert!(
+            peak(&played[from..from + 48]) > 0.9 * before,
+            "the fade starts from the sound: {:?}",
+            &played[from..from + 8]
+        );
+        assert!(
+            peak(&played[to - 24..to]) < 0.02 * before,
+            "and goes down: {:?}",
+            &played[to - 24..to]
+        );
+        assert!(
+            played[to - 1].abs() < 1.0e-6,
+            "to silence: {}",
+            played[to - 1]
+        );
+        assert!(
+            played[to..*next].iter().all(|sample| *sample == 0.0),
+            "and the chain is silent after it, over {} frames: {}",
+            next - to,
+            peak(&played[to..*next])
+        );
+
+        let sound = &played[*next..];
+        let steady = peak(&sound[sound.len() - 96..]);
+        assert!(steady > 0.25, "the next sound is heard: {steady}");
+        assert!(
+            peak(&sound[..48]) < 0.05 * steady,
+            "and fades in from silence: {:?}",
+            &sound[..8]
+        );
+        assert!(
+            peak(&sound[1152..1200]) < 0.9 * steady,
+            "over 30 ms: {} of {steady}",
+            peak(&sound[1152..1200])
+        );
+        assert!(
+            peak(&sound[1488..1584]) > 0.95 * steady,
+            "and is at its level after them: {} of {steady}",
+            peak(&sound[1488..1584])
+        );
+    }
+
+    #[test]
+    fn a_sound_cut_off_by_a_silent_block_fades_out_leaves_the_chain_silent_and_the_next_sound_fades_in()
+     {
+        let silence = |data: &mut SinkData| {
+            let block = vec![0_u8; 2 * CUT_BLOCK * size_of::<f32>()];
+            take_block(data, Some(&block));
+        };
+        assert_faded_out_held_silent_and_faded_in(&played_around_a_cut(silence));
+    }
+
+    #[test]
+    fn a_sound_cut_off_by_pipewires_empty_packet_fades_out_leaves_the_chain_silent_and_the_next_sound_fades_in()
+     {
+        assert_faded_out_held_silent_and_faded_in(&played_around_a_cut(take_empty_packet));
     }
 
     #[test]

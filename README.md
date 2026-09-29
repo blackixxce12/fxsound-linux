@@ -730,8 +730,12 @@ Each of these is a considered decision, not an oversight:
   same channel count and rate, so nothing playing or recording through FxSound is moved: the sound
   dips for about a tenth of a second instead of clicking twice as WirePlumber moved it away and
   back. After a pick in the desktop's sound settings, WirePlumber's own move to the picked device
-  still clicks as plain Linux does; FxSound's taking it back is faded. A device with another
-  channel count or rate still has both nodes built anew, as before.
+  still clicks as plain Linux does where the application arrives, unprocessed; on the speakers
+  FxSound was playing through, the part of the sound it had not played yet fades out over 10 ms,
+  as it does whenever an application is taken off FxSound in the middle of its sound (the preset's
+  ring-out after it is dropped, and the next sound fades in over 30 ms), and FxSound's taking the
+  default back is faded. A device with another channel count or rate still has both
+  nodes built anew, as before.
 - **An application silenced in the middle of a move gets its volume back.** For that tenth of a
   second FxSound keeps each faded application's volume in `~/.local/state/fxsound/handover.toml`.
   Should FxSound be killed right then, the application is left silent — WirePlumber even keeps the

@@ -1218,6 +1218,10 @@ fn on_sink_process(&mut self) {
 }
 ```
 
+*0.5.0:* a block of digital silence or an empty packet right after a block that ended loud is a
+sound cut off: before the push, the unplayed end of the ring fades out and the chain is held
+silent until the next sound (§19.7, "A sound cut off").
+
 **NODE 2 (output):**
 
 ```rust
@@ -1394,6 +1398,23 @@ next volume key would raise it.
 
 **A new pair fades in.** The first 30 ms a new pair processes rise linearly from silence, in both
 lanes, after the volume (`lane_dsp::FADE_IN_SECONDS`).
+
+**A sound cut off.** *0.5.0 (D4).* A stream moved off FxSound's virtual sink — the desktop picking
+another default device, a mixer moving one application — leaves it between two cycles, in the
+middle of its wave, while NODE 2 still holds the block and a half NODE 1 pushed last. Until 0.5.0
+it played that to its end and stopped there in a step as loud as the sound, followed by the
+preset's ring-out. Now NODE 1 watches for it (`engine::CutWatch`): a block whose last 8 frames
+reach −40 dBFS in any channel (`CUT_LEVEL`, `CUT_END_FRAMES`), followed by one of digital silence
+or by an empty packet (`chunk->size == 0`), is a sound cut off. The last 10 ms of it NODE 2 has
+not played yet fade to silence over half a cosine in the ring (`SampleRing::fade_tail`,
+`CUT_FADE`; fewer frames if fewer are left), and the chain is held silent from that block on —
+through the same mute as the system mute, so no ring-out — until the next sound, which fades in
+over 30 ms as a new pair's does (`cut_off`, `FADE_IN_SECONDS`). A sound that ends on its own, or a
+stream the smooth handover faded out (its last step is 1/120 of full scale), ends below the level
+and is left as it is. A sound cut off *inside* a block, padded with silence by the application,
+is not found: its step is in the block the application hands over, which plain Linux plays too.
+Measured in `graph_churn::clicks` on the desktop's picks (§21, the polite protocol, step 4): at
+the speakers FxSound had played through, −88.8 to −105.6 dBFS in 136 of 144 picks.
 
 The rule that matters most is unchanged: **nothing here writes the real device's `Props`.** Only
 FxSound's own two virtual nodes are written, and only with the volume they had or a lower one.
@@ -1694,8 +1715,16 @@ value:            {"name":"fxsound_sink"}
    10.9 dB on the speakers, 7.2 on the microphone), may be no more than 3 dB over the loudest run
    of the same picks with FxSound off (§7 test 4 of the roadmap; `against_bare_linux`). It was
    −10.5 dB (−8.8 in one pass) against −6.8 on the speakers and −6.9 against −5.3 on the
-   microphone. Its cut of the chain's input is D4's. `graph_churn::switch` checks that the sink, the source and the
-   applications' links stay.
+   microphone. The move cuts the application off FxSound's sink between two cycles, in the
+   middle of its wave; since 0.5.0 the end of it NODE 2 has not played yet fades out over 10 ms
+   in the ring and the chain's ring-out after it is dropped (§19.7, "A sound cut off"). At the
+   speakers FxSound had played through, the pick went from a step at the level of the move itself
+   to −88.8 to −105.6 dBFS in 136 of 144 picks (twelve passes); in the other 8 the recording skips
+   into the fade at −8.4 to −16.3. What is left of the move is the application arriving
+   unprocessed on the picked device (−18.8 to −48.0), as in plain Linux; the click test gates the
+   speakers left behind (`left_behind`: no more than a quarter of a pass's picks at −40 dBFS or
+   louder). `graph_churn::switch` checks that the sink, the source and the applications' links
+   stay.
 5. **Restore on exit**, in this order (this is the Linux `sndDevicesRestoreDefaultDevice`,
    `sndDevicesSetupDevices.cpp:545-644`):
    1. Pick the first *present* sink from `user_selected_playback` → `most_recent_playback` →

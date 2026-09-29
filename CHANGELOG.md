@@ -89,6 +89,15 @@ All notable changes to the FxSound Linux port. The format follows
   desktop's sound settings FxSound takes the default back without a click too; WirePlumber's own
   move to the picked device, before FxSound hears of it, still clicks, as in plain Linux and no
   louder for the sound it cuts.
+- **A sound cut off in the middle no longer ends in a click on FxSound's side.** When an
+  application is taken off FxSound in the middle of its sound — the desktop's sound settings
+  picking another device, a mixer moving it — the part FxSound had not played yet stopped in a
+  step, as loud as the sound, followed by the ring-out of the preset. It now fades out over 10 ms;
+  the preset's ring-out after such a cut, its reverb's and filters', is dropped with it, and the
+  next sound fades in over 30 ms. On the speakers FxSound was playing through, the desktop's pick
+  went from that step to −89 dBFS or less in 136 picks of 144; what is left of the move is the
+  application arriving on the picked device, as in plain Linux. A sound an application itself
+  ends in a step, partway through the last of its sound it hands over, still ends as it was given.
 - **Following the system's default device, FxSound starts where the desktop last put it.** With
   *Follow the system's default device* on, a device picked in the desktop's sound settings moved
   the lane but was forgotten at the next start, which began on the device last picked in FxSound.
