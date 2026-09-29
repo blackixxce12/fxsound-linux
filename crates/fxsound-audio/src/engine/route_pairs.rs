@@ -1172,6 +1172,7 @@ fn build_pair(
         volume: None,
         stops_with_the_pair: passive,
         last_block: None,
+        ends_a_switch: false,
     };
     let second_label = second_name.clone();
     let second_listener = second

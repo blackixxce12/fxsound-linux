@@ -1655,6 +1655,47 @@ value:            {"name":"fxsound_sink"}
    click is PipeWire's to end. The tests are `graph_churn::clicks` (gated at −40 in the median, the
    gap at 200 ms, for `pw-cat` and for PulseAudio applications, with every run counted: one switch
    over the gate in a pass is listed, a second fails it) and `graph_churn::handover`.
+4c. **Another device, the same virtual node (0.5.0).** Until 0.5.0 a lane that moved to another
+   device — picked in FxSound, `--output`, `--next-output`, `--input`, a desktop pick it follows
+   (4a), a target that came back as a new node — dropped both of its nodes and built them again
+   there, and for as long as `fxsound_sink` was gone WirePlumber moved every application on it onto
+   a device of its own, unprocessed, and back: −4.9 to −10.3 dBFS on the speakers for FxSound's own
+   pick. Now a target at the format the pair runs at (`PairFormat`: channels, rate, and the
+   microphone's native rate) keeps the virtual node — `fxsound_sink`, `fxsound_source`, and a
+   keep-awake recorder on the source — and only the stream on the device is replaced: the
+   playback stream (NODE 2) or the capture stream (NODE 1, which is also how the capture stream
+   moves onto the echo canceller's source and back). No application is moved, and the claim on
+   the default is never in question. A new format still replaces the whole pair.
+   1. The lane's chain falls silent, as a mute does over 20 ms (`StreamStatus::switch_mute`, read
+      by NODE 1 beside the sleep's mute), and with something playing through the lane the stream
+      on the device goes only once that silence has been played on the old device: the fade and
+      three of the ring's cushions, 68 ms at a 512-frame quantum (`switch_tail`). The handover's
+      clock wakes the main loop for it.
+   2. The new stream is made on the new device. A capture stream takes the lane's DSP, silent; a
+      playback stream drops what the ring holds on its first block. The lane's volume is
+      remembered for the device it left and looked up for the new one, as for a new pair (§19.7),
+      and written to the kept virtual node.
+   3. The chain is heard again, faded in from silence, once the new stream's link to the device
+      is active (followed on the handover's connection) and has settled there for 60 ms, or two
+      cushions at a larger quantum (`switch_settle`) — or after 1 s regardless. Not on the new
+      stream's first block: it is in the virtual node's link-group, so the server runs it from the
+      moment it exists, linked or not, and a chain let out then faded in into nothing and started
+      on the device at full level. Nor at the link itself: the first cycles on the new device's
+      clock can leave the ring a block short, a gap in the middle of the wave.
+   4. After a desktop pick with the lane holding no default, the move to the device is made inside
+      the claim that takes the default back (4b), once the applications WirePlumber moved there are
+      faded to silence: a stream linked to their device while they play changes the quantum under
+      them, and a player or recorder whose quantum changes can skip samples.
+   Measured on a private graph with WirePlumber 0.5.17 and PipeWire 1.6.9 (`graph_churn::clicks`,
+   three passes): FxSound's pick −59.1 to −75.6 dBFS, a gap of 100–140 ms; its claim after a
+   desktop pick −59.9 to −66.7, a gap of 110–160 ms. The desktop's own move before it stays where
+   plain Linux has it (§14 #16 of the roadmap), and is held there: its loudest run, read above the
+   tone rather than in dBFS because the chain plays the tone louder than plain Linux does (by
+   10.9 dB on the speakers, 7.2 on the microphone), may be no more than 3 dB over the loudest run
+   of the same picks with FxSound off (§7 test 4 of the roadmap; `against_bare_linux`). It was
+   −10.5 dB (−8.8 in one pass) against −6.8 on the speakers and −6.9 against −5.3 on the
+   microphone. Its cut of the chain's input is D4's. `graph_churn::switch` checks that the sink, the source and the
+   applications' links stay.
 5. **Restore on exit**, in this order (this is the Linux `sndDevicesRestoreDefaultDevice`,
    `sndDevicesSetupDevices.cpp:545-644`):
    1. Pick the first *present* sink from `user_selected_playback` → `most_recent_playback` →
@@ -1721,7 +1762,9 @@ Implementation notes:
   registry `global_remove` for that node id → re-run the §19.5 rules on the next supervisor tick →
   reconnect NODE 2 with a new `target.object`. Do not tear down NODE 1; apps stay connected to it
   and never notice. Since 0.4.0 that is so for a node that has gone for good; a node whose card is
-  still there is first waited for (*A target that blinks*, below).
+  still there is first waited for (*A target that blinks*, below). *0.5.0:* only now is NODE 1
+  really kept, when the new target takes the pair's format (§21, 4c); 0.3.0 and 0.4.0 rebuilt the
+  whole pair.
 * Watch for `PIPEWIRE_REMOTE` / `XDG_RUNTIME_DIR` being unset (e.g. under a bare TTY or a flatpak
   without the `pipewire` socket permission) and fail with a clear message rather than looping.
 
@@ -1795,8 +1838,10 @@ Since 0.4.0 each lane decides per node that goes (`engine.rs`: `Hold`, `hold_for
   Whether the lane's pair is already on what the rules choose is asked of the target's
   `node.name` **and** its `object.serial` (`is_same_node`), never the name alone: WirePlumber
   never links a handled `node.dont-reconnect` stream again (`linking/prepare-link.lua:71-76`), so
-  a pair kept because the name matched would play into nothing. The new serial rebuilds the pair, and the new pair's NODE 2 is a new stream,
-  which WirePlumber links. A server that reports no serial leaves the name to decide, as before.
+  a pair kept because the name matched would play into nothing. The new serial replaces the
+  stream on the device — since 0.5.0 that stream alone, at the same format, the virtual node kept
+  (§21, 4c) — and the new stream is one WirePlumber links. A server that reports no serial leaves
+  the name to decide, as before.
 * **What is still waited out: a card switched to `off`.** A card set to its `off` profile (in
   `pavucontrol`'s Configuration tab, or by `wpctl set-profile`) removes its nodes and adds none,
   and its `Device` object stays. Nothing ends the hold early: no node comes back under the old
@@ -2377,9 +2422,10 @@ nodes vanish.
 
 Two rebuild paths deliberately **keep** the default, because the same node is about to reappear
 under the same name and `default.configured.audio.*` survives the gap: a target change within the
-same lane, and the supervisor's format-mismatch / NODE 1- or NODE 2-error rebuilds. Since 0.4.0 a
-stream error is one of these, a rebuild of that lane alone on its own backoff (`supervise_lane`,
-§29.1), and no longer a path to `disconnect`.
+same lane, and the supervisor's format-mismatch / NODE 1- or NODE 2-error rebuilds. (Since 0.5.0 a
+target change at the same format keeps the virtual node itself, and there is no gap at all: §21,
+4c.) Since 0.4.0 a stream error is one of these, a rebuild of that lane alone on its own backoff
+(`supervise_lane`, §29.1), and no longer a path to `disconnect`.
 
 ### 28.7 What the GUI receives
 

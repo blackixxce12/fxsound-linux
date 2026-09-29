@@ -724,6 +724,14 @@ Each of these is a considered decision, not an oversight:
   moment at full volume before the fade (it applies a new volume just before it starts the ramp
   to it), and that one clicks as before. The desktop's own device switcher still moves
   applications as plain Linux does, click and all.
+- **Changing the device keeps `FxSound (Output)` and `FxSound (Input)`.** A lane moved to another
+  device — picked in FxSound, `--output`, `--next-output`, `--input`, or followed from the
+  desktop's sound settings — replaces only its own stream on the device when the new one takes the
+  same channel count and rate, so nothing playing or recording through FxSound is moved: the sound
+  dips for about a tenth of a second instead of clicking twice as WirePlumber moved it away and
+  back. After a pick in the desktop's sound settings, WirePlumber's own move to the picked device
+  still clicks as plain Linux does; FxSound's taking it back is faded. A device with another
+  channel count or rate still has both nodes built anew, as before.
 - **An application silenced in the middle of a move gets its volume back.** For that tenth of a
   second FxSound keeps each faded application's volume in `~/.local/state/fxsound/handover.toml`.
   Should FxSound be killed right then, the application is left silent — WirePlumber even keeps the

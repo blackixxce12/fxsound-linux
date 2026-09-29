@@ -62,6 +62,10 @@ on, picked in the desktop's sound settings, which FxSound then follows even
 after a device was picked in FxSound, and starts on the next time \(en the
 device brings its preset back; a device used for the first time leaves the
 preset alone.
+A lane that moves to a device of the same channel count and rate keeps
+FxSound's own output or input, and replaces only its stream on the device, so
+an application playing or recording through FxSound is never moved: it hears
+a gap of about a tenth of a second instead of a click.
 Settings \(-> Audio sets the preset of each playback device, and Settings \(->
 Microphone the voice preset of each microphone, in the device's row of its
 priority list; set on the device a lane is on, it takes over at once. A renamed

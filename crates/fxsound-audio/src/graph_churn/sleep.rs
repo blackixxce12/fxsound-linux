@@ -276,29 +276,39 @@ fn holding_the_microphone_awake_runs_it_with_nobody_recording_and_lets_it_sleep_
             "the microphone held awake never reached the input lane's meters"
         );
 
-        // Another microphone while it is held: a new pair, and a recorder of its own with it — the
-        // old one's link went with the old source, and WirePlumber never relinks a stream like it.
-        let first = graph
-            .our_nodes()
-            .and_then(|nodes| serial_of(&nodes, KEEP_AWAKE_NODE_NAME))
-            .expect("the recorder is in the graph");
+        // Another microphone while it is held: only the capture stream is replaced, on the new
+        // microphone, and the source stays, and with it the recorder held on it and its link — as
+        // an application recording from FxSound (Input) keeps its own (roadmap 0.5.0 §7, D3).
+        let before = graph.our_nodes().expect("pw-dump answered a moment ago");
         handle.send(UiToAudio::SelectDevice {
             node_name: "t_mic".to_owned(),
             direction: DeviceDirection::Input,
         });
         assert!(said.attached(&handle, DeviceDirection::Input, Some("t_mic")));
         let again = graph.nodes_until(|nodes| {
-            serial_of(nodes, KEEP_AWAKE_NODE_NAME).is_some_and(|serial| serial != first)
+            serial_of(nodes, CAPTURE_NODE_NAME)
+                .is_some_and(|serial| Some(serial) != serial_of(&before, CAPTURE_NODE_NAME))
         });
-        assert!(
-            matches!(again, Some(Ok(_))),
-            "the new pair was not held awake: {again:?}"
-        );
+        let Some(Ok(after)) = again else {
+            panic!("the capture stream was not replaced on the new microphone: {again:?}");
+        };
+        for node in [SOURCE_NODE_NAME, KEEP_AWAKE_NODE_NAME] {
+            assert_eq!(
+                serial_of(&after, node),
+                serial_of(&before, node),
+                "{node} went with the microphone"
+            );
+        }
         assert_eq!(
             graph
-                .node_prop(KEEP_AWAKE_NODE_NAME, "target.object")
+                .node_prop(CAPTURE_NODE_NAME, "target.object")
                 .flatten(),
-            Some(SOURCE_NODE_NAME.to_owned())
+            Some("t_mic".to_owned())
+        );
+        assert_eq!(
+            graph.linked(SOURCE_NODE_NAME, KEEP_AWAKE_NODE_NAME),
+            Some(true),
+            "the recorder held on the source lost its link"
         );
 
         // Back on the tone, the wizard closes: the recorder goes, and nothing keeps the microphone

@@ -383,7 +383,9 @@ pub(super) fn fade_line(
 }
 
 /// A link was announced on the [`FadeLine`]. One from or into a stream a handover holds is bound,
-/// and its state listened to ([`link_active`]); every other is none of the handover's business.
+/// and its state listened to ([`link_active`]) — and so is one from or into the stream a lane put
+/// on its new device in a move that kept its virtual node (`super::switch_linked`); every other is
+/// none of the handover's business.
 ///
 /// The link's announcement is not the end of a move. WirePlumber creates the link, and the server
 /// negotiates its format and buffers before anything flows through it — a recorder moved between a
@@ -409,7 +411,7 @@ fn link_announced(
         };
         ends.into_iter()
             .flatten()
-            .any(|end| guard.fades.handover.holds(end))
+            .any(|end| guard.fades.handover.holds(end) || super::is_switching_stream(&guard, end))
     };
     if !held {
         return;
@@ -430,6 +432,8 @@ fn link_announced(
                     && let Ok(mut guard) = shared.try_borrow_mut()
                 {
                     link_active(&mut guard, info.output_node_id(), info.input_node_id());
+                    // A lane's new stream on its device, linked there: its chain is heard again.
+                    super::switch_linked(&mut guard, info.output_node_id(), info.input_node_id());
                 }
             }
         })
@@ -939,6 +943,8 @@ pub(super) fn attach_clock<'l>(
             if let Ok(mut guard) = shared.try_borrow_mut() {
                 guard.fades.armed = None;
                 drive(&mut guard);
+                // A lane's move to another device waits on the same clock ([`wake_at`]).
+                super::switch_devices_due(&mut guard);
             }
         }
     });
@@ -979,6 +985,17 @@ fn tick_at(asked: &crossbeam_channel::Receiver<Instant>, wake: impl Fn() -> bool
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
         }
+    }
+}
+
+/// Ask the clock to wake the main loop at `at`, for a step that is not the handover's: a lane's
+/// move to another device, once its chain has been heard silent on the old one
+/// (`super::switch_ready`). A step that is woken for asks again if it is still early; one asked
+/// for while a sooner wake-up is due is asked again by that wake-up ([`tick_at`]). Without a clock
+/// — the tests, which turn the loop by hand — the supervisor's tick makes the step.
+pub(super) fn wake_at(shared: &Shared, at: Instant) {
+    if let Some(clock) = &shared.fades.clock {
+        let _ = clock.send(at);
     }
 }
 

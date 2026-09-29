@@ -78,6 +78,17 @@ All notable changes to the FxSound Linux port. The format follows
   stopping. PipeWire older than 0.3.68 has no such fade, and moves them as before. Should FxSound
   be killed within that tenth of a second, its next start gives the application its volume back
   (`~/.local/state/fxsound/handover.toml`).
+- **Changing the device no longer clicks.** A lane moved to another device took FxSound's own
+  output or input down and built it again there, and meanwhile WirePlumber moved every application
+  on it onto a device of its own, unprocessed, and back: two clicks, as loud as −5 dBFS on the
+  speakers. When the new device takes the same channel count and rate, FxSound (Output) and
+  FxSound (Input) now stay, and only FxSound's own stream on the device is replaced, its sound
+  faded out before and in again once the new device plays it: a gap of about a tenth of a second,
+  −59 dBFS or less. That goes for a device picked in the window or the tray, `--output`,
+  `--next-output` and `--input`, and for echo cancellation switched on or off. After a pick in the
+  desktop's sound settings FxSound takes the default back without a click too; WirePlumber's own
+  move to the picked device, before FxSound hears of it, still clicks, as in plain Linux and no
+  louder for the sound it cuts.
 - **Following the system's default device, FxSound starts where the desktop last put it.** With
   *Follow the system's default device* on, a device picked in the desktop's sound settings moved
   the lane but was forgotten at the next start, which began on the device last picked in FxSound.
@@ -108,9 +119,12 @@ All notable changes to the FxSound Linux port. The format follows
   itself are held to −40 dBFS once 0.5.0 makes them quiet — the power button's and an
   application's own preset's already, with the gap they leave held to 200 ms, for `pw-cat` and for
   PulseAudio applications alike, and every run of them counted, not only the median: one switch
-  over −40 dBFS in a pass is listed (PipeWire's own, above), a second fails it. An application
-  recording from the default source has to record again within a second of each switch of the
-  power button. CI shows the measurements in the job's summary.
+  over −40 dBFS in a pass is listed (PipeWire's own, above), a second fails it. So are a device
+  chosen in FxSound and FxSound's taking the default back after the desktop's choice; the
+  desktop's own move before it is held to the same choice with FxSound off, plus 3 dB, each read
+  against the level of the sound it cuts. An application recording from the default source has to
+  record again within a second of each switch of the power button. CI shows the measurements in
+  the job's summary.
 - **The sound is checked bit for bit against 0.4.0.** CI renders every shipped preset at 10, 20
   and 31 bands through this version and through v0.4.0, from a cold start and while a preset, the
   band count and a slider are switched, and requires the same output: identical, or nowhere more

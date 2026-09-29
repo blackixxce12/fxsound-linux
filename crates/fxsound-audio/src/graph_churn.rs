@@ -74,6 +74,7 @@ mod handover;
 mod policy;
 mod routes;
 mod sleep;
+mod switch;
 mod volume;
 
 /// How long to wait for anything the server has to do.
@@ -3941,9 +3942,9 @@ fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
         "the speakers run while the canceller listens to them"
     );
 
-    // Off. The canceller goes, the capture stream is rebuilt on the microphone, and once it is
-    // linked there — the session manager's job, done here by hand — the microphone lane runs on
-    // without keeping the speakers awake.
+    // Off. The canceller goes, the capture stream is replaced on the microphone, FxSound's source
+    // kept (roadmap 0.5.0 §7, D3), and once it is linked there — the session manager's job, done
+    // here by hand — the microphone lane runs on without keeping the speakers awake.
     let mark = said.0.len();
     handle.send(UiToAudio::SetEchoCancel(false));
     assert!(heard_echo_cancel(
@@ -3971,16 +3972,13 @@ fn the_speakers_sleep_again_once_echo_cancellation_is_switched_off() {
             .is_some(),
         "the rebuilt capture stream was not given ports"
     );
-    assert!(
-        graph
-            .configure_ports(SOURCE_NODE_NAME, "Output", &["FL", "FR"])
-            .is_some(),
-        "the rebuilt source was not given ports"
-    );
     assert!(graph.link_nodes("t_tone", CAPTURE_NODE_NAME));
-    // The pair was rebuilt whole, so the recorder is linked to the new source as a session manager
-    // would link it.
-    assert!(graph.link_nodes(SOURCE_NODE_NAME, &recording.name));
+    // The source stayed, and the recorder with it, on the link it had.
+    assert_eq!(
+        graph.linked(SOURCE_NODE_NAME, &recording.name),
+        Some(true),
+        "the recorder of FxSound (Input) lost its link when the canceller went"
+    );
     assert_eq!(
         graph.runs_until(CAPTURE_NODE_NAME, true).map(drop),
         Ok(()),
@@ -4431,10 +4429,9 @@ fn a_headset_between_profiles_keeps_the_output_lane_and_its_sink_is_linked_again
         "the playback stream could not be linked to the headset"
     );
     assert_eq!(graph.linked(OUTPUT_NODE_NAME, HEADSET), Some(true));
-    let first = graph
-        .our_nodes()
-        .and_then(|nodes| serial_of(&nodes, OUTPUT_NODE_NAME))
-        .expect("the playback stream is in the graph");
+    let nodes = graph.our_nodes().expect("pw-dump answered a moment ago");
+    let first = serial_of(&nodes, OUTPUT_NODE_NAME).expect("the playback stream is in the graph");
+    let sink = serial_of(&nodes, SINK_NODE_NAME).expect("FxSound's sink is in the graph");
     let from = said.0.len();
 
     // The headset switches profile: its sink goes, and comes back under the same name a moment
@@ -4476,14 +4473,19 @@ fn a_headset_between_profiles_keeps_the_output_lane_and_its_sink_is_linked_again
          slow for this test to say anything"
     );
 
-    // The pair is rebuilt on the node that came back, because the stream WirePlumber linked
-    // once is never linked again — and the new stream is linked.
+    // The playback stream is replaced on the node that came back, because the stream WirePlumber
+    // linked once is never linked again — and the new stream is linked. FxSound's sink stays, at
+    // the same format, and with it every application on it (roadmap 0.5.0 §7, D3).
     let rebuilt = graph.nodes_until(|nodes| {
         serial_of(nodes, OUTPUT_NODE_NAME).is_some_and(|serial| serial != first)
     });
-    assert!(
-        matches!(rebuilt, Some(Ok(_))),
-        "the playback stream was never rebuilt for the sink that came back: {rebuilt:?}"
+    let Some(Ok(rebuilt)) = rebuilt else {
+        panic!("the playback stream was never rebuilt for the sink that came back: {rebuilt:?}");
+    };
+    assert_eq!(
+        serial_of(&rebuilt, SINK_NODE_NAME),
+        Some(sink),
+        "FxSound's sink went with the headset's profile switch"
     );
     said.settle(&handle);
     assert_eq!(
