@@ -1183,6 +1183,11 @@ impl<'a> SettingsDialog<'a> {
                 experimental_pane(ui, pane, self.state, palette, assets, id, &mut response);
             }
         }
+        // A drag cut short by closing the pane chose nothing: its preview goes with the pane,
+        // so the next time the pane is drawn it is not taken for a drag let go.
+        if response.actions.contains(&SettingsAction::Close) {
+            ui.data_mut(|d| d.remove::<ParityDrag>(parity_drag_id(id)));
+        }
         response
     }
 }
@@ -3143,12 +3148,31 @@ pub fn parity_hint_rect(pane: Rect) -> Rect {
     )
 }
 
+/// Where a drag of the «Like FxSound for Windows» thumb is, while the button is held, and the
+/// frame that last saw it held on the slider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParityDrag {
+    level: WindowsParity,
+    /// [`egui::Context::cumulative_frame_nr`] of the last frame the pane was drawn with the
+    /// button held on the slider. A let-go counts only on the frame straight after it: a preview
+    /// any older belongs to a drag the pane stopped seeing (Settings closed, another tab, the
+    /// window hidden) and is dropped unapplied.
+    seen: u64,
+}
+
+/// Where [`experimental_pane`] keeps its [`ParityDrag`] between frames.
+fn parity_drag_id(id: Id) -> Id {
+    id.with("parity-drag")
+}
+
 /// «Как в Windows» / "Like FxSound for Windows": the positions offered, Off to Interface and
 /// sound in 0.5.0 ([`WindowsParity::SLIDER_LEVELS`]; Everything arrives in 0.6.0).
 ///
 /// Nothing is applied while a drag is on its way: the pane remembers where the thumb is until the
 /// pointer lets go, and shows that position's label and hint meanwhile, so a drag from Off to
-/// Interface and sound never passes Interface on to the application. A click on a
+/// Interface and sound never passes Interface on to the application, and one cut short — Escape
+/// with the button held, the pane closed or not drawn before the let-go — passes nothing on at
+/// all ([`ParityDrag`]). A click on a
 /// position or on its label, an arrow key, a wheel notch and a right-click (back to Off, as every
 /// slider resets) apply at once.
 #[allow(clippy::too_many_arguments)]
@@ -3172,8 +3196,17 @@ fn experimental_pane(
         Align2::LEFT_CENTER,
     );
 
-    let preview_id = id.with("parity-drag");
-    let preview: Option<WindowsParity> = ui.data(|d| d.get_temp(preview_id));
+    let preview_id = parity_drag_id(id);
+    let frame = ui.ctx().cumulative_frame_nr();
+    let preview = match ui.data(|d| d.get_temp::<ParityDrag>(preview_id)) {
+        Some(drag) if drag.seen + 1 >= frame => Some(drag.level),
+        Some(_) => {
+            // A drag the pane lost sight of before it let go: nothing was chosen.
+            ui.data_mut(|d| d.remove::<ParityDrag>(preview_id));
+            None
+        }
+        None => None,
+    };
     // A level past the last position offered — Everything, which a later version's
     // settings.toml may hold and this one runs as Interface and sound — shows at the last.
     let shown = preview.unwrap_or(current).offered_or_below();
@@ -3193,12 +3226,20 @@ fn experimental_pane(
     let mut chosen = None;
     if slider.is_pointer_button_down_on() {
         if moved != shown || preview.is_some() {
-            ui.data_mut(|d| d.insert_temp(preview_id, moved));
+            let drag = ParityDrag {
+                level: moved,
+                seen: frame,
+            };
+            ui.data_mut(|d| d.insert_temp(preview_id, drag));
         }
     } else if preview.is_some() {
-        // The drag let go: this is the position it chose.
-        ui.data_mut(|d| d.remove::<WindowsParity>(preview_id));
-        chosen = Some(moved);
+        ui.data_mut(|d| d.remove::<ParityDrag>(preview_id));
+        // The drag let go: this is the position it chose. With the button still held it was
+        // Escape that ended it (egui aborts a drag on Escape), and a drag cancelled chooses
+        // nothing.
+        if !ui.input(|i| i.pointer.primary_down()) {
+            chosen = Some(moved);
+        }
     } else if slider.changed() {
         chosen = Some(moved);
     }
@@ -5492,6 +5533,18 @@ mod tests {
             (actions, shapes)
         }
 
+        /// A frame of the main window with the Settings pane closed: `events` reach no pane.
+        fn closed_frame(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), WINDOW_SIZE)),
+                events,
+                ..Default::default()
+            };
+            self.ctx
+                .run_ui(input, |_| {})
+                .drop_without_applying_deltas();
+        }
+
         fn click(&mut self, state: &SettingsState, at: egui::Pos2) -> Vec<SettingsAction> {
             let button = |pressed| egui::Event::PointerButton {
                 pos: at,
@@ -6405,6 +6458,78 @@ mod tests {
             actions,
             [SettingsAction::SetWindowsParity(WindowsParity::Sound)]
         );
+    }
+
+    /// Press the thumb at Off and drag it to Interface and sound without letting go.
+    fn drag_to_sound_and_hold(window: &mut Window, state: &SettingsState) -> Vec<SettingsAction> {
+        let primary = egui::PointerButton::Primary;
+        let from = detent(WindowsParity::Off);
+        let to = detent(WindowsParity::Sound);
+        let mut actions = window.frame(state, vec![egui::Event::PointerMoved(from)]).0;
+        actions.extend(
+            window
+                .frame(
+                    state,
+                    vec![
+                        egui::Event::PointerMoved(from),
+                        pointer(from, primary, true),
+                    ],
+                )
+                .0,
+        );
+        for step in 1..=12 {
+            let at = from + (to - from) * (step as f32 / 12.0);
+            actions.extend(window.frame(state, vec![egui::Event::PointerMoved(at)]).0);
+        }
+        actions
+    }
+
+    #[test]
+    fn a_drag_cut_short_by_escape_applies_nothing_when_the_pane_opens_again() {
+        let state = experimental_state(WindowsParity::Off);
+        let mut window = Window::new(ThemeMode::Dark);
+        let mut actions = drag_to_sound_and_hold(&mut window, &state);
+        // Escape with the button still held: the pane closes, and the level stays Off.
+        actions.extend(
+            window
+                .frame(
+                    &state,
+                    vec![
+                        key_event(egui::Key::Escape, true),
+                        key_event(egui::Key::Escape, false),
+                    ],
+                )
+                .0,
+        );
+        assert_eq!(actions, [SettingsAction::Close]);
+        // The button is let go with the pane closed, and time passes.
+        let to = detent(WindowsParity::Sound);
+        window.closed_frame(vec![pointer(to, egui::PointerButton::Primary, false)]);
+        for _ in 0..5 {
+            window.closed_frame(Vec::new());
+        }
+        // Opened again on Experimental: nothing is asked for, and the thumb is back at Off.
+        let mut actions = Vec::new();
+        for _ in 0..3 {
+            actions.extend(window.frame(&state, Vec::new()).0);
+        }
+        assert_eq!(actions, []);
+    }
+
+    #[test]
+    fn a_drag_the_pane_stopped_seeing_before_it_let_go_applies_nothing() {
+        // Not closed through the pane (hidden, or another tab drawn): the preview is still in
+        // memory, but no frame of the pane saw the let-go.
+        let state = experimental_state(WindowsParity::Off);
+        let mut window = Window::new(ThemeMode::Dark);
+        let mut actions = drag_to_sound_and_hold(&mut window, &state);
+        let to = detent(WindowsParity::Sound);
+        window.closed_frame(vec![pointer(to, egui::PointerButton::Primary, false)]);
+        window.closed_frame(Vec::new());
+        for _ in 0..3 {
+            actions.extend(window.frame(&state, Vec::new()).0);
+        }
+        assert_eq!(actions, []);
     }
 
     fn key_event(key: egui::Key, pressed: bool) -> egui::Event {

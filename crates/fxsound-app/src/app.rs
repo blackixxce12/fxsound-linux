@@ -4013,7 +4013,8 @@ impl App {
                     .collect();
                 let collisions = self.export_collisions(state.lane, &names);
                 if collisions.is_empty() {
-                    let written = self.export_presets(state.lane, &names);
+                    let written =
+                        self.export_presets(state.lane, &names, Self::export_end_bands(state));
                     state.finished = Some(written > 0);
                 } else {
                     state.collisions = collisions;
@@ -4035,7 +4036,7 @@ impl App {
                 let written = if names.is_empty() {
                     0
                 } else {
-                    self.export_presets(state.lane, &names)
+                    self.export_presets(state.lane, &names, Self::export_end_bands(state))
                 };
                 state.finished = Some(written > 0);
                 false
@@ -4070,13 +4071,23 @@ impl App {
     /// ([`App::export_end_bands`]), ticked as the setting says.
     #[must_use]
     pub fn export_window(&self, lane: DeviceDirection, presets: Vec<String>) -> ExportState {
-        ExportState {
+        let mut state = ExportState {
             lane,
             presets,
-            end_bands_offered: self.end_bands_offered(lane),
-            end_bands_as_they_are: self.settings.export_unshifted,
             ..ExportState::default()
-        }
+        };
+        self.refresh_export_state(&mut state);
+        state
+    }
+
+    /// Bring an open Export window up to date with what may have moved since it opened: whether
+    /// «Like FxSound for Windows» still offers the end-band choice (`--windows-parity`, D-Bus
+    /// `SetWindowsParity`), and the choice itself (`--export-unshifted`). The host calls it
+    /// every frame the window is drawn, so what the window shows is what an export does
+    /// ([`App::handle_export`] exports as the window says, not as the level says).
+    pub fn refresh_export_state(&self, state: &mut ExportState) {
+        state.end_bands_offered = self.end_bands_offered(state.lane);
+        state.end_bands_as_they_are = self.settings.export_unshifted;
     }
 
     /// Whether `lane`'s export offers to keep the end bands where they are: the speakers' `.fac`,
@@ -4086,11 +4097,13 @@ impl App {
         lane == DeviceDirection::Output && self.windows_parity().sound()
     }
 
-    /// Where an export of `lane`'s presets puts the end bands: where they are when that is offered
-    /// and chosen (`export_unshifted`, the Export window's tick box, `--export-unshifted`), back
-    /// inside the Windows build's range otherwise, as 0.4.0 does (0.4.0 audit R6).
-    fn export_end_bands(&self, lane: DeviceDirection) -> EndBands {
-        if self.end_bands_offered(lane) && self.settings.export_unshifted {
+    /// Where an export from the Export window `state` puts the end bands: where they are when the
+    /// window offers that and shows it chosen (`export_unshifted`, the tick box,
+    /// `--export-unshifted`), back inside the Windows build's range otherwise, as 0.4.0 does
+    /// (0.4.0 audit R6). The window's own record, kept current by
+    /// [`App::refresh_export_state`], so the export never does what the window does not show.
+    fn export_end_bands(state: &ExportState) -> EndBands {
+        if state.end_bands_offered && state.end_bands_as_they_are {
             EndBands::AsTheyAre
         } else {
             EndBands::Shifted
@@ -4125,17 +4138,21 @@ impl App {
             .collect()
     }
 
-    /// Write `names`, from `lane`'s store, into the export directory — each as last saved.
-    /// Returns how many files were written, which is what `FxController::exportPresets()` reduces
-    /// to a `bool`.
-    fn export_presets(&mut self, lane: DeviceDirection, names: &[String]) -> usize {
+    /// Write `names`, from `lane`'s store, into the export directory — each as last saved, with
+    /// the end bands put as `end_bands` says. Returns how many files were written, which is what
+    /// `FxController::exportPresets()` reduces to a `bool`.
+    fn export_presets(
+        &mut self,
+        lane: DeviceDirection,
+        names: &[String],
+        end_bands: EndBands,
+    ) -> usize {
         if let Err(err) = std::fs::create_dir_all(&self.export_dir) {
             log::warn!("could not create {}: {err}", self.export_dir.display());
             self.raise_notice(tr("Could not create the export folder"));
             return 0;
         }
         let mut written = 0;
-        let end_bands = self.export_end_bands(lane);
         for name in names {
             match self.store(lane).export(name, &self.export_dir, end_bands) {
                 Ok(_) => written += 1,
@@ -8034,8 +8051,23 @@ mod tests {
     /// file back.
     fn export_through_the_window(app: &mut App, dir: &tempfile::TempDir, name: &str) -> Preset {
         let names: Vec<String> = app.state.presets.iter().map(|p| p.name.clone()).collect();
-        let at = names.iter().position(|n| n == name).expect("listed");
-        let mut state = app.export_window(DeviceDirection::Output, names);
+        let state = app.export_window(DeviceDirection::Output, names);
+        export_from_the_open_window(app, dir, &state, name)
+    }
+
+    /// Export `name` through the Export window `state`, already open, and read the file back.
+    fn export_from_the_open_window(
+        app: &mut App,
+        dir: &tempfile::TempDir,
+        state: &ExportState,
+        name: &str,
+    ) -> Preset {
+        let mut state = state.clone();
+        let at = state
+            .presets
+            .iter()
+            .position(|n| n == name)
+            .expect("listed");
         app.handle_export(&PresetsAction::ToggleExport(at), &mut state);
         app.handle_export(&PresetsAction::Export, &mut state);
         if !state.collisions.is_empty() {
@@ -8103,6 +8135,57 @@ mod tests {
         );
         let state = app.export_window(DeviceDirection::Output, vec!["Wide".into()]);
         assert!(!state.end_bands_offered);
+    }
+
+    #[test]
+    fn an_open_export_window_follows_the_level_and_exports_as_it_shows() {
+        let (mut app, dir) = with_store();
+        let mut wide = Preset {
+            name: "Wide".into(),
+            ..Preset::default()
+        };
+        wide.eq_bands[0].center_hz = 46.0;
+        app.presets.save_as(&wide, "Wide").expect("saved");
+        app.refresh_preset_list();
+        app.set_export_unshifted(true);
+
+        // (a) Opened at Interface and sound, ticked; a keybind takes the level to Off.
+        app.set_windows_parity(WindowsParity::Sound, false)
+            .expect("offered");
+        let mut state = app.export_window(DeviceDirection::Output, vec!["Wide".into()]);
+        assert!(state.end_bands_offered && state.end_bands_as_they_are);
+        app.set_windows_parity(WindowsParity::Off, false)
+            .expect("offered");
+        // Not drawn since: the export does what the window still shows.
+        assert_eq!(
+            export_from_the_open_window(&mut app, &dir, &state, "Wide").eq_bands[0].center_hz,
+            46.0
+        );
+        // Drawn again: the choice is gone from it, and from the export.
+        app.refresh_export_state(&mut state);
+        assert!(!state.end_bands_offered);
+        assert_eq!(
+            export_from_the_open_window(&mut app, &dir, &state, "Wide").eq_bands[0].center_hz,
+            62.5
+        );
+
+        // (b) Opened at Off with the choice saved earlier; the level goes to Interface and sound.
+        let mut state = app.export_window(DeviceDirection::Output, vec!["Wide".into()]);
+        assert!(!state.end_bands_offered);
+        app.set_windows_parity(WindowsParity::Sound, false)
+            .expect("offered");
+        // The window never offered the choice, so the export shifts as 0.4.0 does.
+        assert_eq!(
+            export_from_the_open_window(&mut app, &dir, &state, "Wide").eq_bands[0].center_hz,
+            62.5
+        );
+        // Drawn again it offers it, ticked as saved, and exports as it shows.
+        app.refresh_export_state(&mut state);
+        assert!(state.end_bands_offered && state.end_bands_as_they_are);
+        assert_eq!(
+            export_from_the_open_window(&mut app, &dir, &state, "Wide").eq_bands[0].center_hz,
+            46.0
+        );
     }
 
     #[test]
@@ -15332,9 +15415,14 @@ mod tests {
         }
         assert_eq!(state.wireplumber_hook.restart, WirePlumberRestart::Failed);
 
+        // Unticked again: the files are back to what the WirePlumber from before read, and there
+        // is nothing to restart it for.
         app.handle_settings(&SettingsAction::SetWirePlumberHook(false), &mut state);
         assert_eq!(place.installed(), Installed::No);
         assert!(!state.wireplumber_hook.on);
-        assert_eq!(state.wireplumber_hook.restart, WirePlumberRestart::Due);
+        assert_eq!(
+            state.wireplumber_hook.restart,
+            WirePlumberRestart::NotNeeded
+        );
     }
 }

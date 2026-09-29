@@ -7,7 +7,9 @@
 //! the files away by hand finds the box unticked, and nothing in `settings.toml` can say otherwise.
 //!
 //! WirePlumber reads the files only when it starts, so the pane says when the WirePlumber that
-//! runs started before the box was last changed, and offers to restart it. A restart asked for
+//! runs started before the box was last changed, and offers to restart it — unless the box went
+//! back to what that WirePlumber read (ticked and unticked again), which leaves it nothing new to
+//! read. A restart asked for
 //! and not made — WirePlumber not started by systemd — is said too; the next login brings the
 //! change then.
 
@@ -37,6 +39,10 @@ pub(crate) struct WirePlumberHost {
     pub(crate) restart: fn() -> std::io::Result<()>,
     /// When the box was last ticked or unticked in this run.
     changed: Option<SystemTime>,
+    /// The files as a WirePlumber that started before this run's changes read them, when that is
+    /// known ([`Self::set`]): the box ticked and unticked again leaves that WirePlumber with what
+    /// it already has, and nothing to restart for.
+    read_before: Option<ReadBefore>,
     /// A restart was asked for since, and the WirePlumber from before is still the one running.
     restart_failed: Cell<bool>,
     /// The restart under way, until its thread says how it went ([`Self::restart_settled`]).
@@ -45,6 +51,13 @@ pub(crate) struct WirePlumberHost {
     /// newer than once it is over. A change made while it runs is not one it was asked for, so a
     /// restart that did its part leaves that change due, not failed.
     restart_asked_for: Cell<Option<SystemTime>>,
+}
+
+/// What a WirePlumber running since before `as_of` read of the hook's files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadBefore {
+    as_of: SystemTime,
+    files: Installed,
 }
 
 impl WirePlumberHost {
@@ -56,6 +69,7 @@ impl WirePlumberHost {
             running_since_before: wireplumber_hook::running_since_before,
             restart: wireplumber_hook::restart,
             changed: None,
+            read_before: None,
             restart_failed: Cell::new(false),
             restarting: RefCell::new(None),
             restart_asked_for: Cell::new(None),
@@ -70,6 +84,7 @@ impl WirePlumberHost {
             running_since_before: |_| None,
             restart: || Err(std::io::Error::other("no WirePlumber to restart")),
             changed: None,
+            read_before: None,
             restart_failed: Cell::new(false),
             restarting: RefCell::new(None),
             restart_asked_for: Cell::new(None),
@@ -90,6 +105,7 @@ impl WirePlumberHost {
             running_since_before,
             restart,
             changed: None,
+            read_before: None,
             restart_failed: Cell::new(false),
             restarting: RefCell::new(None),
             restart_asked_for: Cell::new(None),
@@ -106,8 +122,9 @@ impl WirePlumberHost {
         let Some(place) = &self.place else {
             return WirePlumberHook::default();
         };
-        let on = place.installed().is_on();
-        let due = self.predates(self.since());
+        let installed = place.installed();
+        let on = installed.is_on();
+        let due = !self.as_the_running_one_read_them(installed) && self.predates(self.since());
         // Due, not failed, while a restart is under way: it has not had its chance yet.
         let failed = self.restart_failed.get() && self.restarting.borrow().is_none();
         WirePlumberHook {
@@ -140,6 +157,13 @@ impl WirePlumberHost {
         since.is_some_and(|since| (self.running_since_before)(since) == Some(true))
     }
 
+    /// Whether the files, `installed`, are back to what the WirePlumber running read of them when
+    /// it started: the box ticked and unticked again under it, or unticked and ticked again.
+    fn as_the_running_one_read_them(&self, installed: Installed) -> bool {
+        self.read_before
+            .is_some_and(|read| read.files == installed && self.predates(Some(read.as_of)))
+    }
+
     /// Tick (`on`) or untick the box: install the hook, or take it away. Ticking needs WirePlumber
     /// 0.5; unticking never does, so that a hook left from before can always go.
     ///
@@ -157,9 +181,23 @@ impl WirePlumberHost {
                 "WirePlumber 0.5 or later is not installed",
             ));
         }
+        // What the WirePlumber running read, while it is still the one this run first changed the
+        // files under. Otherwise learnt anew: the files as they are, when it started after they
+        // last changed; unknown when it started before that, since the files may have changed
+        // between its start and this run's (and then any change is taken for due, as before).
+        let now = SystemTime::now();
+        if !self
+            .read_before
+            .is_some_and(|read| self.predates(Some(read.as_of)))
+        {
+            self.read_before = (!self.predates(self.since())).then(|| ReadBefore {
+                as_of: now,
+                files: place.installed(),
+            });
+        }
         let result = if on { place.install() } else { place.remove() };
         // Even a half-done change is a change WirePlumber has not read.
-        self.changed = Some(SystemTime::now());
+        self.changed = Some(now);
         self.restart_failed.set(false);
         result
     }
@@ -351,13 +389,73 @@ mod tests {
 
         host.set(true).expect("the hook installs");
         assert_eq!(host.state().restart, WirePlumberRestart::Due);
-        host.set(false).expect("the hook goes");
-        assert_eq!(host.state().restart, WirePlumberRestart::Due);
 
         // Restarted since, or none running: nothing is due.
         host.running_since_before = |_| Some(false);
         assert_eq!(host.state().restart, WirePlumberRestart::NotNeeded);
         host.running_since_before = |_| None;
+        assert_eq!(host.state().restart, WirePlumberRestart::NotNeeded);
+    }
+
+    #[test]
+    fn the_box_ticked_and_unticked_again_under_the_same_wireplumber_asks_for_no_restart() {
+        let dir = tempfile::TempDir::new().expect("a scratch directory");
+        let mut host = host(dir.path(), wp_0_5);
+        // Running since login, before anything this run did.
+        host.running_since_before = |_| Some(true);
+        host.set(true).expect("the hook installs");
+        assert_eq!(host.state().restart, WirePlumberRestart::Due);
+        host.set(false).expect("the hook goes");
+        assert_eq!(host.state().restart, WirePlumberRestart::NotNeeded);
+        // And once more, the same.
+        host.set(true).expect("the hook installs");
+        assert_eq!(host.state().restart, WirePlumberRestart::Due);
+        host.set(false).expect("the hook goes");
+        assert_eq!(host.state().restart, WirePlumberRestart::NotNeeded);
+    }
+
+    #[test]
+    fn a_hook_the_running_wireplumber_read_unticked_and_ticked_again_asks_for_no_restart() {
+        let dir = tempfile::TempDir::new().expect("a scratch directory");
+        let mut host = host(dir.path(), wp_0_5);
+        let place = host.place.clone().expect("a place");
+        place.install().expect("installed by an earlier run");
+        // WirePlumber started after the earlier run's files, and before this run's changes.
+        static FILES: std::sync::Mutex<Option<SystemTime>> = std::sync::Mutex::new(None);
+        *FILES.lock().expect("the files' time") = place.installed_at();
+        host.running_since_before = |since| {
+            let files = FILES.lock().expect("the files' time").expect("a time");
+            Some(since > files)
+        };
+        assert_eq!(host.state().restart, WirePlumberRestart::NotNeeded);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        host.set(false).expect("the hook goes");
+        assert_eq!(host.state().restart, WirePlumberRestart::Due);
+        host.set(true).expect("the hook is back");
+        assert_eq!(host.state().restart, WirePlumberRestart::NotNeeded);
+    }
+
+    #[test]
+    fn a_wireplumber_restarted_between_two_changes_is_due_when_the_files_go_back() {
+        // Started after the tick: it read the hook, so taking the hook away again is a change for
+        // it, even though it gives back the files the WirePlumber from before had.
+        static STARTED: std::sync::Mutex<Option<SystemTime>> = std::sync::Mutex::new(None);
+        let dir = tempfile::TempDir::new().expect("a scratch directory");
+        let mut host = host(dir.path(), wp_0_5);
+        host.running_since_before = |since| {
+            let started = *STARTED.lock().expect("the start's lock");
+            Some(started.is_none_or(|started| started < since))
+        };
+        host.set(true).expect("the hook installs");
+        assert_eq!(host.state().restart, WirePlumberRestart::Due);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        *STARTED.lock().expect("the start's lock") = Some(SystemTime::now());
+        assert_eq!(host.state().restart, WirePlumberRestart::NotNeeded);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        host.set(false).expect("the hook goes");
+        assert_eq!(host.state().restart, WirePlumberRestart::Due);
+        // Back to what that WirePlumber read: nothing due.
+        host.set(true).expect("the hook is back");
         assert_eq!(host.state().restart, WirePlumberRestart::NotNeeded);
     }
 
@@ -403,8 +501,10 @@ mod tests {
         assert_eq!(RESTARTS.load(Ordering::SeqCst), 1);
         assert_eq!(host.state().restart, WirePlumberRestart::Failed);
 
-        // A change after it asks again.
+        // Unticked, the files are what the old WirePlumber has; ticked again, asked again.
         host.set(false).expect("the hook goes");
+        assert_eq!(host.state().restart, WirePlumberRestart::NotNeeded);
+        host.set(true).expect("the hook installs");
         assert_eq!(host.state().restart, WirePlumberRestart::Due);
 
         // A restart that takes: a WirePlumber started after the change.

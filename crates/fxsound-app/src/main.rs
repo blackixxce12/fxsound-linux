@@ -1888,6 +1888,9 @@ impl<'a> Shell<'a> {
         let Some(mut state) = self.export.take() else {
             return;
         };
+        // «Like FxSound for Windows» and the end-band choice may have moved since the window
+        // opened (a keybind, D-Bus): shown as they are now, and exported as shown.
+        self.rt.app.refresh_export_state(&mut state);
         dim_backdrop(ui, window, "export");
         let outer =
             egui::Rect::from_center_size(window.center(), dialogs::presets::export::WINDOW_SIZE);

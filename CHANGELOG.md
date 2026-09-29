@@ -62,7 +62,8 @@ All notable changes to the FxSound Linux port. The format follows
   Interface and sound on it has a tick box, "Keep the end bands where they are", and
   `fxsound --export-unshifted[=0|1]` sets the same: a `.fac` then keeps its first and last band
   where you tuned them, instead of moving them into the range FxSound for Windows tunes them in,
-  which stays the default.
+  which stays the default. An Export window left open follows the level as it changes, and exports
+  as it shows.
 - **Smooth moves in WirePlumber, in the Experimental tab of Settings, off by default.**
   WirePlumber moves an application to a device picked in the desktop's sound settings before
   FxSound hears of it, and that move clicked as in plain Linux, −19 to −28 dBFS, with FxSound on or
@@ -76,7 +77,8 @@ All notable changes to the FxSound Linux port. The format follows
   FxSound's own lane, moving to the picked device after it, still clicks the application that has
   just arrived there, at −23 to −32 dBFS. It changes WirePlumber's policy for every application, so
   it is an option: it needs WirePlumber 0.5 or newer, WirePlumber reads it when it starts —
-  *Restart WirePlumber* is offered, asks first, and restarts it without holding up the window —
+  *Restart WirePlumber* is offered, asks first, and restarts it without holding up the window;
+  a box ticked and unticked again under the same WirePlumber asks for no restart —
   and unticking takes it away again. WirePlumber loads it as an optional component, which it skips
   rather than stop over when it cannot load it. An application closed in the tenth of a second the
   script holds it silent starts again at its own volume: WirePlumber, which keeps each
