@@ -96,8 +96,11 @@ All notable changes to the FxSound Linux port. The format follows
   back only once it is linked again. Before, either clicked at −18 to −38 dBFS on about one claim
   in twenty in the click test.
 - **Settings keep what a later version wrote.** A key of `settings.toml` this version does not
-  know is written back as it was, so going back a version and up again keeps the newer version's
-  settings. 0.4.0 does not keep them: after a downgrade to 0.4.0 its next save drops the keys 0.5.0
+  know is written back as it was — at the top of the file, or inside an entry of
+  `[[device_configs]]` or `[[device_volumes]]` or inside `[calibration]` — so going back a version
+  and up again keeps the newer version's settings. An entry this version drops takes its unknown
+  keys with it: a device forgotten in Settings, a volume or a calibration record that is not a
+  number. 0.4.0 does not keep them: after a downgrade to 0.4.0 its next save drops the keys 0.5.0
   added, `windows_parity` among them.
 
 ### Changed

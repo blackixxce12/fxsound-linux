@@ -677,6 +677,7 @@ fn seeded(target: &str, channels: usize, volume: f32) -> TargetVolume {
         port: String::new(),
         channel_volumes: vec![volume; channels],
         mute: false,
+        extra: toml::Table::new(),
     }
 }
 
@@ -961,6 +962,7 @@ fn the_engine_writing_its_own_nodes_volume_leaves_the_node_answering_every_other
         port: String::new(),
         channel_volumes: vec![0.3, 0.3],
         mute: false,
+        extra: toml::Table::new(),
     }]));
     assert_eq!(graph.publishes(SINK_NODE_NAME, 2, 0.3), Ok(()));
 

@@ -675,6 +675,12 @@ pub struct TargetVolume {
     pub channel_volumes: Vec<f32>,
     /// The node's `mute`.
     pub mute: bool,
+    /// Every key of the settings entry this version does not know, kept and written back with
+    /// it, as `Settings::extra` keeps the file's. The engine neither reads nor reports any: an
+    /// entry it reports starts with none, and takes the stored entry's when it replaces it
+    /// (`Settings::remember_target_volume`).
+    #[serde(flatten)]
+    pub extra: toml::Table,
 }
 
 impl TargetVolume {
@@ -1326,6 +1332,7 @@ mod tests {
             port: String::new(),
             channel_volumes: volumes.to_vec(),
             mute: false,
+            extra: toml::Table::new(),
         }
     }
 
@@ -1391,6 +1398,7 @@ mod tests {
             port: String::new(),
             channel_volumes: vec![0.5, 0.75],
             mute: true,
+            extra: toml::Table::new(),
         };
         let text = toml::to_string(&entry).expect("serialise");
         for line in [
@@ -1417,6 +1425,7 @@ mod tests {
                 port: String::new(),
                 channel_volumes: Vec::new(),
                 mute: false,
+                extra: toml::Table::new(),
             }
         );
     }

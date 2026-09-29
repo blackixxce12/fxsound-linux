@@ -5651,6 +5651,7 @@ impl App {
                 .map_or(0, |since| since.as_secs()),
             preset: name.clone(),
             device: calibration.microphone.node_name.clone(),
+            extra: toml::Table::new(),
         });
         let message = if overwrite {
             Message::preset_overwritten(&name)
@@ -9625,6 +9626,7 @@ mod tests {
             port: String::new(),
             channel_volumes: vec![0.5, 0.5],
             mute: false,
+            extra: toml::Table::new(),
         };
         settings.device_volumes = vec![volume.clone()];
 
@@ -10341,6 +10343,7 @@ mod tests {
             port: String::new(),
             channel_volumes: vec![level, level],
             mute: false,
+            extra: toml::Table::new(),
         };
 
         engine.feed(AudioToUi::TargetVolume(volume(0.4)));
@@ -10397,6 +10400,7 @@ mod tests {
             port: String::new(),
             channel_volumes: vec![0.3, 0.3],
             mute: false,
+            extra: toml::Table::new(),
         };
         engine.feed(AudioToUi::TargetVolume(volume.clone()));
         app.poll_audio();
@@ -13414,6 +13418,7 @@ mod tests {
             port: "analog-output-headphones".to_owned(),
             channel_volumes: vec![0.3, 0.3],
             mute: false,
+            extra: toml::Table::new(),
         };
         settings.device_volumes = vec![volume.clone()];
 

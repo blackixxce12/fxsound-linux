@@ -138,6 +138,7 @@ pub(crate) fn learn(
             device_name: device.description.clone(),
             preset: String::new(),
             device_form_factor: device.form_factor.clone(),
+            extra: toml::Table::new(),
         };
 
         if first_time {

@@ -4908,6 +4908,7 @@ mod tests {
             unix_time: 1_790_121_600,
             preset: "Calibrated — fifine".to_owned(),
             device: "alsa_input.usb-fifine".to_owned(),
+            extra: Default::default(),
         });
         assert_eq!(
             state.calibration_text(),

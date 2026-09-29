@@ -205,6 +205,7 @@ impl NodeVolume {
             port: port.unwrap_or_default().to_owned(),
             channel_volumes: self.effective(channels),
             mute: self.mute,
+            extra: toml::Table::new(),
         }
         .sanitised()
     }
@@ -883,6 +884,7 @@ mod tests {
             port: String::new(),
             channel_volumes: volumes.to_vec(),
             mute: false,
+            extra: toml::Table::new(),
         }
     }
 

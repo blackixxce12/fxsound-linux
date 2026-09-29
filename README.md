@@ -582,7 +582,8 @@ interrupted save cannot truncate what was there. A settings file that does not l
 comment saved in a legacy encoding, permissions) is moved aside to `settings.toml.bad`, or
 `settings.toml.2.bad` and so on, never over an earlier one, before the defaults are saved. Keys this
 version does not know, such as those a later version wrote, are kept and written back as they
-were; 0.4.0 drops them on its next save. A settings file or preset that is a symbolic link, as GNU
+were, at the top of the file and inside a device's entry or the calibration record; 0.4.0 drops
+them on its next save. A settings file or preset that is a symbolic link, as GNU
 Stow or chezmoi leave them, stays one: the file it points to is the one replaced. A link to a
 read-only file, or to one in a directory you may not write, is never saved through, so every save of
 that file fails. home-manager's default links into the Nix store are such links; link the file with

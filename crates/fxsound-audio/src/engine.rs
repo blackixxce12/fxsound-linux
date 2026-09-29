@@ -6948,9 +6948,14 @@ fn format_pod(rate: u32, channels: u32, positions: &ChannelMap) -> Vec<u8> {
 /// An entry with neither a level nor a mute goes too. `sanitised` keeps an entry with no
 /// `channel_volumes` as a remembered mute — which is what [`volume::for_new_pair`] makes of it —
 /// but one that is not muted either says nothing about its device, and is the same as no entry.
+///
+/// The keys a later version wrote into an entry ([`TargetVolume::extra`]) are the settings file's
+/// business, and are left behind: an entry held here is compared with the one a pair reports,
+/// which never has any, and a difference in them alone is no change of volume to report.
 fn remembered_volumes(volumes: Vec<TargetVolume>) -> Vec<TargetVolume> {
     let mut kept: Vec<TargetVolume> = Vec::with_capacity(volumes.len());
-    for entry in volumes.into_iter().filter_map(TargetVolume::sanitised) {
+    for mut entry in volumes.into_iter().filter_map(TargetVolume::sanitised) {
+        entry.extra.clear();
         if entry.channel_volumes.is_empty() && !entry.mute {
             log::info!(
                 "{} lane: a remembered volume for {} has no level, and is left out",
@@ -9356,6 +9361,7 @@ mod tests {
             port: String::new(),
             channel_volumes: volumes.to_vec(),
             mute: false,
+            extra: toml::Table::new(),
         }
     }
 
@@ -9671,6 +9677,37 @@ mod tests {
                 expected_mute
             ],
             "one entry per direction and target, the newest"
+        );
+    }
+
+    #[test]
+    fn a_seeded_volume_with_keys_of_a_later_version_is_not_reported_again_unchanged() {
+        let (mut shared, messages) = shared_with_messages();
+        let mut later = remembered(DeviceDirection::Output, "speakers", &[0.5, 0.25]);
+        later
+            .extra
+            .insert("future_curve".to_owned(), toml::Value::from("loudness"));
+        control(&mut shared, UiToAudio::SeedTargetVolumes(vec![later]));
+        assert_eq!(
+            shared.target_volumes,
+            [remembered(
+                DeviceDirection::Output,
+                "speakers",
+                &[0.5, 0.25]
+            )],
+            "the settings file keeps a later version's keys; the engine has no use for them"
+        );
+        report_target_volume(
+            &mut shared,
+            DeviceDirection::Output,
+            "speakers",
+            None,
+            &at(&[0.5, 0.25]),
+            2,
+        );
+        assert!(
+            volume_reports(&messages).is_empty(),
+            "the volume the file remembers is no change of volume"
         );
     }
 

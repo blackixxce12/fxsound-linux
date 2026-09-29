@@ -287,7 +287,8 @@ impl AppEvent {
             ],
             Self::Calibrated(record) => {
                 // Destructured in full, so a new measurement has to be given a place here. The
-                // time is the envelope's `ts`.
+                // time is the envelope's `ts`; `extra` holds only keys a later version wrote into
+                // the settings file, and a record the wizard has just made has none.
                 let CalibrationRecord {
                     noise_floor_db,
                     speech_rms_db,
@@ -296,6 +297,7 @@ impl AppEvent {
                     unix_time: _,
                     preset,
                     device,
+                    extra: _,
                 } = record;
                 vec![
                     ("device", Value::from(device.as_str())),
@@ -921,6 +923,7 @@ mod tests {
             unix_time: 1_790_000_000,
             preset: "Calibrated — Blue Yeti".to_owned(),
             device: "alsa_input.usb-Blue_Yeti".to_owned(),
+            extra: toml::Table::new(),
         });
         let json = parse(&event.to_json(0));
         assert_eq!(json["event"], "calibrated");
@@ -1539,6 +1542,7 @@ mod tests {
             unix_time: 1_790_000_000,
             preset: "Calibrated — Microphone".to_owned(),
             device: MIC.to_owned(),
+            extra: toml::Table::new(),
         };
         app.record_calibration(record.clone());
         assert_eq!(said(&mut app), [AppEvent::Calibrated(record.clone())]);
